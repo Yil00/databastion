@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, jobs } from "@/db/schema";
+import { registeredClassifiers } from "@/lib/protocol/classifiers";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
@@ -99,8 +100,15 @@ export type ScanRequestOutcome =
   | { outcome: "queued"; jobId: string }
   /** Unknown agent or target, agent revoked / locked, target no longer reported. */
   | { outcome: "not_found" }
-  /** The agent has not reported its classifiers version yet (required by the job). */
+  /** The agent's latest heartbeat carries no `classifiers_version` (required by the job). */
   | { outcome: "not_ready" }
+  /**
+   * The agent's latest heartbeat reports a `classifiers_version` that is not in the contract
+   * registry (`classifiers.json`): the console issues no job with it.
+   */
+  | { outcome: "classifiers_version_unregistered"; classifiersVersion: string }
+  /** `params.classifiers` holds ids that are not classifiers of the agent's version. */
+  | { outcome: "unknown_classifiers"; classifiersVersion: string; unknown: string[] }
   /** A scan of this target is already pending, delivered or running. */
   | { outcome: "busy" };
 
@@ -133,8 +141,14 @@ export async function requestScan(
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
+    // The classifier set of the agent's latest heartbeat (a heartbeat without one clears it), only
+    // if registered; `params.classifiers` must be ids of that version.
     const version = agent.classifiersVersion;
     if (!version || !validateSchema("ClassifiersVersion", version).ok) return { outcome: "not_ready" };
+    const registered = registeredClassifiers(version);
+    if (!registered) return { outcome: "classifiers_version_unregistered", classifiersVersion: version };
+    const unknown = (params.classifiers ?? []).filter((id) => !registered.has(id));
+    if (unknown.length > 0) return { outcome: "unknown_classifiers", classifiersVersion: version, unknown };
     await sweepDeadScans(tx, agentId);
     const [open] = await tx
       .select({ id: jobs.id })
@@ -192,7 +206,14 @@ export async function requestScan(
       targetType: "agent",
       targetId: agentId,
       sourceIp: actor.ip,
-      details: { target_id: targetId, reason: result.outcome },
+      details: {
+        target_id: targetId,
+        reason: result.outcome,
+        ...(result.outcome === "classifiers_version_unregistered" || result.outcome === "unknown_classifiers"
+          ? { classifiers_version: result.classifiersVersion }
+          : {}),
+        ...(result.outcome === "unknown_classifiers" ? { unknown_classifiers: result.unknown.join(",") } : {}),
+      },
     });
   }
   return result;
@@ -205,6 +226,27 @@ export interface ScanJobView {
   finishedAt: Date | null;
   progress: Record<string, number> | null;
   errorCode: string | null;
+  /** The classifier set the job was issued with. */
+  classifiersVersion: string | null;
+}
+
+/**
+ * Short status of a scan job for display. A scan that failed with `unsupported` while its
+ * `classifiers_version` differs from the agent's current heartbeat version was refused by the
+ * agent because its build runs another classifier set (contract `DiscoveryScanJob`): shown as a
+ * "classifier set mismatch" rather than a bare `unsupported`.
+ */
+export function scanStatusLabel(scan: Pick<ScanJobView, "status" | "errorCode" | "classifiersVersion">, agentClassifiersVersion: string | null): string {
+  if (!scan.errorCode) return scan.status;
+  if (
+    scan.status === "failed" &&
+    scan.errorCode === "unsupported" &&
+    scan.classifiersVersion !== null &&
+    scan.classifiersVersion !== agentClassifiersVersion
+  ) {
+    return `${scan.status} (classifier set mismatch: job ${scan.classifiersVersion}, agent ${agentClassifiersVersion ?? "unknown"})`;
+  }
+  return `${scan.status} (${scan.errorCode})`;
 }
 
 /** Latest scan job of each target of an agent (agent detail page). */
@@ -218,6 +260,7 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
       finishedAt: jobs.finishedAt,
       progress: jobs.progress,
       error: jobs.error,
+      classifiersVersion: jobs.classifiersVersion,
     })
     .from(jobs)
     .where(and(eq(jobs.agentId, agentId), eq(jobs.type, "discovery.scan")))
@@ -232,6 +275,7 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
       finishedAt: r.finishedAt,
       progress: r.progress ?? null,
       errorCode: r.error?.code ?? null,
+      classifiersVersion: r.classifiersVersion,
     });
   }
   return out;

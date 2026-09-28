@@ -400,12 +400,17 @@ const SCAN_ERRORS = {
   not_found: [404, "not_found"],
   not_ready: [409, "agent_not_ready"],
   busy: [409, "scan_in_progress"],
+  classifiers_version_unregistered: [409, "classifiers_version_unregistered"],
+  unknown_classifiers: [422, "unknown_classifiers"],
 } as const;
 
 /**
  * Launches a Discovery scan of one target (admin, CSRF): body = contract `DiscoveryScanParams`
  * (all optional; defaults for `sample_rows`, `max_duration_s`, `statement_timeout_ms`), unknown
- * keys, out-of-range values and empty include filters rejected. `202 {job_id}`; audited.
+ * keys, out-of-range values and empty include filters rejected. The job carries the
+ * `classifiers_version` of the agent's latest heartbeat: `409 agent_not_ready` without one,
+ * `409 classifiers_version_unregistered` when it is not in the contract registry,
+ * `422 unknown_classifiers` when `classifiers` holds ids outside it. `202 {job_id}`; audited.
  */
 export function handleRequestScan(req: Request, agentId: string, targetId: string): Promise<Response> {
   return guardedUser("discovery.scan_request", async () => {

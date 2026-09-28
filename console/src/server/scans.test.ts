@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb } from "@/db/client";
 import { auditLog, findings, jobs, users } from "@/db/schema";
@@ -12,7 +12,7 @@ import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, fixtures, uuidv7 } from "@/test/helpers";
 
-import { buildScanParams, SCAN_DEFAULTS, SCAN_GRACE_MS } from "./scans";
+import { buildScanParams, latestScans, SCAN_DEFAULTS, SCAN_GRACE_MS, scanStatusLabel } from "./scans";
 import {
   handleFalsePositive,
   handleLogin,
@@ -22,6 +22,13 @@ import {
   loginFailuresPerUserGlobal,
   loginFailuresUnknownUser,
 } from "./user-api";
+
+// The real registry plus a second, test-only classifier set.
+vi.mock("@/generated/protocol/classifiers.gen", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/generated/protocol/classifiers.gen")>();
+  return { CLASSIFIER_REGISTRY: { ...real.CLASSIFIER_REGISTRY, "2099.01.1": ["pii.email", "pii.test_only"] } };
+});
+const TEST_VERSION = "2099.01.1";
 
 const ORIGIN = "http://console.test";
 const PASSWORD = "correct horse battery staple";
@@ -93,6 +100,27 @@ describe("buildScanParams", () => {
     ["string body", "scan"],
   ])("rejects %s", (_name, input) => {
     expect(buildScanParams(input).ok).toBe(false);
+  });
+});
+
+describe("scanStatusLabel", () => {
+  const job = (status: string, errorCode: string | null, classifiersVersion: string | null = "2026.09.1") => ({
+    status,
+    errorCode,
+    classifiersVersion,
+  });
+
+  it("shows a classifier set mismatch only for unsupported with a version differing from the agent's", () => {
+    expect(scanStatusLabel(job("failed", "unsupported"), "2099.01.1")).toBe(
+      "failed (classifier set mismatch: job 2026.09.1, agent 2099.01.1)",
+    );
+    expect(scanStatusLabel(job("failed", "unsupported"), null)).toBe(
+      "failed (classifier set mismatch: job 2026.09.1, agent unknown)",
+    );
+    expect(scanStatusLabel(job("failed", "unsupported"), "2026.09.1")).toBe("failed (unsupported)");
+    expect(scanStatusLabel(job("failed", "unsupported", null), "2099.01.1")).toBe("failed (unsupported)");
+    expect(scanStatusLabel(job("failed", "timeout"), "2099.01.1")).toBe("failed (timeout)");
+    expect(scanStatusLabel(job("running", null), "2099.01.1")).toBe("running");
   });
 });
 
@@ -243,6 +271,122 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
       .from(auditLog)
       .where(and(eq(auditLog.action, "discovery.scan_request"), eq(auditLog.outcome, "failure")));
     expect(failures.length).toBeGreaterThanOrEqual(4);
+  });
+
+  describe("classifier registry", () => {
+    async function failures(agentId: string) {
+      return getDb()
+        .select()
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "discovery.scan_request"),
+            eq(auditLog.outcome, "failure"),
+            eq(auditLog.targetId, agentId),
+          ),
+        );
+    }
+
+    it("refuses the launch without a heartbeat classifiers_version (409 agent_not_ready, audited)", async () => {
+      const noVersion = { ...HEARTBEAT } as Record<string, unknown>;
+      delete noVersion.classifiers_version;
+      const auth = await agentWithTarget();
+      // The latest heartbeat counts: one without a version clears the previous one.
+      await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: noVersion }));
+      const res = await scan(auth.agentId, {});
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "agent_not_ready" });
+      expect((await failures(auth.agentId))[0]?.details).toMatchObject({ reason: "not_ready" });
+      expect(await getDb().select().from(jobs).where(eq(jobs.agentId, auth.agentId))).toHaveLength(0);
+    });
+
+    it("refuses the launch with an unregistered heartbeat version (409, audited), then accepts after an upgrade", async () => {
+      const auth = await agentWithTarget({ ...HEARTBEAT, classifiers_version: "2026.10.1" });
+      const res = await scan(auth.agentId, {});
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "classifiers_version_unregistered" });
+      expect((await failures(auth.agentId))[0]?.details).toMatchObject({
+        reason: "classifiers_version_unregistered",
+        classifiers_version: "2026.10.1",
+      });
+      expect(await getDb().select().from(jobs).where(eq(jobs.agentId, auth.agentId))).toHaveLength(0);
+      await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...HEARTBEAT, classifiers_version: TEST_VERSION } }));
+      const ok = await scan(auth.agentId, { classifiers: ["pii.test_only"] });
+      expect(ok.status).toBe(202);
+      const { job_id: jobId } = (await ok.json()) as { job_id: string };
+      const [job] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
+      expect(job?.classifiersVersion).toBe(TEST_VERSION);
+    });
+
+    it.each([
+      ["an unknown id", ["pii.unknown"]],
+      ["a valid id of another version", ["pii.email", "pii.test_only"]],
+      ["a prototype-like id", ["pii.email", "x.__proto__", "x.constructor"]],
+    ])("refuses params.classifiers with %s (422 unknown_classifiers, audited)", async (_name, classifiers) => {
+      const auth = await agentWithTarget();
+      const res = await scan(auth.agentId, { classifiers });
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({ error: "unknown_classifiers" });
+      const [audit] = await failures(auth.agentId);
+      expect(audit?.details).toMatchObject({ reason: "unknown_classifiers", classifiers_version: "2026.09.1" });
+      expect(await getDb().select().from(jobs).where(eq(jobs.agentId, auth.agentId))).toHaveLength(0);
+    });
+
+    it("the JobList gate never serves a scan job with an unregistered version or unknown ids", async () => {
+      const auth = await agentWithTarget();
+      const base = { agentId: auth.agentId, type: "discovery.scan" as const, targetId: "pg-prod-1" };
+      const ids = [
+        await enqueueJob(getDb(), { ...base, classifiersVersion: "2026.10.1", params: { ...SCAN_DEFAULTS } }),
+        await enqueueJob(getDb(), {
+          ...base,
+          classifiersVersion: "2026.09.1",
+          params: { ...SCAN_DEFAULTS, classifiers: ["pii.email", "pii.test_only"] },
+        }),
+        await enqueueJob(getDb(), {
+          ...base,
+          classifiersVersion: "2026.09.1",
+          params: { ...SCAN_DEFAULTS, classifiers: ["x.constructor"] },
+        }),
+      ];
+      const good = await enqueueJob(getDb(), {
+        ...base,
+        classifiersVersion: TEST_VERSION,
+        params: { ...SCAN_DEFAULTS, classifiers: ["pii.test_only"] },
+      });
+      const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+      expect(res.status).toBe(200);
+      const list = (await res.json()) as { jobs: { job_id: string }[] };
+      expect(list.jobs.map((j) => j.job_id)).toEqual([good]);
+      for (const id of ids) {
+        const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+        expect(row?.status).toBe("failed");
+        expect(row?.error).toEqual({ code: "internal" });
+      }
+    });
+
+    it("shows a classifier set mismatch when the agent refused the job as unsupported after changing sets", async () => {
+      const auth = await agentWithTarget();
+      const launched = await scan(auth.agentId, {});
+      const { job_id: jobId } = (await launched.json()) as { job_id: string };
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+      // The agent was upgraded to another classifier set before running the job.
+      await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...HEARTBEAT, classifiers_version: TEST_VERSION } }));
+      const failed = await handleJobStatus(
+        agentRequest("POST", `/jobs/${jobId}/status`, {
+          auth,
+          body: { status: "failed", ts: new Date().toISOString(), error: { code: "unsupported" } },
+        }),
+        jobId,
+      );
+      expect(failed.status).toBe(204);
+      const view = (await latestScans(getDb(), auth.agentId)).get("pg-prod-1");
+      expect(view).toMatchObject({ status: "failed", errorCode: "unsupported", classifiersVersion: "2026.09.1" });
+      expect(scanStatusLabel(view as NonNullable<typeof view>, TEST_VERSION)).toBe(
+        "failed (classifier set mismatch: job 2026.09.1, agent 2099.01.1)",
+      );
+      // Same set: a bare unsupported (e.g. a stub connector).
+      expect(scanStatusLabel(view as NonNullable<typeof view>, "2026.09.1")).toBe("failed (unsupported)");
+    });
   });
 
   it("the JobList gate never serves a scan job whose params break the contract", async () => {

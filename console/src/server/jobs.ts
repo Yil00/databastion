@@ -3,7 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { jobs } from "@/db/schema";
 import { logger } from "@/lib/logger";
-import { validateSchema, type Schemas } from "@/lib/protocol/validate";
+import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 
@@ -75,7 +75,9 @@ function toContractJob(r: ClaimedRow): Record<string, unknown> {
  * Leases up to 16 deliverable jobs of the agent (pending, or delivered with an expired lease),
  * oldest first, in one short statement (`FOR UPDATE SKIP LOCKED`: concurrent polls never get the
  * same job twice within a lease). Expired jobs are marked `expired` first. Each job is validated
- * against the contract; a job that does not conform is marked `failed` (`internal`) and never sent.
+ * against the contract (schema + `checkSemantics`: a `discovery.scan` job carries a registered
+ * `classifiers_version` and registered `params.classifiers` ids); a job that does not conform is
+ * marked `failed` (`internal`) and never sent.
  */
 export async function claimJobs(db: Database, agentId: string): Promise<Schemas["Job"][]> {
   await db.execute(sql`
@@ -105,7 +107,9 @@ export async function claimJobs(db: Database, agentId: string): Promise<Schemas[
     returning id, type, target_id, classifiers_version, params, created_at, expires_at`);
   const out: Schemas["Job"][] = [];
   for (const row of [...result.rows].sort((a, b) => iso(a.created_at).localeCompare(iso(b.created_at)))) {
-    const checked = validateSchema("Job", toContractJob(row));
+    // Schema, then the semantic checks (a scan job's classifier set and ids are registered).
+    const schema = validateSchema("Job", toContractJob(row));
+    const checked = schema.ok ? checkSemantics("Job", schema.value) : schema;
     if (checked.ok) {
       out.push(checked.value);
       continue;

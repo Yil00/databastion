@@ -1,5 +1,5 @@
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb } from "@/db/client";
 import { auditLog, findings, findingsBatches, jobs, securityEvents } from "@/db/schema";
@@ -24,6 +24,13 @@ import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv
 
 import { failuresPerAgent } from "./auth";
 import { findingsPerAgent, findingsRequestsPerAgent, handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+
+// The real registry plus a second, test-only classifier set sharing `pii.email` with 2026.09.1.
+vi.mock("@/generated/protocol/classifiers.gen", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/generated/protocol/classifiers.gen")>();
+  return { CLASSIFIER_REGISTRY: { ...real.CLASSIFIER_REGISTRY, "2099.01.1": ["pii.email", "pii.test_only"] } };
+});
+const TEST_VERSION = "2099.01.1";
 
 type Auth = { agentId: string; secret: string };
 type Body = Record<string, unknown> & { findings: Record<string, unknown>[] };
@@ -356,13 +363,68 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
     });
 
-    it("rejects a batch whose classifiers_version differs from the job's (L1)", async () => {
+    it("rejects a batch whose registered classifiers_version differs from the job's (L1: const)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const res = await post(auth, { ...batch(jobId), classifiers_version: TEST_VERSION });
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/classifiers_version", keyword: "const" }]);
+      expect((await integrityRows(auth.agentId, "agent.batch_rejected")).events).toHaveLength(1);
+    });
+
+    it("rejects a batch whose classifiers_version is not in the registry (enum, before const)", async () => {
       const auth = await agentWithTargets();
       const jobId = await deliveredScan(auth);
       const res = await post(auth, { ...batch(jobId), classifiers_version: "2026.10.1" });
       expect(res.status).toBe(400);
-      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/classifiers_version", keyword: "const" }]);
+      // No item pointer: the whole batch is dropped, whatever its classifier ids.
+      expect((await expectConformingError(res, {})).details).toEqual([
+        { pointer: "/classifiers_version", keyword: "enum" },
+        { pointer: "/classifiers_version", keyword: "const" },
+      ]);
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
       expect((await integrityRows(auth.agentId, "agent.batch_rejected")).events).toHaveLength(1);
+    });
+
+    it("rejects, item by item, classifier ids not registered for the batch's version (enum)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const items = [
+        { ...PG_FINDING, classifier: "pii.unknown" },
+        // Valid in another registered version, not in 2026.09.1.
+        { ...PG_FINDING, classifier: "pii.test_only" },
+        // Prototype-like ids (schema-valid): never "registered" through a prototype lookup.
+        { ...PG_FINDING, classifier: "x.__proto__" },
+        { ...PG_FINDING, classifier: "x.constructor" },
+        { ...PG_FINDING, classifier: "pii.phone" },
+        { ...PG_FINDING, classifier: "secret.password_hash" },
+      ];
+      const res = await post(auth, batch(jobId, items));
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([
+        { pointer: "/findings/0/classifier", keyword: "enum" },
+        { pointer: "/findings/1/classifier", keyword: "enum" },
+        { pointer: "/findings/2/classifier", keyword: "enum" },
+        { pointer: "/findings/3/classifier", keyword: "enum" },
+      ]);
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
+      // The agent drops the pointed items and resends the rest.
+      expect((await post(auth, batch(jobId, items.slice(4)))).status).toBe(202);
+    });
+
+    it("checks the ids against the batch's own version: a 2026.09.1 id is refused in a test-version job", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth, "pg-prod-1", {}, TEST_VERSION);
+      const items = [
+        { ...PG_FINDING, classifier: "pii.phone" },
+        { ...PG_FINDING, classifier: "pii.test_only" },
+        { ...PG_FINDING, classifier: "pii.email", location: { ...PG_FINDING.location, field: "mail2" } },
+      ];
+      const res = await post(auth, { ...batch(jobId, items), classifiers_version: TEST_VERSION });
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/findings/0/classifier", keyword: "enum" }]);
+      const retry = await post(auth, { ...batch(jobId, items.slice(1)), classifiers_version: TEST_VERSION });
+      expect(retry.status).toBe(202);
     });
 
     it("a target of another agent is foreign too", async () => {
@@ -626,8 +688,8 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
 
     it("resets when the classifier set changes", async () => {
       const { auth, id } = await markedFinding();
-      const next = await deliveredScan(auth, "pg-prod-1", {}, "2026.10.1");
-      const res = await post(auth, { ...batch(next, [{ ...PG_FINDING, matched: 50 }]), classifiers_version: "2026.10.1" });
+      const next = await deliveredScan(auth, "pg-prod-1", {}, TEST_VERSION);
+      const res = await post(auth, { ...batch(next, [{ ...PG_FINDING, matched: 50 }]), classifiers_version: TEST_VERSION });
       expect(res.status).toBe(202);
       const [row] = await getDb().select().from(findings).where(eq(findings.id, id));
       expect(row?.falsePositiveAt).toBeNull();
