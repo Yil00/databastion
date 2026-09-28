@@ -6,21 +6,46 @@
 //! [`NormalizedName`] can only be obtained through the functions of this
 //! module, and always matches the contract `Identifier` schema: its pattern
 //! **and** its `not` rule (no name or `.`-separated segment made only of 9
-//! or more digits and separators).
+//! or more digits and separators). That `not` rule is a gate: a candidate
+//! that violates it, or keeps a run of more than [`MAX_INDEX_DIGITS`]
+//! digits, becomes `*` whatever the rules below produced.
 //!
-//! Skeleton status (P1-B): structural rules only.
+//! Rules:
 //! - array indices (`orders.3.email`) become `[]` (`orders[].email`);
-//! - segments that look like values become `*`: long numeric runs (the
-//!   `Identifier` `not` rule), characters the pattern forbids (`@`, `=`,
-//!   `:`…, so e-mail addresses and URLs), UUID / long hex keys;
+//! - **classifier matches** (P2-A): every value recognized by a token
+//!   detector of [`crate::detect`] (e-mail, IBAN, card, NIR, phone, AWS key
+//!   id, password hash) is located in the **whole** name, not segment by
+//!   segment, so a value split across dots is still found
+//!   (`a.0612.345678` -> `a.*`). The name is scanned as is, and a second
+//!   time with `.`, `_`, `-` and `/` read as spaces (`card_4111.1111.1111.1111`).
+//!   Every segment a match touches becomes `*`, and consecutive such
+//!   segments collapse into one `*`;
+//! - an `@` masks the whole address around it: the local part extends left
+//!   across dots (a dot-separated path cannot tell `contacts.jane@…` from
+//!   `jane.doe@…`, so the conservative reading wins: use
+//!   [`normalize_field_path`] with the real keys to keep `contacts`), the
+//!   domain ends at the shortest valid address;
+//! - digit runs split by single separators (`.`, `_`, `-`, space, `+`) with
+//!   more than [`MAX_INDEX_DIGITS`] digits in total are values
+//!   (`ab0612.34.5678`);
+//! - segments that look like values become `*`: long numeric runs,
+//!   characters the pattern forbids (`@`, `=`, `:`…), UUID / long hex keys,
+//!   and words from a small list of common first names
+//!   (`archive_lucas_martin`, `ou=Oliver Martin`), see [`is_first_name`];
 //! - an LDAP entry DN is reduced to its parent container, attribute types
 //!   are lowercased;
 //! - anything that still does not conform becomes `*`.
 //!
-//! P2-A extends [`segment_looks_like_value`] with classifier matches (a
-//! segment matched by a classifier becomes `*`).
+//! Known gap: a surname alone, or a first name missing from the list, is
+//! not recognized (`archive_martin`). No detector recognizes arbitrary
+//! person names in identifiers.
 
 use std::fmt;
+use std::ops::Range;
+
+use crate::detect;
+use crate::hints::word_tokens;
+use crate::id::ClassifierId;
 
 /// Wildcard replacing a name or segment that may carry a value.
 const WILDCARD: &str = "*";
@@ -157,9 +182,205 @@ pub fn longest_digit_run(s: &str) -> usize {
     best
 }
 
-/// Whether a path segment looks like a value rather than a name.
-///
-/// Structural rules only; P2-A adds classifier matches here.
+/// Common first names (FR + EN, lowercase, with and without accents),
+/// matched as whole words of a name segment. Words that are also common
+/// schema vocabulary (`mark`, `will`, `max`, `grace`, `may`, `rose`…) are
+/// left out on purpose: they would mask ordinary column names.
+const FIRST_NAMES: &[&str] = &[
+    // dev seed (dev/seed/generate.py)
+    "jean",
+    "marie",
+    "camille",
+    "louis",
+    "chloe",
+    "chloé",
+    "hugo",
+    "lea",
+    "léa",
+    "lucas",
+    "manon",
+    "theo",
+    "théo",
+    "ines",
+    "inès",
+    "nathan",
+    "zoe",
+    "zoé",
+    "gabriel",
+    "elodie",
+    "élodie",
+    "raphael",
+    "raphaël",
+    "anais",
+    "anaïs",
+    "arthur",
+    "jade",
+    "noe",
+    "noé",
+    "olivia",
+    "james",
+    "amelia",
+    "noah",
+    "sophia",
+    "liam",
+    "emma",
+    "oliver",
+    "ava",
+    "elijah",
+    "hannah",
+    "lukas",
+    "mia",
+    "mateo",
+    "sofia",
+    "aiden",
+    // other common FR first names
+    "pierre",
+    "paul",
+    "jacques",
+    "michel",
+    "nicolas",
+    "thomas",
+    "julien",
+    "antoine",
+    "alexandre",
+    "maxime",
+    "guillaume",
+    "sebastien",
+    "sébastien",
+    "stephane",
+    "stéphane",
+    "christophe",
+    "philippe",
+    "francois",
+    "françois",
+    "olivier",
+    "laurent",
+    "vincent",
+    "frederic",
+    "frédéric",
+    "patrick",
+    "alain",
+    "eric",
+    "éric",
+    "julie",
+    "sophie",
+    "nathalie",
+    "isabelle",
+    "sandrine",
+    "celine",
+    "céline",
+    "valerie",
+    "valérie",
+    "christine",
+    "catherine",
+    "emilie",
+    "émilie",
+    "aurelie",
+    "aurélie",
+    "caroline",
+    "helene",
+    "hélène",
+    "margaux",
+    "mathilde",
+    "juliette",
+    "clement",
+    "clément",
+    "quentin",
+    "romain",
+    "baptiste",
+    "adrien",
+    "benoit",
+    "benoît",
+    "cedric",
+    "cédric",
+    "jerome",
+    "jérôme",
+    "thierry",
+    "dominique",
+    "sylvie",
+    "martine",
+    "francoise",
+    "françoise",
+    "monique",
+    "brigitte",
+    "lucie",
+    "pauline",
+    "charlotte",
+    "louise",
+    "alice",
+    "clara",
+    "enzo",
+    "ethan",
+    "timeo",
+    "timéo",
+    "leon",
+    "léon",
+    "jules",
+    "adam",
+    "sacha",
+    // other common EN first names
+    "john",
+    "jane",
+    "mary",
+    "michael",
+    "william",
+    "robert",
+    "richard",
+    "david",
+    "daniel",
+    "joseph",
+    "charles",
+    "george",
+    "henry",
+    "edward",
+    "matthew",
+    "andrew",
+    "joshua",
+    "christopher",
+    "jennifer",
+    "jessica",
+    "sarah",
+    "elizabeth",
+    "emily",
+    "ashley",
+    "amanda",
+    "stephanie",
+    "rebecca",
+    "laura",
+    "rachel",
+    "megan",
+    "samantha",
+    "victoria",
+    "isabella",
+    "abigail",
+    "madison",
+    "benjamin",
+    "alexander",
+    "jacob",
+    "mason",
+    "logan",
+    "jackson",
+    "sebastian",
+    "harper",
+    "evelyn",
+    "scarlett",
+    "lily",
+    "ella",
+    "aria",
+    "nora",
+    "zoey",
+    "riley",
+];
+
+/// Whether `word` (one lowercase word of a name) is a common first name.
+#[must_use]
+pub fn is_first_name(word: &str) -> bool {
+    FIRST_NAMES.contains(&word)
+}
+
+/// Whether a path segment looks like a value rather than a name: structural
+/// rules (forbidden characters, long digit runs, hex keys), a classifier
+/// match anywhere in it, or a first name among its words.
 #[must_use]
 pub fn segment_looks_like_value(segment: &str) -> bool {
     if segment.is_empty() || segment.chars().any(is_plain_excluded) {
@@ -178,7 +399,143 @@ pub fn segment_looks_like_value(segment: &str) -> bool {
         .chars()
         .filter(|c| *c != '-')
         .all(|c| c.is_ascii_hexdigit());
-    hex && segment.len() >= 16 && segment.chars().any(|c| c.is_ascii_digit())
+    if hex && segment.len() >= 16 && segment.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if segment.len() <= MAX_INPUT_BYTES && !value_spans(segment).is_empty() {
+        return true;
+    }
+    word_tokens(segment).iter().any(|w| is_first_name(w))
+}
+
+/// Byte ranges of `s` that hold a value: classifier tokens (as is and with
+/// `.`, `_`, `-`, `/` read as spaces), addresses around an `@`, and long
+/// split digit runs. `s` is at most [`MAX_INPUT_BYTES`] long, below the
+/// detectors' scan bound.
+fn value_spans(s: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    for t in detect::scan_tokens(s, &|_| true) {
+        spans.push(if t.classifier == ClassifierId::Email {
+            shortest_email(s, t.range)
+        } else {
+            t.range
+        });
+    }
+    // Same byte length: ASCII separators replaced by an ASCII space.
+    let spaced: String = s
+        .chars()
+        .map(|c| {
+            if matches!(c, '.' | '_' | '-' | '/') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    spans.extend(
+        detect::scan_tokens(&spaced, &|c| c != ClassifierId::Email)
+            .into_iter()
+            .map(|t| t.range),
+    );
+    spans.extend(address_spans(s));
+    spans.extend(split_digit_runs(s));
+    spans
+}
+
+/// Local-part characters of an address, read leniently.
+fn is_local_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
+/// Domain characters of an address.
+fn is_domain_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '-')
+}
+
+/// Shortens an e-mail token that swallowed the following path segments
+/// (`jane@example.com.phone`) to the shortest valid address.
+fn shortest_email(s: &str, range: Range<usize>) -> Range<usize> {
+    let token = &s[range.clone()];
+    let Some(at) = token.find('@') else {
+        return range;
+    };
+    let local = token[..at].trim_start_matches(|c: char| !c.is_alphanumeric());
+    let local_start = at - local.len();
+    for (i, c) in token.char_indices().skip_while(|(i, _)| *i <= at) {
+        if c == '.' && crate::validate::email_valid(&token[local_start..i]) {
+            return range.start..range.start + i;
+        }
+    }
+    range
+}
+
+/// Every `@` masks the address around it: the local part extends left over
+/// local-part characters (dots included), the domain ends at the shortest
+/// valid address, or at the end of its domain characters.
+fn address_spans(s: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for (at, _) in s.match_indices('@') {
+        let start = s[..at]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_local_char(*c))
+            .last()
+            .map_or(at, |(i, _)| i);
+        let domain_len: usize = s[at + 1..]
+            .chars()
+            .take_while(|c| is_domain_char(*c))
+            .map(char::len_utf8)
+            .sum();
+        let full = start..at + 1 + domain_len;
+        out.push(shortest_email(s, full));
+    }
+    out
+}
+
+/// Runs of ASCII digits separated by single `.`, `_`, `-`, space or `+`,
+/// with more than [`MAX_INDEX_DIGITS`] digits in total: a value split
+/// across segments (`0612.345678`, `ab4111_1111.1111.1111`).
+fn split_digit_runs(s: &str) -> Vec<Range<usize>> {
+    let b = s.as_bytes();
+    let is_sep = |x: u8| matches!(x, b'.' | b'_' | b'-' | b' ' | b'+');
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        let mut digits = 0usize;
+        let mut j = i;
+        loop {
+            if j < b.len() && b[j].is_ascii_digit() {
+                digits += 1;
+                j += 1;
+                end = j;
+            } else if j + 1 < b.len() && is_sep(b[j]) && b[j + 1].is_ascii_digit() {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if digits > MAX_INDEX_DIGITS {
+            out.push(start..end);
+        }
+        i = end;
+    }
+    out
+}
+
+/// One part of a structured field path, as the connector walked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPart<'a> {
+    /// An object key (MongoDB document key, JSON key). May itself contain
+    /// dots.
+    Key(&'a str),
+    /// An array element (the index itself is never kept).
+    Index,
 }
 
 fn strip_forbidden(raw: &str) -> String {
@@ -187,14 +544,32 @@ fn strip_forbidden(raw: &str) -> String {
 
 /// Normalizes a plain name or a `.`-separated field path (column, MongoDB
 /// field path, collection, table…).
+///
+/// Digit-only segments of up to [`MAX_INDEX_DIGITS`] digits are read as
+/// array indices. Values are located in the whole string, so one split
+/// across dots is still found (`a.0612.345678` -> `a.*`). When the
+/// connector knows the real keys, [`normalize_field_path`] is more precise.
 #[must_use]
 pub fn normalize_path(raw: &str) -> NormalizedName {
     if raw.len() > MAX_INPUT_BYTES {
         return NormalizedName::wildcard();
     }
     let cleaned = strip_forbidden(raw);
+    let spans = value_spans(&cleaned);
     let mut out: Vec<String> = Vec::new();
+    let mut in_value = false;
+    let mut offset = 0;
     for segment in cleaned.split('.') {
+        let range = offset..offset + segment.len();
+        offset = range.end + 1;
+        if overlaps(&spans, &range) {
+            if !in_value {
+                out.push(WILDCARD.to_owned());
+            }
+            in_value = true;
+            continue;
+        }
+        in_value = false;
         let digits_only = !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit());
         if digits_only && segment.len() <= MAX_INDEX_DIGITS {
             match out.last_mut() {
@@ -205,6 +580,100 @@ pub fn normalize_path(raw: &str) -> NormalizedName {
             out.push(WILDCARD.to_owned());
         } else {
             out.push(segment.to_owned());
+        }
+    }
+    NormalizedName::checked(out.join("."))
+}
+
+/// Whether a (possibly empty) segment range touches a value span.
+fn overlaps(spans: &[Range<usize>], r: &Range<usize>) -> bool {
+    spans
+        .iter()
+        .any(|s| s.start < r.end.max(r.start + 1) && r.start < s.end)
+}
+
+/// Normalizes a field path given as the keys and array levels the connector
+/// walked (MongoDB documents). Preferred over [`normalize_path`] whenever
+/// the keys are known:
+/// - an array level becomes `[]`;
+/// - a key that is digit-only (a map keyed by numbers: `hourly.13`), contains
+///   a dot, or looks like a value by itself becomes `*` (dynamic key), so
+///   `contacts` / `jane.doe@example.com` / `phone` gives `contacts.*.phone`;
+/// - the remaining keys are then scanned **together** (joined with dots,
+///   dynamic keys blanked), so a value split across nested keys
+///   (`jane` / `doe@example` / `com`) is still masked; consecutive keys
+///   touched by one value collapse into one `*`.
+#[must_use]
+pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
+    let total: usize = parts
+        .iter()
+        .map(|p| match p {
+            PathPart::Key(k) => k.len() + 1,
+            PathPart::Index => 2,
+        })
+        .sum();
+    if total > MAX_INPUT_BYTES {
+        return NormalizedName::wildcard();
+    }
+    // Pass 1: keys that are dynamic or values on their own.
+    let keys: Vec<Option<String>> = parts
+        .iter()
+        .map(|p| match p {
+            PathPart::Key(k) => {
+                let k = strip_forbidden(k);
+                let dynamic = k.chars().all(|c| c.is_ascii_digit())
+                    || k.contains('.')
+                    || segment_looks_like_value(&k);
+                Some((!dynamic).then_some(k))
+            }
+            PathPart::Index => None,
+        })
+        .map(Option::flatten)
+        .collect();
+    // Pass 2: the whole path. Keys holding a dot and indices are blanked
+    // with `#` (no detector reads `#`): a key such as `jane.doe@example.com`
+    // is a complete value, and its local part must not be read as extending
+    // over the previous keys.
+    let mut joined = String::with_capacity(total);
+    let mut ranges = Vec::with_capacity(parts.len());
+    for (part, key) in parts.iter().zip(&keys) {
+        if !joined.is_empty() {
+            joined.push('.');
+        }
+        let start = joined.len();
+        match (part, key) {
+            (PathPart::Key(_), Some(k)) => joined.push_str(k),
+            (PathPart::Key(k), None) if k.contains('.') => {
+                joined.push_str(&"#".repeat(k.len().max(1)));
+            }
+            (PathPart::Key(k), None) => joined.push_str(&strip_forbidden(k)),
+            (PathPart::Index, _) => joined.push('#'),
+        }
+        ranges.push(start..joined.len());
+    }
+    let spans = value_spans(&joined);
+    let mut out: Vec<String> = Vec::new();
+    let mut in_value = false;
+    for ((part, key), range) in parts.iter().zip(&keys).zip(&ranges) {
+        match (part, key) {
+            (PathPart::Index, _) => {
+                in_value = false;
+                match out.last_mut() {
+                    Some(prev) => prev.push_str("[]"),
+                    None => out.push(WILDCARD.to_owned()),
+                }
+            }
+            (PathPart::Key(_), key) => {
+                if overlaps(&spans, range) {
+                    if !in_value {
+                        out.push(WILDCARD.to_owned());
+                    }
+                    in_value = true;
+                } else {
+                    in_value = false;
+                    out.push(key.clone().unwrap_or_else(|| WILDCARD.to_owned()));
+                }
+            }
         }
     }
     NormalizedName::checked(out.join("."))
@@ -246,6 +715,7 @@ pub fn normalize_ldap_dn(raw: &str) -> NormalizedName {
         }
         let bad = value.is_empty()
             || value.contains('=')
+            || !value_spans(value).is_empty()
             || value.split('.').any(segment_looks_like_value);
         parts.push(format!("{ty}={}", if bad { WILDCARD } else { value }));
     }
@@ -261,9 +731,18 @@ mod tests {
         assert_eq!(normalize_path("orders.3.email").as_str(), "orders[].email");
         assert_eq!(
             normalize_path("contacts.jane@example.com.phone").as_str(),
-            // `jane@example` and `com` are separate segments: the first is a
-            // value, the second a plain word (P2-A classifiers catch domains).
-            "contacts.*.com.phone"
+            // A dotted path cannot tell `contacts` from a local part: the
+            // conservative reading masks it. The key-level API keeps it.
+            "*.phone"
+        );
+        assert_eq!(
+            normalize_field_path(&[
+                PathPart::Key("contacts"),
+                PathPart::Key("jane@example.com"),
+                PathPart::Key("phone"),
+            ])
+            .as_str(),
+            "contacts.*.phone"
         );
         assert_eq!(
             normalize_ldap_dn("uid=jdoe,ou=people,dc=example,dc=com").as_str(),
@@ -316,6 +795,160 @@ mod tests {
         }
         assert_eq!(normalize_ldap_dn("ou=19800101,dc=x").as_str(), "ou=*,dc=x");
         assert_eq!(normalize_ldap_dn("uid=a,ou=c12345678").as_str(), "ou=*");
+    }
+
+    #[test]
+    fn classifier_matches_become_wildcards() {
+        for (raw, want) in [
+            // Values split across dots (P1-D follow-up).
+            ("a.0612.345678", "a.*"),
+            ("a.06.12.34.56.78.b", "a.*.b"),
+            ("users.4111.1111.1111.1111.x", "users.*.x"),
+            ("card_4111_1111_1111_1111", "*"),
+            ("iban.FR76.3000.6000.0112.3456.7890.189", "iban.*"),
+            ("ab0612.34.5678", "*"),
+            ("keys.AKIAIOSFODNN7EXAMPLE", "keys.*"),
+            // Ground truth (dev/ground-truth.json, name_contains_value).
+            ("export_client_0639988384", "*"),
+            ("archive_lucas_martin", "*"),
+            ("escalations_jean.richard@example.com", "*"),
+            ("members.33199004673.points", "members.*.points"),
+            ("contacts.mia.nielsen@example.net.phone", "*.phone"),
+            ("jane.doe@example.co.uk", "*.uk"),
+            ("archiveLucasMartin", "*"),
+        ] {
+            assert_eq!(normalize_path(raw).as_str(), want, "{raw}");
+        }
+        assert_eq!(
+            normalize_ldap_dn("uid=x,ou=Oliver Martin,ou=teams,dc=example,dc=org").as_str(),
+            "ou=*,ou=teams,dc=example,dc=org"
+        );
+        assert_eq!(
+            normalize_ldap_dn("ou=0612.345678,dc=x").as_str(),
+            "ou=*,dc=x"
+        );
+    }
+
+    #[test]
+    fn field_paths_use_the_real_keys() {
+        use PathPart::{Index, Key};
+        for (parts, want) in [
+            (
+                vec![Key("contacts"), Key("mia.nielsen@example.net"), Key("name")],
+                "contacts.*.name",
+            ),
+            (
+                vec![Key("members"), Key("33199004673"), Key("points")],
+                "members.*.points",
+            ),
+            (vec![Key("hourly"), Key("13")], "hourly.*"),
+            (vec![Key("cards"), Index, Key("number")], "cards[].number"),
+            (vec![Key("phones"), Index], "phones[]"),
+            (vec![Key("a"), Key("0612"), Key("345678")], "a.*"),
+            // Split across nested keys (dotted update paths).
+            (
+                vec![
+                    Key("contacts"),
+                    Key("jane"),
+                    Key("doe@example"),
+                    Key("com"),
+                    Key("phone"),
+                ],
+                "*.phone",
+            ),
+            (
+                vec![
+                    Key("x"),
+                    Key("06"),
+                    Key("12"),
+                    Key("34"),
+                    Key("56"),
+                    Key("78"),
+                ],
+                "x.*",
+            ),
+            (vec![Key("by_year"), Key("2024"), Key("2025")], "by_year.*"),
+            (vec![Key("name"), Key("first")], "name.first"),
+            (
+                vec![Key("credentials"), Key("accessKeyId")],
+                "credentials.accessKeyId",
+            ),
+            (vec![Index, Key("a")], "*.a"),
+        ] {
+            assert_eq!(normalize_field_path(&parts).as_str(), want, "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_names_are_kept() {
+        // Every non-value name of dev/ground-truth.json survives.
+        for raw in [
+            "first_name",
+            "last_name",
+            "email",
+            "phone",
+            "birth_date",
+            "street",
+            "nir",
+            "email_opt_in",
+            "phone_verified",
+            "created_at",
+            "customer_notes",
+            "card_number",
+            "card_holder",
+            "iban",
+            "card_brand",
+            "iban_country",
+            "tracking_ref",
+            "invoice_number",
+            "amount_cents",
+            "email_template_id",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "owner_email",
+            "password_hash",
+            "service",
+            "full_name",
+            "work_email",
+            "mobile_phone",
+            "home_address",
+            "salary_eur",
+            "badge_id",
+            "phone_extension",
+            "bonus_by_year",
+            "requester_name",
+            "requester_email",
+            "requester_phone",
+            "subject",
+            "status",
+            "name.first",
+            "address.street",
+            "email_verified",
+            "phone_country",
+            "credentials.secretAccessKey",
+            "address_books",
+            "daily_stats",
+            "loyalty",
+            "inetOrgPerson",
+            "groupOfNames",
+            "givenname",
+            "telephonenumber",
+            "postaladdress",
+            "employeenumber",
+            "userpassword",
+            "payment_methods",
+            "app_credentials",
+            "customers",
+            "orders_2024",
+            "v2.users",
+            "events_2024_09",
+        ] {
+            assert_eq!(normalize_path(raw).as_str(), raw, "{raw}");
+        }
+        assert_eq!(
+            normalize_ldap_dn("ou=people,dc=example,dc=org").as_str(),
+            "ou=people,dc=example,dc=org"
+        );
     }
 
     #[test]

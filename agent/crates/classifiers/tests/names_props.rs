@@ -152,3 +152,191 @@ fn long_inputs_are_bounded() {
     let long = "b".repeat(300);
     assert_eq!(normalize_path(&long).as_str(), "*");
 }
+
+// ------------------------------------------------------------------ Gate
+//
+// Contract `Identifier` `not` rule (card / phone numbers used as names) and
+// ADR-0009 classifier matches: generated names embedding a card number, a
+// phone number, an IBAN or an e-mail address, split across separators and
+// glued to ordinary words, never keep any of it (I2).
+
+mod gate {
+    use databastion_classifiers::names::{
+        PathPart, conforms, normalize_field_path, normalize_ldap_dn, normalize_path,
+        violates_numeric_rule,
+    };
+    use proptest::prelude::*;
+
+    const WORDS: &[&str] = &["contacts", "users", "archive", "export", "data", "points"];
+    const SEPARATORS: &[&str] = &[".", " ", "-", "_"];
+    const JOINERS: &[&str] = &[".", "_", ""];
+
+    fn luhn_check_digit(body: &str) -> u32 {
+        let sum: u32 = body
+            .chars()
+            .rev()
+            .enumerate()
+            .map(|(i, c)| {
+                let d = c.to_digit(10).unwrap();
+                if i % 2 == 0 {
+                    let x = d * 2;
+                    if x > 9 { x - 9 } else { x }
+                } else {
+                    d
+                }
+            })
+            .sum();
+        (10 - sum % 10) % 10
+    }
+
+    fn digits(n: usize) -> impl Strategy<Value = String> {
+        proptest::collection::vec(0u8..10, n)
+            .prop_map(|v| v.into_iter().map(|d| char::from(b'0' + d)).collect())
+    }
+
+    /// Compact digit-bearing values: Visa / Mastercard numbers, French and
+    /// international phones, French IBANs.
+    fn compact_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (prop_oneof![Just("4"), Just("51"), Just("55")], digits(14)).prop_map(|(p, d)| {
+                let body = format!("{p}{d}")[..15].to_owned();
+                format!("{body}{}", luhn_check_digit(&body))
+            }),
+            (1u8..10, digits(8)).prop_map(|(a, d)| format!("0{a}{d}")),
+            (1u8..10, digits(8)).prop_map(|(a, d)| format!("+33{a}{d}")),
+            (1u8..10, digits(8)).prop_map(|(a, d)| format!("33{a}{d}")),
+            digits(23).prop_map(|bban| {
+                // FR = 15 27; check digits = 98 - (bban FR00 mod 97).
+                let n = format!("{bban}152700");
+                let r = n
+                    .chars()
+                    .fold(0u32, |acc, c| (acc * 10 + c.to_digit(10).unwrap()) % 97);
+                format!("FR{:02}{bban}", 98 - r)
+            }),
+        ]
+    }
+
+    /// Splits `value` into groups of 1..=6 characters joined by separators.
+    fn split(value: String) -> impl Strategy<Value = String> {
+        let n = value.chars().count();
+        proptest::collection::vec((1usize..=6, 0..SEPARATORS.len()), n).prop_map(move |cuts| {
+            let chars: Vec<char> = value.chars().collect();
+            let mut out = String::new();
+            let mut i = 0;
+            for (len, sep) in cuts {
+                if i >= chars.len() {
+                    break;
+                }
+                if i > 0 {
+                    out.push_str(SEPARATORS[sep]);
+                }
+                let end = (i + len).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            out
+        })
+    }
+
+    fn embed(value: impl Strategy<Value = String>) -> impl Strategy<Value = String> {
+        (
+            proptest::option::of((0..WORDS.len(), 0..JOINERS.len())),
+            value,
+            proptest::option::of((0..WORDS.len(), 0..2usize)),
+        )
+            .prop_map(|(pre, v, post)| {
+                let mut s = String::new();
+                if let Some((w, j)) = pre {
+                    s.push_str(WORDS[w]);
+                    s.push_str(JOINERS[j]);
+                }
+                s.push_str(&v);
+                if let Some((w, j)) = post {
+                    s.push_str(JOINERS[j]);
+                    s.push_str(WORDS[w]);
+                }
+                s
+            })
+    }
+
+    fn assert_contract(input: &str, out: &str) {
+        assert!(
+            databastion_protocol::Identifier::try_from(out).is_ok() && conforms(out),
+            "{input:?} -> {out:?} does not match Identifier"
+        );
+        assert!(
+            !violates_numeric_rule(out),
+            "{input:?} -> {out:?} violates `not`"
+        );
+    }
+
+    fn keys(input: &str) -> Vec<PathPart<'_>> {
+        input.split('.').map(PathPart::Key).collect()
+    }
+
+    /// Letters that never form a word of [`WORDS`], nor a first name.
+    fn word() -> impl Strategy<Value = String> {
+        "[bcdfghjklmnpqrstvwxz]{4,8}"
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn split_numbers_never_survive(input in embed(compact_value().prop_flat_map(split))) {
+            for out in [
+                normalize_path(&input),
+                normalize_field_path(&keys(&input)),
+            ] {
+                let out = out.as_str();
+                assert_contract(&input, out);
+                prop_assert!(
+                    !out.chars().any(|c| c.is_ascii_digit()),
+                    "{input:?} -> {out:?} keeps digits"
+                );
+            }
+            let dn = normalize_ldap_dn(&format!("uid=x,ou={input},dc=example"));
+            prop_assert!(!dn.as_str().chars().any(|c| c.is_ascii_digit()), "{input:?} -> {dn:?}");
+        }
+
+        #[test]
+        fn emails_never_survive(
+            local in proptest::collection::vec(word(), 1..=3),
+            domain in word(),
+            tld in prop_oneof![Just("com"), Just("net"), Just("org"), Just("fr")],
+            pre in proptest::option::of(0..WORDS.len()),
+            post in proptest::option::of(0..WORDS.len()),
+        ) {
+            let email = format!("{}@{domain}.{tld}", local.join("."));
+            let mut input = email.clone();
+            if let Some(w) = pre {
+                input = format!("{}.{input}", WORDS[w]);
+            }
+            if let Some(w) = post {
+                input = format!("{input}.{}", WORDS[w]);
+            }
+            let as_keys: Vec<PathPart<'_>> = pre
+                .map(|w| PathPart::Key(WORDS[w]))
+                .into_iter()
+                .chain([PathPart::Key(email.as_str())])
+                .chain(post.map(|w| PathPart::Key(WORDS[w])))
+                .collect();
+            for out in [
+                normalize_path(&input),
+                normalize_field_path(&keys(&input)),
+                normalize_field_path(&as_keys),
+            ] {
+                let out = out.as_str();
+                assert_contract(&input, out);
+                for secret in local.iter().chain([&domain]) {
+                    prop_assert!(!out.contains(secret.as_str()), "{input:?} -> {out:?}");
+                }
+            }
+            // With the real keys, the container keys are kept.
+            if let Some(w) = pre {
+                let out = normalize_field_path(&as_keys);
+                prop_assert!(out.as_str().starts_with(WORDS[w]), "{input:?} -> {out:?}");
+            }
+        }
+    }
+}
