@@ -306,6 +306,10 @@ struct PreparedScan {
     /// Index in `Runtime::connectors`.
     connector: usize,
     scan: ScanJob,
+    /// When the job was received: its (clamped) `max_duration_s` runs from
+    /// here, whether the scan waits in the queue or runs, so it never
+    /// outlives the console's findings window for the job.
+    received: Instant,
 }
 
 /// Scans waiting for the worker, and the ids queued or running (a
@@ -315,9 +319,6 @@ struct ScanQueue {
     queued: std::collections::VecDeque<PreparedScan>,
     in_flight: std::collections::HashSet<Uuid>,
 }
-
-/// How often the scan worker checks whether `/findings` is still parked.
-const PARKED_RECHECK: Duration = Duration::from_secs(5);
 
 /// Scans queued at most; more are left unacknowledged and redelivered.
 const MAX_QUEUED_SCANS: usize = 16;
@@ -837,6 +838,24 @@ impl Runtime {
         self.lock_parked().is_parked(findings, Instant::now())
     }
 
+    /// Resolves once `/findings` is no longer parked (at once if it is not).
+    async fn findings_unparked(&self) {
+        loop {
+            let until = {
+                let mut parked = self.lock_parked();
+                if parked.is_parked(true, Instant::now()) {
+                    parked.findings.until
+                } else {
+                    None
+                }
+            };
+            let Some(until) = until else {
+                return;
+            };
+            tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
+        }
+    }
+
     fn lock_spool(&self) -> std::sync::MutexGuard<'_, Spool> {
         self.spool
             .lock()
@@ -1302,6 +1321,7 @@ impl Runtime {
             engine: proto_engine(target.engine),
             connector,
             scan: ScanJob::new(params, target, &config.limits, Arc::clone(&self.hmac)),
+            received: Instant::now(),
         });
         drop(queue);
         self.scan_ready.notify_one();
@@ -1323,9 +1343,10 @@ impl Runtime {
             }
             if self.endpoint_parked(true) {
                 // `/findings` parked after a `501`: no new findings are
-                // produced meanwhile; queued scans wait.
+                // produced meanwhile; queued scans wait (their window keeps
+                // running, see `discovery_scan`).
                 tokio::select! {
-                    () = tokio::time::sleep(PARKED_RECHECK) => {}
+                    () = self.findings_unparked() => {}
                     _ = shutdown.changed() => {}
                 }
                 continue;
@@ -1377,6 +1398,17 @@ impl Runtime {
     /// findings already handed over are flushed first. Findings that cannot
     /// be spooled are counted as lost.
     ///
+    /// The scan's window is its clamped `max_duration_s` counted from the
+    /// job's reception: a scan popped after it (held behind a parked
+    /// `/findings`, or a long queue) ends `failed` / `timeout` without
+    /// touching the target, and a partly elapsed window shortens the
+    /// deadline.
+    ///
+    /// While `/findings` is parked, a full chunk is held (the connector is
+    /// back-pressured through the bounded channel) until the park ends or
+    /// the scan stops; the findings held when the scan stops are spooled
+    /// (bounded spool), never dropped.
+    ///
     /// At most `findings_cap` ([`MAX_FINDINGS_PER_JOB`]) findings are
     /// emitted for the job: the next one stops the scan (the connector
     /// future is dropped), the findings kept so far are flushed and the job
@@ -1392,14 +1424,22 @@ impl Runtime {
             engine,
             connector,
             scan,
+            received,
         } = prepared;
+        let Some(deadline) = scan
+            .max_duration()
+            .checked_sub(received.elapsed())
+            .filter(|d| !d.is_zero())
+        else {
+            tracing::warn!(job_id = %id, "scan window elapsed before it could start");
+            return Outcome::failed(FailureCode::Timeout);
+        };
         let Some(connector) = self.connectors.get(connector) else {
             return Outcome::failed(FailureCode::Unsupported);
         };
         let Some(version) = classifiers_version() else {
             return Outcome::failed(FailureCode::Internal);
         };
-        let deadline = scan.max_duration();
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
         let spool_failed = std::sync::atomic::AtomicBool::new(false);
@@ -1421,26 +1461,25 @@ impl Runtime {
             }
             chunk.clear();
         };
-        // Takes a finding into the current chunk; `false` once the per-job
-        // cap is reached (the finding is not kept, the scan must stop).
-        let take = |f: MaskedFinding| -> bool {
+        // Takes a finding into the current chunk. `Capped` once the per-job
+        // cap is reached (the finding is not kept, the scan must stop);
+        // `Full` when the chunk should be flushed.
+        let take = |f: MaskedFinding| -> Take {
             bump(&self.counters.findings_received, 1);
             if emitted.load(Ordering::Relaxed) >= self.findings_cap {
                 capped.store(true, Ordering::Relaxed);
-                return false;
+                return Take::Capped;
             }
             emitted.fetch_add(1, Ordering::Relaxed);
-            let full = {
-                let mut c = chunk
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                c.push(f);
-                c.len() >= FINDINGS_CHUNK
-            };
-            if full {
-                flush();
+            let mut c = chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            c.push(f);
+            if c.len() >= FINDINGS_CHUNK {
+                Take::Full
+            } else {
+                Take::Kept
             }
-            true
         };
         let outcome = {
             let run = async {
@@ -1452,8 +1491,16 @@ impl Runtime {
             // (`true`).
             let collect = async {
                 while let Some(f) = rx.recv().await {
-                    if !take(f) {
-                        return true;
+                    match take(f) {
+                        Take::Capped => return true,
+                        Take::Full => {
+                            // No new batch for a parked `/findings`: hold
+                            // the chunk (the connector blocks on the full
+                            // channel) until the park ends.
+                            self.findings_unparked().await;
+                            flush();
+                        }
+                        Take::Kept => {}
                     }
                 }
                 false
@@ -1511,8 +1558,10 @@ impl Runtime {
         // The connector future (and its sink) is dropped: drain what it
         // handed over (within the cap), then flush the partial chunk.
         while let Ok(f) = rx.try_recv() {
-            if !take(f) {
-                break;
+            match take(f) {
+                Take::Capped => break,
+                Take::Full => flush(),
+                Take::Kept => {}
             }
         }
         flush();
@@ -1671,6 +1720,15 @@ fn unsupported_classifiers(job: &databastion_protocol::DiscoveryScanJob) -> Opti
             .any(|id| databastion_classifiers::id::ClassifierId::parse(id.as_str()).is_none())
     });
     unknown.then_some("classifier id outside the compiled set")
+}
+
+/// What happened to a finding taken into a scan chunk.
+enum Take {
+    Kept,
+    /// Kept; the chunk is full.
+    Full,
+    /// Not kept: the per-job findings cap is reached.
+    Capped,
 }
 
 /// Minimum gap between two job polls. A poll that returns without jobs in

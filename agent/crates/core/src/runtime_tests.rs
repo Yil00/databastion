@@ -2326,30 +2326,6 @@ async fn scans_with_an_unsupported_classifier_set_are_refused_before_the_target(
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
-    struct Untouchable;
-    #[async_trait::async_trait]
-    impl Connector for Untouchable {
-        fn engine(&self) -> Engine {
-            Engine::Postgres
-        }
-        async fn check(&self) -> TargetHealth {
-            panic!("the target must not be touched");
-        }
-        async fn discover(
-            &self,
-            _: &crate::ScanJob,
-            _: &crate::FindingSink,
-        ) -> Result<(), crate::ConnectorError> {
-            panic!("the target must not be touched");
-        }
-        async fn audit_stream(
-            &self,
-            _: &crate::AuditConfig,
-            _: &crate::EventSink,
-        ) -> Result<(), crate::ConnectorError> {
-            panic!("the target must not be touched");
-        }
-    }
     let rt = Runtime::new(
         &env.config_path,
         env.config.clone(),
@@ -2454,4 +2430,160 @@ async fn scan_reaching_exactly_the_cap_succeeds() {
     let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
     assert_eq!(update["error"]["code"], "resource_limit");
     assert_eq!(sent_findings(&sent_batches(&server).await), 7);
+}
+
+// ------------------------------------ review of the follow-ups (M1, L1, L2)
+
+#[tokio::test]
+async fn not_implemented_outside_result_endpoints_stays_bounded() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(not_implemented(Some("3600")))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let e = rt.heartbeat_once().await.unwrap_err();
+    assert!(matches!(
+        e,
+        CallError::Uplink(UplinkError::Server { status: 501 })
+    ));
+    let normal = Duration::from_secs(30);
+    let delay = rt.on_call_error("heartbeat", &e, 1, normal).unwrap();
+    assert!(delay <= normal, "{delay:?}");
+    // The result endpoints are not parked by it.
+    assert!(!rt.endpoint_parked(true) && !rt.endpoint_parked(false));
+}
+
+/// Panics if the target is touched.
+struct Untouchable;
+
+#[async_trait::async_trait]
+impl Connector for Untouchable {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self) -> TargetHealth {
+        panic!("the target must not be touched");
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        panic!("the target must not be touched");
+    }
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        panic!("the target must not be touched");
+    }
+}
+
+/// A runtime with `connector`, answering job statuses and findings, with
+/// one queued 10 s scan received `age` ago.
+async fn queued_scan_runtime(
+    connector: Box<dyn Connector>,
+    age: Duration,
+) -> (MockServer, Runtime, Env) {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(&env.config_path, env.config.clone(), vec![connector]).unwrap();
+    let body = serde_json::json!({ "jobs": [scan_job(
+        JOB, CLASSIFIERS_VERSION, serde_json::json!({"max_duration_s": 10}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    {
+        let mut scans = rt.lock_scans();
+        let queued = scans.queued.front_mut().unwrap();
+        queued.received = Instant::now().checked_sub(age).unwrap();
+    }
+    (server, rt, env)
+}
+
+async fn job_error(server: &MockServer) -> serde_json::Value {
+    let got = statuses(server).await;
+    got.iter().find(|(i, _)| i == JOB).unwrap().1["error"]["code"].clone()
+}
+
+#[tokio::test]
+async fn scan_held_behind_a_park_past_its_window_times_out_untouched() {
+    // Received 9.8 s ago with a 10 s window; `/findings` parked 400 ms.
+    let (server, rt, _env) =
+        queued_scan_runtime(Box::new(Untouchable), Duration::from_millis(9_800)).await;
+    rt.lock_parked().findings.until = Some(Instant::now() + Duration::from_millis(400));
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.scan_loop(shutdown);
+    let driver = async {
+        for _ in 0..100 {
+            if !statuses(&server).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    assert_eq!(job_error(&server).await, "timeout");
+    assert!(rt.lock_scans().in_flight.is_empty());
+}
+
+#[tokio::test]
+async fn partly_elapsed_window_shortens_the_scan_deadline() {
+    // `Stuck` never returns: only the remaining 300 ms bound it.
+    let (server, rt, _env) =
+        queued_scan_runtime(Box::new(Stuck), Duration::from_millis(9_700)).await;
+    let started = Instant::now();
+    run_queued_scans(&rt).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(job_error(&server).await, "timeout");
+    // Its finding was still spooled.
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+}
+
+#[tokio::test]
+async fn running_scan_holds_its_findings_while_findings_are_parked() {
+    let (server, rt, _env) = queued_scan_runtime(Box::new(Flood(Some(700))), Duration::ZERO).await;
+    // Parked while the scan runs: the first full chunk is held.
+    rt.lock_parked().findings.until = Some(Instant::now() + Duration::from_millis(500));
+    let scan = run_queued_scans(&rt);
+    let probe = async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let batches = rt.lock_spool().status().batches.0;
+        let received = rt.counters.findings_received.load(Ordering::Relaxed);
+        (batches, received)
+    };
+    let ((), (batches, received)) = tokio::join!(scan, probe);
+    // Nothing spooled while parked; the connector was back-pressured.
+    assert_eq!(batches, 0);
+    let bound = u64::try_from(FINDINGS_CHUNK + FINDINGS_CHANNEL + 1).unwrap();
+    assert!(received <= bound, "{received}");
+    // After the park: everything spooled, the job succeeded.
+    let got = statuses(&server).await;
+    assert_eq!(
+        got.iter().find(|(i, _)| i == JOB).unwrap().1["status"],
+        "succeeded",
+        "{got:?}"
+    );
+    drain(&rt).await;
+    assert_eq!(sent_findings(&sent_batches(&server).await), 700);
 }

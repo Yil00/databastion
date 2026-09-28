@@ -59,10 +59,11 @@ pub(crate) enum UplinkError {
     /// `426`: the console requires a newer protocol.
     #[error("protocol upgrade required (426), console minimum protocol {min_protocol:?}")]
     UpgradeRequired { min_protocol: Option<u64> },
-    /// `429` / `503`, and `501` (endpoint not implemented by this console,
-    /// `code` `unavailable`); retryable, honoring `Retry-After` (parsed and
-    /// clamped to `1..=3600` s). A `501` on `/findings` or `/events` parks
-    /// that endpoint only (docs/09, "Agent handling").
+    /// `429` / `503`, and `501` on `/findings` / `/events` (endpoint not
+    /// implemented by this console, `code` `unavailable`); retryable,
+    /// honoring `Retry-After` (parsed and clamped to `1..=3600` s). A `501`
+    /// parks that endpoint only (docs/09, "Agent handling"); on any other
+    /// path it is a [`UplinkError::Server`] error.
     #[error("console throttled the request ({status})")]
     Throttled {
         status: u16,
@@ -345,6 +346,11 @@ fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<
     Some(items)
 }
 
+/// The result endpoints, which a `501` parks.
+fn is_result_path(path: &str) -> bool {
+    matches!(path, "/findings" | "/events")
+}
+
 /// Maps a non-2xx response. Logs only the closed error code and the
 /// `pointer` / `keyword` of the details, never the body.
 fn classify(
@@ -382,7 +388,14 @@ fn classify(
         426 => UplinkError::UpgradeRequired {
             min_protocol: error.and_then(|e| e.min_protocol).map(|p| p.0.get()),
         },
-        429 | 501 | 503 => UplinkError::Throttled {
+        429 | 503 => UplinkError::Throttled {
+            status,
+            retry_after,
+        },
+        // `501` parks a result endpoint (docs/09). Elsewhere it stays a
+        // plain server error, retried within the caller's normal bound: a
+        // long `Retry-After` must not silence heartbeats or job polls.
+        501 if is_result_path(path) => UplinkError::Throttled {
             status,
             retry_after,
         },
@@ -915,6 +928,33 @@ mod tests {
         );
         assert!(e.is_retryable());
         assert!(e.retry_delay(0) <= Duration::from_secs(1));
+        // Outside the result endpoints: a bounded server error, whatever
+        // `Retry-After` says.
+        for path in [
+            "/heartbeat",
+            "/jobs",
+            "/jobs/x/status",
+            "/rotate",
+            "/enroll",
+        ] {
+            let e = classify(
+                path,
+                StatusCode::NOT_IMPLEMENTED,
+                Some(Duration::from_secs(3600)),
+                body,
+            );
+            assert_eq!(e, UplinkError::Server { status: 501 }, "{path}");
+            assert!(e.retry_delay(0) <= Duration::from_secs(1), "{path}");
+        }
+        assert!(matches!(
+            classify(
+                "/findings",
+                StatusCode::NOT_IMPLEMENTED,
+                Some(Duration::from_secs(3600)),
+                body
+            ),
+            UplinkError::Throttled { status: 501, .. }
+        ));
     }
 
     #[test]
