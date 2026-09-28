@@ -24,6 +24,19 @@ echo "# PostgreSQL + pgaudit"
 PSQL='PGPASSWORD="$DATABASTION_DB_PASSWORD" psql -h 127.0.0.1 -U databastion -d shop -v ON_ERROR_STOP=1 -Atq'
 check "read-only account can read" ex postgres "$PSQL -c 'SELECT count(*) FROM crm.customers' | grep -Eq '^[1-9]'"
 check "read-only account cannot write" must_fail ex postgres "$PSQL -c 'DELETE FROM billing.invoices WHERE id = -1'"
+# ADR-0012 minimal variant: no pg_read_all_data, so the credential-bearing catalogs are denied.
+check "read-only account cannot SELECT pg_authid" must_fail ex postgres \
+  "$PSQL -c 'SELECT count(*) FROM pg_catalog.pg_authid'"
+check "read-only account cannot read pg_user_mapping" must_fail ex postgres \
+  "$PSQL -c 'SELECT count(*) FROM pg_catalog.pg_user_mapping'"
+check "read-only account role defaults (read-only, timeouts)" ex postgres \
+  "$PSQL -c \"SELECT current_setting('default_transaction_read_only') = 'on'
+     AND current_setting('statement_timeout')::interval = '30s'
+     AND current_setting('lock_timeout')::interval = '2s'
+     AND current_setting('idle_in_transaction_session_timeout')::interval = '60s'\" | grep -qx t"
+check "read-only account is a member of pg_read_all_stats only" ex postgres \
+  "$PSQL -c \"SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
+     JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = 'databastion'::regrole\" | grep -qx pg_read_all_stats"
 check "pgaudit SESSION log line after a SELECT" retry 15 ex postgres \
   "grep 'AUDIT: SESSION' /var/log/databastion/postgresql.json | grep -q 'crm.customers'"
 check "pgaudit OBJECT log line (databastion_auditor)" retry 15 ex postgres \
