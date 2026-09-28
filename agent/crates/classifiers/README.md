@@ -81,6 +81,16 @@ Names are split into lowercase tokens on separators and camelCase (`accessKeyId`
 
 A last segment containing `id`, `code`, `city`, `country`, `verified`, `opt`, `brand`, `type`,
 `format`, `extension`, `status`… (e.g. `phone_country`, `address.postalCode`) turns the hint off.
+**Names of things other than persons.** A name word (`name`, `nom`, `nombre`, `nome`) qualified by
+an object word, or a flat `<object>name`, turns `pii.person_name` off in every naming style
+(`pet_name`, `petName`, `PET_NAME`, `petname`, `pets[].name`, `hostname`, `company.name`,
+`nom_produit`): pets and animals, ships, horses, products, brands, models, teams, projects, hosts
+and servers, files, places, companies, applications, groups… Values alone cannot tell `Max, Bella,
+Luna` from people. A person qualifier or person name word wins (`pet_owner_name`,
+`company.contact_name`).
+
+Column names are read in NFKC (`pre\u{301}nom` and fullwidth letters read like `prénom`).
+
 Negative names: `order`, `tracking`, `imei`, `invoice`, `serial`, `sku`, `ean`, `barcode`, `awb`,
 `iccid`… (no card hint) turn card numbers off; `token`, `session`, `nonce`, `jwt`, `checksum`,
 `digest`, `hash`, `sha`, `commit`, `uuid`… make whole 40-character values AWS secrets only when 30 %
@@ -114,6 +124,14 @@ distinct masked samples whose values have the smallest
 independent across columns. Without the agent key, a random key (OS CSPRNG) is drawn for the call.
 Fingerprints are the 50 smallest distinct ones, emitted sorted.
 
+**Unicode.** Each value is put in canonical composition (NFC) before detection, so a value stored
+decomposed (`e` + U+0301, as written by macOS and some ETLs) is recognized like its composed form
+(names, addresses, textual months, e-mail local parts). Tokens, masked samples and fingerprints are
+taken from the NFC value: fingerprints of names and addresses were already computed on NFC (no
+change); for other classifiers the fingerprint of a non-NFC value is now that of its NFC form
+(ASCII values are unchanged). Compatibility forms (NFKC: fullwidth, ligatures) apply to column names
+only, not to values.
+
 **Decision rules.** Values are detected first; a column name only lowers thresholds. `n` counts the
 informative values (empty values and placeholders such as `N/A`, `null`, `-`, `unknown`,
 `0000-00-00` skipped), `ratio = matched / n`:
@@ -125,7 +143,7 @@ informative values (empty values and placeholders such as `N/A`, `null`, `-`, `u
 | e-mail | hint, `ratio >= 0.05` or `matched >= 3`; not the same single address repeated (`matched >= 3`) | idem |
 | phone | hint and `matched >= 1`; no hint: `>= 0.3` of values with a formatted number (national plan groupings, North American, `+` / `00`), compact digits only in a column of `>= 0.8` whole compact numbers 60 % with a mobile prefix `06` / `07`, or 3 values and `>= 0.05` with a strong number (`+`, area code in parentheses, a phone label such as `tel`, `phone`, `call` just before) | `0.4 + 0.4·ratio (+0.2 hint)` |
 | birth date | labelled dates in text: `ratio >= 0.05` or 3 values; hint: dates `>= 0.5`; no hint: dates `>= 0.7`, at least 3, distributed like ages (median year ≤ 2002, 10-year spread between the 10th and 90th percentiles, ≤ 15 % after 2014, none after 2026, not all on the 1st; with more than 20 % times of day, median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
-| person name | hint: name-shaped `>= 0.6` (bare `name`: `>= 0.7` and 25 % with a known name); no hint: name-shaped `>= 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed name, under 20 % well-known places or brands (`Austin`, `Lincoln`, `Hugo Boss`: a list of major cities, countries, US states, regions, car makers, fashion houses and large companies), 3 distinct values | idem |
+| person name | never under a name of something else (below); hint: name-shaped `>= 0.6` (bare `name`: `>= 0.7` and 25 % with a known name); no hint: name-shaped `>= 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed name, under 20 % well-known places or brands (`Austin`, `Lincoln`, `Hugo Boss`: a list of major cities, countries, US states, regions, car makers, fashion houses and large companies), 3 distinct values | idem |
 | postal address | hint: address-like `>= 0.5`; no hint: strong addresses `>= 0.5`, address-like `>= 0.8` with 25 % strong, or at least 3 strong addresses and `>= 0.1` | idem |
 | AWS secret key (whole value) | secret-key hint and `>= 0.5`; no hint: `>= 0.8` and 3 values (30 % with `/` or `+` under a token / digest name) | `0.6 + 0.35·ratio` |
 | password hash (raw digest) | password name and `>= 0.5` | idem |

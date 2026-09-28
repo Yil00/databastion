@@ -14,6 +14,8 @@
 //! `date_naissance` -> `date`, `naissance`). For a field path, every segment
 //! contributes tokens (`name.first`, `address.street`).
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::id::ClassifierId;
 
 /// Longest column name examined (bytes); longer names give no hint.
@@ -352,6 +354,170 @@ const PASSWORD_WORDS: &[&str] = &[
     "secretpassword",
 ];
 
+/// Tokens of things other than persons that have names (pets, ships,
+/// products, teams, projects, hosts, files, places, companies…): a `name`
+/// qualified by one of them (`pet_name`, `dogName`, `hostname`,
+/// `company.name`) is not a person name, whatever the values look like.
+const NOT_PERSON_WORDS: &[&str] = &[
+    "pet",
+    "pets",
+    "dog",
+    "dogs",
+    "cat",
+    "cats",
+    "animal",
+    "animals",
+    "horse",
+    "horses",
+    "breed",
+    "species",
+    "ship",
+    "ships",
+    "boat",
+    "boats",
+    "vessel",
+    "yacht",
+    "aircraft",
+    "plane",
+    "product",
+    "products",
+    "item",
+    "items",
+    "article",
+    "sku",
+    "brand",
+    "brands",
+    "model",
+    "models",
+    "make",
+    "team",
+    "teams",
+    "club",
+    "project",
+    "projects",
+    "host",
+    "hosts",
+    "server",
+    "servers",
+    "machine",
+    "vm",
+    "node",
+    "cluster",
+    "device",
+    "devices",
+    "file",
+    "files",
+    "folder",
+    "directory",
+    "dir",
+    "path",
+    "city",
+    "cities",
+    "town",
+    "village",
+    "place",
+    "places",
+    "location",
+    "site",
+    "venue",
+    "country",
+    "region",
+    "state",
+    "province",
+    "street",
+    "company",
+    "companies",
+    "organization",
+    "organisation",
+    "org",
+    "business",
+    "firm",
+    "employer",
+    "store",
+    "shop",
+    "restaurant",
+    "hotel",
+    "school",
+    "university",
+    "bank",
+    "merchant",
+    "vendor",
+    "supplier",
+    "carrier",
+    "app",
+    "application",
+    "service",
+    "database",
+    "db",
+    "schema",
+    "table",
+    "queue",
+    "topic",
+    "bucket",
+    "repo",
+    "repository",
+    "branch",
+    "package",
+    "module",
+    "library",
+    "category",
+    "tag",
+    "event",
+    "campaign",
+    "course",
+    "book",
+    "song",
+    "album",
+    "movie",
+    "film",
+    "game",
+    "planet",
+    "domain",
+    "workspace",
+    "channel",
+    "group",
+    "role",
+    "department",
+    "dept",
+    "plan",
+    "feature",
+    "metric",
+    "sensor",
+    "job",
+    "task",
+    "pipeline",
+    "workflow",
+    "report",
+    "dataset",
+    "template",
+    "chien",
+    "chat",
+    "cheval",
+    "produit",
+    "marque",
+    "modele",
+    "equipe",
+    "projet",
+    "serveur",
+    "fichier",
+    "ville",
+    "pays",
+    "societe",
+    "entreprise",
+    "magasin",
+    "boutique",
+    "navire",
+    "bateau",
+    "mascota",
+    "perro",
+    "gato",
+    "tier",
+    "hund",
+    "katze",
+    "firma",
+    "stadt",
+];
+
 /// Tokens of other 40-character secrets and digests (session tokens, API
 /// tokens, commit ids, checksums): a 40-character value there is not an
 /// AWS secret access key without a secret-key name.
@@ -461,6 +627,7 @@ pub struct NameHints {
     password: bool,
     not_card: bool,
     other_token: bool,
+    not_person: bool,
 }
 
 impl NameHints {
@@ -470,6 +637,9 @@ impl NameHints {
         if name.len() > MAX_NAME_BYTES {
             return Self::default();
         }
+        // Compatibility composition (NFKC): `pre\u{301}nom` (decomposed),
+        // fullwidth letters and ligatures read like `prénom`.
+        let name: String = name.nfkc().collect();
         let segments: Vec<Vec<String>> = name.split('.').map(tokens).collect();
         let all: Vec<&str> = segments.iter().flatten().map(String::as_str).collect();
         let last: &[String] = segments.last().map_or(&[], Vec::as_slice);
@@ -509,6 +679,26 @@ impl NameHints {
             .any(|t| has(t));
         // A bare `hash` / `hashed` column (in a table of accounts) holds
         // password hashes; `file_hash`, `content_hash`… do not.
+        // A name of something that is not a person: an object word
+        // (`pet_name`, `PetName`, flat `petname`, `pets[].name`) and no
+        // person qualifier or person name word (`pet_owner_name`).
+        let person_ctx = all.iter().any(|t| PERSON_QUALIFIERS.contains(t))
+            || DIRECT
+                .iter()
+                .find(|(id, _)| *id == ClassifierId::PersonName)
+                .is_some_and(|(_, words)| words.iter().any(|w| has(w)));
+        let flat_object_name = all.iter().any(|t| {
+            ["names", "name", "nom"].iter().any(|n| {
+                t.strip_suffix(n)
+                    .is_some_and(|p| NOT_PERSON_WORDS.contains(&p))
+            })
+        });
+        let object_ctx =
+            flat_object_name || (name_word && all.iter().any(|t| NOT_PERSON_WORDS.contains(t)));
+        let not_person = object_ctx && !person_ctx;
+        if not_person {
+            hinted.retain(|c| *c != ClassifierId::PersonName);
+        }
         let password = all.iter().any(|t| PASSWORD_WORDS.contains(t))
             || (!last.is_empty() && last.iter().all(|t| matches!(t.as_str(), "hash" | "hashed")));
         let not_card = !hinted.contains(&ClassifierId::CardNumber)
@@ -522,6 +712,7 @@ impl NameHints {
             password,
             not_card,
             other_token: all.iter().any(|t| OTHER_TOKEN_WORDS.contains(t)),
+            not_person,
         }
     }
 
@@ -567,6 +758,14 @@ impl NameHints {
     #[must_use]
     pub fn not_card(&self) -> bool {
         self.not_card
+    }
+
+    /// Whether the name says the values name something other than a person
+    /// (`pet_name`, `dogName`, `SHIP_NAME`, `hostname`, `product.name`,
+    /// `team_name`, `company_name`…): person names are not reported there.
+    #[must_use]
+    pub fn not_person(&self) -> bool {
+        self.not_person
     }
 
     /// Whether the name designates another kind of token or digest
@@ -685,6 +884,60 @@ mod tests {
         }
         assert!(NameHints::of("aws_secret_access_key").aws_secret());
         assert!(NameHints::of("credentials.secretAccessKey").aws_secret());
+    }
+
+    #[test]
+    fn non_person_names() {
+        for n in [
+            "pet_name",
+            "petName",
+            "PetName",
+            "PET_NAME",
+            "petname",
+            "dog_name",
+            "ANIMAL_NAME",
+            "horseName",
+            "ship_name",
+            "boat_name",
+            "product_name",
+            "productName",
+            "brand_name",
+            "model_name",
+            "team_name",
+            "project_name",
+            "hostname",
+            "host_name",
+            "server_name",
+            "file_name",
+            "filename",
+            "city_name",
+            "place_name",
+            "company_name",
+            "companyName",
+            "pets[].name",
+            "company.name",
+            "nom_produit",
+            "nom_ville",
+        ] {
+            let h = NameHints::of(n);
+            assert!(h.not_person(), "{n}");
+            assert!(!h.hints(C::PersonName), "{n}");
+        }
+        for n in [
+            "first_name",
+            "pet_owner_name",
+            "company.contact_name",
+            "customer_name",
+            "name",
+            "cn",
+            "full_name",
+            "author_name",
+        ] {
+            assert!(!NameHints::of(n).not_person(), "{n}");
+        }
+        // Decomposed (NFD) and fullwidth names read like their composed form.
+        assert!(NameHints::of("pre\u{301}nom").hints(C::PersonName));
+        assert!(NameHints::of("\u{ff45}\u{ff4d}\u{ff41}\u{ff49}\u{ff4c}").hints(C::Email));
     }
 
     #[test]

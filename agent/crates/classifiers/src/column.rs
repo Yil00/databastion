@@ -22,7 +22,7 @@
 //! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
 //! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07`), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it) | `0.4 + 0.4·ratio (+0.2 hint)` |
 //! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
-//! | person name | hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
+//! | person name | never under a name of something else (`pet_name`, `hostname`, `product.name`, `team_name`, `company_name`…); hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
 //! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
 //! | AWS secret key (whole value) | secret-key hint and `≥ 0.5`; no hint: `≥ 0.8` and 3 values, and under a token / session / digest name 30 % with `/` or `+` | `0.6 + 0.35·ratio` |
 //! | password hash (raw hex / base64 digest) | password hint and `≥ 0.5` | idem |
@@ -44,6 +44,9 @@
 //! smallest distinct ones, emitted sorted.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
+use zeroize::Zeroizing;
 
 use crate::detect;
 use crate::hints::NameHints;
@@ -125,7 +128,7 @@ fn placeholder(value: &str) -> bool {
 
 /// Per-column evidence beyond the matched counts.
 #[derive(Default)]
-struct Stats<'v> {
+struct Stats {
     /// Informative values (non-empty, not a placeholder).
     n: u32,
     card_cand: u32,
@@ -138,8 +141,8 @@ struct Stats<'v> {
     phone_compact: u32,
     phone_compact_mobile: u32,
     nir_cand: u32,
-    /// Up to 2 distinct e-mail tokens (borrowed for the call).
-    emails: Vec<&'v str>,
+    /// Up to 2 distinct e-mail tokens, as in-memory hashes (never output).
+    emails: Vec<u64>,
     /// Values with an AWS key id or a secret key in context.
     aws_tokens: u32,
     aws_whole: u32,
@@ -154,15 +157,21 @@ struct Stats<'v> {
     names_listed: u32,
     /// Name-shaped values that name a well-known place or brand.
     names_entities: u32,
-    /// Up to 3 distinct name values (borrowed for the call).
-    names: Vec<&'v str>,
+    /// Up to 3 distinct name values, as in-memory hashes (never output).
+    names: Vec<u64>,
     addr_strong: u32,
     addr_weak: u32,
 }
 
-fn remember<'v>(set: &mut Vec<&'v str>, v: &'v str, max: usize) {
-    if set.len() < max && !set.contains(&v) {
-        set.push(v);
+/// Remembers up to `max` distinct values by an in-memory hash (only
+/// compared within the call, never output).
+fn remember(set: &mut Vec<u64>, v: &str, max: usize) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    let h = h.finish();
+    if set.len() < max && !set.contains(&h) {
+        set.push(h);
     }
 }
 
@@ -301,7 +310,18 @@ impl ColumnClassifier<'_> {
         let on = |c| self.enabled(c);
 
         for raw in values.iter().take(MAX_SAMPLE_VALUES) {
-            let value = detect::bounded(raw.expose());
+            let original = detect::bounded(raw.expose());
+            // Canonical composition (NFC): a name, address or month stored
+            // decomposed (`e` + U+0301, macOS / some ETLs) is analyzed like
+            // its composed form; tokens, masked samples and fingerprints
+            // come from the NFC value. Zeroized on drop.
+            let composed: Zeroizing<String>;
+            let value: &str = if is_nfc_quick(original.chars()) == IsNormalized::Yes {
+                original
+            } else {
+                composed = Zeroizing::new(original.nfc().collect());
+                detect::bounded(&composed)
+            };
             if value.trim().is_empty() {
                 continue;
             }
@@ -469,7 +489,7 @@ impl ColumnClassifier<'_> {
 
 /// Whether classifier `c`, matched in `matched` values, is reported for the
 /// column (module table).
-fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> bool {
+fn decide(c: ClassifierId, matched: u32, st: &Stats, hints: &NameHints) -> bool {
     let hint = hints.hints(c);
     let share = |k: u32| f64::from(k) / f64::from(st.n);
     let ratio = share(matched);
@@ -505,7 +525,11 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> b
         ClassifierId::PasswordHash => st.hash_tokens >= 1 || share(st.raw_digests) >= 0.5,
         ClassifierId::BirthDate => birth_dates(st, hints.gates(c)),
         ClassifierId::PersonName => {
-            if hints.gates(c) && !hints.person_name_weak() {
+            if hints.not_person() {
+                // `pet_name`, `hostname`, `company.name`: values alone
+                // cannot tell `Max, Bella, Luna` from people.
+                false
+            } else if hints.gates(c) && !hints.person_name_weak() {
                 ratio >= 0.6
             } else if hints.gates(c) {
                 ratio >= 0.7 && share(st.names_known) >= 0.25
@@ -536,7 +560,7 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> b
 /// Birth-date decision: labelled dates in text, or a column of dates with
 /// a hint, or without one a column whose dates are distributed like ages
 /// (not event timestamps, not recent dates, spread over a lifetime).
-fn birth_dates(st: &Stats<'_>, hint: bool) -> bool {
+fn birth_dates(st: &Stats, hint: bool) -> bool {
     let n = f64::from(st.n);
     if st.birth_labelled >= 1
         && (f64::from(st.birth_labelled) / n >= EMBEDDED_MIN_RATIO
@@ -730,6 +754,34 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn decomposed_values_are_read_like_composed_ones() {
+        let key = HmacKey::new(&[5; 32]).unwrap_or_else(|_| unreachable!());
+        let c = ColumnClassifier::new().with_key(&key);
+        let composed = [
+            "José García",
+            "Hélène Lefèvre",
+            "Chloé Dupré",
+            "Anaïs Béranger",
+        ];
+        let decomposed: Vec<String> = composed.iter().map(|v| v.nfd().collect()).collect();
+        let a: Vec<RawSample<'_>> = composed.iter().map(|v| RawSample::new(v)).collect();
+        let b: Vec<RawSample<'_>> = decomposed.iter().map(|v| RawSample::new(v)).collect();
+        let fa = c.classify("col_1", &a);
+        let fb = c.classify("col_1", &b);
+        assert_eq!(fa.len(), 1);
+        assert_eq!(fa, fb);
+        let emails = [
+            "jose\u{301}.garci\u{301}a@example.com",
+            "he\u{301}le\u{300}ne@example.org",
+        ];
+        let raws: Vec<RawSample<'_>> = emails.iter().map(|v| RawSample::new(v)).collect();
+        let composed_emails = ["josé.garcía@example.com", "hélène@example.org"];
+        let raws_c: Vec<RawSample<'_>> =
+            composed_emails.iter().map(|v| RawSample::new(v)).collect();
+        assert_eq!(c.classify("col_2", &raws), c.classify("col_2", &raws_c));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use databastion_classifiers::column::classify_column;
 use databastion_classifiers::masking::{ClassifierId as C, RawSample};
+use unicode_normalization::UnicodeNormalization;
 
 // ------------------------------------------------------------------ PRNG
 
@@ -1666,6 +1667,127 @@ fn build() -> Vec<Case> {
         });
     }
 
+    // Decomposed values (NFD: base letter + combining mark), as written by
+    // macOS and some ETLs.
+    let nfd = |v: String| v.nfd().collect::<String>();
+    const ACCENTED_FIRST: &[&str] = &[
+        "Élodie",
+        "Chloé",
+        "Anaïs",
+        "Raphaël",
+        "Noémie",
+        "Hélène",
+        "Zoé",
+        "Inès",
+        "Jérôme",
+        "Frédéric",
+        "Séverine",
+        "Benoît",
+        "Loïc",
+        "Maëlle",
+        "Gaëtan",
+        "Clémence",
+    ];
+    const ACCENTED_LAST: &[&str] = &[
+        "Lefèvre",
+        "Béranger",
+        "Mérieux",
+        "Chénier",
+        "Pétain",
+        "Géraud",
+        "Hébert",
+        "Lemaître",
+        "Dupré",
+        "Frérot",
+        "Müller",
+        "Gómez",
+        "Sánchez",
+        "Núñez",
+        "Björk",
+        "Łukasiewicz",
+    ];
+    for (i, name) in ["col_120", "given_name", "f_121", "NOM"]
+        .into_iter()
+        .enumerate()
+    {
+        let values = column(r, 90, false, |r| {
+            nfd(match i % 2 {
+                0 => format!("{} {}", r.pick(ACCENTED_FIRST), r.pick(ACCENTED_LAST)),
+                _ => (*r.pick(ACCENTED_FIRST)).to_owned(),
+            })
+        });
+        cases.push(Case {
+            label: format!("names NFD {i}"),
+            name: name.to_owned(),
+            values,
+            want: vec![C::PersonName],
+        });
+    }
+    for (i, name) in ["col_122", "adresse"].into_iter().enumerate() {
+        let values = column(r, 90, false, |r| {
+            let (pc, c) = *r.pick(&[
+                ("13006", "Marseille"),
+                ("69003", "Lyon"),
+                ("97400", "Saint-Denis"),
+                ("59000", "Lille"),
+            ]);
+            nfd(format!(
+                "{} {} {}, {pc} {c}",
+                r.range(1, 200),
+                r.pick(&["allée", "impasse", "chemin", "rue"]),
+                r.pick(&[
+                    "des Écoles",
+                    "de l'Église",
+                    "Hélène Boucher",
+                    "du Château",
+                    "des Pâquerettes"
+                ])
+            ))
+        });
+        cases.push(Case {
+            label: format!("addresses NFD {i}"),
+            name: name.to_owned(),
+            values,
+            want: vec![C::PostalAddress],
+        });
+    }
+    for (i, name) in ["col_123", "date_naissance"].into_iter().enumerate() {
+        let values = column(r, 90, false, |r| {
+            let age = r.range(20, 90);
+            let (m, d) = (r.range(1, 12), r.range(1, 28));
+            nfd(format!("{d} {} {}", MONTHS_FR[m as usize - 1], 2026 - age))
+        });
+        cases.push(Case {
+            label: format!("french months NFD {i}"),
+            name: name.to_owned(),
+            values,
+            want: vec![C::BirthDate],
+        });
+    }
+    for (i, name) in ["col_124", "courriel"].into_iter().enumerate() {
+        let values = column(r, 90, false, |r| {
+            nfd(format!(
+                "{}.{}@exemple.fr",
+                r.pick(ACCENTED_FIRST).to_lowercase(),
+                r.pick(ACCENTED_LAST).to_lowercase()
+            ))
+        });
+        cases.push(Case {
+            label: format!("emails NFD {i}"),
+            name: name.to_owned(),
+            values,
+            want: vec![C::Email],
+        });
+    }
+    // A person qualifier wins over an object word.
+    let values = column(r, 90, false, |r| person(r, 0));
+    cases.push(Case {
+        label: "pet owner names".to_owned(),
+        name: "petOwnerName".to_owned(),
+        values,
+        want: vec![C::PersonName],
+    });
+
     // Mixed columns: 75 % values, the rest free text placeholders.
     for (i, (want, name)) in [
         (C::BirthDate, "col_50"),
@@ -2626,6 +2748,140 @@ fn build() -> Vec<Case> {
         negative(&mut cases, r, what, "col_71", 80, &|r| {
             (*r.pick(pool)).to_owned()
         });
+    }
+    // Names of things other than persons: the name says so, the values
+    // look like person names.
+    const PET_NAMES: &[&str] = &[
+        "Max", "Bella", "Luna", "Charlie", "Lucy", "Cooper", "Daisy", "Rocky", "Milo", "Oscar",
+        "Coco", "Rosie", "Toby", "Lola", "Oliver", "Chloe", "Leo", "Sophie", "Jack", "Molly",
+    ];
+    for name in [
+        "pet_name",
+        "petName",
+        "PetName",
+        "PET_NAME",
+        "petname",
+        "dog_name",
+        "catName",
+        "ANIMAL_NAME",
+        "pets.name",
+        "nom_chien",
+    ] {
+        negative(
+            &mut cases,
+            r,
+            &format!("pet names {name}"),
+            name,
+            80,
+            &|r| (*r.pick(PET_NAMES)).to_owned(),
+        );
+    }
+    for (name, pool) in [
+        (
+            "ship_name",
+            &[
+                "Queen Mary",
+                "Mary Rose",
+                "Victoria",
+                "Elizabeth",
+                "Santa Maria",
+                "Marie Galante",
+                "Charles de Gaulle",
+                "Jean Bart",
+            ][..],
+        ),
+        (
+            "horseName",
+            &[
+                "Seabiscuit",
+                "Secretariat",
+                "Jolly Jumper",
+                "Ourasi",
+                "Frankel",
+                "Pégase",
+                "Arthur",
+                "Samson",
+            ][..],
+        ),
+        (
+            "product_name",
+            &[
+                "Victoria Sofa",
+                "Emma Mattress",
+                "Oscar Lamp",
+                "Clara Chair",
+                "Hugo Desk",
+                "Lucie Mug",
+            ][..],
+        ),
+        (
+            "TEAM_NAME",
+            &[
+                "Les Bleus",
+                "Jean Moulin",
+                "Marie Curie",
+                "Ada Lovelace",
+                "Alan Turing",
+                "Grace Hopper",
+            ][..],
+        ),
+        (
+            "projectName",
+            &[
+                "Apollo", "Gemini", "Athena", "Hermes", "Artemis", "Juno", "Diana", "Selene",
+            ][..],
+        ),
+        (
+            "hostname",
+            &["athena", "zeus", "hera", "apollo", "hermes", "diana"][..],
+        ),
+        (
+            "server_name",
+            &[
+                "Athena", "Zeus", "Hera", "Apollo", "Hermes", "Diana", "Minerva", "Juno",
+            ][..],
+        ),
+        (
+            "file_name",
+            &["Jean Dupont", "Marie Curie", "Paul Martin", "Lucie Bernard"][..],
+        ),
+        (
+            "company_name",
+            &[
+                "Martin Dubois",
+                "Bernard Fils",
+                "Laurent Petit",
+                "Durand Moreau",
+                "Johnson Wilson",
+                "Smith Brown",
+            ][..],
+        ),
+        (
+            "city_name",
+            &[
+                "Charlotte",
+                "Madison",
+                "Florence",
+                "Victoria",
+                "Lincoln",
+                "Austin",
+                "Jackson",
+                "Nancy",
+            ][..],
+        ),
+        (
+            "modelName",
+            &["Clio", "Zoé", "Megane", "Laguna", "Juke", "Leaf", "Micra"][..],
+        ),
+    ] {
+        negative(
+            &mut cases,
+            r,
+            &format!("object names {name}"),
+            name,
+            80,
+            &|r| (*r.pick(pool)).to_owned(),
+        );
     }
     negative(&mut cases, r, "log lines", "message", 150, &|r| {
         let (y, m, d) = ymd(r, 2023, 2026);
