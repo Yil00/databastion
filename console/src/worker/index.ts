@@ -9,6 +9,7 @@ import { PgBoss } from "pg-boss";
 import { getDatabaseUrl } from "@/config/env";
 import { errorSummary, logger } from "@/lib/logger";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
+import { startupErrors, startupFatal } from "@/server/startup-checks";
 
 import { createNoopHandler, NOOP_QUEUE, pgBossOptions, type NoopPayload } from "./queues";
 
@@ -17,6 +18,10 @@ const SHUTDOWN_TIMEOUT_MS = 30_000;
 const log = logger.child({ process: "worker" });
 
 async function main(): Promise<void> {
+  const fatal = startupFatal();
+  if (fatal !== null) throw new Error(fatal);
+  for (const message of startupErrors()) log.error(message);
+
   const boss = new PgBoss(pgBossOptions(getDatabaseUrl()));
 
   boss.on("error", (err: unknown) => {

@@ -31,6 +31,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_METRICS_TOKEN` / `_FILE` | Bearer token required by `GET /metrics` (at least 32 characters, e.g. `openssl rand -base64 32`). Unset or too short: `/metrics` answers `404`. See "Metrics" |
 | `DATABASTION_METRICS_PORT` | Serve `GET /metrics` on a dedicated listener on this port (e.g. `9464`) instead of the main port, which then answers `404` on `/metrics`. Unset: no dedicated listener, `/metrics` stays on the main port (a startup warning is logged in production when the token is set). Must differ from `PORT`. See "Metrics" |
 | `DATABASTION_METRICS_HOST` | Bind address (IP literal) of that listener: `127.0.0.1` by default; `0.0.0.0` inside a container whose metrics port is not published. Invalid port / host: `/metrics` is disabled everywhere and an error is logged |
+| `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` | Let the web and worker processes start in production without a usable `DATABASTION_ENCRYPTION_KEY(_FILE)` (see below; not recommended) |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
@@ -38,7 +39,7 @@ database (also used as the job queue: no Redis). See
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
-e.g. `openssl rand -base64 32`) is the console server key of the web process. It keys the agent "known good" fingerprints (HKDF-SHA256
+e.g. `openssl rand -base64 32`) is the console server key of the web and worker processes. It keys the agent "known good" fingerprints (HKDF-SHA256
 subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
 `login-device.v1`, see "Brute-force protection") and encrypts masked samples at rest (domain
 `masked-samples.v1`, see "Data at rest"). **Set it in production: the shared-IP protection
@@ -46,7 +47,9 @@ of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.*
 or unreadable: fingerprints and device cookies are neither issued nor accepted (fail closed: agents
 lose the lock-out exemption, so agents behind a shared NAT / proxy IP can be blocked by floods from
 it, and a distributed guessing attack on a username can keep its user out), and in production the
-web process logs an **error** at startup naming those disabled protections (it still starts). Changing it
+web and worker processes **refuse to start** (a `fatal` log, exit code 1), unless
+`DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` is set: they then start and log an **error** naming
+those disabled protections (masked samples are then neither stored nor shown). Changing it
 invalidates the stored fingerprints. The console only knows its own database: it never stores target
 database credentials (invariant I3).
 

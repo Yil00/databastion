@@ -1,10 +1,17 @@
 /**
- * Node.js part of the Next.js startup hook (src/instrumentation.ts): configuration warnings and the
- * dedicated /metrics listener of the web process.
+ * Node.js part of the Next.js startup hook (src/instrumentation.ts): fatal configuration check
+ * (exits), configuration warnings and the dedicated /metrics listener of the web process.
  */
 export async function registerNode(): Promise<void> {
-  const { startupErrors, startupWarnings } = await import("@/server/startup-checks");
+  const { startupErrors, startupFatal, startupWarnings } = await import("@/server/startup-checks");
   const { logger, errorSummary } = await import("@/lib/logger");
+  const fatal = startupFatal();
+  if (fatal !== null) {
+    // Exit explicitly: an error thrown from register() is not guaranteed to stop `next start`.
+    logger.fatal(fatal);
+    logger.flush();
+    process.exit(1);
+  }
   for (const warning of startupWarnings()) logger.warn(warning);
   for (const message of startupErrors()) logger.error(message);
   await startMetricsListenerOnce();

@@ -1,9 +1,13 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { assertSafeDetails } from "./audit";
 import { jobHub } from "./agent-api/job-hub";
 import { DEVICE_COOKIE_TTL_S, issueDeviceCookie, readDeviceCookie } from "./auth/device-cookie";
-import { startupErrors, startupWarnings } from "./startup-checks";
+import { startupErrors, startupFatal, startupWarnings } from "./startup-checks";
 import { parseWait } from "./agent-api/handlers";
 import {
   argon2Hash,
@@ -155,6 +159,46 @@ describe("startupErrors (P1-D N3)", () => {
     }
     expect(startupErrors(env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) }))).toEqual([]);
     expect(startupErrors(env({ NODE_ENV: "development" }))).toEqual([]);
+  });
+});
+
+describe("startupFatal (missing server key in production)", () => {
+  const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
+  const dir = mkdtempSync(join(tmpdir(), "databastion-key-"));
+  const goodFile = join(dir, "encryption_key");
+  const shortFile = join(dir, "short_key");
+  writeFileSync(goodFile, "k".repeat(44) + "\n");
+  writeFileSync(shortFile, "short\n");
+
+  it("refuses to start in production without a usable key", () => {
+    const cases: Record<string, string>[] = [
+      { NODE_ENV: "production" },
+      { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "too-short" },
+      { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: "/nonexistent/encryption_key" },
+      { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: shortFile },
+      // Only "1" overrides.
+      { NODE_ENV: "production", DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY: "true" },
+    ];
+    for (const e of cases) {
+      const fatal = startupFatal(env(e));
+      expect(fatal).toContain("refusing to start");
+      expect(fatal).toContain("DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1");
+      expect(fatal).not.toContain("too-short");
+      expect(fatal).not.toContain("short\n");
+    }
+  });
+
+  it("starts with a usable key (direct or file), outside production, or with the override", () => {
+    expect(startupFatal(env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) }))).toBeNull();
+    expect(startupFatal(env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: goodFile }))).toBeNull();
+    expect(startupFatal(env({ NODE_ENV: "development" }))).toBeNull();
+    expect(startupFatal(env({ NODE_ENV: "test" }))).toBeNull();
+    const overridden = env({ NODE_ENV: "production", DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY: "1" });
+    expect(startupFatal(overridden)).toBeNull();
+    // The override keeps the loud error naming the disabled protections.
+    expect(startupErrors(overridden)).toHaveLength(1);
+    expect(startupErrors(overridden)[0]).toContain("PROTECTIONS DISABLED");
+    expect(startupErrors(env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: goodFile }))).toEqual([]);
   });
 });
 
