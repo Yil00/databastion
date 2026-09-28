@@ -1,7 +1,10 @@
 import { and, eq, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
+import * as schema from "@/db/schema";
 import { accessEvents, auditLog, incidentEvents, incidents, notificationDeliveries, policies, principalBaselines } from "@/db/schema";
 import { BASELINE_WARMUP, eventScore, objectSensitivity } from "@/lib/event-model";
 import { failuresPerAgent } from "@/server/agent-api/auth";
@@ -16,11 +19,13 @@ import {
   handlePollJobs,
 } from "@/server/agent-api/handlers";
 import { enqueueJob } from "@/server/jobs";
-import { hasDb, setupTestDatabase } from "@/test/db";
+import { runtimeRoleWarnings } from "@/server/db-role-check";
+import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
+import { configureAudit } from "./audit-config";
 import { EVENT_CHUNK } from "./event-engine";
-import { getPrincipal, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
+import { getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
 import { setFalsePositive } from "./findings";
 import { drainPolicyWork, getIncident, transitionIncident } from "./incidents";
 import { createException, createPolicy, type PolicyInput } from "./policies";
@@ -400,6 +405,36 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const [first] = await listEvents(getDb(), { agentId: auth.agentId, targetId: "pg-prod-1", principalKey: principalKey({ db_user: "backup" }) });
       expect(first).toMatchObject({ principal: "backup", fingerprinted: false, application: "pg_dump", evaluated: true, incidentIds: [] });
     });
+  });
+
+  it("ingestion, correlation, incidents, purge and Audit settings work as the runtime role; the role check stays quiet", async () => {
+    const auth = await agentWithTargets();
+    await scanWith(auth, [finding("email", "pii.email", 1)]);
+    await policy({ signals: ["signature.*"] });
+    const { url } = await createRuntimeRole();
+    const pool = new Pool({ connectionString: url, max: 2 });
+    try {
+      const db = drizzle(pool, { schema });
+      const body = { batch_id: uuidv7(), events: [dumpEvent(), dumpEvent({ ts: at(1000) })] };
+      expect(await ingestEvents(db, auth.agentId, body as never)).toMatchObject({ kind: "accepted", duplicate: false });
+      expect(await ingestEvents(db, auth.agentId, body as never)).toMatchObject({ kind: "accepted", duplicate: true });
+      const stats = await drainPolicyWork(db);
+      expect(stats.events).toBeGreaterThanOrEqual(2);
+      const [inc] = await incidentsOf(auth.agentId);
+      expect(inc?.matchCount).toBe(2);
+      expect(await transitionIncident(db, String(inc?.id), "resolved", actor())).toMatchObject({ outcome: "ok" });
+      const r = await configureAudit(db, auth.agentId, "pg-prod-1", { enabled: true, aggregationWindowS: 60, pollIntervalS: 10, minRows: null, deriveFromFindings: true, manualObjects: [], confirm: null }, actor());
+      expect(r.outcome).toBe("queued");
+      expect((await configureAudit(db, auth.agentId, "pg-prod-1", { enabled: true, aggregationWindowS: 30, pollIntervalS: 10, minRows: 5, deriveFromFindings: true, manualObjects: [], confirm: null }, actor())).outcome).toBe("queued");
+      await pool.query("select public.databastion_purge_access_events(7, 10)");
+      await expect(pool.query("update access_events set rows = 0")).rejects.toThrow(/permission denied/);
+      await expect(pool.query("delete from incident_events")).rejects.toThrow(/permission denied/);
+      await expect(pool.query("delete from principal_baselines")).rejects.toThrow(/permission denied/);
+      await expect(pool.query("update incidents set principal = 'x'")).rejects.toThrow(/permission denied/);
+      expect(await runtimeRoleWarnings(pool)).toEqual([]);
+    } finally {
+      await pool.end();
+    }
   });
 
   it("I2: nothing copied from the findings' samples or fingerprints into events, incidents, baselines, links or notifications", async () => {

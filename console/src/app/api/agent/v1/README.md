@@ -10,7 +10,7 @@ Server side of the agent ↔ console protocol.
 | `POST /jobs/{job_id}/status` | implemented (P1-A) | `handleJobStatus` |
 | `POST /rotate` | implemented (P1-A part 2), ADR-0008 + ADR-0010 | `handleRotate`, logic in `src/server/rotation.ts` |
 | `POST /findings` | implemented (P2-D) | `handleFindings`, logic in `src/server/findings.ts` |
-| `POST /events` | `501` with a contract `Error` body (`unavailable`, `Retry-After`), body never read | phase 4 |
+| `POST /events` | implemented (P4-C) | `handleEvents`, logic in `src/server/events.ts` (ingestion) and `src/server/event-engine.ts` (worker) |
 | any other path | `501` (catch-all `[...path]/route.ts`, body never read) | |
 
 Route files are thin: the logic lives in `src/server/agent-api/` (pipeline, auth, long-poll hub)

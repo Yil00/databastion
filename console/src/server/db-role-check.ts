@@ -27,6 +27,18 @@ export async function runtimeRoleWarnings(pool: Pick<Pool, "query">): Promise<st
       "The console's database role can delete incidents or rewrite their policy snapshot: apply migrations 0015 and 0016 (README, Database roles).",
     );
   }
+  // Access events (migration 0022): never deletable nor rewritable (only through the purge function).
+  const events = await pool.query<{ del: boolean | null; upd: boolean | null }>(`
+    select case when pg_catalog.to_regclass('public.access_events') is null then null
+                else pg_catalog.has_table_privilege(current_user, 'public.access_events', 'DELETE') end as del,
+           case when pg_catalog.to_regclass('public.access_events') is null then null
+                else pg_catalog.has_column_privilege(current_user, 'public.access_events', 'objects', 'UPDATE') end as upd`);
+  const ev = events.rows[0];
+  if (!row?.superuser && !row?.owns_audit_log && (ev?.del || ev?.upd)) {
+    warnings.push(
+      "The console's database role can delete or rewrite access events: apply migration 0022 (README, Database roles).",
+    );
+  }
   if (row?.superuser) {
     warnings.push("The console connects to its database as a superuser: use the non-owner runtime role (README, Database roles).");
   }

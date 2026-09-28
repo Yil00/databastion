@@ -13,7 +13,9 @@ database (also used as the job queue: no Redis). See
 > Docker image. Phase 2 (P2-D): `/findings` ingestion, scan launching, findings view, false
 > positives. Phase 3 (P3-A, P3-B): policy engine in the worker, exceptions, incidents and their
 > lifecycle (see "Policies and incidents"); P3-C: e-mail and HMAC-signed webhook notifications,
-> "silent agent" and agent-integrity alerts (see "Alerting").
+> "silent agent" and agent-integrity alerts (see "Alerting"). Phase 4 (P4-C): `/events`
+> ingestion, volume x sensitivity scoring, per-principal baselines, policies over access events,
+> `audit.configure` settings with confirmation (see "Audit correlation").
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -29,6 +31,7 @@ database (also used as the job queue: no Redis). See
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin. The worker also uses it for the links in notifications (unset: notifications carry ids only) |
 | `DATABASTION_SILENT_AGENT_INTERVALS` | Worker: "silent agent" alert after this many heartbeat intervals (30 s) without a heartbeat; integer 3 to 2880, default 10 (5 minutes). See "Alerting" |
+| `DATABASTION_EVENTS_RETENTION_DAYS` | Worker: Audit access events older than this many days (event `ts`) are deleted every hour; integer 7 to 3650, default 90; other values fall back to the default. Baselines and incidents are kept. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
@@ -90,7 +93,7 @@ and migrations must never run code planted by the console. Production uses three
 |------|---------|--------|
 | Bootstrap superuser (`POSTGRES_USER`) | the initdb script only | Creates the roles below, then is never used |
 | `databastion_owner` (LOGIN, NOSUPERUSER, NOCREATEROLE) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns the database, `public`, `pgboss` and every console table and trigger. `search_path` pinned to `public` (role setting and migration session) |
-| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, only `SELECT, INSERT` and `UPDATE (acknowledged_at, acknowledged_by)` on `security_events` (no `DELETE`: an integrity alert cannot be erased or rewritten), `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
+| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, only `SELECT, INSERT` and `UPDATE (acknowledged_at, acknowledged_by)` on `security_events` (no `DELETE`: an integrity alert cannot be erased or rewritten), only `SELECT, INSERT` and `UPDATE` of the evaluation columns on `access_events` (deleted only through the purge function), `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
 
 Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql`,
 `0010_security_events_no_delete.sql`, `0012_findings_runtime_grants.sql` (`findings_batches`:
@@ -99,6 +102,13 @@ Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_
 `UPDATE` only on the lifecycle columns and the engine's re-match counters, never the policy
 snapshot, severity, dedup key or subject) and `0019_notification_deliveries_grants.sql`
 (`notification_deliveries`: no `DELETE`, `TRUNCATE`, `UPDATE` only on the delivery-state columns)
+and `0022_p4c_events_grants.sql` (`access_events`: `SELECT, INSERT`, `UPDATE` only on the
+evaluation columns `evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`;
+`events_batches`, `incident_events`: `SELECT, INSERT` only; `principal_baselines`,
+`audit_configs`: no `DELETE`, `TRUNCATE`; `incidents`: `UPDATE` also on the event re-match columns
+`event_score`, `event_rows`, `event_signals`, `last_event_at`; `EXECUTE` on the owner-defined
+`SECURITY DEFINER` function `databastion_purge_access_events(retention_days, max_rows)`, the only
+way for the runtime role to delete events: never those younger than 7 days)
 (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
@@ -111,7 +121,8 @@ first database initialization, reading the passwords from the Docker secret file
 (never on a command line). The worker runs pg-boss with `schema: 'pgboss'`, `createSchema: false`.
 
 At startup, the web and worker processes log a warning if their database role is a superuser or
-owns `audit_log`, or if it can delete incidents or rewrite their snapshot columns.
+owns `audit_log`, if it can delete incidents or rewrite their snapshot columns, or if it can
+delete or rewrite access events.
 
 Rule: the owner role must never run SQL against objects inside schema `pgboss` (DML, DDL, manual
 maintenance). pg-boss creates them as the runtime role, so a trigger or function planted there by
@@ -161,7 +172,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 |-------|---------|
 | `GET /api/health` | Liveness: `{"status":"ok"}`, never touches the database |
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
-| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/events` still `501` (phase 4) |
+| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)) |
 | `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP, per username + IP, and per username (slow-down, never a lock-out; see "Brute-force protection") |
 | `POST /api/auth/logout` | Ends the session |
@@ -172,6 +183,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
 | `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (the agent's latest heartbeat carries no `classifiers_version`), `409 classifiers_version_unregistered` (that version is not in the contract classifier registry `classifiers.json`: no job is issued), `422 unknown_classifiers` (`classifiers` holds ids that are not classifiers of that version); each refusal is audited (`discovery.scan_request`, `failure`, with the reason and the version). The job carries the version of the agent's latest heartbeat. `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline) |
+| `POST /api/agents/{id}/targets/{target_id}/audit` | Audit settings of a target, queued as an `audit.configure` job (admin, CSRF; P4-C). Body `{enabled, aggregation_window_s?, poll_interval_s?, min_rows?, derive_from_findings?, manual_objects?, confirm?}` (defaults 60, 10, none, `true`, `[]`; `manual_objects`: contract `SensitiveObject[]`); unknown keys and non-conforming objects: `400 {"error": "invalid_audit_settings", "field"}`; `404` unknown / inactive agent or target not currently reported. `202 {job_id, warning, previous_objects, next_objects, added_objects, removed_objects, truncated_objects}`. A change that disables Audit, empties `sensitive_objects` or removes many objects answers `409 {"error": "confirmation_required", warning, ...counts, digest}` and queues nothing: post the same settings again with `confirm: digest`. Audited `audit.configure` (counts, flags, warning, `confirmed`; refusals as failures). See "Audit correlation" |
 | `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor). Marking closes the finding's open / acknowledged incidents as `false_positive` (audited `incident.transition`); unmarking makes the policies apply to it again |
 | `POST /api/policies` | Create a policy (admin, CSRF): `{name, description?, enabled?, source?, conditions, actions}`, strictly validated (see "Policies and incidents"); `201 {id}`, `400 {"error": "invalid_policy", "field"}`, `409 name_taken` (case-insensitive). Audited `policy.create` (identifiers, flags and counts only: never the name or description) |
 | `PATCH` / `DELETE /api/policies/{id}` | Update any subset of the create keys (`source` is fixed) / delete (admin, CSRF); `204`, `404`. A deleted policy's exceptions go with it, its incidents are kept. Audited `policy.update` (with the changed keys) / `policy.delete` |
@@ -202,6 +214,15 @@ masked samples, decrypted server side through the same path as `/findings` (`no-
 notifications (channel, status, attempts, last error code with its explanation).
 `/notifications` (admin) lists the channels (create, edit, enable / disable, test, new webhook
 secret, delete) and the last 100 deliveries.
+`/events` lists the Audit access events (newest first, at most 500; filters
+`?agent=&target=&principal=<key>&signal=<id or family>&from=&to=&anomaly=1`) with their score,
+signals, baseline anomaly flag and the incidents they matched, and the principals with a baseline;
+`/events/principal?agent=&target=&principal=<key>` shows one principal's baseline, incidents and
+latest events. The principal is designated by its key (SHA-256), never by the account name in a
+URL. `/agents/{id}/targets/{target_id}/audit` shows a target's Audit settings, the objects its
+findings make sensitive, and (admin) the settings form with the confirmation step; the agent page
+shows each target's settings and the warning left by a narrowing change. Incidents raised from
+events show the principal, database, hour, rows, score and signals, and their events.
 `/policies` lists the policies and exceptions (admin: create, enable / disable, delete, add or
 delete exceptions); `/policies/{id}` shows one policy with its exceptions (admin: edit form) and
 warns when a notify channel name matches no channel or a disabled one (the form warns as you type). A scan that failed with `unsupported` while its `classifiers_version` differs from
@@ -414,6 +435,11 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | HMAC fingerprints (`findings.fingerprints`) | as sent by the agent (keyed by its local key, which never leaves it) |
 | Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch in canonical JSON (keys sorted recursively), job, item count: idempotency only, never the body. Append-only for the runtime role (migration `0012`: no `UPDATE`, `DELETE`, `TRUNCATE`); `findings` rows cannot be deleted by it either |
 | Policies, exceptions (`policies`, `policy_exceptions`) | plain columns: admin-typed name, description, reason; condition and action documents holding only identifiers, globs on normalized names, thresholds, severities and channel references; never a sampled value |
+| Access events (`access_events`) | exactly the contract `AccessEvent` fields, in plain columns (principal `db_user` or its `hmac-sha256:` fingerprint, client address, application, action, normalized object names, rows, signals, source, counts, timestamps; escaped on display), `principal_key` = SHA-256 of the principal, and the worker's evaluation (sensitivity, score, anomaly flag, baseline snapshot). No query text, bound parameter or returned value: the contract has no field for them and unknown fields are rejected before anything is stored (ADR-0007). The runtime role cannot rewrite or delete them; deleted after `DATABASTION_EVENTS_RETENTION_DAYS` (migration `0022`) |
+| Events batches (`events_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch in canonical JSON, item count: idempotency only, never the body. Insert-only for the runtime role; purged with the events |
+| Principal baselines (`principal_baselines`) | per (agent, target, principal key): EWMA mean and variance of `ln(1 + rows)` and `ln(1 + score)`, counters, first / last event; the account name or fingerprint for display. Aggregates only: no object name, no event. Kept after the events are purged |
+| Incident links (`incident_events`) | (incident, event) pairs, insert-only; go with a purged event |
+| Audit settings (`audit_configs`) | per target: the settings last sent, the manual sensitive objects (normalized names and classifier ids), the `sensitive_objects` list last sent, the last job, and the warning of the last change (`disabled` / `emptied` / `shrunk` with the number of objects removed) |
 | Incidents (`incidents`) | plain columns: policy snapshot (id, name, revision), severity, status and who / when of each transition, finding id, agent, target, classifier, `matched` and `classifiers_version` snapshots, `dedup_key`; no sampled value (the samples stay encrypted on the finding). Never deleted by the runtime role, which may only update the lifecycle and re-match columns (migrations `0015`, `0016`) |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
@@ -429,14 +455,13 @@ limiters (the secret cache is already safe across processes, as it is bound to t
 *P3-A, P3-B. Model and lifecycle: `src/lib/policy-model.ts`, `src/lib/incident-lifecycle.ts`;
 engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 
-- **Conditions** (source `finding`; every key optional, all present keys must hold, the values of a
-  list are alternatives): `classifiers` (registered ids of any classifier set, or families such as
+- **Conditions** (source `finding`; source `access_event`: see "Audit correlation"; every key
+  optional, all present keys must hold, the values of a list are alternatives): `classifiers` (registered ids of any classifier set, or families such as
   `pii.*`), `agent_ids`, `target_ids`, `engines`, `location` (`database`, `schema`, `object`,
   `field` globs on the normalized names: `*`, `?`, `\` escape, case-insensitive, matched in linear
   time), `min_confidence`, `min_match_ratio` (matched / sampled), `min_matched`. Unknown keys are
-  rejected. Phase 4 adds the `access_event` source (a new `policy_source` enum value) with its own
-  keys (signals `signature.*`, `shape.*`, `volume.*`); a document is validated against its policy's
-  source, so existing policies keep their meaning.
+  rejected. A document is validated against its policy's source (fixed at creation), so existing
+  policies keep their meaning.
 - **Actions**: exactly one `{"type": "create_incident", "severity": "low|medium|high|critical"}`,
   and up to 5 `{"type": "notify", "channel": "<slug>"}`. Channel references are stored on the policy
   and copied to each incident (`notify_channels`); a new incident is notified to them (see
@@ -477,8 +502,84 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   then the incident). `false_positive` is the finding's false-positive decision (admin only, as on
   `/findings`): it marks the finding (with its `matched` / `classifiers_version` snapshot) and closes
   every active incident of it.
-- The `audit.configure` confirmation of P3-A (warning when a change empties `sensitive_objects`)
-  depends on phase 4 and is not implemented.
+- The `audit.configure` confirmation of P3-A is implemented with P4-C (see "Audit correlation").
+
+## Audit correlation
+*P4-C. Model: `src/lib/event-model.ts`; ingestion and views: `src/server/events.ts`; engine:
+`src/server/event-engine.ts`; settings: `src/server/audit-config.ts`; migrations `0021`, `0022`.*
+
+- **Ingestion** (`POST /api/agent/v1/events`): same pipeline and bounds as `/findings`
+  (authentication, 4 MiB body cap `413`, schema then `checkSemantics`: unknown fields such as query
+  text, names or account names failing the contract patterns, a batch over 1 MiB (`maxBytes`) and
+  `ts_last < ts` (`/events/<i>/ts_last`, `formatMinimum`) are `400`). Then, in one transaction
+  serialized per agent: the idempotency check on (`agent_id`, `batch_id`) over the canonical JSON
+  (replay `202 duplicate: true`, other content `409 batch_conflict`), target ownership (`404`,
+  `/events/<i>/target_id`, `notFound`), timestamps at most 5 min ahead (`/events/<i>/ts` or
+  `ts_last`, `formatMaximum`), storage. Rejected batches, conflicts and foreign targets are
+  agent-integrity events (endpoint `events`). Limits per agent and process: 300 requests and 60
+  stored batches (30 000 events) per minute (`429`). An accepted batch wakes the policy worker.
+- **Sensitivity** of an object: for each classifier found on it (any column, false positives
+  excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
+  is that of its most sensitive object; an event object without schema matches the findings of any
+  schema. Weights:
+
+  | Classifier | Weight | Classifier | Weight |
+  |------------|--------|------------|--------|
+  | `secret.aws_key` | 10 | `pii.birth_date` | 3 |
+  | `secret.password_hash` | 8 | `pii.email` | 3 |
+  | `pii.card_number` | 8 | `pii.phone` | 3 |
+  | `pii.iban` | 7 | `pii.postal_address` | 3 |
+  | `pii.nir` | 7 | `pii.person_name` | 2 |
+
+  Unlisted ids: 8 for `secret.*`, 2 for `pii.*`, 1 otherwise.
+- **Score** = sensitivity x log10(1 + rows), 0 when the source reports no `rows` or no object is
+  sensitive. For an event pre-aggregated by the agent, `rows` is the total of the merged events.
+- **Baselines** per (agent, target, principal), over the events that report `rows`: exponentially
+  weighted mean and variance of `ln(1 + rows)`, weight `max(0.05, 1/n)` (the plain mean for the first
+  20 events, then about the last 20). Warm after 20 events. A warm baseline flags an event as an
+  **anomaly** when `rows >= 1000` and `ln(1 + rows) > mean + max(ln 10, 3 sd)` (ten times the
+  typical volume, and three standard deviations). The verdict uses the baseline before the event;
+  the event then updates it, capped at that threshold, so one dump does not raise the baseline
+  while a lasting change is learnt gradually. The same statistics on `ln(1 + score)` are shown.
+- **Evaluation** runs first in `policies.evaluate` (before the findings, so an exfiltration never
+  waits behind a full pass), in chunks of 200 events in arrival order, serialized by an advisory
+  lock. Each event gets its sensitivity, score, anomaly flag and baseline snapshot, then every
+  enabled `access_event` policy is applied. A policy applies to the events evaluated after its
+  creation or change, never to past ones.
+- **Conditions** (source `access_event`; all present keys must hold, the values of a list are
+  alternatives; at least one of `signals`, `event_actions`, `principals`, `objects`, `min_rows`,
+  `min_score`, `min_sensitivity`, `anomaly`): `signals` (contract ids or families `signature.*`,
+  `shape.*`, `volume.*`; the event carries one of them), `event_actions`, `sources`, `agent_ids`,
+  `target_ids`, `engines` (of the target), `principals` and `exclude_principals` (globs on the
+  account name, or on the fingerprint sent in its place), `objects` (`database`, `schema`,
+  `object` globs; one object of the event matches), `min_rows`, `min_score`, `min_sensitivity`,
+  `anomaly: true`. Exceptions apply by agent, target and location (`database` / `schema` /
+  `object` globs covering every retained object); a classifier-scoped exception never covers an
+  event. The `volume.*` signals are the agent's; the console's own baseline verdict is `anomaly`.
+- **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
+  The database is that of the most sensitive retained object. While the incident of a key is open or
+  acknowledged, later events of the key are added to it (`match_count`, total rows, highest score,
+  signals, and a link in `incident_events`); once it is resolved or a false positive, the rest of
+  that hour opens nothing; the next hour opens a new incident. A `pg_dump` (one event per table)
+  thus raises one incident per policy, principal, database and hour. Incident creation is audited
+  (`incident.create`, source `access_event`) and notified through the outbox: `incident.opened`
+  with `source: "access_event"`, the principal, database, hour and the first event's action,
+  source, rows, score, sensitivity, anomaly flag, signals and objects (no value).
+- **Promptness** (phase 4 exit criterion, incident in < 2 min): the accepted batch wakes the worker
+  (polling every 2 s); a lost wake-up is caught up by the one-minute schedule.
+- **Retention**: `events.purge` (hourly, and at worker start) deletes the events whose `ts` is older
+  than `DATABASTION_EVENTS_RETENTION_DAYS` (default 90) through the owner-defined purge function,
+  10 000 at a time within a 50 s budget; the events batches received before that bound go too.
+  Incidents keep their counts; their event list shows what is left.
+- **Audit settings** (`audit.configure`, admin): enabled, aggregation window, polling interval,
+  `min_rows`, sensitive objects derived from the findings (objects with a finding that is not a
+  false positive, with their classifiers) and / or added by hand; at most 1000 objects, manual
+  ones first, then the most sensitive. The console validates the contract `AuditConfigureParams`,
+  cancels the pending settings jobs of the target and queues the job. A change that **disables**
+  Audit, **empties** `sensitive_objects`, or **shrinks** it by at least 20 objects or at least 50 %
+  of those sent last time needs a confirmation of the exact settings (a digest: if the findings
+  change in between, confirm again), is audited, and leaves a warning on the target until a later
+  change that does not narrow Audit. The first configuration of a target never warns.
 
 ## Alerting
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
@@ -504,8 +605,13 @@ contents: `src/lib/notification-render.ts`.*
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
   `agent.integrity`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
-  location (engine, database, schema, object, field), counts (sampled, matched, confidence). **Never a
-  sampled value, masked or not** (I2); the masked samples stay encrypted on the finding.
+  location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
+  `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
+  has `source: "access_event"` and, instead of the classifier, location and counts: `principal`,
+  `principal_fingerprinted`, `database`, `hour` and `access` (the first event's `ts`, action,
+  source, rows, score, sensitivity, anomaly flag, signals and objects); receivers should switch on
+  `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
+  finding, and access events carry none.
 - **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:
   application/json`, `X-DataBastion-Event`, `X-DataBastion-Delivery` (stable across retries: the
   receiver deduplicates on it) and `X-DataBastion-Signature: t=<unix seconds>,v1=<hex>`, where `v1` =
