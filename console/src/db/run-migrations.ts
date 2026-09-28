@@ -18,7 +18,34 @@ export const MIGRATIONS_FOLDER = path.resolve(
  */
 export const MIGRATION_SEARCH_PATH = "public";
 
-/** Applies the committed migrations with a dedicated pool, as the role of `url` (the owner). */
+export class PgbossOwnerError extends Error {
+  override name = "PgbossOwnerError";
+}
+
+/**
+ * Pre-flight of every migrate run, same check as migration `0009_pgboss_owner_guard.sql` (which
+ * only runs once): refuses when schema `pgboss` exists and is owned by a role other than the
+ * migration role, before any migration SQL runs. Role names are not secrets.
+ */
+export async function assertPgbossOwnership(pool: Pool): Promise<void> {
+  const { rows } = await pool.query<{ schema_owner: string; migration_role: string }>(
+    `select pg_catalog.pg_get_userbyid(n.nspowner) as schema_owner, current_user as migration_role
+       from pg_catalog.pg_namespace n where n.nspname = 'pgboss'`,
+  );
+  const row = rows[0];
+  if (row && row.schema_owner !== row.migration_role) {
+    throw new PgbossOwnerError(
+      `schema pgboss is owned by role ${row.schema_owner}, not by the migration role ${row.migration_role}: ` +
+        "as a superuser, ALTER SCHEMA pgboss OWNER TO the migration (owner) role after checking the schema for planted objects " +
+        '(console/README.md, "Database roles")',
+    );
+  }
+}
+
+/**
+ * Applies the committed migrations with a dedicated pool, as the role of `url` (the owner), after
+ * the `pgboss` ownership pre-flight.
+ */
 export async function runMigrations(url: string): Promise<void> {
   const pool = new Pool({
     connectionString: url,
@@ -27,6 +54,7 @@ export async function runMigrations(url: string): Promise<void> {
     options: `-c search_path=${MIGRATION_SEARCH_PATH}`,
   });
   try {
+    await assertPgbossOwnership(pool);
     await migrate(drizzle(pool), { migrationsFolder: MIGRATIONS_FOLDER });
   } finally {
     await pool.end();

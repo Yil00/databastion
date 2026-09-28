@@ -97,9 +97,13 @@ async function requireUser(
  * - per username across all IPs (`loginFailuresPerUserGlobal`, much higher): reaching it never
  *   refuses the login outright. It degrades to a slow-down (`loginSlowdown`) with at most one
  *   attempt in flight per username (`503` + `Retry-After` for the others).
- * A valid device cookie for the username (N1, `device-cookie.ts`) skips the global cap and the
- * degraded slot (a distributed attacker holding that slot cannot keep the real user out); it stays
- * subject to the per-(username, IP) limit, its own per-cookie failure limit and the argon2id pool.
+ * With an unknown IP, the slow-down past the per-username counter grows with the username's failed
+ * degraded attempts (`loginDegradedFailures`): `loginSlowdown.ms` (2 s), doubling, capped at
+ * `loginSlowdown.maxMs` (30 s). Over the global cap with a known IP it stays at 2 s.
+ * A valid device cookie for the username (N1, `device-cookie.ts`) skips the global cap, the
+ * degraded slot and the slow-down (a distributed attacker holding that slot cannot keep the real
+ * user out); it stays subject to the per-(username, IP) limit, its own per-cookie failure limit
+ * and the argon2id pool, and its failures still count toward the global per-username cap.
  */
 export const LOGIN_IPV6_PREFIX = 56;
 export const loginFailuresPerIp = new RateLimiter(20, 15 * 60_000);
@@ -107,8 +111,20 @@ export const loginFailuresPerUser = new RateLimiter(5, 15 * 60_000);
 export const loginFailuresPerUserGlobal = new RateLimiter(100, 15 * 60_000);
 /** Failed logins per device cookie (nonce): beyond, the cookie gives no bypass (a stolen cookie). */
 export const loginFailuresPerDevice = new RateLimiter(5, 15 * 60_000);
-/** Delay before each verification of a username over its global cap (test hook: tests shorten it). */
-export const loginSlowdown = { ms: 2000 };
+/**
+ * Delay before each verification of a degraded login (test hook: tests shorten it). Unknown IP:
+ * `ms * 2^n` for the n-th failed degraded attempt of the username in the window, at most `maxMs`.
+ */
+export const loginSlowdown = { ms: 2000, maxMs: 30_000 };
+/** Failed degraded logins per username with an unknown IP (drives the growing slow-down). */
+export const loginDegradedFailures = new RateLimiter(Number.MAX_SAFE_INTEGER, 15 * 60_000);
+
+/** Slow-down before a degraded login of `userKey` (see {@link loginSlowdown}). */
+export function loginSlowdownMs(userKey: string, unknownIp: boolean): number {
+  if (!unknownIp) return loginSlowdown.ms;
+  const failures = Math.min(loginDegradedFailures.count(userKey), 30);
+  return Math.min(loginSlowdown.maxMs, loginSlowdown.ms * 2 ** failures);
+}
 /** Usernames over their global cap with a (slowed-down) attempt in flight. */
 const degradedLoginsInFlight = new Set<string>();
 /** Process-wide budget of argon2id-backed failed logins on unknown usernames (slow refill). */
@@ -173,7 +189,9 @@ export function handleLogin(req: Request): Promise<Response> {
       const user = await findLoginUser(getDb(), username);
       if (user && user.id === device.userId) {
         const refundDevice = loginFailuresPerDevice.reserve(device.nonce) ?? noop;
-        return verifyLogin(req, username, password, ip, [...baseRefunds, refundDevice], { user });
+        // Bypasses the global cap, but its failures still count toward it.
+        const refundGlobal = loginFailuresPerUserGlobal.charge(userKey);
+        return verifyLogin(req, username, password, ip, [...baseRefunds, refundDevice, refundGlobal], { user });
       }
     }
 
@@ -181,15 +199,18 @@ export function handleLogin(req: Request): Promise<Response> {
     // username; never a hard refusal (the correct password from a fresh IP still logs in).
     const refundGlobal = degradeUnknownIp ? null : loginFailuresPerUserGlobal.reserve(userKey);
     if (!refundGlobal) {
+      const delayMs = loginSlowdownMs(userKey, degradeUnknownIp);
       if (degradedLoginsInFlight.has(userKey)) {
         baseRefunds.forEach((refund) => refund());
-        const retry = Math.max(1, Math.ceil(loginSlowdown.ms / 1000) + 1);
+        const retry = Math.max(1, Math.ceil(delayMs / 1000) + 1);
         return error(503, "busy", { "Retry-After": String(retry) });
       }
       degradedLoginsInFlight.add(userKey);
       try {
-        await new Promise((r) => setTimeout(r, loginSlowdown.ms));
-        return await verifyLogin(req, username, password, ip, baseRefunds);
+        // Counted before the delay (refunded on success), so the next attempt waits longer.
+        const refunds = degradeUnknownIp ? [...baseRefunds, loginDegradedFailures.charge(userKey)] : baseRefunds;
+        await new Promise((r) => setTimeout(r, delayMs));
+        return await verifyLogin(req, username, password, ip, refunds);
       } finally {
         degradedLoginsInFlight.delete(userKey);
       }
