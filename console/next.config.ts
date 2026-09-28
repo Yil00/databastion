@@ -10,7 +10,7 @@ const nextConfig: NextConfig = {
   // do not let `next dev` generate extra ones in console/.
   agentRules: false,
   // Server-only packages loaded from node_modules at runtime, never bundled.
-  serverExternalPackages: ["pg", "pg-boss", "pino"],
+  serverExternalPackages: ["pg", "pg-boss", "pino", "@node-rs/argon2"],
 };
 
 export default nextConfig;

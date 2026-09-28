@@ -1,0 +1,796 @@
+import { randomUUID } from "node:crypto";
+
+import { and, eq, sql } from "drizzle-orm";
+import { Client } from "pg";
+import { PgBoss } from "pg-boss";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+
+import { getDb, getPool } from "@/db/client";
+import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
+import { validateSchema } from "@/lib/protocol/validate";
+import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
+import {
+  agentArgon2Gate,
+  argon2Stats,
+  loginArgon2Gate,
+  MAX_CONCURRENT_UNAUTHENTICATED_ARGON2,
+  sha256Hex,
+} from "@/server/crypto";
+import { handleLogin, loginFailuresUnknownUser } from "@/server/user-api";
+import { enqueueJob, MAX_JOB_ATTEMPTS } from "@/server/jobs";
+import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
+import { runtimeRoleWarnings } from "@/server/db-role-check";
+import { pgBossOptions } from "@/worker/queues";
+import {
+  adminUser,
+  agentRequest,
+  enroll,
+  expectConformingError,
+  fixtures,
+  newToken,
+} from "@/test/helpers";
+
+import { expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp } from "./auth";
+import {
+  enrollPerIp,
+  handleEnroll,
+  handleHeartbeat,
+  handleJobStatus,
+  handlePollJobs,
+  pollClock,
+} from "./handlers";
+import { jobHub } from "./job-hub";
+
+const MINIMAL_HEARTBEAT = {
+  ts: new Date().toISOString(),
+  agent_version: "0.1.0",
+  uptime_s: 12,
+  connectors: ["postgres"],
+  targets: [{ target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited" }],
+  detected_targets: [],
+  spool: { bytes: 0, max_bytes: 1024, batches: 0 },
+};
+
+const SCAN_PARAMS = { sample_rows: 200, max_duration_s: 900 };
+
+describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
+  let teardown: () => Promise<void>;
+
+  beforeAll(async () => {
+    teardown = await setupTestDatabase();
+    await adminUser();
+  });
+  afterAll(async () => {
+    pollClock.msPerSecond = 1000;
+    await teardown?.();
+  });
+  beforeEach(() => {
+    loginFailuresUnknownUser.clear();
+    enrollFailureAuditBudget.clear();
+    failuresPerAgent.clear();
+    failuresPerIp.clear();
+    enrollPerIp.clear();
+    pollClock.msPerSecond = 1000;
+  });
+
+  describe("POST /enroll", () => {
+    it("exchanges a token for an identity, stores only hashes, audits, no-store", async () => {
+      const token = await newToken();
+      const res = await handleEnroll(
+        agentRequest("POST", "/enroll", {
+          body: { token, hostname: "db-host-1", agent_version: "0.1.0", connectors: ["postgres"] },
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(validateSchema("EnrollResponse", body).ok).toBe(true);
+      expect(body.heartbeat_interval_s).toBe(30);
+      const [agent] = await getDb().select().from(agents).where(eq(agents.id, String(body.agent_id)));
+      expect(agent?.currentSecretHash).toMatch(/^\$argon2id\$/);
+      expect(agent?.currentSecretHash).not.toContain(String(body.agent_secret));
+      const [tok] = await getDb()
+        .select()
+        .from(enrollmentTokens)
+        .where(eq(enrollmentTokens.tokenHash, sha256Hex(token)));
+      expect(tok?.consumedAt).not.toBeNull();
+      expect(tok?.consumedByAgentId).toBe(body.agent_id);
+      const audit = await getDb().select().from(auditLog).where(eq(auditLog.action, "agent.enroll"));
+      expect(audit.some((a) => a.targetId === body.agent_id)).toBe(true);
+      // Neither the token nor the secret is stored anywhere in clear.
+      const dump = await getDb().execute(sql`
+        select coalesce(string_agg(t::text, ' '), '') as s from (
+          select row_to_json(a)::text as t from agents a
+          union all select row_to_json(e)::text from enrollment_tokens e
+          union all select row_to_json(l)::text from audit_log l) x`);
+      const all = String(dump.rows[0]?.s);
+      expect(all).not.toContain(token);
+      expect(all).not.toContain(String(body.agent_secret));
+    });
+
+    it("rejects a reused, expired or revoked token with 401", async () => {
+      const token = await newToken();
+      const body = { token, hostname: "h1", agent_version: "0.1.0", connectors: [] };
+      expect((await handleEnroll(agentRequest("POST", "/enroll", { body }))).status).toBe(200);
+      const reuse = await handleEnroll(agentRequest("POST", "/enroll", { body }));
+      expect(reuse.status).toBe(401);
+      await expectConformingError(reuse, body);
+
+      const expired = await newToken();
+      await getDb()
+        .update(enrollmentTokens)
+        .set({ expiresAt: new Date(Date.now() - 1000) })
+        .where(eq(enrollmentTokens.tokenHash, sha256Hex(expired)));
+      const res = await handleEnroll(agentRequest("POST", "/enroll", { body: { ...body, token: expired } }));
+      expect(res.status).toBe(401);
+
+      const revoked = await newToken();
+      await getDb()
+        .update(enrollmentTokens)
+        .set({ revokedAt: new Date() })
+        .where(eq(enrollmentTokens.tokenHash, sha256Hex(revoked)));
+      expect(
+        (await handleEnroll(agentRequest("POST", "/enroll", { body: { ...body, token: revoked } }))).status,
+      ).toBe(401);
+    });
+
+    it("consumes a token atomically under concurrency", async () => {
+      const token = await newToken();
+      const body = { token, hostname: "h2", agent_version: "0.1.0", connectors: [] };
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => handleEnroll(agentRequest("POST", "/enroll", { body }))),
+      );
+      expect(results.filter((r) => r.status === 200)).toHaveLength(1);
+      expect(results.filter((r) => r.status === 401)).toHaveLength(4);
+    });
+
+    it.each(fixtures("valid", "EnrollRequest"))("valid fixture %s passes validation", async (_f, body) => {
+      // Fixture tokens are well-formed but unknown: validation passes, the token lookup fails.
+      const res = await handleEnroll(agentRequest("POST", "/enroll", { body }));
+      expect(res.status).toBe(401);
+    });
+
+    it.each(fixtures("invalid", "EnrollRequest"))("invalid fixture %s -> 400", async (_f, body) => {
+      const res = await handleEnroll(agentRequest("POST", "/enroll", { body }));
+      expect(res.status).toBe(400);
+      const err = await expectConformingError(res, body);
+      expect(err.code).toBe("invalid_request");
+      expect(Array.isArray(err.details)).toBe(true);
+    });
+
+    it("rate limits per source IP when the IP is known (trusted proxy)", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      try {
+        const body = { token: `dbe_${"A".repeat(43)}`, hostname: "h", agent_version: "0.1.0", connectors: [] };
+        const headers = { "X-Forwarded-For": "198.51.100.20" };
+        let last = 0;
+        for (let i = 0; i < 21; i++) {
+          last = (await handleEnroll(agentRequest("POST", "/enroll", { body, headers }))).status;
+        }
+        expect(last).toBe(429);
+        // Another client IP is not affected.
+        const other = await handleEnroll(
+          agentRequest("POST", "/enroll", { body, headers: { "X-Forwarded-For": "198.51.100.21" } }),
+        );
+        expect(other.status).toBe(401);
+      } finally {
+        delete process.env.DATABASTION_TRUST_PROXY;
+      }
+    });
+
+    it("runs no argon2id for an unusable token and audits the failure without token material (M4, L3)", async () => {
+      const token = `dbe_${"B".repeat(43)}`;
+      const before = argon2Stats.started;
+      const res = await handleEnroll(
+        agentRequest("POST", "/enroll", { body: { token, hostname: "h", agent_version: "0.1.0", connectors: [] } }),
+      );
+      expect(res.status).toBe(401);
+      expect(argon2Stats.started).toBe(before);
+      const rows = await getDb().select().from(auditLog).where(eq(auditLog.action, "agent.enroll"));
+      const failures = rows.filter((r) => r.outcome === "failure");
+      expect(failures.length).toBeGreaterThan(0);
+      expect(JSON.stringify(failures)).not.toContain(token);
+      expect(JSON.stringify(failures)).not.toContain(sha256Hex(token));
+    });
+  });
+
+  describe("common request checks", () => {
+    it("requires the protocol and user-agent headers; 426 below the minimum", async () => {
+      const auth = await enroll();
+      const noProto = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT, headers: { "X-DataBastion-Protocol": "" } }),
+      );
+      expect(noProto.status).toBe(400);
+      const old = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT, headers: { "X-DataBastion-Protocol": "0" } }),
+      );
+      expect(old.status).toBe(426);
+      const err = await expectConformingError(old, {});
+      expect(err.code).toBe("protocol_unsupported");
+      expect(err.min_protocol).toBe(1);
+      const ua = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT, headers: { "User-Agent": "curl/8" } }),
+      );
+      expect(ua.status).toBe(400);
+    });
+
+    it("rejects bodies over 4 MiB with 413", async () => {
+      const auth = await enroll();
+      const raw = JSON.stringify({ ...MINIMAL_HEARTBEAT, pad: "x".repeat(4 * 1024 * 1024) });
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, raw }));
+      expect(res.status).toBe(413);
+      expect(((await res.json()) as { code: string }).code).toBe("payload_too_large");
+    });
+
+    it("rejects unknown fields at any depth without echoing them", async () => {
+      const auth = await enroll();
+      const body = {
+        ...MINIMAL_HEARTBEAT,
+        targets: [{ ...MINIMAL_HEARTBEAT.targets[0], password_leak: "jane.doe@example.com" }],
+      };
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(400);
+      const err = await expectConformingError(res, body);
+      expect(err.details).toEqual([{ pointer: "/targets/0", keyword: "additionalProperties" }]);
+    });
+
+    it("rejects malformed JSON and wrong content type", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, raw: "{" }))).status).toBe(400);
+      const res = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT, headers: { "Content-Type": "text/plain" } }),
+      );
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe("authentication", () => {
+    it("rejects missing, malformed and wrong secrets with 401", async () => {
+      const auth = await enroll();
+      const none = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { body: MINIMAL_HEARTBEAT }),
+      );
+      expect(none.status).toBe(401);
+      const wrong = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", {
+          auth: { agentId: auth.agentId, secret: (await enroll("other")).secret },
+          body: MINIMAL_HEARTBEAT,
+        }),
+      );
+      expect(wrong.status).toBe(401);
+      const lowEntropy = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", {
+          auth: { agentId: auth.agentId, secret: `dbs_${"EXAMPLE".repeat(6)}1` },
+          body: MINIMAL_HEARTBEAT,
+        }),
+      );
+      expect(lowEntropy.status).toBe(401);
+      const unknown = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", {
+          auth: { agentId: "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a", secret: auth.secret },
+          body: MINIMAL_HEARTBEAT,
+        }),
+      );
+      expect(unknown.status).toBe(401);
+      await expectConformingError(unknown, {});
+    });
+
+    it("rate limits failed authentications per agent id before verifying (429 + Retry-After)", async () => {
+      const auth = await enroll();
+      const other = (await enroll("other2")).secret;
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i++) {
+        const res = await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: other }, body: MINIMAL_HEARTBEAT }),
+        );
+        statuses.push(res.status);
+        if (res.status === 429) {
+          expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+          expect(((await res.json()) as { code: string }).code).toBe("rate_limited");
+        }
+      }
+      expect(statuses.slice(0, 10).every((s) => s === 401)).toBe(true);
+      expect(statuses[10]).toBe(429);
+    });
+  });
+
+  describe("brute-force protections (security review H1, M1)", () => {
+    it("40 concurrent wrong secrets: at most the per-agent limit reaches argon2id", async () => {
+      const auth = await enroll();
+      const wrong = (await enroll("other-bf")).secret;
+      const before = argon2Stats.started;
+      const results = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      expect(argon2Stats.started - before).toBeLessThanOrEqual(failuresPerAgent.limit);
+      expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+      expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(failuresPerAgent.limit);
+    });
+
+    it("caps concurrent argon2id verifications process-wide", async () => {
+      const ids = await Promise.all(Array.from({ length: 12 }, (_, i) => enroll(`conc-${i}`)));
+      const wrong = (await enroll("conc-wrong")).secret;
+      argon2Stats.maxActive = 0;
+      const results = await Promise.all(
+        ids.flatMap((a) =>
+          Array.from({ length: 3 }, () =>
+            handleHeartbeat(
+              agentRequest("POST", "/heartbeat", { auth: { agentId: a.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+            ),
+          ),
+        ),
+      );
+      expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
+      const busy = results.filter((r) => r.status === 503);
+      for (const r of busy) expect(Number(r.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    });
+
+    it("an attacker from another IP cannot lock a legitimate agent out", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      try {
+        const auth = await enroll();
+        const wrong = (await enroll("other-m1")).secret;
+        for (let i = 0; i < 12; i++) {
+          await handleHeartbeat(
+            agentRequest("POST", "/heartbeat", {
+              auth: { agentId: auth.agentId, secret: wrong },
+              body: MINIMAL_HEARTBEAT,
+              headers: { "X-Forwarded-For": "203.0.113.66" },
+            }),
+          );
+        }
+        const legit = await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", {
+            auth,
+            body: MINIMAL_HEARTBEAT,
+            headers: { "X-Forwarded-For": "192.0.2.10" },
+          }),
+        );
+        expect(legit.status).toBe(200);
+      } finally {
+        delete process.env.DATABASTION_TRUST_PROXY;
+      }
+    });
+
+    it("with an unknown IP, a known-good secret is exempt from the per-agent limit (never authenticates)", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const wrong = (await enroll("other-m1b")).secret;
+      for (let i = 0; i < 12; i++) {
+        await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+      }
+      const blocked = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+      );
+      expect(blocked.status).toBe(429);
+      expireVerifiedCacheForTests();
+      const before = argon2Stats.started;
+      const legit = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      expect(legit.status).toBe(200);
+      // Exempt from the limit, but still fully verified.
+      expect(argon2Stats.started).toBe(before + 1);
+    });
+  });
+
+  describe("argon2id pool isolation (security re-review N1)", () => {
+    it("allows one unrecognized verification in flight per agent id (L1)", async () => {
+      const auth = await enroll();
+      const wrong = (await enroll("l1-other")).secret;
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      expect(results.filter((r) => r.status === 401)).toHaveLength(1);
+      expect(results.filter((r) => r.status === 503)).toHaveLength(5);
+    });
+
+    it("saturated login and wrong-secret pools never block a known-good agent", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      expireVerifiedCacheForTests();
+      // Deterministic saturation of both unauthenticated pools.
+      const held = [
+        ...Array.from({ length: loginArgon2Gate.max }, () => loginArgon2Gate.tryAcquire()),
+        ...Array.from({ length: agentArgon2Gate.max }, () => agentArgon2Gate.tryAcquire()),
+      ];
+      try {
+        expect(loginArgon2Gate.tryAcquire()).toBeNull();
+        expect(agentArgon2Gate.tryAcquire()).toBeNull();
+        const wrong = (await enroll("n1-other")).secret;
+        const flooded = await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+        expect(flooded.status).toBe(503);
+        const legit = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+        expect(legit.status).toBe(200);
+      } finally {
+        for (const release of held) release?.();
+      }
+    });
+
+    it("a concurrent login flood + wrong secrets on random agents does not produce 503 for a known-good agent", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const victims = await Promise.all(Array.from({ length: 6 }, (_, i) => enroll(`n1-victim-${i}`)));
+      const wrong = (await enroll("n1-wrong")).secret;
+      expireVerifiedCacheForTests();
+      const floodLogins = Array.from({ length: 30 }, (_, i) =>
+        handleLogin(
+          new Request("http://console.test/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Origin: "http://console.test" },
+            body: JSON.stringify({ username: `flood${i}`, password: "wrong wrong wrong" }),
+          }),
+        ),
+      );
+      const floodAgents = victims.flatMap((v) =>
+        Array.from({ length: 3 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: v.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      const randomIds = Array.from({ length: 20 }, () =>
+        handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: randomUUID(), secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        ),
+      );
+      const legit = handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      const [legitRes] = await Promise.all([legit, ...floodLogins, ...floodAgents, ...randomIds]);
+      expect(legitRes.status).toBe(200);
+    });
+  });
+
+  describe("POST /heartbeat", () => {
+    it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
+      const auth = await enroll();
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(200);
+      const out = (await res.json()) as Record<string, unknown>;
+      expect(validateSchema("HeartbeatResponse", out).ok).toBe(true);
+      expect(out.heartbeat_interval_s).toBe(30);
+      expect(out.console_min_protocol).toBe(1);
+      const targets = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(targets).toHaveLength((body as { targets: unknown[] }).targets.length);
+      const [agent] = await getDb().select().from(agents).where(eq(agents.id, auth.agentId));
+      expect(agent?.status).toBe("online");
+      expect(agent?.lastSeenAt).not.toBeNull();
+    });
+
+    it.each(fixtures("invalid", "HeartbeatRequest"))("invalid fixture %s -> 400", async (_f, body) => {
+      const auth = await enroll();
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(400);
+      await expectConformingError(res, body);
+    });
+
+    it("marks targets absent from the last heartbeat", async () => {
+      const auth = await enroll();
+      await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...MINIMAL_HEARTBEAT, targets: [] } }));
+      const [t] = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(t?.present).toBe(false);
+    });
+  });
+
+  describe("GET /jobs (long-poll)", () => {
+    it("returns 204 immediately with wait=0 and after wait seconds otherwise", async () => {
+      const auth = await enroll();
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      pollClock.msPerSecond = 50;
+      const started = Date.now();
+      const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=2", { auth }));
+      expect(res.status).toBe(204);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(90);
+    });
+
+    it("rejects invalid query parameters", async () => {
+      const auth = await enroll();
+      for (const q of ["wait=26", "wait=-1", "wait=abc", "wait=1&wait=2", "foo=1", "wait=01"]) {
+        expect((await handlePollJobs(agentRequest("GET", `/jobs?${q}`, { auth }))).status).toBe(400);
+      }
+    });
+
+    it("wakes a held poll when a job is queued and serves a conforming JobList", async () => {
+      const auth = await enroll();
+      await jobHub.ready();
+      const poll = handlePollJobs(agentRequest("GET", "/jobs?wait=25", { auth }));
+      await new Promise((r) => setTimeout(r, 100));
+      const jobId = await enqueueJob(getDb(), {
+        agentId: auth.agentId,
+        type: "discovery.scan",
+        targetId: "pg-prod-1",
+        classifiersVersion: "2026.09.1",
+        params: SCAN_PARAMS,
+        expiresAt: new Date(Date.now() + 3600_000),
+      });
+      const started = Date.now();
+      const res = await poll;
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(res.status).toBe(200);
+      const list = (await res.json()) as { jobs: { job_id: string }[] };
+      expect(validateSchema("JobList", list).ok).toBe(true);
+      expect(list.jobs.map((j) => j.job_id)).toEqual([jobId]);
+      // Leased: not delivered again before the lease expires, then redelivered.
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      await getDb().update(jobs).set({ leaseUntil: new Date(Date.now() - 1000) }).where(eq(jobs.id, jobId));
+      const again = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+      expect(again.status).toBe(200);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
+      expect(row?.attempts).toBe(2);
+    });
+
+    it("never serves a job that does not conform to the contract", async () => {
+      const auth = await enroll();
+      const bad = await enqueueJob(getDb(), {
+        agentId: auth.agentId,
+        type: "agent.config.reload",
+        params: { config: "targets: [...]" },
+      });
+      const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+      expect(res.status).toBe(204);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, bad));
+      expect(row?.status).toBe("failed");
+    });
+
+    it("caps held polls per agent, reserving slots before any await (M2)", async () => {
+      const auth = await enroll();
+      // Warm the verified-secret cache (L1 allows one unrecognized verification per agent at once).
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      pollClock.msPerSecond = 100;
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => handlePollJobs(agentRequest("GET", "/jobs?wait=2", { auth }))),
+      );
+      const statuses = results.map((r) => r.status).sort();
+      expect(statuses).toEqual([204, 204, 429, 429, 429]);
+      expect(jobHub.heldPolls(auth.agentId)).toBe(0);
+    });
+
+    it("applies the held-poll slots to wait=0 too (L-a)", async () => {
+      const auth = await enroll();
+      const a = jobHub.reserveSlot(auth.agentId);
+      const b = jobHub.reserveSlot(auth.agentId);
+      try {
+        expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(429);
+      } finally {
+        if (typeof a === "function") a();
+        if (typeof b === "function") b();
+      }
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+    });
+
+    it("gives up a job delivered MAX_JOB_ATTEMPTS times without status (L7)", async () => {
+      const auth = await enroll();
+      const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "agent.config.reload", params: {} });
+      await getDb()
+        .update(jobs)
+        .set({ status: "delivered", attempts: MAX_JOB_ATTEMPTS, leaseUntil: new Date(Date.now() - 1000) })
+        .where(eq(jobs.id, id));
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+      expect(row?.status).toBe("failed");
+      expect(row?.error).toEqual({ code: "timeout" });
+    });
+
+    it("does not deliver expired jobs", async () => {
+      const auth = await enroll();
+      const id = await enqueueJob(getDb(), {
+        agentId: auth.agentId,
+        type: "agent.config.reload",
+        params: {},
+        expiresAt: new Date(Date.now() - 1000),
+      });
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+      expect(row?.status).toBe("expired");
+    });
+  });
+
+  describe("revocation", () => {
+    it("makes the secret unusable immediately (cache purged) and closes held polls", async () => {
+      const auth = await enroll();
+      const userId = await adminUser();
+      // Warm the verified-secret cache.
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      await jobHub.ready();
+      const held = handlePollJobs(agentRequest("GET", "/jobs?wait=25", { auth }));
+      await new Promise((r) => setTimeout(r, 100));
+      const started = Date.now();
+      expect(await revokeAgent(getDb(), auth.agentId, { userId, ip: "direct" })).toBe(true);
+      const closed = await held;
+      expect(closed.status).toBe(401);
+      expect(Date.now() - started).toBeLessThan(2000);
+      const after = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      expect(after.status).toBe(401);
+      const [agent] = await getDb().select().from(agents).where(eq(agents.id, auth.agentId));
+      expect(agent?.currentSecretHash).toBeNull();
+      expect(agent?.pendingSecretHash).toBeNull();
+      expect(agent?.status).toBe("revoked");
+      const audit = await getDb().select().from(auditLog).where(eq(auditLog.action, "agent.revoke"));
+      expect(audit.some((a) => a.targetId === auth.agentId && a.actorId === userId)).toBe(true);
+    });
+
+    it("is effective across console processes (cache bound to the stored hash)", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      // Another process revoked the agent: this process's cache was not purged explicitly.
+      await getDb()
+        .update(agents)
+        .set({ revokedAt: new Date(), currentSecretHash: null, status: "revoked" })
+        .where(eq(agents.id, auth.agentId));
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(401);
+    });
+  });
+
+  describe("audit log", () => {
+    it("is append-only at the database level (M5)", async () => {
+      await adminUser();
+      await expect(getDb().execute(sql`update audit_log set action = 'x'`)).rejects.toThrow();
+      await expect(getDb().execute(sql`delete from audit_log`)).rejects.toThrow();
+      await expect(getDb().execute(sql`truncate audit_log`)).rejects.toThrow();
+      const [n] = (await getDb().execute(sql`select count(*)::int as n from audit_log`)).rows;
+      expect(Number(n?.n)).toBeGreaterThan(0);
+    });
+
+    it("audits a revoke of an unknown or already revoked agent (L3)", async () => {
+      const userId = await adminUser();
+      const auth = await enroll();
+      expect(await revokeAgent(getDb(), auth.agentId, { userId, ip: null })).toBe(true);
+      expect(await revokeAgent(getDb(), auth.agentId, { userId, ip: null })).toBe(false);
+      const rows = await getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.targetId, auth.agentId), eq(auditLog.action, "agent.revoke")));
+      expect(rows.map((r) => r.outcome).sort()).toEqual(["failure", "success"]);
+    });
+  });
+
+  describe("database roles (R1, N2, L3, L4)", () => {
+    it("the runtime role cannot create schemas, create in public, or touch the audit log", async () => {
+      await adminUser();
+      const { url } = await createRuntimeRole();
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      try {
+        const [row] = (await client.query("select count(*)::int as n from users")).rows as { n: number }[];
+        expect(row?.n).toBeGreaterThan(0);
+        await client.query("insert into audit_log (actor_type, action) values ('system', 'user.bootstrap')");
+        for (const stmt of [
+          "create schema databastion",
+          "create schema attacker",
+          "create table public.planted (x int)",
+          "create function public.format(text, name) returns text language sql as 'select 1::text'",
+          "update audit_log set action = 'x'",
+          "delete from audit_log",
+          "truncate audit_log",
+          "alter table public.audit_log disable trigger all",
+          "drop trigger audit_log_no_update_delete on public.audit_log",
+          "drop table public.audit_log",
+        ]) {
+          await expect(client.query(stmt), stmt).rejects.toThrow();
+        }
+        expect(await runtimeRoleWarnings(client)).toEqual([]);
+      } finally {
+        await client.end();
+      }
+    });
+
+    it("databastion_app has no UPDATE, DELETE or TRUNCATE on audit_log and no CREATE on the database (L4)", async () => {
+      const { rows } = await getDb().execute(sql`
+        select has_table_privilege('databastion_app', 'public.audit_log', 'UPDATE') as upd,
+               has_table_privilege('databastion_app', 'public.audit_log', 'DELETE') as del,
+               has_table_privilege('databastion_app', 'public.audit_log', 'TRUNCATE') as trunc,
+               has_table_privilege('databastion_app', 'public.audit_log', 'INSERT') as ins,
+               has_database_privilege('databastion_app', current_database(), 'CREATE') as db_create,
+               has_schema_privilege('databastion_app', 'public', 'CREATE') as public_create,
+               has_schema_privilege('databastion_app', 'pgboss', 'CREATE') as pgboss_create`);
+      expect(rows[0]).toEqual({
+        upd: false,
+        del: false,
+        trunc: false,
+        ins: true,
+        db_create: false,
+        public_create: false,
+        pgboss_create: true,
+      });
+    });
+
+    it("warns when the console connects as the owner of audit_log (L3)", async () => {
+      const warnings = await runtimeRoleWarnings(getPool());
+      expect(warnings.some((w) => w.includes("owner of audit_log"))).toBe(true);
+    });
+
+    it("pg-boss installs and works as the runtime role in the pgboss schema", async () => {
+      const { url } = await createRuntimeRole();
+      const boss = new PgBoss(pgBossOptions(url));
+      boss.on("error", () => undefined);
+      await boss.start();
+      try {
+        await boss.createQueue("test.queue");
+        const id = await boss.send("test.queue", { n: 1 });
+        expect(id).toBeTruthy();
+        const jobsFetched = await boss.fetch("test.queue");
+        expect(jobsFetched.map((j) => j.id)).toEqual([id]);
+      } finally {
+        await boss.stop({ graceful: false });
+      }
+      const { rows } = await getDb().execute(
+        sql`select count(*)::int as n from pg_catalog.pg_tables where schemaname = 'pgboss'`,
+      );
+      expect(Number(rows[0]?.n)).toBeGreaterThan(0);
+    });
+  });
+
+  describe("POST /jobs/{job_id}/status", () => {
+    async function deliveredJob(agentId: string) {
+      const id = await enqueueJob(getDb(), {
+        agentId,
+        type: "discovery.scan",
+        targetId: "pg-prod-1",
+        classifiersVersion: "2026.09.1",
+        params: SCAN_PARAMS,
+      });
+      return id;
+    }
+
+    it.each(fixtures("valid", "JobStatusUpdate"))("valid fixture %s -> 204", async (_f, body) => {
+      const auth = await enroll();
+      const id = await deliveredJob(auth.agentId);
+      const update: Record<string, unknown> = { ...(body as Record<string, unknown>), ts: new Date().toISOString() };
+      const res = await handleJobStatus(agentRequest("POST", `/jobs/${id}/status`, { auth, body: update }), id);
+      expect(res.status).toBe(204);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+      expect(row?.status).toBe(update.status);
+    });
+
+    it.each(fixtures("invalid", "JobStatusUpdate"))("invalid fixture %s -> 400", async (_f, body) => {
+      const auth = await enroll();
+      const id = await deliveredJob(auth.agentId);
+      const res = await handleJobStatus(agentRequest("POST", `/jobs/${id}/status`, { auth, body }), id);
+      expect(res.status).toBe(400);
+      await expectConformingError(res, body);
+    });
+
+    it("404 for unknown or foreign jobs, 409 after a terminal status, ignores older updates", async () => {
+      const auth = await enroll();
+      const other = await enroll("other-host");
+      const foreign = await deliveredJob(other.agentId);
+      const ts = new Date().toISOString();
+      const running = { status: "running", ts };
+      expect(
+        (await handleJobStatus(agentRequest("POST", `/jobs/${foreign}/status`, { auth, body: running }), foreign)).status,
+      ).toBe(404);
+      const unknown = "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a";
+      expect(
+        (await handleJobStatus(agentRequest("POST", `/jobs/${unknown}/status`, { auth, body: running }), unknown)).status,
+      ).toBe(404);
+      expect(
+        (await handleJobStatus(agentRequest("POST", "/jobs/NOT-A-UUID/status", { auth, body: running }), "NOT-A-UUID")).status,
+      ).toBe(400);
+
+      const id = await deliveredJob(auth.agentId);
+      const post = (body: unknown) =>
+        handleJobStatus(agentRequest("POST", `/jobs/${id}/status`, { auth, body }), id);
+      expect((await post({ status: "running", ts, progress: { ratio: 0.5 } })).status).toBe(204);
+      const older = new Date(Date.parse(ts) - 60_000).toISOString();
+      expect((await post({ status: "running", ts: older, progress: { ratio: 0.1 } })).status).toBe(204);
+      const [mid] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+      expect(mid?.progress).toEqual({ ratio: 0.5 });
+      const future = new Date(Date.now() + 10 * 60_000).toISOString();
+      expect((await post({ status: "running", ts: future })).status).toBe(400);
+      expect((await post({ status: "succeeded", ts: new Date().toISOString() })).status).toBe(204);
+      const conflict = await post({ status: "running", ts: new Date().toISOString() });
+      expect(conflict.status).toBe(409);
+      expect(((await conflict.json()) as { code: string }).code).toBe("conflict");
+    });
+  });
+});

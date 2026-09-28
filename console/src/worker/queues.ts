@@ -8,6 +8,22 @@ import type { Logger } from "@/lib/logger";
  */
 export const NOOP_QUEUE = "console.noop";
 
+/**
+ * pg-boss runs in the `pgboss` schema, created by the owner in migration 0004. The runtime role
+ * has `USAGE, CREATE` on that schema only and no `CREATE` on the database, so pg-boss must not
+ * try to create its schema (security re-review N2).
+ */
+export const PGBOSS_SCHEMA = "pgboss";
+
+export function pgBossOptions(connectionString: string) {
+  return {
+    connectionString,
+    application_name: "databastion-worker",
+    schema: PGBOSS_SCHEMA,
+    createSchema: false,
+  };
+}
+
 export type NoopPayload = Record<string, never>;
 
 /** Acknowledges jobs without doing anything; proves the worker loop is wired. */
