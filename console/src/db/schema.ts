@@ -113,6 +113,11 @@ export const agents = pgTable(
     /** Previous secret hash, kept for the 60 s tolerance window after promotion (ADR-0008). */
     previousSecretHash: text("previous_secret_hash"),
     promotedAt: tsz("promoted_at"),
+    /**
+     * `grace_expires_at` of the rotation that produced the current secret, copied at promotion: the
+     * deadline answered to a late `S0 + S1` retry, even after a newer rotation started (ADR-0011).
+     */
+    promotedGraceExpiresAt: tsz("promoted_grace_expires_at"),
     lockedAt: tsz("locked_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),
@@ -230,4 +235,27 @@ export const auditLog = pgTable(
     details: jsonb("details").$type<Record<string, unknown>>(),
   },
   (t) => [index("audit_log_at_idx").on(t.at), index("audit_log_action_idx").on(t.action)],
+);
+
+// ------------------------------------------------------------------ security events
+
+/**
+ * Agent-integrity security events (placeholder for the P3 `incidents` model): `rotation_conflict`
+ * today, rejected batches and `batch_conflict` with P2-D. Raised by the console itself, never from
+ * agent-provided text: `details` only holds console-computed scalars (no secret, no hash).
+ */
+export const securityEvents = pgTable(
+  "security_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    at: tsz("at").notNull().defaultNow(),
+    /** Closed set, e.g. `agent.rotation_conflict`. */
+    kind: text("kind").notNull(),
+    severity: text("severity").notNull(),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
+    details: jsonb("details").$type<Record<string, string | number | boolean | null>>(),
+    acknowledgedAt: tsz("acknowledged_at"),
+    acknowledgedBy: uuid("acknowledged_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [index("security_events_at_idx").on(t.at), index("security_events_agent_idx").on(t.agentId)],
 );

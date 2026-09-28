@@ -18,6 +18,10 @@ export type AuditAction =
   | "enrollment_token.revoke"
   | "agent.enroll"
   | "agent.revoke"
+  | "agent.rotate_request"
+  | "agent.rotate"
+  | "agent.secret_promote"
+  | "agent.rotation_conflict"
   | "user.access_denied";
 
 export interface AuditEntry {
