@@ -1,0 +1,211 @@
+# DataBastion dev environment. Start with `make dev` from the repository root; see dev/README.md.
+# - Every port is published on 127.0.0.1 only.
+# - Credentials come from dev/.env (copy of dev/.env.example): dev-only values.
+# - Images are pinned by tag AND index digest (multi-arch).
+# - Engine logs used by Audit are written under dev/.state/logs/ (git-ignored). `make dev` creates
+#   those directories world-writable first, so the engines' non-root users can write to them; if you
+#   run `docker compose` directly, run `make dev-dirs` before.
+name: databastion-dev
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 5s
+  retries: 60
+  start_period: 20s
+
+services:
+  postgres:
+    build: ./postgres
+    image: databastion-dev/postgres:17.11-pgaudit
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?copy dev/.env.example to dev/.env}
+      POSTGRES_DB: shop
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pgaudit,pg_stat_statements
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - logging_collector=on
+      - -c
+      - log_destination=jsonlog
+      - -c
+      - log_directory=/var/log/databastion
+      - -c
+      - log_filename=postgresql.log
+      - -c
+      - log_file_mode=0644
+      # pgaudit: nothing server-wide; `read, write` on the `shop` database (ALTER DATABASE in
+      # initdb/20-databastion.sh) and object audit of the seeded tables via databastion_auditor.
+      - -c
+      - pgaudit.log=none
+      - -c
+      - pgaudit.role=databastion_auditor
+      - -c
+      - pgaudit.log_relation=on
+      - -c
+      - pgaudit.log_catalog=off
+      - -c
+      - pgaudit.log_parameter=off
+      - -c
+      - pg_stat_statements.track=all
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./.state/logs/postgres:/var/log/databastion
+      - ./seed/out/postgres.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./postgres/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+    healthcheck:
+      # TCP only: the temporary server used during initialization listens on the Unix socket only,
+      # so the service becomes healthy after seeding.
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U databastion -d shop"]
+      <<: *healthcheck
+
+  mariadb:
+    image: mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    ports:
+      - "127.0.0.1:${MARIADB_PORT:-3307}:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./.state/logs/mariadb:/var/log/databastion
+      - ./mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
+      - ./seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+    healthcheck:
+      # --connect fails while the entrypoint's temporary (--skip-networking) server is seeding.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      <<: *healthcheck
+
+  mysql:
+    image: mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
+      - ./seed/out/mysql.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./mysql/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+    healthcheck:
+      # TCP: the temporary server used during initialization runs with --skip-networking.
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$DATABASTION_DB_PASSWORD\" mysql -h 127.0.0.1 -u databastion -N -e 'SELECT 1 FROM hr.employees LIMIT 1'"]
+      <<: *healthcheck
+
+  mongo:
+    image: mongo:8.0.32@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    # Community edition: no audit log. Profiler level 1 + structured JSON log (docs/08: Limited -> Partial).
+    command:
+      - mongod
+      - --profile
+      - "1"
+      - --slowms
+      - "${MONGO_SLOWMS:-0}"
+      - --logpath
+      - /var/log/databastion/mongod.log
+      - --logappend
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+      - ./.state/logs/mongodb:/var/log/databastion
+      - ./seed/out/mongo.json:/seed/mongo.json:ro
+      - ./mongo/initdb/10-seed.js:/docker-entrypoint-initdb.d/10-seed.js:ro
+    healthcheck:
+      # Healthy only once the final server runs with --auth (the init server runs without it).
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --norc "mongodb://databastion:$$DATABASTION_DB_PASSWORD@127.0.0.1:27017/admin"
+          --eval 'if (!db.adminCommand({getCmdLineOpts: 1}).argv.includes("--auth")) quit(1)'
+      <<: *healthcheck
+
+  openldap:
+    build: ./openldap
+    image: databastion-dev/openldap:bookworm-20260918
+    environment:
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD:?copy dev/.env.example to dev/.env}
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    ports:
+      - "127.0.0.1:${LDAP_PORT:-1389}:389"
+    volumes:
+      - openldap-config:/etc/ldap/slapd.d
+      - openldap-data:/var/lib/ldap
+      - ./seed/out/openldap.ldif:/seed/openldap.ldif:ro
+    healthcheck:
+      # ldapi + EXTERNAL on cn=config: does not touch the audited tree, so no cn=accesslog noise.
+      test: ["CMD", "ldapsearch", "-Q", "-Y", "EXTERNAL", "-H", "ldapi:///", "-b", "cn=config", "-s", "base", "-LLL", "dn"]
+      <<: *healthcheck
+
+  mailpit:
+    image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
+    environment:
+      MP_MAX_MESSAGES: "500"
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      <<: *healthcheck
+
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      <<: *healthcheck
+
+  grafana:
+    image: grafana/grafana:12.4.11@sha256:3ea272e5cab64a4a62240c682e2c62433b25614d956d44c299a10cb6994f6f2e
+    depends_on:
+      prometheus: { condition: service_healthy }
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?copy dev/.env.example to dev/.env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      <<: *healthcheck
+
+volumes:
+  postgres-data:
+  mariadb-data:
+  mysql-data:
+  mongo-data:
+  openldap-config:
+  openldap-data:
+  prometheus-data:
+  grafana-data:

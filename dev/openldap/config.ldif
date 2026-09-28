@@ -1,0 +1,73 @@
+# cn=config for the DataBastion dev OpenLDAP. Placeholders @ADMIN_PW_HASH@ and @SERVICE_DN@ are
+# substituted by the entrypoint. Loaded offline with `slapadd -n 0`.
+dn: cn=config
+objectClass: olcGlobal
+cn: config
+olcPidFile: /run/slapd/slapd.pid
+olcArgsFile: /run/slapd/slapd.args
+olcLogLevel: stats
+
+dn: cn=module{0},cn=config
+objectClass: olcModuleList
+cn: module{0}
+olcModulePath: /usr/lib/ldap
+olcModuleLoad: back_mdb
+olcModuleLoad: accesslog
+
+dn: cn=schema,cn=config
+objectClass: olcSchemaConfig
+cn: schema
+
+include: file:///etc/ldap/schema/core.ldif
+include: file:///etc/ldap/schema/cosine.ldif
+include: file:///etc/ldap/schema/nis.ldif
+include: file:///etc/ldap/schema/inetorgperson.ldif
+
+dn: olcDatabase={-1}frontend,cn=config
+objectClass: olcDatabaseConfig
+objectClass: olcFrontendConfig
+olcDatabase: {-1}frontend
+olcSizeLimit: 1000
+
+dn: olcDatabase={0}config,cn=config
+objectClass: olcDatabaseConfig
+olcDatabase: {0}config
+olcAccess: {0}to * by dn.exact=gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth manage by * none
+
+# Audit database written by slapo-accesslog. Read by the databastion service DN (docs/05-security.md).
+dn: olcDatabase={1}mdb,cn=config
+objectClass: olcDatabaseConfig
+objectClass: olcMdbConfig
+olcDatabase: {1}mdb
+olcSuffix: cn=accesslog
+olcRootDN: cn=accesslog
+olcDbDirectory: /var/lib/ldap/accesslog
+olcDbMaxSize: 268435456
+olcDbIndex: default eq
+olcDbIndex: objectClass,entryCSN,reqStart,reqEnd,reqResult,reqType,reqDN
+olcAccess: {0}to * by dn.exact="@SERVICE_DN@" read by dn.exact="cn=admin,dc=example,dc=org" read by * none
+
+# Directory data (seeded from dev/seed/out/openldap.ldif).
+dn: olcDatabase={2}mdb,cn=config
+objectClass: olcDatabaseConfig
+objectClass: olcMdbConfig
+olcDatabase: {2}mdb
+olcSuffix: dc=example,dc=org
+olcRootDN: cn=admin,dc=example,dc=org
+olcRootPW: @ADMIN_PW_HASH@
+olcDbDirectory: /var/lib/ldap/data
+olcDbMaxSize: 268435456
+olcDbIndex: objectClass eq
+olcDbIndex: uid,mail eq
+# The service account can authenticate and read the tree, but never password hashes.
+olcAccess: {0}to attrs=userPassword by self =xw by anonymous auth by * none
+olcAccess: {1}to * by dn.exact="@SERVICE_DN@" read by self read by * none
+
+dn: olcOverlay={0}accesslog,olcDatabase={2}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcAccessLogConfig
+olcOverlay: {0}accesslog
+olcAccessLogDB: cn=accesslog
+olcAccessLogOps: reads writes session
+olcAccessLogSuccess: FALSE
+olcAccessLogPurge: 07+00:00 01+00:00
