@@ -13,9 +13,9 @@ Notation as in ADR-0010: `S0` is the previous secret, `S1` the new secret regist
 
 ## Decision
 - **Late retry**: a `/rotate` authenticated with `S0` whose `new_secret` matches the **current** (promoted) secret is an idempotent retry **at any time**, not only inside the 60 s window. The console answers `200` with `duplicate: true` and the deadline of that rotation (`grace_expires_at` as originally set), and never locks the agent. Only the holder of `S1` can send it, so it reveals nothing and grants nothing.
-- **Every other outcome of a `/rotate` authenticated with `S0` after the window locks the agent** (`409 rotation_conflict` + security event): invalid body, low-entropy or any other `new_secret`, unknown `job_id`. This path has exactly two outcomes, the late-retry duplicate or a lock; it never answers `400`, `404`, `429` or `503`.
+- **Every other outcome of a `/rotate` authenticated with `S0` after the window locks the agent** (`409 rotation_conflict` + security event): invalid body, low-entropy or any other `new_secret`, unknown `job_id`. Once the console has recognized a stale `S0`, this path has exactly two outcomes, the late-retry duplicate or a lock; it never answers `400`, `404`, `429` or `503`. Answers given before the secret is recognized (protocol headers, authentication rate limit, verification capacity) are the same as for any secret; a stale `S0` that was replaced meanwhile, or of a revoked agent, gets `401`.
 - **Other endpoints**: a request authenticated with `S0` after the window on any endpoint other than `/rotate` is a `rotation_conflict`, unchanged from ADR-0010.
-- **Bound**: late retries are limited to 10 per agent per 5 minutes; the 11th locks the agent.
+- **Bound**: late retries are limited to 10 per agent per 5-minute window (a fixed window, per console process in the MVP); the 11th locks the agent.
 - **Agent**: when the outcome of a `/rotate` is unknown, the agent first tries its pending `S1` (a heartbeat used as a probe) and re-sends `/rotate` with `S0` only if `S1` is refused. Implemented in P1-B (#20).
 
 ### Errata to ADR-0010
