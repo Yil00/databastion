@@ -1,0 +1,50 @@
+{
+  "batch_id": "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f",
+  "job_id": "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "pg-prod-1",
+      "location": {
+        "engine": "postgres",
+        "database": "crm",
+        "schema": "public",
+        "object": "clients",
+        "field": "email"
+      },
+      "classifier": "pii.email",
+      "confidence": -0.1,
+      "sampled": 200,
+      "matched": 194,
+      "estimated_rows": 1250000,
+      "masked_samples": [
+        "j*******@e******.com",
+        "m****@e******.org"
+      ],
+      "fingerprints": [
+        "hmac-sha256:9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f",
+        "hmac-sha256:4141414141414141414141414141414141414141414141414141414141414141"
+      ]
+    },
+    {
+      "target_id": "pg-prod-1",
+      "location": {
+        "engine": "postgres",
+        "database": "crm",
+        "schema": "public",
+        "object": "clients",
+        "field": "iban"
+      },
+      "classifier": "pii.iban",
+      "confidence": 1,
+      "sampled": 200,
+      "matched": 200,
+      "masked_samples": [
+        "FR76 **** **** **** **** ***1 89"
+      ],
+      "fingerprints": [
+        "hmac-sha256:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c"
+      ]
+    }
+  ]
+}

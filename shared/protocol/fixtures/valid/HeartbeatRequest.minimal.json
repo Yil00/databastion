@@ -1,0 +1,15 @@
+{
+  "ts": "2026-09-28T14:02:00Z",
+  "agent_version": "0.1.0",
+  "uptime_s": 12,
+  "connectors": [
+    "postgres"
+  ],
+  "targets": [],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

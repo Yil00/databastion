@@ -1,0 +1,39 @@
+{
+  "batch_id": "01920f61-4d2b-7c3f-8011-6b2c3d4e5f60",
+  "job_id": "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "ldap-main",
+      "location": {
+        "engine": "openldap",
+        "database": "dc=example,dc=com",
+        "object": "inetOrgPerson",
+        "field": "mail"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.99,
+      "sampled": 200,
+      "matched": 199,
+      "masked_samples": [
+        "j*******@e******.com"
+      ]
+    },
+    {
+      "target_id": "ldap-main",
+      "location": {
+        "engine": "openldap",
+        "database": "dc=example,dc=com",
+        "object": "ou=people",
+        "field": "userPassword"
+      },
+      "classifier": "secret.password_hash",
+      "confidence": 1,
+      "sampled": 200,
+      "matched": 200,
+      "masked_samples": [
+        "{SSHA}****************"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,957 @@
+{
+  "ts": "2026-09-28T14:02:00Z",
+  "agent_version": "0.1.0",
+  "uptime_s": 86400,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap"
+  ],
+  "targets": [
+    {
+      "target_id": "t0",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t1",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t2",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t3",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t4",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t5",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t6",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t7",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t8",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t9",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t10",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t11",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t12",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t13",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t14",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t15",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t16",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t17",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t18",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t19",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t20",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t21",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t22",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t23",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t24",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t25",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t26",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t27",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t28",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t29",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t30",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t31",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t32",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t33",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t34",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t35",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t36",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t37",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t38",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t39",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t40",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t41",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t42",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t43",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t44",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t45",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t46",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t47",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t48",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t49",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t50",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t51",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t52",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t53",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t54",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t55",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t56",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t57",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t58",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t59",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t60",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t61",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t62",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t63",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    },
+    {
+      "target_id": "t64",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      }
+    }
+  ],
+  "detected_targets": [
+    {
+      "engine": "postgres",
+      "unix_socket": "/var/run/postgresql/.s.PGSQL.5433",
+      "port": 5433,
+      "process": "postgres"
+    },
+    {
+      "engine": "mariadb",
+      "unix_socket": "/run/mysqld/mysqld.sock",
+      "process": "mariadbd"
+    },
+    {
+      "engine": "mongodb",
+      "port": 27018
+    }
+  ],
+  "running_jobs": [
+    "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a"
+  ],
+  "spool": {
+    "bytes": 524288,
+    "max_bytes": 104857600,
+    "batches": 3,
+    "oldest_age_s": 95,
+    "dropped_batches": 0
+  },
+  "metrics": {
+    "uplink_requests_total": 10234,
+    "uplink_errors_total": 3,
+    "heartbeat_duration_seconds": 0.042,
+    "process_resident_memory_bytes": 31457280
+  }
+}

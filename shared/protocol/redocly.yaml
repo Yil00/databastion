@@ -1,0 +1,5 @@
+# Local Redocly configuration for the protocol contract.
+# CI (.github/workflows/ci.yml) currently lints with the default "recommended" ruleset;
+# the contract also passes the stricter set below (`npm run lint`).
+extends:
+  - recommended-strict

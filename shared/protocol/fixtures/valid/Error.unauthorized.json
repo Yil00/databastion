@@ -1,0 +1,4 @@
+{
+  "code": "unauthorized",
+  "message": "Invalid or revoked agent credentials."
+}

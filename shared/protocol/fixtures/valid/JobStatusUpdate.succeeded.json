@@ -1,0 +1,11 @@
+{
+  "status": "succeeded",
+  "ts": "2026-09-28T14:12:00Z",
+  "progress": {
+    "ratio": 1,
+    "objects_done": 412,
+    "objects_total": 412,
+    "findings": 31,
+    "batches": 2
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "ts": "2026-09-29T15:00:00Z",
+  "error": {
+    "code": "expired"
+  }
+}
