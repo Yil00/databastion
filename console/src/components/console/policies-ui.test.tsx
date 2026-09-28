@@ -26,6 +26,7 @@ const incident = (over: Partial<IncidentView> = {}): IncidentView => ({
   policyName: "Emails",
   policyRevision: 1,
   source: "finding",
+  access: null,
   findingId: "01890a5d-ac96-774b-bcce-b302099a8050",
   agentId: "01890a5d-ac96-774b-bcce-b302099a8058",
   agentName: "db-host-1",

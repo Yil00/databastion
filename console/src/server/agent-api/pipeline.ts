@@ -8,6 +8,8 @@ import { agentError, invalidRequest, NO_STORE, unavailable } from "./errors";
 export const CONSOLE_MIN_PROTOCOL = 1;
 export const MAX_PROTOCOL_V1 = 1;
 export const HEARTBEAT_INTERVAL_S = 30;
+/** Console-side clock skew tolerance on agent timestamps (contract: 5 min, `formatMaximum`). */
+export const MAX_FUTURE_SKEW_MS = 5 * 60_000;
 
 const PROTOCOL_HEADER = /^[0-9]{1,3}$/;
 const USER_AGENT = /^databastion-agent\/[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$/;

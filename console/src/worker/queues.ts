@@ -5,6 +5,7 @@ import { errorSummary, type Logger } from "@/lib/logger";
 import { silentAgentThresholdS } from "@/server/alerting-config";
 import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
+import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
 import { drainDeliveries, enqueueSuppressionDigests } from "@/server/notifications";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 import { checkSilentAgents } from "@/server/system-alerts";
@@ -12,7 +13,8 @@ import { checkSilentAgents } from "@/server/system-alerts";
 /**
  * Queues handled by the worker: `console.noop` (wiring check), `policies.evaluate` (P3-A, see
  * src/server/policy-queue.ts) and `notifications.deliver` (P3-C, see
- * src/server/notification-queue.ts). Correlation arrives with its ROADMAP task.
+ * src/server/notification-queue.ts) and `events.purge` (P4-C: retention of access events). The
+ * correlation of access events runs in `policies.evaluate` (src/server/event-engine.ts).
  */
 export const NOOP_QUEUE = "console.noop";
 /** Catch-up schedule of the policy engine (lost wake-ups, restarts, exception expiries). */
@@ -141,4 +143,43 @@ export async function registerNotificationQueue(
 export async function scheduleNotificationQueue(boss: PgBoss): Promise<void> {
   await boss.schedule(NOTIFICATION_QUEUE, NOTIFICATION_SCHEDULE_CRON, {});
   await boss.send(NOTIFICATION_QUEUE, {});
+}
+
+/** Retention of access events (P4-C): hourly, and once at worker start. */
+export const EVENTS_PURGE_QUEUE = "events.purge";
+export const EVENTS_PURGE_CRON = "17 * * * *";
+export const EVENTS_PURGE_BUDGET_MS = 50_000;
+
+/**
+ * `events.purge`: deletes the access events older than `DATABASTION_EVENTS_RETENTION_DAYS` (default
+ * 90) through the owner-defined purge function (the runtime role cannot delete events otherwise),
+ * in chunks; re-queued when rows remain after the time budget.
+ */
+export function createEventsPurgeHandler(
+  db: () => Database,
+  log: Logger,
+  requeue: () => Promise<unknown>,
+  opts: { budgetMs?: number; retentionDays?: () => number } = {},
+) {
+  return async (jobs: Job<Record<string, unknown>>[]): Promise<void> => {
+    if (jobs.length === 0) return;
+    const retentionDays = (opts.retentionDays ?? eventsRetentionDays)();
+    const stats = await purgeAccessEvents(db(), { retentionDays, budgetMs: opts.budgetMs ?? EVENTS_PURGE_BUDGET_MS });
+    if (stats.deleted > 0) log.info({ queue: EVENTS_PURGE_QUEUE, deleted: stats.deleted, retentionDays }, "access events purged");
+    if (stats.more) {
+      await requeue().catch((err: unknown) =>
+        log.warn({ queue: EVENTS_PURGE_QUEUE, error: errorSummary(err) }, "events purge re-queue failed"),
+      );
+    }
+  };
+}
+
+export async function registerEventsPurgeQueue(boss: PgBoss, db: () => Database, log: Logger): Promise<void> {
+  await boss.createQueue(EVENTS_PURGE_QUEUE, { policy: "stately" });
+  await boss.work(EVENTS_PURGE_QUEUE, { pollingIntervalSeconds: 30 }, createEventsPurgeHandler(db, log, () => boss.send(EVENTS_PURGE_QUEUE, {})));
+}
+
+export async function scheduleEventsPurgeQueue(boss: PgBoss): Promise<void> {
+  await boss.schedule(EVENTS_PURGE_QUEUE, EVENTS_PURGE_CRON, {});
+  await boss.send(EVENTS_PURGE_QUEUE, {});
 }

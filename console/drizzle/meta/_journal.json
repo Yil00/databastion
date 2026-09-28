@@ -148,6 +148,20 @@
       "when": 1790628183929,
       "tag": "0020_notification_rate_limit_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790631838089,
+      "tag": "0021_p4c_access_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790631854042,
+      "tag": "0022_p4c_events_grants",
+      "breakpoints": true
     }
   ]
 }

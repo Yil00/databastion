@@ -210,6 +210,8 @@ export function scanJobRegistryDetails(job: Schemas["Job"], prefix: string): Val
  *   `FindingsBatch.findings[].masked_samples[]`; a test fails if the contract adds another use.
  * - `JobList` / `Job` / `DiscoveryScanJob` (outgoing, P1-A gate): a scan job's
  *   `classifiers_version` and `params.classifiers` ids are registered (`scanJobRegistryDetails`).
+ * - `EventsBatch`: `ts_last >= ts` for each event (keyword `formatMinimum`, item pointer). The
+ *   future-timestamp bound depends on the clock and is checked at ingestion (`events.ts`).
  * Reserved metric names (`HeartbeatRequest.metrics`) are not rejected: the contract says they are
  * ignored, which is the job of the `/metrics` exporter.
  */
@@ -242,6 +244,15 @@ export function checkSemantics<K extends SchemaName>(
           details.push({ pointer: `/findings/${i}/masked_samples/${j}`, keyword: "maskRatio" });
         }
       });
+    });
+  }
+  if (name === "EventsBatch") {
+    // Contract "Console-side checks": `ts_last >= ts`. Keyword `formatMinimum` (the JSON Schema
+    // keyword of a lower bound on a formatted value), pointer on the item so the agent drops it.
+    (value as Schemas["EventsBatch"]).events.forEach((event, i) => {
+      if (details.length < MAX_VALIDATION_DETAILS && event.ts_last !== undefined && Date.parse(event.ts_last) < Date.parse(event.ts)) {
+        details.push({ pointer: `/events/${i}/ts_last`, keyword: "formatMinimum" });
+      }
     });
   }
   return details.length === 0 ? { ok: true, value } : { ok: false, details };

@@ -6,6 +6,8 @@
 
 export interface IncidentOpenedPayload {
   event: "incident.opened";
+  /** Absent in rows written before P4-C. */
+  source?: "finding";
   occurred_at: string;
   url: string | null;
   incident: { id: string; severity: string; status: "open"; reopened_from: string | null };
@@ -16,6 +18,41 @@ export interface IncidentOpenedPayload {
   classifiers_version: string;
   location: { engine: string; database: string; schema: string | null; object: string; field: string };
   counts: { sampled: number; matched: number; confidence: number };
+}
+
+/**
+ * A new incident raised from Audit access events (P4-C). Same `event` as a finding incident (same
+ * hourly budget, same receivers); `source` tells them apart. No value: the principal, normalized
+ * object names, counts, score and signals only (ADR-0007).
+ */
+export interface AccessIncidentOpenedPayload {
+  event: "incident.opened";
+  source: "access_event";
+  occurred_at: string;
+  url: string | null;
+  incident: { id: string; severity: string; status: "open"; reopened_from: null };
+  policy: { id: string; name: string; revision: number };
+  agent_id: string;
+  target_id: string;
+  /** `db_user`, or the `hmac-sha256:` fingerprint the agent sent in its place. */
+  principal: string;
+  principal_fingerprinted: boolean;
+  /** Database of the dedup scope (null for an event without object). */
+  database: string | null;
+  /** Start of the UTC hour of the dedup scope. */
+  hour: string;
+  /** The first event of the incident. */
+  access: {
+    ts: string;
+    action: string;
+    source: string;
+    rows: number | null;
+    score: number;
+    sensitivity: number;
+    anomaly: boolean;
+    signals: string[];
+    objects: { database: string; schema: string | null; object: string }[];
+  };
 }
 
 export interface AgentSilentPayload {
@@ -70,6 +107,7 @@ export interface SuppressedPayload {
 export type NotificationPayload =
   | SuppressedPayload
   | IncidentOpenedPayload
+  | AccessIncidentOpenedPayload
   | AgentSilentPayload
   | AgentRecoveredPayload
   | AgentIntegrityPayload
@@ -92,11 +130,42 @@ function locationText(l: IncidentOpenedPayload["location"]): string {
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
 
+function objectText(o: AccessIncidentOpenedPayload["access"]["objects"][number]): string {
+  return [o.database, o.schema, o.object].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
+}
+
+function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { subject: string; text: string } {
+  const a = p.access;
+  const objects = a.objects.slice(0, 5).map(objectText).join(", ") + (a.objects.length > 5 ? `, and ${a.objects.length - 5} more` : "");
+  const lines = [
+    "A new incident was opened from database access events.",
+    "",
+    `Incident:   ${p.incident.id}`,
+    `Severity:   ${p.incident.severity}`,
+    `Policy:     ${one(p.policy.name, 100)} (rev. ${p.policy.revision}, ${p.policy.id})`,
+    `Agent:      ${p.agent_id}`,
+    `Target:     ${one(p.target_id, 128)}`,
+    `Principal:  ${one(p.principal, 128)}${p.principal_fingerprinted ? " (fingerprint of an unknown or non-conforming account name)" : ""}`,
+    `Database:   ${p.database === null ? "none" : one(p.database, 128)} (hour starting ${p.hour})`,
+    `Access:     ${one(a.action, 16)} at ${a.ts} (${one(a.source, 32)})`,
+    `Objects:    ${objects || "none"}`,
+    `Rows:       ${a.rows === null ? "not reported by the source" : a.rows}`,
+    `Score:      ${a.score} (sensitivity ${a.sensitivity})${a.anomaly ? ", above the principal's baseline" : ""}`,
+    `Signals:    ${a.signals.map((s) => one(s, 64)).join(", ") || "none"}`,
+    `Opened at:  ${p.occurred_at}`,
+  ];
+  return {
+    subject: `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)} (${one(p.principal, 64)})`,
+    text: `${lines.join("\n")}\n${link}${FOOTER}`,
+  };
+}
+
 /** Subject and plain-text body of the alert e-mail. */
 export function renderEmail(payload: NotificationPayload): { subject: string; text: string } {
   const link = (url: string | null) => (url ? `\nOpen in the console: ${url}\n` : "");
   switch (payload.event) {
     case "incident.opened": {
+      if (payload.source === "access_event") return renderAccessIncident(payload, link(payload.url));
       const p = payload;
       const subject = `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)}`;
       const lines = [

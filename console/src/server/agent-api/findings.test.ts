@@ -23,7 +23,7 @@ import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
-import { findingsPerAgent, findingsRequestsPerAgent, handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
 
 // The real registry plus a second, test-only classifier set sharing `pii.email` with 2026.09.1.
 vi.mock("@/generated/protocol/classifiers.gen", async (importOriginal) => {
@@ -800,15 +800,6 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(row?.matched).toBe(194);
       const view = await listFindings(getDb(), { agentId: auth.agentId });
       expect(view[0]?.samples).toEqual({ state: "none" });
-    });
-  });
-
-  describe("POST /events", () => {
-    it("stays 501 until phase 4, with a contract Error body", async () => {
-      const res = handleEventsNotImplemented();
-      expect(res.status).toBe(501);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      expect((await expectConformingError(res, {})).code).toBe("unavailable");
     });
   });
 });

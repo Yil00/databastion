@@ -15,8 +15,8 @@ import {
   REASON_MAX,
   incidentSeverityOf,
   notifyChannelsOf,
-  type FindingConditions,
   type LocationPattern,
+  type PolicyConditions,
   type PolicyAction,
   type PolicySource,
   type Severity,
@@ -40,7 +40,7 @@ export interface PolicyInput {
   description: string | null;
   enabled: boolean;
   source: PolicySource;
-  conditions: FindingConditions;
+  conditions: PolicyConditions;
   actions: PolicyAction[];
 }
 
@@ -95,13 +95,14 @@ export function parsePolicyInput(
 }
 
 /** Audit details of a policy: identifiers, flags and counts only (no free text). */
-function policyAuditDetails(p: { enabled: boolean; source: string; conditions: FindingConditions; actions: PolicyAction[]; revision: number }) {
+function policyAuditDetails(p: { enabled: boolean; source: string; conditions: PolicyConditions; actions: PolicyAction[]; revision: number }) {
   return {
     source: p.source,
     enabled: p.enabled,
     revision: p.revision,
     condition_keys: Object.keys(p.conditions).sort().join(","),
-    classifiers: p.conditions.classifiers?.join(",") ?? null,
+    classifiers: "classifiers" in p.conditions ? (p.conditions.classifiers?.join(",") ?? null) : null,
+    signals: "signals" in p.conditions ? (p.conditions.signals?.join(",") ?? null) : null,
     severity: incidentSeverityOf(p.actions),
     notify_channels: notifyChannelsOf(p.actions).join(","),
   };
@@ -200,7 +201,7 @@ export async function updatePolicy(db: Database, id: string, input: Partial<Poli
               ...policyAuditDetails({
                 enabled: row.enabled,
                 source: row.source,
-                conditions: row.conditions as FindingConditions,
+                conditions: row.conditions as PolicyConditions,
                 actions: row.actions as unknown as PolicyAction[],
                 revision: row.revision,
               }),
@@ -240,13 +241,16 @@ export interface PolicyView {
   description: string | null;
   enabled: boolean;
   source: PolicySource;
-  conditions: FindingConditions;
+  conditions: PolicyConditions;
   actions: PolicyAction[];
   severity: Severity;
   notifyChannels: string[];
   revision: number;
   updatedAt: Date;
-  /** The worker has applied the latest change to the existing findings. */
+  /**
+   * The worker has applied the latest change to the existing findings. Always true for an
+   * `access_event` policy: it applies to the events evaluated after the change, never to past ones.
+   */
   evaluated: boolean;
 }
 
@@ -262,7 +266,7 @@ export async function listPolicies(db: Database): Promise<PolicyView[]> {
       actions: policies.actions,
       revision: policies.revision,
       updatedAt: policies.updatedAt,
-      evaluated: sql<boolean>`${policies.evaluatedAt} is not null and ${policies.evaluatedAt} >= ${policies.changedAt}`,
+      evaluated: sql<boolean>`${policies.source} = 'access_event' or (${policies.evaluatedAt} is not null and ${policies.evaluatedAt} >= ${policies.changedAt})`,
     })
     .from(policies)
     .orderBy(asc(sql`lower(${policies.name})`));
@@ -270,7 +274,7 @@ export async function listPolicies(db: Database): Promise<PolicyView[]> {
     const actions = r.actions as unknown as PolicyAction[];
     return {
       ...r,
-      conditions: r.conditions as FindingConditions,
+      conditions: r.conditions as PolicyConditions,
       actions,
       severity: incidentSeverityOf(actions),
       notifyChannels: notifyChannelsOf(actions),

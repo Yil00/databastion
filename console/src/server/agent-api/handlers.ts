@@ -4,6 +4,7 @@ import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
+import { ingestEvents } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
 import { requestPolicyEvaluation } from "@/server/policy-queue";
@@ -28,6 +29,7 @@ import {
   CONSOLE_MIN_PROTOCOL,
   guarded,
   HEARTBEAT_INTERVAL_S,
+  MAX_FUTURE_SKEW_MS,
   readValidBody,
   validateBody,
 } from "./pipeline";
@@ -162,8 +164,7 @@ async function stillActive(agentId: string, matchedHash: string): Promise<boolea
   return !!row && row.revokedAt === null && row.lockedAt === null && row.hash === matchedHash;
 }
 
-/** Console-side clock skew tolerance on agent timestamps (contract: 5 min). */
-export const MAX_FUTURE_SKEW_MS = 5 * 60_000;
+export { MAX_FUTURE_SKEW_MS };
 
 export function handleJobStatus(req: Request, jobId: string): Promise<Response> {
   return guarded("job_status", async () => {
@@ -371,10 +372,65 @@ export function handleFindings(req: Request): Promise<Response> {
 }
 
 /**
- * `POST /events`: Audit lands in phase 4. Answers `501` with a contract `Error` body (`unavailable`:
- * the closest code; the contract has no "not implemented" one), without reading the body or
- * authenticating: nothing is stored, the agent keeps its spool and retries with backoff.
+ * Events batches per agent per minute, per process, counted like {@link findingsPerAgent} (only
+ * stored batches consume it): at most 60 x 500 = 30 000 events per agent and minute.
  */
-export function handleEventsNotImplemented(): Response {
-  return agentError(501, "unavailable", { retryAfterS: 3600 });
+export const eventsPerAgent = new RateLimiter(60, 60_000);
+/** Every authenticated `POST /events` request of an agent, whatever its outcome: 300 per minute. */
+export const eventsRequestsPerAgent = new RateLimiter(300, 60_000);
+
+/**
+ * `POST /events` (P4-C). Same pipeline as `/findings`: headers, authentication, body (4 MiB cap:
+ * `413`), `validateSchema` then `checkSemantics` (`400`: unknown fields such as query text, names
+ * and account names that fail the contract patterns, `ts_last < ts`, batch over 1 MiB), then
+ * `ingestEvents`: idempotency on (`agent_id`, `batch_id`), target ownership (`404`, item pointers),
+ * future timestamps (`400`), storage. A rejected batch, a `batch_conflict` and an event for a
+ * target the agent does not own are agent-integrity events. Accepted batches wake the worker, which
+ * scores the events and applies the `access_event` policies. The body is never logged.
+ */
+export function handleEvents(req: Request): Promise<Response> {
+  return guarded("events", async () => {
+    const auth = await preamble(req);
+    if (!auth.ok) return auth.response;
+    const agentId = auth.agent.id;
+    if (!eventsRequestsPerAgent.reserve(agentId)) {
+      return rateLimited(eventsRequestsPerAgent.check(agentId).retryAfterS);
+    }
+    const ip = clientIp(req);
+    const integrity = (kind: "batch_rejected" | "batch_conflict" | "foreign_target", status: number, details?: ValidationDetail[]) =>
+      recordIntegrityEvent(getDb(), { agentId, kind, endpoint: "events", status, details, ip });
+    const body = validateBody(await readJsonBody(req), "EventsBatch");
+    if (!body.ok) {
+      if (body.response.status === 400) {
+        await integrity("batch_rejected", 400, (await errorDetails(body.response)) as ValidationDetail[]);
+      }
+      return body.response;
+    }
+    const refund = eventsPerAgent.reserve(agentId);
+    if (!refund) return rateLimited(eventsPerAgent.check(agentId).retryAfterS);
+    let outcome: Awaited<ReturnType<typeof ingestEvents>>;
+    try {
+      outcome = await ingestEvents(getDb(), agentId, body.value);
+    } catch (err) {
+      refund();
+      throw err;
+    }
+    if (outcome.kind !== "accepted" || outcome.duplicate) refund();
+    switch (outcome.kind) {
+      case "accepted":
+        // After the commit, not awaited: the events are durably pending evaluation (P4 exit
+        // criterion: incident within 2 min; the worker polls its queue every 2 s).
+        if (!outcome.duplicate) void requestPolicyEvaluation();
+        return conformingJson("BatchAck", { batch_id: body.value.batch_id, duplicate: outcome.duplicate }, { status: 202 });
+      case "batch_conflict":
+        await integrity("batch_conflict", 409);
+        return agentError(409, "batch_conflict");
+      case "foreign_target":
+        await integrity("foreign_target", 404, outcome.details);
+        return agentError(404, "not_found", { details: outcome.details });
+      case "invalid":
+        await integrity("batch_rejected", 400, outcome.details);
+        return invalidRequest(outcome.details);
+    }
+  });
 }

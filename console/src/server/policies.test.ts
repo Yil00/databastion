@@ -253,7 +253,8 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       ["address as channel", { ...EMAIL_POLICY, actions: [{ type: "create_incident", severity: "low" }, { type: "notify", channel: "a@b.c" }] }, "actions.channel"],
       ["control characters in the name", { ...EMAIL_POLICY, name: "a‮b" }, "name"],
       ["missing name", { conditions: {}, actions: EMAIL_POLICY.actions }, "name"],
-      ["unknown source", { ...EMAIL_POLICY, source: "access_event" }, "source"],
+      ["unknown source", { ...EMAIL_POLICY, source: "heartbeat" }, "source"],
+      ["finding keys on an access_event policy", { ...EMAIL_POLICY, source: "access_event" }, "conditions"],
     ])("rejects %s (400 invalid_policy + field)", async (_name, body, field) => {
       const res = await create(body);
       expect(res.status).toBe(400);

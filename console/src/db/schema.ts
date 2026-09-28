@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
   check,
@@ -399,11 +400,12 @@ export const findings = pgTable(
 // ------------------------------------------------------------------- policies (P3-A)
 
 /**
- * What a policy evaluates. `finding` today; phase 4 adds `access_event` (`ALTER TYPE ... ADD
- * VALUE`, a compatible change). The condition document is validated per source
- * (src/lib/policy-model.ts), so a new source brings its own keys without changing this table.
+ * What a policy evaluates: Discovery findings (P3-A) or Audit access events (P4-C, added with
+ * `ALTER TYPE ... ADD VALUE`, a compatible change). The condition document is validated per source
+ * (src/lib/policy-model.ts, src/lib/event-model.ts), so a source brings its own keys without
+ * changing this table.
  */
-export const policySource = pgEnum("policy_source", ["finding"]);
+export const policySource = pgEnum("policy_source", ["finding", "access_event"]);
 
 export const incidentSeverity = pgEnum("incident_severity", ["low", "medium", "high", "critical"]);
 
@@ -514,6 +516,20 @@ export const incidents = pgTable(
     resolvedBy: uuid("resolved_by").references(() => users.id, { onDelete: "set null" }),
     falsePositiveAt: tsz("false_positive_at"),
     falsePositiveBy: uuid("false_positive_by").references(() => users.id, { onDelete: "set null" }),
+    // ---- source `access_event` (P4-C); null for finding incidents.
+    /** First access event that matched (the others are in `incident_events`). */
+    accessEventId: uuid("access_event_id").references((): AnyPgColumn => accessEvents.id, { onDelete: "set null" }),
+    /** Principal as sent by the agent: `db_user`, or its `hmac-sha256:` fingerprint. Escaped on display. */
+    principal: text("principal"),
+    /** Database of the dedup scope (normalized name; null for an event without object). */
+    eventDatabase: text("event_database"),
+    /** Start of the UTC hour of the dedup scope (event `ts`, agent clock). */
+    eventBucket: tsz("event_bucket"),
+    /** Highest event score seen, total rows, union of the signals (at most 16), latest event `ts`. */
+    eventScore: doublePrecision("event_score"),
+    eventRows: doublePrecision("event_rows"),
+    eventSignals: jsonb("event_signals").$type<string[]>(),
+    lastEventAt: tsz("last_event_at"),
   },
   (t) => [
     uniqueIndex("incidents_active_dedup_key")
@@ -614,5 +630,194 @@ export const notificationDeliveries = pgTable(
       .where(sql`${t.lastError} = 'rate_limited'`),
     check("notification_deliveries_attempts", sql`${t.attempts} >= 0`),
     check("notification_deliveries_last_error_format", sql`${t.lastError} ~ '^[a-z0-9_]{1,64}$'`),
+  ],
+);
+
+// ------------------------------------------------------------------- Audit (P4-C)
+
+/**
+ * Events batches received from agents (`POST /events`): idempotency on (`agent_id`, `batch_id`),
+ * exactly like `findings_batches` (SHA-256 of the validated batch in canonical JSON, never the
+ * body). Insert-only for the runtime role; purged with the events past the retention bound by the
+ * owner-defined function `databastion_purge_access_events` (migration 0022).
+ */
+export const eventsBatches = pgTable(
+  "events_batches",
+  {
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    batchId: uuid("batch_id").notNull(),
+    bodySha256: text("body_sha256").notNull(),
+    eventsCount: integer("events_count").notNull(),
+    receivedAt: tsz("received_at").notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.batchId] }),
+    index("events_batches_received_idx").on(t.receivedAt),
+    check("events_batches_sha256_format", sql`${t.bodySha256} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+/**
+ * Normalized Audit access events (contract `AccessEvent`), masked by the agent before the uplink
+ * (ADR-0007): no query text, no bound parameter, no returned value can be stored here, because the
+ * contract has no field for them and the console rejects unknown fields. Columns hold the principal
+ * (`db_user` or its fingerprint, client address, application), the action, the normalized object
+ * names, counts, signals and the source, all bounded by the contract and escaped on display.
+ * `principal_key` = SHA-256 of `u\0<db_user>` or `f\0<fingerprint>`: the grouping key of baselines
+ * and dedup keys, so agent-provided text never appears in a key.
+ *
+ * The runtime role may only INSERT and SELECT, plus UPDATE of the evaluation columns
+ * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`) written by the worker:
+ * what the agent reported can never be rewritten nor deleted by the console process (migration
+ * 0022). Rows older than the retention bound are deleted by `databastion_purge_access_events`.
+ */
+export const accessEvents = pgTable(
+  "access_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    agentId: uuid("agent_id").notNull(),
+    targetId: text("target_id").notNull(),
+    batchId: uuid("batch_id").notNull(),
+    /** Index of the event in its batch. */
+    itemIndex: integer("item_index").notNull(),
+    ts: tsz("ts").notNull(),
+    tsLast: tsz("ts_last"),
+    receivedAt: tsz("received_at").notNull().defaultNow(),
+    principalKey: text("principal_key").notNull(),
+    dbUser: text("db_user"),
+    dbUserFingerprint: text("db_user_fingerprint"),
+    clientAddr: text("client_addr"),
+    application: text("application"),
+    action: text("action").notNull(),
+    /** Contract `ObjectRef[]` (normalized names), at most 16. */
+    objects: jsonb("objects").$type<{ database: string; schema?: string; object: string }[]>().notNull(),
+    rows: bigint("rows", { mode: "number" }),
+    signals: jsonb("signals").$type<string[]>().notNull().default([]),
+    source: text("source").notNull(),
+    aggregatedCount: integer("aggregated_count").notNull(),
+    // ---- evaluation (worker)
+    evaluatedAt: tsz("evaluated_at"),
+    /** Sensitivity of the most sensitive object reached (see src/lib/event-model.ts). */
+    sensitivity: doublePrecision("sensitivity"),
+    /** Volume x sensitivity score. */
+    score: doublePrecision("score"),
+    /** Volume above the principal's baseline (after its warm-up). */
+    anomaly: boolean("anomaly"),
+    /** Baseline volume (rows) of the principal when the event was evaluated; null during warm-up. */
+    baselineRows: doublePrecision("baseline_rows"),
+  },
+  (t) => [
+    foreignKey({
+      name: "access_events_agent_target_fk",
+      columns: [t.agentId, t.targetId],
+      foreignColumns: [agentTargets.agentId, agentTargets.targetId],
+    }).onDelete("cascade"),
+    index("access_events_ts_idx").on(t.ts),
+    index("access_events_target_ts_idx").on(t.agentId, t.targetId, t.ts),
+    index("access_events_principal_ts_idx").on(t.agentId, t.targetId, t.principalKey, t.ts),
+    index("access_events_signals_idx").using("gin", t.signals),
+    index("access_events_pending_idx")
+      .on(t.receivedAt, t.id)
+      .where(sql`${t.evaluatedAt} is null`),
+    check("access_events_principal", sql`(${t.dbUser} is null) <> (${t.dbUserFingerprint} is null)`),
+    check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
+    check("access_events_action", sql`${t.action} in ('connect', 'auth_failure', 'read', 'write', 'ddl', 'dcl')`),
+    check("access_events_counts", sql`${t.aggregatedCount} >= 1 and (${t.rows} is null or ${t.rows} >= 0)`),
+  ],
+);
+
+/**
+ * Link between an incident raised from access events and every event that matched it (the first
+ * one is also `incidents.access_event_id`). Insert-only for the runtime role; the links of a purged
+ * event go with it (`ON DELETE CASCADE`).
+ */
+export const incidentEvents = pgTable(
+  "incident_events",
+  {
+    incidentId: uuid("incident_id")
+      .notNull()
+      .references(() => incidents.id, { onDelete: "cascade" }),
+    eventId: uuid("event_id")
+      .notNull()
+      .references(() => accessEvents.id, { onDelete: "cascade" }),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.incidentId, t.eventId] }), index("incident_events_event_idx").on(t.eventId)],
+);
+
+/**
+ * Per-principal baselines (P4-C): exponentially weighted mean and variance of `ln(1 + rows)` and of
+ * `ln(1 + score)` per event of a (agent, target, principal), with counters. Aggregates only: no
+ * event, no object name, no value. `db_user` / `db_user_fingerprint` are kept for display. Not
+ * deleted by the runtime role; they outlive the events they summarize.
+ */
+export const principalBaselines = pgTable(
+  "principal_baselines",
+  {
+    agentId: uuid("agent_id").notNull(),
+    targetId: text("target_id").notNull(),
+    principalKey: text("principal_key").notNull(),
+    dbUser: text("db_user"),
+    dbUserFingerprint: text("db_user_fingerprint"),
+    events: bigint("events", { mode: "number" }).notNull().default(0),
+    meanLogRows: doublePrecision("mean_log_rows").notNull().default(0),
+    varLogRows: doublePrecision("var_log_rows").notNull().default(0),
+    meanLogScore: doublePrecision("mean_log_score").notNull().default(0),
+    varLogScore: doublePrecision("var_log_score").notNull().default(0),
+    rowsTotal: doublePrecision("rows_total").notNull().default(0),
+    maxScore: doublePrecision("max_score").notNull().default(0),
+    anomalies: bigint("anomalies", { mode: "number" }).notNull().default(0),
+    firstEventAt: tsz("first_event_at"),
+    lastEventAt: tsz("last_event_at"),
+    updatedAt: tsz("updated_at").notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.targetId, t.principalKey] }),
+    foreignKey({
+      name: "principal_baselines_agent_target_fk",
+      columns: [t.agentId, t.targetId],
+      foreignColumns: [agentTargets.agentId, agentTargets.targetId],
+    }).onDelete("cascade"),
+    check("principal_baselines_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
+    check("principal_baselines_counts", sql`${t.events} >= 0 and ${t.anomalies} >= 0 and ${t.varLogRows} >= 0 and ${t.varLogScore} >= 0`),
+  ],
+);
+
+/**
+ * Audit settings per target (P4-C `audit.configure`), as last sent to the agent. `manual_objects`
+ * are the objects an administrator added by hand (contract `SensitiveObject`); the objects derived
+ * from findings are recomputed at each change. `sent_objects` is the `sensitive_objects` list of
+ * the last job (to compute what a change removes); `warning` (closed code `emptied` / `shrunk` /
+ * `disabled`) is set when the last change emptied the list, removed many objects or disabled Audit,
+ * and cleared by a later change that does not.
+ */
+export const auditConfigs = pgTable(
+  "audit_configs",
+  {
+    agentId: uuid("agent_id").notNull(),
+    targetId: text("target_id").notNull(),
+    enabled: boolean("enabled").notNull(),
+    aggregationWindowS: integer("aggregation_window_s").notNull(),
+    pollIntervalS: integer("poll_interval_s").notNull(),
+    minRows: bigint("min_rows", { mode: "number" }),
+    deriveFromFindings: boolean("derive_from_findings").notNull().default(true),
+    manualObjects: jsonb("manual_objects").$type<Record<string, unknown>[]>().notNull().default([]),
+    sentObjects: jsonb("sent_objects").$type<Record<string, unknown>[]>().notNull().default([]),
+    lastJobId: uuid("last_job_id").references(() => jobs.id, { onDelete: "set null" }),
+    warning: text("warning"),
+    warningRemoved: integer("warning_removed"),
+    updatedAt: tsz("updated_at").notNull().defaultNow(),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.targetId] }),
+    foreignKey({
+      name: "audit_configs_agent_target_fk",
+      columns: [t.agentId, t.targetId],
+      foreignColumns: [agentTargets.agentId, agentTargets.targetId],
+    }).onDelete("cascade"),
+    check("audit_configs_warning", sql`${t.warning} is null or ${t.warning} in ('emptied', 'shrunk', 'disabled')`),
   ],
 );

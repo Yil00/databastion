@@ -23,6 +23,7 @@ describe("noop queue handler", () => {
 });
 
 const stats = (over: Partial<incidents.DrainStats> = {}): incidents.DrainStats => ({
+  events: 0,
   findings: 0,
   policyPasses: 0,
   created: 0,

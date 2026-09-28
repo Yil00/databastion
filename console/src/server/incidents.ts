@@ -10,8 +10,8 @@ import {
   findingMatches,
   incidentSeverityOf,
   notifyChannelsOf,
+  parseFindingConditions,
   parsePolicyActions,
-  parsePolicyConditions,
   type ExceptionScope,
   type FindingConditions,
   type FindingFacts,
@@ -21,6 +21,7 @@ import {
 } from "@/lib/policy-model";
 
 import { consoleUrl } from "./alerting-config";
+import { drainEventWork } from "./event-engine";
 import { writeAudit } from "./audit";
 import { applyFalsePositive, fpResetNeeded, type Tx } from "./findings";
 import { enqueueIncidentNotifications } from "./notifications";
@@ -66,17 +67,16 @@ async function loadEnabledPolicies(db: Database | Tx, ids?: string[]): Promise<L
       id: policies.id,
       name: policies.name,
       revision: policies.revision,
-      source: policies.source,
       conditions: policies.conditions,
       actions: policies.actions,
     })
     .from(policies)
-    .where(and(eq(policies.enabled, true), ids ? inArray(policies.id, ids) : undefined));
+    .where(and(eq(policies.enabled, true), eq(policies.source, "finding"), ids ? inArray(policies.id, ids) : undefined));
   const out: LoadedPolicy[] = [];
   for (const r of rows) {
     // Documents are validated on write; a document that no longer validates (e.g. a classifier
     // removed from the registry) is skipped, never half-applied.
-    const conditions = parsePolicyConditions(r.source, r.conditions);
+    const conditions = parseFindingConditions(r.conditions);
     const actions = parsePolicyActions(r.actions);
     if (!conditions.ok || !actions.ok) {
       log.error({ policyId: r.id }, "policy document does not validate: skipped");
@@ -267,6 +267,7 @@ async function applyPolicy(
   // P3-C: the notifications of the policy's `notify` channels, in the same transaction (outbox).
   await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, {
     event: "incident.opened",
+    source: "finding",
     occurred_at: now.toISOString(),
     url: consoleUrl(`/incidents/${row.id}`),
     incident: { id: row.id, severity: policy.severity, status: "open", reopened_from: latest?.status === "resolved" ? latest.id : null },
@@ -282,6 +283,8 @@ async function applyPolicy(
 }
 
 export interface DrainStats {
+  /** Access events evaluated (P4-C). */
+  events: number;
   findings: number;
   policyPasses: number;
   created: number;
@@ -290,15 +293,26 @@ export interface DrainStats {
 }
 
 /**
- * Drains the pending policy work within `budgetMs`: full passes of changed policies first, then the
- * pending findings. Safe to run concurrently and repeatedly (row locks, skip-locked, dedup index).
+ * Drains the pending policy work within `budgetMs`: the pending access events first (P4-C: an
+ * exfiltration must not wait behind a full pass over the findings), then the full passes of changed
+ * `finding` policies, then the pending findings. Safe to run concurrently and repeatedly (row
+ * locks, skip-locked, dedup index, advisory lock of the event evaluation).
  */
 export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } = {}): Promise<DrainStats> {
   const deadline = Date.now() + (opts.budgetMs ?? 50_000);
-  const stats: DrainStats = { findings: 0, policyPasses: 0, created: 0, more: false };
+  const stats: DrainStats = { events: 0, findings: 0, policyPasses: 0, created: 0, more: false };
   const count = (results: ApplyResult[]) => {
     stats.created += results.filter((r) => r === "created").length;
   };
+
+  // 0. Access events (their own chunks and lock, see event-engine.ts).
+  const events = await drainEventWork(db, deadline);
+  stats.events = events.events;
+  stats.created += events.created;
+  if (events.more) {
+    stats.more = true;
+    return stats;
+  }
 
   // 1. Full passes: policies changed since their last pass, or with an exception expired since.
   const stale = await db
@@ -307,6 +321,7 @@ export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } 
     .where(
       and(
         eq(policies.enabled, true),
+        eq(policies.source, "finding"),
         sql`(${policies.evaluatedAt} is null or ${policies.evaluatedAt} < ${policies.changedAt} or exists (
           select 1 from ${policyExceptions} e
           where (e.policy_id = ${policies.id} or e.policy_id is null)
@@ -525,6 +540,17 @@ export interface IncidentView {
   findingMatched: number | null;
   matchCount: number;
   notifyChannels: string[];
+  /** Source `access_event` (P4-C); null for finding incidents. */
+  access: {
+    eventId: string | null;
+    principal: string;
+    database: string | null;
+    bucket: Date | null;
+    score: number | null;
+    rows: number | null;
+    signals: string[];
+    lastEventAt: Date | null;
+  } | null;
   createdAt: Date;
   updatedAt: Date;
   acknowledgedAt: Date | null;
@@ -568,6 +594,14 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       findingMatched: incidents.findingMatched,
       matchCount: incidents.matchCount,
       notifyChannels: incidents.notifyChannels,
+      accessEventId: incidents.accessEventId,
+      principal: incidents.principal,
+      eventDatabase: incidents.eventDatabase,
+      eventBucket: incidents.eventBucket,
+      eventScore: incidents.eventScore,
+      eventRows: incidents.eventRows,
+      eventSignals: incidents.eventSignals,
+      lastEventAt: incidents.lastEventAt,
       createdAt: incidents.createdAt,
       updatedAt: incidents.updatedAt,
       acknowledgedAt: incidents.acknowledgedAt,
@@ -583,13 +617,42 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
     .where(where)
     .orderBy(SEVERITY_RANK, desc(incidents.createdAt), asc(incidents.id))
     .limit(limit);
-  return rows.map(({ databaseName, schemaName, objectName, fieldName, ...r }) => ({
+  return rows.map(
+    ({
+      databaseName,
+      schemaName,
+      objectName,
+      fieldName,
+      accessEventId,
+      principal,
+      eventDatabase,
+      eventBucket,
+      eventScore,
+      eventRows,
+      eventSignals,
+      lastEventAt,
+      ...r
+    }) => ({
     ...r,
+    access:
+      r.source === "access_event"
+        ? {
+            eventId: accessEventId,
+            principal: principal ?? "",
+            database: eventDatabase,
+            bucket: eventBucket,
+            score: eventScore,
+            rows: eventRows,
+            signals: eventSignals ?? [],
+            lastEventAt,
+          }
+        : null,
     location:
       databaseName !== null && objectName !== null && fieldName !== null
         ? { databaseName, schemaName, objectName, fieldName }
         : null,
-  }));
+  }),
+  );
 }
 
 export function listIncidents(db: Database, filter: IncidentFilter = {}): Promise<IncidentView[]> {
@@ -617,7 +680,7 @@ export async function activeIncidentCounts(db: Database): Promise<Record<Severit
 export async function runPolicyEvaluation(db: Database, budgetMs?: number): Promise<DrainStats> {
   try {
     const stats = await drainPolicyWork(db, { budgetMs });
-    if (stats.findings > 0 || stats.policyPasses > 0) log.info({ ...stats }, "policy evaluation");
+    if (stats.events > 0 || stats.findings > 0 || stats.policyPasses > 0) log.info({ ...stats }, "policy evaluation");
     return stats;
   } catch (err) {
     log.error({ error: errorSummary(err) }, "policy evaluation failed");

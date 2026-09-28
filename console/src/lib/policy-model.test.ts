@@ -70,7 +70,7 @@ describe("parsePolicyConditions", () => {
       min_matched: 3,
       min_match_ratio: 0.1,
     });
-    expect(r.ok && r.value.classifiers).toEqual(["pii.email", "secret.*"]);
+    expect(r.ok && "classifiers" in r.value && r.value.classifiers).toEqual(["pii.email", "secret.*"]);
   });
 
   it("accepts an empty document (every finding)", () => {
