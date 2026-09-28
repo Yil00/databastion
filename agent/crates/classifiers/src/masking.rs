@@ -387,10 +387,15 @@ pub(crate) fn normalize(
     raw: &str,
     region: PhoneRegion,
 ) -> Option<Zeroizing<String>> {
-    let v = raw.trim();
-    if v.is_empty() || v.len() > detect::MAX_SCAN_BYTES {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > detect::MAX_SCAN_BYTES {
         return None;
     }
+    // Canonical composition first (as the column classifier does), so that
+    // a value stored decomposed (NFD) has the fingerprint of its composed
+    // form for every caller. ASCII values are unchanged.
+    let composed = Zeroizing::new(trimmed.nfc().collect::<String>());
+    let v = composed.as_str();
     let z = |s: String| Zeroizing::new(s);
     match classifier {
         ClassifierId::Email => {
@@ -426,8 +431,7 @@ pub(crate) fn normalize(
         ClassifierId::Phone => normalize_phone(v, region),
         ClassifierId::BirthDate => normalize_date(v).map(z),
         ClassifierId::PersonName | ClassifierId::PostalAddress => {
-            let nfc = z(v.nfc().collect());
-            let words: Vec<&str> = nfc
+            let words: Vec<&str> = v
                 .split(|c: char| c.is_whitespace() || c == '$')
                 .filter(|w| !w.is_empty())
                 .collect();
