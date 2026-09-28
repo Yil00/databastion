@@ -442,10 +442,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   runs for at most 50 s and re-queues itself when work remains.
 - **Dedup**: `dedup_key = policy:<id>|finding:<id>`; a partial unique index allows one open or
   acknowledged incident per key. A later scan of the same finding increments `match_count` once per
-  finding revision. **`resolved` means remediated**: when a scan that ran after the resolution still
-  sees the finding (its `last_seen_at` is later than `resolved_at`, both from the database clock), or
-  when the finding matches more values or is reclassified by another classifier set, a new incident
-  opens; re-evaluations without a new scan open nothing. Durable suppression is an administrator
+  finding revision. **`resolved` means remediated**: when a scan that read the data after the
+  resolution still sees the finding, or when the finding matches more values or is reclassified by
+  another classifier set, a new incident opens; re-evaluations without a new scan open nothing.
+  "Read after the resolution" compares `resolved_at` with the first console-side delivery of the
+  scan job that produced the finding's latest revision (`jobs.first_delivered_at`, set when the
+  agent first fetches the job and never moved by a redelivery; both from the database clock), not
+  with the ingestion time: a scan already in flight when the incident is resolved does not reopen
+  it (N1). A finding whose job is gone falls back to its `last_seen_at`. Durable suppression is an administrator
   decision only: a false positive (a false-positive finding never opens an incident) or an
   exception. Incident creation is audited `incident.create` (system actor).
 - **Lifecycle**: `open` -> `acknowledged` -> `resolved`, `open` -> `resolved`, `open` /

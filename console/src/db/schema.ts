@@ -222,6 +222,11 @@ export const jobs = pgTable(
     leaseUntil: tsz("lease_until"),
     attempts: integer("attempts").notNull().default(0),
     deliveredAt: tsz("delivered_at"),
+    /**
+     * First delivery (console clock, never changed by a redelivery): no data of the job can have
+     * been read before this instant. The policy engine compares it with `resolved_at` (N1).
+     */
+    firstDeliveredAt: tsz("first_delivered_at"),
     /** Agent `ts` of the last status update (older updates are ignored). */
     lastStatusAt: tsz("last_status_at"),
     progress: jsonb("progress").$type<Record<string, number>>(),

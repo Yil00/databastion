@@ -95,7 +95,8 @@ export async function claimJobs(db: Database, agentId: string): Promise<Schemas[
       status = 'delivered',
       lease_until = now() + make_interval(secs => ${JOB_LEASE_S}),
       attempts = attempts + 1,
-      delivered_at = now()
+      delivered_at = now(),
+      first_delivered_at = coalesce(first_delivered_at, now())
     where id in (
       select id from jobs
       where agent_id = ${agentId}

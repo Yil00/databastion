@@ -1,0 +1,1 @@
+ALTER TABLE "jobs" ADD COLUMN "first_delivered_at" timestamp with time zone;
