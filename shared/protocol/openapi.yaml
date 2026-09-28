@@ -1,0 +1,1594 @@
+openapi: 3.1.0
+info:
+  title: DataBastion agent protocol
+  version: 1.0.0
+  summary: Contract between the DataBastion agent (always the client) and the console.
+  license:
+    name: Apache 2.0
+    identifier: Apache-2.0
+  description: |
+    Single source of truth for the agent <-> console protocol, version **1**
+    (header `X-DataBastion-Protocol: 1`). Narrative design: `docs/09-agent-protocol.md`.
+    TypeScript and Rust types are generated from this file and never edited by hand.
+
+    ## Transport (ADR-0001, ADR-0004)
+    - The agent is **always the client**. It opens every connection, over HTTPS (TLS 1.3 only).
+      The console never connects to an agent and agents open no listening port.
+    - JSON bodies (`application/json`, UTF-8). The console rejects bodies larger than **4 MiB** with `413`.
+      The agent keeps every serialized batch under **1 MiB** (`x-databastion-max-bytes`), in addition to
+      the `maxItems` bounds, so a conforming agent never hits the console limit.
+    - Headers on every request: `X-DataBastion-Protocol`, `User-Agent`; plus, on every request
+      except `POST /enroll`, `Authorization: Bearer <agent_secret>` and `X-DataBastion-Agent-Id`.
+      The agent id is the lookup key for the hash of the secret on the console side.
+
+    ## Data minimization (ADR-0003, invariants I2 and I3)
+    - **Every object schema is closed** (`additionalProperties: false`). The console rejects any
+      body that carries an unknown field, at any depth, with `400`, and never stores any part of it.
+      The single exception is the numeric metrics maps of the heartbeat (`MetricsMap`): keys are
+      restricted by pattern and values can only be numbers.
+    - Every string, array and number is bounded (`maxLength`, `maxItems`, ranges). Free-text strings
+      exclude control, format (bidi overrides, zero-width), private-use and line/paragraph separator
+      characters (`\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}`).
+    - No field is **meant** to carry a raw sampled value, a database credential, a connection string,
+      a target network address, or query text, and the schemas reject the obvious forms. Sampled values
+      only leave the agent as masked samples and `hmac-sha256:` fingerprints, both produced by
+      `classifiers::masking`. The HMAC key is generated locally at enrollment and appears in no schema.
+    - **The schema alone cannot prove that names are free of values.** Object and field names are
+      engine metadata that can embed values (MongoDB dynamic keys, LDAP entry DNs, generated table
+      names). Contract rule `x-databastion-normalized-name` (see `Identifier`): the agent normalizes every
+      name before the uplink (array indices -> `[]`, dynamic keys and any name segment that matches a
+      classifier -> `*`, LDAP entry DNs reduced to their parent container) and the name patterns reject
+      e-mail addresses, `key=value` forms other than LDAP container RDNs, URLs and SQL fragments.
+    - Locations identify a column / field / attribute, never a single record.
+    - Error bodies never echo submitted values (see `Error`).
+
+    ## Agent-side validation and sanitization (batch poisoning)
+    Database-side content (names, account names, application names, versions) is attacker-influenced.
+    Before spooling, the agent validates **each item** against this contract and sanitizes it rather
+    than dropping it: control and format characters stripped, strings truncated to `maxLength` on a
+    character boundary, a non-conforming name segment replaced by `*`, a non-conforming account name
+    replaced by its fingerprint (`db_user_fingerprint`), a non-conforming optional field omitted.
+    A single hostile name therefore cannot get a whole batch rejected.
+
+    ## Retries and error handling
+    - `401`: see the `Unauthorized` response. Fatal only if the request was sent with the agent's
+      current secret; then slow retry (one heartbeat every 15 min), never an aggressive loop.
+    - `426`: protocol version below `console_min_protocol`. The agent logs it and keeps spooling to disk.
+    - `429` / `503`: exponential backoff with jitter, honoring `Retry-After` (seconds).
+    - `400` on `/findings` or `/events`: when every `details[].pointer` designates an item
+      (`/findings/<i>/...`, `/events/<i>/...`), the agent removes those items and resends the remaining
+      ones under a **new** `batch_id`; otherwise it drops the batch. `404` on `/findings` or `/events`
+      with pointers to `/findings/<i>/target_id` or `/events/<i>/target_id` (target not belonging to the
+      agent) is handled the same way; a `404` on `job_id` drops the whole batch.
+    - `413`: the agent splits the batch in two halves, each under a new `batch_id`, and resends them; a
+      single item still rejected with `413` is dropped.
+    - Other `400`, `404`, `409`: not retryable. The agent drops the request and increments a metric.
+      It logs the error `code`, `pointer` and `keyword`, never the payload.
+    - Network errors and `5xx`: retry with backoff; batches are idempotent thanks to `batch_id`.
+    - Console side: a rejected (`400`) findings or events batch, a `batch_conflict` or a
+      `rotation_conflict` is a conforming-agent impossibility. The console records it in its audit log
+      and raises an agent-integrity alert.
+
+    ## Idempotency
+    `POST /findings` and `POST /events` carry a `batch_id` (UUIDv7) generated by the agent before
+    spooling. The console deduplicates on **(`agent_id`, `batch_id`)** and stores a SHA-256 of the
+    received body: the same pair with the same content is acknowledged with `202` and `duplicate: true`
+    without being processed again; the same pair with a different content is rejected with `409`
+    (`batch_conflict`) and raises an alert. A batch is accepted or rejected as a whole.
+
+    ## Console-side checks not expressible in this schema
+    The console enforces, in addition to schema validation:
+    - `job_id` of a findings batch or status update exists, is assigned to the calling agent, and is a
+      `discovery.scan` job for findings (`404` otherwise);
+    - every `target_id` belongs to the calling agent, i.e. was reported in one of its heartbeats (`404`);
+    - `Location.engine` matches the engine last reported for the target;
+    - `matched <= sampled <= params.sample_rows` of the job;
+    - `ts_last >= ts`; no timestamp more than 5 min in the future (clock skew tolerance);
+    - in each masked sample, at least 50 % of the non-separator characters (letters, digits and `*`)
+      are `*` (e.g. `06 ** ** ** 78`: 6 of 10);
+    - classifier ids exist in the reported `classifiers_version`.
+    Every string coming from an agent is escaped on display and in exports (no HTML, CSV or log injection).
+servers:
+  - url: https://{console_host}/api/agent/v1
+    description: DataBastion console, agent API version 1.
+    variables:
+      console_host:
+        default: console.databastion.internal
+        description: Host name (and optional port) of the console, as configured in `agent.yaml`.
+security:
+  - agentSecret: []
+tags:
+  - name: enrollment
+    description: Agent identity lifecycle (enrollment, secret rotation).
+  - name: control
+    description: Heartbeat and job long-poll.
+  - name: results
+    description: Discovery findings and Audit access events.
+paths:
+  /enroll:
+    post:
+      operationId: enrollAgent
+      summary: Exchange a single-use enrollment token for an agent identity
+      description: |
+        The token is created by an administrator in the console (single use, valid 24 h) and copied
+        manually into the agent configuration. The console stores only a hash (SHA-256) of the token and
+        consumes it **atomically** (a single conditional update: unused and not expired -> used), so two
+        concurrent enrollments with the same token cannot both succeed. It creates the agent and returns
+        its `agent_id` and `agent_secret`. The agent stores them in a `0600` file, then generates its
+        local HMAC key, which is **never transmitted**. This is the only unauthenticated endpoint; it
+        carries no `Authorization` nor `X-DataBastion-Agent-Id` header, and it is rate limited per
+        source IP. Its request and response bodies are excluded from every request, APM and error log on
+        both sides.
+      tags: [enrollment]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnrollRequest"
+      responses:
+        "200":
+          description: "Agent enrolled. The response carries a secret and is sent with `Cache-Control: no-store`."
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Unknown, expired or already consumed enrollment token. The agent does not retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /heartbeat:
+    post:
+      operationId: sendHeartbeat
+      summary: Report agent status, target status, local detections and metrics
+      description: |
+        Sent every `heartbeat_interval_s` seconds (30 s by default). Carries the agent version, uptime,
+        enabled connectors, the status and honest audit level of each declared target, the engines
+        detected on the local host but not configured (ADR-0006), the spool state and internal
+        metrics (ADR-0004), which the console re-exposes on its own `/metrics` endpoint.
+        The targets reported here are the targets of this agent: results referencing another
+        `target_id` are rejected with `404`. The agent sends a heartbeat before the first result of a
+        newly declared target.
+      tags: [control]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /jobs:
+    get:
+      operationId: pollJobs
+      summary: Long-poll pending jobs
+      description: |
+        The console holds the request for up to `wait` seconds and returns as soon as at least one job
+        is pending for this agent, or `204` when `wait` elapses. The agent's HTTP client timeout must be
+        at least `wait + 10` s; behind a proxy with a shorter idle timeout, the agent lowers `wait`.
+        Revoking an agent closes its held long-poll.
+
+        Delivery is **at least once**: a delivered job is leased to the agent, which acknowledges it by
+        posting a `running` (or terminal) status. A job with no status after 120 s is delivered again.
+        The agent deduplicates jobs by `job_id`.
+      tags: [control]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+        - name: wait
+          in: query
+          required: false
+          description: Maximum time, in seconds, the console holds the request. `0` returns immediately.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 25
+            default: 25
+      responses:
+        "200":
+          description: At least one job is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+        "204":
+          description: No job became available within `wait` seconds. The agent polls again immediately.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /jobs/{job_id}/status:
+    post:
+      operationId: reportJobStatus
+      summary: Report the progress or outcome of a job
+      description: |
+        Status transitions: `running` -> `running` (progress) -> `succeeded` | `failed`. A job may also go
+        straight to `failed` (rejected: expired, unknown target, unsupported parameters). The console
+        ignores updates older than the last one received (`ts`) and answers `409` to any update after a
+        terminal status. A failure carries a closed error code, never a driver message (which could
+        contain sampled values or query text).
+      tags: [control]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+        - name: job_id
+          in: path
+          required: true
+          description: Identifier of the job, as received from `GET /jobs`.
+          schema:
+            $ref: "#/components/schemas/Uuid"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobStatusUpdate"
+      responses:
+        "204":
+          description: Status recorded.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /findings:
+    post:
+      operationId: submitFindings
+      summary: Submit a batch of Discovery findings
+      description: |
+        Idempotent on (`agent_id`, `batch_id`). The whole batch is rejected with `400` if any item does
+        not conform to the schema (in particular any unknown field, which could carry a raw value); the
+        error `details` let the agent drop only the offending items and resend the rest. `404` when
+        `job_id` is unknown, not assigned to this agent or not a `discovery.scan` job (pointer
+        `/job_id`), or when a `target_id` does not belong to this agent (pointer
+        `/findings/<i>/target_id`, per-item handling). `409` (`batch_conflict`) when the `batch_id` was
+        already received with a different content.
+      tags: [results]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindingsBatch"
+      responses:
+        "202":
+          $ref: "#/components/responses/BatchAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /events:
+    post:
+      operationId: submitEvents
+      summary: Submit a batch of normalized Audit access events
+      description: |
+        Same envelope and idempotency rules as `POST /findings` (`batch_id`, UUIDv7, deduplicated on
+        (`agent_id`, `batch_id`)). Events are pre-aggregated by the agent (same principal, object set and
+        action within the aggregation window, 60 s by default) and carry no query text. `404` when a
+        `target_id` does not belong to this agent (`details[].pointer` designates the items).
+      tags: [results]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EventsBatch"
+      responses:
+        "202":
+          $ref: "#/components/responses/BatchAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /rotate:
+    post:
+      operationId: rotateSecret
+      summary: Register a new agent-generated secret
+      description: |
+        Secret rotation. The **agent generates** the new secret; the console never sends one after
+        enrollment.
+        1. Trigger: an `agent.rotate_secret` job (which carries no secret), or a local operator command.
+        2. The agent generates `S1` locally (same format as `AgentSecret`, 256 bits from a CSPRNG) and
+           persists it as *pending* next to its current secret `S0` (`0600` file, fsync) **before** any
+           network call.
+        3. The agent calls `POST /rotate` with `{new_secret: S1}`, authenticated with `S0`.
+        4. The console stores the argon2id hash of `S1` as pending and answers `200` with
+           `grace_expires_at` (at most 3600 s later, 300 s by default).
+        5. The agent switches to `S1` for every subsequent request. **Promotion**: the first successful
+           request authenticated with `S1`, or `grace_expires_at`, whichever comes first, makes `S1`
+           current and revokes `S0`. When the rotation was requested by a job, the agent reports it as
+           `succeeded` with `S1`.
+
+        **Retries are idempotent**: after a network error the agent resends the **same** `S1` with `S0`;
+        the console compares it with the pending hash and answers `200` with `duplicate: true` and the
+        unchanged deadline. The agent **never generates a new secret while one is pending**: it reuses
+        the pending `S1`, including when a rotate job is redelivered. After a restart with a pending `S1`,
+        the agent authenticates with `S1` first and falls back to `S0` only on `401` (then `S1` was never
+        registered, and it retries step 3). Conversely, any `401` received while a pending `S1` exists
+        makes the agent retry with `S1` before any other `401` handling.
+
+        The console rejects with `400` (`invalid_secret`) a `new_secret` equal to the current secret, or
+        obviously low-entropy (see `AgentSecret`).
+
+        **Takeover detection** (someone else holds `S0`):
+        - a `/rotate` whose `new_secret` does not match the secret already pending (or just promoted) is
+          answered `409` `rotation_conflict`. A `/rotate` carrying `S0` and the **same** `S1` as the
+          pending or just-promoted one is a late retry: answered `200` with `duplicate: true`;
+        - a request authenticated with `S0` within a **60 s tolerance window** after promotion (requests
+          in flight during the switch) is answered `401` without incident;
+        - a request authenticated with `S0` **after** that window is treated like `rotation_conflict`.
+
+        On `rotation_conflict` (either case) the console **locks the agent, revokes every secret
+        (current and pending), closes its long-polls and raises a security incident**. The agent that
+        receives `rotation_conflict` stops all activity, logs a critical error and requires
+        re-enrollment. A conforming agent never triggers it.
+
+        Suspected compromise is not handled by rotation: the administrator revokes the agent and
+        re-enrolls it. The endpoint is rate limited (`429`). Its request body is excluded from every
+        request, APM and error log on both sides.
+      tags: [enrollment]
+      parameters:
+        - $ref: "#/components/parameters/AgentId"
+        - $ref: "#/components/parameters/ProtocolVersion"
+        - $ref: "#/components/parameters/UserAgent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateRequest"
+      responses:
+        "200":
+          description: "New secret registered as pending (or already registered: `duplicate: true`). Carries no secret."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            `rotation_conflict`: a different new secret is already pending (or was just promoted). The agent
+            has been locked and all its secrets revoked; the agent stops and requires re-enrollment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+components:
+  securitySchemes:
+    agentSecret:
+      type: http
+      scheme: bearer
+      bearerFormat: DataBastionAgentSecret
+      description: |
+        `Authorization: Bearer <agent_secret>`, always sent together with `X-DataBastion-Agent-Id`.
+        The secret is 256 random bits (see `AgentSecret`), stored hashed (argon2id) by the console and
+        in a `0600` file by the agent.
+
+        Console requirements:
+        - failed authentications are rate limited per agent id **and** per source IP **before** the hash
+          verification runs (`429`), so the hash cost cannot be used for denial of service;
+        - a cache of verified secrets, if any, keeps entries less than 30 s and is purged on revocation
+          and on rotation;
+        - revocation invalidates the current **and** the pending secret and closes the agent's held
+          long-polls; it is effective in **less than 60 s** in every case.
+
+  parameters:
+    AgentId:
+      name: X-DataBastion-Agent-Id
+      in: header
+      required: true
+      description: Agent identifier returned by `POST /enroll`.
+      schema:
+        $ref: "#/components/schemas/Uuid"
+    ProtocolVersion:
+      name: X-DataBastion-Protocol
+      in: header
+      required: true
+      description: Protocol major version spoken by the agent. `1` for this contract.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 999
+    UserAgent:
+      name: User-Agent
+      in: header
+      required: true
+      description: "`databastion-agent/<version>`, e.g. `databastion-agent/0.1.0`."
+      schema:
+        type: string
+        maxLength: 128
+        pattern: "^databastion-agent/[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]*)?$"
+
+  headers:
+    RetryAfter:
+      description: Delay, in seconds, before the agent may retry. The agent adds jitter.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3600
+    CacheControlNoStore:
+      description: Responses carrying a secret must not be cached by any intermediary.
+      schema:
+        type: string
+        const: no-store
+
+  responses:
+    BatchAccepted:
+      description: |
+        Batch accepted for asynchronous processing, or already received with the same content
+        (`duplicate: true`). Either way the agent removes it from its spool.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BatchAck"
+    BadRequest:
+      description: |
+        Body or parameters do not conform to this contract (unknown field, bound exceeded, bad format).
+        Not retryable as is: see "Retries and error handling" for the per-item handling of batches.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: |
+        Missing, invalid, superseded (after a rotation) or revoked secret.
+        - If a pending secret exists (rotation in progress), the agent first retries with it.
+        - If the request was sent with a secret that is no longer the agent's current one (e.g. `S0`
+          in flight while switching to `S1`), the agent retries once with its current secret.
+        - If it was sent with the current secret, the agent stops normal operation (no job polling, no
+          uploads), keeps spooling within its bounds, logs an error, and retries a single heartbeat every
+          15 min with jitter, so that it recovers if the console restores it. It never loops aggressively.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: |
+        Referenced job unknown or not assigned to this agent (the two cases are not distinguished), or
+        `target_id` not belonging to this agent.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: |
+        `conflict`: invalid job status transition (the job is already in a terminal state).
+        `batch_conflict`: `batch_id` already received with a different content (alert raised).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Body larger than 4 MiB. The agent splits the batch in two and resends each half under a new `batch_id`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UpgradeRequired:
+      description: |
+        `X-DataBastion-Protocol` is below the minimum accepted by the console (`min_protocol` in the body).
+        The agent logs it and keeps spooling results to disk until it is upgraded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: Rate limited. Exponential backoff with jitter, honoring `Retry-After`.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: Console temporarily unavailable. Exponential backoff with jitter, honoring `Retry-After`.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    # ------------------------------------------------------------------ scalars
+    Uuid:
+      description: Canonical lowercase UUID.
+      type: string
+      format: uuid
+      minLength: 36
+      maxLength: 36
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    UuidV7:
+      description: Canonical lowercase UUID version 7 (time ordered), generated by the agent.
+      type: string
+      format: uuid
+      minLength: 36
+      maxLength: 36
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    Timestamp:
+      description: RFC 3339 date-time, UTC recommended.
+      type: string
+      format: date-time
+      maxLength: 40
+    AgentVersion:
+      description: Semantic version of the agent binary.
+      type: string
+      maxLength: 64
+      pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    ProtocolMajor:
+      description: Protocol major version.
+      type: integer
+      minimum: 1
+      maximum: 999
+    HeartbeatIntervalSeconds:
+      description: Interval, in seconds, between two heartbeats.
+      type: integer
+      minimum: 10
+      maximum: 300
+    EnrollmentToken:
+      description: |
+        Single-use enrollment token created in the console (valid 24 h): `dbe_` + 43 base64url chars
+        (256 random bits). Stored hashed by the console.
+      type: string
+      minLength: 47
+      maxLength: 47
+      pattern: "^dbe_[A-Za-z0-9_-]{43}$"
+    AgentSecret:
+      description: |
+        Agent secret: `dbs_` + 43 base64url chars (256 random bits from a CSPRNG). Issued by the console
+        in the `/enroll` response, generated by the agent for `/rotate`. Sent only in the
+        `Authorization` header afterwards. Never logged by either side. The console rejects obviously
+        low-entropy values (e.g. fewer than 16 distinct characters in the 43-character body, such as a
+        single repeated character) with `400` `invalid_secret`.
+      type: string
+      minLength: 47
+      maxLength: 47
+      pattern: "^dbs_[A-Za-z0-9_-]{43}$"
+    Hostname:
+      description: Host name of the agent host (RFC 1123), informational.
+      type: string
+      minLength: 1
+      maxLength: 253
+      pattern: "^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+    TargetId:
+      description: |
+        Identifier of a target, as declared in `agent.yaml` (ADR-0006). Unique per agent. A slug: it
+        cannot contain a host name, address or credential.
+      type: string
+      minLength: 1
+      maxLength: 63
+      pattern: "^[a-z0-9][a-z0-9_.-]{0,62}$"
+    ClassifierId:
+      description: Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`.
+      type: string
+      minLength: 3
+      maxLength: 64
+      pattern: "^[a-z]+(\\.[a-z0-9_]+)+$"
+    ClassifiersVersion:
+      description: Version of the classifier set, `YYYY.MM.N`, e.g. `2026.09.1`.
+      type: string
+      maxLength: 16
+      pattern: "^[0-9]{4}\\.[0-9]{2}\\.[0-9]{1,4}$"
+    Signal:
+      description: Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`.
+      type: string
+      maxLength: 64
+      pattern: "^(signature|shape|volume)\\.[a-z0-9_]+$"
+    Fingerprint:
+      description: |
+        `HMAC-SHA256(agent_local_key, normalized_value)`, lowercase hex. The key never leaves the agent,
+        so fingerprints only correlate values seen by the same agent.
+      type: string
+      minLength: 76
+      maxLength: 76
+      pattern: "^hmac-sha256:[0-9a-f]{64}$"
+    MaskedSample:
+      description: |
+        Sample masked by `classifiers::masking` (e.g. `j*******@e******.com`,
+        `FR76 **** **** **** **** ***1 89`). Schema rules: contains at least one `*`, no run of more than
+        4 consecutive letters or digits, no combining mark, no control / format / private-use / line
+        separator character. The console additionally requires at least 50 % of the non-separator characters (letters, digits
+        and `*`; spaces and punctuation ignored) to be `*`: `06 ** ** ** 78` passes (6 of 10).
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[^\p{L}\p{N}\p{M}\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]*([\p{L}\p{N}]{1,4}[^\p{L}\p{N}\p{M}\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+)*([\p{L}\p{N}]{1,4})?$'
+      allOf:
+        - type: string
+          pattern: '\*'
+    Identifier:
+      description: |
+        **Normalized** name of a database object: database, schema, table, collection, column, field
+        path, LDAP suffix, container or attribute. Never a value, never a record identifier.
+
+        Normalization rules (`x-databastion-normalized-name`), applied by the agent before the uplink:
+        - array indices in a path become `[]` (`orders.3.email` -> `orders[].email`);
+        - dynamic keys (map keys, keys that look like identifiers or values) and any name segment
+          matched by a classifier become `*` (`contacts.jane@example.com.phone` -> `contacts.*.phone`);
+        - an LDAP entry DN is reduced to its parent container (`uid=jdoe,ou=people,dc=example,dc=com`
+          -> `ou=people,dc=example,dc=com`); attribute types are lowercased;
+        - a name that still does not match this schema is replaced by `*`.
+
+        Pattern: either a plain name, which excludes `@ = : ; / \ ' "`, backquote, `< > ( ) ,` and
+        control / format characters (so no e-mail address, `key=value`, URL or SQL fragment), or an LDAP
+        container DN made only of `ou=`, `dc=`, `o=`, `c=`, `l=`, `st=` RDNs (never `uid=` / `cn=`).
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: '^([^@=:;/\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+|(ou|dc|o|c|l|st)=[^@=:;/\\''"`<>(),+\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+(,(ou|dc|o|c|l|st)=[^@=:;/\\''"`<>(),+\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+)*)$'
+      not:
+        description: |
+          No name, and no `.`-separated path segment, made only of 9 or more digits and separators
+          (phone numbers, account or card numbers used as keys).
+        type: string
+        pattern: '^[0-9 +.-]{9,}$|(^|\.)[0-9 +-]{9,}(\.|$)'
+      x-databastion-normalized-name: true
+    IdentifierPattern:
+      description: |
+        Console-provided filter on object names: an exact name, or a glob with `*` and `?`. The agent
+        treats it as a name filter only and never interpolates it into a query.
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: '^[^;''"`\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+$'
+    Count:
+      description: Non-negative integer counter, bounded to the JavaScript safe integer range.
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    UnixSocketPath:
+      description: |
+        Absolute path of a local Unix socket under a well-known runtime directory (`/run`, `/var/run`,
+        `/tmp`, `/var/lib/mysql`), e.g. `/var/run/postgresql/.s.PGSQL.5432`. No segment starting with
+        `..`. The agent only reports sockets from its fixed probe list.
+      type: string
+      minLength: 6
+      maxLength: 108
+      pattern: "^/(run|var/run|tmp|var/lib/mysql)(/\\.?[A-Za-z0-9_-][A-Za-z0-9._-]*)+$"
+    ClientAddress:
+      description: |
+        IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket
+        connection. Never a host name.
+      type: string
+      minLength: 2
+      maxLength: 45
+      anyOf:
+        - type: string
+          format: ipv4
+        - type: string
+          format: ipv6
+        - type: string
+          const: local
+
+    # -------------------------------------------------------------------- enums
+    Engine:
+      description: Database or directory engine.
+      type: string
+      enum: [postgres, mysql, mariadb, mongodb, openldap]
+    Connector:
+      description: Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB.
+      type: string
+      enum: [postgres, mysql, mongodb, openldap]
+    ConnectorList:
+      description: Connectors compiled in and enabled in this agent.
+      type: array
+      maxItems: 4
+      uniqueItems: true
+      items:
+        $ref: "#/components/schemas/Connector"
+    AuditLevel:
+      description: |
+        Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
+        e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
+        `limited` (or `partial` with profiler level 2), a target with audit disabled `none`.
+      type: string
+      enum: [full, partial, limited, none]
+    AuditSource:
+      description: Native source used for Audit on a target.
+      type: string
+      enum:
+        - pgaudit
+        - pg_stat_statements
+        - pg_stat_activity
+        - mariadb_server_audit
+        - mysql_audit_log
+        - performance_schema
+        - mongodb_audit_log
+        - mongodb_profiler
+        - mongodb_log
+        - openldap_accesslog
+    Edition:
+      description: Engine edition or distribution, when the agent can tell.
+      type: string
+      enum: [community, enterprise, percona]
+    FailureCode:
+      description: |
+        Closed set of failure causes. Driver or engine messages are never sent (they can contain values
+        or query text); `engine_code` may carry the engine's numeric / SQLSTATE code.
+      type: string
+      enum:
+        - target_unreachable
+        - authentication_failed
+        - permission_denied
+        - timeout
+        - cancelled
+        - expired
+        - unknown_target
+        - unsupported
+        - invalid_params
+        - resource_limit
+        - internal
+    EngineCode:
+      description: Engine error code (SQLSTATE, MySQL / MongoDB numeric code, LDAP result code). No text.
+      type: string
+      minLength: 1
+      maxLength: 16
+      pattern: "^[A-Za-z0-9_]+$"
+
+    # ----------------------------------------------------------------- errors
+    Error:
+      description: |
+        Common error body for every non-2xx response. `message` is a fixed, generic English sentence chosen
+        by the console; it **never echoes submitted values**. Validation `details` point to the offending
+        location with a JSON pointer that the console builds **only from property names known to this
+        schema** and array indices: an unknown property is reported on its parent object, never by its
+        (possibly sensitive) name.
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - not_found
+            - conflict
+            - batch_conflict
+            - rotation_conflict
+            - invalid_secret
+            - payload_too_large
+            - protocol_unsupported
+            - rate_limited
+            - unavailable
+            - internal
+        message:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+$'
+        request_id:
+          $ref: "#/components/schemas/Uuid"
+        min_protocol:
+          description: Present on `426`; minimum protocol major version accepted by the console.
+          $ref: "#/components/schemas/ProtocolMajor"
+        details:
+          type: array
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [pointer, keyword]
+      properties:
+        pointer:
+          description: JSON pointer into the submitted body (e.g. `/findings/3/confidence`); `""` for the root.
+          type: string
+          maxLength: 256
+          pattern: "^(/([a-z][a-z0-9_]{0,63}|[0-9]{1,6}))*$"
+        keyword:
+          description: Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`).
+          type: string
+          maxLength: 32
+          pattern: "^[A-Za-z]+$"
+
+    # ------------------------------------------------------------- enrollment
+    EnrollRequest:
+      type: object
+      additionalProperties: false
+      required: [token, hostname, agent_version, connectors]
+      properties:
+        token:
+          $ref: "#/components/schemas/EnrollmentToken"
+        hostname:
+          $ref: "#/components/schemas/Hostname"
+        agent_version:
+          $ref: "#/components/schemas/AgentVersion"
+        connectors:
+          $ref: "#/components/schemas/ConnectorList"
+        os:
+          type: string
+          enum: [linux]
+        arch:
+          type: string
+          enum: [x86_64, aarch64]
+    EnrollResponse:
+      description: |
+        The agent identity. The agent's HMAC key is generated locally after enrollment and never
+        appears in this protocol.
+      type: object
+      additionalProperties: false
+      required: [agent_id, agent_secret, console_min_protocol, heartbeat_interval_s]
+      properties:
+        agent_id:
+          $ref: "#/components/schemas/Uuid"
+        agent_secret:
+          $ref: "#/components/schemas/AgentSecret"
+        console_min_protocol:
+          $ref: "#/components/schemas/ProtocolMajor"
+        heartbeat_interval_s:
+          $ref: "#/components/schemas/HeartbeatIntervalSeconds"
+    RotateRequest:
+      description: |
+        Body of `POST /rotate`, authenticated with the current secret. `new_secret` is generated by the
+        agent and persisted as pending before the call; retries resend the same value.
+      type: object
+      additionalProperties: false
+      required: [new_secret]
+      properties:
+        new_secret:
+          $ref: "#/components/schemas/AgentSecret"
+        job_id:
+          description: The `agent.rotate_secret` job that requested this rotation, if any.
+          $ref: "#/components/schemas/Uuid"
+    RotateResponse:
+      description: Carries no secret.
+      type: object
+      additionalProperties: false
+      required: [grace_expires_at, duplicate]
+      properties:
+        grace_expires_at:
+          description: |
+            Deadline at which the pending secret is promoted and the previous one revoked, if the new
+            secret has not been used before. At most 3600 s after the first registration; never extended
+            by a retry.
+          $ref: "#/components/schemas/Timestamp"
+        duplicate:
+          description: "`true` when this exact secret was already pending (idempotent retry)."
+          type: boolean
+
+    # -------------------------------------------------------------- heartbeat
+    MetricsMap:
+      description: |
+        Internal metrics as a bounded `name -> number` map (counters, gauges, durations in seconds).
+        The only open-keyed object of the protocol: names are restricted to `^[a-z][a-z0-9_]{0,63}$`
+        and values to numbers, so it cannot carry text.
+
+        The console re-exposes them on `/metrics` under the distinct prefix `databastion_agent_reported_`
+        with labels `agent_id` (and `target_id` for target metrics), so an agent can never shadow a
+        console-computed metric such as `databastion_agent_last_seen_seconds`. Names on the console's
+        reserved list (e.g. `last_seen_seconds`, `up`, `revoked`) are ignored.
+      type: object
+      maxProperties: 128
+      propertyNames:
+        type: string
+        maxLength: 64
+        pattern: "^[a-z][a-z0-9_]{0,63}$"
+      additionalProperties:
+        type: number
+        minimum: -9007199254740991
+        maximum: 9007199254740991
+      x-databastion-numeric-map: true
+    HeartbeatRequest:
+      type: object
+      additionalProperties: false
+      required: [ts, agent_version, uptime_s, connectors, targets, detected_targets, spool]
+      properties:
+        ts:
+          description: Agent clock when the heartbeat was built (lets the console detect clock skew).
+          $ref: "#/components/schemas/Timestamp"
+        agent_version:
+          $ref: "#/components/schemas/AgentVersion"
+        uptime_s:
+          $ref: "#/components/schemas/Count"
+        classifiers_version:
+          $ref: "#/components/schemas/ClassifiersVersion"
+        connectors:
+          $ref: "#/components/schemas/ConnectorList"
+        targets:
+          description: Status of every target declared in `agent.yaml`.
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/TargetStatus"
+        detected_targets:
+          description: |
+            Engines detected on the **local host** but not configured (ADR-0006), as suggestions for the
+            console's configuration wizard. Never a target network address, never a process command line.
+          type: array
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/DetectedTarget"
+        running_jobs:
+          description: Jobs currently executing, so the console can detect lost jobs.
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Uuid"
+        spool:
+          $ref: "#/components/schemas/SpoolStatus"
+        metrics:
+          $ref: "#/components/schemas/MetricsMap"
+    TargetStatus:
+      type: object
+      additionalProperties: false
+      required: [target_id, engine, reachable, audit_level]
+      properties:
+        target_id:
+          $ref: "#/components/schemas/TargetId"
+        engine:
+          $ref: "#/components/schemas/Engine"
+        edition:
+          $ref: "#/components/schemas/Edition"
+        server_version:
+          description: |
+            Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted
+            when the reported string does not match this pattern.
+          type: string
+          maxLength: 32
+          pattern: "^[0-9A-Za-z._+-]+$"
+        reachable:
+          description: Whether the last connection attempt with the configured read-only account succeeded.
+          type: boolean
+        audit_level:
+          $ref: "#/components/schemas/AuditLevel"
+        audit_source:
+          $ref: "#/components/schemas/AuditSource"
+        last_error:
+          description: Cause of the last failed `check()` or connection, if any.
+          $ref: "#/components/schemas/FailureCode"
+        metrics:
+          $ref: "#/components/schemas/MetricsMap"
+    DetectedTarget:
+      description: |
+        A local engine spotted by a Unix socket, a local listening port or a process name. At least one
+        of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
+      type: object
+      additionalProperties: false
+      required: [engine]
+      minProperties: 2
+      properties:
+        engine:
+          $ref: "#/components/schemas/Engine"
+        unix_socket:
+          $ref: "#/components/schemas/UnixSocketPath"
+        port:
+          description: Local listening TCP port. The listening address is not reported.
+          type: integer
+          minimum: 1
+          maximum: 65535
+        process:
+          description: Process name only (the command line may contain secrets and is never read or sent).
+          type: string
+          enum: [postgres, mysqld, mariadbd, mongod, slapd]
+    SpoolStatus:
+      type: object
+      additionalProperties: false
+      required: [bytes, max_bytes, batches]
+      properties:
+        bytes:
+          $ref: "#/components/schemas/Count"
+        max_bytes:
+          $ref: "#/components/schemas/Count"
+        batches:
+          $ref: "#/components/schemas/Count"
+        oldest_age_s:
+          description: Age, in seconds, of the oldest spooled batch.
+          $ref: "#/components/schemas/Count"
+        dropped_batches:
+          description: Batches dropped since start (spool full, or rejected with a non-retryable 4xx).
+          $ref: "#/components/schemas/Count"
+        dropped_items:
+          description: Individual findings / events dropped since start after a `400` or `404` pointing at them.
+          $ref: "#/components/schemas/Count"
+    HeartbeatResponse:
+      type: object
+      additionalProperties: false
+      required: [console_min_protocol, heartbeat_interval_s, server_time]
+      properties:
+        console_min_protocol:
+          $ref: "#/components/schemas/ProtocolMajor"
+        heartbeat_interval_s:
+          $ref: "#/components/schemas/HeartbeatIntervalSeconds"
+        server_time:
+          $ref: "#/components/schemas/Timestamp"
+
+    # -------------------------------------------------------------------- jobs
+    JobList:
+      type: object
+      additionalProperties: false
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/Job"
+    Job:
+      description: |
+        A console order, discriminated by `type`. Jobs never carry a secret, a credential, a connection
+        string or configuration content: targets and credentials live in the agent's local `agent.yaml`.
+      oneOf:
+        - $ref: "#/components/schemas/DiscoveryScanJob"
+        - $ref: "#/components/schemas/AuditConfigureJob"
+        - $ref: "#/components/schemas/AgentConfigReloadJob"
+        - $ref: "#/components/schemas/AgentRotateSecretJob"
+      discriminator:
+        propertyName: type
+        mapping:
+          discovery.scan: "#/components/schemas/DiscoveryScanJob"
+          audit.configure: "#/components/schemas/AuditConfigureJob"
+          agent.config.reload: "#/components/schemas/AgentConfigReloadJob"
+          agent.rotate_secret: "#/components/schemas/AgentRotateSecretJob"
+    DiscoveryScanJob:
+      type: object
+      additionalProperties: false
+      required: [job_id, type, created_at, target_id, classifiers_version, params]
+      properties:
+        job_id:
+          $ref: "#/components/schemas/Uuid"
+        type:
+          type: string
+          const: discovery.scan
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+        expires_at:
+          description: The agent must not start the job after this instant (reports `failed` / `expired`).
+          $ref: "#/components/schemas/Timestamp"
+        target_id:
+          $ref: "#/components/schemas/TargetId"
+        classifiers_version:
+          $ref: "#/components/schemas/ClassifiersVersion"
+        params:
+          $ref: "#/components/schemas/DiscoveryScanParams"
+    DiscoveryScanParams:
+      description: |
+        Bounds of a Discovery scan (invariant I4). The agent also applies its own local hard limits and
+        a per-statement timeout on every query.
+      type: object
+      additionalProperties: false
+      required: [sample_rows, max_duration_s]
+      properties:
+        sample_rows:
+          description: Maximum rows (documents, entries) sampled per object.
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 200
+        max_duration_s:
+          description: Wall-clock budget of the whole scan.
+          type: integer
+          minimum: 10
+          maximum: 86400
+          default: 900
+        statement_timeout_ms:
+          description: Timeout applied to each query against the target.
+          type: integer
+          minimum: 100
+          maximum: 600000
+          default: 30000
+        databases:
+          description: Databases (or LDAP suffixes) to include. Absent = all visible to the account.
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IdentifierPattern"
+        schemas:
+          description: Schemas to include (PostgreSQL). Absent = all.
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/IdentifierPattern"
+        include_objects:
+          description: Tables / collections / objectClasses to include. Absent = all.
+          type: array
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/IdentifierPattern"
+        exclude_objects:
+          description: Tables / collections / objectClasses to skip.
+          type: array
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/IdentifierPattern"
+        classifiers:
+          description: Restrict the scan to these classifiers. Absent = all classifiers of the version.
+          type: array
+          maxItems: 200
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ClassifierId"
+    AuditConfigureJob:
+      type: object
+      additionalProperties: false
+      required: [job_id, type, created_at, target_id, params]
+      properties:
+        job_id:
+          $ref: "#/components/schemas/Uuid"
+        type:
+          type: string
+          const: audit.configure
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+        expires_at:
+          $ref: "#/components/schemas/Timestamp"
+        target_id:
+          $ref: "#/components/schemas/TargetId"
+        params:
+          $ref: "#/components/schemas/AuditConfigureParams"
+    AuditConfigureParams:
+      description: |
+        Audit settings for one target. Replaces the previous settings as a whole. Detection thresholds
+        and scoring are applied by the console's worker; these settings only drive collection and
+        pre-aggregation on the agent.
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+        aggregation_window_s:
+          description: Pre-aggregation window (same principal, object set and action).
+          type: integer
+          minimum: 1
+          maximum: 300
+          default: 60
+        poll_interval_s:
+          description: Polling interval for polled sources (`performance_schema`, `pg_stat_activity`, `cn=accesslog`, profiler).
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 10
+        min_rows:
+          description: |
+            Events on objects that are not listed in `sensitive_objects` and carry no signal are only
+            reported when they return at least this many rows.
+          $ref: "#/components/schemas/Count"
+        sensitive_objects:
+          description: Objects classified as sensitive by Discovery, whose accesses are always reported.
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/SensitiveObject"
+    SensitiveObject:
+      type: object
+      additionalProperties: false
+      required: [database, object, classifiers]
+      properties:
+        database:
+          $ref: "#/components/schemas/Identifier"
+        schema:
+          $ref: "#/components/schemas/Identifier"
+        object:
+          $ref: "#/components/schemas/Identifier"
+        classifiers:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ClassifierId"
+    AgentConfigReloadJob:
+      description: |
+        Asks the agent to re-read its **local** `agent.yaml`. The job carries no configuration: targets and
+        credentials never transit through the console (invariant I3).
+      type: object
+      additionalProperties: false
+      required: [job_id, type, created_at, params]
+      properties:
+        job_id:
+          $ref: "#/components/schemas/Uuid"
+        type:
+          type: string
+          const: agent.config.reload
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+        expires_at:
+          $ref: "#/components/schemas/Timestamp"
+        params:
+          $ref: "#/components/schemas/EmptyParams"
+    AgentRotateSecretJob:
+      description: |
+        Asks the agent to rotate its secret. **Carries no secret**: the agent generates the new secret and
+        registers it with `POST /rotate`. Suspected compromise is handled by revocation and
+        re-enrollment, not by this job.
+      type: object
+      additionalProperties: false
+      required: [job_id, type, created_at, params]
+      properties:
+        job_id:
+          $ref: "#/components/schemas/Uuid"
+        type:
+          type: string
+          const: agent.rotate_secret
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+        expires_at:
+          $ref: "#/components/schemas/Timestamp"
+        params:
+          $ref: "#/components/schemas/RotateSecretParams"
+    RotateSecretParams:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum: [scheduled, manual]
+    EmptyParams:
+      description: No parameters.
+      type: object
+      additionalProperties: false
+      maxProperties: 0
+    JobStatusUpdate:
+      description: "`error` is required when `status` is `failed`, and forbidden otherwise."
+      type: object
+      additionalProperties: false
+      required: [status, ts]
+      properties:
+        status:
+          type: string
+          enum: [running, succeeded, failed]
+        ts:
+          $ref: "#/components/schemas/Timestamp"
+        progress:
+          $ref: "#/components/schemas/JobProgress"
+        error:
+          $ref: "#/components/schemas/JobError"
+      if:
+        required: [status]
+        properties:
+          status:
+            const: failed
+      then:
+        required: [error]
+        properties:
+          error:
+            $ref: "#/components/schemas/JobError"
+      else:
+        properties:
+          error: false
+    JobProgress:
+      type: object
+      additionalProperties: false
+      properties:
+        ratio:
+          description: Estimated completion, from 0 to 1.
+          type: number
+          minimum: 0
+          maximum: 1
+        objects_done:
+          $ref: "#/components/schemas/Count"
+        objects_total:
+          $ref: "#/components/schemas/Count"
+        findings:
+          description: Findings reported so far for this job.
+          $ref: "#/components/schemas/Count"
+        batches:
+          description: |
+            Findings batches sent so far for this job. On `succeeded`, lets the console check that it
+            received all of them.
+          $ref: "#/components/schemas/Count"
+    JobError:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code:
+          $ref: "#/components/schemas/FailureCode"
+        engine_code:
+          $ref: "#/components/schemas/EngineCode"
+
+    # ---------------------------------------------------------------- results
+    BatchAck:
+      type: object
+      additionalProperties: false
+      required: [batch_id, duplicate]
+      properties:
+        batch_id:
+          $ref: "#/components/schemas/UuidV7"
+        duplicate:
+          description: "`true` when this (`agent_id`, `batch_id`) had already been received with the same content; the batch was not processed again."
+          type: boolean
+    FindingsBatch:
+      description: Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).
+      type: object
+      additionalProperties: false
+      required: [batch_id, job_id, classifiers_version, findings]
+      x-databastion-max-bytes: 1048576
+      properties:
+        batch_id:
+          $ref: "#/components/schemas/UuidV7"
+        job_id:
+          description: The `discovery.scan` job that produced these findings.
+          $ref: "#/components/schemas/Uuid"
+        classifiers_version:
+          $ref: "#/components/schemas/ClassifiersVersion"
+        findings:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/Finding"
+    Finding:
+      description: |
+        A location contains a sensitive data type. `matched <= sampled` (checked by the console).
+        No raw value: only masked samples and HMAC fingerprints.
+      type: object
+      additionalProperties: false
+      required: [target_id, location, classifier, confidence, sampled, matched]
+      properties:
+        target_id:
+          $ref: "#/components/schemas/TargetId"
+        location:
+          $ref: "#/components/schemas/Location"
+        classifier:
+          $ref: "#/components/schemas/ClassifierId"
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        sampled:
+          description: Values examined.
+          type: integer
+          minimum: 1
+          maximum: 10000
+        matched:
+          description: Values matching the classifier.
+          type: integer
+          minimum: 0
+          maximum: 10000
+        estimated_rows:
+          description: Estimated size of the object (rows, documents, entries), from engine statistics.
+          $ref: "#/components/schemas/Count"
+        masked_samples:
+          type: array
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/MaskedSample"
+        fingerprints:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Fingerprint"
+    Location:
+      description: |
+        Where the data lives, down to the column / field / attribute; never a record. All names are
+        normalized (see `Identifier`).
+        PostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).
+        MongoDB: database, collection, normalized field path. OpenLDAP: suffix (as `database`),
+        objectClass or container (as `object`, never an entry DN), attribute.
+      type: object
+      additionalProperties: false
+      required: [engine, database, object, field]
+      properties:
+        engine:
+          $ref: "#/components/schemas/Engine"
+        database:
+          $ref: "#/components/schemas/Identifier"
+        schema:
+          $ref: "#/components/schemas/Identifier"
+        object:
+          $ref: "#/components/schemas/Identifier"
+        field:
+          $ref: "#/components/schemas/Identifier"
+    EventsBatch:
+      description: Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).
+      type: object
+      additionalProperties: false
+      required: [batch_id, events]
+      x-databastion-max-bytes: 1048576
+      properties:
+        batch_id:
+          $ref: "#/components/schemas/UuidV7"
+        events:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/AccessEvent"
+    AccessEvent:
+      description: |
+        Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
+        and no returned value: only who, what object, which action, how many rows, and signals.
+        `read` and `write` events name at least one object.
+      type: object
+      additionalProperties: false
+      required: [target_id, ts, principal, action, objects, source, aggregated_count]
+      properties:
+        target_id:
+          $ref: "#/components/schemas/TargetId"
+        ts:
+          description: First occurrence.
+          $ref: "#/components/schemas/Timestamp"
+        ts_last:
+          description: Last occurrence, when `aggregated_count > 1`.
+          $ref: "#/components/schemas/Timestamp"
+        principal:
+          $ref: "#/components/schemas/Principal"
+        action:
+          description: "`auth_failure`: failed authentication (the account name is then usually fingerprinted)."
+          type: string
+          enum: [connect, auth_failure, read, write, ddl, dcl]
+        objects:
+          type: array
+          maxItems: 16
+          items:
+            $ref: "#/components/schemas/ObjectRef"
+        rows:
+          description: Rows (documents, entries) returned or affected, when the source provides it.
+          $ref: "#/components/schemas/Count"
+        signals:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Signal"
+        source:
+          $ref: "#/components/schemas/AuditSource"
+        aggregated_count:
+          description: Number of raw events merged into this one.
+          type: integer
+          minimum: 1
+          maximum: 1000000
+      if:
+        required: [action]
+        properties:
+          action:
+            enum: [read, write]
+      then:
+        properties:
+          objects:
+            type: array
+            minItems: 1
+    Principal:
+      description: |
+        Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with
+        an account that does not exist on the target (the attempted name may be a mistyped password), and
+        for any account name that does not match the `db_user` pattern, the agent sends
+        `db_user_fingerprint` instead of the name. The console escapes `db_user` and `application` on
+        display.
+      type: object
+      additionalProperties: false
+      properties:
+        db_user:
+          description: Database account (or LDAP bind DN) as logged by the engine.
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+$'
+        db_user_fingerprint:
+          $ref: "#/components/schemas/Fingerprint"
+        client_addr:
+          $ref: "#/components/schemas/ClientAddress"
+        application:
+          description: |
+            Client-declared application name (`application_name`, `appName`). The agent replaces every
+            character outside `[A-Za-z0-9 ._:/+-]` with `_` and truncates to 64 characters.
+          type: string
+          maxLength: 64
+          pattern: "^[A-Za-z0-9 ._:/+-]*$"
+      oneOf:
+        - required: [db_user]
+        - required: [db_user_fingerprint]
+    ObjectRef:
+      description: Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+      type: object
+      additionalProperties: false
+      required: [database, object]
+      properties:
+        database:
+          $ref: "#/components/schemas/Identifier"
+        schema:
+          $ref: "#/components/schemas/Identifier"
+        object:
+          $ref: "#/components/schemas/Identifier"

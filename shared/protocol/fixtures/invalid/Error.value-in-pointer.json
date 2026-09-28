@@ -1,0 +1,10 @@
+{
+  "code": "invalid_request",
+  "message": "Invalid body.",
+  "details": [
+    {
+      "pointer": "/findings/0/jane.doe@example.com",
+      "keyword": "additionalProperties"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "code": "invalid_request",
+  "message": "The request body does not conform to the protocol schema.",
+  "request_id": "0192a1b3-0000-7000-8000-000000000001",
+  "details": [
+    {
+      "pointer": "/findings/0",
+      "keyword": "additionalProperties"
+    },
+    {
+      "pointer": "/findings/3/confidence",
+      "keyword": "maximum"
+    }
+  ]
+}
