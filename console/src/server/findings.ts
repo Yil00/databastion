@@ -7,6 +7,7 @@ import { agents, agentTargets, findings, findingsBatches, jobs } from "@/db/sche
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import type { FindingFilter } from "@/lib/findings-filter";
+import { registeredClassifiers } from "@/lib/protocol/classifiers";
 
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
@@ -118,7 +119,10 @@ function crossFieldDetails(
   };
   const sampleRows = jobSampleRows(job.params);
   const allowed = jobClassifiers(job.params);
-  // L1: the batch was produced with the classifier set the scan asked for.
+  // The batch's classifier set is registered (contract registry `classifiers.json`), and is the
+  // one the scan asked for (L1). Both drop the whole batch.
+  const registered = registeredClassifiers(batch.classifiers_version);
+  if (!registered) push({ pointer: "/classifiers_version", keyword: "enum" });
   if (batch.classifiers_version !== job.classifiersVersion) {
     push({ pointer: "/classifiers_version", keyword: "const" });
   }
@@ -130,7 +134,11 @@ function crossFieldDetails(
     }
     if (f.matched > f.sampled) push({ pointer: `/findings/${i}/matched`, keyword: "maximum" });
     if (f.sampled > sampleRows) push({ pointer: `/findings/${i}/sampled`, keyword: "maximum" });
-    if (allowed && !allowed.has(f.classifier)) push({ pointer: `/findings/${i}/classifier`, keyword: "enum" });
+    // An id of the batch's version and of the job's `params.classifiers` when present; both skipped
+    // when the version itself is unknown (the whole batch is already rejected). Set lookups only.
+    if (registered && (!registered.has(f.classifier) || (allowed && !allowed.has(f.classifier)))) {
+      push({ pointer: `/findings/${i}/classifier`, keyword: "enum" });
+    }
   });
   return details;
 }
@@ -140,7 +148,9 @@ function crossFieldDetails(
  * 1. idempotency on `(agent_id, batch_id)`: same content -> duplicate, other content -> conflict;
  * 2. `job_id` is a delivered `discovery.scan` job of the agent (`404` `/job_id` otherwise);
  * 3. every `target_id` was reported by the agent (`404`, item pointers);
- * 4. cross-field checks (`400`, item pointers);
+ * 4. cross-field checks (`400`, all together): `classifiers_version` registered (`enum`) and equal
+ *    to the job's (`const`), then item pointers (job target, engine, counts, classifier id of the
+ *    batch's registered version and of the job's `params.classifiers`);
  * 5. upsert of the findings (masked samples encrypted, see `samples.ts`) + the batch record.
  * Batches of one agent are serialized (transaction-scoped advisory lock), so the finding id bound
  * into the samples' AAD is always the id of the stored row.

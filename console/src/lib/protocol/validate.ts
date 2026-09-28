@@ -4,6 +4,8 @@ import addFormats from "ajv-formats";
 import bundle from "@/generated/protocol/schemas.gen.json";
 import type { components } from "@/generated/protocol/types.gen";
 
+import { registeredClassifiers } from "./classifiers";
+
 /**
  * Runtime validator for agent API bodies (invariant I6, security review L2).
  *
@@ -184,11 +186,30 @@ export function isSufficientlyMasked(sample: string): boolean {
 const encoder = new TextEncoder();
 
 /**
+ * Outgoing `discovery.scan` jobs (contract `DiscoveryScanJob`): the `classifiers_version` is
+ * registered in `classifiers.json` and every `params.classifiers` id belongs to that version
+ * (keyword `enum`). Other job types carry no classifier set.
+ */
+export function scanJobRegistryDetails(job: Schemas["Job"], prefix: string): ValidationDetail[] {
+  if (job.type !== "discovery.scan") return [];
+  const scan = job as Schemas["DiscoveryScanJob"];
+  const ids = registeredClassifiers(scan.classifiers_version);
+  if (!ids) return [{ pointer: `${prefix}/classifiers_version`, keyword: "enum" }];
+  const details: ValidationDetail[] = [];
+  (scan.params.classifiers ?? []).forEach((id, i) => {
+    if (!ids.has(id)) details.push({ pointer: `${prefix}/params/classifiers/${i}`, keyword: "enum" });
+  });
+  return details;
+}
+
+/**
  * Second pass, after `validateSchema` returned `ok: true`: the contract rules that JSON Schema
  * cannot express.
  * - `x-databastion-max-bytes`: serialized size of the value (keyword `maxBytes`, pointer `""`).
  * - `MaskedSample`: at least 50 % `*` (keyword `maskRatio`). `MaskedSample` is only used in
  *   `FindingsBatch.findings[].masked_samples[]`; a test fails if the contract adds another use.
+ * - `JobList` / `Job` / `DiscoveryScanJob` (outgoing, P1-A gate): a scan job's
+ *   `classifiers_version` and `params.classifiers` ids are registered (`scanJobRegistryDetails`).
  * Reserved metric names (`HeartbeatRequest.metrics`) are not rejected: the contract says they are
  * ignored, which is the job of the `/metrics` exporter.
  */
@@ -200,6 +221,18 @@ export function checkSemantics<K extends SchemaName>(
   const maxBytes = maxBytesOf(name);
   if (maxBytes !== undefined && encoder.encode(JSON.stringify(value)).byteLength > maxBytes) {
     details.push({ pointer: "", keyword: "maxBytes" });
+  }
+  if (name === "JobList") {
+    (value as Schemas["JobList"]).jobs.forEach((job, i) => {
+      for (const d of scanJobRegistryDetails(job, `/jobs/${i}`)) {
+        if (details.length < MAX_VALIDATION_DETAILS) details.push(d);
+      }
+    });
+  }
+  if (name === "Job" || name === "DiscoveryScanJob") {
+    for (const d of scanJobRegistryDetails(value as Schemas["Job"], "")) {
+      if (details.length < MAX_VALIDATION_DETAILS) details.push(d);
+    }
   }
   if (name === "FindingsBatch") {
     const batch = value as Schemas["FindingsBatch"];

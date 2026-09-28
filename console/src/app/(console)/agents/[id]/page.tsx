@@ -11,7 +11,7 @@ import { getDb } from "@/db/client";
 import { displayStatus, formatAge } from "@/lib/agent-status";
 import { getAgentDetail } from "@/server/agents";
 import { rotationBlocked } from "@/server/rotation";
-import { latestScans } from "@/server/scans";
+import { latestScans, scanStatusLabel } from "@/server/scans";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
 export const dynamic = "force-dynamic";
@@ -115,7 +115,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                       {(() => {
                         const scan = scans.get(t.targetId);
                         if (!scan) return "never";
-                        return `${scan.status}${scan.errorCode ? ` (${scan.errorCode})` : ""}, ${formatAge(scan.createdAt, now)}`;
+                        return `${scanStatusLabel(scan, agent.classifiersVersion)}, ${formatAge(scan.createdAt, now)}`;
                       })()}
                     </TableCell>
                     <TableCell>

@@ -21,8 +21,12 @@ Request pipeline (every endpoint): required headers (`X-DataBastion-Protocol`, `
 body read with a hard 4 MiB cap (`413`) → `validateSchema` → `checkSemantics` → handler. Errors use
 the contract `Error` body with a fixed message per code and never echo submitted values. Every
 response is `Cache-Control: no-store`. Outgoing bodies (`EnrollResponse`, `HeartbeatResponse`,
-`JobList`) are validated against the contract before being sent; each job is validated
-individually and a non-conforming job is marked `failed` and never served.
+`JobList`) are validated against the contract before being sent (`validateSchema` then
+`checkSemantics`); each job is validated individually and a non-conforming job is marked `failed`
+(`internal`) and never served. For a `discovery.scan` job, `checkSemantics` also requires a
+`classifiers_version` registered in the contract classifier registry (`classifiers.json`, generated
+into `src/generated/protocol/classifiers.gen.ts`) and `params.classifiers` ids of that version
+(`src/lib/protocol/classifiers.ts`: `Map` / `Set` lookups only, never a prototype lookup).
 
 Authentication: every attempt that needs an argon2id verification is counted before it runs
 (refunded on success), per (agent id, source IP) (10 / 5 min) and per source IP (50 / 5 min); the
@@ -69,12 +73,13 @@ agent (advisory lock):
    otherwise `404` with pointer `/job_id` (keyword `notFound`);
 3. every `target_id` reported by the agent in a heartbeat: otherwise `404`, pointers
    `/findings/<i>/target_id` (keyword `notFound`);
-4. `400`: `classifiers_version` = the job's (`/classifiers_version`, `const`); per item,
-   `target_id` = the job's target (`const`), `location.engine` = the engine last reported for the
-   target (`const`), `matched <= sampled` and `sampled <= params.sample_rows` (`maximum`), classifier
-   within the job's `params.classifiers` when set (`enum`). There is **no check that classifier ids
-   exist in `classifiers_version`** yet: the console has no registry of classifier ids per version;
-   it waits for a contract artifact, which a protocol PR will add;
+4. `400`, all details together: first `classifiers_version` registered in `classifiers.json`
+   (`/classifiers_version`, `enum`) and equal to the job's (`/classifiers_version`, `const`); both
+   drop the whole batch. Then per item: `target_id` = the job's target (`const`),
+   `location.engine` = the engine last reported for the target (`const`), `matched <= sampled` and
+   `sampled <= params.sample_rows` (`maximum`), `classifier` an id of the batch's registered version
+   and within the job's `params.classifiers` when set (`/findings/<i>/classifier`, `enum`; neither
+   is reported per item when the version itself is unknown);
 5. at most 50 000 findings per job over all its batches (`MAX_FINDINGS_PER_JOB`): beyond, `400`
    with pointer `/findings` (keyword `maxItems`);
 6. upsert of the findings (masked samples encrypted, see the console README "Data at rest") and of

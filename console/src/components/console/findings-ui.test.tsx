@@ -7,7 +7,7 @@ import type { FindingView } from "@/server/findings";
 import { proxy } from "@/proxy";
 
 import { findingsHref, FindingsSummary, FindingsTable, locationLabel } from "./findings-table";
-import { scanRequestBody } from "./scan-dialog";
+import { scanErrorMessage, scanRequestBody } from "./scan-dialog";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: () => undefined }) }));
 
@@ -142,5 +142,21 @@ describe("proxy", () => {
     const res = proxy(new NextRequest("http://console.test/findings"));
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(res.headers.get("content-security-policy")).toContain("'nonce-");
+  });
+});
+
+describe("scanErrorMessage", () => {
+  it("explains the classifier registry refusals from the error code", () => {
+    expect(scanErrorMessage(409, { error: "classifiers_version_unregistered" })).toMatch(/classifier set this console does not know/);
+    expect(scanErrorMessage(409, { error: "agent_not_ready" })).toMatch(/not reported its classifier set/);
+    expect(scanErrorMessage(422, { error: "unknown_classifiers" })).toMatch(/not part of the agent's classifier set/);
+    expect(scanErrorMessage(409, { error: "scan_in_progress" })).toMatch(/already queued or running/);
+  });
+
+  it("falls back on the status for unknown or prototype-like codes and non-JSON bodies", () => {
+    expect(scanErrorMessage(409, { error: "__proto__" })).toMatch(/already queued or running, or the agent is not ready/);
+    expect(scanErrorMessage(409, { error: "constructor" })).toMatch(/already queued or running, or the agent is not ready/);
+    expect(scanErrorMessage(422, null)).toMatch(/not part of the agent's classifier set/);
+    expect(scanErrorMessage(500, [])).toBe("The scan could not be queued (500).");
   });
 });

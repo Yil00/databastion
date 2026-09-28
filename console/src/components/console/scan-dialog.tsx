@@ -41,11 +41,31 @@ export function scanRequestBody(values: Record<string, string>): Record<string, 
   return body;
 }
 
+/** Messages per `error` code of the scan request (fallback: per HTTP status). */
+export const SCAN_ERROR_CODES: Record<string, string> = {
+  invalid_params: "Invalid parameters (check the ranges and the name filters).",
+  not_found: "The agent or the target is no longer active.",
+  scan_in_progress: "A scan of this target is already queued or running.",
+  agent_not_ready: "The agent has not reported its classifier set yet: wait for its next heartbeat.",
+  classifiers_version_unregistered:
+    "The agent runs a classifier set this console does not know: upgrade the console or install a supported agent build.",
+  unknown_classifiers: "Some classifiers are not part of the agent's classifier set.",
+};
+
 const ERRORS: Record<number, string> = {
   400: "Invalid parameters (check the ranges and the name filters).",
   404: "The agent or the target is no longer active.",
-  409: "A scan of this target is already queued or running, or the agent has not reported its classifiers yet.",
+  409: "A scan of this target is already queued or running, or the agent is not ready.",
+  422: "Some classifiers are not part of the agent's classifier set.",
 };
+
+/** User message of a refused scan request, from its JSON `{ error }` body when there is one. */
+export function scanErrorMessage(status: number, body: unknown): string {
+  const code =
+    body !== null && typeof body === "object" && !Array.isArray(body) ? (body as { error?: unknown }).error : undefined;
+  if (typeof code === "string" && Object.hasOwn(SCAN_ERROR_CODES, code)) return SCAN_ERROR_CODES[code] as string;
+  return ERRORS[status] ?? `The scan could not be queued (${status}).`;
+}
 
 /** "Scan" action of a target (admin): a native `<dialog>` form, posted with the CSRF header. */
 export function ScanDialog({
@@ -79,7 +99,7 @@ export function ScanDialog({
       return;
     }
     if (!res.ok) {
-      setMessage(ERRORS[res.status] ?? `The scan could not be queued (${res.status}).`);
+      setMessage(scanErrorMessage(res.status, await res.json().catch(() => null)));
       return;
     }
     ref.current?.close();
