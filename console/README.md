@@ -38,6 +38,7 @@ database credentials (invariant I3).
 | `pnpm lint` | ESLint, zero warnings allowed |
 | `pnpm typecheck` | `next typegen` + `tsc --noEmit` |
 | `pnpm test` | Unit tests (vitest) |
+| `pnpm protocol:generate` | Regenerate `src/generated/protocol/` from `shared/protocol/openapi.yaml` (checked by `pnpm test`) |
 | `pnpm db:generate --name <slug>` | Generate a versioned SQL migration in `drizzle/` from `src/db/schema.ts` |
 | `pnpm db:migrate` | Apply pending migrations to `DATABASE_URL(_FILE)` |
 
@@ -54,12 +55,14 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 ## Layout
 ```
 drizzle/                  versioned SQL migrations (generated, never edited by hand)
+scripts/protocol/         protocol code generator (`pnpm protocol:generate`)
 src/app/                  Next.js App Router (UI + API routes)
 src/app/api/agent/v1/     agent API (placeholder)
 src/config/               configuration loading (NAME / NAME_FILE)
 src/db/                   Drizzle schema, client, migrator
-src/generated/protocol/   types generated from shared/protocol/ (placeholder)
-src/lib/                  logger (pino, JSON on stdout), shadcn/ui helpers
+src/generated/protocol/   types + JSON Schema bundle generated from shared/protocol/ (never edited)
+src/lib/                  logger (pino, JSON on stdout), shadcn/ui helpers,
+                          protocol/validate.ts (agent API body validator)
 src/worker/               pg-boss worker entrypoint and queue handlers
 ```
 
