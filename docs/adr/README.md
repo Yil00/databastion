@@ -2,6 +2,8 @@
 
 Every structural decision is recorded here. **An agent (human or AI) does not challenge an accepted ADR as part of a task**: it proposes a new ADR that supersedes it (`Status: Superseded by ADR-XXXX`).
 
+An accepted ADR is not edited. A new ADR either supersedes it, or refines it (a `Refines: ADR-XXXX (which stays Accepted)` line under its date) when it only makes a point precise or adds to it.
+
 | # | Decision | Status |
 |---|----------|--------|
 | [0001](0001-transport-https-outbound.md) | Outbound HTTPS transport with long-poll | Accepted |
@@ -21,5 +23,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0015](0015-postgresql-connector-decisions.md) | PostgreSQL connector: TLS policy, authentication refusals, RLS policy allow-list, audit level before P4-A, partition and byte bounds (refines 0012) | Accepted |
 | [0016](0016-classifier-semantics-2026-09-1.md) | Classifier semantics for set 2026.09.1: value-based decision, personal e-mail, placeholders, age reference year, NFC, held-out evaluation process | Accepted |
 | [0017](0017-alerting.md) | Alerting: webhook signature, channel secrets, outbox delivery, skipped slugs, system alerts, SMTP client, SSRF model, volume bounds | Accepted |
+| [0019](0019-incident-reopen-cutoff.md) | "Seen after the resolution" decided on the scan job's first delivery (refines 0014) | Accepted |
 
 Template: copy [template.md](template.md).
