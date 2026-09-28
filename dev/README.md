@@ -93,7 +93,9 @@ from the host's PostgreSQL binaries (127.0.0.1:55432, same seed, same `20-databa
 pgaudit unless installed; TLS with a throwaway CA, exported as `DATABASTION_TEST_PG_CA_FILE` for the
 `verify_full` test; `pg_hba` lines for the md5 / cleartext refusal test) and prints the variables: `eval "$(dev/postgres/local-cluster.sh start)"`,
 then `dev/postgres/local-cluster.sh stop` (deletes it). The pgaudit probe of ADR-0012 only runs
-where pgaudit is loaded (the dev image).
+where pgaudit is loaded (the dev image). A skipped check prints `skipped: …`;
+`DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`, `pgaudit`, `weak-auth`, `tls`,
+or `all`) turns the listed skips into failures, as CI does for each server.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.

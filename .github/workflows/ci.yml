@@ -242,15 +242,26 @@ jobs:
           cp dev/.env.example dev/.env
           make dev-dirs
           timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 postgres
-      - name: Connector integration tests
+      # DATABASTION_TEST_REQUIRE turns the listed skips into failures: each run must exercise
+      # what only its server provides (pgaudit in the dev image; TLS with a pinned CA and the
+      # md5 / cleartext refusal on the local cluster).
+      - name: Connector integration tests (dev image, pgaudit)
         working-directory: agent
         run: |
           set -a; . ../dev/.env; set +a
           export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
           export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
-          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture 2>&1 | tee ../pg-it.log
-          # The pgaudit branch must have run (the dev image loads pgaudit).
-          grep -q "pgaudit loaded; pgaudit.log readable without pg_read_all_settings" ../pg-it.log
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit
+          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
+      - name: Connector integration tests (local cluster, TLS and weak authentication)
+        run: |
+          if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends postgresql
+          fi
+          eval "$(dev/postgres/local-cluster.sh start)"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls
+          (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
+          dev/postgres/local-cluster.sh stop
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 postgres
