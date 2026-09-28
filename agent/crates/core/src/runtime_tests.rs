@@ -1086,6 +1086,15 @@ async fn items_rejected_by_pointer_are_dropped_and_rest_resent_under_new_id() {
 }
 
 #[tokio::test]
+async fn out_of_range_item_pointer_drops_the_batch() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/7"])], 3).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    assert_eq!(rt.lock_spool().status().dropped_batches.unwrap().0, 1);
+}
+
+#[tokio::test]
 async fn envelope_pointer_drops_the_whole_batch() {
     let server = MockServer::start().await;
     let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/job_id"])], 4).await;

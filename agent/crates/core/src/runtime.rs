@@ -691,6 +691,15 @@ impl Runtime {
                 self.lock_spool().remove(&key);
                 Ok(Flush::Progress)
             }
+            Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. }))
+                if items.iter().any(|&i| i >= batch.len()) =>
+            {
+                // Pointers outside the batch: resending would loop.
+                bump(&self.counters.batches_rejected, 1);
+                tracing::warn!("console rejected items outside the batch; batch dropped");
+                self.lock_spool().drop_batch(&key);
+                Ok(Flush::Progress)
+            }
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
                 tracing::warn!(
