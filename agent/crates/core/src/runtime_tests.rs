@@ -1929,11 +1929,19 @@ async fn discovery_scans_go_through_the_gate_and_spool_fingerprinted_findings() 
     let got = statuses(&server).await;
     let find = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
     assert_eq!(find(ok)["status"], "succeeded");
-    for id in [empty, unknown_id, bad_timeout] {
+    for id in [empty, bad_timeout] {
         assert_eq!(find(id)["error"]["code"], "invalid_params", "{id}");
     }
+    // An id outside the compiled classifier set is a capability mismatch.
+    assert_eq!(find(unknown_id)["error"]["code"], "unsupported");
     assert_eq!(find(unknown_target)["error"]["code"], "unknown_target");
-    assert_eq!(rt.counters.jobs_invalid_params.load(Ordering::Relaxed), 3);
+    assert_eq!(rt.counters.jobs_invalid_params.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        rt.counters
+            .jobs_unsupported_classifiers
+            .load(Ordering::Relaxed),
+        1
+    );
     assert_eq!(rt.counters.findings_received.load(Ordering::Relaxed), 1);
 
     // Only the gated job reached the connector, clamped.
@@ -2088,4 +2096,362 @@ async fn suspension_cancels_a_running_scan_and_flushes_its_findings() {
     assert_eq!(rt.lock_spool().status().batches.0, 1);
     assert_eq!(rt.counters.findings_lost.load(Ordering::Relaxed), 0);
     assert!(rt.lock_scans().in_flight.is_empty());
+}
+
+// ------------------------------------------------ 501, classifier set, cap
+
+const JOB: &str = "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a";
+
+fn not_implemented(retry_after: Option<&str>) -> ResponseTemplate {
+    let t = error_body(501, "unavailable");
+    match retry_after {
+        Some(v) => t.insert_header("Retry-After", v),
+        None => t,
+    }
+}
+
+fn metric(rt: &Runtime, name: &str) -> f64 {
+    rt.metrics().0[&MetricsMapKey::try_from(name).unwrap()]
+}
+
+#[tokio::test]
+async fn not_implemented_events_park_only_that_endpoint() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(not_implemented(Some("3600")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    // Queue: events first, then findings.
+    rt.lock_spool()
+        .push(&crate::spool::tests::events_batch())
+        .unwrap();
+    rt.spool_findings(
+        Uuid::try_from(JOB).unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(3, "email"),
+    )
+    .unwrap();
+    // 501 on /events: parked for Retry-After, the batch kept.
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Progress);
+    {
+        let mut parked = rt.lock_parked();
+        let now = Instant::now();
+        assert!(parked.is_parked(false, now));
+        assert!(!parked.is_parked(true, now));
+        let until = parked.events.until.unwrap();
+        assert!(until >= now + Duration::from_secs(3590));
+        assert!(until <= now + Duration::from_secs(3600 + 31));
+    }
+    assert!(rt.endpoint_parked(false));
+    assert!(!rt.endpoint_parked(true));
+    // /findings is not blocked behind the parked /events batch.
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Progress);
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    // Only the parked batch is left, never dropped.
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Idle);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 1);
+    assert_eq!(status.dropped_batches.unwrap().0, 0);
+    assert!((metric(&rt, "batches_parked_total") - 1.0).abs() < f64::EPSILON);
+    // Once the park has elapsed, the same batch is sent again.
+    rt.lock_parked().events.until = Some(Instant::now());
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Progress);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+    assert!(!rt.endpoint_parked(false));
+    assert_eq!(rt.lock_parked().events.strikes, 0);
+    let events: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/events"))
+        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["batch_id"].clone())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], events[1], "the parked batch keeps its batch_id");
+}
+
+#[tokio::test]
+async fn not_implemented_findings_do_not_block_events_and_pause_scans() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(not_implemented(None))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Flood(None))],
+    )
+    .unwrap();
+    rt.spool_findings(
+        Uuid::try_from(JOB).unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(2, "email"),
+    )
+    .unwrap();
+    rt.lock_spool()
+        .push(&crate::spool::tests::events_batch())
+        .unwrap();
+    // 501 without Retry-After: parked for the spool backoff.
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Progress);
+    assert!(rt.endpoint_parked(true));
+    let until = rt.lock_parked().findings.until.unwrap();
+    assert!(until <= Instant::now() + Duration::from_secs(1));
+    rt.lock_parked().findings.until = Some(Instant::now() + Duration::from_secs(60));
+    // The events batch behind it is sent.
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Progress);
+    assert_eq!(rt.flush_once(1).await.unwrap(), Flush::Idle);
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    // No new findings are produced while /findings is parked.
+    let body = serde_json::json!({ "jobs": [scan_job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6fa1", "2026.09.1", serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.scan_loop(shutdown);
+    let driver = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    assert_eq!(rt.lock_scans().queued.len(), 1);
+    assert_eq!(rt.counters.findings_received.load(Ordering::Relaxed), 0);
+    // A second 501 grows the backoff; a contract answer ends the streak.
+    assert_eq!(rt.lock_parked().findings.strikes, 1);
+    let mut parked = Parked::default();
+    let now = Instant::now();
+    let d1 = parked.park(true, None, now, 0.999_999);
+    let d2 = parked.park(true, None, now, 0.999_999);
+    assert!(d2 > d1);
+    parked.answered(true);
+    assert!(!parked.is_parked(true, now));
+    assert_eq!(parked.findings.strikes, 0);
+    assert_eq!(
+        parked.park(false, Some(Duration::from_secs(10)), now, 0.0),
+        Duration::from_secs(10)
+    );
+}
+
+fn scan_job(id: &str, version: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut params = serde_json::json!({"sample_rows": 200, "max_duration_s": 900});
+    if let (Some(p), Some(e)) = (params.as_object_mut(), extra.as_object()) {
+        p.extend(e.clone());
+    }
+    serde_json::json!({
+        "job_id": id, "type": "discovery.scan", "created_at": "2026-09-28T14:00:00Z",
+        "target_id": "pg-main", "classifiers_version": version, "params": params
+    })
+}
+
+/// Submits `Some(n)` findings then returns, or floods forever (`None`).
+struct Flood(Option<usize>);
+
+#[async_trait::async_trait]
+impl Connector for Flood {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        use databastion_classifiers::masking::{FindingLocation, RawSample};
+        use databastion_classifiers::names::normalize_path;
+        let values = [RawSample::new("jane.doe@example.com")];
+        let mut n = 0;
+        while self.0.is_none_or(|max| n < max) {
+            for f in job.classify("email", &values) {
+                let location = FindingLocation {
+                    database: normalize_path("shop"),
+                    schema: None,
+                    object: normalize_path("customers"),
+                    field: normalize_path("email"),
+                };
+                sink.submit(f.into_finding(location)).await?;
+            }
+            n += 1;
+        }
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn scans_with_an_unsupported_classifier_set_are_refused_before_the_target() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    struct Untouchable;
+    #[async_trait::async_trait]
+    impl Connector for Untouchable {
+        fn engine(&self) -> Engine {
+            Engine::Postgres
+        }
+        async fn check(&self) -> TargetHealth {
+            panic!("the target must not be touched");
+        }
+        async fn discover(
+            &self,
+            _: &crate::ScanJob,
+            _: &crate::FindingSink,
+        ) -> Result<(), crate::ConnectorError> {
+            panic!("the target must not be touched");
+        }
+        async fn audit_stream(
+            &self,
+            _: &crate::AuditConfig,
+            _: &crate::EventSink,
+        ) -> Result<(), crate::ConnectorError> {
+            panic!("the target must not be touched");
+        }
+    }
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Untouchable)],
+    )
+    .unwrap();
+    let other_version = "01920f5f-0c30-7e6f-a043-2b3c4d5e6fb1";
+    let unknown_id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6fb2";
+    // Even with otherwise invalid parameters, the capability check wins.
+    let both = "01920f5f-0c30-7e6f-a043-2b3c4d5e6fb3";
+    let body = serde_json::json!({ "jobs": [
+        scan_job(other_version, "2026.10.1", serde_json::json!({})),
+        scan_job(unknown_id, CLASSIFIERS_VERSION,
+            serde_json::json!({"classifiers": ["pii.email", "pii.passport"]})),
+        scan_job(both, "2099.01.1", serde_json::json!({"databases": []})),
+    ]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert!(rt.lock_scans().queued.is_empty());
+    assert!(rt.lock_scans().in_flight.is_empty());
+    let got = statuses(&server).await;
+    for id in [other_version, unknown_id, both] {
+        let update = &got.iter().find(|(i, _)| i == id).unwrap().1;
+        assert_eq!(update["status"], "failed", "{id}");
+        assert_eq!(update["error"]["code"], "unsupported", "{id}");
+    }
+    assert_eq!(rt.counters.jobs_invalid_params.load(Ordering::Relaxed), 0);
+    assert!((metric(&rt, "jobs_unsupported_classifiers_total") - 3.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn per_job_findings_cap_matches_the_contract() {
+    assert_eq!(MAX_FINDINGS_PER_JOB, 50_000);
+}
+
+async fn capped_scan(findings: Option<usize>, cap: usize) -> (MockServer, Runtime) {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let mut rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Flood(findings))],
+    )
+    .unwrap();
+    rt.findings_cap = cap;
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    drain(&rt).await;
+    (server, rt)
+}
+
+fn sent_findings(batches: &[serde_json::Value]) -> usize {
+    batches
+        .iter()
+        .map(|b| b["findings"].as_array().unwrap().len())
+        .sum()
+}
+
+#[tokio::test]
+async fn scan_stops_at_the_per_job_findings_cap() {
+    // A connector that never ends: stopped at the cap, not at its deadline.
+    let (server, rt) = capped_scan(None, 450).await;
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
+    assert_eq!(update["status"], "failed");
+    assert_eq!(update["error"]["code"], "resource_limit");
+    // Exactly the cap was emitted (in several batches), none beyond.
+    let batches = sent_batches(&server).await;
+    assert!(batches.len() >= 3);
+    assert_eq!(sent_findings(&batches), 450);
+    assert!((metric(&rt, "scans_findings_capped_total") - 1.0).abs() < f64::EPSILON);
+    assert_eq!(rt.counters.findings_lost.load(Ordering::Relaxed), 0);
+    assert!(rt.lock_scans().in_flight.is_empty());
+}
+
+#[tokio::test]
+async fn scan_reaching_exactly_the_cap_succeeds() {
+    let (server, rt) = capped_scan(Some(7), 7).await;
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
+    assert_eq!(update["status"], "succeeded");
+    assert_eq!(sent_findings(&sent_batches(&server).await), 7);
+    assert!(metric(&rt, "scans_findings_capped_total").abs() < f64::EPSILON);
+    // One more finding than the cap fails the job.
+    let (server, _rt) = capped_scan(Some(8), 7).await;
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
+    assert_eq!(update["error"]["code"], "resource_limit");
+    assert_eq!(sent_findings(&sent_batches(&server).await), 7);
 }

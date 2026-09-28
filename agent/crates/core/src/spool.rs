@@ -312,9 +312,28 @@ impl Spool {
     /// The batch at the head of the queue. Corrupt files are quarantined
     /// and skipped; a transient read error (EMFILE, ENOMEM…) leaves the
     /// queue untouched and returns `None` (retried later).
+    #[cfg(test)]
     pub(crate) fn front(&mut self) -> Option<(Key, ResultBatch)> {
+        self.front_where(|_| true)
+    }
+
+    /// The oldest batch whose endpoint is accepted by `endpoint` (called
+    /// with `true` for `/findings`, `false` for `/events`). A parked
+    /// endpoint (`501`) is skipped without reordering: each endpoint stays
+    /// FIFO. Corrupt files are quarantined and skipped; a transient read
+    /// error (EMFILE, ENOMEM…) leaves the queue untouched and returns `None`
+    /// (retried later).
+    pub(crate) fn front_where(
+        &mut self,
+        mut endpoint: impl FnMut(bool) -> bool,
+    ) -> Option<(Key, ResultBatch)> {
+        let mut index = 0;
         loop {
-            let entry = self.entries.front()?.clone();
+            let entry = self.entries.get(index)?.clone();
+            if !endpoint(entry.findings) {
+                index += 1;
+                continue;
+            }
             match self.read(&entry.key, entry.findings) {
                 Ok(batch) => return Some((entry.key, batch)),
                 Err(ReadError::Transient(e)) => {
@@ -322,7 +341,7 @@ impl Spool {
                     return None;
                 }
                 Err(err) => {
-                    self.entries.pop_front();
+                    self.entries.remove(index);
                     self.total = self.total.saturating_sub(entry.bytes);
                     if matches!(err, ReadError::Corrupt) {
                         self.quarantine(OsStr::new(&file_name(&entry.key, entry.findings)));

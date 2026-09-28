@@ -45,6 +45,15 @@ pub(crate) fn batches(n: usize) -> Vec<ResultBatch> {
     .batches
 }
 
+/// An events batch (a spooled body parsed back, as after a restart).
+pub(crate) fn events_batch() -> ResultBatch {
+    let body = serde_json::json!({
+        "batch_id": databastion_protocol::new_batch_id(),
+        "events": [crate::sanitize::tests::event("read", 1)],
+    });
+    ResultBatch::parse(false, serde_json::to_vec(&body).unwrap()).unwrap()
+}
+
 fn config(max_bytes: u64, max_batches: u32) -> SpoolConfig {
     SpoolConfig {
         max_bytes,
@@ -261,4 +270,36 @@ fn refused_and_non_utf8_files_are_quarantined() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(names, vec![std::ffi::OsString::from("quarantine")]);
+}
+
+#[test]
+fn front_where_skips_a_parked_endpoint_and_keeps_each_fifo() {
+    let dir = TempDir::new();
+    let f = batches(2 * 200);
+    let e = [events_batch(), events_batch()];
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    // Queue order: e0, f0, e1, f1.
+    spool.push(&e[0]).unwrap();
+    spool.push(&f[0]).unwrap();
+    spool.push(&e[1]).unwrap();
+    spool.push(&f[1]).unwrap();
+    // `/events` parked: the findings are served in their own order.
+    let findings_only = |findings: bool| findings;
+    for x in &f {
+        let (key, front) = spool.front_where(findings_only).unwrap();
+        assert!(front.is_findings());
+        assert_eq!(front.batch_id(), x.batch_id());
+        spool.remove(&key);
+    }
+    assert!(spool.front_where(findings_only).is_none());
+    // The parked batches are kept, still in order.
+    assert_eq!(spool.len(), 2);
+    assert_eq!(spool.counters.dropped_batches, 0);
+    for x in &e {
+        let (key, front) = spool.front().unwrap();
+        assert!(!front.is_findings());
+        assert_eq!(front.batch_id(), x.batch_id());
+        spool.remove(&key);
+    }
+    assert!(spool.front().is_none());
 }

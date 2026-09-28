@@ -59,7 +59,10 @@ pub(crate) enum UplinkError {
     /// `426`: the console requires a newer protocol.
     #[error("protocol upgrade required (426), console minimum protocol {min_protocol:?}")]
     UpgradeRequired { min_protocol: Option<u64> },
-    /// `429` / `503`; retryable, honoring `Retry-After`.
+    /// `429` / `503`, and `501` (endpoint not implemented by this console,
+    /// `code` `unavailable`); retryable, honoring `Retry-After` (parsed and
+    /// clamped to `1..=3600` s). A `501` on `/findings` or `/events` parks
+    /// that endpoint only (docs/09, "Agent handling").
     #[error("console throttled the request ({status})")]
     Throttled {
         status: u16,
@@ -379,7 +382,7 @@ fn classify(
         426 => UplinkError::UpgradeRequired {
             min_protocol: error.and_then(|e| e.min_protocol).map(|p| p.0.get()),
         },
-        429 | 503 => UplinkError::Throttled {
+        429 | 501 | 503 => UplinkError::Throttled {
             status,
             retry_after,
         },
@@ -880,6 +883,38 @@ mod tests {
         );
         assert!(classify("/x", StatusCode::BAD_GATEWAY, None, b"").is_retryable());
         assert!(!classify("/x", StatusCode::BAD_REQUEST, None, b"").is_retryable());
+    }
+
+    #[test]
+    fn not_implemented_is_throttled_with_retry_after() {
+        let body = br#"{"code":"unavailable","message":"Not implemented."}"#;
+        // Same parsing and clamping as 429 / 503.
+        for (value, expected) in [("3600", 3600), ("7200", 3600), ("0", 1), (" 42 ", 42)] {
+            let ra = backoff::parse_retry_after(value);
+            assert_eq!(
+                classify("/events", StatusCode::NOT_IMPLEMENTED, ra, body),
+                UplinkError::Throttled {
+                    status: 501,
+                    retry_after: Some(Duration::from_secs(expected))
+                }
+            );
+        }
+        // Without a valid header or body: still throttled, own backoff.
+        let e = classify(
+            "/events",
+            StatusCode::NOT_IMPLEMENTED,
+            backoff::parse_retry_after("soon"),
+            b"",
+        );
+        assert_eq!(
+            e,
+            UplinkError::Throttled {
+                status: 501,
+                retry_after: None
+            }
+        );
+        assert!(e.is_retryable());
+        assert!(e.retry_delay(0) <= Duration::from_secs(1));
     }
 
     #[test]
