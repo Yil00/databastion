@@ -8,7 +8,8 @@ Server side of the agent ↔ console protocol.
 | `POST /heartbeat` | implemented (P1-A) | `handleHeartbeat` |
 | `GET /jobs?wait=` | implemented (P1-A), long-poll | `handlePollJobs` |
 | `POST /jobs/{job_id}/status` | implemented (P1-A) | `handleJobStatus` |
-| `POST /findings`, `POST /events`, `POST /rotate` | `501` (catch-all `[...path]/route.ts`, body never read) | later phases (P2-D, P3, rotation) |
+| `POST /rotate` | implemented (P1-A part 2), ADR-0008 + ADR-0010 | `handleRotate`, logic in `src/server/rotation.ts` |
+| `POST /findings`, `POST /events` | `501` (catch-all `[...path]/route.ts`, body never read) | later phases (P2-D, P3) |
 
 Route files are thin: the logic lives in `src/server/agent-api/` (pipeline, auth, long-poll hub)
 and `src/server/{agents,jobs,enrollment}.ts`.
@@ -31,6 +32,10 @@ a legitimate agent. Verified secrets are cached 25 s, bound to the stored hash a
 revocation; the agent row is read on every request, so a revocation from any console process is
 effective immediately. A 24 h "known good" fingerprint of the last verified secret only exempts it
 from the per-agent failure limit (an attacker cannot lock the agent out); it never authenticates.
+
+Rotation: `authenticateAgent` also matches the pending secret (promoting it on first use) and the
+previous one (`401` inside the 60 s window, `/rotate` only gets it through; after the window the
+handler locks the agent, `409 rotation_conflict`). See the console README, "Agent secret rotation".
 
 Long-poll: one `LISTEN` connection per process (`databastion_jobs`, `databastion_agent_revoked`),
 no database connection held while waiting. While the listener is up, a held poll re-reads only the

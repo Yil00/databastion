@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "promoted_grace_expires_at" timestamp with time zone;

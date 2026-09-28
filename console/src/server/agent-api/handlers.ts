@@ -6,9 +6,16 @@ import { validateSchema } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
+import {
+  lockAgentForConflict,
+  rotatePerAgent,
+  rotateSecret,
+  staleRotateRetry,
+  type RotateOutcome,
+} from "@/server/rotation";
 import { clientIp, ipBucket } from "@/server/request";
 
-import { authenticateAgent } from "./auth";
+import { authenticateAgent, type AgentRow, type AuthOptions, type SecretSlot } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -51,10 +58,21 @@ export function handleEnroll(req: Request): Promise<Response> {
   });
 }
 
-async function preamble(req: Request) {
+type Preamble =
+  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
+  | { ok: false; response: Response };
+
+async function preamble(req: Request, opts: AuthOptions = {}): Promise<Preamble> {
   const headers = checkProtocolHeaders(req);
-  if (headers) return { ok: false as const, response: headers };
-  return authenticateAgent(req);
+  if (headers) return { ok: false, response: headers };
+  const auth = await authenticateAgent(req, opts);
+  if (auth.ok) return auth;
+  if (auth.staleSecret) {
+    // `S0` used after the tolerance window (ADR-0008 / ADR-0010): treated like rotation_conflict.
+    await lockAgentForConflict(getDb(), auth.agentId, "stale_secret", clientIp(req));
+    return { ok: false, response: agentError(409, "rotation_conflict") };
+  }
+  return { ok: false, response: auth.response };
 }
 
 export function handleHeartbeat(req: Request): Promise<Response> {
@@ -112,10 +130,10 @@ export function handlePollJobs(req: Request): Promise<Response> {
         if (remaining <= 0) break;
         // No database connection is held while waiting.
         const reason = await jobHub.wait(agentId, remaining, req.signal, seq);
-        if (reason === "revoked") return unauthorized();
         if (reason === "aborted") break;
-        // Revocation / lock may have come from a console process whose NOTIFY we missed.
-        if (!(await stillActive(agentId))) return unauthorized();
+        // Revocation, lock or promotion (L2: the poll is bound to the secret it was opened with),
+        // possibly from a console process whose NOTIFY we missed.
+        if (!(await stillActive(agentId, auth.matchedHash))) return unauthorized();
         if (reason === "timeout") break;
         // M3: claim only on a job wake-up, or when the listener is down (polling fallback).
         claim = reason === "job" || !jobHub.listening;
@@ -129,13 +147,14 @@ export function handlePollJobs(req: Request): Promise<Response> {
 
 const noContent = () => new Response(null, { status: 204, headers: NO_STORE });
 
-async function stillActive(agentId: string): Promise<boolean> {
+/** The agent is active AND the secret that authenticated the poll is still its current one. */
+async function stillActive(agentId: string, matchedHash: string): Promise<boolean> {
   const [row] = await getDb()
     .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, hash: agents.currentSecretHash })
     .from(agents)
     .where(eq(agents.id, agentId))
     .limit(1);
-  return !!row && row.revokedAt === null && row.lockedAt === null && row.hash !== null;
+  return !!row && row.revokedAt === null && row.lockedAt === null && row.hash === matchedHash;
 }
 
 /** Console-side clock skew tolerance on agent timestamps (contract: 5 min). */
@@ -156,4 +175,74 @@ export function handleJobStatus(req: Request, jobId: string): Promise<Response> 
     if (outcome === "conflict") return agentError(409, "conflict");
     return noContent();
   });
+}
+
+/**
+ * `POST /rotate` (ADR-0008, ADR-0010). The body carries a secret: it is never logged, and an error
+ * never echoes it. A new secret that fails the `AgentSecret` format is answered `invalid_secret`.
+ */
+export function handleRotate(req: Request): Promise<Response> {
+  return guarded("rotate", async () => {
+    const auth = await preamble(req, { allowPrevious: true });
+    if (!auth.ok) return auth.response;
+    if (auth.via === "previous" && auth.stale) {
+      // N1: stale S0. Handled before any other check: duplicate or lock, never another answer.
+      const body = await readValidBody(req, "RotateRequest");
+      const outcome = await staleRotateRetry(
+        getDb(),
+        { agentId: auth.agent.id, matchedHash: auth.matchedHash },
+        body.ok ? body.value : null,
+        clientIp(req),
+      );
+      return rotateResponse(outcome);
+    }
+    const limit = rotatePerAgent.hit(auth.agent.id);
+    if (limit.limited) return rateLimited(limit.retryAfterS);
+    const body = await readValidBody(req, "RotateRequest");
+    if (!body.ok) {
+      const details = await errorDetails(body.response);
+      if (details.length > 0 && details.every((d) => d.pointer === "/new_secret")) {
+        return agentError(400, "invalid_secret");
+      }
+      return body.response;
+    }
+    const presented = /^Bearer (\S+)$/.exec(req.headers.get("authorization") ?? "")?.[1] ?? "";
+    const outcome = await rotateSecret(
+      getDb(),
+      { agentId: auth.agent.id, via: auth.via, presented, matchedHash: auth.matchedHash },
+      body.value,
+      clientIp(req),
+    );
+    return rotateResponse(outcome);
+  });
+}
+
+function rotateResponse(outcome: RotateOutcome): Response {
+  switch (outcome.kind) {
+    case "registered":
+    case "duplicate":
+      return conformingJson("RotateResponse", {
+        grace_expires_at: outcome.graceExpiresAt.toISOString(),
+        duplicate: outcome.kind === "duplicate",
+      });
+    case "invalid_secret":
+      return agentError(400, "invalid_secret");
+    case "not_found":
+      return agentError(404, "not_found");
+    case "conflict":
+      return agentError(409, "rotation_conflict");
+    case "busy":
+      return unavailable();
+    case "unauthorized":
+      return unauthorized();
+  }
+}
+
+async function errorDetails(res: Response): Promise<{ pointer: string }[]> {
+  try {
+    const body = (await res.clone().json()) as { details?: { pointer: string }[] };
+    return body.details ?? [];
+  } catch {
+    return [];
+  }
 }
