@@ -28,11 +28,11 @@ export default async function FindingsPage({ searchParams }: { searchParams: Pro
         <h1 className="text-2xl font-semibold tracking-tight">Findings</h1>
         <div className="ml-auto flex gap-4 text-sm">
           {filtered && (
-            <Link className="hover:underline" href={findingsHref({ fp })}>
+            <Link className="hover:underline" prefetch={false} href={findingsHref({ fp })}>
               Clear filters
             </Link>
           )}
-          <Link className="hover:underline" href={findingsHref({ ...base, fp: !fp })}>
+          <Link className="hover:underline" prefetch={false} href={findingsHref({ ...base, fp: !fp })}>
             {fp ? "Hide false positives" : "Show false positives"}
           </Link>
         </div>
@@ -62,7 +62,17 @@ export default async function FindingsPage({ searchParams }: { searchParams: Pro
               Showing the first {MAX_LISTED_FINDINGS} findings: filter by target or classifier to see the others.
             </p>
           )}
-          <FindingsTable findings={rows} csrfToken={session.csrfToken} now={requestTime()} />
+          {session.user.role !== "admin" && (
+            <p className="text-sm text-muted-foreground">
+              Only administrators can mark a finding as a false positive: ask one if a location is misclassified.
+            </p>
+          )}
+          <FindingsTable
+            findings={rows}
+            csrfToken={session.csrfToken}
+            now={requestTime()}
+            canMark={session.user.role === "admin"}
+          />
         </CardContent>
       </Card>
     </div>

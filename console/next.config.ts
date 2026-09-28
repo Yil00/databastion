@@ -15,7 +15,13 @@ const nextConfig: NextConfig = {
   serverExternalPackages: ["pg", "pg-boss", "pino", "@node-rs/argon2"],
   // Static security headers on every response; the nonce-based CSP of UI pages is set in src/proxy.ts.
   async headers() {
-    return [{ source: "/:path*", headers: [...SECURITY_HEADERS] }];
+    return [
+      { source: "/:path*", headers: [...SECURITY_HEADERS] },
+      // The findings view carries decrypted masked samples (L4). src/proxy.ts also sets it on every
+      // UI page; this rule does not depend on the proxy matcher (e.g. prefetch requests).
+      { source: "/findings", headers: [{ key: "Cache-Control", value: "no-store" }] },
+      { source: "/findings/:path*", headers: [{ key: "Cache-Control", value: "no-store" }] },
+    ];
   },
 };
 

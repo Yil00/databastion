@@ -44,6 +44,7 @@ describe("FindingsTable", () => {
         findings={[finding({ agentName: HOSTILE, objectName: HOSTILE, fieldName: HOSTILE, samples: { state: "ok", values: [HOSTILE] } })]}
         csrfToken="csrf"
         now={NOW}
+        canMark
       />,
     );
     expect(html).not.toContain("<img");
@@ -62,6 +63,7 @@ describe("FindingsTable", () => {
         ]}
         csrfToken="csrf"
         now={NOW}
+        canMark
       />,
     );
     expect(html).toContain("j*******@e******.com");
@@ -83,7 +85,7 @@ describe("FindingsTable", () => {
     );
     expect(html).not.toContain("<img");
     expect(html).toContain('href="/findings?agent=a1&amp;target=pg-prod-1&amp;classifier=pii.email"');
-    expect(renderToStaticMarkup(<FindingsTable findings={[]} csrfToken="" now={NOW} />)).toContain("No finding.");
+    expect(renderToStaticMarkup(<FindingsTable findings={[]} csrfToken="" now={NOW} canMark />)).toContain("No finding.");
   });
 
   it("builds and parses filters, ignoring malformed values", () => {
@@ -103,6 +105,11 @@ describe("FindingsTable", () => {
       classifier: undefined,
       includeFalsePositives: false,
     });
+  });
+
+  it("shows no false-positive button to non-admins (M2)", () => {
+    const html = renderToStaticMarkup(<FindingsTable findings={[finding()]} csrfToken="csrf" now={NOW} canMark={false} />);
+    expect(html).not.toContain("False positive");
   });
 });
 

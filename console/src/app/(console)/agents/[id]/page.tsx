@@ -120,7 +120,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     </TableCell>
                     <TableCell>
                       <div className="flex items-start gap-2">
-                        <Link className="text-sm hover:underline" href={findingsHref({ agent: agent.id, target: t.targetId })}>
+                        <Link className="text-sm hover:underline" prefetch={false} href={findingsHref({ agent: agent.id, target: t.targetId })}>
                           Findings
                         </Link>
                         {isAdmin && active && t.present && (

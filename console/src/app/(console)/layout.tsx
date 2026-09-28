@@ -16,7 +16,7 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
           <Link href="/agents" className="hover:underline">
             Agents
           </Link>
-          <Link href="/findings" className="hover:underline">
+          <Link href="/findings" prefetch={false} className="hover:underline">
             Findings
           </Link>
           {session.user.role === "admin" && (

@@ -44,13 +44,18 @@ export function FindingsSummary({ rows, showFalsePositives }: { rows: FindingSum
           <TableRow key={`${r.agentId}/${r.targetId}/${r.classifier}`}>
             <TableCell>{r.agentName}</TableCell>
             <TableCell>
-              <Link className="hover:underline" href={findingsHref({ agent: r.agentId, target: r.targetId, fp: showFalsePositives })}>
+              <Link
+                className="hover:underline"
+                prefetch={false}
+                href={findingsHref({ agent: r.agentId, target: r.targetId, fp: showFalsePositives })}
+              >
                 {r.targetId}
               </Link>
             </TableCell>
             <TableCell>
               <Link
                 className="hover:underline"
+                prefetch={false}
                 href={findingsHref({ agent: r.agentId, target: r.targetId, classifier: r.classifier, fp: showFalsePositives })}
               >
                 {r.classifier}
@@ -79,7 +84,18 @@ function Samples({ samples }: { samples: FindingView["samples"] }) {
   );
 }
 
-export function FindingsTable({ findings, csrfToken, now }: { findings: FindingView[]; csrfToken: string; now: number }) {
+export function FindingsTable({
+  findings,
+  csrfToken,
+  now,
+  canMark,
+}: {
+  findings: FindingView[];
+  csrfToken: string;
+  now: number;
+  /** Admins only (M2): others see a hint instead of the button. */
+  canMark: boolean;
+}) {
   if (findings.length === 0) return <p className="text-sm text-muted-foreground">No finding.</p>;
   return (
     <Table>
@@ -124,7 +140,9 @@ export function FindingsTable({ findings, csrfToken, now }: { findings: FindingV
             <TableCell>{f.fingerprintCount}</TableCell>
             <TableCell>{formatAge(f.lastSeenAt, now)}</TableCell>
             <TableCell>
-              <FalsePositiveButton findingId={f.id} falsePositive={f.falsePositiveAt !== null} csrfToken={csrfToken} />
+              {canMark ? (
+                <FalsePositiveButton findingId={f.id} falsePositive={f.falsePositiveAt !== null} csrfToken={csrfToken} />
+              ) : null}
             </TableCell>
           </TableRow>
         ))}

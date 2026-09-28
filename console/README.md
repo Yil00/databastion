@@ -82,8 +82,9 @@ and migrations must never run code planted by the console. Production uses three
 | `databastion_owner` (LOGIN, NOSUPERUSER, NOCREATEROLE) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns the database, `public`, `pgboss` and every console table and trigger. `search_path` pinned to `public` (role setting and migration session) |
 | `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, only `SELECT, INSERT` and `UPDATE (acknowledged_at, acknowledged_by)` on `security_events` (no `DELETE`: an integrity alert cannot be erased or rewritten), `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
 
-Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql` and
-`0010_security_events_no_delete.sql` (custom, every name schema-qualified). Migration
+Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql`,
+`0010_security_events_no_delete.sql` and `0012_findings_runtime_grants.sql` (`findings_batches`:
+`SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`) (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
@@ -154,8 +155,8 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
-| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h |
-| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (any authenticated user, CSRF, audited `finding.false_positive`); `204`, `404` unknown finding |
+| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`) |
+| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor) |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
@@ -164,7 +165,8 @@ browser): `/login`, `/agents` (name, hostname, version, status online / silent (
 `dbe_…` token is shown once with a copy button; list; revoke), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
 `?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
-row). The agent detail page shows the last scan of each target, a link to its findings and (admin)
+row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
+(most recently seen first within each), so one noisy agent or target cannot hide the others. The agent detail page shows the last scan of each target, a link to its findings and (admin)
 a "Scan" dialog. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
 (new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the
@@ -176,7 +178,8 @@ confirmation dialog uses the native `<dialog>` element).
   `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`; `'unsafe-eval'` in `next dev`
   only). Every page is rendered per request (root layout `force-dynamic`), so no prerendered page
   lacks the nonce. Not applied to `/api/*` and `/metrics` (no HTML). UI pages also get
-  `Cache-Control: no-store` (the findings view carries decrypted masked samples).
+  `Cache-Control: no-store` (the findings view carries decrypted masked samples); `/findings` also
+  gets it from `next.config.ts` `headers()`, and links to it are not prefetched.
 - Every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy` / `-Resource-Policy: same-origin`,
   a restrictive `Permissions-Policy` (`next.config.ts`). HSTS is set by the TLS reverse proxy.
@@ -287,7 +290,9 @@ longer the current one is closed with `401`.
 `/findings`), `agent.batch_conflict` and `agent.foreign_target` (a finding for a target the agent
 never reported), all `high`, each with an audit-log entry of the same name. Their details are the
 endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
-per 10 minutes; beyond, they are counted and logged once per window.
+per 10 minutes; beyond, they are counted, logged once per window, and the next recorded event of the
+agent carries the count (`suppressed_before`). The budget is in memory, per web process (like the
+rate limiters): with N web processes an agent can get up to N x 20 rows per window.
 
 ## Metrics
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
@@ -360,9 +365,9 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Agent "known good" fingerprints (`agents.known_good_fingerprint`, `known_good_at`, `known_good_pending_fingerprint`) | HMAC-SHA256 (subkey of `DATABASTION_ENCRYPTION_KEY`) over the bound argon2id hash and the 256-bit agent secret; never authenticate, only exempt the last verified secret (24 h, survives restarts) and the pending secret registered by the authenticated agent from the per-agent failure limit; the pending one becomes the current one at promotion; cleared on lock and revocation |
 | Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
 | Findings (`findings`) | one row per (agent, target, location, classifier), keyed by `location_key` = SHA-256 of that tuple; names, counts, confidence, first / last seen, false-positive decision in plain columns (normalized names, escaped on display) |
-| Masked samples (`findings.masked_samples`) | AES-256-GCM, key = HKDF-SHA256 subkey `masked-samples.v1` of `DATABASTION_ENCRYPTION_KEY`, random 96-bit nonce, AAD = label + finding id; layout `0x01 ‖ nonce ‖ ciphertext ‖ tag`. Without a usable key no sample is stored (the finding is); a key change makes stored samples "unavailable" in the view until the next scan |
+| Masked samples (`findings.masked_samples`) | AES-256-GCM, key = HKDF-SHA256 subkey `masked-samples.v1` of `DATABASTION_ENCRYPTION_KEY`, random 96-bit nonce, AAD = `"databastion.masked-samples.v1" ‖ 0x01 ‖ finding id`; layout `0x01 ‖ nonce ‖ ciphertext ‖ tag`. Without a usable key no sample is stored (the finding is); a key change makes stored samples "unavailable" in the view until the next scan |
 | HMAC fingerprints (`findings.fingerprints`) | as sent by the agent (keyed by its local key, which never leaves it) |
-| Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch, job, item count: idempotency only, never the body |
+| Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch in canonical JSON (keys sorted recursively), job, item count: idempotency only, never the body. Append-only for the runtime role (migration `0012`: no `UPDATE`, `DELETE`, `TRUNCATE`); `findings` rows cannot be deleted by it either |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
