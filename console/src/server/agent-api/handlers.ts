@@ -296,6 +296,13 @@ async function errorDetails(res: Response): Promise<{ pointer: string; keyword: 
 }
 
 /**
+ * Findings batches per agent per minute (M1), per process (in memory, like the other limiters: one
+ * web process in the MVP). Counted before ingestion and given back when the batch is not stored
+ * (duplicate, rejected), so only stored batches consume it; beyond: `429` + `Retry-After`.
+ */
+export const findingsPerAgent = new RateLimiter(60, 60_000);
+
+/**
  * `POST /findings` (P2-D). Pipeline: headers, authentication, body (4 MiB cap: `413`),
  * `validateSchema` then `checkSemantics` (`400`), then `ingestFindings`: idempotency on
  * (`agent_id`, `batch_id`), job and target ownership (`404`), cross-field checks (`400`), storage.
@@ -317,7 +324,16 @@ export function handleFindings(req: Request): Promise<Response> {
       }
       return body.response;
     }
-    const outcome = await ingestFindings(getDb(), agentId, body.value);
+    const refund = findingsPerAgent.reserve(agentId);
+    if (!refund) return rateLimited(findingsPerAgent.check(agentId).retryAfterS);
+    let outcome: Awaited<ReturnType<typeof ingestFindings>>;
+    try {
+      outcome = await ingestFindings(getDb(), agentId, body.value);
+    } catch (err) {
+      refund();
+      throw err;
+    }
+    if (outcome.kind !== "accepted" || outcome.duplicate) refund();
     switch (outcome.kind) {
       case "accepted":
         return conformingJson(
@@ -334,6 +350,7 @@ export function handleFindings(req: Request): Promise<Response> {
         await integrity("foreign_target", 404, outcome.details);
         return agentError(404, "not_found", { details: outcome.details });
       case "invalid":
+      case "job_full":
         await integrity("batch_rejected", 400, outcome.details);
         return invalidRequest(outcome.details);
     }

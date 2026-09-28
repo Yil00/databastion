@@ -11,6 +11,7 @@ import type { FindingFilter } from "@/lib/findings-filter";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
 import { decryptMaskedSamples, encryptMaskedSamples, maskedSamplesKey } from "./samples";
+import { scanDeadlineSql } from "./scans";
 
 /**
  * Discovery findings (P2-D): ingestion of `POST /findings` batches, the findings view and
@@ -29,9 +30,35 @@ type Finding = Schemas["Finding"];
  */
 export const FINDINGS_JOB_STATUSES = ["delivered", "running", "succeeded", "failed"] as const;
 
-/** SHA-256 of the validated batch serialized as JSON (idempotency on `(agent_id, batch_id)`). */
+/**
+ * Late batches (M1). A finished (`succeeded` / `failed`) scan accepts findings for this long after
+ * `finished_at`: the bound on how long an agent's spool may hold a batch of a finished scan (e.g.
+ * console outage, network partition). A `delivered` / `running` scan accepts them until
+ * `delivered_at + max_duration_s + SCAN_GRACE_MS` (see `scans.ts`). Later batches get `404` on
+ * `/job_id` (the agent drops them), so an agent cannot write into old jobs forever.
+ */
+export const LATE_BATCH_RETENTION_MS = 24 * 3600_000;
+/** Findings accepted per scan job, over all its batches (M1); beyond, `400` + integrity event. */
+export const MAX_FINDINGS_PER_JOB = 50_000;
+
+/** JSON with object keys sorted recursively (arrays keep their order). */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * SHA-256 of the validated batch in canonical JSON (idempotency on `(agent_id, batch_id)`): neither
+ * whitespace nor key order changes it, any value change does.
+ */
 export function batchSha256(batch: FindingsBatch): string {
-  return sha256Hex(JSON.stringify(batch));
+  return sha256Hex(canonicalJson(batch));
 }
 
 /** Identity of a finding within an agent: target, location (engine excluded) and classifier. */
@@ -48,14 +75,19 @@ export type IngestOutcome =
   /** `target_id` not reported by this agent: pointers `/findings/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
   /** Console-side cross-field checks (contract "Console-side checks not expressible..."). */
-  | { kind: "invalid"; details: ValidationDetail[] };
+  | { kind: "invalid"; details: ValidationDetail[] }
+  /** The job already received `MAX_FINDINGS_PER_JOB` findings: pointer `/findings`. */
+  | { kind: "job_full"; details: ValidationDetail[] };
 
 interface JobRow {
   id: string;
   type: string;
   status: string;
   targetId: string | null;
+  classifiersVersion: string | null;
   params: Record<string, unknown>;
+  /** The job still accepts findings (not past its time box). */
+  open: boolean;
 }
 
 function jobSampleRows(params: Record<string, unknown>): number {
@@ -84,6 +116,10 @@ function crossFieldDetails(
   };
   const sampleRows = jobSampleRows(job.params);
   const allowed = jobClassifiers(job.params);
+  // L1: the batch was produced with the classifier set the scan asked for.
+  if (batch.classifiers_version !== job.classifiersVersion) {
+    push({ pointer: "/classifiers_version", keyword: "const" });
+  }
   batch.findings.forEach((f, i) => {
     // A scan job covers one target: its findings are about that target only.
     if (f.target_id !== job.targetId) push({ pointer: `/findings/${i}/target_id`, keyword: "const" });
@@ -123,14 +159,28 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
     }
 
     const [job] = await tx
-      .select({ id: jobs.id, type: jobs.type, status: jobs.status, targetId: jobs.targetId, params: jobs.params })
+      .select({
+        id: jobs.id,
+        type: jobs.type,
+        status: jobs.status,
+        targetId: jobs.targetId,
+        classifiersVersion: jobs.classifiersVersion,
+        params: jobs.params,
+        open: sql<boolean>`case
+          when ${jobs.status} in ('succeeded', 'failed')
+            then coalesce(${jobs.finishedAt}, now()) >= now() - make_interval(secs => ${LATE_BATCH_RETENTION_MS / 1000})
+          when ${jobs.status} in ('delivered', 'running')
+            then ${jobs.deliveredAt} is not null and ${scanDeadlineSql} >= now()
+          else false end`,
+      })
       .from(jobs)
       .where(and(eq(jobs.id, batch.job_id), eq(jobs.agentId, agentId)))
       .limit(1);
     if (
       !job ||
       job.type !== "discovery.scan" ||
-      !(FINDINGS_JOB_STATUSES as readonly string[]).includes(job.status)
+      !(FINDINGS_JOB_STATUSES as readonly string[]).includes(job.status) ||
+      !job.open
     ) {
       return { kind: "job_not_found" as const, details: [{ pointer: "/job_id", keyword: "notFound" }] };
     }
@@ -151,6 +201,14 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
 
     const invalid = crossFieldDetails(batch, job, engines);
     if (invalid.length > 0) return { kind: "invalid" as const, details: invalid };
+
+    const [received] = await tx
+      .select({ n: sql<number>`coalesce(sum(${findingsBatches.findingsCount}), 0)::int` })
+      .from(findingsBatches)
+      .where(and(eq(findingsBatches.agentId, agentId), eq(findingsBatches.jobId, job.id)));
+    if ((received?.n ?? 0) + batch.findings.length > MAX_FINDINGS_PER_JOB) {
+      return { kind: "job_full" as const, details: [{ pointer: "/findings", keyword: "maxItems" }] };
+    }
 
     await upsertFindings(tx, agentId, batch);
     await tx.insert(findingsBatches).values({
@@ -173,11 +231,23 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
   const byKey = new Map<string, Finding>();
   for (const f of batch.findings) byKey.set(findingLocationKey(f), f);
   const keys = [...byKey.keys()];
+  // Locked: a concurrent false-positive marking waits, so the reset decision below is exact.
   const existing = await tx
-    .select({ id: findings.id, locationKey: findings.locationKey })
+    .select({
+      id: findings.id,
+      locationKey: findings.locationKey,
+      falsePositiveAt: findings.falsePositiveAt,
+      falsePositiveMatched: findings.falsePositiveMatched,
+      falsePositiveClassifiersVersion: findings.falsePositiveClassifiersVersion,
+    })
     .from(findings)
-    .where(and(eq(findings.agentId, agentId), inArray(findings.locationKey, keys)));
+    .where(and(eq(findings.agentId, agentId), inArray(findings.locationKey, keys)))
+    .for("update");
   const ids = new Map(existing.map((r) => [r.locationKey, r.id]));
+  const resets = existing.filter((r) => {
+    const f = byKey.get(r.locationKey);
+    return f !== undefined && r.falsePositiveAt !== null && fpResetNeeded(r, f.matched, batch.classifiers_version);
+  });
   // Fail closed: without the server key, no sample is stored (the finding still is).
   const key = maskedSamplesKey();
   const rows = keys.map((locationKey) => {
@@ -225,13 +295,55 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
         lastJobId: excluded("last_job_id"),
         lastBatchId: excluded("last_batch_id"),
         lastSeenAt: sql`now()`,
+        // M2: same predicate as `fpResetNeeded`, evaluated on the locked row.
+        falsePositiveAt: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveAt} end`,
+        falsePositiveBy: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveBy} end`,
+        falsePositiveMatched: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveMatched} end`,
+        falsePositiveClassifiersVersion: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveClassifiersVersion} end`,
       },
     });
+  for (const r of resets) {
+    const f = byKey.get(r.locationKey) as Finding;
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "finding.false_positive_reset",
+      targetType: "finding",
+      targetId: r.id,
+      details: {
+        agent_id: agentId,
+        target_id: f.target_id,
+        classifier: f.classifier,
+        job_id: batch.job_id,
+        reason:
+          r.falsePositiveClassifiersVersion !== batch.classifiers_version ? "classifiers_version" : "matched_increased",
+      },
+    });
+  }
 }
+
+/**
+ * M2: a false positive is reset when a later scan matches more values than when it was marked, or
+ * ran another classifier set (a mark without a snapshot is kept).
+ */
+export function fpResetNeeded(
+  row: { falsePositiveMatched: number | null; falsePositiveClassifiersVersion: string | null },
+  matched: number,
+  classifiersVersion: string,
+): boolean {
+  if (row.falsePositiveMatched !== null && matched > row.falsePositiveMatched) return true;
+  return row.falsePositiveClassifiersVersion !== null && row.falsePositiveClassifiersVersion !== classifiersVersion;
+}
+
+const FP_RESET_SQL = sql`(${findings.falsePositiveAt} is not null and (
+  (${findings.falsePositiveMatched} is not null and excluded.matched > ${findings.falsePositiveMatched})
+  or (${findings.falsePositiveClassifiersVersion} is not null
+      and excluded.classifiers_version <> ${findings.falsePositiveClassifiersVersion})))`;
 
 // ----------------------------------------------------------------------------- view
 
 export const MAX_LISTED_FINDINGS = 500;
+
+const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 export interface FindingView {
   id: string;
@@ -295,7 +407,10 @@ export async function listFindings(db: Database, filter: FindingFilter = {}): Pr
     .from(findings)
     .innerJoin(agents, eq(agents.id, findings.agentId))
     .where(filterWhere(filter))
+    // M1: round-robin over targets (most recently seen first within each), so that one noisy agent
+    // or target cannot push every other finding out of the first MAX_LISTED_FINDINGS rows.
     .orderBy(
+      sql`row_number() over (partition by ${findings.agentId}, ${findings.targetId} order by ${findings.lastSeenAt} desc, ${findings.id})`,
       asc(agents.name),
       asc(findings.targetId),
       asc(findings.classifier),
@@ -306,6 +421,17 @@ export async function listFindings(db: Database, filter: FindingFilter = {}): Pr
     )
     .limit(MAX_LISTED_FINDINGS);
   const key = maskedSamplesKey();
+  // Fetched fairly (see above), displayed in a stable reading order.
+  rows.sort(
+    (a, b) =>
+      cmp(a.agentName, b.agentName) ||
+      cmp(a.targetId, b.targetId) ||
+      cmp(a.classifier, b.classifier) ||
+      cmp(a.databaseName, b.databaseName) ||
+      cmp(a.schemaName ?? "", b.schemaName ?? "") ||
+      cmp(a.objectName, b.objectName) ||
+      cmp(a.fieldName, b.fieldName),
+  );
   return rows.map(({ maskedSamples, ...r }) => {
     let samples: FindingView["samples"] = { state: "none" };
     if (maskedSamples) {
@@ -347,8 +473,10 @@ export async function summarizeFindings(db: Database, filter: FindingFilter = {}
 // -------------------------------------------------------------------- false positives
 
 /**
- * Marks (or unmarks) a finding as a false positive. Kept across rescans of the same location and
- * classifier. Audited, including when the finding does not exist.
+ * Marks (or unmarks) a finding as a false positive (admin decision, M2). The mark records `matched`
+ * and `classifiers_version` at marking time; a later scan matching more values or using another
+ * classifier set resets it (see `fpResetNeeded`). Kept across other rescans. Audited, including
+ * when the finding does not exist.
  */
 export async function setFalsePositive(
   db: Database,
@@ -361,22 +489,29 @@ export async function setFalsePositive(
       .update(findings)
       .set(
         falsePositive
-          ? { falsePositiveAt: sql`coalesce(${findings.falsePositiveAt}, now())`, falsePositiveBy: sql`coalesce(${findings.falsePositiveBy}, ${actor.userId}::uuid)` }
-          : { falsePositiveAt: null, falsePositiveBy: null },
+          ? {
+              falsePositiveAt: sql`coalesce(${findings.falsePositiveAt}, now())`,
+              falsePositiveBy: sql`coalesce(${findings.falsePositiveBy}, ${actor.userId}::uuid)`,
+              falsePositiveMatched: sql`case when ${findings.falsePositiveAt} is null then ${findings.matched} else ${findings.falsePositiveMatched} end`,
+              falsePositiveClassifiersVersion: sql`case when ${findings.falsePositiveAt} is null then ${findings.classifiersVersion} else ${findings.falsePositiveClassifiersVersion} end`,
+            }
+          : { falsePositiveAt: null, falsePositiveBy: null, falsePositiveMatched: null, falsePositiveClassifiersVersion: null },
       )
       .where(eq(findings.id, findingId))
-      .returning({ id: findings.id });
-    const found = rows.length > 0;
+      .returning({ agentId: findings.agentId, targetId: findings.targetId, classifier: findings.classifier });
+    const row = rows[0];
     await writeAudit(tx, {
       actorType: "user",
       actorId: actor.userId,
       action: "finding.false_positive",
-      outcome: found ? "success" : "failure",
+      outcome: row ? "success" : "failure",
       targetType: "finding",
       targetId: findingId,
       sourceIp: actor.ip,
-      details: found ? { false_positive: falsePositive } : { false_positive: falsePositive, reason: "not_found" },
+      details: row
+        ? { false_positive: falsePositive, agent_id: row.agentId, target_id: row.targetId, classifier: row.classifier }
+        : { false_positive: falsePositive, reason: "not_found" },
     });
-    return found;
+    return row !== undefined;
   });
 }

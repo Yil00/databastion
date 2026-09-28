@@ -10,8 +10,9 @@ import { serverSubkey } from "./crypto";
  * - Key: 256-bit HKDF-SHA256 subkey of `DATABASTION_ENCRYPTION_KEY(_FILE)`, domain
  *   `masked-samples.v1` (independent from the other subkeys of the server key).
  * - AES-256-GCM, random 96-bit nonce per encryption, 128-bit tag.
- * - AAD: a fixed label + the finding id, so a ciphertext copied onto another finding row does not
- *   decrypt (a tampered or swapped row is detected, not shown).
+ * - AAD: `"databastion.masked-samples.v1" || 0x01 (format version) || finding id`, so a ciphertext
+ *   copied onto another finding row, or relabelled with another format version, does not decrypt
+ *   (a tampered or swapped row is detected, not shown).
  * - Stored layout: `0x01 || nonce (12) || ciphertext || tag (16)`; the plaintext is the JSON array
  *   of the masked samples of the latest scan.
  *
@@ -32,8 +33,11 @@ export function maskedSamplesKey(env: Env = process.env): Buffer | null {
   return serverSubkey(MASKED_SAMPLES_DOMAIN, env);
 }
 
+const AAD_LABEL = Buffer.from(`databastion.${MASKED_SAMPLES_DOMAIN}`, "utf8");
+
+/** `label || format version || finding id`: binds the ciphertext to its row and its format. */
 function aad(findingId: string): Buffer {
-  return Buffer.from(`databastion.${MASKED_SAMPLES_DOMAIN}\0${findingId}`, "utf8");
+  return Buffer.concat([AAD_LABEL, Buffer.from([FORMAT_VERSION]), Buffer.from(findingId, "utf8")]);
 }
 
 export function encryptMaskedSamples(key: Buffer, findingId: string, samples: readonly string[]): Buffer {

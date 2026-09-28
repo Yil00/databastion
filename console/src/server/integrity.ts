@@ -29,10 +29,20 @@ const ACTION: Record<IntegrityKind, AuditAction> = {
   foreign_target: "agent.foreign_target",
 };
 
-/** Integrity rows written per agent (security event + audit entry) per 10 minutes. */
+/**
+ * Integrity rows written per agent (security event + audit entry) per 10 minutes. The budget is
+ * in memory, per web process (like the other limiters; one web process in the MVP): with N
+ * processes an agent can get up to N x 20 rows per window.
+ */
 export const integrityWriteBudget = new RateLimiter(20, 10 * 60_000);
 export const integrityStats = { recorded: 0, suppressed: 0 };
 const warnedSuppression = new RateLimiter(1, 10 * 60_000);
+/**
+ * Events suppressed per agent since its last recorded one: the next recorded event carries the
+ * count (`suppressed_before`), so a flood is still visible in `security_events`. Bounded map.
+ */
+const suppressedSince = new Map<string, number>();
+const MAX_SUPPRESSED_KEYS = 10_000;
 
 export interface IntegrityEvent {
   agentId: string;
@@ -46,6 +56,9 @@ export interface IntegrityEvent {
 export async function recordIntegrityEvent(db: Database, event: IntegrityEvent): Promise<boolean> {
   if (!integrityWriteBudget.reserve(event.agentId)) {
     integrityStats.suppressed++;
+    if (suppressedSince.has(event.agentId) || suppressedSince.size < MAX_SUPPRESSED_KEYS) {
+      suppressedSince.set(event.agentId, (suppressedSince.get(event.agentId) ?? 0) + 1);
+    }
     if (warnedSuppression.reserve(event.agentId)) {
       logger.warn(
         { agentId: event.agentId, kind: event.kind },
@@ -61,7 +74,9 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
     details_count: event.details?.length ?? 0,
     pointer: first?.pointer ?? null,
     keyword: first?.keyword ?? null,
+    suppressed_before: suppressedSince.get(event.agentId) ?? 0,
   };
+  suppressedSince.delete(event.agentId);
   await db.transaction(async (tx) => {
     await tx.insert(securityEvents).values({
       kind: `agent.${event.kind}`,

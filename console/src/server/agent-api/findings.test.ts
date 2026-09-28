@@ -4,7 +4,16 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getDb } from "@/db/client";
 import { auditLog, findings, findingsBatches, jobs, securityEvents } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
-import { findingLocationKey, listFindings } from "@/server/findings";
+import {
+  canonicalJson,
+  findingLocationKey,
+  LATE_BATCH_RETENTION_MS,
+  listFindings,
+  MAX_FINDINGS_PER_JOB,
+  MAX_LISTED_FINDINGS,
+  setFalsePositive,
+} from "@/server/findings";
+import { SCAN_GRACE_MS } from "@/server/scans";
 import { integrityStats, integrityWriteBudget } from "@/server/integrity";
 import { enqueueJob } from "@/server/jobs";
 import { decryptMaskedSamples, encryptMaskedSamples, maskedSamplesKey } from "@/server/samples";
@@ -12,7 +21,7 @@ import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
-import { handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+import { findingsPerAgent, handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
 
 type Auth = { agentId: string; secret: string };
 type Body = Record<string, unknown> & { findings: Record<string, unknown>[] };
@@ -55,12 +64,17 @@ async function agentWithTargets(): Promise<Auth> {
 }
 
 /** A `discovery.scan` job for `targetId`, delivered to the agent through `GET /jobs`. */
-async function deliveredScan(auth: Auth, targetId = "pg-prod-1", params: Record<string, unknown> = {}): Promise<string> {
+async function deliveredScan(
+  auth: Auth,
+  targetId = "pg-prod-1",
+  params: Record<string, unknown> = {},
+  classifiersVersion = "2026.09.1",
+): Promise<string> {
   const id = await enqueueJob(getDb(), {
     agentId: auth.agentId,
     type: "discovery.scan",
     targetId,
-    classifiersVersion: "2026.09.1",
+    classifiersVersion,
     params: { sample_rows: 200, max_duration_s: 900, ...params },
   });
   const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
@@ -112,6 +126,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
   beforeEach(() => {
     failuresPerAgent.clear();
     integrityWriteBudget.clear();
+    findingsPerAgent.clear();
   });
 
   describe("contract fixtures", () => {
@@ -240,6 +255,22 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(audits).toHaveLength(1);
     });
 
+    it("hashes canonical JSON: a replay with other key order is a duplicate (L6)", async () => {
+      const auth = await agentWithTargets();
+      const body = batch(await deliveredScan(auth));
+      expect((await post(auth, body)).status).toBe(202);
+      const reordered = {
+        findings: body.findings.map((f) => Object.fromEntries(Object.entries(f).reverse())),
+        classifiers_version: body.classifiers_version,
+        job_id: body.job_id,
+        batch_id: body.batch_id,
+      };
+      const res = await post(auth, reordered);
+      expect(res.status).toBe(202);
+      expect(((await res.json()) as { duplicate: boolean }).duplicate).toBe(true);
+      expect(canonicalJson({ b: [{ d: 1, c: 2 }], a: null })).toBe('{"a":null,"b":[{"c":2,"d":1}]}');
+    });
+
     it("scopes batch ids per agent", async () => {
       const a = await agentWithTargets();
       const b = await agentWithTargets();
@@ -311,6 +342,24 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(audits).toHaveLength(1);
     });
 
+    it("rejects findings sent through a scan job of another target of the same agent (L7)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth, "pg-other");
+      const res = await post(auth, batch(jobId, [PG_FINDING]));
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/findings/0/target_id", keyword: "const" }]);
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
+    });
+
+    it("rejects a batch whose classifiers_version differs from the job's (L1)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const res = await post(auth, { ...batch(jobId), classifiers_version: "2026.10.1" });
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/classifiers_version", keyword: "const" }]);
+      expect((await integrityRows(auth.agentId, "agent.batch_rejected")).events).toHaveLength(1);
+    });
+
     it("a target of another agent is foreign too", async () => {
       const auth = await agentWithTargets();
       const jobId = await deliveredScan(auth);
@@ -362,6 +411,142 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       const { events } = await integrityRows(auth.agentId, "agent.batch_rejected");
       expect(events).toHaveLength(integrityWriteBudget.limit);
       expect(integrityStats.suppressed - before).toBe(5);
+      // L5: the next recorded event carries the number suppressed in between.
+      integrityWriteBudget.clear();
+      expect((await post(auth, { batch_id: "nope" })).status).toBe(400);
+      const after = await integrityRows(auth.agentId, "agent.batch_rejected");
+      const latest = after.events.sort((a, b) => b.at.getTime() - a.at.getTime())[0];
+      expect(latest?.details).toMatchObject({ suppressed_before: 5 });
+    });
+  });
+
+  describe("M1: time box, per-job cap, rate limit", () => {
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000);
+
+    it("refuses late batches of finished scans after the spool-retention bound (404 /job_id)", async () => {
+      const auth = await agentWithTargets();
+      expect(LATE_BATCH_RETENTION_MS).toBe(24 * 3600_000);
+      const recent = await deliveredScan(auth);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: hoursAgo(23) }).where(eq(jobs.id, recent));
+      expect((await post(auth, batch(recent))).status).toBe(202);
+      const old = await deliveredScan(auth);
+      await getDb().update(jobs).set({ status: "failed", finishedAt: hoursAgo(25) }).where(eq(jobs.id, old));
+      const res = await post(auth, batch(old));
+      expect(res.status).toBe(404);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/job_id", keyword: "notFound" }]);
+    });
+
+    it("refuses batches of a running scan past delivered_at + max_duration_s + grace", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth, "pg-prod-1", { max_duration_s: 600 });
+      await getDb().update(jobs).set({ status: "running" }).where(eq(jobs.id, jobId));
+      const past = new Date(Date.now() - 600_000 - SCAN_GRACE_MS - 60_000);
+      await getDb().update(jobs).set({ deliveredAt: new Date(past.getTime() + 120_000) }).where(eq(jobs.id, jobId));
+      expect((await post(auth, batch(jobId))).status).toBe(202);
+      await getDb().update(jobs).set({ deliveredAt: past }).where(eq(jobs.id, jobId));
+      expect((await post(auth, batch(jobId))).status).toBe(404);
+    });
+
+    it("caps the findings of one job: 400 /findings + integrity event beyond the cap", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      await getDb().insert(findingsBatches).values({
+        agentId: auth.agentId,
+        batchId: uuidv7(),
+        bodySha256: "0".repeat(64),
+        jobId,
+        findingsCount: MAX_FINDINGS_PER_JOB - 1,
+      });
+      const second = { ...PG_FINDING, location: { ...PG_FINDING.location, field: "phone" } };
+      const res = await post(auth, batch(jobId, [PG_FINDING, second]));
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/findings", keyword: "maxItems" }]);
+      expect((await integrityRows(auth.agentId, "agent.batch_rejected")).events).toHaveLength(1);
+      expect((await post(auth, batch(jobId, [PG_FINDING]))).status).toBe(202);
+      expect((await post(auth, batch(jobId, [second]))).status).toBe(400);
+    });
+
+    it("rate limits stored batches per agent (429 + Retry-After); duplicates and rejections are free", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const first = batch(jobId);
+      expect((await post(auth, first)).status).toBe(202);
+      for (let i = 0; i < 5; i++) expect((await post(auth, first)).status).toBe(202);
+      expect((await post(auth, batch(jobId, [{ ...PG_FINDING, matched: 999 }]))).status).toBe(400);
+      expect(findingsPerAgent.check(auth.agentId).limited).toBe(false);
+      for (let i = 1; i < findingsPerAgent.limit; i++) findingsPerAgent.hit(auth.agentId);
+      const res = await post(auth, batch(jobId));
+      expect(res.status).toBe(429);
+      expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+      expect((await expectConformingError(res, {})).code).toBe("rate_limited");
+      // Other agents are not affected.
+      const other = await agentWithTargets();
+      expect((await post(other, batch(await deliveredScan(other)))).status).toBe(202);
+    });
+
+    it("lists findings fairly: a noisy target cannot hide the others", async () => {
+      const noisy = await agentWithTargets();
+      const quiet = await agentWithTargets();
+      await getDb().execute(sql`
+        insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+          field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id, last_seen_at)
+        select gen_random_uuid(), ${noisy.agentId}, 'pg-prod-1', md5(g::text) || md5(g::text), 'postgres', 'a',
+          'o', 'f' || g, 'pii.email', '2026.09.1', 0.5, 10, 5, gen_random_uuid(), now()
+        from generate_series(1, ${MAX_LISTED_FINDINGS + 20}) g`);
+      expect((await post(quiet, batch(await deliveredScan(quiet)))).status).toBe(202);
+      await getDb().execute(sql`update findings set last_seen_at = now() - interval '1 day' where agent_id = ${quiet.agentId}`);
+      const view = await listFindings(getDb());
+      expect(view).toHaveLength(MAX_LISTED_FINDINGS);
+      expect(view.some((f) => f.agentId === quiet.agentId)).toBe(true);
+    });
+  });
+
+  describe("M2: false-positive reset on rescan", () => {
+    async function markedFinding() {
+      const auth = await agentWithTargets();
+      const first = await deliveredScan(auth);
+      expect((await post(auth, batch(first, [{ ...PG_FINDING, matched: 100 }]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded" }).where(eq(jobs.id, first));
+      const [row] = await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId));
+      const userId = await adminUser();
+      expect(await setFalsePositive(getDb(), String(row?.id), true, { userId, ip: null })).toBe(true);
+      const [marked] = await getDb().select().from(findings).where(eq(findings.id, String(row?.id)));
+      expect(marked?.falsePositiveMatched).toBe(100);
+      expect(marked?.falsePositiveClassifiersVersion).toBe("2026.09.1");
+      return { auth, id: String(row?.id) };
+    }
+    const resets = (id: string) =>
+      getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.action, "finding.false_positive_reset"), eq(auditLog.targetId, id)));
+
+    it("keeps the mark while matched does not rise, resets (audited) when it does", async () => {
+      const { auth, id } = await markedFinding();
+      const again = await deliveredScan(auth);
+      expect((await post(auth, batch(again, [{ ...PG_FINDING, matched: 90 }]))).status).toBe(202);
+      let [row] = await getDb().select().from(findings).where(eq(findings.id, id));
+      expect(row?.falsePositiveAt).not.toBeNull();
+      expect(await resets(id)).toHaveLength(0);
+      expect((await post(auth, batch(again, [{ ...PG_FINDING, matched: 101 }]))).status).toBe(202);
+      [row] = await getDb().select().from(findings).where(eq(findings.id, id));
+      expect(row?.falsePositiveAt).toBeNull();
+      expect(row?.falsePositiveBy).toBeNull();
+      expect(row?.falsePositiveMatched).toBeNull();
+      const audit = await resets(id);
+      expect(audit).toHaveLength(1);
+      expect(audit[0]?.actorType).toBe("system");
+      expect(audit[0]?.details).toMatchObject({ agent_id: auth.agentId, target_id: "pg-prod-1", classifier: "pii.email", reason: "matched_increased" });
+    });
+
+    it("resets when the classifier set changes", async () => {
+      const { auth, id } = await markedFinding();
+      const next = await deliveredScan(auth, "pg-prod-1", {}, "2026.10.1");
+      const res = await post(auth, { ...batch(next, [{ ...PG_FINDING, matched: 50 }]), classifiers_version: "2026.10.1" });
+      expect(res.status).toBe(202);
+      const [row] = await getDb().select().from(findings).where(eq(findings.id, id));
+      expect(row?.falsePositiveAt).toBeNull();
+      expect((await resets(id))[0]?.details).toMatchObject({ reason: "classifiers_version" });
     });
   });
 

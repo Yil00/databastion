@@ -405,12 +405,12 @@ export function handleRequestScan(req: Request, agentId: string, targetId: strin
 }
 
 /**
- * Marks (`{"false_positive": true}`) or unmarks a finding as a false positive (any authenticated
- * user, CSRF). Audited. False positives are hidden from the findings view by default.
+ * Marks (`{"false_positive": true}`) or unmarks a finding as a false positive (admin, CSRF; M2: it
+ * hides a finding from everyone). Audited. False positives are hidden from the view by default.
  */
 export function handleFalsePositive(req: Request, findingId: string): Promise<Response> {
   return guardedUser("finding.false_positive", async () => {
-    const g = await requireUser(req, { stateChanging: true, route: "finding.false_positive" });
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "finding.false_positive" });
     if (!g.ok) return g.response;
     if (!UUID.test(findingId)) return error(404, "not_found");
     const body = await readJsonBody(req, MAX_USER_BODY);

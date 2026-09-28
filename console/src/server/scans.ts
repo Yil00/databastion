@@ -16,10 +16,56 @@ import { writeAudit } from "./audit";
 
 export type DiscoveryScanParams = Schemas["DiscoveryScanParams"];
 
+type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
 /** Contract defaults (`DiscoveryScanParams`), made explicit in every job. */
 export const SCAN_DEFAULTS = { sample_rows: 200, max_duration_s: 900, statement_timeout_ms: 30_000 } as const;
 /** The agent must not start a scan after this delay (contract `expires_at`). */
 export const SCAN_JOB_TTL_MS = 6 * 3600_000;
+/**
+ * Slack added to a scan's `max_duration_s` after delivery: past `delivered_at + max_duration_s +
+ * SCAN_GRACE_MS`, a `delivered` / `running` scan is dead (the agent's own budget is over). It gets no
+ * more findings, and the next scan request of the agent marks it `failed` (`timeout`).
+ */
+export const SCAN_GRACE_MS = 3600_000;
+
+/** SQL: the instant after which a delivered / running scan job is dead. */
+export const scanDeadlineSql = sql`${jobs.deliveredAt} + make_interval(secs => coalesce((${jobs.params}->>'max_duration_s')::int, 86400)) + make_interval(secs => ${SCAN_GRACE_MS / 1000})`;
+
+/**
+ * Expiry sweep of the agent's scan jobs, run before the "one open scan per target" check (L2):
+ * pending scans past `expires_at` become `expired`; delivered / running scans past their deadline
+ * become `failed` (`timeout`), each audited as a system action. Returns the timed-out job ids.
+ */
+export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]> {
+  await tx.execute(sql`
+    update jobs set status = 'expired', finished_at = now()
+    where agent_id = ${agentId} and type = 'discovery.scan' and status = 'pending'
+      and expires_at is not null and expires_at <= now()`);
+  const dead = await tx
+    .update(jobs)
+    .set({ status: "failed", error: { code: "timeout" }, finishedAt: sql`now()`, leaseUntil: null })
+    .where(
+      and(
+        eq(jobs.agentId, agentId),
+        eq(jobs.type, "discovery.scan"),
+        inArray(jobs.status, ["delivered", "running"]),
+        sql`${jobs.deliveredAt} is not null and ${scanDeadlineSql} < now()`,
+      ),
+    )
+    .returning({ id: jobs.id, targetId: jobs.targetId });
+  for (const job of dead) {
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "job.timeout",
+      outcome: "failure",
+      targetType: "job",
+      targetId: job.id,
+      details: { agent_id: agentId, target_id: job.targetId, type: "discovery.scan" },
+    });
+  }
+  return dead.map((j) => j.id);
+}
 
 const PARAM_KEYS = new Set([
   "sample_rows",
@@ -88,6 +134,7 @@ export async function requestScan(
     if (!target?.present) return { outcome: "not_found" };
     const version = agent.classifiersVersion;
     if (!version || !validateSchema("ClassifiersVersion", version).ok) return { outcome: "not_ready" };
+    await sweepDeadScans(tx, agentId);
     const [open] = await tx
       .select({ id: jobs.id })
       .from(jobs)

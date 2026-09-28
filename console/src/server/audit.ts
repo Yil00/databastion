@@ -27,6 +27,8 @@ export type AuditAction =
   | "agent.foreign_target"
   | "discovery.scan_request"
   | "finding.false_positive"
+  | "finding.false_positive_reset"
+  | "job.timeout"
   | "user.access_denied";
 
 export interface AuditEntry {

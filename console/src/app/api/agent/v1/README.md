@@ -59,15 +59,26 @@ agent (advisory lock):
 1. idempotency on (`agent_id`, `batch_id`) with the SHA-256 of the validated batch: same content
    `202 duplicate: true` (not processed again), other content `409 batch_conflict`;
 2. `job_id` must be a `discovery.scan` job of the agent that was delivered (`delivered`, `running`,
-   `succeeded` or `failed`: batches may overtake the `running` status or arrive after the final one);
+   `succeeded` or `failed`: batches may overtake the `running` status or arrive after the final one)
+   and is still open: `succeeded` / `failed` for 24 h after `finished_at` (`LATE_BATCH_RETENTION_MS`,
+   the spool-retention bound), `delivered` / `running` until `delivered_at + max_duration_s + 1 h`;
    otherwise `404` with pointer `/job_id` (keyword `notFound`);
 3. every `target_id` reported by the agent in a heartbeat: otherwise `404`, pointers
    `/findings/<i>/target_id` (keyword `notFound`);
-4. per item, `400`: `target_id` = the job's target (`const`), `location.engine` = the engine last
-   reported for the target (`const`), `matched <= sampled` and `sampled <= params.sample_rows`
-   (`maximum`), classifier within the job's `params.classifiers` when set (`enum`);
-5. upsert of the findings (masked samples encrypted, see the console README "Data at rest") and of
-   the batch record; `202` `BatchAck`.
+4. `400`: `classifiers_version` = the job's (`/classifiers_version`, `const`); per item,
+   `target_id` = the job's target (`const`), `location.engine` = the engine last reported for the
+   target (`const`), `matched <= sampled` and `sampled <= params.sample_rows` (`maximum`), classifier
+   within the job's `params.classifiers` when set (`enum`). There is **no check that classifier ids
+   exist in `classifiers_version`** yet: the console has no registry of classifier ids per version;
+   it waits for a contract artifact, which a protocol PR will add;
+5. at most 50 000 findings per job over all its batches (`MAX_FINDINGS_PER_JOB`): beyond, `400`
+   with pointer `/findings` (keyword `maxItems`);
+6. upsert of the findings (masked samples encrypted, see the console README "Data at rest") and of
+   the batch record; `202` `BatchAck`. A false-positive mark is cleared when `matched` rises above its
+   value at marking time or `classifiers_version` changes (audited).
+
+Stored batches are limited to 60 per agent per minute (`429` + `Retry-After`, per web process);
+duplicates and rejected batches do not count.
 
 Any `400` on `/findings`, a `batch_conflict` and a foreign `target_id` write an agent-integrity
 event (`security_events` + audit log). `413` (over 4 MiB) and a `404` on `job_id` do not.

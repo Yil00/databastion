@@ -12,7 +12,7 @@ import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, fixtures, uuidv7 } from "@/test/helpers";
 
-import { buildScanParams, SCAN_DEFAULTS } from "./scans";
+import { buildScanParams, SCAN_DEFAULTS, SCAN_GRACE_MS } from "./scans";
 import {
   handleFalsePositive,
   handleLogin,
@@ -170,6 +170,39 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     expect((await scan(auth.agentId, {})).status).toBe(202);
   });
 
+  it("one open scan per target (409 scan_in_progress); a dead scan is swept, audited, then replaced (L2)", async () => {
+    const auth = await agentWithTarget();
+    const first = await scan(auth.agentId, {});
+    expect(first.status).toBe(202);
+    const { job_id: jobId } = (await first.json()) as { job_id: string };
+    const busy = await scan(auth.agentId, {});
+    expect(busy.status).toBe(409);
+    expect(await busy.json()).toEqual({ error: "scan_in_progress" });
+    // Delivered, then running within its budget: still busy.
+    expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+    await getDb().update(jobs).set({ status: "running" }).where(eq(jobs.id, jobId));
+    expect((await scan(auth.agentId, {})).status).toBe(409);
+    // Past delivered_at + max_duration_s + grace: dead.
+    const past = new Date(Date.now() - SCAN_DEFAULTS.max_duration_s * 1000 - SCAN_GRACE_MS - 60_000);
+    await getDb().update(jobs).set({ deliveredAt: past }).where(eq(jobs.id, jobId));
+    const replaced = await scan(auth.agentId, {});
+    expect(replaced.status).toBe(202);
+    const [dead] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
+    expect(dead?.status).toBe("failed");
+    expect(dead?.error).toEqual({ code: "timeout" });
+    const [audit] = await getDb()
+      .select()
+      .from(auditLog)
+      .where(and(eq(auditLog.action, "job.timeout"), eq(auditLog.targetId, jobId)));
+    expect(audit?.actorType).toBe("system");
+    // A pending scan past expires_at is expired by the sweep, not busy.
+    const { job_id: pendingId } = (await replaced.json()) as { job_id: string };
+    await getDb().update(jobs).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(jobs.id, pendingId));
+    expect((await scan(auth.agentId, {})).status).toBe(202);
+    const [expired] = await getDb().select().from(jobs).where(eq(jobs.id, pendingId));
+    expect(expired?.status).toBe("expired");
+  });
+
   it("rejects out-of-range or unknown parameters with 400 and queues nothing", async () => {
     const auth = await agentWithTarget();
     for (const body of [{ sample_rows: 0 }, { databases: [] }, { statement_timeout_ms: 0 }, { foo: 1 }, []]) {
@@ -280,14 +313,15 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
       return { auth, id: String(phone?.id) };
     }
 
-    const mark = (id: string, value: unknown, who = analyst) =>
+    const mark = (id: string, value: unknown, who = admin) =>
       handleFalsePositive(
         userReq(`/api/findings/${id}/false-positive`, { body: { false_positive: value }, cookie: who.cookie, csrf: who.csrf }),
         id,
       );
 
-    it("marks and unmarks (any authenticated user, audited); hidden from the view by default", async () => {
+    it("marks and unmarks (admin only, audited with agent, target, classifier); hidden by default", async () => {
       const { auth, id } = await withFinding();
+      expect((await mark(id, true, analyst)).status).toBe(403);
       expect((await mark(id, true)).status).toBe(204);
       const [row] = await getDb().select().from(findings).where(eq(findings.id, id));
       expect(row?.falsePositiveAt).not.toBeNull();
@@ -297,7 +331,14 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
         .from(auditLog)
         .where(and(eq(auditLog.action, "finding.false_positive"), eq(auditLog.targetId, id)));
       expect(audits).toHaveLength(1);
-      expect(audits[0]?.details).toEqual({ false_positive: true });
+      expect(audits[0]?.details).toEqual({
+        false_positive: true,
+        agent_id: auth.agentId,
+        target_id: "pg-prod-1",
+        classifier: "pii.phone",
+      });
+      expect(row?.falsePositiveMatched).toBe(1);
+      expect(row?.falsePositiveClassifiersVersion).toBe("2026.09.1");
 
       const hidden = await listFindings(getDb(), { agentId: auth.agentId });
       expect(hidden.map((f) => f.classifier)).toEqual(["pii.email"]);
@@ -307,21 +348,23 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
       expect(all.map((f) => f.classifier).sort()).toEqual(["pii.email", "pii.phone"]);
       expect(all.find((f) => f.id === id)?.falsePositiveAt).not.toBeNull();
 
-      expect((await mark(id, false, admin)).status).toBe(204);
+      expect((await mark(id, false)).status).toBe(204);
+      const [cleared] = await getDb().select().from(findings).where(eq(findings.id, id));
+      expect(cleared?.falsePositiveMatched).toBeNull();
       expect((await listFindings(getDb(), { agentId: auth.agentId })).length).toBe(2);
     });
 
     it("validates the request: CSRF, body shape, unknown finding (audited)", async () => {
       const { id } = await withFinding();
-      expect((await mark(id, true, { cookie: analyst.cookie, csrf: "" })).status).toBe(403);
+      expect((await mark(id, true, { cookie: admin.cookie, csrf: "" })).status).toBe(403);
       expect((await mark(id, "yes")).status).toBe(400);
       expect(
         (
           await handleFalsePositive(
             userReq(`/api/findings/${id}/false-positive`, {
               body: { false_positive: true, note: "x" },
-              cookie: analyst.cookie,
-              csrf: analyst.csrf,
+              cookie: admin.cookie,
+              csrf: admin.csrf,
             }),
             id,
           )
