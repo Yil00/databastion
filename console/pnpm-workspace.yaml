@@ -1,0 +1,7 @@
+# Standalone pnpm project (not a monorepo workspace): this file only holds pnpm settings.
+# Dependencies whose install scripts are NOT run (prebuilt binaries are used instead).
+ignoredBuiltDependencies:
+  - sharp
+  - unrs-resolver
+onlyBuiltDependencies:
+  - esbuild
