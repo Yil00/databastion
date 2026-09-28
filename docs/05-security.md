@@ -55,13 +55,19 @@ The console uses three PostgreSQL roles, so that a compromised console process c
 The owner role never runs SQL against objects inside `pgboss`: they are created by the runtime role, so a trigger or function planted there would run with the owner's rights. In a single-role setup (development), the audit log is append-only against the application code only.
 
 ### Metrics endpoint (#21)
-`GET /metrics` requires `Authorization: Bearer <DATABASTION_METRICS_TOKEN>` (at least 32 characters, constant-time comparison, `401` otherwise). When the token is unset or too short, the endpoint answers `404`. It is meant for the internal network only: block the path on the public reverse proxy and scrape the console directly. Serving it on a separate port or behind an allowlist is a follow-up (ROADMAP P1-D).
+`GET /metrics` requires `Authorization: Bearer <DATABASTION_METRICS_TOKEN>` (at least 32 characters, constant-time comparison, `401` otherwise). When the token is unset or too short, the endpoint answers `404`. It is meant for the internal network only. Since #27, setting `DATABASTION_METRICS_PORT` serves it on a dedicated listener of the web process, bound to `DATABASTION_METRICS_HOST` (an IP address, `127.0.0.1` by default), and the main port then answers `404` on `/metrics`. Without a dedicated port, `/metrics` stays on the main port: block the path on the public reverse proxy (a production start warns about it).
 
 ### Web UI headers (#21)
 UI pages get a `Content-Security-Policy` with a per-request nonce: `script-src 'self' 'nonce-…' 'strict-dynamic'`, `object-src 'none'`, `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`. It is not applied to `/api/*` and `/metrics`, which serve no HTML.
 
 ### Authentication rate limits
 Every login or agent authentication that needs an argon2id verification is counted **before** the verification runs and refunded on success, so concurrent requests cannot exceed the limits. Logins and agent authentications use separate, bounded argon2id pools (`503` + `Retry-After` when full), plus a pool reserved for agents presenting their last verified secret, so a login flood or a flood of wrong agent secrets cannot block a legitimate agent. Per-IP limits apply only when the client IP is known, that is behind a trusted reverse proxy explicitly configured (`DATABASTION_TRUST_PROXY` / `DATABASTION_TRUSTED_PROXY_HOPS`); otherwise only the per-user / per-agent limits and the pool caps apply. Limiters are in memory, per process (one web process in the MVP).
+
+Since #27:
+- **Previous secret (`S0`)**: attempts authenticated with the previous secret go through the same argon2id path and count against the per-agent and per-IP failure limits like a wrong secret. They are refunded only when `/rotate` answers an idempotent `duplicate`.
+- **Known-good fingerprints**: the console remembers which secrets it has verified for an agent as an HMAC-SHA256 fingerprint keyed with a subkey derived (HKDF-SHA256) from `DATABASTION_ENCRYPTION_KEY`, persisted across restarts. A known-good secret uses the reserved agent pool and is exempt from the per-agent failure limit; it still counts against the per-IP limit (follow-up M1, ROADMAP P1-C). Without a usable key (unset, shorter than 32 characters or unreadable), nothing is stored and nothing matches: the feature fails closed and the console logs a warning.
+- **Pending secret (`S1`)**: a pending secret registered by `/rotate` is recognized as known good in the same way, so the agent's `S1` probe is exempt from the per-agent failure limit.
+- **`/rotate` body**: a cheap precheck (protocol headers, secret format, failure limits) runs before the body is read. The body is capped at 64 KiB and must arrive within 10 s; a body that misses the deadline is answered `400` before any argon2id work, never causes a lock, and counts against the per-IP failure limit.
 
 ## Agent local state and results path
 *Introduced by P1-B (#16, #20); details in `agent/README.md`.*
