@@ -536,15 +536,27 @@ export interface components {
              * @default 30000
              */
             statement_timeout_ms: number;
-            /** @description Databases (or LDAP suffixes) to include. Absent = all visible to the account. */
+            /**
+             * @description Databases (or LDAP suffixes) to include. Absent = all visible to the account. An empty list is
+             *     rejected (`minItems: 1`) so that a "none selected" bug can never widen a scan to everything.
+             */
             databases?: components["schemas"]["IdentifierPattern"][];
-            /** @description Schemas to include (PostgreSQL). Absent = all. */
+            /** @description Schemas to include (PostgreSQL). Absent = all. An empty list is rejected (`minItems: 1`). */
             schemas?: components["schemas"]["IdentifierPattern"][];
-            /** @description Tables / collections / objectClasses to include. Absent = all. */
+            /**
+             * @description Tables / collections / objectClasses to include. Absent = all. An empty list is rejected
+             *     (`minItems: 1`).
+             */
             include_objects?: components["schemas"]["IdentifierPattern"][];
-            /** @description Tables / collections / objectClasses to skip. */
+            /**
+             * @description Tables / collections / objectClasses to skip. Absent or empty = nothing skipped (an empty list
+             *     cannot widen the scan beyond the include filters, so it is accepted).
+             */
             exclude_objects?: components["schemas"]["IdentifierPattern"][];
-            /** @description Restrict the scan to these classifiers. Absent = all classifiers of the version. */
+            /**
+             * @description Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`.
+             *     An empty list is rejected (`minItems: 1`): it never means "no classifiers" nor "all".
+             */
             classifiers?: components["schemas"]["ClassifierId"][];
         };
         AuditConfigureJob: {
@@ -581,7 +593,12 @@ export interface components {
              *     reported when they return at least this many rows.
              */
             min_rows?: components["schemas"]["Count"];
-            /** @description Objects classified as sensitive by Discovery, whose accesses are always reported. */
+            /**
+             * @description Objects classified as sensitive by Discovery, whose accesses are always reported. Absent or
+             *     empty = no object is flagged sensitive: the settings replace the previous ones as a whole, so
+             *     an empty list legitimately clears them. An empty list narrows reporting to events that carry
+             *     a signal or reach `min_rows`; it can never widen what is reported.
+             */
             sensitive_objects?: components["schemas"]["SensitiveObject"][];
         };
         SensitiveObject: {
