@@ -26,6 +26,8 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 | **MongoDB Community** | Structured JSON logs (slow operations: `appName`, `nreturned`) + profiler | Limited → Partial | Profiler level 1 with low `slowms`; level 2 = Partial but costly |
 | **OpenLDAP** | `slapo-accesslog` overlay (`cn=accesslog` database, queryable over LDAP) | Full | `olcAccessLogOps: reads writes session`, read account on `cn=accesslog` |
 
+> **PostgreSQL, as implemented (P2-B, [ADR-0015](adr/0015-postgresql-connector-decisions.md))**: the connector's `check()` reports **Limited** when `pg_stat_statements` is installed and loaded in a monitored database and the agent's role sees other users' statements (member of `pg_read_all_stats`), and **None** otherwise. It never reports **Full** yet: Full needs a readable pgaudit log, and the log path is only configured with the Audit connector (P4-A); a loaded pgaudit is only mentioned in the agent's logs. The level describes the prerequisites found on the target. The PostgreSQL Audit connector itself (reading `pg_stat_statements` or pgaudit, producing access events) is P4-A and not implemented: no PostgreSQL access event is collected yet.
+
 > **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations (or all of them, at the cost of a level 2 profiler). A fast `mongodump` of a small collection can go unnoticed. **This must be stated clearly in the user documentation and in the console.**
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
