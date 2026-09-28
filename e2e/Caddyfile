@@ -11,10 +11,14 @@ https://console.e2e.internal:{$E2E_HTTPS_PORT} {
 		protocols tls1.3
 	}
 	# Access log on stdout (JSON): run.sh uses it to check that the agent stops polling after
-	# revocation. Caddy redacts Authorization / Cookie headers by default.
+	# revocation. Caddy redacts Authorization / Cookie / Set-Cookie by default; the CSRF header
+	# is not covered, so it is deleted here (run.sh fails on any secret in the logs).
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			request>headers>X-Csrf-Token delete
+		}
 	}
 	header Strict-Transport-Security "max-age=31536000"
 	# /metrics stays on the internal network (console README, ADR-0004).
