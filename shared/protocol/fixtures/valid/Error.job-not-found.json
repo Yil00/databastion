@@ -1,0 +1,5 @@
+{
+  "code": "not_found",
+  "message": "The referenced job does not exist or no longer accepts findings.",
+  "details": [{ "pointer": "/job_id", "keyword": "notFound" }]
+}

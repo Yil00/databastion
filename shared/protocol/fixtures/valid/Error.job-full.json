@@ -1,0 +1,5 @@
+{
+  "code": "invalid_request",
+  "message": "The job has reached its findings limit.",
+  "details": [{ "pointer": "/findings", "keyword": "maxItems" }]
+}
