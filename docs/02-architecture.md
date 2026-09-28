@@ -37,8 +37,14 @@ PostgreSQL MariaDB      MongoDB           OpenLDAP
 | Process | Role |
 |-----------|------|
 | `web` | UI, user API, agent API (`/api/agent/v1/*`) |
-| `worker` | Same image, different command. Applies policies, correlates events, creates incidents, sends alerts |
+| `worker` | Same image, different command. Applies policies, creates incidents, sends alerts, checks for silent agents; correlates access events from phase 4 |
 | `postgres` | Internal database. Also serves as the job queue (pg-boss) → **no Redis** |
+
+**Worker queues** (pg-boss, `stately`, no payload): the pending work is recorded in console tables, and a job only wakes the worker, so a lost or repeated job loses or repeats nothing.
+- `policies.evaluate`: evaluates pending findings and policies that need a full pass, and creates incidents ([ADR-0014](adr/0014-policy-and-incident-model.md)). Woken by the web process after an accepted findings batch or a policy change, and scheduled every minute.
+- `notifications.deliver`: sends the due rows of the notification outbox and runs the silent-agent check ([ADR-0017](adr/0017-alerting.md)). Woken after new incidents, integrity events and channel tests, and scheduled every minute.
+
+**Console outbound connections**: the worker is the only console process that connects out, to the webhook endpoints and SMTP relays of the notification channels, under the outbound address policy of [ADR-0017](adr/0017-alerting.md) (every resolved address checked, connections pinned to the checked addresses). The web process never connects to them; it validates settings and queues tests. None of this involves the agents, which still accept no inbound connection (I1).
 
 ### Agent
 A **single Rust binary** ([ADR-0002](adr/0002-single-agent-connectors.md)) made up of:
