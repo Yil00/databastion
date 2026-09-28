@@ -52,6 +52,14 @@ targets:
     # that `06 12 34 56 78` and `+33 6 12 34 56 78` get the same fingerprint.
     # `fr` only for now; absent = unknown (digits fingerprinted as is).
     phone_region: fr
+    # PostgreSQL settings (optional block).
+    postgres:
+      databases: [app]         # 1..=16 databases to connect to (default: [postgres])
+      tls: verify_full         # verify_full (default; rustls, certificate + host name) | disable
+      # ca_file: /etc/databastion/pg-ca.pem   # only trusted root for this target
+      # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
+      # the membership as an expected warning instead of over-privilege.
+      extended_grants: false
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

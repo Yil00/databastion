@@ -1729,7 +1729,7 @@ impl Connector for Health {
         Engine::Postgres
     }
 
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
         self.0.clone()
     }
 
@@ -1806,7 +1806,7 @@ impl Connector for Scanner {
         Engine::Postgres
     }
 
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
         TargetHealth::not_implemented(Engine::Postgres)
     }
 
@@ -1866,8 +1866,8 @@ async fn discovery_scans_go_through_the_gate_and_spool_fingerprinted_findings() 
         fn engine(&self) -> Engine {
             self.0.engine()
         }
-        async fn check(&self) -> TargetHealth {
-            self.0.check().await
+        async fn check(&self, t: &crate::config::TargetConfig) -> TargetHealth {
+            self.0.check(t).await
         }
         async fn discover(
             &self,
@@ -2004,7 +2004,7 @@ impl Connector for Stuck {
         Engine::Postgres
     }
 
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
         TargetHealth::not_implemented(Engine::Postgres)
     }
 
@@ -2280,7 +2280,7 @@ impl Connector for Flood {
         Engine::Postgres
     }
 
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
         TargetHealth::not_implemented(Engine::Postgres)
     }
 
@@ -2464,7 +2464,7 @@ impl Connector for Untouchable {
     fn engine(&self) -> Engine {
         Engine::Postgres
     }
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
         panic!("the target must not be touched");
     }
     async fn discover(
@@ -2617,4 +2617,69 @@ async fn completed_scan_is_not_held_by_a_park_until_its_deadline() {
         sent_findings(&sent_batches(&server).await),
         FINDINGS_CHUNK + 20
     );
+}
+
+/// A connector whose scans fail on the target.
+struct TargetFailure;
+
+#[async_trait::async_trait]
+impl Connector for TargetFailure {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Err(crate::ConnectorError::Target {
+            engine: Engine::Postgres,
+            code: FailureCode::PermissionDenied,
+            engine_code: Some("42501".to_owned()),
+        })
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn target_errors_end_the_scan_with_their_failure_code() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(TargetFailure)],
+    )
+    .unwrap();
+    let id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f91";
+    let body = serde_json::json!({ "jobs": [{
+        "job_id": id, "type": "discovery.scan", "created_at": "2026-09-28T14:00:00Z",
+        "target_id": "pg-main", "classifiers_version": "2026.09.1",
+        "params": { "sample_rows": 200, "max_duration_s": 900 }
+    }]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    let got = statuses(&server).await;
+    let status = &got.iter().find(|(i, _)| i == id).unwrap().1;
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error"]["code"], "permission_denied");
 }

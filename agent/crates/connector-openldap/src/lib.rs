@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use databastion_core::{
     AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
+    config::TargetConfig,
 };
 
 /// OpenLDAP connector (stub).
@@ -38,7 +39,7 @@ impl Connector for OpenldapConnector {
         Engine::Openldap
     }
 
-    async fn check(&self) -> TargetHealth {
+    async fn check(&self, _target: &TargetConfig) -> TargetHealth {
         TargetHealth::not_implemented(self.engine())
     }
 
@@ -64,7 +65,12 @@ mod tests {
     async fn stub_reports_honest_health() {
         let connector = OpenldapConnector::new();
         assert_eq!(connector.engine(), Engine::Openldap);
-        let health = connector.check().await;
+        let config = databastion_core::AgentConfig::parse(
+            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: \
+             [{id: t, engine: openldap, host: h, account: a, secret: {env: PW}}]}",
+        )
+        .unwrap();
+        let health = connector.check(&config.targets[0]).await;
         assert!(!health.reachable);
         assert_eq!(health.audit_level, AuditLevel::None);
     }
