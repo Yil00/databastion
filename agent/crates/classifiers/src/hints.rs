@@ -1,15 +1,20 @@
-//! Column-name hints (FR + EN).
+//! Column-name hints (FR + EN, and common DE / ES / IT / NL / PT words).
 //!
-//! A hint never produces a finding on its own: values must match too. Hints
-//! raise the confidence of value-validated classifiers, and they are
-//! **required** by the classifiers whose values cannot be recognized reliably
-//! alone (`pii.person_name`, `pii.postal_address`, `pii.birth_date`, AWS
-//! secret access keys).
+//! A hint never produces a finding on its own: values must match too.
+//! Values are detected first ([`crate::column`]); a hint lowers the share of
+//! matching values a whole-value classifier needs (`pii.person_name`,
+//! `pii.postal_address`, `pii.birth_date`, AWS secret access keys), lets
+//! loose phone formats and raw password digests count, and raises the
+//! confidence of validated classifiers. Negative names turn a hint off
+//! (`phone_country`), card numbers off (`order_number`, `imei`), or make
+//! 40-character AWS secrets need more evidence (`session_token`).
 //!
 //! Names are split into lowercase tokens on non-alphanumeric characters and
 //! camelCase boundaries (`accessKeyId` -> `access`, `key`, `id`;
 //! `date_naissance` -> `date`, `naissance`). For a field path, every segment
 //! contributes tokens (`name.first`, `address.street`).
+
+use unicode_normalization::UnicodeNormalization;
 
 use crate::id::ClassifierId;
 
@@ -27,6 +32,10 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "emailaddress",
             "mailaddress",
             "adressemail",
+            "correo",
+            "emailaddr",
+            "mailaddr",
+            "epost",
         ],
     ),
     (
@@ -47,6 +56,20 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "phonenumber",
             "mobilephone",
             "homephone",
+            "telefon",
+            "telefono",
+            "teléfono",
+            "fone",
+            "handy",
+            "telno",
+            "phoneno",
+            "tfno",
+            "mob",
+            "landline",
+            "contactnumber",
+            "phonenum",
+            "numtel",
+            "numerotelephone",
         ],
     ),
     (ClassifierId::Iban, &["iban", "rib", "bban"]),
@@ -61,6 +84,13 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "carte",
             "cb",
             "creditcard",
+            "cardno",
+            "cardnum",
+            "ccnumber",
+            "ccno",
+            "kreditkarte",
+            "tarjeta",
+            "primaryaccountnumber",
         ],
     ),
     (
@@ -74,6 +104,11 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "ssn",
             "securite",
             "sécurité",
+            "nss",
+            "numss",
+            "securitesociale",
+            "numerosecu",
+            "nirpp",
         ],
     ),
     (
@@ -87,6 +122,20 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "naissance",
             "datenaissance",
             "ddn",
+            "born",
+            "birthdt",
+            "bdate",
+            "bday",
+            "dateofbirth",
+            "geburtsdatum",
+            "geburtstag",
+            "nacimiento",
+            "fechanacimiento",
+            "nascita",
+            "datanascita",
+            "geboortedatum",
+            "naiss",
+            "datnaiss",
         ],
     ),
     (
@@ -110,6 +159,34 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "holder",
             "cardholder",
             "titulaire",
+            "fname",
+            "lname",
+            "apellido",
+            "apellidos",
+            "vorname",
+            "nachname",
+            "cognome",
+            "voornaam",
+            "achternaam",
+            "nomfamille",
+            "prenoms",
+            "prénoms",
+            "nomcomplet",
+            "nomusage",
+            "nomnaissance",
+            "personname",
+            "contactname",
+            "customername",
+            "clientname",
+            "employeename",
+            "patientname",
+            "membername",
+            "ownername",
+            "holdername",
+            "accountholder",
+            "beneficiary",
+            "beneficiaire",
+            "bénéficiaire",
         ],
     ),
     (
@@ -127,6 +204,29 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "homepostaladdress",
             "registeredaddress",
             "addressline",
+            "adres",
+            "direccion",
+            "dirección",
+            "indirizzo",
+            "anschrift",
+            "strasse",
+            "straße",
+            "calle",
+            "addr1",
+            "addr2",
+            "address1",
+            "address2",
+            "street1",
+            "street2",
+            "domicile",
+            "domicilio",
+            "mailingaddress",
+            "billingaddress",
+            "shippingaddress",
+            "adressepostale",
+            "adrpostale",
+            "line1",
+            "line2",
         ],
     ),
     (
@@ -142,6 +242,14 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "passwordhash",
             "pwhash",
             "hash",
+            "pw",
+            "passhash",
+            "pwdhash",
+            "hashedpassword",
+            "encryptedpassword",
+            "passworddigest",
+            "motpasse",
+            "secretpassword",
         ],
     ),
     (
@@ -159,7 +267,7 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
 /// Generic name tokens that only hint at a person name when qualified
 /// (`first_name`, `requester_name`, `nom_client`), or when they are the
 /// whole column name.
-const NAME_WORDS: &[&str] = &["name", "names", "nom", "noms"];
+const NAME_WORDS: &[&str] = &["name", "names", "nom", "noms", "nombre", "nome"];
 const PERSON_QUALIFIERS: &[&str] = &[
     "first",
     "last",
@@ -189,6 +297,291 @@ const PERSON_QUALIFIERS: &[&str] = &[
     "usage",
     "complet",
     "naissance",
+    "author",
+    "sender",
+    "recipient",
+    "signer",
+    "signatory",
+    "guest",
+    "passenger",
+    "traveler",
+    "traveller",
+    "student",
+    "teacher",
+    "user",
+    "billing",
+    "shipping",
+    "emergency",
+    "spouse",
+    "parent",
+    "father",
+    "mother",
+    "child",
+    "applicant",
+    "candidate",
+    "tenant",
+    "buyer",
+    "doctor",
+    "physician",
+    "manager",
+    "agent",
+    "real",
+    "nick",
+    "maiden",
+    "common",
+    "preferred",
+];
+
+/// Tokens that name a password (not a generic hash): raw hex digests are
+/// password hashes only under such a name.
+const PASSWORD_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "mdp",
+    "motdepasse",
+    "motpasse",
+    "userpassword",
+    "passwordhash",
+    "pwhash",
+    "pw",
+    "passhash",
+    "pwdhash",
+    "hashedpassword",
+    "encryptedpassword",
+    "passworddigest",
+    "secretpassword",
+];
+
+/// Tokens of things other than persons that have names (pets, ships,
+/// products, teams, projects, hosts, files, places, companies…): a `name`
+/// qualified by one of them (`pet_name`, `dogName`, `hostname`,
+/// `company.name`) is not a person name, whatever the values look like.
+const NOT_PERSON_WORDS: &[&str] = &[
+    "pet",
+    "pets",
+    "dog",
+    "dogs",
+    "cat",
+    "cats",
+    "animal",
+    "animals",
+    "horse",
+    "horses",
+    "breed",
+    "species",
+    "ship",
+    "ships",
+    "boat",
+    "boats",
+    "vessel",
+    "yacht",
+    "aircraft",
+    "plane",
+    "product",
+    "products",
+    "item",
+    "items",
+    "article",
+    "sku",
+    "brand",
+    "brands",
+    "model",
+    "models",
+    "make",
+    "team",
+    "teams",
+    "club",
+    "project",
+    "projects",
+    "host",
+    "hosts",
+    "server",
+    "servers",
+    "machine",
+    "vm",
+    "node",
+    "cluster",
+    "device",
+    "devices",
+    "file",
+    "files",
+    "folder",
+    "directory",
+    "dir",
+    "path",
+    "city",
+    "cities",
+    "town",
+    "village",
+    "place",
+    "places",
+    "location",
+    "site",
+    "venue",
+    "country",
+    "region",
+    "state",
+    "province",
+    "street",
+    "company",
+    "companies",
+    "organization",
+    "organisation",
+    "org",
+    "business",
+    "firm",
+    "employer",
+    "store",
+    "shop",
+    "restaurant",
+    "hotel",
+    "school",
+    "university",
+    "bank",
+    "merchant",
+    "vendor",
+    "supplier",
+    "carrier",
+    "app",
+    "application",
+    "service",
+    "database",
+    "db",
+    "schema",
+    "table",
+    "queue",
+    "topic",
+    "bucket",
+    "repo",
+    "repository",
+    "branch",
+    "package",
+    "module",
+    "library",
+    "category",
+    "tag",
+    "event",
+    "campaign",
+    "course",
+    "book",
+    "song",
+    "album",
+    "movie",
+    "film",
+    "game",
+    "planet",
+    "domain",
+    "workspace",
+    "channel",
+    "group",
+    "role",
+    "department",
+    "dept",
+    "plan",
+    "feature",
+    "metric",
+    "sensor",
+    "job",
+    "task",
+    "pipeline",
+    "workflow",
+    "report",
+    "dataset",
+    "template",
+    "chien",
+    "chat",
+    "cheval",
+    "produit",
+    "marque",
+    "modele",
+    "equipe",
+    "projet",
+    "serveur",
+    "fichier",
+    "ville",
+    "pays",
+    "societe",
+    "entreprise",
+    "magasin",
+    "boutique",
+    "navire",
+    "bateau",
+    "mascota",
+    "perro",
+    "gato",
+    "tier",
+    "hund",
+    "katze",
+    "firma",
+    "stadt",
+];
+
+/// Tokens of other 40-character secrets and digests (session tokens, API
+/// tokens, commit ids, checksums): a 40-character value there is not an
+/// AWS secret access key without a secret-key name.
+const OTHER_TOKEN_WORDS: &[&str] = &[
+    "token",
+    "tokens",
+    "session",
+    "sessionid",
+    "sid",
+    "nonce",
+    "csrf",
+    "xsrf",
+    "jwt",
+    "bearer",
+    "cookie",
+    "signature",
+    "sig",
+    "checksum",
+    "digest",
+    "hash",
+    "sha",
+    "sha1",
+    "salt",
+    "etag",
+    "commit",
+    "revision",
+    "rev",
+    "uuid",
+    "guid",
+    "apikey",
+    "refresh",
+    "otp",
+    "totp",
+    "captcha",
+];
+
+/// Tokens of identifiers that pass Luhn or look like card numbers without
+/// being cards (order and tracking numbers, IMEI, barcodes…). SIRET / SIREN
+/// columns have their own rule ([`NameHints::siret`]).
+const NOT_CARD_WORDS: &[&str] = &[
+    "order",
+    "orders",
+    "commande",
+    "tracking",
+    "track",
+    "imei",
+    "imeisv",
+    "invoice",
+    "facture",
+    "shipment",
+    "parcel",
+    "colis",
+    "serial",
+    "sku",
+    "ean",
+    "gtin",
+    "upc",
+    "isbn",
+    "barcode",
+    "awb",
+    "consignment",
+    "iccid",
+    "imsi",
+    "waybill",
 ];
 
 /// Tokens of the **last** segment that turn a hint off for the hint-gated
@@ -230,6 +623,11 @@ pub struct NameHints {
     negative: bool,
     aws_secret: bool,
     siret: bool,
+    person_weak: bool,
+    password: bool,
+    not_card: bool,
+    other_token: bool,
+    not_person: bool,
 }
 
 impl NameHints {
@@ -239,6 +637,9 @@ impl NameHints {
         if name.len() > MAX_NAME_BYTES {
             return Self::default();
         }
+        // Compatibility composition (NFKC): `pre\u{301}nom` (decomposed),
+        // fullwidth letters and ligatures read like `prénom`.
+        let name: String = name.nfkc().collect();
         let segments: Vec<Vec<String>> = name.split('.').map(tokens).collect();
         let all: Vec<&str> = segments.iter().flatten().map(String::as_str).collect();
         let last: &[String] = segments.last().map_or(&[], Vec::as_slice);
@@ -251,12 +652,14 @@ impl NameHints {
             }
         }
         let name_word = all.iter().any(|t| NAME_WORDS.contains(t));
-        if name_word
-            && (all.iter().any(|t| PERSON_QUALIFIERS.contains(t))
-                || all.iter().all(|t| NAME_WORDS.contains(t)))
-            && !hinted.contains(&ClassifierId::PersonName)
-        {
-            hinted.push(ClassifierId::PersonName);
+        let mut person_weak = false;
+        if name_word && !hinted.contains(&ClassifierId::PersonName) {
+            if all.iter().any(|t| PERSON_QUALIFIERS.contains(t)) {
+                hinted.push(ClassifierId::PersonName);
+            } else if all.iter().all(|t| NAME_WORDS.contains(t)) {
+                hinted.push(ClassifierId::PersonName);
+                person_weak = true;
+            }
         }
         // `access_key` split as `access`, `key`.
         let access_key = has("access") && has("key");
@@ -274,11 +677,42 @@ impl NameHints {
         let siret = ["siret", "siren", "numsiret", "numsiren"]
             .iter()
             .any(|t| has(t));
+        // A bare `hash` / `hashed` column (in a table of accounts) holds
+        // password hashes; `file_hash`, `content_hash`… do not.
+        // A name of something that is not a person: an object word
+        // (`pet_name`, `PetName`, flat `petname`, `pets[].name`) and no
+        // person qualifier or person name word (`pet_owner_name`).
+        let person_ctx = all.iter().any(|t| PERSON_QUALIFIERS.contains(t))
+            || DIRECT
+                .iter()
+                .find(|(id, _)| *id == ClassifierId::PersonName)
+                .is_some_and(|(_, words)| words.iter().any(|w| has(w)));
+        let flat_object_name = all.iter().any(|t| {
+            ["names", "name", "nom"].iter().any(|n| {
+                t.strip_suffix(n)
+                    .is_some_and(|p| NOT_PERSON_WORDS.contains(&p))
+            })
+        });
+        let object_ctx =
+            flat_object_name || (name_word && all.iter().any(|t| NOT_PERSON_WORDS.contains(t)));
+        let not_person = object_ctx && !person_ctx;
+        if not_person {
+            hinted.retain(|c| *c != ClassifierId::PersonName);
+        }
+        let password = all.iter().any(|t| PASSWORD_WORDS.contains(t))
+            || (!last.is_empty() && last.iter().all(|t| matches!(t.as_str(), "hash" | "hashed")));
+        let not_card = !hinted.contains(&ClassifierId::CardNumber)
+            && all.iter().any(|t| NOT_CARD_WORDS.contains(t));
         Self {
             hinted,
             negative,
             aws_secret,
             siret,
+            person_weak,
+            password,
+            not_card,
+            other_token: all.iter().any(|t| OTHER_TOKEN_WORDS.contains(t)),
+            not_person,
         }
     }
 
@@ -300,6 +734,45 @@ impl NameHints {
     #[must_use]
     pub fn siret(&self) -> bool {
         self.siret
+    }
+
+    /// Whether the person-name hint only comes from a bare `name` / `nom`
+    /// (which also names products, cities, companies…): the values must
+    /// then look like known given names or surnames too.
+    #[must_use]
+    pub fn person_name_weak(&self) -> bool {
+        self.person_weak
+    }
+
+    /// Whether the name designates a password (`password`, `pwd`, `mdp`…,
+    /// or a bare `hash`), not any hash (`file_hash`, `checksum`): raw hex
+    /// digests count as password hashes only there.
+    #[must_use]
+    pub fn password(&self) -> bool {
+        self.password && !self.negative
+    }
+
+    /// Whether the name designates identifiers that look like card numbers
+    /// without being cards (`order_number`, `tracking_ref`, `imei`,
+    /// `barcode`…) and no card.
+    #[must_use]
+    pub fn not_card(&self) -> bool {
+        self.not_card
+    }
+
+    /// Whether the name says the values name something other than a person
+    /// (`pet_name`, `dogName`, `SHIP_NAME`, `hostname`, `product.name`,
+    /// `team_name`, `company_name`…): person names are not reported there.
+    #[must_use]
+    pub fn not_person(&self) -> bool {
+        self.not_person
+    }
+
+    /// Whether the name designates another kind of token or digest
+    /// (`session_token`, `api_token`, `commit_sha`, `checksum`…).
+    #[must_use]
+    pub fn other_token(&self) -> bool {
+        self.other_token && !self.hints(ClassifierId::AwsKey)
     }
 
     /// Whether the name designates an AWS secret access key.
@@ -411,6 +884,75 @@ mod tests {
         }
         assert!(NameHints::of("aws_secret_access_key").aws_secret());
         assert!(NameHints::of("credentials.secretAccessKey").aws_secret());
+    }
+
+    #[test]
+    fn non_person_names() {
+        for n in [
+            "pet_name",
+            "petName",
+            "PetName",
+            "PET_NAME",
+            "petname",
+            "dog_name",
+            "ANIMAL_NAME",
+            "horseName",
+            "ship_name",
+            "boat_name",
+            "product_name",
+            "productName",
+            "brand_name",
+            "model_name",
+            "team_name",
+            "project_name",
+            "hostname",
+            "host_name",
+            "server_name",
+            "file_name",
+            "filename",
+            "city_name",
+            "place_name",
+            "company_name",
+            "companyName",
+            "pets[].name",
+            "company.name",
+            "nom_produit",
+            "nom_ville",
+        ] {
+            let h = NameHints::of(n);
+            assert!(h.not_person(), "{n}");
+            assert!(!h.hints(C::PersonName), "{n}");
+        }
+        for n in [
+            "first_name",
+            "pet_owner_name",
+            "company.contact_name",
+            "customer_name",
+            "name",
+            "cn",
+            "full_name",
+            "author_name",
+        ] {
+            assert!(!NameHints::of(n).not_person(), "{n}");
+        }
+        // Decomposed (NFD) and fullwidth names read like their composed form.
+        assert!(NameHints::of("pre\u{301}nom").hints(C::PersonName));
+        assert!(NameHints::of("\u{ff45}\u{ff4d}\u{ff41}\u{ff49}\u{ff4c}").hints(C::Email));
+    }
+
+    #[test]
+    fn hint_strengths() {
+        assert!(NameHints::of("name").person_name_weak());
+        assert!(!NameHints::of("first_name").person_name_weak());
+        assert!(NameHints::of("password_hash").password());
+        assert!(NameHints::of("hash").password());
+        assert!(!NameHints::of("file_hash").password());
+        assert!(!NameHints::of("checksum").password());
+        assert!(NameHints::of("order_number").not_card());
+        assert!(NameHints::of("imei").not_card());
+        assert!(!NameHints::of("card_number").not_card());
+        assert!(NameHints::of("session_token").other_token());
+        assert!(!NameHints::of("aws_secret_access_key").other_token());
     }
 
     #[test]

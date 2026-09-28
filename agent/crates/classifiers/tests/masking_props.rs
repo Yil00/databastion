@@ -16,6 +16,7 @@ use databastion_classifiers::masking::{
     ClassifierId, HmacKey, MAX_KEPT_RUN, RawSample, RawValue, mask_as, masked_sample_conforms,
 };
 use proptest::prelude::*;
+use unicode_normalization::UnicodeNormalization;
 
 fn luhn_digit(partial: &str) -> char {
     let mut sum = 0;
@@ -67,29 +68,45 @@ fn iban() -> impl Strategy<Value = String> {
     (
         prop_oneof![Just(("FR", 23)), Just(("DE", 18))],
         "[0-9]{23}",
+        prop_oneof![Just(""), Just(" "), Just("-"), Just(".")],
         any::<bool>(),
     )
-        .prop_map(|((country, len), digits, spaced)| {
+        .prop_map(|((country, len), digits, sep, lower)| {
             let bban = &digits[..len];
             let raw = format!("{country}{}{bban}", iban_check(country, bban));
-            if spaced {
-                raw.as_bytes()
-                    .chunks(4)
-                    .map(|c| std::str::from_utf8(c).unwrap())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else {
-                raw
-            }
+            let v = raw
+                .as_bytes()
+                .chunks(4)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+                .join(sep);
+            if lower { v.to_lowercase() } else { v }
         })
 }
 
 fn nir() -> impl Strategy<Value = String> {
-    ("[12]", "[0-9]{2}", 1u32..=12, "[0-9]{8}").prop_map(|(sex, year, month, rest)| {
-        let body = format!("{sex}{year}{month:02}{rest}");
-        let key = 97 - body.parse::<u64>().unwrap() % 97;
-        format!("{body}{key:02}")
-    })
+    (
+        "[12]",
+        "[0-9]{2}",
+        1u32..=12,
+        "[0-9]{8}",
+        prop_oneof![Just(""), Just(" "), Just("."), Just("-")],
+        prop_oneof![Just(""), Just(" "), Just(" / "), Just("-")],
+    )
+        .prop_map(|(sex, year, month, rest, sep, key_sep)| {
+            let body = format!("{sex}{year}{month:02}{rest}");
+            let key = 97 - body.parse::<u64>().unwrap() % 97;
+            let b = &body;
+            format!(
+                "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{key_sep}{key:02}",
+                &b[..1],
+                &b[1..3],
+                &b[3..5],
+                &b[5..7],
+                &b[7..10],
+                &b[10..13]
+            )
+        })
 }
 
 fn phone() -> impl Strategy<Value = String> {
@@ -109,25 +126,105 @@ fn phone() -> impl Strategy<Value = String> {
             }),
         ("[1-9][0-9]{0,2}", "[0-9]{3}", "[0-9]{3}", "[0-9]{4}")
             .prop_map(|(cc, a, b, c)| format!("+{cc} {a} {b} {c}")),
+        // Parentheses, slashes and a trunk `(0)`.
+        ("[2-9][0-9]{2}", "[2-9][0-9]{2}", "[0-9]{4}")
+            .prop_map(|(a, b, c)| format!("({a}) {b}-{c}")),
+        ("[0-9]{4}").prop_map(|c| format!("+44 (0)20 7946 {c}")),
+        ("[1-9]", "[0-9]{8}").prop_map(|(d, r)| format!(
+            "+33 (0){d} {} {} {} {}",
+            &r[..2],
+            &r[2..4],
+            &r[4..6],
+            &r[6..]
+        )),
+        ("[0-9]{7}").prop_map(|r| format!("030/{r}")),
+        ("[1-9][0-9]{0,2}", "[0-9]{8}").prop_map(|(cc, r)| format!("+({cc}) {r}")),
     ]
 }
 
 fn email() -> impl Strategy<Value = String> {
-    "[a-z0-9]{1,6}(\\.[a-z0-9]{1,6})?@[a-z]{1,8}\\.(com|org|fr|museum)"
+    prop_oneof![
+        "[a-z0-9]{1,6}(\\.[a-z0-9]{1,6})?@[a-z]{1,8}\\.(com|org|fr|museum)",
+        // Accented local parts, composed or decomposed (NFD).
+        (
+            "(josé|hélène|chloé|anaïs|jürgen)",
+            "[a-z]{1,6}",
+            any::<bool>()
+        )
+            .prop_map(|(a, b, decompose)| {
+                let v = format!("{a}.{b}@example.fr");
+                if decompose { v.nfd().collect() } else { v }
+            }),
+    ]
 }
 
+const MONTHS: &[&str] = &[
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+];
+const MONTHS_EN: &[&str] = &[
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
 fn birth_date() -> impl Strategy<Value = String> {
-    (1900u32..=2030, 1u32..=12, 1u32..=28, any::<bool>()).prop_map(|(y, m, d, iso)| {
-        if iso {
-            format!("{y}-{m:02}-{d:02}")
-        } else {
-            format!("{d:02}/{m:02}/{y}")
-        }
-    })
+    (
+        1900u32..=2030,
+        1u32..=12,
+        1u32..=28,
+        0u8..8,
+        0u32..24,
+        0u32..60,
+    )
+        .prop_map(|(y, m, d, fmt, h, min)| match fmt {
+            0 => format!("{y}-{m:02}-{d:02}"),
+            1 => format!("{d:02}/{m:02}/{y}"),
+            2 => format!("{d:02}.{m:02}.{y}"),
+            3 => format!("{y}{m:02}{d:02}"),
+            4 => format!("{d} {} {y}", MONTHS[m as usize - 1]),
+            // Textual month, decomposed (NFD).
+            5 => format!("{d} {} {y}", MONTHS[m as usize - 1])
+                .nfd()
+                .collect(),
+            6 => format!("{} {d}, {y}", MONTHS_EN[m as usize - 1]),
+            _ => format!("{y}-{m:02}-{d:02} {h:02}:{min:02}:00"),
+        })
 }
 
 fn person_name() -> impl Strategy<Value = String> {
-    proptest::collection::vec("[A-Z][a-z]{1,9}", 1..=3).prop_map(|w| w.join(" "))
+    prop_oneof![
+        proptest::collection::vec("[A-Z][a-z]{1,9}", 1..=3).prop_map(|w| w.join(" ")),
+        // Accented names, composed or decomposed (NFD).
+        (
+            "(Élodie|Chloé|Anaïs|Jérôme|Hélène)",
+            "(Lefèvre|Müller|Gómez|Béranger)",
+            any::<bool>()
+        )
+            .prop_map(|(f, l, decompose)| {
+                let v = format!("{f} {l}");
+                if decompose { v.nfd().collect() } else { v }
+            }),
+    ]
 }
 
 fn address() -> impl Strategy<Value = String> {
@@ -307,5 +404,48 @@ proptest! {
                 prop_assert!(masked_sample_conforms(m.as_str()));
             }
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Decomposed (NFD) values keep the masking guarantees.
+    #[test]
+    fn decomposed_values_are_masked_safely((c, raw) in classified()) {
+        let nfd: String = raw.nfd().collect();
+        let m = mask_as(c, &RawSample::new(&nfd));
+        prop_assert!(masked_sample_conforms(m.as_str()), "{c}: {}", m.as_str());
+        prop_assert!(digits(m.as_str()).len() <= MAX_KEPT_RUN);
+        prop_assert!(!m.as_str().contains(nfd.as_str()));
+    }
+
+    /// Fingerprints are defined on the composed form: every caller of
+    /// `HmacKey::fingerprint` agrees with the column path.
+    #[test]
+    fn fingerprints_ignore_the_normalization_form((c, raw) in classified(), k in any::<u8>()) {
+        let nfc: String = raw.nfc().collect();
+        let nfd: String = raw.nfd().collect();
+        let key = key(k);
+        prop_assert_eq!(
+            key.fingerprint(c, &RawSample::new(&nfc)),
+            key.fingerprint(c, &RawSample::new(&nfd))
+        );
+    }
+
+    /// A column stored decomposed gives the same findings, masked samples
+    /// and fingerprints as the same column composed.
+    #[test]
+    fn decomposed_columns_classify_like_composed_ones(
+        values in proptest::collection::vec(classified(), 1..12),
+        k in any::<u8>(),
+    ) {
+        let nfc: Vec<String> = values.iter().map(|(_, v)| v.nfc().collect()).collect();
+        let nfd: Vec<String> = values.iter().map(|(_, v)| v.nfd().collect()).collect();
+        let a: Vec<RawSample<'_>> = nfc.iter().map(|v| RawSample::new(v)).collect();
+        let b: Vec<RawSample<'_>> = nfd.iter().map(|v| RawSample::new(v)).collect();
+        let key = key(k);
+        let c = ColumnClassifier::new().with_key(&key);
+        prop_assert_eq!(c.classify("col_1", &a), c.classify("col_1", &b));
     }
 }

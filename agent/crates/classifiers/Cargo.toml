@@ -11,7 +11,11 @@ publish.workspace = true
 [dependencies]
 getrandom = { version = "0.4", default-features = false }
 hmac.workspace = true
-regex.workspace = true
+# `unicode-case` is required by the case-insensitive detector patterns
+# (`(?i)`); declared here so that the production build does not depend on a
+# dev-dependency enabling it through feature unification
+# (tests/regex_features.rs checks the resolved production features).
+regex = { workspace = true, features = ["unicode-case"] }
 sha2.workspace = true
 unicode-normalization.workspace = true
 zeroize = { version = "1", default-features = false, features = ["alloc"] }

@@ -461,6 +461,11 @@ pub async fn run(
     connectors: Vec<Box<dyn Connector>>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), AgentError> {
+    // Compile every classifier pattern before anything else: a pattern that
+    // does not compile (a build defect, e.g. a missing `regex` feature)
+    // stops the agent here with the pattern name, never silently disabling
+    // a detector during a scan.
+    databastion_classifiers::detect::check_patterns();
     let config = AgentConfig::load(config_path)?;
     let runtime = Runtime::new(config_path, config, connectors)?;
     runtime.run(shutdown).await

@@ -6,7 +6,9 @@
 //!
 //! - [`id`]: the frozen classifier ids and [`id::CLASSIFIERS_VERSION`];
 //! - [`column`]: column-level classification (name + bounded sample);
-//! - [`detect`], [`validate`], [`hints`]: detectors, checksums, name hints;
+//! - [`detect`], [`validate`], [`hints`]: detectors, checksums, name hints
+//!   (the detectors use an internal lexicon of given names, surnames, month
+//!   names and street types);
 //! - [`masking`]: masked samples, HMAC-SHA256 fingerprints, uplink types;
 //! - [`names`]: name normalization (ADR-0009).
 //!
@@ -18,6 +20,7 @@ pub mod column;
 pub mod detect;
 pub mod hints;
 pub mod id;
+mod lexicon;
 pub mod masking;
 pub mod names;
 pub mod validate;
