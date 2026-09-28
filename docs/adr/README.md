@@ -17,6 +17,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0011](0011-late-rotation-retry.md) | Late rotation retry with the previous secret (refines 0010) | Accepted |
 | [0012](0012-postgresql-agent-grants.md) | Grant set of the agent's PostgreSQL role (Discovery, Audit) | Accepted |
 | [0013](0013-frozen-error-codes.md) | Error codes are frozen within a protocol major version | Accepted |
-| [0014](0014-policy-and-incident-model.md) | Policy and incident model: per-source conditions, durable work markers, dedup and false-positive alignment | Accepted |
+| [0014](0014-policy-and-incident-model.md) | Policy and incident model: per-source conditions, durable work markers, dedup (resolved means remediated) and false-positive alignment | Accepted |
 
 Template: copy [template.md](template.md).
