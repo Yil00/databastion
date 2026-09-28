@@ -1,8 +1,43 @@
 # Agent API v1 (`/api/agent/v1/*`)
 
-Server side of the agent ↔ console protocol. **Nothing is implemented yet**: the
-catch-all route `[...path]/route.ts` answers `501 not_implemented` to every
-request and never reads the request body.
+Server side of the agent ↔ console protocol.
+
+| Route | Status | Handler |
+|-------|--------|---------|
+| `POST /enroll` | implemented (P1-A) | `src/server/agent-api/handlers.ts` `handleEnroll` |
+| `POST /heartbeat` | implemented (P1-A) | `handleHeartbeat` |
+| `GET /jobs?wait=` | implemented (P1-A), long-poll | `handlePollJobs` |
+| `POST /jobs/{job_id}/status` | implemented (P1-A) | `handleJobStatus` |
+| `POST /findings`, `POST /events`, `POST /rotate` | `501` (catch-all `[...path]/route.ts`, body never read) | later phases (P2-D, P3, rotation) |
+
+Route files are thin: the logic lives in `src/server/agent-api/` (pipeline, auth, long-poll hub)
+and `src/server/{agents,jobs,enrollment}.ts`.
+
+Request pipeline (every endpoint): required headers (`X-DataBastion-Protocol`, `User-Agent`;
+`426` with `min_protocol` below the console minimum) → agent authentication (except `/enroll`) →
+body read with a hard 4 MiB cap (`413`) → `validateSchema` → `checkSemantics` → handler. Errors use
+the contract `Error` body with a fixed message per code and never echo submitted values. Every
+response is `Cache-Control: no-store`. Outgoing bodies (`EnrollResponse`, `HeartbeatResponse`,
+`JobList`) are validated against the contract before being sent; each job is validated
+individually and a non-conforming job is marked `failed` and never served.
+
+Authentication: every attempt that needs an argon2id verification is counted before it runs
+(refunded on success), per (agent id, source IP) (10 / 5 min) and per source IP (50 / 5 min); the
+per-IP limit only applies when the IP is known (trusted proxy), and the per-agent key falls back to
+the agent id alone otherwise. At most 8 argon2id verifications of unrecognized secrets run at once per process (`503` +
+`Retry-After` beyond); secrets matching the last verified fingerprint use a separate reserved pool
+of 4, and logins have their own pool, so neither floods of wrong secrets nor login floods can block
+a legitimate agent. Verified secrets are cached 25 s, bound to the stored hash and purged on
+revocation; the agent row is read on every request, so a revocation from any console process is
+effective immediately. A 24 h "known good" fingerprint of the last verified secret only exempts it
+from the per-agent failure limit (an attacker cannot lock the agent out); it never authenticates.
+
+Long-poll: one `LISTEN` connection per process (`databastion_jobs`, `databastion_agent_revoked`),
+no database connection held while waiting. While the listener is up, a held poll re-reads only the
+agent's revocation state every 30 s and claims jobs on a job wake-up; when it is down, it claims
+every 5 s. Held-poll slots are reserved before any await, also for `wait=0`: at most 2 per agent
+(`429`) and 2000 per process (`503`). Revocation closes held polls with `401`. A job delivered 5 times without any
+status is marked `failed` (`timeout`).
 
 Rules for the endpoints to come (see [docs/09-agent-protocol.md](../../../../../../docs/09-agent-protocol.md)):
 
@@ -26,3 +61,5 @@ Rules for the endpoints to come (see [docs/09-agent-protocol.md](../../../../../
 - Agent secrets are stored hashed (argon2id).
 - Each endpoint is a sibling route (e.g. `heartbeat/route.ts`), which takes
   precedence over the catch-all placeholder.
+- Tests: `src/server/agent-api/agent-api.test.ts` runs every endpoint against the fixtures of
+  `shared/protocol/fixtures/` on a throwaway PostgreSQL cluster.

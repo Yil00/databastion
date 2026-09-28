@@ -3,22 +3,21 @@
  * web process, different command. Runs background jobs through pg-boss on the
  * console's internal PostgreSQL (no Redis).
  */
+import { Pool } from "pg";
 import { PgBoss } from "pg-boss";
 
 import { getDatabaseUrl } from "@/config/env";
 import { errorSummary, logger } from "@/lib/logger";
+import { runtimeRoleWarnings } from "@/server/db-role-check";
 
-import { createNoopHandler, NOOP_QUEUE, type NoopPayload } from "./queues";
+import { createNoopHandler, NOOP_QUEUE, pgBossOptions, type NoopPayload } from "./queues";
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 const log = logger.child({ process: "worker" });
 
 async function main(): Promise<void> {
-  const boss = new PgBoss({
-    connectionString: getDatabaseUrl(),
-    application_name: "databastion-worker",
-  });
+  const boss = new PgBoss(pgBossOptions(getDatabaseUrl()));
 
   boss.on("error", (err: unknown) => {
     log.error({ error: errorSummary(err) }, "pg-boss error");
@@ -42,6 +41,14 @@ async function main(): Promise<void> {
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
+
+  try {
+    const pool = new Pool({ connectionString: getDatabaseUrl(), max: 1 });
+    for (const warning of await runtimeRoleWarnings(pool)) log.warn(warning);
+    await pool.end();
+  } catch (err) {
+    log.warn({ error: errorSummary(err) }, "database role check skipped");
+  }
 
   await boss.start();
   await boss.createQueue(NOOP_QUEUE);

@@ -7,6 +7,23 @@
 name: databastion
 
 services:
+  # One-shot: applies the console migrations as the database OWNER role, then exits.
+  migrate:
+    image: ghcr.io/yil00/databastion-console:latest
+    command: ["migrate"]         # pnpm db:migrate
+    restart: "no"
+    environment:
+      DATABASE_MIGRATION_URL_FILE: /run/secrets/db_owner_url
+    secrets: [db_owner_url]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db:
+        condition: service_healthy
+
   console:
     image: ghcr.io/yil00/databastion-console:latest
     command: ["web"]
@@ -17,6 +34,10 @@ services:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       DATABASTION_PUBLIC_URL: https://databastion.example.com
+      # The console runs behind ONE HTTPS reverse proxy that sets / overwrites X-Forwarded-For.
+      # Remove this line if nothing in front of the console does (clients could spoof their IP).
+      # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
+      DATABASTION_TRUST_PROXY: "1"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key]
     user: "10001:10001"
@@ -25,8 +46,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     image: ghcr.io/yil00/databastion-console:latest
@@ -43,31 +64,40 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   db:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: databastion
+      # Bootstrap superuser: used only by the initdb script below, never by the console.
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: databastion
-    secrets: [db_password]
+    secrets: [db_password, db_owner_password, db_app_password]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates the owner and runtime roles at first initialization (see the script).
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     # No "ports:": the internal database is never exposed.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U databastion -d databastion"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d databastion"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 secrets:
   db_password:
-    file: ./secrets/db_password
+    file: ./secrets/db_password       # bootstrap superuser (POSTGRES_USER), initdb only
+  db_owner_password:
+    file: ./secrets/db_owner_password # databastion_owner (NOSUPERUSER), used only by `migrate`
+  db_owner_url:
+    file: ./secrets/db_owner_url      # postgresql://databastion_owner:<db_owner_password>@db:5432/databastion
+  db_app_password:
+    file: ./secrets/db_app_password   # runtime role databastion_runtime (web + worker)
   db_url:
-    file: ./secrets/db_url            # postgresql://databastion:<password>@db:5432/databastion
+    file: ./secrets/db_url            # postgresql://databastion_runtime:<db_app_password>@db:5432/databastion
   encryption_key:
     file: ./secrets/encryption_key    # openssl rand -base64 32
 
