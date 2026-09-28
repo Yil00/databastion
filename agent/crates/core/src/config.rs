@@ -370,6 +370,12 @@ pub struct MysqlTargetConfig {
     /// When set, it is the only trusted root; otherwise the system store.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// Extended grant variant (`SELECT ON *.*`, opt-in): `check()` then
+    /// reports the global `SELECT` as an expected warning instead of
+    /// over-privilege. The connector never reads the system schemas either
+    /// way.
+    #[serde(default)]
+    pub extended_grants: bool,
 }
 
 /// TLS mode of a MySQL / MariaDB target.
@@ -908,7 +914,10 @@ impl TargetConfig {
     fn validate_mysql(&self, my: &MysqlTargetConfig, i: usize) -> Result<(), ConfigError> {
         let f = |name: &str| format!("targets[{i}].mysql.{name}");
         if !matches!(self.engine, TargetEngine::Mysql | TargetEngine::Mariadb) {
-            return Err(invalid(f("tls"), "only for engine mysql or mariadb"));
+            return Err(invalid(
+                format!("targets[{i}].mysql"),
+                "only for engine mysql or mariadb",
+            ));
         }
         if my.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
             return Err(invalid(f("ca_file"), "must be an absolute path"));
@@ -1278,7 +1287,11 @@ targets:
         ))
         .unwrap();
         assert!(cfg.targets[0].mysql_settings().ca_file.is_some());
-        let cfg = parse(&with("    mysql: {tls: disable_insecure}\n")).unwrap();
+        let cfg = parse(&with(
+            "    mysql: {tls: disable_insecure, extended_grants: true}\n",
+        ))
+        .unwrap();
+        assert!(cfg.targets[0].mysql_settings().extended_grants);
         assert_eq!(
             cfg.targets[0].mysql_settings().tls,
             MysqlTlsMode::DisableInsecure
@@ -1326,7 +1339,11 @@ targets:
             "    port: 5432\n",
             "    port: 5432\n    mysql: {tls: verify_full}\n",
         );
-        assert!(err(&pg).contains("targets[0].mysql"), "{}", err(&pg));
+        let message = err(&pg);
+        assert!(
+            message.contains("targets[0].mysql") && !message.contains("mysql.tls"),
+            "{message}"
+        );
     }
 
     #[test]
