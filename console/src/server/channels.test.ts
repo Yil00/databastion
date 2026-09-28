@@ -25,6 +25,8 @@ describe("notification channel validation", () => {
     [{ host: "bad host" }, "config.host"],
     [{ port: 0 }, "config.port"],
     [{ port: 70000 }, "config.port"],
+    [{ port: 22 }, "config.port"],
+    [{ port: 6379 }, "config.port"],
     [{ tls: "ssl" }, "config.tls"],
     [{ from: "not an address" }, "config.from"],
     [{ from: "a@b.com\r\nBcc: x@y.com" }, "config.from"],
@@ -43,6 +45,11 @@ describe("notification channel validation", () => {
     expect(parseChannelCreate(plain("localhost"), false).ok).toBe(true);
     expect(parseChannelCreate(plain("127.0.0.1"), false).ok).toBe(true);
     expect(parseChannelCreate(plain("smtp.example.com"), true).ok).toBe(true);
+  });
+
+  it("L3: SMTP ports 25, 465, 587, 2525; any port with the dev flag", () => {
+    for (const port of [25, 465, 587, 2525]) expect(parseChannelCreate({ ...EMAIL, config: { ...EMAIL.config, port } }, false).ok).toBe(true);
+    expect(parseChannelCreate({ ...EMAIL, config: { ...EMAIL.config, port: 1025 } }, true).ok).toBe(true);
   });
 
   it("a password needs a user and has no line break", () => {

@@ -2,7 +2,7 @@ import net from "node:net";
 import { hostname as osHostname } from "node:os";
 import tls from "node:tls";
 
-import type { EmailConfig } from "@/lib/notification-model";
+import { SMTP_PORTS, type EmailConfig } from "@/lib/notification-model";
 
 import { classifyAddress, resolveOutbound, type Resolver } from "../net-guard";
 import type { SendResult } from "./types";
@@ -49,6 +49,8 @@ export interface SmtpOptions {
   resolver?: Resolver;
   /** Extra trusted CA (tests only). */
   ca?: string | Buffer;
+  /** Any port (tests only: the in-process servers listen on random ports). */
+  allowAnyPort?: boolean;
   connectTimeoutMs?: number;
   replyTimeoutMs?: number;
   totalTimeoutMs?: number;
@@ -291,6 +293,8 @@ function upgrade(socket: net.Socket, config: EmailConfig, opts: SmtpOptions): Pr
 const isLoopbackAddress = (ip: string) => /^127\./.test(ip) || ip === "::1" || /^::ffff:127\./i.test(ip);
 
 export async function sendMail(config: EmailConfig, password: string | null, msg: MailMessage, opts: SmtpOptions): Promise<SendResult> {
+  // L3 (also checked on input): submission / relay ports only, unless the dev flag.
+  if (!opts.allowInsecure && !opts.allowAnyPort && !(SMTP_PORTS as readonly number[]).includes(config.port)) return { ok: false, code: "port_refused", retryable: false };
   const resolved = await resolveOutbound(config.host, { allowInternal: true, resolver: opts.resolver });
   if (!resolved.ok) return { ok: false, code: resolved.code, retryable: resolved.retryable };
   if (classifyAddress(resolved.address) === "forbidden") return { ok: false, code: "address_forbidden", retryable: false };

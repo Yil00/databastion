@@ -723,12 +723,37 @@ export function handleRotateChannelSecret(req: Request, id: string): Promise<Res
   });
 }
 
-/** Queues a test notification on a channel (admin, CSRF, audited): `202`. */
+/**
+ * L3: test sends are bounded per administrator and per channel (a test is an outbound connection
+ * chosen by the caller: no scanning through it). In memory, per web process.
+ */
+export const channelTestsPerUser = new RateLimiter(10, 10 * 60_000);
+export const channelTestsPerChannel = new RateLimiter(3, 10 * 60_000);
+
+/** Queues a test notification on a channel (admin, CSRF, audited): `202`; `429` over the limits. */
 export function handleTestChannel(req: Request, id: string): Promise<Response> {
   return guardedUser("notification_channel.test", async () => {
     const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.test" });
     if (!g.ok) return g.response;
     if (!UUID.test(id)) return error(404, "not_found");
+    const byUser = channelTestsPerUser.check(g.session.user.id);
+    const byChannel = channelTestsPerChannel.check(id);
+    if (byUser.limited || byChannel.limited) {
+      await writeAudit(getDb(), {
+        actorType: "user",
+        actorId: g.session.user.id,
+        action: "notification_channel.test",
+        outcome: "failure",
+        targetType: "notification_channel",
+        targetId: id,
+        sourceIp: g.ip,
+        details: { reason: "rate_limited" },
+      });
+      const retry = Math.max(byUser.limited ? byUser.retryAfterS : 1, byChannel.limited ? byChannel.retryAfterS : 1);
+      return error(429, "rate_limited", { "Retry-After": String(retry) });
+    }
+    channelTestsPerUser.hit(g.session.user.id);
+    channelTestsPerChannel.hit(id);
     const ok = await enqueueTestNotification(getDb(), id, { userId: g.session.user.id, ip: g.ip });
     if (!ok) return error(404, "not_found");
     void requestNotificationDelivery();

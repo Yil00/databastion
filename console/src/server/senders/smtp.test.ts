@@ -202,7 +202,7 @@ describe("SMTP sender against an in-process server", () => {
   afterAll(() => plain.stop());
 
   it("delivers in plain text to a loopback relay", async () => {
-    expect(await sendMail(config(port), null, MSG, { allowInsecure: false })).toEqual({ ok: true });
+    expect(await sendMail(config(port), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: true });
     const mail = plain.mails.at(-1);
     expect(mail?.from).toBe("<dlp@example.com>");
     expect(mail?.rcpts).toEqual(["<soc@example.com>", "<ciso@example.com>"]);
@@ -212,7 +212,7 @@ describe("SMTP sender against an in-process server", () => {
   it("refuses plain text towards a non-loopback address without the dev flag (no connection)", async () => {
     const resolver = async () => [{ address: "10.0.0.25", family: 4 }];
     const n = plain.commands.length;
-    expect(await sendMail(config(port, { host: "relay.example" }), null, MSG, { allowInsecure: false, resolver })).toEqual({
+    expect(await sendMail(config(port, { host: "relay.example" }), null, MSG, { allowInsecure: false, allowAnyPort: true, resolver })).toEqual({
       ok: false,
       code: "insecure_refused",
       retryable: false,
@@ -224,8 +224,14 @@ describe("SMTP sender against an in-process server", () => {
     expect(plain.commands.length).toBe(n);
   });
 
+  it("L3: only the SMTP ports 25, 465, 587 and 2525 without the dev flag", async () => {
+    const n = plain.commands.length;
+    expect(await sendMail(config(port), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "port_refused", retryable: false });
+    expect(plain.commands.length).toBe(n);
+  });
+
   it("STARTTLS is required when configured: no silent downgrade", async () => {
-    expect(await sendMail(config(port, { tls: "starttls" }), null, MSG, { allowInsecure: false })).toEqual({
+    expect(await sendMail(config(port, { tls: "starttls" }), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({
       ok: false,
       code: "starttls_unavailable",
       retryable: false,
@@ -237,8 +243,8 @@ describe("SMTP sender against an in-process server", () => {
     const busy = new FakeSmtp({ rcptReply: "451 try later" });
     const [p1, p2] = [await reject.start(), await busy.start()];
     try {
-      expect(await sendMail(config(p1), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_550", retryable: false });
-      expect(await sendMail(config(p2), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_451", retryable: true });
+      expect(await sendMail(config(p1), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: false, code: "smtp_550", retryable: false });
+      expect(await sendMail(config(p2), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: false, code: "smtp_451", retryable: true });
     } finally {
       await reject.stop();
       await busy.stop();
@@ -250,8 +256,8 @@ describe("SMTP sender against an in-process server", () => {
     const big = new FakeSmtp({ ehloExtra: Array.from({ length: 90 }, () => "Y".repeat(1000)) });
     const [p1, p2] = [await many.start(), await big.start()];
     try {
-      expect(await sendMail(config(p1), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
-      expect(await sendMail(config(p2), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(config(p1), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(config(p2), null, MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
       expect(many.mails).toHaveLength(0);
     } finally {
       await many.stop();
@@ -263,7 +269,7 @@ describe("SMTP sender against an in-process server", () => {
     const mute = new FakeSmtp({ silent: true });
     const p = await mute.start();
     try {
-      expect(await sendMail(config(p), null, MSG, { allowInsecure: false, replyTimeoutMs: 200 })).toEqual({ ok: false, code: "timeout", retryable: true });
+      expect(await sendMail(config(p), null, MSG, { allowInsecure: false, allowAnyPort: true, replyTimeoutMs: 200 })).toEqual({ ok: false, code: "timeout", retryable: true });
     } finally {
       await mute.stop();
     }
@@ -292,13 +298,13 @@ describe.skipIf(!cert)("SMTP sender over TLS", () => {
 
   it("upgrades with STARTTLS, verifies the certificate, then authenticates", async () => {
     const cfg = config(p1, { host: "localhost", tls: "starttls", username: "dlp" });
-    expect(await sendMail(cfg, "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: true });
+    expect(await sendMail(cfg, "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: true });
     expect(starttls.mails.at(-1)).toMatchObject({ tls: true, auth: "dlp" });
     // The credentials never appear in clear on the wire before TLS (the server saw them inside TLS).
     expect(starttls.commands.filter((c) => c.includes("s3cret"))).toEqual([]);
-    expect(await sendMail(cfg, "wrong", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_535", retryable: false });
+    expect(await sendMail(cfg, "wrong", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_535", retryable: false });
     // Untrusted certificate: refused.
-    expect(await sendMail(cfg, "s3cret pass", MSG, { allowInsecure: false })).toEqual({ ok: false, code: "tls_failed", retryable: true });
+    expect(await sendMail(cfg, "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true })).toEqual({ ok: false, code: "tls_failed", retryable: true });
   });
 
   it("L1: bytes pipelined in clear after the STARTTLS 220 abort the session", async () => {
@@ -307,8 +313,8 @@ describe.skipIf(!cert)("SMTP sender over TLS", () => {
     const [a, b] = [await injecting.start(), await full.start()];
     try {
       const cfg = (p: number) => config(p, { host: "localhost", tls: "starttls", username: "dlp" });
-      expect(await sendMail(cfg(a), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
-      expect(await sendMail(cfg(b), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(cfg(a), "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(cfg(b), "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
       expect(injecting.mails).toHaveLength(0);
       expect(full.mails).toHaveLength(0);
     } finally {
@@ -322,26 +328,26 @@ describe.skipIf(!cert)("SMTP sender over TLS", () => {
     const other = new FakeSmtp({ cert, host: "127.0.0.2" });
     const p = await other.start();
     try {
-      expect(await sendMail(config(p, { host: "127.0.0.2", tls: "starttls" }), null, MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({
+      expect(await sendMail(config(p, { host: "127.0.0.2", tls: "starttls" }), null, MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({
         ok: false,
         code: "tls_failed",
         retryable: true,
       });
       const resolver = async () => [{ address: "127.0.0.1", family: 4 }];
-      expect(await sendMail(config(p1, { host: "mail.example.test", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert, resolver })).toEqual({
+      expect(await sendMail(config(p1, { host: "mail.example.test", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert, resolver })).toEqual({
         ok: false,
         code: "tls_failed",
         retryable: true,
       });
       // An IP literal covered by the certificate verifies against the IP.
-      expect(await sendMail(config(p1, { host: "127.0.0.1", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: true });
+      expect(await sendMail(config(p1, { host: "127.0.0.1", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: true });
     } finally {
       await other.stop();
     }
   });
 
   it("implicit TLS", async () => {
-    expect(await sendMail(config(p2, { host: "localhost", tls: "implicit" }), null, MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: true });
+    expect(await sendMail(config(p2, { host: "localhost", tls: "implicit" }), null, MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: true });
     expect(implicit.mails.at(-1)?.tls).toBe(true);
   });
 });

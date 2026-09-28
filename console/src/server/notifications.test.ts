@@ -35,6 +35,8 @@ import {
   handleRotateChannelSecret,
   handleTestChannel,
   handleUpdateChannel,
+  channelTestsPerChannel,
+  channelTestsPerUser,
   loginFailuresPerIp,
   loginFailuresPerUser,
   loginFailuresPerUserGlobal,
@@ -181,6 +183,8 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
     loginFailuresPerUserGlobal.clear();
     loginFailuresUnknownUser.clear();
     failuresPerAgent.clear();
+    channelTestsPerUser.clear();
+    channelTestsPerChannel.clear();
     process.env.DATABASTION_ALERTING_INSECURE_DEV = "1";
     process.env.DATABASTION_PUBLIC_URL = ORIGIN;
     await getDb().delete(policies);
@@ -498,6 +502,27 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
       expect(await drainDeliveries(getDb(), { senders: rec.senders })).toMatchObject({ delivered: 1 });
       expect(rec.calls.at(-1)?.body).toMatch(/Test notification/);
       expect((await getDb().select().from(auditLog).where(eq(auditLog.action, "notification_channel.test"))).length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("L3: channel tests are rate limited per channel and per admin; connection errors are merged", async () => {
+      const ids = [await emailChannel("m1"), await emailChannel("m2"), await emailChannel("m3"), await emailChannel("m4")];
+      const test = (id: string) => handleTestChannel(userReq("POST", `/api/notification-channels/${id}/test`, { who: admin }), id);
+      const first = ids[0] as string;
+      for (let i = 0; i < 3; i++) expect((await test(first)).status).toBe(202);
+      const limited = await test(first);
+      expect(limited.status).toBe(429);
+      expect(Number(limited.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
+      for (const id of ids.slice(1)) for (let i = 0; i < 3; i++) await test(id);
+      // 3 + 3 x 3 = 12 > 10 per admin: the last ones are refused.
+      expect(channelTestsPerUser.count((await getDb().select().from(users).where(eq(users.username, "admin")))[0]?.id ?? "")).toBe(10);
+      const refusals = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "notification_channel.test"), eq(auditLog.outcome, "failure")));
+      expect(refusals.length).toBeGreaterThanOrEqual(3);
+      // Refused and filtered connections look the same on a test delivery.
+      const timeouts = fakeSenders(() => ({ ok: false, code: "connect_timeout", retryable: true }));
+      await drainDeliveries(getDb(), { senders: timeouts.senders });
+      const tests = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.event, "channel.test"));
+      expect(tests.length).toBeGreaterThan(0);
+      expect(tests.filter((t) => t.status === "pending").every((t) => t.lastError === "connect_failed")).toBe(true);
     });
 
     it("a secret sealed under another server key is unusable: secret_unavailable (retried)", async () => {

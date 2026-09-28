@@ -231,7 +231,15 @@ async function claim(db: Database): Promise<ClaimedRow[]> {
   return res.rows;
 }
 
-async function record(db: Database, row: ClaimedRow, result: SendResult): Promise<"delivered" | "retry" | "failed" | "skipped"> {
+/**
+ * L3: a test send reaches a destination chosen by an administrator; "refused" and "filtered" are
+ * reported alike, so tests cannot map which ports of a host answer.
+ */
+const CONNECT_CODES = new Set(["connect_failed", "connect_timeout"]);
+
+async function record(db: Database, row: ClaimedRow, raw: SendResult): Promise<"delivered" | "retry" | "failed" | "skipped"> {
+  const result: SendResult =
+    !raw.ok && row.event === "channel.test" && CONNECT_CODES.has(raw.code) ? { ...raw, code: "connect_failed" } : raw;
   let status: DeliveryStatus;
   let outcome: "delivered" | "retry" | "failed" | "skipped";
   if (result.ok) {

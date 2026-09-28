@@ -10,6 +10,7 @@ import {
   MAX_PASSWORD_LENGTH,
   MAX_RECIPIENTS,
   MAX_URL_LENGTH,
+  SMTP_PORTS,
   TLS_MODES,
   type ChannelType,
   type ChannelView,
@@ -80,6 +81,8 @@ function parseEmailConfig(v: unknown, insecureDev: boolean): Parsed<EmailInput> 
   const host = parseHost(v.host);
   if (host === null) return fail("config.host");
   if (typeof v.port !== "number" || !Number.isInteger(v.port) || v.port < 1 || v.port > 65535) return fail("config.port");
+  // L3: submission / relay ports only (no probing of other services), unless the dev flag.
+  if (!insecureDev && !(SMTP_PORTS as readonly number[]).includes(v.port)) return fail("config.port");
   if (typeof v.tls !== "string" || !(TLS_MODES as readonly string[]).includes(v.tls)) return fail("config.tls");
   const tls = v.tls as TlsMode;
   // Plain text only towards a loopback relay, or with the explicit development flag.

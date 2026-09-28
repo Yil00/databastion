@@ -15,6 +15,8 @@ export const TLS_MODES = ["starttls", "implicit", "none"] as const;
 export type TlsMode = (typeof TLS_MODES)[number];
 
 export const MAX_RECIPIENTS = 20;
+/** SMTP ports accepted without the dev flag: relay (25), implicit TLS (465), submission (587, 2525). */
+export const SMTP_PORTS = [25, 465, 587, 2525] as const;
 export const MAX_URL_LENGTH = 2048;
 export const MAX_PASSWORD_LENGTH = 1024;
 
@@ -74,6 +76,7 @@ export const DELIVERY_ERROR_TEXT: Record<string, string> = {
   channel_deleted: "the channel was deleted",
   secret_unavailable: "the channel secret cannot be decrypted (server key missing or changed)",
   insecure_refused: "plain-text transport refused (not a loopback host, no dev flag)",
+  port_refused: "SMTP port refused (25, 465, 587 or 2525 only, no dev flag)",
   dns_failed: "name resolution failed",
   address_forbidden: "destination address refused (link-local, metadata, multicast or reserved)",
   address_internal: "destination address refused (private or loopback)",
@@ -109,7 +112,7 @@ export const CHANNEL_FIELD_ERRORS: Record<string, string> = {
   system_alerts: "System alerts: true or false.",
   config: "Invalid settings.",
   "config.host": "SMTP host: a host name or IP address (link-local and metadata addresses are refused).",
-  "config.port": "SMTP port: 1 to 65535.",
+  "config.port": "SMTP port: 25, 465, 587 or 2525.",
   "config.tls": "TLS: starttls or implicit; none only towards a loopback host (or with the dev flag).",
   "config.from": "Sender: one e-mail address.",
   "config.recipients": `Recipients: 1 to ${MAX_RECIPIENTS} distinct e-mail addresses.`,
