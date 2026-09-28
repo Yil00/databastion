@@ -35,7 +35,7 @@ export const scanDeadlineSql = sql`${jobs.deliveredAt} + make_interval(secs => c
 /**
  * Expiry sweep of the agent's scan jobs, run before the "one open scan per target" check (L2):
  * pending scans past `expires_at` become `expired`; delivered / running scans past their deadline
- * become `failed` (`timeout`), each audited as a system action. Returns the timed-out job ids.
+ * become `failed` (`timeout`, `finished_at` = that deadline), each audited as a system action. Returns the timed-out job ids.
  */
 export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]> {
   await tx.execute(sql`
@@ -44,7 +44,8 @@ export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]>
       and expires_at is not null and expires_at <= now()`);
   const dead = await tx
     .update(jobs)
-    .set({ status: "failed", error: { code: "timeout" }, finishedAt: sql`now()`, leaseUntil: null })
+    // finished_at = the deadline, not now(): the late-batch window of findings.ts starts there.
+    .set({ status: "failed", error: { code: "timeout" }, finishedAt: scanDeadlineSql, leaseUntil: null })
     .where(
       and(
         eq(jobs.agentId, agentId),

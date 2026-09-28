@@ -60,8 +60,12 @@ agent (advisory lock):
    `202 duplicate: true` (not processed again), other content `409 batch_conflict`;
 2. `job_id` must be a `discovery.scan` job of the agent that was delivered (`delivered`, `running`,
    `succeeded` or `failed`: batches may overtake the `running` status or arrive after the final one)
-   and is still open: `succeeded` / `failed` for 24 h after `finished_at` (`LATE_BATCH_RETENTION_MS`,
-   the spool-retention bound), `delivered` / `running` until `delivered_at + max_duration_s + 1 h`;
+   and is still open: `succeeded` / `failed` for 24 h after
+   `least(finished_at, delivered_at + max_duration_s + 1 h)` (`LATE_BATCH_RETENTION_MS`, the
+   spool-retention bound; the scan's own deadline caps it, so a final status sent long after the
+   deadline does not reopen the window, and a null `finished_at` or `delivered_at` closes it),
+   `delivered` / `running` until `delivered_at + max_duration_s + 1 h` (a dead scan swept to
+   `failed` gets that deadline as its `finished_at`);
    otherwise `404` with pointer `/job_id` (keyword `notFound`);
 3. every `target_id` reported by the agent in a heartbeat: otherwise `404`, pointers
    `/findings/<i>/target_id` (keyword `notFound`);
@@ -78,7 +82,9 @@ agent (advisory lock):
    value at marking time or `classifiers_version` changes (audited).
 
 Stored batches are limited to 60 per agent per minute (`429` + `Retry-After`, per web process);
-duplicates and rejected batches do not count.
+duplicates and rejected batches do not count. A second, looser limit counts every authenticated
+`/findings` request of an agent, whatever its outcome (malformed, rejected, not found, duplicate,
+stored): 300 per minute, checked before the body is read (`429` + `Retry-After`).
 
 Any `400` on `/findings`, a `batch_conflict` and a foreign `target_id` write an agent-integrity
 event (`security_events` + audit log). `413` (over 4 MiB) and a `404` on `job_id` do not.

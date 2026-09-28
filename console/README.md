@@ -158,7 +158,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
-| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`) |
+| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline) |
 | `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor) |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
@@ -169,7 +169,9 @@ browser): `/login`, `/agents` (name, hostname, version, status online / silent (
 classifier, then one row per location with its masked samples decrypted server side; filters
 `?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
 row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
-(most recently seen first within each), so one noisy agent or target cannot hide the others. The agent detail page shows the last scan of each target, a link to its findings and (admin)
+(most recently seen first within each), so one noisy agent or target cannot hide the others; the
+counts show at most 1000 (target, classifier) groups, fetched round-robin over agents then over
+the targets of each agent. The agent detail page shows the last scan of each target, a link to its findings and (admin)
 a "Scan" dialog. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
 (new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the

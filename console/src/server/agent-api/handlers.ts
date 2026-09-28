@@ -301,6 +301,12 @@ async function errorDetails(res: Response): Promise<{ pointer: string; keyword: 
  * (duplicate, rejected), so only stored batches consume it; beyond: `429` + `Retry-After`.
  */
 export const findingsPerAgent = new RateLimiter(60, 60_000);
+/**
+ * Every authenticated `POST /findings` request of an agent, whatever its outcome (malformed,
+ * rejected, not found, duplicate, stored): 300 per minute, beyond `429` + `Retry-After`. Looser
+ * than {@link findingsPerAgent}; bounds the validation and database work of rejected batches.
+ */
+export const findingsRequestsPerAgent = new RateLimiter(300, 60_000);
 
 /**
  * `POST /findings` (P2-D). Pipeline: headers, authentication, body (4 MiB cap: `413`),
@@ -314,6 +320,10 @@ export function handleFindings(req: Request): Promise<Response> {
     const auth = await preamble(req);
     if (!auth.ok) return auth.response;
     const agentId = auth.agent.id;
+    // Counted before the body is read, never refunded.
+    if (!findingsRequestsPerAgent.reserve(agentId)) {
+      return rateLimited(findingsRequestsPerAgent.check(agentId).retryAfterS);
+    }
     const ip = clientIp(req);
     const integrity = (kind: "batch_rejected" | "batch_conflict" | "foreign_target", status: number, details?: ValidationDetail[]) =>
       recordIntegrityEvent(getDb(), { agentId, kind, endpoint: "findings", status, details, ip });

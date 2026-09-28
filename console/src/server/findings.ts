@@ -32,8 +32,10 @@ export const FINDINGS_JOB_STATUSES = ["delivered", "running", "succeeded", "fail
 
 /**
  * Late batches (M1). A finished (`succeeded` / `failed`) scan accepts findings for this long after
- * `finished_at`: the bound on how long an agent's spool may hold a batch of a finished scan (e.g.
- * console outage, network partition). A `delivered` / `running` scan accepts them until
+ * `least(finished_at, delivered_at + max_duration_s + SCAN_GRACE_MS)`: the bound on how long an
+ * agent's spool may hold a batch of a finished scan (e.g. console outage, network partition). The
+ * scan's own deadline caps it, so a final status sent long after the deadline does not reopen the
+ * window; a null `finished_at` or `delivered_at` closes it (fail closed). A `delivered` / `running` scan accepts them until
  * `delivered_at + max_duration_s + SCAN_GRACE_MS` (see `scans.ts`). Later batches get `404` on
  * `/job_id` (the agent drops them), so an agent cannot write into old jobs forever.
  */
@@ -168,7 +170,10 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
         params: jobs.params,
         open: sql<boolean>`case
           when ${jobs.status} in ('succeeded', 'failed')
-            then coalesce(${jobs.finishedAt}, now()) >= now() - make_interval(secs => ${LATE_BATCH_RETENTION_MS / 1000})
+            then least(
+                coalesce(${jobs.finishedAt}, '-infinity'::timestamptz),
+                coalesce(${scanDeadlineSql}, '-infinity'::timestamptz)
+              ) >= now() - make_interval(secs => ${LATE_BATCH_RETENTION_MS / 1000})
           when ${jobs.status} in ('delivered', 'running')
             then ${jobs.deliveredAt} is not null and ${scanDeadlineSql} >= now()
           else false end`,
@@ -451,23 +456,54 @@ export interface FindingSummaryRow {
   maxConfidence: number;
 }
 
-/** Counts per target and classifier (false positives excluded unless asked). */
+export const MAX_SUMMARY_GROUPS = 1000;
+
+/**
+ * Counts per target and classifier (false positives excluded unless asked). At most
+ * `MAX_SUMMARY_GROUPS` groups, fetched round-robin like {@link listFindings}: over agents, then over
+ * the targets of each agent (most recently seen first within each target), so one noisy agent or
+ * target cannot push the others out. Returned in a stable reading order.
+ */
 export async function summarizeFindings(db: Database, filter: FindingFilter = {}): Promise<FindingSummaryRow[]> {
-  return db
+  const grouped = db
     .select({
-      agentId: findings.agentId,
-      agentName: agents.name,
-      targetId: findings.targetId,
-      classifier: findings.classifier,
-      findings: sql<number>`count(*)::int`,
-      maxConfidence: sql<number>`max(${findings.confidence})`,
+      agentId: sql<string>`${findings.agentId}`.as("agent_id"),
+      agentName: sql<string>`${agents.name}`.as("agent_name"),
+      targetId: sql<string>`${findings.targetId}`.as("target_id"),
+      classifier: sql<string>`${findings.classifier}`.as("classifier"),
+      findings: sql<number>`count(*)::int`.as("findings"),
+      maxConfidence: sql<number>`max(${findings.confidence})`.as("max_confidence"),
+      // Rank of the group within its (agent, target).
+      targetRank: sql<number>`row_number() over (partition by ${findings.agentId}, ${findings.targetId}
+        order by max(${findings.lastSeenAt}) desc, ${findings.classifier})`.as("target_rank"),
     })
     .from(findings)
     .innerJoin(agents, eq(agents.id, findings.agentId))
     .where(filterWhere(filter))
     .groupBy(findings.agentId, agents.name, findings.targetId, findings.classifier)
-    .orderBy(asc(agents.name), asc(findings.targetId), asc(findings.classifier))
-    .limit(1000);
+    .as("grouped");
+  const rows = await db
+    .select({
+      agentId: grouped.agentId,
+      agentName: grouped.agentName,
+      targetId: grouped.targetId,
+      classifier: grouped.classifier,
+      findings: grouped.findings,
+      maxConfidence: grouped.maxConfidence,
+    })
+    .from(grouped)
+    .orderBy(
+      sql`row_number() over (partition by ${grouped.agentId} order by ${grouped.targetRank}, ${grouped.targetId})`,
+      asc(grouped.agentName),
+      asc(grouped.agentId),
+      asc(grouped.targetId),
+      asc(grouped.classifier),
+    )
+    .limit(MAX_SUMMARY_GROUPS);
+  rows.sort(
+    (a, b) => cmp(a.agentName, b.agentName) || cmp(a.agentId, b.agentId) || cmp(a.targetId, b.targetId) || cmp(a.classifier, b.classifier),
+  );
+  return rows;
 }
 
 // -------------------------------------------------------------------- false positives
