@@ -64,6 +64,20 @@
       "when": 1790613977736,
       "tag": "0008_agent_known_good_pending",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790615605991,
+      "tag": "0009_pgboss_owner_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790615607485,
+      "tag": "0010_security_events_no_delete",
+      "breakpoints": true
     }
   ]
 }

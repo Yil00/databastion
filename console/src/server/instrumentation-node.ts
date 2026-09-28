@@ -3,9 +3,10 @@
  * dedicated /metrics listener of the web process.
  */
 export async function registerNode(): Promise<void> {
-  const { startupWarnings } = await import("@/server/startup-checks");
+  const { startupErrors, startupWarnings } = await import("@/server/startup-checks");
   const { logger, errorSummary } = await import("@/lib/logger");
   for (const warning of startupWarnings()) logger.warn(warning);
+  for (const message of startupErrors()) logger.error(message);
   await startMetricsListenerOnce();
   if (!process.env.DATABASE_URL && !process.env.DATABASE_URL_FILE) return;
   try {

@@ -50,6 +50,8 @@ export function handleEnroll(req: Request): Promise<Response> {
     const body = await readValidBody(req, "EnrollRequest");
     if (!body.ok) return body.response;
     const enrolled = await enrollAgent(getDb(), body.value, ip);
+    // L4: the enroll argon2id pool is full; the token was not consumed, the agent retries.
+    if (enrolled === "busy") return unavailable();
     if (!enrolled) return unauthorized();
     return conformingJson("EnrollResponse", {
       agent_id: enrolled.agentId,

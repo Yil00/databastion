@@ -109,6 +109,13 @@ export const agentKnownGoodGate = new Semaphore(MAX_CONCURRENT_KNOWN_GOOD_ARGON2
  */
 export const MAX_CONCURRENT_ROTATE_ARGON2 = 2;
 export const rotateArgon2Gate = new Semaphore(MAX_CONCURRENT_ROTATE_ARGON2);
+/**
+ * `/enroll` (P1-D L4): hashing the new agent secret, after the (cheap) enrollment token lookup. Its
+ * own small pool: a burst of enrollments with valid tokens neither runs unbounded argon2id work nor
+ * competes with authentication or logins (`503` + `Retry-After` when full, token not consumed).
+ */
+export const MAX_CONCURRENT_ENROLL_ARGON2 = 2;
+export const enrollArgon2Gate = new Semaphore(MAX_CONCURRENT_ENROLL_ARGON2);
 
 let dummyHash: Promise<string> | undefined;
 

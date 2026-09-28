@@ -6,6 +6,13 @@
 
 name: databastion
 
+# Console image, pinned by version tag (never `latest`): one place to change on upgrade. Use a
+# published tag (RELEASE.md: `X.Y.Z` or `X.Y.Z-alpha.N`, no `v` prefix); `0.1.0-alpha.1` is the first
+# planned pre-release: it is published with that first pre-release (end of phase 2), and does not
+# exist on GHCR before then. For a fully immutable pin, append the digest: `...:<tag>@sha256:<digest>`
+# (verify it first: `cosign verify`, see RELEASE.md).
+x-console-image: &console-image ghcr.io/yil00/databastion-console:0.1.0-alpha.1
+
 services:
   # One image (console/Dockerfile), four commands: web (default), worker, migrate, bootstrap-admin.
   # First administrator, once, after `migrate`:
@@ -16,7 +23,7 @@ services:
 
   # One-shot: applies the console migrations as the database OWNER role, then exits.
   migrate:
-    image: ghcr.io/yil00/databastion-console:latest
+    image: *console-image
     command: ["migrate"]         # src/db/migrate.ts (pnpm db:migrate)
     restart: "no"
     environment:
@@ -32,7 +39,7 @@ services:
         condition: service_healthy
 
   console:
-    image: ghcr.io/yil00/databastion-console:latest
+    image: *console-image
     command: ["web"]
     restart: unless-stopped
     ports:
@@ -71,7 +78,7 @@ services:
         condition: service_completed_successfully
 
   worker:
-    image: ghcr.io/yil00/databastion-console:latest
+    image: *console-image
     command: ["worker"]          # policies, correlation, alerting
     restart: unless-stopped
     environment:
@@ -89,7 +96,9 @@ services:
         condition: service_completed_successfully
 
   db:
-    image: postgres:17-alpine
+    # Pinned by tag AND digest (multi-arch index of postgres:17-alpine = 17.11 on Alpine 3.24,
+    # resolved 2026-09-28). Update both together, to a digest you have checked.
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
       # Bootstrap superuser: used only by the initdb script below, never by the console.
