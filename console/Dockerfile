@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # DataBastion console image: one image, three commands (see docker/entrypoint.sh):
-#   web      Next.js standalone server (UI, user API, agent API, /metrics), port 3000
+#   web      Next.js standalone server (UI, user API, agent API), port 3000; /metrics on the
+#            dedicated listener DATABASTION_METRICS_PORT (e.g. 9464) when set, else on port 3000
 #   worker   pg-boss worker
 #   migrate  applies the versioned SQL migrations (DATABASE_MIGRATION_URL(_FILE)), then exits
 #   bootstrap-admin  creates the first administrator (refused once a user exists)
@@ -63,7 +64,8 @@ COPY --chown=root:root src /app/console/src
 COPY --chown=root:root --chmod=0755 docker/entrypoint.sh docker/healthcheck.sh /usr/local/bin/
 # Files are owned by root and not writable by the runtime user.
 USER 10001:10001
-EXPOSE 3000
+# 9464: suggested DATABASTION_METRICS_PORT (internal network only, never published).
+EXPOSE 3000 9464
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["web"]
