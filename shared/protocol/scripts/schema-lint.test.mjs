@@ -44,6 +44,14 @@ const mutations = {
   "numeric map with string values": (s) => { s.MetricsMap.additionalProperties = { type: "string", maxLength: 8 }; },
   "numeric map without propertyNames": (s) => { delete s.MetricsMap.propertyNames; },
   "open map without the numeric-map mark": (s) => { delete s.MetricsMap["x-databastion-numeric-map"]; },
+  "patternProperties on a closed object": (s) => {
+    s.Finding.patternProperties = { ".*": { type: "string", maxLength: 4096 } };
+  },
+  "patternProperties in a fragment": (s) => {
+    s.JobStatusUpdate.then.patternProperties = { ".*": { type: "string", maxLength: 8 } };
+  },
+  "unevaluatedProperties: true": (s) => { s.Location.unevaluatedProperties = true; },
+  "propertyNames outside the numeric map": (s) => { s.Location.propertyNames = { type: "string", maxLength: 8 }; },
   "empty items schema": (s) => { s.Finding.properties.masked_samples.items = {}; },
 };
 

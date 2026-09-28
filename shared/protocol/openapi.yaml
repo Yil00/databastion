@@ -57,8 +57,9 @@ info:
     - `429` / `503`: exponential backoff with jitter, honoring `Retry-After` (seconds).
     - `400` on `/findings` or `/events`: when every `details[].pointer` designates an item
       (`/findings/<i>/...`, `/events/<i>/...`), the agent removes those items and resends the remaining
-      ones under a **new** `batch_id`; otherwise it drops the batch. `404` on `/events` with a pointer to
-      `/events/<i>/target_id` is handled the same way.
+      ones under a **new** `batch_id`; otherwise it drops the batch. `404` on `/findings` or `/events`
+      with pointers to `/findings/<i>/target_id` or `/events/<i>/target_id` (target not belonging to the
+      agent) is handled the same way; a `404` on `job_id` drops the whole batch.
     - `413`: the agent splits the batch in two halves, each under a new `batch_id`, and resends them; a
       single item still rejected with `413` is dropped.
     - Other `400`, `404`, `409`: not retryable. The agent drops the request and increments a metric.
@@ -83,7 +84,8 @@ info:
     - `Location.engine` matches the engine last reported for the target;
     - `matched <= sampled <= params.sample_rows` of the job;
     - `ts_last >= ts`; no timestamp more than 5 min in the future (clock skew tolerance);
-    - at least 50 % of the characters of each masked sample are `*`;
+    - in each masked sample, at least 50 % of the non-separator characters (letters, digits and `*`)
+      are `*` (e.g. `06 ** ** ** 78`: 6 of 10);
     - classifier ids exist in the reported `classifiers_version`.
     Every string coming from an agent is escaped on display and in exports (no HTML, CSV or log injection).
 servers:
@@ -115,7 +117,8 @@ paths:
         its `agent_id` and `agent_secret`. The agent stores them in a `0600` file, then generates its
         local HMAC key, which is **never transmitted**. This is the only unauthenticated endpoint; it
         carries no `Authorization` nor `X-DataBastion-Agent-Id` header, and it is rate limited per
-        source IP.
+        source IP. Its request and response bodies are excluded from every request, APM and error log on
+        both sides.
       tags: [enrollment]
       security: []
       parameters:
@@ -295,8 +298,9 @@ paths:
         Idempotent on (`agent_id`, `batch_id`). The whole batch is rejected with `400` if any item does
         not conform to the schema (in particular any unknown field, which could carry a raw value); the
         error `details` let the agent drop only the offending items and resend the rest. `404` when
-        `job_id` is unknown, not assigned to this agent or not a `discovery.scan` job, or when a
-        `target_id` does not belong to this agent. `409` (`batch_conflict`) when the `batch_id` was
+        `job_id` is unknown, not assigned to this agent or not a `discovery.scan` job (pointer
+        `/job_id`), or when a `target_id` does not belong to this agent (pointer
+        `/findings/<i>/target_id`, per-item handling). `409` (`batch_conflict`) when the `batch_id` was
         already received with a different content.
       tags: [results]
       parameters:
@@ -388,19 +392,31 @@ paths:
 
         **Retries are idempotent**: after a network error the agent resends the **same** `S1` with `S0`;
         the console compares it with the pending hash and answers `200` with `duplicate: true` and the
-        unchanged deadline. After a restart with a pending `S1`, the agent authenticates with `S1` first
-        and falls back to `S0` only on `401` (then `S1` was never registered, and it retries step 3).
+        unchanged deadline. The agent **never generates a new secret while one is pending**: it reuses
+        the pending `S1`, including when a rotate job is redelivered. After a restart with a pending `S1`,
+        the agent authenticates with `S1` first and falls back to `S0` only on `401` (then `S1` was never
+        registered, and it retries step 3). Conversely, any `401` received while a pending `S1` exists
+        makes the agent retry with `S1` before any other `401` handling.
+
+        The console rejects with `400` (`invalid_secret`) a `new_secret` equal to the current secret, or
+        obviously low-entropy (see `AgentSecret`).
 
         **Takeover detection** (someone else holds `S0`):
-        - a `/rotate` whose `new_secret` does not match the secret already pending is answered `409`
-          `rotation_conflict`: the console **locks the agent, revokes every secret (current and
-          pending), closes its long-polls and raises a security incident**. The agent that receives
-          `rotation_conflict` stops all activity, logs a critical error and requires re-enrollment;
-        - any request authenticated with `S0` after promotion is answered `401` **and** recorded as a
-          security event (audit log + incident), since a conforming agent never uses `S0` again.
+        - a `/rotate` whose `new_secret` does not match the secret already pending (or just promoted) is
+          answered `409` `rotation_conflict`. A `/rotate` carrying `S0` and the **same** `S1` as the
+          pending or just-promoted one is a late retry: answered `200` with `duplicate: true`;
+        - a request authenticated with `S0` within a **60 s tolerance window** after promotion (requests
+          in flight during the switch) is answered `401` without incident;
+        - a request authenticated with `S0` **after** that window is treated like `rotation_conflict`.
+
+        On `rotation_conflict` (either case) the console **locks the agent, revokes every secret
+        (current and pending), closes its long-polls and raises a security incident**. The agent that
+        receives `rotation_conflict` stops all activity, logs a critical error and requires
+        re-enrollment. A conforming agent never triggers it.
 
         Suspected compromise is not handled by rotation: the administrator revokes the agent and
-        re-enrolls it. The endpoint is rate limited (`429`).
+        re-enrolls it. The endpoint is rate limited (`429`). Its request body is excluded from every
+        request, APM and error log on both sides.
       tags: [enrollment]
       parameters:
         - $ref: "#/components/parameters/AgentId"
@@ -427,8 +443,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            `rotation_conflict`: a different new secret is already pending. The agent has been locked and
-            all its secrets revoked; the agent stops and requires re-enrollment.
+            `rotation_conflict`: a different new secret is already pending (or was just promoted). The agent
+            has been locked and all its secrets revoked; the agent stops and requires re-enrollment.
           content:
             application/json:
               schema:
@@ -520,6 +536,7 @@ components:
     Unauthorized:
       description: |
         Missing, invalid, superseded (after a rotation) or revoked secret.
+        - If a pending secret exists (rotation in progress), the agent first retries with it.
         - If the request was sent with a secret that is no longer the agent's current one (e.g. `S0`
           in flight while switching to `S1`), the agent retries once with its current secret.
         - If it was sent with the current secret, the agent stops normal operation (no job polling, no
@@ -626,7 +643,9 @@ components:
       description: |
         Agent secret: `dbs_` + 43 base64url chars (256 random bits from a CSPRNG). Issued by the console
         in the `/enroll` response, generated by the agent for `/rotate`. Sent only in the
-        `Authorization` header afterwards. Never logged by either side.
+        `Authorization` header afterwards. Never logged by either side. The console rejects obviously
+        low-entropy values (e.g. fewer than 16 distinct characters in the 43-character body, such as a
+        single repeated character) with `400` `invalid_secret`.
       type: string
       minLength: 47
       maxLength: 47
@@ -674,7 +693,8 @@ components:
         Sample masked by `classifiers::masking` (e.g. `j*******@e******.com`,
         `FR76 **** **** **** **** ***1 89`). Schema rules: contains at least one `*`, no run of more than
         4 consecutive letters or digits, no combining mark, no control / format / private-use / line
-        separator character. The console additionally requires at least 50 % of the characters to be `*`.
+        separator character. The console additionally requires at least 50 % of the non-separator characters (letters, digits
+        and `*`; spaces and punctuation ignored) to be `*`: `06 ** ** ** 78` passes (6 of 10).
       type: string
       minLength: 1
       maxLength: 128
@@ -702,6 +722,12 @@ components:
       minLength: 1
       maxLength: 256
       pattern: '^([^@=:;/\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+|(ou|dc|o|c|l|st)=[^@=:;/\\''"`<>(),+\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+(,(ou|dc|o|c|l|st)=[^@=:;/\\''"`<>(),+\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+)*)$'
+      not:
+        description: |
+          No name, and no `.`-separated path segment, made only of 9 or more digits and separators
+          (phone numbers, account or card numbers used as keys).
+        type: string
+        pattern: '^[0-9 +.-]{9,}$|(^|\.)[0-9 +-]{9,}(\.|$)'
       x-databastion-normalized-name: true
     IdentifierPattern:
       description: |
@@ -826,6 +852,7 @@ components:
             - conflict
             - batch_conflict
             - rotation_conflict
+            - invalid_secret
             - payload_too_large
             - protocol_unsupported
             - rate_limited

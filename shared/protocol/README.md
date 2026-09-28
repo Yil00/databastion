@@ -19,6 +19,8 @@ Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.**
 
 `<Schema>` is a key of `components/schemas` in `openapi.yaml` (e.g. `FindingsBatch`, `HeartbeatRequest`). Fixture data is fake: `example.com` domains, documentation IP ranges (`192.0.2.0/24`, `198.51.100.0/24`, `2001:db8::/32`), secrets made of `EXAMPLE`.
 
+Fixture secrets and tokens (`dbs_EXAMPLE…`, `dbe_EXAMPLE…`) are deliberately low-entropy so that secret scanners ignore them. They are valid for the **schema** only: the console's low-entropy check (see `AgentSecret`) rejects them, so console tests of `/rotate` must generate a real secret.
+
 ### Why the schemas live in `openapi.yaml`
 The schemas sit in `components/schemas` rather than in separate `schemas/*.json` files:
 - one self-contained file: no cross-file `$ref` resolution for Redocly, for code generators or for the console's runtime validator;

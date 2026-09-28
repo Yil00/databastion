@@ -13,6 +13,8 @@
 // or a branch of a composition whose parent has its own `type`. Fragments are not required to be
 // closed, typed or bounded, but cannot be `true` / `{}` (except under not / if / then / else) and cannot open
 // the parent (no `additionalProperties` other than `false`).
+// Anywhere: no `patternProperties`, no `unevaluatedProperties` other than `false`, and no
+// `propertyNames` outside the numeric map.
 
 export const MAP_MARK = "x-databastion-numeric-map";
 const CONDITIONAL = new Set(["not", "if", "then", "else"]);
@@ -48,6 +50,19 @@ function lintNode(node, path, { fragment, via }, fail) {
 
   if (!fragment && !hasRef && !isEnum && !composition && types.length === 0) {
     fail(`${path}: value schema without type, $ref, enum or const`);
+  }
+
+  // Other ways of opening an object: pattern-keyed properties, unevaluated properties, and
+  // `propertyNames` (only meaningful on an open map). Allowed only on the numeric map (and not even
+  // there for patternProperties / unevaluatedProperties).
+  if (node.patternProperties !== undefined) {
+    fail(`${path}: patternProperties is forbidden (open keys); use closed properties or the numeric map`);
+  }
+  if (node.unevaluatedProperties !== undefined && node.unevaluatedProperties !== false) {
+    fail(`${path}: unevaluatedProperties other than false is forbidden`);
+  }
+  if (node.propertyNames !== undefined && node[MAP_MARK] !== true) {
+    fail(`${path}: propertyNames outside a ${MAP_MARK} object`);
   }
 
   if (fragment) {
