@@ -17,6 +17,10 @@ services:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       DATABASTION_PUBLIC_URL: https://databastion.example.com
+      # The console runs behind ONE HTTPS reverse proxy that sets / overwrites X-Forwarded-For.
+      # Remove this line if nothing in front of the console does (clients could spoof their IP).
+      # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
+      DATABASTION_TRUST_PROXY: "1"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key]
     user: "10001:10001"
