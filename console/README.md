@@ -186,8 +186,12 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
 - promotion: first successful request with `S1`, or the deadline (applied lazily on the agent's
   next request, with the deadline as promotion time);
 - `S0` within 60 s of the promotion: `401` without incident on every endpoint but `/rotate`;
-- `rotation_conflict` (`409`): `/rotate` with `S0` and a different `S1` while pending or within the
-  window, or any request with `S0` after the window. The agent is locked (every secret hash
+- `/rotate` with `S0` and the promoted `S1` (it verifies against the current hash) is a late retry
+  at **any** time (ADR-0011, refining ADR-0010): `200 duplicate: true` with that rotation's deadline
+  (`promoted_grace_expires_at`, kept even when a newer rotation has started), never a lock. Only the
+  holder of `S1` can send it; this check runs only on the `/rotate` path authenticated with `S0`;
+- `rotation_conflict` (`409`): `/rotate` with `S0` and any other secret while pending or at any time
+  after the promotion, or any other request with `S0` after the window. The agent is locked (every secret hash
   cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
   audit log and a `critical` row to `security_events`. Only revocation + re-enrollment recovers;
 - `/rotate` authenticated with the current secret (e.g. `S1` right after promotion) always starts
@@ -201,6 +205,11 @@ pending / promoted hash) in a dedicated pool of 2 (`503` + `Retry-After` beyond)
 to 10 calls per agent per 5 min (`429`). Concurrent `/rotate` calls are serialized by conditional
 updates: of two different secrets sent together with `S0`, one is registered and the other one
 locks the agent. The body is never logged; responses are `no-store`.
+
+All rotation instants (registration deadline, promotion time, window checks) use the console
+(Node) clock. Held long-polls are bound to the secret that opened them: a promotion, a lock or a
+revocation wakes them (locally and via `NOTIFY` in other processes) and a poll whose secret is no
+longer the current one is closed with `401`.
 
 `security_events` is a placeholder for the incident model of phase 3 (agent-integrity alerts:
 `rotation_conflict` today, rejected batches and `batch_conflict` with P2-D).
@@ -237,7 +246,7 @@ Per-agent series cover enrolled / online agents (not revoked or locked). Agent-p
 names (contract: `^[a-z][a-z0-9_]{0,63}$`, numeric values) on the reserved list (`last_seen_seconds`,
 `up`, `revoked`, `locked`, `status`, `info`, `clock_skew_seconds`, `uptime_seconds`, `spool_*`) or,
 at agent level, starting with `target_` are ignored, so an agent cannot shadow a console series.
-Cardinality caps: 1000 agents, 50 000 agent-reported series per scrape (the contract already caps
+Cardinality caps: 1000 agents (applied in SQL, targets joined to those agents), 50 000 agent-driven series per scrape (agent-reported and per-target series) (the contract already caps
 128 metrics per map and 64 targets per agent).
 
 ## Docker image
