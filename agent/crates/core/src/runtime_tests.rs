@@ -330,11 +330,28 @@ async fn unauthorized_with_current_secret_suspends_with_slow_retry() {
     let rt = runtime(&env);
     let err = rt.heartbeat_once().await.unwrap_err();
     assert!(matches!(err, CallError::Unauthorized));
-    let delay = rt
+    // First slow retry after 60-90 s, then every 15 min.
+    let first = rt
         .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
         .unwrap();
-    assert!(delay >= Duration::from_secs(900));
+    assert!(first >= Duration::from_secs(60) && first <= Duration::from_secs(90));
     assert_eq!(*rt.state.borrow(), RunState::Suspended);
+    for _ in 0..2 {
+        let delay = rt
+            .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+            .unwrap();
+        assert!(delay >= Duration::from_secs(900));
+    }
+    // A 401 seen by another loop does not consume the quick retry.
+    let rt = runtime(&env);
+    let other = rt
+        .on_call_error("jobs", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(other >= Duration::from_secs(900));
+    let hb = rt
+        .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(hb <= Duration::from_secs(90));
 }
 
 #[tokio::test]
@@ -986,4 +1003,309 @@ async fn immediate_204_does_not_hot_loop() {
         .filter(|r| r.url.path().ends_with("/jobs"))
         .count();
     assert!((1..=3).contains(&polls), "{polls} polls in 1.5 s");
+}
+
+// ---------------------------------------------------------------- spool
+
+/// Scripted `/findings` responses, in order; then plain acks.
+enum Step {
+    Ack(bool),
+    Items(&'static [&'static str]),
+    TooLarge,
+    Conflict,
+}
+
+struct Script(std::sync::Mutex<std::collections::VecDeque<Step>>);
+
+impl wiremock::Respond for Script {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let ack = |dup: bool| {
+            ResponseTemplate::new(202)
+                .set_body_json(serde_json::json!({"batch_id": body["batch_id"], "duplicate": dup}))
+        };
+        match self.0.lock().unwrap().pop_front() {
+            None | Some(Step::Ack(false)) => ack(false),
+            Some(Step::Ack(true)) => ack(true),
+            Some(Step::Items(pointers)) => {
+                let details: Vec<_> = pointers
+                    .iter()
+                    .map(|p| serde_json::json!({"pointer": p, "keyword": "maximum"}))
+                    .collect();
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "code": "invalid_request", "message": "Invalid.", "details": details
+                }))
+            }
+            Some(Step::TooLarge) => error_body(413, "payload_too_large"),
+            Some(Step::Conflict) => error_body(409, "batch_conflict"),
+        }
+    }
+}
+
+async fn spooled_runtime(server: &MockServer, steps: Vec<Step>, findings: usize) -> (Env, Runtime) {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(findings, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    (env, rt)
+}
+
+async fn sent_batches(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/findings"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+async fn drain(rt: &Runtime) {
+    for _ in 0..20 {
+        if rt.flush_once(1).await.unwrap() == Flush::Idle {
+            return;
+        }
+    }
+    panic!("spool not drained");
+}
+
+#[tokio::test]
+async fn items_rejected_by_pointer_are_dropped_and_rest_resent_under_new_id() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(
+        &server,
+        vec![Step::Items(&["/findings/1/confidence", "/findings/3"])],
+        10,
+    )
+    .await;
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 8);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    assert_eq!(status.dropped_batches.unwrap().0, 0);
+    assert_eq!(status.batches.0, 0);
+}
+
+#[tokio::test]
+async fn out_of_range_item_pointer_drops_the_batch() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/7"])], 3).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    assert_eq!(rt.lock_spool().status().dropped_batches.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn envelope_pointer_drops_the_whole_batch() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/job_id"])], 4).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_batches.unwrap().0, 1);
+    assert_eq!(status.dropped_items.unwrap().0, 4);
+}
+
+#[tokio::test]
+async fn payload_too_large_splits_in_halves_with_new_ids() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::TooLarge, Step::Ack(true)], 9).await;
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    let sizes: Vec<_> = sent
+        .iter()
+        .map(|b| b["findings"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [9, 4, 5]);
+    let ids: std::collections::HashSet<_> =
+        sent.iter().map(|b| b["batch_id"].to_string()).collect();
+    assert_eq!(ids.len(), 3);
+    let m = rt.metrics().0;
+    let get = |k: &str| m[&MetricsMapKey::try_from(k).unwrap()];
+    assert!((get("batches_duplicate_total") - 1.0).abs() < f64::EPSILON);
+    assert!((get("batches_sent_total") - 2.0).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn batch_conflict_is_dropped_never_resent() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Conflict], 3).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    let m = rt.metrics().0;
+    assert!(
+        (m[&MetricsMapKey::try_from("batch_conflicts_total").unwrap()] - 1.0).abs() < f64::EPSILON
+    );
+    assert_eq!(rt.lock_spool().status().dropped_batches.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn server_errors_keep_the_batch_for_retry() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(2, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
+    let hb = rt.build_heartbeat().await.unwrap();
+    assert_eq!(hb.spool.batches.0, 1);
+    assert!(hb.spool.bytes.0 > 0);
+    assert!(hb.spool.max_bytes.0 > 0);
+}
+
+#[test]
+fn spool_backoff_grows_and_is_capped() {
+    let top = |f| spool_backoff(f, 0.999_999);
+    assert!(top(1) <= Duration::from_secs(1));
+    assert!(top(2) > top(1));
+    assert!(top(6) > Duration::from_secs(30));
+    assert_eq!(top(40), Duration::from_secs(300).mul_f64(0.999_999));
+}
+
+async fn spool_answered_with(template: ResponseTemplate) -> Runtime {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(template)
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(2, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    for failures in 1..=3 {
+        assert!(matches!(
+            rt.flush_once(failures).await.unwrap(),
+            Flush::Retry(_)
+        ));
+    }
+    drop(server);
+    rt
+}
+
+#[tokio::test]
+async fn non_contract_answers_never_empty_the_spool() {
+    let html = ResponseTemplate::new(200).set_body_string("<html>proxy login</html>");
+    let bare_404 = ResponseTemplate::new(404);
+    let bare_409 = ResponseTemplate::new(409).set_body_string("conflict");
+    let wrong_ack = ResponseTemplate::new(202).set_body_json(serde_json::json!({
+        "batch_id": "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f", "duplicate": false
+    }));
+    for template in [html, bare_404, bare_409, wrong_ack] {
+        let rt = spool_answered_with(template).await;
+        let status = rt.lock_spool().status();
+        assert_eq!(status.batches.0, 1);
+        assert_eq!(status.dropped_batches.unwrap().0, 0);
+        let m = rt.metrics().0;
+        let unexpected = m[&MetricsMapKey::try_from("batches_unexpected_response_total").unwrap()];
+        assert!((unexpected - 3.0).abs() < f64::EPSILON);
+        assert!(m.contains_key(&MetricsMapKey::try_from("spool_quarantined_total").unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn unknown_rotation_outcome_is_probed_with_s1_before_resending_rotate() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    // The console registered and promoted S1 meanwhile; S0 is past grace.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .respond_with(heartbeat_response(30))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let outcome = session.rotate_probed(None, Some(b"{}")).await.unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyDone);
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_eq!(stored.secret.expose(), s1);
+}
+
+#[tokio::test]
+async fn probe_refused_falls_back_to_rotate_with_s0() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(401, "unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(true))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        session.rotate_probed(None, Some(b"{}")).await.unwrap(),
+        RotateOutcome::Registered { duplicate: true }
+    );
+    assert!(env.state.load_identity().unwrap().pending.is_some());
 }

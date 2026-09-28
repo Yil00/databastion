@@ -205,6 +205,9 @@ dependencies = [
 [[package]]
 name = "databastion-classifiers"
 version = "0.0.0"
+dependencies = [
+ "databastion-protocol",
+]
 
 [[package]]
 name = "databastion-connector-mongodb"

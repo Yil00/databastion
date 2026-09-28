@@ -98,7 +98,9 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> 
 pub(crate) fn open_private(path: &Path) -> io::Result<File> {
     let fd = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
+        // NONBLOCK: a FIFO planted in the state directory cannot block
+        // the open; the handle is then checked to be a regular file.
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(|e| {

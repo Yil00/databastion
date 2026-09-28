@@ -85,6 +85,11 @@ pub(crate) fn unauthorized_retry_delay(fraction: f64) -> Duration {
     Duration::from_secs(15 * 60) + Duration::from_secs(60).mul_f64(fraction.clamp(0.0, 1.0))
 }
 
+/// First heartbeat retry after a fatal `401`: 60 to 90 s, jittered.
+pub(crate) fn first_unauthorized_retry_delay(fraction: f64) -> Duration {
+    Duration::from_secs(60) + Duration::from_secs(30).mul_f64(fraction.clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

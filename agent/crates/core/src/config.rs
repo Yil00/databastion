@@ -90,6 +90,37 @@ pub struct AgentConfig {
     /// Local metrics options (ADR-0004).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Bounds of the disk spool (`<state_dir>/spool`).
+    #[serde(default)]
+    pub spool: SpoolConfig,
+}
+
+/// Bounds of the disk spool. When full, the oldest batches are dropped.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpoolConfig {
+    /// Total bytes of spooled batches (default 256 MiB, 2 MiB..=64 GiB).
+    #[serde(default = "default_spool_bytes")]
+    pub max_bytes: u64,
+    /// Number of spooled batches (default 10000, 1..=1000000).
+    #[serde(default = "default_spool_batches")]
+    pub max_batches: u32,
+}
+
+const fn default_spool_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+const fn default_spool_batches() -> u32 {
+    10_000
+}
+
+impl Default for SpoolConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_spool_bytes(),
+            max_batches: default_spool_batches(),
+        }
+    }
 }
 
 /// Console connection settings.
@@ -461,6 +492,15 @@ impl AgentConfig {
                 "limits.max_scan_duration_s",
                 "must be in 60..=86400",
             ));
+        }
+        if !(2 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&self.spool.max_bytes) {
+            return Err(invalid(
+                "spool.max_bytes",
+                "must be in 2097152..=68719476736 (2 MiB to 64 GiB)",
+            ));
+        }
+        if !(1..=1_000_000).contains(&self.spool.max_batches) {
+            return Err(invalid("spool.max_batches", "must be in 1..=1000000"));
         }
         Ok(())
     }

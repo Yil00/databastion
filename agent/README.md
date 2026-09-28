@@ -46,6 +46,73 @@ binary: `cargo build --no-default-features --features postgres`.
 - Raw values are wrapped in `RawSample`: redacted `Debug`, no `Display`, no
   serialization, and `expose()` is crate-private to `classifiers`.
 
+### Results path: normalization, sanitization, spool (ADR-0009)
+- Names: `classifiers::names` is the only producer of `NormalizedName`
+  (array indices of up to 6 digits → `[]`; value-like segments such as any
+  segment with more than 6 digits (dates, phone or customer numbers), UUIDs,
+  e-mail addresses → `*`, LDAP entry DN → parent container, attribute types
+  lowercased, anything non-conforming → `*`). A `FindingLocation` is built
+  only from `NormalizedName`s. Property tests
+  (`crates/classifiers/tests/names_props.rs`, deterministic generator, no
+  extra dependency) check every output against the generated `Identifier`
+  type and its `not` rule. Skeleton: classifier matches on segments are
+  added by P2-A.
+- Conversion: `uplink::to_batches` is the single conversion from
+  `MaskedFinding` / `MaskedEvent` to `FindingsBatch` / `EventsBatch`. Each
+  item goes through `sanitize` (the `NOT_ENFORCED_BY_SERDE` keywords for sent
+  types: `not` → `*`, `confidence` / `sampled` / `matched` ranges and
+  `matched <= sampled`, `maxItems` / `uniqueItems` of samples, fingerprints,
+  objects and signals, the `read` / `write` object requirement, `Count`
+  ranges); an item still invalid is dropped and counted. Batches hold at most
+  200 findings / 500 events and 1 MiB serialized, each with a fresh UUIDv7.
+- Account names: control / format characters stripped, truncated on a
+  character boundary; a non-conforming name goes to `db_user_fingerprint`.
+  **Stub**: HMAC fingerprints are not wired yet (P2-A), so such an event is
+  dropped and counted instead. `MaskedEvent` has no content yet (P4): no
+  event reaches the spool today.
+- Spool: `<state_dir>/spool/`, one `0600` file per batch written with
+  tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
+  removed at startup, unreadable files are moved to `spool/quarantine/` (32
+  kept) and counted (`quarantined`), never crash the agent and are never
+  logged. Bounded by `spool.max_bytes` (default 256 MiB) and
+  `spool.max_batches` (default 10000): oldest dropped first. FIFO send:
+  `2xx` (including `duplicate: true`) removes the batch; `400` / `404` whose
+  pointers all designate items → those items dropped, the rest resent under
+  a new `batch_id` at the same queue position; `413` → two halves with new
+  ids (a single item is dropped); `409 batch_conflict` → dropped, counted
+  (`batch_conflicts_total`), warned, never resent; other `4xx` with a
+  parseable contract `Error` body → dropped. Anything that is not a contract
+  answer (a proxy's HTML `200`, a bare `404` / `409`, an unparseable or
+  mismatched `BatchAck`) is kept, counted
+  (`batches_unexpected_response_total`) and retried, so a middlebox cannot
+  empty the spool. Network / `5xx` / `429` → kept and retried; retries back
+  off exponentially (1 s doubling to 5 min, full jitter) over consecutive
+  failures. `401` / `426` → kept (spooling continues within bounds). Stored
+  bytes are sent verbatim (parsed only for `batch_id`, item count and
+  splitting). Quarantine is only for unparseable files or files refused by
+  the state-file checks (symlink, owner, mode, not regular; opened with
+  `O_NONBLOCK` so a planted FIFO cannot block); transient errors (`EMFILE`,
+  `ENOMEM`) are retried. `spool_quarantined_total` is exported in the
+  heartbeat metrics. Real stats go into the heartbeat `spool` section.
+
+### Local engine detection (ADR-0006, I5)
+`detect` looks at the agent host only, read-only, with no network I/O: a
+fixed list of Unix socket paths under `/run`, `/var/run`, `/tmp`,
+`/var/lib/mysql` (`lstat`, never connect); `LISTEN` entries of
+`/proc/net/tcp{,6}` for ports 5432 / 3306 / 27017 / 389 / 636 (the address is
+never reported); `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`,
+`mongod`, `slapd` (never the command line). Declared targets are excluded
+(same socket; loopback host with the same port; a local target of the same
+engine family hides the process entry). At most 16 entries, reported as
+`detected_targets` in the heartbeat. Detection runs in `spawn_blocking` and
+is cached for 5 minutes (reset on `agent.config.reload`). The host root is
+injectable; tests use fixture trees.
+
+`/proc/net/tcp{,6}` only lists sockets of the agent's **network
+namespace**: an agent running in a container (without host networking)
+detects no listening port of the host, and its `/proc` shows only its own
+processes. Sockets are only seen if their directory is mounted in.
+
 ### Guards
 `crates/agent/tests/architecture.rs` checks that connectors do not depend on
 an HTTP client or `socket2` (including `[dependencies.x]` tables and

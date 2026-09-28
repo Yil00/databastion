@@ -9,3 +9,4 @@
 #![forbid(unsafe_code)]
 
 pub mod masking;
+pub mod names;

@@ -40,8 +40,9 @@
 //! `tests/fixtures.rs` lists every invalid fixture that still deserializes,
 //! and why.
 //!
-//! On the console side, Ajv enforces all of them. **On the agent side, no
-//! sanitizer exists yet**: checking what the agent receives against the
+//! On the console side, Ajv enforces all of them. On the agent side, the
+//! items the agent **sends** are checked by `databastion-core`'s `sanitize`
+//! module (ADR-0009) before spooling. Checking what the agent receives against the
 //! contract ranges is a required future step, not a current guarantee
 //! (heartbeat and job bounds in the P1-B scheduler; scan and audit
 //! parameters mapped into `ScanJob` / `AuditConfig` through a `TryFrom`

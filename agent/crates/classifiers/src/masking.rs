@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+use crate::names::NormalizedName;
+
 /// Placeholder emitted by the skeleton [`mask`] implementation.
 const FULLY_REDACTED: &str = "***";
 
@@ -134,10 +136,30 @@ impl ClassifierId {
 /// let sample = MaskedSample("jane.doe@example.com".to_owned());
 /// let _ = MaskedFinding::new(ClassifierId::PII_EMAIL, vec![sample]);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MaskedFinding {
     classifier: ClassifierId,
     masked_samples: Vec<MaskedSample>,
+    location: Option<FindingLocation>,
+    sampled: u32,
+    matched: u32,
+    confidence: f64,
+    estimated_rows: Option<u64>,
+}
+
+/// Where a finding lives, down to the column / field / attribute. Built only
+/// from [`NormalizedName`]s (ADR-0009): a connector cannot put a raw name
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingLocation {
+    /// Database (PostgreSQL / MySQL / MongoDB) or LDAP suffix.
+    pub database: NormalizedName,
+    /// Schema (PostgreSQL only).
+    pub schema: Option<NormalizedName>,
+    /// Table, collection, or LDAP container / objectClass.
+    pub object: NormalizedName,
+    /// Column, normalized field path, or attribute.
+    pub field: NormalizedName,
 }
 
 impl MaskedFinding {
@@ -147,7 +169,66 @@ impl MaskedFinding {
         Self {
             classifier,
             masked_samples,
+            location: None,
+            sampled: 0,
+            matched: 0,
+            confidence: 0.0,
+            estimated_rows: None,
         }
+    }
+
+    /// Sets the location (normalized names only).
+    #[must_use]
+    pub fn with_location(mut self, location: FindingLocation) -> Self {
+        self.location = Some(location);
+        self
+    }
+
+    /// Sets the sampling counters and the confidence. The core validates the
+    /// contract ranges before spooling (a finding out of range is dropped).
+    #[must_use]
+    pub fn with_counts(mut self, sampled: u32, matched: u32, confidence: f64) -> Self {
+        self.sampled = sampled;
+        self.matched = matched;
+        self.confidence = confidence;
+        self
+    }
+
+    /// Sets the estimated size of the object, from engine statistics.
+    #[must_use]
+    pub fn with_estimated_rows(mut self, rows: u64) -> Self {
+        self.estimated_rows = Some(rows);
+        self
+    }
+
+    /// Location, if set. A finding without location is never sent.
+    #[must_use]
+    pub fn location(&self) -> Option<&FindingLocation> {
+        self.location.as_ref()
+    }
+
+    /// Values examined.
+    #[must_use]
+    pub fn sampled(&self) -> u32 {
+        self.sampled
+    }
+
+    /// Values matching the classifier.
+    #[must_use]
+    pub fn matched(&self) -> u32 {
+        self.matched
+    }
+
+    /// Confidence, expected in `0..=1`.
+    #[must_use]
+    pub fn confidence(&self) -> f64 {
+        self.confidence
+    }
+
+    /// Estimated object size.
+    #[must_use]
+    pub fn estimated_rows(&self) -> Option<u64> {
+        self.estimated_rows
     }
 
     /// Classifier that produced the finding.
