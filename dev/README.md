@@ -29,7 +29,14 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | Grafana (`grafana`) | 3001 | | | |
 
 - Mailpit UI: <http://127.0.0.1:8025> (SMTP `127.0.0.1:1025`, no auth), for alert e-mails (P3-C).
-- Prometheus: <http://127.0.0.1:9090>. Following [ADR-0004](../docs/adr/0004-observability-via-console.md), it scrapes a single target, the console `/metrics` at `host.docker.internal:3000`. That job is **DOWN** until the console exposes `/metrics` (P1); agents are never scraped.
+- Prometheus: <http://127.0.0.1:9090>. Following [ADR-0004](../docs/adr/0004-observability-via-console.md), it scrapes a single target, the console `/metrics` at `host.docker.internal:3000`; agents are never scraped. That job is **DOWN** until the host console runs with the scrape token (below).
+- Metrics token: the console `/metrics` requires `Authorization: Bearer <token>` (`DATABASTION_METRICS_TOKEN(_FILE)`, at least 32 characters; otherwise `/metrics` answers `404`). `make dev` (target `dev-metrics-token`) generates `dev/.state/metrics_token` once (48 random characters, mode `0600`, git-ignored, removed by `make dev-reset`) and mounts it read-only into Prometheus (`credentials_file`). Start the host console with the same file:
+
+  ```bash
+  DATABASTION_METRICS_TOKEN_FILE="$PWD/dev/.state/metrics_token" pnpm dev   # from console/: ../dev/.state/metrics_token
+  ```
+
+  Prometheus runs as root inside its container only to read that `0600` file owned by your user. Run `make dev-metrics-token` first if you call `docker compose` directly (otherwise Docker creates a directory at that path).
 - Grafana: <http://127.0.0.1:3001> (user `admin`, password `GRAFANA_ADMIN_PASSWORD`). Dashboard *DataBastion / DataBastion - overview*: agents online, silent agents, heartbeat age, spool size. Metric names (`databastion_agent_last_seen_seconds`, `databastion_agent_reported_spool_bytes`) are provisional until the console implements `/metrics`.
 
 ## Credentials
@@ -65,7 +72,7 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
 - **OpenLDAP**: image built from Debian's `slapd` package ([openldap/Dockerfile](openldap/Dockerfile)): osixia/openldap is unmaintained and the Bitnami catalog no longer publishes free versioned tags. Configuration in [openldap/config.ldif](openldap/config.ldif) (`olcAccessLogOps: reads writes session`, purge after 7 days). Healthchecks use `ldapi://` on `cn=config`, so they do not add entries to `cn=accesslog`.
 
-`make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs` first if you call `docker compose` directly.
+`make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.

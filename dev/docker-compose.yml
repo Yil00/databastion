@@ -164,6 +164,9 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    # Root inside the container only so that it can read the 0600 metrics token owned by the host
+    # user (`make dev-metrics-token`); the container publishes nothing beyond 127.0.0.1.
+    user: "0:0"
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -174,6 +177,7 @@ services:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./.state/metrics_token:/etc/prometheus/metrics_token:ro
       - prometheus-data:/prometheus
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
