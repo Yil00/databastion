@@ -22,7 +22,15 @@ import { pgBossOptions, registerNotificationQueue, registerPolicyQueue } from "@
 import { drainPolicyWork, getIncident } from "./incidents";
 import { POLICY_QUEUE } from "./policy-queue";
 import { recordIntegrityEvent } from "./integrity";
-import { backoffSeconds, drainDeliveries, enqueueSuppressionDigests, listDeliveries, MAX_DELIVERY_ATTEMPTS, type Senders } from "./notifications";
+import {
+  backoffSeconds,
+  drainDeliveries,
+  enqueueSuppressionDigests,
+  listDeliveries,
+  MAX_DELIVERY_ATTEMPTS,
+  notificationClock,
+  type Senders,
+} from "./notifications";
 import { verifyWebhookSignature } from "./senders/webhook";
 import { checkSilentAgents } from "./system-alerts";
 import {
@@ -194,6 +202,7 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
     await getDb().execute(sql`update notification_deliveries set status = 'failed', last_error = 'internal' where status in ('pending', 'sending')`);
   });
   afterEach(() => {
+    notificationClock.now = null;
     delete process.env.DATABASTION_NOTIFY_MAX_PER_HOUR;
     delete process.env.DATABASTION_ALERTING_INSECURE_DEV;
     delete process.env.DATABASTION_PUBLIC_URL;
@@ -528,6 +537,9 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
 
     it("L6: over its hourly budget a channel skips incident notifications, then gets one digest (counts only)", async () => {
       process.env.DATABASTION_NOTIFY_MAX_PER_HOUR = "2";
+      // Pinned clock (never the wall clock): every enqueue falls in the 10:00 hour of a fixed day.
+      let clock = new Date("2026-09-27T10:15:00.000Z");
+      notificationClock.now = () => clock;
       const { id: channelId } = await webhookChannel("burst-hook");
       const auth = await agentWithTargets();
       await policyNotifying(auth.agentId, ["burst-hook"]);
@@ -550,14 +562,23 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
         ["pending", null],
         ["skipped", "rate_limited"],
       ]);
+      expect(rows.every((r) => r.createdAt.toISOString() === "2026-09-27T10:15:00.000Z")).toBe(true);
       // The hour is not over: no digest yet.
+      clock = new Date("2026-09-27T10:59:59.999Z");
       expect(await enqueueSuppressionDigests(getDb())).toBe(0);
-      // Fake time: the suppressed row belongs to a closed hour.
-      await getDb().execute(sql`update notification_deliveries set created_at = date_trunc('hour', now()) - interval '30 minutes' where channel_id = ${channelId} and last_error = 'rate_limited'`);
+      // The next hour starts: one digest for the closed hour, never twice.
+      clock = new Date("2026-09-27T11:00:00.000Z");
       expect(await enqueueSuppressionDigests(getDb())).toBe(1);
       expect(await enqueueSuppressionDigests(getDb())).toBe(0);
       const [digest] = await getDb().select().from(notificationDeliveries).where(and(eq(notificationDeliveries.channelId, channelId), eq(notificationDeliveries.event, "notifications.suppressed")));
-      expect(digest?.payload).toMatchObject({ event: "notifications.suppressed", channel: "burst-hook", suppressed: 1, limit_per_hour: 2 });
+      expect(digest?.payload).toMatchObject({
+        event: "notifications.suppressed",
+        channel: "burst-hook",
+        window_start: "2026-09-27T10:00:00.000Z",
+        window_end: "2026-09-27T11:00:00.000Z",
+        suppressed: 1,
+        limit_per_hour: 2,
+      });
       expect(JSON.stringify(digest?.payload)).not.toContain(auth.agentId);
       const rec = fakeSenders(() => ({ ok: true }));
       await drainDeliveries(getDb(), { senders: rec.senders });

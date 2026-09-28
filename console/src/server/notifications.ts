@@ -48,6 +48,18 @@ export function backoffSeconds(attempts: number): number {
 
 type Exec = Database | Tx;
 
+/**
+ * Time source of the hourly budget (L6): the enqueue time of a delivery (`created_at`), the hour
+ * whose budget it uses, and the closed hours the digests cover. `null` (production): the database
+ * clock. Tests pin it, so a run never depends on where the wall clock is within the hour.
+ */
+export const notificationClock: { now: (() => Date) | null } = { now: null };
+
+function clockSql() {
+  const pinned = notificationClock.now?.();
+  return pinned ? sql`${pinned.toISOString()}::timestamptz` : sql`now()`;
+}
+
 interface NewDelivery {
   key: string;
   event: NotificationPayload["event"];
@@ -77,6 +89,7 @@ async function insertDeliveries(db: Exec, rows: NewDelivery[]): Promise<number> 
         payload: r.payload as unknown as Record<string, unknown>,
         status: r.status,
         lastError: r.lastError ?? null,
+        createdAt: clockSql(),
       })),
     )
     .onConflictDoNothing({ target: notificationDeliveries.idempotencyKey })
@@ -101,6 +114,7 @@ export async function enqueueIncidentNotifications(
     .where(inArray(notificationChannels.slug, [...slugs]));
   const bySlug = new Map(channels.map((c) => [c.slug, c]));
   // L6: hourly budget per channel (soft: concurrent evaluations may overshoot by a few).
+  const now = clockSql();
   const enabledIds = channels.filter((c) => c.enabled).map((c) => c.id);
   const used = new Map<string, number>();
   if (enabledIds.length > 0) {
@@ -112,7 +126,8 @@ export async function enqueueIncidentNotifications(
           inArray(notificationDeliveries.channelId, enabledIds),
           eq(notificationDeliveries.event, "incident.opened"),
           sql`${notificationDeliveries.status} <> 'skipped'`,
-          sql`${notificationDeliveries.createdAt} >= date_trunc('hour', now())`,
+          sql`${notificationDeliveries.createdAt} >= date_trunc('hour', ${now})`,
+          sql`${notificationDeliveries.createdAt} < date_trunc('hour', ${now}) + interval '1 hour'`,
         ),
       )
       .groupBy(notificationDeliveries.channelId);
@@ -171,11 +186,12 @@ export async function enqueueSystemAlert(
  * by the hourly budget (last 2 days; idempotent). Counts only. Returns the number queued.
  */
 export async function enqueueSuppressionDigests(db: Database): Promise<number> {
+  const now = clockSql();
   const res = await db.execute<{ channel_id: string; channel_slug: string; window_start: Date | string; n: number }>(sql`
     select channel_id, max(channel_slug) as channel_slug, date_trunc('hour', created_at) as window_start, count(*)::int as n
     from notification_deliveries
     where last_error = 'rate_limited' and event = 'incident.opened' and channel_id is not null
-      and created_at >= now() - interval '2 days' and created_at < date_trunc('hour', now())
+      and created_at >= ${now} - interval '2 days' and created_at < date_trunc('hour', ${now})
     group by channel_id, date_trunc('hour', created_at)`);
   const limit = notifyMaxPerHour();
   let queued = 0;
