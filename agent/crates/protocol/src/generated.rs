@@ -580,7 +580,11 @@ pub struct BatchAck {
     ///`true` when this (`agent_id`, `batch_id`) had already been received with the same content; the batch was not processed again.
     pub duplicate: bool,
 }
-///Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`.
+/**Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`. The valid ids of each
+`classifiers_version` are listed in the classifier registry `shared/protocol/classifiers.json`;
+the console rejects an id that is not registered for the batch's version (`enum`). An id is
+never renamed: a change of meaning is a new id in a new classifier set version.
+*/
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct ClassifierId(::std::string::String);
@@ -648,7 +652,9 @@ impl<'de> ::serde::Deserialize<'de> for ClassifierId {
             })
     }
 }
-///Version of the classifier set, `YYYY.MM.N`, e.g. `2026.09.1`.
+/**Version of the classifier set, `YYYY.MM.N`, e.g. `2026.09.1`. Findings are accepted only for a
+version listed in the classifier registry `shared/protocol/classifiers.json` (`enum` otherwise).
+*/
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct ClassifiersVersion(::std::string::String);
@@ -1005,6 +1011,9 @@ impl ::std::convert::TryFrom<::std::string::String> for DetectedTargetProcess {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryScanJob {
+    /**Classifier set the scan must use; always a version of the classifier registry
+(`classifiers.json`). Findings batches of this job must carry the same version.
+*/
     pub classifiers_version: ClassifiersVersion,
     pub created_at: Timestamp,
     ///The agent must not start the job after this instant (reports `failed` / `expired`).
@@ -1073,7 +1082,8 @@ a per-statement timeout on every query.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryScanParams {
-    /**Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`.
+    /**Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`
+(as listed in `classifiers.json`); present = ids of that version only.
 An empty list is rejected (`minItems: 1`): it never means "no classifiers" nor "all".
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
@@ -1440,6 +1450,10 @@ schema** and array indices: an unknown property is reported on its parent object
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Error {
+    /**Closed set. Agents decode it strictly, so adding a value is an incompatible change (new
+ADR and protocol version); a new situation reuses an existing code (e.g. `unavailable`
+for `501`, see `NotImplemented`).
+*/
     pub code: ErrorCode,
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub details: ::std::vec::Vec<ErrorDetail>,
@@ -1450,7 +1464,10 @@ pub struct Error {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub request_id: ::std::option::Option<crate::ids::Uuid>,
 }
-///`ErrorCode`
+/**Closed set. Agents decode it strictly, so adding a value is an incompatible change (new
+ADR and protocol version); a new situation reuses an existing code (e.g. `unavailable`
+for `501`, see `NotImplemented`).
+*/
 #[derive(
     ::serde::Deserialize,
     ::serde::Serialize,
@@ -1549,12 +1566,40 @@ impl ::std::convert::TryFrom<::std::string::String> for ErrorCode {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorDetail {
-    ///Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`).
+    /**Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`), or the
+keyword of a console-side check (see "Console-side checks" in the description of this
+contract):
+- `const`: a value that must equal the job's (`/classifiers_version`,
+  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+- `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
+  `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
+- `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
+- `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
+  or a classifier id not registered for the batch's version or outside the job's
+  `params.classifiers` (`/findings/<i>/classifier`);
+- `maxItems`: the per-job findings cap would be exceeded (`/findings`);
+- `formatMaximum`: a timestamp more than 5 min in the future;
+- `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
+*/
     pub keyword: ErrorDetailKeyword,
     ///JSON pointer into the submitted body (e.g. `/findings/3/confidence`); `""` for the root.
     pub pointer: ErrorDetailPointer,
 }
-///Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`).
+/**Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`), or the
+keyword of a console-side check (see "Console-side checks" in the description of this
+contract):
+- `const`: a value that must equal the job's (`/classifiers_version`,
+  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+- `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
+  `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
+- `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
+- `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
+  or a classifier id not registered for the batch's version or outside the job's
+  `params.classifiers` (`/findings/<i>/classifier`);
+- `maxItems`: the per-job findings cap would be exceeded (`/findings`);
+- `formatMaximum`: a timestamp more than 5 min in the future;
+- `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
+*/
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct ErrorDetailKeyword(::std::string::String);
@@ -1879,6 +1924,7 @@ pub struct Finding {
 #[serde(deny_unknown_fields)]
 pub struct FindingsBatch {
     pub batch_id: crate::ids::UuidV7,
+    ///Must equal the job's `classifiers_version` (`const`) and be registered (`enum`).
     pub classifiers_version: ClassifiersVersion,
     pub findings: ::std::vec::Vec<Finding>,
     ///The `discovery.scan` job that produced these findings.
@@ -1889,6 +1935,11 @@ lowercase hex, with `db_user` in place of the classifier id for `db_user_fingerp
 domain separation keeps the same string under two classifiers, or as an account name, from
 correlating. The key never leaves the agent, so fingerprints only correlate values seen by the
 same agent.
+
+The normalization of the value is **agent-local and not part of this contract**: it belongs to
+the agent's classifier implementation and may change with its classifier set version. The
+console treats fingerprints as opaque, compares them only for equality, and must not assume
+that fingerprints of different agents, classifiers or `classifiers_version`s correlate.
 */
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]

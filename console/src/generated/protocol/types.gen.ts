@@ -125,6 +125,12 @@ export interface paths {
          *     `/job_id`), or when a `target_id` does not belong to this agent (pointer
          *     `/findings/<i>/target_id`, per-item handling). `409` (`batch_conflict`) when the `batch_id` was
          *     already received with a different content.
+         *
+         *     The job must still accept findings (`delivered` / `running`, or at most 24 h after
+         *     `succeeded` / `failed`), the batch's `classifiers_version` and `target_id`s must be the job's,
+         *     classifier ids must be registered for that version (`classifiers.json`), and a job accepts at
+         *     most 50 000 findings over all its batches: see "Console-side checks" in the description of
+         *     this contract for the order of the checks and the exact `pointer` / `keyword` of each answer.
          */
         post: operations["submitFindings"];
         delete?: never;
@@ -148,6 +154,9 @@ export interface paths {
          *     (`agent_id`, `batch_id`)). Events are pre-aggregated by the agent (same principal, object set and
          *     action within the aggregation window, 60 s by default) and carry no query text. `404` when a
          *     `target_id` does not belong to this agent (`details[].pointer` designates the items).
+         *
+         *     A console that does not implement Audit yet (before phase 4) answers `501`
+         *     (`NotImplemented`) without reading the body.
          */
         post: operations["submitEvents"];
         delete?: never;
@@ -290,9 +299,17 @@ export interface components {
          *     cannot contain a host name, address or credential.
          */
         TargetId: string;
-        /** @description Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`. */
+        /**
+         * @description Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`. The valid ids of each
+         *     `classifiers_version` are listed in the classifier registry `shared/protocol/classifiers.json`;
+         *     the console rejects an id that is not registered for the batch's version (`enum`). An id is
+         *     never renamed: a change of meaning is a new id in a new classifier set version.
+         */
         ClassifierId: string;
-        /** @description Version of the classifier set, `YYYY.MM.N`, e.g. `2026.09.1`. */
+        /**
+         * @description Version of the classifier set, `YYYY.MM.N`, e.g. `2026.09.1`. Findings are accepted only for a
+         *     version listed in the classifier registry `shared/protocol/classifiers.json` (`enum` otherwise).
+         */
         ClassifiersVersion: string;
         /** @description Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`. */
         Signal: string;
@@ -302,6 +319,11 @@ export interface components {
          *     domain separation keeps the same string under two classifiers, or as an account name, from
          *     correlating. The key never leaves the agent, so fingerprints only correlate values seen by the
          *     same agent.
+         *
+         *     The normalization of the value is **agent-local and not part of this contract**: it belongs to
+         *     the agent's classifier implementation and may change with its classifier set version. The
+         *     console treats fingerprints as opaque, compares them only for equality, and must not assume
+         *     that fingerprints of different agents, classifiers or `classifiers_version`s correlate.
          */
         Fingerprint: string;
         /**
@@ -392,7 +414,12 @@ export interface components {
          *     (possibly sensitive) name.
          */
         Error: {
-            /** @enum {string} */
+            /**
+             * @description Closed set. Agents decode it strictly, so adding a value is an incompatible change (new
+             *     ADR and protocol version); a new situation reuses an existing code (e.g. `unavailable`
+             *     for `501`, see `NotImplemented`).
+             * @enum {string}
+             */
             code: "invalid_request" | "unauthorized" | "not_found" | "conflict" | "batch_conflict" | "rotation_conflict" | "invalid_secret" | "payload_too_large" | "protocol_unsupported" | "rate_limited" | "unavailable" | "internal";
             message: string;
             request_id?: components["schemas"]["Uuid"];
@@ -403,7 +430,22 @@ export interface components {
         ErrorDetail: {
             /** @description JSON pointer into the submitted body (e.g. `/findings/3/confidence`); `""` for the root. */
             pointer: string;
-            /** @description Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`). */
+            /**
+             * @description Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`), or the
+             *     keyword of a console-side check (see "Console-side checks" in the description of this
+             *     contract):
+             *     - `const`: a value that must equal the job's (`/classifiers_version`,
+             *       `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+             *     - `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
+             *       `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
+             *     - `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
+             *     - `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
+             *       or a classifier id not registered for the batch's version or outside the job's
+             *       `params.classifiers` (`/findings/<i>/classifier`);
+             *     - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
+             *     - `formatMaximum`: a timestamp more than 5 min in the future;
+             *     - `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
+             */
             keyword: string;
         };
         EnrollRequest: {
@@ -559,6 +601,10 @@ export interface components {
             /** @description The agent must not start the job after this instant (reports `failed` / `expired`). */
             expires_at?: components["schemas"]["Timestamp"];
             target_id: components["schemas"]["TargetId"];
+            /**
+             * @description Classifier set the scan must use; always a version of the classifier registry
+             *     (`classifiers.json`). Findings batches of this job must carry the same version.
+             */
             classifiers_version: components["schemas"]["ClassifiersVersion"];
             params: components["schemas"]["DiscoveryScanParams"];
         };
@@ -600,7 +646,8 @@ export interface components {
              */
             exclude_objects?: components["schemas"]["IdentifierPattern"][];
             /**
-             * @description Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`.
+             * @description Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`
+             *     (as listed in `classifiers.json`); present = ids of that version only.
              *     An empty list is rejected (`minItems: 1`): it never means "no classifiers" nor "all".
              */
             classifiers?: components["schemas"]["ClassifierId"][];
@@ -727,6 +774,7 @@ export interface components {
             batch_id: components["schemas"]["UuidV7"];
             /** @description The `discovery.scan` job that produced these findings. */
             job_id: components["schemas"]["Uuid"];
+            /** @description Must equal the job's `classifiers_version` (`const`) and be registered (`enum`). */
             classifiers_version: components["schemas"]["ClassifiersVersion"];
             findings: components["schemas"]["Finding"][];
         };
@@ -909,6 +957,24 @@ export interface components {
         };
         /** @description Rate limited. Exponential backoff with jitter, honoring `Retry-After`. */
         TooManyRequests: {
+            headers: {
+                "Retry-After": components["headers"]["RetryAfter"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description The endpoint is part of this contract but not implemented by this console version (e.g.
+         *     `POST /events` before Audit, phase 4). The body is not read. `code` is `unavailable`: there is
+         *     no dedicated `not_implemented` code because `Error.code` is a closed enum decoded strictly by
+         *     v1 agents, and a new value would make a deployed agent fail to decode the whole error body.
+         *     The console may send `Retry-After` (typically 3600 s). The agent treats it like any `5xx`:
+         *     it keeps the batch spooled within its bounds and retries with backoff, honoring `Retry-After`
+         *     when present; it never drops the batch because of a `501`.
+         */
+        NotImplemented: {
             headers: {
                 "Retry-After": components["headers"]["RetryAfter"];
                 [name: string]: unknown;
@@ -1169,6 +1235,7 @@ export interface operations {
             413: components["responses"]["PayloadTooLarge"];
             426: components["responses"]["UpgradeRequired"];
             429: components["responses"]["TooManyRequests"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
