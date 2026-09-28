@@ -32,7 +32,8 @@ a legitimate agent. Verified secrets are cached 25 s, bound to the stored hash a
 revocation; the agent row is read on every request, so a revocation from any console process is
 effective immediately. A 24 h "known good" fingerprint of the last verified secret only exempts it
 from the per-agent failure limit (an attacker cannot lock the agent out); it never authenticates.
-It is persisted in the agent row (hash-bound SHA-256, no secret), so it survives console restarts.
+It is persisted in the agent row (hash-bound HMAC keyed by the console server key, no secret), so it
+survives console restarts; the pending secret registered by an authenticated `/rotate` gets one too.
 
 Rotation: `authenticateAgent` also matches the pending secret (promoting it on first use) and the
 previous one (`401` inside the 60 s window, `/rotate` only gets it through; after the window the

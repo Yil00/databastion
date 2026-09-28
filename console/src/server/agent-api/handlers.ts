@@ -14,9 +14,9 @@ import {
   type RotateOutcome,
 } from "@/server/rotation";
 import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
-import { clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
+import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
-import { authenticateAgent, type AuthOptions, type AuthResult } from "./auth";
+import { authenticateAgent, authPrecheck, type AuthOptions, type AuthResult } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -178,12 +178,15 @@ export function handleJobStatus(req: Request, jobId: string): Promise<Response> 
 }
 
 /**
- * `/rotate` bodies are read BEFORE authentication (a `RotateRequest` is a few hundred bytes: 64 KiB
- * cap, `413` after authentication beyond), so that the late-retry check of a stale `S0` runs under
- * the argon2id pool slot of the authentication itself (P1-D). Nothing about the body is answered
- * before the caller is authenticated.
+ * `/rotate` bodies are read BEFORE the argon2id authentication, but after its cheap checks
+ * (`authPrecheck`: headers, secret format, failure limits; L1), so that the late-retry check of a
+ * stale `S0` runs under the argon2id pool slot of the authentication itself (P1-D). 64 KiB cap
+ * (`413` after authentication beyond); 10 s read deadline (`400` before any argon2id work). Apart
+ * from that deadline, nothing about the body is answered before the caller is authenticated.
  */
 export const MAX_ROTATE_BODY_BYTES = 64 * 1024;
+/** Read deadline of the `/rotate` body (test hook: tests shorten it). */
+export const rotateBodyDeadline = { ms: BODY_READ_DEADLINE_MS };
 
 /** A well-formed `new_secret` of a body not validated yet, for `AuthOptions.staleCandidate`. */
 function rotateCandidate(body: BodyResult): string | undefined {
@@ -205,7 +208,13 @@ export function handleRotate(req: Request): Promise<Response> {
   return guarded("rotate", async () => {
     const headers = checkProtocolHeaders(req);
     if (headers) return headers;
-    const raw = await readJsonBody(req, MAX_ROTATE_BODY_BYTES);
+    // L1: cheap rejections (headers, secret format, failure limits) before buffering the body.
+    const pre = await authPrecheck(req);
+    if (!pre.ok) return pre.response;
+    const raw = await readJsonBody(req, { maxBytes: MAX_ROTATE_BODY_BYTES, deadlineMs: rotateBodyDeadline.ms });
+    // A body not received within the deadline is answered before any argon2id work: no pool slot,
+    // no counted attempt, and never a lock (a slow network is not a rotation conflict).
+    if (!raw.ok && raw.timedOut) return invalidRequest();
     const auth = await preamble(req, { allowPrevious: true, staleCandidate: rotateCandidate(raw) });
     if (!auth.ok) return auth.response;
     if (auth.via === "previous" && auth.stale) {

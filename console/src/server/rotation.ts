@@ -4,7 +4,7 @@ import type { Database } from "@/db/client";
 import { agents, jobs, securityEvents } from "@/db/schema";
 import type { Schemas } from "@/lib/protocol/validate";
 
-import { purgeSecretCache, TOLERANCE_WINDOW_MS, type SecretSlot } from "./agent-api/auth";
+import { knownGoodFingerprint, purgeSecretCache, TOLERANCE_WINDOW_MS, type SecretSlot } from "./agent-api/auth";
 import { jobHub, JOBS_CHANNEL, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { argon2Hash, argon2Verify, isLowEntropySecret, rotateArgon2Gate } from "./crypto";
@@ -62,6 +62,7 @@ export async function lockAgentForConflict(
         promotedGraceExpiresAt: null,
         knownGoodFingerprint: null,
         knownGoodAt: null,
+        knownGoodPendingFingerprint: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.lockedAt), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
@@ -179,10 +180,18 @@ export async function rotateSecret(
         newHash = await argon2Hash(next);
       }
       const graceExpiresAt = new Date(Date.now() + ROTATION_GRACE_S * 1000);
+      const pendingHash = newHash;
+      const pendingFingerprint = knownGoodFingerprint(next, pendingHash);
       const registered = await db.transaction(async (tx) => {
         const rows = await tx
           .update(agents)
-          .set({ pendingSecretHash: newHash, graceExpiresAt })
+          // L2: S1 comes from the agent authenticated with its current secret: known good while
+          // pending (exempt from the per-agent failure limit), carried over at promotion.
+          .set({
+            pendingSecretHash: pendingHash,
+            graceExpiresAt,
+            knownGoodPendingFingerprint: pendingFingerprint,
+          })
           .where(
             and(
               eq(agents.id, auth.agentId),
@@ -340,11 +349,12 @@ export async function staleRotateRetry(
   if (!row || !row.currentSecretHash || row.revokedAt || row.lockedAt) return { kind: "unauthorized" };
   // S0 replaced by a newer promotion meanwhile: it is now an unknown secret, like any other.
   if (row.previousSecretHash !== auth.matchedHash) return { kind: "unauthorized" };
-  // The check was made against another current hash (a promotion landed meanwhile), or not made:
-  // decide nothing, and run no argon2id here.
-  if (row.currentSecretHash !== auth.verifiedCurrentHash || auth.staleDuplicate === undefined) {
-    return { kind: "unauthorized" };
-  }
+  // The check was made against another current hash (a promotion landed meanwhile): decide
+  // nothing, and run no argon2id here.
+  if (row.currentSecretHash !== auth.verifiedCurrentHash) return { kind: "unauthorized" };
+  // Row unchanged but no check was made (no well-formed candidate reached authentication): a stale
+  // S0 that is not a valid late retry locks, like any other (I1).
+  if (auth.staleDuplicate === undefined) return conflict();
   if (auth.staleDuplicate) {
     return { kind: "duplicate", graceExpiresAt: row.promotedGraceExpiresAt ?? row.promotedAt ?? new Date() };
   }

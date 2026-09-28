@@ -13,6 +13,8 @@ export default defineConfig({
     restoreMocks: true,
     // Throwaway PostgreSQL cluster for the DB tests (skipped with a message when unavailable).
     globalSetup: ["./src/test/pg-global-setup.ts"],
+    // Console server key for the tests (known-good fingerprints, P1-D). Fake test canary.
+    env: { DATABASTION_ENCRYPTION_KEY: "hunter2-SECRET-test-server-key-0123456789abcdef" },
     testTimeout: 30_000,
     hookTimeout: 120_000,
   },

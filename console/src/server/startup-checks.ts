@@ -17,6 +17,11 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
       "DATABASTION_INSECURE_COOKIES=1 in production: session cookies are sent without Secure; use it only for plain-HTTP test setups.",
     );
   }
+  if (production && !env.DATABASTION_ENCRYPTION_KEY && !env.DATABASTION_ENCRYPTION_KEY_FILE) {
+    warnings.push(
+      "DATABASTION_ENCRYPTION_KEY(_FILE) unset: agent known-good fingerprints are disabled (agents lose the lock-out exemption).",
+    );
+  }
   if (production && !env.DATABASTION_METRICS_PORT && (env.DATABASTION_METRICS_TOKEN || env.DATABASTION_METRICS_TOKEN_FILE)) {
     warnings.push(
       "/metrics is served on the main port: set DATABASTION_METRICS_PORT to move it to a dedicated listener, or block /metrics at the reverse proxy.",

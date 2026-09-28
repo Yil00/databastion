@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "known_good_pending_fingerprint" text;

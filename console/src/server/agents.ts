@@ -181,6 +181,7 @@ export async function revokeAgent(
         promotedGraceExpiresAt: null,
         knownGoodFingerprint: null,
         knownGoodAt: null,
+        knownGoodPendingFingerprint: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt)))
       .returning({ id: agents.id });

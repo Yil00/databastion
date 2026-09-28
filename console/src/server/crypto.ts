@@ -1,6 +1,8 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { hash, verify, type Algorithm } from "@node-rs/argon2";
+
+import { readEnvOrFile, type Env } from "@/config/env";
 
 /**
  * Secret primitives. Nothing here logs its input.
@@ -151,4 +153,49 @@ export function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
   return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
+// ------------------------------------------------------------------------ server key
+
+/** Minimum length of `DATABASTION_ENCRYPTION_KEY` (e.g. `openssl rand -base64 32`: 44 characters). */
+export const MIN_SERVER_KEY_LENGTH = 32;
+
+const subkeyCache = new Map<string, { source: string; key: Buffer | null }>();
+let warnedServerKey = false;
+
+/**
+ * 256-bit subkey derived (HKDF-SHA256) from the console server key `DATABASTION_ENCRYPTION_KEY(_FILE)`
+ * for one `domain` (e.g. `agent-known-good.v1`); distinct domains give independent keys. Returns
+ * `null` when the key is unset, too short or unreadable: callers must then fail closed. Memoized per
+ * configuration (a file is read once). The key is never logged.
+ */
+export function serverSubkey(domain: string, env: Env = process.env): Buffer | null {
+  const source = `${env.DATABASTION_ENCRYPTION_KEY ?? ""}\0${env.DATABASTION_ENCRYPTION_KEY_FILE ?? ""}`;
+  const cached = subkeyCache.get(domain);
+  if (cached && cached.source === source) return cached.key;
+  let key: Buffer | null = null;
+  try {
+    const ikm = readEnvOrFile("DATABASTION_ENCRYPTION_KEY", env);
+    if (ikm !== undefined && ikm.length >= MIN_SERVER_KEY_LENGTH) {
+      key = Buffer.from(hkdfSync("sha256", Buffer.from(ikm, "utf8"), "databastion.console.v1", domain, 32));
+    }
+  } catch {
+    key = null;
+  }
+  if (key === null && !warnedServerKey) {
+    warnedServerKey = true;
+    // Imported lazily: crypto.ts stays free of the logger for the Edge-safe callers.
+    void import("@/lib/logger").then(({ logger }) =>
+      logger.warn(
+        `DATABASTION_ENCRYPTION_KEY(_FILE) unset, shorter than ${MIN_SERVER_KEY_LENGTH} characters or unreadable: features keyed by it are disabled (fail closed)`,
+      ),
+    );
+  }
+  subkeyCache.set(domain, { source, key });
+  return key;
+}
+
+/** Hex HMAC-SHA256 of `value` under `key`. */
+export function hmacSha256Hex(key: Buffer, value: string): string {
+  return createHmac("sha256", key).update(value, "utf8").digest("hex");
 }

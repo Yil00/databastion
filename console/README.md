@@ -36,8 +36,12 @@ database (also used as the job queue: no Redis). See
 | `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
-[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) is not
-used yet (see "Data at rest"). The console only knows its own database: it never stores target
+[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
+e.g. `openssl rand -base64 32`) is the console server key of the web process. Today it only keys the
+agent "known good" fingerprints (HKDF-SHA256 subkey, domain `agent-known-good.v1`, see "Data at
+rest"); unset, too short or unreadable: those fingerprints are neither stored nor matched (fail
+closed: agents lose the lock-out exemption, nothing else) and a warning is logged. Changing it
+invalidates the stored fingerprints. The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
 ## Commands
@@ -197,8 +201,10 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
   5 min locks the agent; once `S0` is recognized, this path never answers `400` / `404` / `429` /
   `503` and never uses the per-agent rotate bucket. Its only argon2id work (does `new_secret`
   verify against the current hash?) runs inside the authentication itself, under the pool slot and
-  the counted attempt that verified `S0` (P1-D): the `/rotate` body is read before authentication
-  for that (64 KiB cap, `413` after authentication beyond; nothing is answered about it before);
+  the counted attempt that verified `S0` (P1-D): the `/rotate` body is read before the argon2id
+  authentication for that, but after its cheap checks (headers, secret format, failure limits),
+  with a 64 KiB cap (`413` after authentication beyond) and a 10 s read deadline (`400` before any
+  argon2id work, never a lock); nothing else about it is answered before authentication;
 - `rotation_conflict` (`409`): `/rotate` with `S0` and any other secret while pending or at any time
   after the promotion, or any other request with `S0` after the window. The agent is locked (every secret hash
   cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
@@ -293,7 +299,7 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Data | Storage |
 |------|---------|
 | User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
-| Agent "known good" fingerprint (`agents.known_good_fingerprint`, `known_good_at`) | SHA-256 over a domain tag, the current argon2id hash and the 256-bit agent secret; never authenticates, only exempts the last verified secret from the per-agent failure limit (24 h, survives restarts); cleared on promotion, lock and revocation |
+| Agent "known good" fingerprints (`agents.known_good_fingerprint`, `known_good_at`, `known_good_pending_fingerprint`) | HMAC-SHA256 (subkey of `DATABASTION_ENCRYPTION_KEY`) over the bound argon2id hash and the 256-bit agent secret; never authenticate, only exempt the last verified secret (24 h, survives restarts) and the pending secret registered by the authenticated agent from the per-agent failure limit; the pending one becomes the current one at promotion; cleared on lock and revocation |
 | Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
