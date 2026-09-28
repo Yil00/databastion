@@ -2,18 +2,23 @@
 //!
 //! The agent is an HTTPS client only: this binary opens no listening socket
 //! (invariant I1). Logs are structured JSON on stdout and never contain a
-//! sampled value (I2).
+//! sampled value (I2) nor a secret.
 //!
-//! Skeleton status (P0-D): parses the command line, logs startup and the
-//! compiled-in connectors, then exits.
+//! Subcommands:
+//! - `enroll --config <agent.yaml> --token-file <path>`: exchanges a
+//!   single-use enrollment token for an identity (`0600`) and generates the
+//!   local HMAC key;
+//! - `run --config <agent.yaml>`: heartbeat and jobs loops until SIGTERM /
+//!   SIGINT.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
-use databastion_core::{Connector, Engine};
+use clap::{Parser, Subcommand};
+use databastion_core::{AgentConfig, Connector, Engine};
+use tokio::sync::watch;
 use tracing::Level;
 use tracing_subscriber::filter::{EnvFilter, filter_fn};
 use tracing_subscriber::prelude::*;
@@ -25,9 +30,31 @@ const LOG_ENV: &str = "DATABASTION_LOG";
 #[derive(Debug, Parser)]
 #[command(name = "databastion-agent", version, about)]
 struct Cli {
-    /// Path to the agent configuration file (`agent.yaml`).
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Enroll this agent with a single-use token from the console.
+    Enroll {
+        /// Path to the agent configuration file (`agent.yaml`).
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        /// File holding the enrollment token (never pass it on the command
+        /// line: it would be visible in the process list).
+        #[arg(long, value_name = "PATH", env = "DATABASTION_ENROLLMENT_TOKEN_FILE")]
+        token_file: PathBuf,
+        /// Replace an existing identity.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run the agent.
+    Run {
+        /// Path to the agent configuration file (`agent.yaml`).
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
 }
 
 /// Connectors compiled into this binary (Cargo features).
@@ -70,6 +97,61 @@ fn init_logging() -> Result<(), tracing_subscriber::util::TryInitError> {
     tracing_subscriber::registry().with(layer).try_init()
 }
 
+/// Resolves on SIGTERM or SIGINT.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = ctrl_c.await;
+        }
+    }
+}
+
+async fn run(config: PathBuf) -> ExitCode {
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown requested");
+        let _ = tx.send(true);
+    });
+    match databastion_core::run(&config, compiled_connectors(), rx).await {
+        Ok(()) => {
+            tracing::info!("databastion-agent stopped");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "databastion-agent stopped on error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn enroll(config: PathBuf, token_file: PathBuf, force: bool) -> ExitCode {
+    let config = match AgentConfig::load(&config) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    match databastion_core::enroll(&config, &token_file, force, &compiled_engines()).await {
+        Ok(agent_id) => {
+            tracing::info!(agent_id, "enrollment complete");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "enrollment failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -81,15 +163,17 @@ async fn main() -> ExitCode {
     let engines: Vec<&str> = compiled_engines().into_iter().map(Engine::as_str).collect();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        config = %cli.config.display(),
         connectors = ?engines,
         "databastion-agent starting"
     );
-    tracing::warn!(
-        "skeleton build: configuration loading, enrollment and uplink are not implemented yet"
-    );
-    tracing::info!("databastion-agent stopped");
-    ExitCode::SUCCESS
+    match cli.command {
+        Command::Enroll {
+            config,
+            token_file,
+            force,
+        } => enroll(config, token_file, force).await,
+        Command::Run { config } => run(config).await,
+    }
 }
 
 #[cfg(test)]
@@ -103,19 +187,49 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_config_path() {
+    fn cli_parses_run() {
         let cli = Cli::try_parse_from([
             "databastion-agent",
+            "run",
             "--config",
             "/etc/databastion/agent.yaml",
         ])
         .unwrap();
-        assert_eq!(cli.config, PathBuf::from("/etc/databastion/agent.yaml"));
+        match cli.command {
+            Command::Run { config } => {
+                assert_eq!(config, PathBuf::from("/etc/databastion/agent.yaml"));
+            }
+            Command::Enroll { .. } => panic!("expected run"),
+        }
     }
 
     #[test]
-    fn cli_requires_config() {
+    fn cli_parses_enroll() {
+        let cli = Cli::try_parse_from([
+            "databastion-agent",
+            "enroll",
+            "--config",
+            "/etc/databastion/agent.yaml",
+            "--token-file",
+            "/run/token",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Enroll {
+                token_file, force, ..
+            } => {
+                assert_eq!(token_file, PathBuf::from("/run/token"));
+                assert!(force);
+            }
+            Command::Run { .. } => panic!("expected enroll"),
+        }
+    }
+
+    #[test]
+    fn cli_requires_a_subcommand_and_config() {
         assert!(Cli::try_parse_from(["databastion-agent"]).is_err());
+        assert!(Cli::try_parse_from(["databastion-agent", "run"]).is_err());
     }
 
     #[test]

@@ -14,10 +14,28 @@ databastion-classifiers.workspace = true
 databastion-protocol.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tracing.workspace = true
+# HTTPS uplink. rustls only (no OpenSSL / native-tls), `ring` crypto provider
+# (reqwest's `__rustls-ring`), trust roots from the system store
+# (`rustls-native-certs`) or a pinned CA file (`console.ca_file`). No http2,
+# no system-proxy feature, no cookies, no compression.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_yaml_ng = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+getrandom = { version = "0.4", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+# HTTP mock server for tests only (bound to 127.0.0.1 by wiremock). It pulls
+# hyper's `server` feature: deny.toml excludes dev-dependencies from the
+# graph (`exclude-dev`), the shipped binary never links it.
+wiremock = "0.6"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

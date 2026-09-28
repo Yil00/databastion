@@ -1,0 +1,48 @@
+# Example configuration for databastion-agent (agent.yaml).
+#
+# - The agent only connects to the console (HTTPS, TLS 1.3) and to the
+#   targets declared below (I1, I5). It never listens on a port.
+# - Database credentials stay on this host (I3): give a *reference* to each
+#   secret (an environment variable name or a 0600 file), never the secret.
+# - Unknown keys are rejected.
+
+console:
+  # Base URL of the console; the agent API path /api/agent/v1 is appended.
+  url: https://console.example.internal
+  # Optional: PEM CA certificate of the console. When set, it is the only
+  # trusted root (pinning); otherwise the system trust store is used.
+  # ca_file: /etc/databastion/console-ca.pem
+  # Long-poll wait for GET /jobs (0..=25 s). Lower it behind a proxy with a
+  # short idle timeout.
+  long_poll_wait_s: 25
+  # Development only: allows http:// for a console on 127.0.0.1 / ::1 /
+  # localhost. Refused for any other host.
+  # insecure_dev_http: false
+
+# Identity (0600), pending rotation secret, local HMAC key and spool.
+state_dir: /var/lib/databastion
+
+# Local hard limits (I4). Console job parameters are clamped to them.
+limits:
+  max_sample_rows: 1000        # 1..=10000
+  statement_timeout_ms: 30000  # 100..=600000, never 0
+  max_scan_duration_s: 3600    # 60..=86400
+
+targets:
+  - id: pg-main                # slug reported to the console (no host name)
+    engine: postgres           # postgres | mysql | mariadb | mongodb | openldap
+    host: 127.0.0.1            # or `socket: /var/run/postgresql/.s.PGSQL.5432`
+    port: 5432
+    account: databastion       # dedicated read-only account (docs/05-security.md)
+    secret:
+      env: DATABASTION_PG_MAIN_PASSWORD
+  - id: ldap-main
+    engine: openldap
+    socket: /run/slapd/ldapi
+    account: cn=databastion,dc=example,dc=com
+    secret:
+      file: /etc/databastion/secrets/ldap-main   # 0600, owned by the agent user
+
+# metrics.local_listen is not implemented yet: a local listener is an
+# exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
+# it is rejected.

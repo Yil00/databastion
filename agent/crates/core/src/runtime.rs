@@ -1,0 +1,758 @@
+//! Agent runtime: enrollment, heartbeat loop and jobs long-poll loop.
+//!
+//! The binary only gets [`enroll`] and [`run`]; the uplink, the session and
+//! the generated protocol types stay private to this crate.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
+
+use databastion_protocol::{
+    AgentVersion, Connector as ProtoConnector, ConnectorList, Count, EnrollRequest,
+    EnrollRequestArch, EnrollRequestOs, EnrollResponse, EnrollmentToken, FailureCode,
+    HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate, MetricsMap,
+    MetricsMapKey, SpoolStatus, TargetId, TargetStatus, Timestamp, Uuid,
+};
+use reqwest::{Method, StatusCode};
+use tokio::sync::watch;
+use zeroize::Zeroizing;
+
+use crate::backoff;
+use crate::config::{AgentConfig, ConfigError, TargetEngine};
+use crate::connector::Connector;
+use crate::engine::{AuditLevel, Engine};
+use crate::identity::{Identity, IdentityError, StateDir};
+use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
+use crate::session::{CallError, RotateOutcome, Session};
+use crate::uplink::{self, Auth, Uplink, UplinkError};
+
+/// Errors returned to the binary. Messages never contain a secret or a
+/// configuration value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// Invalid configuration.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// Identity / state directory problem.
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    /// Enrollment failed.
+    #[error("enrollment failed: {0}")]
+    Enrollment(String),
+    /// Uplink setup or unrecoverable uplink error.
+    #[error("uplink: {0}")]
+    Uplink(String),
+    /// The console locked this agent (`rotation_conflict`).
+    #[error("rotation conflict: the console locked this agent; revoke and re-enroll it")]
+    RotationConflict,
+}
+
+impl From<UplinkError> for AgentError {
+    fn from(e: UplinkError) -> Self {
+        Self::Uplink(e.to_string())
+    }
+}
+
+impl From<CallError> for AgentError {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::RotationConflict => Self::RotationConflict,
+            CallError::Identity(e) => Self::Identity(e),
+            other => Self::Uplink(other.to_string()),
+        }
+    }
+}
+
+fn now() -> Timestamp {
+    Timestamp(chrono::DateTime::<chrono::Utc>::from(SystemTime::now()))
+}
+
+fn agent_version() -> Result<AgentVersion, AgentError> {
+    AgentVersion::try_from(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| AgentError::Uplink("invalid agent version".to_owned()))
+}
+
+fn proto_connector(engine: Engine) -> ProtoConnector {
+    match engine {
+        Engine::Postgres => ProtoConnector::Postgres,
+        Engine::Mysql => ProtoConnector::Mysql,
+        Engine::Mongodb => ProtoConnector::Mongodb,
+        Engine::Openldap => ProtoConnector::Openldap,
+    }
+}
+
+fn connector_list(engines: &[Engine]) -> ConnectorList {
+    ConnectorList(engines.iter().copied().map(proto_connector).collect())
+}
+
+fn hostname() -> Hostname {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .and_then(|h| Hostname::try_from(h.trim()).ok())
+        .or_else(|| Hostname::try_from("localhost").ok())
+        .unwrap_or_else(fallback_hostname)
+}
+
+#[allow(clippy::expect_used, reason = "constant literal matching the pattern")]
+fn fallback_hostname() -> Hostname {
+    Hostname::try_from("unknown").expect("valid hostname literal")
+}
+
+/// Reads the enrollment token from a file (surrounding whitespace ignored).
+fn read_token(path: &Path) -> Result<EnrollmentToken, AgentError> {
+    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        AgentError::Enrollment(format!(
+            "cannot read the token file {}: {}",
+            path.display(),
+            e.kind()
+        ))
+    })?);
+    EnrollmentToken::try_from(text.trim()).map_err(|_| {
+        AgentError::Enrollment("the token file does not contain a valid enrollment token".into())
+    })
+}
+
+/// Maximum attempts for `POST /enroll` on retryable errors.
+const ENROLL_ATTEMPTS: u32 = 5;
+
+/// Enrolls the agent: exchanges the token for an identity, stores it
+/// (`0600`, atomic) and generates the local HMAC key (never transmitted).
+/// Returns the agent id.
+///
+/// # Errors
+/// [`AgentError`]; an existing identity is only replaced with `force`.
+pub async fn enroll(
+    config: &AgentConfig,
+    token_file: &Path,
+    force: bool,
+    engines: &[Engine],
+) -> Result<String, AgentError> {
+    let state = StateDir::new(&config.state_dir);
+    if state.has_identity() && !force {
+        return Err(IdentityError::AlreadyEnrolled(state.identity_path()).into());
+    }
+    state.ensure()?;
+    let token = read_token(token_file)?;
+    let uplink = Uplink::new(config)?;
+    let request = EnrollRequest {
+        agent_version: agent_version()?,
+        arch: EnrollRequestArch::try_from(std::env::consts::ARCH).ok(),
+        connectors: connector_list(engines),
+        hostname: hostname(),
+        os: Some(EnrollRequestOs::Linux),
+        token,
+    };
+    let body = Zeroizing::new(
+        serde_json::to_vec(&request)
+            .map_err(|_| AgentError::Enrollment("cannot encode the request".into()))?,
+    );
+    drop(request);
+    let mut attempt = 0;
+    let reply = loop {
+        match uplink
+            .request(
+                Method::POST,
+                "/enroll",
+                &[],
+                Auth::Anonymous,
+                Some(&body),
+                uplink::REQUEST_TIMEOUT,
+            )
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(UplinkError::Unauthorized) => {
+                return Err(AgentError::Enrollment(
+                    "token rejected (unknown, expired or already used); not retried".into(),
+                ));
+            }
+            Err(e) if e.is_retryable() && attempt + 1 < ENROLL_ATTEMPTS => {
+                let delay = e.retry_delay(attempt);
+                tracing::warn!(error = %e, delay_ms = delay.as_millis() as u64, "enrollment retry");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let response: EnrollResponse = serde_json::from_slice(&reply.body)
+        .map_err(|_| AgentError::Enrollment("invalid enrollment response".into()))?;
+    let interval = backoff::clamp_heartbeat_interval(response.heartbeat_interval_s.0)
+        .unwrap_or(backoff::HEARTBEAT_DEFAULT_S);
+    let identity = Identity {
+        agent_id: response.agent_id,
+        secret: response.agent_secret,
+        pending: None,
+        rotation_job: None,
+        heartbeat_interval_s: interval,
+    };
+    state.save_identity(&identity)?;
+    state.create_hmac_key()?;
+    tracing::info!(agent_id = %identity.agent_id, "agent enrolled");
+    Ok(identity.agent_id.to_string())
+}
+
+/// Run state shared by the loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    /// Normal operation.
+    Active,
+    /// Fatal `401`: no job polling; one heartbeat every 15 min.
+    Suspended,
+}
+
+#[derive(Default)]
+struct Counters {
+    heartbeats_sent: AtomicU64,
+    heartbeat_failures: AtomicU64,
+    jobs_received: AtomicU64,
+    jobs_failed: AtomicU64,
+    jobs_unparseable: AtomicU64,
+    jobs_deferred: AtomicU64,
+}
+
+fn bump(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+struct Runtime {
+    config_path: PathBuf,
+    config: RwLock<AgentConfig>,
+    session: Session,
+    connectors: Vec<Box<dyn Connector>>,
+    started: Instant,
+    counters: Counters,
+    ledger: Mutex<Ledger>,
+    state: watch::Sender<RunState>,
+}
+
+/// Runs the agent until `shutdown` becomes `true`.
+///
+/// # Errors
+/// Startup errors (configuration, identity, uplink setup) and fatal errors
+/// (`rotation_conflict`).
+pub async fn run(
+    config_path: &Path,
+    connectors: Vec<Box<dyn Connector>>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), AgentError> {
+    let config = AgentConfig::load(config_path)?;
+    let runtime = Runtime::new(config_path, config, connectors)?;
+    runtime.run(shutdown).await
+}
+
+impl Runtime {
+    fn new(
+        config_path: &Path,
+        config: AgentConfig,
+        connectors: Vec<Box<dyn Connector>>,
+    ) -> Result<Self, AgentError> {
+        let state = StateDir::new(&config.state_dir);
+        let identity = state.load_identity()?;
+        // The HMAC key must exist (fingerprints, P2); it is never sent.
+        state.load_hmac_key()?;
+        let uplink = Uplink::new(&config)?;
+        tracing::info!(agent_id = %identity.agent_id, "identity loaded");
+        Ok(Self {
+            config_path: config_path.to_owned(),
+            config: RwLock::new(config),
+            session: Session::new(uplink, state, identity),
+            connectors,
+            started: Instant::now(),
+            counters: Counters::default(),
+            ledger: Mutex::new(Ledger::default()),
+            state: watch::channel(RunState::Active).0,
+        })
+    }
+
+    async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        let heartbeat = self.heartbeat_loop(shutdown.clone());
+        let jobs = self.jobs_loop(shutdown);
+        tokio::select! {
+            r = heartbeat => r,
+            r = jobs => r,
+        }
+    }
+
+    fn config(&self) -> AgentConfig {
+        self.config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_state(&self, state: RunState) {
+        self.state.send_if_modified(|s| {
+            let changed = *s != state;
+            *s = state;
+            changed
+        });
+    }
+
+    // ------------------------------------------------------------ heartbeat
+
+    async fn target_statuses(&self, config: &AgentConfig) -> Vec<TargetStatus> {
+        let mut out = Vec::with_capacity(config.targets.len());
+        for target in &config.targets {
+            let Ok(target_id) = TargetId::try_from(target.id.as_str()) else {
+                continue; // validated by config; unreachable in practice
+            };
+            let connector = self
+                .connectors
+                .iter()
+                .find(|c| c.engine() == target.engine.connector());
+            let (reachable, level, last_error) = match connector {
+                None => (false, AuditLevel::None, Some(FailureCode::Unsupported)),
+                Some(c) => match tokio::time::timeout(Duration::from_secs(10), c.check()).await {
+                    Ok(h) => (h.reachable, h.audit_level, None),
+                    Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
+                },
+            };
+            out.push(TargetStatus {
+                audit_level: proto_audit_level(level),
+                audit_source: None,
+                edition: None,
+                engine: proto_engine(target.engine),
+                last_error,
+                metrics: None,
+                reachable,
+                server_version: None,
+                target_id,
+            });
+        }
+        out
+    }
+
+    fn metrics(&self) -> MetricsMap {
+        let c = &self.counters;
+        let mut map = std::collections::HashMap::new();
+        for (name, value) in [
+            ("heartbeats_sent_total", &c.heartbeats_sent),
+            ("heartbeat_failures_total", &c.heartbeat_failures),
+            ("jobs_received_total", &c.jobs_received),
+            ("jobs_failed_total", &c.jobs_failed),
+            ("jobs_unparseable_total", &c.jobs_unparseable),
+            ("jobs_deferred_total", &c.jobs_deferred),
+        ] {
+            if let Ok(key) = MetricsMapKey::try_from(name) {
+                #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+                map.insert(key, value.load(Ordering::Relaxed) as f64);
+            }
+        }
+        MetricsMap(map)
+    }
+
+    async fn build_heartbeat(&self) -> Result<HeartbeatRequest, AgentError> {
+        let config = self.config();
+        let engines: Vec<Engine> = self.connectors.iter().map(|c| c.engine()).collect();
+        let uptime = i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX);
+        Ok(HeartbeatRequest {
+            agent_version: agent_version()?,
+            classifiers_version: None,
+            connectors: connector_list(&engines),
+            // Local engine detection (ADR-0006) is a separate P1-B item.
+            detected_targets: Vec::new(),
+            metrics: Some(self.metrics()),
+            running_jobs: None,
+            // Placeholder until the bounded disk spool exists.
+            spool: SpoolStatus {
+                batches: Count(0),
+                bytes: Count(0),
+                dropped_batches: None,
+                dropped_items: None,
+                max_bytes: Count(0),
+                oldest_age_s: None,
+            },
+            targets: self.target_statuses(&config).await,
+            ts: now(),
+            uptime_s: Count(uptime),
+        })
+    }
+
+    /// Sends one heartbeat; returns the clamped interval from the console.
+    async fn heartbeat_once(&self) -> Result<Option<u64>, CallError> {
+        let request = self
+            .build_heartbeat()
+            .await
+            .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
+        let body = serde_json::to_vec(&request)
+            .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
+        let reply = self
+            .session
+            .call(
+                Method::POST,
+                "/heartbeat",
+                &[],
+                Some(&body),
+                uplink::REQUEST_TIMEOUT,
+            )
+            .await?;
+        let response: HeartbeatResponse = serde_json::from_slice(&reply.body).map_err(|_| {
+            CallError::Uplink(UplinkError::UnexpectedResponse {
+                status: reply.status.as_u16(),
+            })
+        })?;
+        let value = response.heartbeat_interval_s.0;
+        let clamped = backoff::clamp_heartbeat_interval(value);
+        if clamped.is_none() {
+            tracing::warn!(
+                value,
+                "ignoring invalid heartbeat_interval_s from the console"
+            );
+        }
+        Ok(clamped)
+    }
+
+    async fn heartbeat_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        let mut failures: u32 = 0;
+        loop {
+            let interval = Duration::from_secs(self.session.heartbeat_interval_s());
+            let delay = match self.heartbeat_once().await {
+                Ok(new_interval) => {
+                    failures = 0;
+                    bump(&self.counters.heartbeats_sent, 1);
+                    if *self.state.borrow() == RunState::Suspended {
+                        tracing::info!("console accepted the agent again; resuming");
+                    }
+                    self.set_state(RunState::Active);
+                    if let Some(s) = new_interval {
+                        self.session.set_heartbeat_interval(s);
+                    }
+                    self.retry_pending_rotation().await?;
+                    Duration::from_secs(self.session.heartbeat_interval_s())
+                }
+                Err(e) => {
+                    bump(&self.counters.heartbeat_failures, 1);
+                    failures = failures.saturating_add(1);
+                    self.on_call_error("heartbeat", &e, failures, interval)?
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                _ = shutdown.changed() => return Ok(()),
+            }
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn retry_pending_rotation(&self) -> Result<(), AgentError> {
+        if !self.session.needs_rotation_retry() {
+            return Ok(());
+        }
+        match self.session.rotate(None).await {
+            Ok(_) => Ok(()),
+            Err(CallError::RotationConflict) => Err(AgentError::RotationConflict),
+            Err(e) => {
+                tracing::warn!(error = %e, "pending secret registration failed; will retry");
+                Ok(())
+            }
+        }
+    }
+
+    /// Common error handling; returns the delay before the next attempt.
+    fn on_call_error(
+        &self,
+        what: &'static str,
+        e: &CallError,
+        failures: u32,
+        normal: Duration,
+    ) -> Result<Duration, AgentError> {
+        match e {
+            CallError::RotationConflict => {
+                tracing::error!("rotation_conflict: the console locked this agent; stopping");
+                Err(AgentError::RotationConflict)
+            }
+            CallError::Unauthorized => {
+                tracing::error!(
+                    what,
+                    "console rejected the current secret (401): normal operation stopped, \
+                     slow retry every 15 min"
+                );
+                self.set_state(RunState::Suspended);
+                Ok(backoff::unauthorized_retry_delay(backoff::random_fraction()))
+            }
+            CallError::Uplink(UplinkError::UpgradeRequired { min_protocol }) => {
+                tracing::error!(
+                    what,
+                    min_protocol,
+                    "console requires a newer protocol (426); upgrade the agent. Results keep \
+                     being spooled"
+                );
+                Ok(normal.max(Duration::from_secs(300)))
+            }
+            CallError::Uplink(u @ UplinkError::Throttled { .. }) => {
+                Ok(u.retry_delay(failures.saturating_sub(1)))
+            }
+            CallError::Uplink(u) if u.is_retryable() => {
+                tracing::warn!(what, error = %u, "console unreachable; backing off");
+                Ok(u.retry_delay(failures.saturating_sub(1)).min(normal))
+            }
+            other => {
+                tracing::warn!(what, error = %other, "request failed");
+                Ok(normal)
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- jobs
+
+    async fn jobs_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        let mut state = self.state.subscribe();
+        let mut failures: u32 = 0;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            if *state.borrow_and_update() != RunState::Active {
+                tokio::select! {
+                    _ = state.changed() => continue,
+                    _ = shutdown.changed() => continue,
+                }
+            }
+            let wait = self.config().console.long_poll_wait_s;
+            let timeout = Duration::from_secs(u64::from(wait) + 15);
+            let query = [("wait", wait.to_string())];
+            let poll = self
+                .session
+                .call(Method::GET, "/jobs", &query, None, timeout);
+            let result = tokio::select! {
+                r = poll => r,
+                _ = shutdown.changed() => return Ok(()),
+            };
+            let delay = match result {
+                Ok(reply) => {
+                    failures = 0;
+                    if reply.status == StatusCode::OK {
+                        self.handle_job_list(&reply.body).await?;
+                    }
+                    Duration::ZERO
+                }
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    let d = self.on_call_error("jobs", &e, failures, Duration::from_secs(300))?;
+                    if matches!(e, CallError::Unauthorized) {
+                        Duration::ZERO // wait on the state change instead
+                    } else {
+                        d
+                    }
+                }
+            };
+            if !delay.is_zero() {
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    _ = shutdown.changed() => return Ok(()),
+                }
+            }
+        }
+    }
+
+    async fn handle_job_list(&self, body: &[u8]) -> Result<(), AgentError> {
+        let list = match jobs::parse_job_list(body) {
+            Ok(list) => list,
+            Err(e) => {
+                bump(&self.counters.jobs_unparseable, 1);
+                tracing::warn!(error = %e, "ignoring a malformed job list");
+                return Ok(());
+            }
+        };
+        if list.deferred > 0 {
+            bump(&self.counters.jobs_deferred, list.deferred as u64);
+            tracing::warn!(
+                deferred = list.deferred,
+                "more jobs than the per-poll cap; the rest will be redelivered"
+            );
+        }
+        for polled in list.jobs {
+            bump(&self.counters.jobs_received, 1);
+            match polled {
+                PolledJob::Unparseable {
+                    job_id: Some(id),
+                    code,
+                } => {
+                    bump(&self.counters.jobs_unparseable, 1);
+                    tracing::warn!(job_id = %id, code = %code, "unparseable job reported as failed");
+                    self.finish(id, Outcome::failed(code)).await;
+                }
+                PolledJob::Unparseable { job_id: None, .. } => {
+                    bump(&self.counters.jobs_unparseable, 1);
+                    tracing::warn!("unparseable job without a valid job_id ignored");
+                }
+                PolledJob::Parsed(job) => self.handle_job(&job).await?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_job(&self, job: &Job) -> Result<(), AgentError> {
+        let id = jobs::job_id(job);
+        let kind = jobs::job_type(job);
+        let known = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id);
+        if let Some(entry) = known {
+            if !entry.reported {
+                self.finish(id, entry.outcome).await;
+            }
+            tracing::debug!(job_id = %id, kind, "duplicate job delivery ignored");
+            return Ok(());
+        }
+        tracing::info!(job_id = %id, kind, "job received");
+        let expired = jobs::expires_at(job).is_some_and(|t| t < now().0);
+        let outcome = if expired {
+            Some(Outcome::failed(FailureCode::Expired))
+        } else {
+            self.execute(job, id).await?
+        };
+        if let Some(outcome) = outcome {
+            self.finish(id, outcome).await;
+        }
+        Ok(())
+    }
+
+    /// Executes a job. `None`: leave it unacknowledged (redelivered later).
+    async fn execute(&self, job: &Job, id: Uuid) -> Result<Option<Outcome>, AgentError> {
+        match job {
+            Job::DiscoveryScanJob(_) | Job::AuditConfigureJob(_) => {
+                // P2 / P4: not implemented in this build.
+                Ok(Some(Outcome::failed(FailureCode::Unsupported)))
+            }
+            Job::AgentConfigReloadJob(_) => Ok(Some(self.reload_config())),
+            Job::AgentRotateSecretJob(_) => self.rotate_for_job(id).await,
+        }
+    }
+
+    fn reload_config(&self) -> Outcome {
+        match AgentConfig::load(&self.config_path) {
+            Ok(new) => {
+                let mut current = self
+                    .config
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if new.console.url != current.console.url
+                    || new.console.ca_file != current.console.ca_file
+                    || new.console.insecure_dev_http != current.console.insecure_dev_http
+                    || new.state_dir != current.state_dir
+                {
+                    tracing::warn!(
+                        "console or state_dir settings changed: they apply after a restart"
+                    );
+                }
+                *current = new;
+                tracing::info!("configuration reloaded");
+                Outcome::SUCCEEDED
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "configuration reload failed; keeping the previous one");
+                Outcome::failed(FailureCode::Internal)
+            }
+        }
+    }
+
+    async fn rotate_for_job(&self, id: Uuid) -> Result<Option<Outcome>, AgentError> {
+        for attempt in 0..3 {
+            match self.session.rotate(Some(id)).await {
+                Ok(RotateOutcome::Registered { duplicate }) => {
+                    tracing::info!(job_id = %id, duplicate, "new secret registered as pending");
+                    return Ok(Some(Outcome::SUCCEEDED));
+                }
+                Ok(RotateOutcome::AlreadyDone) => return Ok(Some(Outcome::SUCCEEDED)),
+                Err(CallError::RotationConflict) => {
+                    tracing::error!("rotation_conflict: the console locked this agent; stopping");
+                    return Err(AgentError::RotationConflict);
+                }
+                Err(CallError::Uplink(e)) if e.is_retryable() => {
+                    tokio::time::sleep(e.retry_delay(attempt)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(job_id = %id, error = %e, "secret rotation failed");
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Records the outcome and reports it (`POST /jobs/{id}/status`).
+    async fn finish(&self, id: Uuid, outcome: Outcome) {
+        if outcome.error.is_some() {
+            bump(&self.counters.jobs_failed, 1);
+        }
+        let reported = self.report(id, outcome).await;
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(id, LedgerEntry { outcome, reported });
+    }
+
+    async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
+        let update = JobStatusUpdate {
+            error: outcome.error.map(|code| JobError {
+                code,
+                engine_code: None,
+            }),
+            progress: None,
+            status: outcome.status,
+            ts: now(),
+        };
+        let Ok(body) = serde_json::to_vec(&update) else {
+            return false;
+        };
+        let path = format!("/jobs/{id}/status");
+        for attempt in 0..3 {
+            match self
+                .session
+                .call(
+                    Method::POST,
+                    &path,
+                    &[],
+                    Some(&body),
+                    uplink::REQUEST_TIMEOUT,
+                )
+                .await
+            {
+                Ok(_) => return true,
+                // Terminal already, or not ours: nothing more to report.
+                Err(CallError::Uplink(UplinkError::Rejected {
+                    status: 404 | 409, ..
+                })) => return true,
+                Err(CallError::Uplink(e)) if e.is_retryable() => {
+                    tokio::time::sleep(e.retry_delay(attempt)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(job_id = %id, error = %e, "job status not reported");
+                    return false;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
+    match level {
+        AuditLevel::None => databastion_protocol::AuditLevel::None,
+        AuditLevel::Limited => databastion_protocol::AuditLevel::Limited,
+        AuditLevel::Partial => databastion_protocol::AuditLevel::Partial,
+        AuditLevel::Full => databastion_protocol::AuditLevel::Full,
+    }
+}
+
+fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine {
+    match engine {
+        TargetEngine::Postgres => databastion_protocol::Engine::Postgres,
+        TargetEngine::Mysql => databastion_protocol::Engine::Mysql,
+        TargetEngine::Mariadb => databastion_protocol::Engine::Mariadb,
+        TargetEngine::Mongodb => databastion_protocol::Engine::Mongodb,
+        TargetEngine::Openldap => databastion_protocol::Engine::Openldap,
+    }
+}
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;

@@ -1,0 +1,642 @@
+//! HTTP tests against a wiremock server bound to 127.0.0.1 (test code
+//! only; the agent itself never listens, I1).
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use wiremock::matchers::{body_partial_json, header, method, path, path_regex};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+use super::*;
+use crate::fsutil::test_dir::TempDir;
+use crate::session::RotateOutcome;
+
+const S0: &str = "dbs_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE0";
+const TOKEN: &str = "dbe_TOKENTOKENTOKENTOKENTOKENTOKENTOKENTOKEN012";
+const AGENT_ID: &str = "0192a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
+const STATUS_PATH: &str = r"^/api/agent/v1/jobs/[0-9a-f-]{36}/status$";
+
+struct Env {
+    _dir: TempDir,
+    config_path: PathBuf,
+    config: AgentConfig,
+    state: StateDir,
+}
+
+fn env(server: &MockServer) -> Env {
+    let dir = TempDir::new();
+    let state_dir = dir.path().join("state");
+    let text = format!(
+        "console:\n  url: {}\n  insecure_dev_http: true\n  long_poll_wait_s: 0\n\
+         state_dir: {}\ntargets:\n  - id: pg-main\n    engine: postgres\n    host: 127.0.0.1\n    \
+         port: 5432\n    account: databastion\n    secret:\n      env: DATABASTION_PG\n",
+        server.uri(),
+        state_dir.display()
+    );
+    let config_path = dir.path().join("agent.yaml");
+    std::fs::write(&config_path, &text).unwrap();
+    let config = AgentConfig::parse(&text).unwrap();
+    Env {
+        state: StateDir::new(&state_dir),
+        _dir: dir,
+        config_path,
+        config,
+    }
+}
+
+fn write_token(env: &Env) -> PathBuf {
+    let path = env.config_path.with_file_name("token");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "{TOKEN}").unwrap();
+    path
+}
+
+fn enroll_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_raw(
+        include_str!("../../../../shared/protocol/fixtures/valid/EnrollResponse.default.json"),
+        "application/json",
+    )
+}
+
+fn heartbeat_response(interval: i64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "console_min_protocol": 1,
+        "heartbeat_interval_s": interval,
+        "server_time": "2026-09-28T14:02:00Z"
+    }))
+}
+
+fn rotate_response(duplicate: bool) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "grace_expires_at": "2026-09-28T14:07:11Z",
+        "duplicate": duplicate
+    }))
+}
+
+fn error_body(status: u16, code: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .set_body_json(serde_json::json!({"code": code, "message": "Generic message."}))
+}
+
+fn bearer(secret: &str) -> String {
+    format!("Bearer {secret}")
+}
+
+async fn enrolled(server: &MockServer) -> Env {
+    let env = env(server);
+    let _guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/enroll"))
+        .respond_with(enroll_response())
+        .mount_as_scoped(server)
+        .await;
+    enroll(&env.config, &write_token(&env), false, &[Engine::Postgres])
+        .await
+        .unwrap();
+    env
+}
+
+fn session(env: &Env) -> Session {
+    Session::new(
+        Uplink::new(&env.config).unwrap(),
+        env.state.clone(),
+        env.state.load_identity().unwrap(),
+    )
+}
+
+fn runtime(env: &Env) -> Runtime {
+    Runtime::new(&env.config_path, env.config.clone(), Vec::new()).unwrap()
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+// ------------------------------------------------------------- enrollment
+
+#[tokio::test]
+async fn enroll_stores_identity_and_local_hmac_key() {
+    let server = MockServer::start().await;
+    let env = env(&server);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/enroll"))
+        .and(header("x-databastion-protocol", "1"))
+        .and(header("user-agent", uplink::user_agent().as_str()))
+        .and(body_partial_json(serde_json::json!({
+            "token": TOKEN, "connectors": ["postgres"], "os": "linux"
+        })))
+        .respond_with(enroll_response())
+        .expect(2)
+        .mount(&server)
+        .await;
+    let token = write_token(&env);
+    let id = enroll(&env.config, &token, false, &[Engine::Postgres])
+        .await
+        .unwrap();
+    assert_eq!(id, AGENT_ID);
+    for req in server.received_requests().await.unwrap() {
+        assert!(req.headers.get("authorization").is_none());
+        assert!(req.headers.get("x-databastion-agent-id").is_none());
+    }
+    let identity = env.state.load_identity().unwrap();
+    assert_eq!(identity.secret.expose(), S0);
+    assert_eq!(identity.heartbeat_interval_s, 30);
+    assert_eq!(mode(&env.state.identity_path()), 0o600);
+    assert_eq!(mode(&env.state.hmac_key_path()), 0o600);
+    let key = env.state.load_hmac_key().unwrap();
+    assert_eq!(key.len(), 32);
+    // The HMAC key never appears in a request.
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    for req in server.received_requests().await.unwrap() {
+        assert!(!String::from_utf8_lossy(&req.body).contains(&hex));
+    }
+
+    let err = enroll(&env.config, &token, false, &[Engine::Postgres])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AgentError::Identity(IdentityError::AlreadyEnrolled(_))
+    ));
+    enroll(&env.config, &token, true, &[Engine::Postgres])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn enroll_401_is_not_retried() {
+    let server = MockServer::start().await;
+    let env = env(&server);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/enroll"))
+        .respond_with(error_body(401, "unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = enroll(&env.config, &write_token(&env), false, &[])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not retried"), "{err}");
+    assert!(!err.to_string().contains(TOKEN));
+    assert!(!env.state.has_identity());
+}
+
+#[tokio::test]
+async fn enroll_honors_retry_after_on_503() {
+    let server = MockServer::start().await;
+    let env = env(&server);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/enroll"))
+        .respond_with(error_body(503, "unavailable").insert_header("retry-after", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/enroll"))
+        .respond_with(enroll_response())
+        .mount(&server)
+        .await;
+    let start = Instant::now();
+    enroll(&env.config, &write_token(&env), false, &[])
+        .await
+        .unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn invalid_token_file_is_rejected_without_echo() {
+    let server = MockServer::start().await;
+    let env = env(&server);
+    let path = env.config_path.with_file_name("token");
+    std::fs::write(&path, "dbe_short-SECRETISH").unwrap();
+    let err = enroll(&env.config, &path, false, &[]).await.unwrap_err();
+    assert!(!err.to_string().contains("SECRETISH"), "{err}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// -------------------------------------------------------------- heartbeat
+
+#[tokio::test]
+async fn heartbeat_sends_contract_headers_and_clamps_interval() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .and(header("x-databastion-agent-id", AGENT_ID))
+        .and(header("x-databastion-protocol", "1"))
+        .respond_with(heartbeat_response(1))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(0))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let interval = rt.heartbeat_once().await.unwrap();
+    assert_eq!(interval, Some(10));
+    rt.session.set_heartbeat_interval(10);
+    assert_eq!(env.state.load_identity().unwrap().heartbeat_interval_s, 10);
+    // `0` is rejected: the previous interval is kept.
+    assert_eq!(rt.heartbeat_once().await.unwrap(), None);
+
+    let requests = server.received_requests().await.unwrap();
+    let last = requests.last().unwrap();
+    let hb: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+    // Conforms to the generated (closed) type.
+    serde_json::from_value::<HeartbeatRequest>(hb.clone()).unwrap();
+    assert_eq!(hb["targets"][0]["target_id"], "pg-main");
+    assert_eq!(hb["targets"][0]["reachable"], false);
+    assert_eq!(hb["targets"][0]["last_error"], "unsupported");
+    assert!(hb["metrics"]["heartbeats_sent_total"].is_number());
+    // No target address nor account in the heartbeat (I3).
+    let text = String::from_utf8_lossy(&last.body).to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains("\"databastion\""));
+}
+
+#[tokio::test]
+async fn unauthorized_with_current_secret_suspends_with_slow_retry() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(401, "unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let err = rt.heartbeat_once().await.unwrap_err();
+    assert!(matches!(err, CallError::Unauthorized));
+    let delay = rt
+        .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(delay >= Duration::from_secs(900));
+    assert_eq!(*rt.state.borrow(), RunState::Suspended);
+}
+
+#[tokio::test]
+async fn upgrade_required_keeps_running() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(ResponseTemplate::new(426).set_body_json(serde_json::json!({
+            "code": "protocol_unsupported", "message": "Upgrade required.", "min_protocol": 2
+        })))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let err = rt.heartbeat_once().await.unwrap_err();
+    let delay = rt
+        .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(delay, Duration::from_secs(300));
+    assert_eq!(*rt.state.borrow(), RunState::Active);
+}
+
+#[tokio::test]
+async fn run_stops_on_shutdown() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/jobs"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn({
+        let path = env.config_path.clone();
+        async move { run(&path, Vec::new(), rx).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.url.path().ends_with("/heartbeat"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.url.path().ends_with("/jobs") && r.url.query() == Some("wait=0"))
+    );
+}
+
+// ------------------------------------------------------------------- jobs
+
+fn job(id: &str, kind: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": id, "type": kind, "created_at": "2026-09-28T14:00:00Z", "params": params
+    })
+}
+
+async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/status"))
+        .map(|r: Request| {
+            let id = r.url.path().split('/').rev().nth(1).unwrap().to_owned();
+            (id, serde_json::from_slice(&r.body).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn jobs_are_parsed_individually_and_reported() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let reload = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f71";
+    let unknown = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f72";
+    let audit = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f73";
+    let mut audit_job: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/JobList.audit-configure.json"
+    ))
+    .unwrap();
+    let mut audit_job = audit_job["jobs"][0].take();
+    audit_job["job_id"] = audit.into();
+    audit_job.as_object_mut().unwrap().remove("expires_at");
+    let body = serde_json::json!({ "jobs": [
+        job(reload, "agent.config.reload", serde_json::json!({})),
+        job(unknown, "agent.self_destruct", serde_json::json!({})),
+        {"type": "agent.config.reload"},
+        audit_job,
+    ]});
+    let rt = runtime(&env);
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let got = statuses(&server).await;
+    let find = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    assert_eq!(find(reload)["status"], "succeeded");
+    assert_eq!(find(unknown)["status"], "failed");
+    assert_eq!(find(unknown)["error"]["code"], "unsupported");
+    assert_eq!(find(audit)["status"], "failed");
+    assert_eq!(find(audit)["error"]["code"], "unsupported");
+    assert_eq!(got.len(), 3);
+    for (_, update) in &got {
+        serde_json::from_value::<JobStatusUpdate>(update.clone()).unwrap();
+    }
+    assert_eq!(rt.counters.jobs_unparseable.load(Ordering::Relaxed), 2);
+
+    // Redelivery: parsed jobs are deduplicated; the unknown one (never
+    // parsed, so not in the ledger) is reported again.
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(statuses(&server).await.len(), 4);
+}
+
+#[tokio::test]
+async fn expired_job_is_failed_as_expired() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let mut j = job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6f74",
+        "agent.config.reload",
+        serde_json::json!({}),
+    );
+    j["expires_at"] = "2020-01-01T00:00:00Z".into();
+    let rt = runtime(&env);
+    rt.handle_job_list(&serde_json::to_vec(&serde_json::json!({"jobs": [j]})).unwrap())
+        .await
+        .unwrap();
+    let got = statuses(&server).await;
+    assert_eq!(got[0].1["error"]["code"], "expired");
+}
+
+// --------------------------------------------------------------- rotation
+
+fn rotate_bodies(requests: &[Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/rotate"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn rotation_persists_pending_first_reuses_it_and_promotes() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let job_id = Uuid::try_from("01920f5f-1d40-7f70-b154-3c4d5e6f7081").unwrap();
+    let first = session(&env);
+
+    // 1. /rotate fails: the pending secret is already on disk.
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(error_body(400, "invalid_request"))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(first.rotate(Some(job_id)).await.is_err());
+    let on_disk = env.state.load_identity().unwrap();
+    let s1 = on_disk.pending.clone().unwrap().expose().to_owned();
+    assert_eq!(on_disk.secret.expose(), S0);
+    assert_eq!(mode(&env.state.identity_path()), 0o600);
+    drop(guard);
+
+    // 2. Redelivery after a restart (fresh session): the same S1 is resent.
+    let session = session(&env);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(rotate_response(true))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        session.rotate(Some(job_id)).await.unwrap(),
+        RotateOutcome::Registered { duplicate: true }
+    );
+    let bodies = rotate_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 2);
+    for body in &bodies {
+        assert_eq!(body["new_secret"], s1.as_str());
+        assert_eq!(body["job_id"], job_id.to_string());
+    }
+
+    // 3. First success with S1 promotes it.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    session
+        .call(
+            Method::POST,
+            "/heartbeat",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let on_disk = env.state.load_identity().unwrap();
+    assert_eq!(on_disk.secret.expose(), s1);
+    assert!(on_disk.pending.is_none());
+    assert_eq!(session.snapshot().secret.expose(), s1);
+
+    // 4. The same job redelivered after promotion: no new secret.
+    assert_eq!(
+        session.rotate(Some(job_id)).await.unwrap(),
+        RotateOutcome::AlreadyDone
+    );
+    assert_eq!(
+        rotate_bodies(&server.received_requests().await.unwrap()).len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn unregistered_pending_secret_falls_back_to_current() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // Crash between persisting S1 and POST /rotate.
+    let mut identity = env.state.load_identity().unwrap();
+    let s1 = crate::identity::generate_secret().unwrap();
+    identity.pending = Some(s1.clone());
+    env.state.save_identity(&identity).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(s1.expose()).as_str()))
+        .respond_with(error_body(401, "unauthorized"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    let session = session(&env);
+    session
+        .call(
+            Method::POST,
+            "/heartbeat",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let auths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/heartbeat"))
+        .map(|r| r.headers["authorization"].to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(auths, [bearer(s1.expose()), bearer(S0)]);
+    assert!(session.needs_rotation_retry());
+    let on_disk = env.state.load_identity().unwrap();
+    assert_eq!(on_disk.secret.expose(), S0);
+    assert_eq!(on_disk.pending.unwrap().expose(), s1.expose());
+}
+
+#[tokio::test]
+async fn rotation_conflict_is_fatal() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let err = rt
+        .rotate_for_job(Uuid::try_from("01920f5f-1d40-7f70-b154-3c4d5e6f7082").unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::RotationConflict));
+}
+
+// ---------------------------------------------------------- secrets / logs
+
+#[derive(Clone, Default)]
+struct Capture(Arc<StdMutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn secrets_never_appear_in_logs_or_debug() {
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(401, "unauthorized"))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    rt.rotate_for_job(Uuid::try_from("01920f5f-1d40-7f70-b154-3c4d5e6f7083").unwrap())
+        .await
+        .unwrap();
+    let err = rt.heartbeat_once().await.unwrap_err();
+    rt.on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+        .unwrap();
+
+    let identity = env.state.load_identity().unwrap();
+    let s1 = identity.pending.clone().unwrap().expose().to_owned();
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    // Everything is captured, including third-party trace output (hyper).
+    assert!(!logs.is_empty());
+    let debug = format!("{identity:?} {err:?} {:?}", env.config);
+    for secret in [S0, s1.as_str(), TOKEN] {
+        assert!(!logs.contains(secret), "secret in logs");
+        assert!(!debug.contains(secret), "secret in Debug");
+    }
+}
