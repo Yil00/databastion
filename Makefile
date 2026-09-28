@@ -22,7 +22,8 @@ dev-dirs: ## Create the engine log directories (world-writable: engines run as n
 
 dev-metrics-token: ## Create dev/.state/metrics_token (48 random chars, 0600) if missing; never committed
 	@mkdir -p dev/.state
-	@if [ ! -s dev/.state/metrics_token ]; then \
+	@if [ -d dev/.state/metrics_token ]; then rmdir dev/.state/metrics_token; fi
+	@if [ ! -f dev/.state/metrics_token ] || [ ! -s dev/.state/metrics_token ]; then \
 	  (umask 077; head -c 36 /dev/urandom | base64 | tr '+/' '-_' | tr -d '\n' > dev/.state/metrics_token); \
 	  echo "Generated dev/.state/metrics_token"; \
 	fi

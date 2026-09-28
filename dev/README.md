@@ -30,13 +30,13 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 
 - Mailpit UI: <http://127.0.0.1:8025> (SMTP `127.0.0.1:1025`, no auth), for alert e-mails (P3-C).
 - Prometheus: <http://127.0.0.1:9090>. Following [ADR-0004](../docs/adr/0004-observability-via-console.md), it scrapes a single target, the console `/metrics` at `host.docker.internal:3000`; agents are never scraped. That job is **DOWN** until the host console runs with the scrape token (below).
-- Metrics token: the console `/metrics` requires `Authorization: Bearer <token>` (`DATABASTION_METRICS_TOKEN(_FILE)`, at least 32 characters; otherwise `/metrics` answers `404`). `make dev` (target `dev-metrics-token`) generates `dev/.state/metrics_token` once (48 random characters, mode `0600`, git-ignored, removed by `make dev-reset`) and mounts it read-only into Prometheus (`credentials_file`). Start the host console with the same file:
+- Metrics token: the console `/metrics` requires `Authorization: Bearer <token>` (`DATABASTION_METRICS_TOKEN(_FILE)`, at least 32 characters; otherwise `/metrics` answers `404`). `make dev` (target `dev-metrics-token`) generates `dev/.state/metrics_token` once (48 random characters, mode `0600`, git-ignored, removed by `make dev-reset`); the one-shot `metrics-token-init` service (busybox, no network, only the `CHOWN`, `DAC_READ_SEARCH` and `FOWNER` capabilities) copies it into the `prometheus-secrets` volume as `0400`, owned by the Prometheus user (65534), and Prometheus reads it read-only (`credentials_file: /etc/prometheus/secrets/metrics_token`). After changing the token, run `make dev` again (the init service re-runs on `up`). Start the host console with the same file:
 
   ```bash
   DATABASTION_METRICS_TOKEN_FILE="$PWD/dev/.state/metrics_token" pnpm dev   # from console/: ../dev/.state/metrics_token
   ```
 
-  Prometheus runs as root inside its container only to read that `0600` file owned by your user. Run `make dev-metrics-token` first if you call `docker compose` directly (otherwise Docker creates a directory at that path).
+  Prometheus itself runs as non-root. Run `make dev-metrics-token` first if you call `docker compose` directly (otherwise Docker creates a directory at that path).
 - Grafana: <http://127.0.0.1:3001> (user `admin`, password `GRAFANA_ADMIN_PASSWORD`). Dashboard *DataBastion / DataBastion - overview*: agents online, silent agents, heartbeat age, spool size. Metric names (`databastion_agent_last_seen_seconds`, `databastion_agent_reported_spool_bytes`) are provisional until the console implements `/metrics`.
 
 ## Credentials
