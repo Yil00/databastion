@@ -23,3 +23,9 @@ keywords = ["dbe_"]
 [[allowlists]]
 description = "DataBastion example credentials"
 regexes = ['''db[se]_(EXAMPLE){6}[0-9]''']
+
+# Test canaries used to prove secrets never reach logs or error messages
+# (agent/crates/core tests). They are fake by construction.
+[[allowlists]]
+description = "DataBastion test canaries"
+regexes = ['''hunter2-SECRET''', '''db[se]_(TOKEN){8}[0-9]{3}''']

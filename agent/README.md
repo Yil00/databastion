@@ -3,15 +3,18 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: skeleton (P0-D).** The workspace compiles and the binary starts,
-> logs and exits. No enrollment, uplink, Discovery or Audit logic yet.
+> **Status: P1-B part 1.** `agent.yaml` configuration, enrollment, `0600`
+> identity storage, HTTPS uplink, heartbeat and jobs loops, secret rotation
+> (ADR-0008). No spool, local engine detection, Discovery or Audit yet:
+> `discovery.scan` / `audit.configure` jobs are reported `failed`
+> (`unsupported`).
 
 ## Layout
 
 | Crate | Path | Role |
 |-------|------|------|
 | `databastion-agent` | `crates/agent` | Binary: CLI (`--config`), JSON logs, connector selection by Cargo feature |
-| `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, HTTPS uplink (stub) |
+| `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, `agent.yaml`, enrollment, runtime (heartbeat / jobs), crate-private HTTPS uplink and session |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector (stub) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector (stub) |
@@ -51,6 +54,51 @@ socket API appears in any crate's `src/`, `tests/`, `examples/`, `benches/`
 or `build.rs` (I1), and that `Cargo.lock` contains no OpenSSL / native-tls.
 These are text-level guards against honest mistakes; the types and code
 review remain the primary controls.
+
+### Uplink, TLS and state files
+- reqwest `default-features = false`, features `rustls-tls-native-roots` +
+  `json`: rustls only, **`ring`** crypto provider (reqwest's
+  `__rustls-ring`; no `aws-lc-rs`, so no C/CMake build and no extra
+  license), trust roots from the system store (`rustls-native-certs`, which
+  pulls the pure-Rust `openssl-probe` path finder, not OpenSSL). `webpki-roots`
+  (`rustls-tls`) was not used: it bundles a fixed root set under
+  CDLA-Permissive-2.0 and ignores the enterprise CAs of the host store.
+  `console.ca_file` pins a single CA (built-in roots disabled).
+- TLS 1.3 minimum, no redirects, no http2 / cookies / compression,
+  30 s request timeout (`wait + 15` s for the long-poll), 1 MiB response cap.
+  `http://` only with `insecure_dev_http: true` **and** an IP-literal
+  loopback URL (`127.0.0.1` / `[::1]`, not `localhost`); such a client never
+  uses a proxy. Otherwise `HTTPS_PROXY` / `NO_PROXY` are honoured.
+  `console.ca_file` may hold a PEM bundle (all certificates trusted, built-in
+  roots disabled).
+- `<state_dir>/identity.json` (agent id, secret, pending rotation secret)
+  and `<state_dir>/hmac.key` (32 random bytes, never transmitted) are
+  `0600`, written atomically (temp file, fsync, rename, directory fsync).
+  `state_dir` must be a real directory owned by the agent user and not
+  group / world writable (a mode other than `0700` warns). State files are
+  opened with `O_NOFOLLOW` (`rustix`) and checked on the handle: regular
+  file, owned by the agent user, no group / other access.
+- Enrollment refuses a token file readable by others. `enroll --force`
+  replaces the identity (revoke the old agent in the console first) and keeps
+  the HMAC key unless `--new-hmac-key`.
+- Rotation (ADR-0008): a `/rotate` attempt with an unknown outcome keeps S1
+  first; S0 is preferred only after S1 got a `401` following the latest
+  attempt. Up to 8 rotate job ids satisfied by the pending / promoted secret
+  are persisted (redelivery acknowledged without a new secret); a new
+  rotation within 60 s of a promotion is deferred.
+- `long_poll_wait_s` is `5..=25` (below 5 only with `insecure_dev_http`),
+  and a poll returning in under 1 s without jobs is followed by at least
+  1 s plus jittered backoff. A config reload that changes `console.*` or
+  `state_dir` is refused (`invalid_params`).
+- Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
+  `<= 0` are ignored. At most 16 jobs are handled per poll, each parsed on
+  its own; an unparseable job is reported `failed` (`unsupported` /
+  `invalid_params`) when its `job_id` is readable.
+- HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
+  `deny.toml` sets `[graph] exclude-dev = true`: the hyper `server` feature
+  it needs is never linked into the binary, and the bans stay strict for
+  the shipped graph. `deny-dev.toml` checks licenses and sources of the full
+  graph, dev-dependencies included.
 
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
@@ -99,11 +147,13 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --no-default-features --locked   # minimal binary, no connector
 cargo deny --locked check bans licenses sources
+cargo deny --config deny-dev.toml --locked check licenses sources   # dev-deps too
 cargo run -p databastion-protocol-codegen      # after changing shared/protocol/openapi.yaml
-cargo run -- --config /etc/databastion/agent.yaml
+cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
+cargo run -- run --config /etc/databastion/agent.yaml
 ```
 
-Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`
+`agent.example.yaml` documents every configuration key. Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`
 (e.g. `DATABASTION_LOG=debug`), default `info`.
 
 ## Rules
