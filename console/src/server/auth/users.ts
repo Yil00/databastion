@@ -47,18 +47,36 @@ export async function bootstrapAdmin(db: Database, username: string, password: s
   });
 }
 
-/** Verifies credentials. Always runs one argon2id verification (unknown user: dummy hash). */
-export async function verifyCredentials(db: Database, username: string, password: string) {
+export interface LoginUser {
+  id: string;
+  username: string;
+  role: "admin" | "analyst";
+  passwordHash: string;
+}
+
+/** Enabled user by login name, or null (unknown, malformed or disabled). No argon2id work. */
+export async function findLoginUser(db: Database, username: string): Promise<LoginUser | null> {
   const name = username.trim().toLowerCase();
-  const [user] = USERNAME.test(name)
-    ? await db.select().from(users).where(eq(users.username, name)).limit(1)
-    : [];
-  if (!user || user.disabledAt) {
+  if (!USERNAME.test(name)) return null;
+  const [user] = await db.select().from(users).where(eq(users.username, name)).limit(1);
+  if (!user || user.disabledAt) return null;
+  return { id: user.id, username: user.username, role: user.role, passwordHash: user.passwordHash };
+}
+
+/** Checks a password. Always runs one argon2id verification (unknown user: dummy hash). */
+export async function checkPassword(user: LoginUser | null, password: string): Promise<boolean> {
+  if (!user) {
     await argon2VerifyDummy(password);
-    return { ok: false as const, userId: user?.id ?? null };
+    return false;
   }
-  const ok = await argon2Verify(user.passwordHash, password);
-  return ok
+  return argon2Verify(user.passwordHash, password);
+}
+
+/** Verifies credentials (lookup + one argon2id verification). */
+export async function verifyCredentials(db: Database, username: string, password: string) {
+  const user = await findLoginUser(db, username);
+  const ok = await checkPassword(user, password);
+  return ok && user
     ? { ok: true as const, user: { id: user.id, username: user.username, role: user.role } }
-    : { ok: false as const, userId: user.id };
+    : { ok: false as const, userId: user?.id ?? null };
 }

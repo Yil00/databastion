@@ -15,7 +15,7 @@ import {
   Semaphore,
 } from "./crypto";
 import { RateLimiter } from "./rate-limit";
-import { clientIp, readJsonBody } from "./request";
+import { clientIp, ipBucket, readJsonBody, xffWarningStats } from "./request";
 
 describe("crypto", () => {
   it("generates contract-conforming, high-entropy tokens and secrets", () => {
@@ -58,6 +58,30 @@ describe("RateLimiter", () => {
     for (let i = 0; i < 10; i++) rl.hit(`k${i}`);
     expect(rl.check("k0").limited).toBe(false);
     expect(rl.check("k9").limited).toBe(true);
+  });
+});
+
+describe("ipBucket", () => {
+  it("aggregates IPv6 by /64 and unmaps IPv4-mapped addresses", () => {
+    expect(ipBucket("192.0.2.1")).toBe("192.0.2.1");
+    expect(ipBucket("2001:db8:1:2:aaaa:bbbb:cccc:dddd")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8:1:2::1")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:0db8:0001:0002:ffff::")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(ipBucket("::1")).toBe("0:0:0:0::/64");
+    expect(ipBucket("::ffff:198.51.100.7")).toBe("198.51.100.7");
+    expect(ipBucket("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
+  });
+});
+
+describe("X-Forwarded-For misconfiguration warning (L-b)", () => {
+  it("warns at most once per minute when the selected entry is not an IP", () => {
+    const env = { DATABASTION_TRUSTED_PROXY_HOPS: "2" } as unknown as NodeJS.ProcessEnv;
+    const before = xffWarningStats.warned;
+    for (let i = 0; i < 5; i++) {
+      expect(clientIp(new Request("http://x/", { headers: { "x-forwarded-for": "192.0.2.1" } }), env)).toBeNull();
+    }
+    expect(xffWarningStats.warned - before).toBeLessThanOrEqual(1);
   });
 });
 

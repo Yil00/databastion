@@ -6,7 +6,7 @@ import { validateSchema } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
-import { clientIp } from "@/server/request";
+import { clientIp, ipBucket } from "@/server/request";
 
 import { authenticateAgent } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
@@ -35,7 +35,7 @@ export function handleEnroll(req: Request): Promise<Response> {
     if (headers) return headers;
     const ip = clientIp(req);
     if (ip) {
-      const limit = enrollPerIp.hit(ip);
+      const limit = enrollPerIp.hit(ipBucket(ip));
       if (limit.limited) return rateLimited(limit.retryAfterS);
     }
     const body = await readValidBody(req, "EnrollRequest");
@@ -95,11 +95,7 @@ export function handlePollJobs(req: Request): Promise<Response> {
     const wait = parseWait(new URL(req.url));
     if (wait === null) return invalidRequest();
     const agentId = auth.agent.id;
-    if (wait === 0) {
-      const jobs = await claimJobs(getDb(), agentId);
-      return jobs.length > 0 ? conformingJson("JobList", { jobs }) : noContent();
-    }
-    // Reserved synchronously, before any await, released in `finally` (M2).
+    // Reserved synchronously (also for wait=0: L-a), before any await, released in `finally` (M2).
     const slot = jobHub.reserveSlot(agentId);
     if (slot === "agent") return rateLimited(1);
     if (slot === "process") return unavailable();

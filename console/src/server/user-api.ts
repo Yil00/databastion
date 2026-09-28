@@ -16,15 +16,15 @@ import {
   validCsrf,
   type Session,
 } from "@/server/auth/session";
-import { MAX_PASSWORD_LENGTH, verifyCredentials } from "@/server/auth/users";
+import { checkPassword, findLoginUser, MAX_PASSWORD_LENGTH } from "@/server/auth/users";
 import {
   createEnrollmentToken,
   listEnrollmentTokens,
   revokeEnrollmentToken,
 } from "@/server/enrollment";
-import { argon2Gate, sha256Hex } from "@/server/crypto";
+import { loginArgon2Gate, sha256Hex } from "@/server/crypto";
 import { RateLimiter } from "@/server/rate-limit";
-import { clientIp, readJsonBody } from "@/server/request";
+import { clientIp, ipBucket, readJsonBody } from "@/server/request";
 
 /**
  * User (UI) API: login / logout / session, enrollment tokens, agents. Every state-changing route
@@ -85,6 +85,8 @@ async function requireUser(
 /** Failed logins: per source IP and per username, checked before argon2id. */
 export const loginFailuresPerIp = new RateLimiter(20, 15 * 60_000);
 export const loginFailuresPerUser = new RateLimiter(5, 15 * 60_000);
+/** Process-wide budget of failed logins on unknown usernames. */
+export const loginFailuresUnknownUser = new RateLimiter(30, 60_000);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -113,33 +115,52 @@ export function handleLogin(req: Request): Promise<Response> {
       return error(400, "invalid_request");
     }
     const ip = clientIp(req);
+    const ipKey = ip ? ipBucket(ip) : null;
     const userKey = v.username.trim().toLowerCase();
     // H1: attempts are reserved synchronously before argon2id and refunded on success, so
     // concurrent requests cannot overrun the limits. H2: no per-IP limit when the IP is unknown.
-    const refundIp = ip ? loginFailuresPerIp.reserve(ip) : () => undefined;
+    const refundIp = ipKey ? loginFailuresPerIp.reserve(ipKey) : () => undefined;
     const refundUser = loginFailuresPerUser.reserve(userKey);
     if (!refundIp || !refundUser) {
       refundIp?.();
       refundUser?.();
       const retry = Math.max(
-        ip ? loginFailuresPerIp.check(ip).retryAfterS : 1,
+        ipKey ? loginFailuresPerIp.check(ipKey).retryAfterS : 1,
         loginFailuresPerUser.check(userKey).retryAfterS,
       );
       return error(429, "rate_limited", { "Retry-After": String(retry) });
     }
-    const release = argon2Gate.tryAcquire();
+    const db = getDb();
+    const user = await findLoginUser(db, v.username);
+    // N1: failures on unknown usernames share one process-wide budget, so random-username
+    // floods (fresh per-username buckets, unknown IP) are bounded.
+    let refundUnknown: () => void = () => undefined;
+    if (!user) {
+      const reserved = loginFailuresUnknownUser.reserve("global");
+      if (!reserved) {
+        const retry = loginFailuresUnknownUser.check("global").retryAfterS;
+        return error(429, "rate_limited", { "Retry-After": String(retry) });
+      }
+      refundUnknown = reserved;
+    }
+    // Login has its own argon2id pool: it can never starve agent authentication (N1).
+    const release = loginArgon2Gate.tryAcquire();
     if (!release) {
       refundIp();
       refundUser();
+      refundUnknown();
       return error(503, "busy", { "Retry-After": "1" });
     }
-    const db = getDb();
-    let result: Awaited<ReturnType<typeof verifyCredentials>>;
+    let ok: boolean;
     try {
-      result = await verifyCredentials(db, v.username, v.password);
+      ok = await checkPassword(user, v.password);
     } finally {
       release();
     }
+    const result =
+      ok && user
+        ? { ok: true as const, user: { id: user.id, username: user.username, role: user.role } }
+        : { ok: false as const, userId: user?.id ?? null };
     if (!result.ok) {
       // The attempted username is not recorded for unknown users (it may be a mistyped password).
       await writeAudit(db, {
@@ -153,6 +174,7 @@ export function handleLogin(req: Request): Promise<Response> {
     }
     refundIp();
     refundUser();
+    refundUnknown();
     // L4: drop the session this browser already had, and expired / idle sessions.
     const previous = readSessionToken(req);
     if (previous) await deleteSession(db, sha256Hex(previous));

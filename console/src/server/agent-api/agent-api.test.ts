@@ -1,11 +1,21 @@
+import { randomUUID } from "node:crypto";
+
 import { and, eq, sql } from "drizzle-orm";
+import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
-import { argon2Stats, MAX_CONCURRENT_UNAUTHENTICATED_ARGON2, sha256Hex } from "@/server/crypto";
+import {
+  agentArgon2Gate,
+  argon2Stats,
+  loginArgon2Gate,
+  MAX_CONCURRENT_UNAUTHENTICATED_ARGON2,
+  sha256Hex,
+} from "@/server/crypto";
+import { handleLogin, loginFailuresUnknownUser } from "@/server/user-api";
 import { enqueueJob, MAX_JOB_ATTEMPTS } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import {
@@ -52,6 +62,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     await teardown?.();
   });
   beforeEach(() => {
+    loginFailuresUnknownUser.clear();
     enrollFailureAuditBudget.clear();
     failuresPerAgent.clear();
     failuresPerIp.clear();
@@ -364,6 +375,64 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     });
   });
 
+  describe("argon2id pool isolation (security re-review N1)", () => {
+    it("saturated login and wrong-secret pools never block a known-good agent", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      expireVerifiedCacheForTests();
+      // Deterministic saturation of both unauthenticated pools.
+      const held = [
+        ...Array.from({ length: loginArgon2Gate.max }, () => loginArgon2Gate.tryAcquire()),
+        ...Array.from({ length: agentArgon2Gate.max }, () => agentArgon2Gate.tryAcquire()),
+      ];
+      try {
+        expect(loginArgon2Gate.tryAcquire()).toBeNull();
+        expect(agentArgon2Gate.tryAcquire()).toBeNull();
+        const wrong = (await enroll("n1-other")).secret;
+        const flooded = await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+        expect(flooded.status).toBe(503);
+        const legit = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+        expect(legit.status).toBe(200);
+      } finally {
+        for (const release of held) release?.();
+      }
+    });
+
+    it("a concurrent login flood + wrong secrets on random agents does not produce 503 for a known-good agent", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const victims = await Promise.all(Array.from({ length: 6 }, (_, i) => enroll(`n1-victim-${i}`)));
+      const wrong = (await enroll("n1-wrong")).secret;
+      expireVerifiedCacheForTests();
+      const floodLogins = Array.from({ length: 30 }, (_, i) =>
+        handleLogin(
+          new Request("http://console.test/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Origin: "http://console.test" },
+            body: JSON.stringify({ username: `flood${i}`, password: "wrong wrong wrong" }),
+          }),
+        ),
+      );
+      const floodAgents = victims.flatMap((v) =>
+        Array.from({ length: 3 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: v.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      const randomIds = Array.from({ length: 20 }, () =>
+        handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: randomUUID(), secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        ),
+      );
+      const legit = handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      const [legitRes] = await Promise.all([legit, ...floodLogins, ...floodAgents, ...randomIds]);
+      expect(legitRes.status).toBe(200);
+    });
+  });
+
   describe("POST /heartbeat", () => {
     it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
@@ -467,6 +536,19 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(jobHub.heldPolls(auth.agentId)).toBe(0);
     });
 
+    it("applies the held-poll slots to wait=0 too (L-a)", async () => {
+      const auth = await enroll();
+      const a = jobHub.reserveSlot(auth.agentId);
+      const b = jobHub.reserveSlot(auth.agentId);
+      try {
+        expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(429);
+      } finally {
+        if (typeof a === "function") a();
+        if (typeof b === "function") b();
+      }
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+    });
+
     it("gives up a job delivered MAX_JOB_ATTEMPTS times without status (L7)", async () => {
       const auth = await enroll();
       const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "agent.config.reload", params: {} });
@@ -550,6 +632,36 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         .from(auditLog)
         .where(and(eq(auditLog.targetId, auth.agentId), eq(auditLog.action, "agent.revoke")));
       expect(rows.map((r) => r.outcome).sort()).toEqual(["failure", "success"]);
+    });
+  });
+
+  describe("database roles (R1)", () => {
+    it("the runtime role cannot alter, delete or unprotect the audit log", async () => {
+      await adminUser();
+      const role = `t_rt_${randomUUID().slice(0, 8)}`;
+      const db = new URL(String(process.env.DATABASE_URL));
+      await getDb().execute(sql.raw(`create role ${role} login in role databastion_app`));
+      const url = new URL(db);
+      url.username = role;
+      const client = new Client({ connectionString: url.toString() });
+      await client.connect();
+      try {
+        const [row] = (await client.query("select count(*)::int as n from users")).rows as { n: number }[];
+        expect(row?.n).toBeGreaterThan(0);
+        await client.query("insert into audit_log (actor_type, action) values ('system', 'user.bootstrap')");
+        for (const stmt of [
+          "update audit_log set action = 'x'",
+          "delete from audit_log",
+          "truncate audit_log",
+          "alter table audit_log disable trigger all",
+          "drop trigger audit_log_no_update_delete on audit_log",
+          "drop table audit_log",
+        ]) {
+          await expect(client.query(stmt), stmt).rejects.toThrow();
+        }
+      } finally {
+        await client.end();
+      }
     });
   });
 

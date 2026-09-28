@@ -1,5 +1,7 @@
 import { isIP } from "node:net";
 
+import { logger } from "@/lib/logger";
+
 /**
  * Number of trusted reverse proxies in front of the console:
  * `DATABASTION_TRUSTED_PROXY_HOPS=N` (1..10), or `DATABASTION_TRUST_PROXY=1` (same as 1 hop).
@@ -24,7 +26,45 @@ export function clientIp(req: Request, env: NodeJS.ProcessEnv = process.env): st
   if (hops === 0) return null;
   const entries = (req.headers.get("x-forwarded-for") ?? "").split(",").map((e) => e.trim());
   const entry = entries.length >= hops ? entries[entries.length - hops] : undefined;
-  return entry && isIP(entry) ? entry : null;
+  if (entry && isIP(entry)) return entry;
+  warnBadForwardedFor();
+  return null;
+}
+
+let lastXffWarning = 0;
+export const xffWarningStats = { warned: 0 };
+
+/** L-b: misconfigured proxy chain. At most one warning per minute; never logs the header value. */
+function warnBadForwardedFor(): void {
+  const now = Date.now();
+  if (now - lastXffWarning < 60_000) return;
+  lastXffWarning = now;
+  xffWarningStats.warned++;
+  logger.warn(
+    "trusted proxy hops are configured but the selected X-Forwarded-For entry is missing or not an IP",
+  );
+}
+
+/**
+ * Rate-limit bucket of an IP: IPv6 addresses are aggregated by /64 (one host usually owns a whole
+ * /64), IPv4-mapped IPv6 addresses are reduced to their IPv4 address.
+ */
+export function ipBucket(ip: string): string {
+  if (isIP(ip) !== 6) return ip;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+  if (mapped?.[1]) return mapped[1];
+  const parts = ip.toLowerCase().split("::");
+  const head = parts[0] ?? "";
+  const tail = ip.includes("::") ? (parts[1] ?? "") : "";
+  const toGroups = (part: string) => (part === "" ? [] : part.split(":"));
+  let headGroups = toGroups(head);
+  let tailGroups = toGroups(tail);
+  // An embedded IPv4 suffix only affects the last 32 bits: outside the /64 prefix.
+  if (tailGroups.at(-1)?.includes(".")) tailGroups = [...tailGroups.slice(0, -1), "0", "0"];
+  if (headGroups.at(-1)?.includes(".")) headGroups = [...headGroups.slice(0, -1), "0", "0"];
+  const missing = 8 - headGroups.length - tailGroups.length;
+  const groups = [...headGroups, ...Array<string>(Math.max(0, missing)).fill("0"), ...tailGroups];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
 }
 
 export const MAX_BODY_BYTES = 4 * 1024 * 1024;

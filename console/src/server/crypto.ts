@@ -73,8 +73,19 @@ export class Semaphore {
   }
 }
 
+/**
+ * Separate pools, so that one path can never starve another (security re-review N1):
+ * - `loginArgon2Gate`: user logins;
+ * - `agentArgon2Gate`: agent authentications with an unrecognized secret;
+ * - `agentKnownGoodGate`: reserved for agent secrets matching the last verified fingerprint
+ *   (the legitimate agent after its 25 s cache expired). Full argon2id still runs.
+ */
 export const MAX_CONCURRENT_UNAUTHENTICATED_ARGON2 = 8;
-export const argon2Gate = new Semaphore(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
+export const MAX_CONCURRENT_LOGIN_ARGON2 = 4;
+export const MAX_CONCURRENT_KNOWN_GOOD_ARGON2 = 4;
+export const loginArgon2Gate = new Semaphore(MAX_CONCURRENT_LOGIN_ARGON2);
+export const agentArgon2Gate = new Semaphore(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
+export const agentKnownGoodGate = new Semaphore(MAX_CONCURRENT_KNOWN_GOOD_ARGON2);
 
 let dummyHash: Promise<string> | undefined;
 

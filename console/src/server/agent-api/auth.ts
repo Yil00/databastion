@@ -4,14 +4,15 @@ import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import {
   AGENT_SECRET_FORMAT,
-  argon2Gate,
+  agentArgon2Gate,
+  agentKnownGoodGate,
   argon2Verify,
   isLowEntropySecret,
   safeEqual,
   sha256Hex,
 } from "@/server/crypto";
 import { RateLimiter } from "@/server/rate-limit";
-import { clientIp } from "@/server/request";
+import { clientIp, ipBucket } from "@/server/request";
 
 import { rateLimited, unauthorized, unavailable } from "./errors";
 
@@ -103,13 +104,14 @@ const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}
 
 export async function authenticateAgent(req: Request): Promise<AuthResult> {
   const ip = clientIp(req);
+  const ipKey = ip ? ipBucket(ip) : null;
   const headerId = req.headers.get("x-databastion-agent-id");
   const agentId = headerId !== null && UUID.test(headerId) ? headerId : null;
   const secret = BEARER.exec(req.headers.get("authorization") ?? "")?.[1];
 
   const denied = (): AuthResult => ({ ok: false, response: unauthorized() });
   const limitedResponse = (keys: { agent?: string }): AuthResult | null => {
-    const byIp = ip ? failuresPerIp.check(ip) : undefined;
+    const byIp = ipKey ? failuresPerIp.check(ipKey) : undefined;
     const byAgent = keys.agent ? failuresPerAgent.check(keys.agent) : undefined;
     if (byIp?.limited || byAgent?.limited) {
       const retry = Math.max(byIp?.retryAfterS ?? 1, byAgent?.retryAfterS ?? 1);
@@ -122,12 +124,12 @@ export async function authenticateAgent(req: Request): Promise<AuthResult> {
     const blocked = limitedResponse({ agent: key });
     if (blocked) return blocked;
     if (key) failuresPerAgent.hit(key);
-    if (ip) failuresPerIp.hit(ip);
+    if (ipKey) failuresPerIp.hit(ipKey);
     return denied();
   };
 
   if (agentId === null || secret === undefined) return cheapFailure();
-  const key = agentKey(agentId, ip);
+  const key = agentKey(agentId, ipKey);
   if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(key);
 
   const [agent] = await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1);
@@ -139,14 +141,15 @@ export async function authenticateAgent(req: Request): Promise<AuthResult> {
 
   // Expensive path. Everything up to argon2Verify is synchronous: reservations cannot race.
   const exempt = knownGood.matches(agentId, secret, storedHash);
-  const refundIp = ip ? failuresPerIp.reserve(ip) : () => undefined;
+  const refundIp = ipKey ? failuresPerIp.reserve(ipKey) : () => undefined;
   const refundAgent = exempt ? () => undefined : failuresPerAgent.reserve(key);
   if (!refundIp || !refundAgent) {
     refundIp?.();
     refundAgent?.();
     return limitedResponse({ agent: exempt ? undefined : key }) ?? { ok: false, response: rateLimited(1) };
   }
-  const release = argon2Gate.tryAcquire();
+  // N1: the legitimate secret uses a reserved pool that floods of wrong secrets cannot fill.
+  const release = (exempt ? agentKnownGoodGate : agentArgon2Gate).tryAcquire();
   if (!release) {
     // Not a failed attempt: give the reservations back.
     refundIp();

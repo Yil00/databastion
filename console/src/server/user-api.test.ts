@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { agents, auditLog, sessions, users } from "@/db/schema";
-import { argon2Stats, argon2VerifyDummy, MAX_CONCURRENT_UNAUTHENTICATED_ARGON2 } from "@/server/crypto";
+import { argon2Stats, argon2VerifyDummy, MAX_CONCURRENT_LOGIN_ARGON2 } from "@/server/crypto";
 import { bootstrapAdmin, BootstrapError } from "@/server/auth/users";
 import { handleEnroll } from "@/server/agent-api/handlers";
 import { hasDb, setupTestDatabase } from "@/test/db";
@@ -20,6 +20,7 @@ import {
   handleSession,
   loginFailuresPerIp,
   loginFailuresPerUser,
+  loginFailuresUnknownUser,
 } from "./user-api";
 
 const ORIGIN = "http://console.test";
@@ -57,6 +58,7 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
   beforeEach(() => {
     loginFailuresPerIp.clear();
     loginFailuresPerUser.clear();
+    loginFailuresUnknownUser.clear();
   });
 
   it("bootstraps the first admin once, with no default password", async () => {
@@ -114,8 +116,18 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
         handleLogin(userReq("POST", "/api/auth/login", { body: { username: `nobody${i}`, password: "wrong wrong" } })),
       ),
     );
-    expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
-    expect(results.every((r) => [401, 503].includes(r.status))).toBe(true);
+    expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_LOGIN_ARGON2);
+    expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+  });
+
+  it("bounds random-username floods with a process-wide budget (N1)", async () => {
+    const before = argon2Stats.started;
+    for (let i = 0; i < 40; i++) {
+      await handleLogin(userReq("POST", "/api/auth/login", { body: { username: `rnd${i}`, password: "wrong wrong" } }));
+    }
+    expect(argon2Stats.started - before).toBeLessThanOrEqual(loginFailuresUnknownUser.limit);
+    // Known usernames keep their own per-user budget.
+    expect((await login()).res.status).toBe(200);
   });
 
   it("applies no shared per-IP bucket when the client IP is unknown (H2)", async () => {
