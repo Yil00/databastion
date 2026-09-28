@@ -309,8 +309,21 @@ impl NameHints {
     }
 }
 
-/// Lowercase tokens of one name segment.
+/// Lowercase tokens of one name segment, plus their joined form.
 fn tokens(segment: &str) -> Vec<String> {
+    let mut out = word_tokens(segment);
+    // Joined forms catch `e_mail`, `num_secu`, `date_naissance`, `pass_word`.
+    let joined: String = out.concat();
+    if out.len() > 1 && !out.contains(&joined) {
+        out.push(joined);
+    }
+    out
+}
+
+/// Lowercase words of one name segment, split on non-alphanumeric
+/// characters and camelCase boundaries (`archiveLucasMartin` -> `archive`,
+/// `lucas`, `martin`).
+pub(crate) fn word_tokens(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut prev_lower = false;
@@ -330,11 +343,6 @@ fn tokens(segment: &str) -> Vec<String> {
     }
     if !cur.is_empty() {
         out.push(cur);
-    }
-    // Joined forms catch `e_mail`, `num_secu`, `date_naissance`, `pass_word`.
-    let joined: String = out.concat();
-    if out.len() > 1 && !out.contains(&joined) {
-        out.push(joined);
     }
     out
 }

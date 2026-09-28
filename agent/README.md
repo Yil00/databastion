@@ -55,8 +55,12 @@ binary: `cargo build --no-default-features --features postgres`.
   only from `NormalizedName`s. Property tests
   (`crates/classifiers/tests/names_props.rs`, deterministic generator, no
   extra dependency) check every output against the generated `Identifier`
-  type and its `not` rule. Skeleton: classifier matches on segments are
-  added by P2-A.
+  type and its `not` rule. Classifier matches are located in the whole name,
+  so a value split across separators is masked (`a.0612.345678` -> `a.*`);
+  connectors that know the real keys use `normalize_field_path`
+  (`contacts.*.phone`). Gate property tests: generated names embedding split
+  cards, phones, IBANs and e-mail addresses never survive (see
+  `crates/classifiers/README.md`).
 - Conversion: `uplink::to_batches` is the single conversion from
   `MaskedFinding` / `MaskedEvent` to `FindingsBatch` / `EventsBatch`. Each
   item goes through `sanitize` (the `NOT_ENFORCED_BY_SERDE` keywords for sent
@@ -66,10 +70,26 @@ binary: `cargo build --no-default-features --features postgres`.
   ranges); an item still invalid is dropped and counted. Batches hold at most
   200 findings / 500 events and 1 MiB serialized, each with a fresh UUIDv7.
 - Account names: control / format characters stripped, truncated on a
-  character boundary; a non-conforming name goes to `db_user_fingerprint`.
-  **Stub**: HMAC fingerprints are not wired yet (P2-A), so such an event is
-  dropped and counted instead. `MaskedEvent` has no content yet (P4): no
-  event reaches the spool today.
+  character boundary; a non-conforming name goes to `db_user_fingerprint`,
+  computed with the agent HMAC key in the `db_user` domain. `MaskedEvent` has
+  no content yet (P4): no event reaches the spool today.
+- HMAC key: `<state_dir>/hmac.key` is loaded once at startup into a
+  `classifiers::masking::HmacKey` (keyed state, zeroized on drop, redacted
+  `Debug`) held by the runtime and shared with scan jobs. Findings carry the
+  masked samples and fingerprints of `MaskedFinding`; heartbeats and findings
+  batches report `classifiers_version` (`CLASSIFIERS_VERSION`).
+- Job parameters (`core::job`): `discovery.scan` / `audit.configure`
+  parameters reach a connector only through `ScanParams::try_from` /
+  `AuditParams::try_from` (contract ranges, empty filter lists and unknown
+  or duplicate classifier ids refused → `invalid_params`), then
+  `ScanJob::new` / `AuditConfig::new`, which clamp to `limits` in
+  `agent.yaml`. A statement timeout is never `0`: a requested `0` becomes
+  `limits.statement_timeout_ms`. Scans run in a scan worker next to the jobs
+  loop (at most 16 queued, one at a time), so `rotate` / `reload` jobs never
+  wait behind a scan. A scan is stopped at its clamped duration (`timeout`)
+  and when the agent is suspended or revoked (`cancelled`); findings are
+  spooled per chunk of 500, the partial chunk is flushed on every exit, and
+  findings that cannot be spooled are counted (`findings_lost_total`).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
   removed at startup, unreadable files are moved to `spool/quarantine/` (32
@@ -190,10 +210,11 @@ written by hand (I6): `crates/protocol/src/generated.rs` is produced by
 `databastion-protocol-codegen` (typify) and committed. Its header lists the
 schema rewrites applied before generation and the keywords that serde does
 not enforce (`if` / `then` / `else`, `not`, numeric bounds, `minItems` /
-`maxItems`…). The console's Ajv validation enforces them; checking received
-values on the agent side is a required future step (P1-B heartbeat
-scheduler, P2 scan / audit parameter mapping), not an existing guarantee
-(`crates/protocol/tests/fixtures.rs` lists the affected invalid fixtures).
+`maxItems`…). The console's Ajv validation enforces them on what the agent
+sends. On what the agent receives, the heartbeat interval is clamped (P1-B)
+and the scan / audit job parameters go through the `core::job` `TryFrom`
+gates (`crates/core/tests/job_fixtures.rs`); `crates/protocol/tests/fixtures.rs`
+lists the invalid fixtures serde accepts.
 `AgentSecret` / `EnrollmentToken` are hand-written wrappers (redacted
 `Debug`, zeroized on drop), as are `Uuid` / `UuidV7` (canonical, version
 checked).
@@ -202,8 +223,8 @@ The generator (developer tool only, never linked into the binary) parses
 YAML with `serde_yaml_ng`, a maintained fork of the deprecated `serde_yaml`.
 Only the crate-private uplink uses these types; connectors may not depend on
 `databastion-protocol` (architecture test). `ScanJob` and `AuditConfig`
-remain opaque placeholders that the core will map from the generated job
-parameters.
+(`core::job`) are mapped from the generated job parameters by `TryFrom`,
+then clamped; connectors never see the generated types.
 
 ## Commands
 Run from `agent/` (same as CI):

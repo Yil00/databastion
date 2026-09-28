@@ -39,8 +39,9 @@ such a column are missed; elsewhere, a Luhn-valid SIRET with those prefixes is r
   column can still be found through its other rows.
 - **Hint-gated classifiers** (`pii.person_name`, `pii.postal_address`, `pii.birth_date`, AWS secret
   keys) find nothing in a column whose name gives no hint, and nothing in free text.
-- **Names used as identifiers** (a table named `archive_lucas_martin`) are not recognized by any
-  detector.
+- **Person names in identifiers**: the name normalizer masks words from a small list of common
+  first names (`archive_lucas_martin` -> `*`, `ou=Oliver Martin` -> `ou=*`), but a surname alone
+  (`archive_martin`) or a first name missing from the list is not recognized.
 - The recall / precision measured on the dev seed is in-sample: the detectors were written with
   the seed generator in view.
 
@@ -102,6 +103,25 @@ Fingerprints are the 50 smallest distinct ones, emitted sorted. Decision rules
 | birth date, person name, AWS secret key | hint and `ratio >= 0.8` | `0.3 + 0.5·ratio` (secret key: as validated) |
 | postal address | hint and `ratio >= 0.6` | `0.3 + 0.5·ratio` |
 
+## Name normalization (ADR-0009)
+
+`names::normalize_path` (a dotted name), `names::normalize_field_path` (the keys and array levels a
+connector walked; preferred for MongoDB) and `names::normalize_ldap_dn` produce a `NormalizedName`,
+which always matches the contract `Identifier` (pattern and `not` rule; anything else becomes `*`).
+Values are located in the **whole** name, so a value split across separators is found: the token
+detectors above run on the name as is and with `.`, `_`, `-`, `/` read as spaces; an `@` masks the
+address around it; digit runs split by single separators with more than 6 digits are values. Every
+segment a value touches becomes `*` (`a.0612.345678` -> `a.*`, `card_4111_1111_1111_1111` -> `*`).
+Inputs are NFKC-folded first (fullwidth digits, `＠`, `．`); percent-encoded bytes make a segment a
+value; password-hash prefixes and split AWS key ids are masked; the final gate rejects any name with
+more than 6 numeric characters in a row or 8 in total, in any script.
+
+A dotted string cannot tell a container from the local part of an address:
+`normalize_path("contacts.jane@example.com.phone")` gives `*.phone` (conservative), while
+`normalize_field_path(&[Key("contacts"), Key("jane@example.com"), Key("phone")])` gives
+`contacts.*.phone`. Digit-only object keys are dynamic keys (`hourly.13` -> `hourly.*`); array
+levels become `[]`.
+
 ## Masking
 
 Every masked sample is checked against the contract `MaskedSample` rules (ASCII, at least one `*`,
@@ -145,7 +165,8 @@ time) and the normalized values are zeroized on drop. Production callers must pa
 - unit tests: positive / negative cases per detector, validator, hint and masking format;
 - `tests/masking_props.rs` (proptest): contract conformance, no raw value or 5-digit run survives,
   stability, keyed, deterministic and domain-separated fingerprints, no raw value in `Debug`;
-- `tests/names_props.rs`: name normalizer (ADR-0009);
+- `tests/names_props.rs`: name normalizer (ADR-0009), including the Gate property tests: cards,
+  phones, IBANs and e-mail addresses split across separators never survive normalization;
 - `tests/ground_truth.rs`: column-level recall / precision against `dev/ground-truth.json`, offline,
   from the committed seed (`dev/seed/out/`). `cargo test -p databastion-classifiers --test
   ground_truth -- --nocapture` prints the table (counts only).

@@ -22,8 +22,8 @@ use std::time::Duration;
 use databastion_classifiers::masking::{MaskedEvent, MaskedFinding};
 use databastion_protocol::{
     AccessEvent, AgentSecret, ClassifierId as ProtoClassifierId, ClassifiersVersion, Count, Engine,
-    ErrorCode, EventsBatch, Finding, FindingsBatch, Identifier, Location,
-    MaskedSample as ProtoMaskedSample, TargetId, Uuid, UuidV7, new_batch_id,
+    ErrorCode, EventsBatch, Finding, FindingsBatch, Fingerprint as ProtoFingerprint, Identifier,
+    Location, MaskedSample as ProtoMaskedSample, TargetId, Uuid, UuidV7, new_batch_id,
 };
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
@@ -663,7 +663,14 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             .estimated_rows()
             .and_then(|r| i64::try_from(r).ok())
             .map(Count),
-        fingerprints: None,
+        fingerprints: {
+            let fps: Vec<ProtoFingerprint> = f
+                .fingerprints()
+                .iter()
+                .filter_map(|fp| ProtoFingerprint::try_from(fp.as_str()).ok())
+                .collect();
+            (!fps.is_empty()).then_some(fps)
+        },
         location: Location {
             database: id(&loc.database)?,
             engine,
@@ -916,5 +923,84 @@ mod tests {
             to_batches(MaskedResults::Events(&[])).batches.as_slice(),
             []
         ));
+    }
+
+    /// End to end: raw column values -> classifier with the agent key ->
+    /// `MaskedFinding` -> protocol `Finding` -> serialized batch. The batch
+    /// carries masked samples and domain-separated fingerprints, and neither
+    /// a raw value nor the key.
+    #[test]
+    fn finding_items_carry_masked_samples_and_fingerprints() {
+        use databastion_classifiers::column::ColumnClassifier;
+        use databastion_classifiers::masking::{
+            ClassifierId as C, FindingLocation, HmacKey, RawSample,
+        };
+        use databastion_classifiers::names::{NormalizedName, normalize_path};
+
+        let key_bytes = [0x5au8; 32];
+        let key = HmacKey::new(&key_bytes).unwrap();
+        let raw = ["jane.doe@example.com", "john.smith@example.org", "x"];
+        let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+        let found = ColumnClassifier::new()
+            .with_key(&key)
+            .classify("email", &values);
+        assert_eq!(found.len(), 1);
+        let location = FindingLocation {
+            database: normalize_path("shop"),
+            schema: Some(normalize_path("crm")),
+            object: normalize_path("customers"),
+            field: normalize_path("email"),
+        };
+        let finding = found.into_iter().next().unwrap().into_finding(location);
+        let _: &NormalizedName = &finding.location().unwrap().field;
+
+        let target = TargetId::try_from("pg-main").unwrap();
+        let version = ClassifiersVersion::try_from("2026.09.1").unwrap();
+        let built = to_batches(MaskedResults::Findings {
+            job_id: Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+            classifiers_version: &version,
+            target_id: &target,
+            engine: Engine::Postgres,
+            findings: std::slice::from_ref(&finding),
+        });
+        assert_eq!(built.dropped_items, 0);
+        let json = String::from_utf8(built.batches[0].bytes().to_vec()).unwrap();
+        let batch: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let item = &batch["findings"][0];
+        assert_eq!(item["classifier"], "pii.email");
+        let samples: Vec<&str> = item["masked_samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(samples.len(), 2);
+        assert!(samples.contains(&"j***@e***.com"), "{samples:?}");
+        let fps: Vec<&str> = item["fingerprints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let jane = key.fingerprint(C::Email, &RawSample::new(raw[0])).unwrap();
+        let john = key.fingerprint(C::Email, &RawSample::new(raw[1])).unwrap();
+        assert!(
+            fps.contains(&jane.as_str()) && fps.contains(&john.as_str()),
+            "{fps:?}"
+        );
+        // Domain separation: not the `db_user` fingerprint of the same bytes.
+        let as_user = key.fingerprint_db_user(&RawSample::new(raw[0]));
+        assert!(!fps.contains(&as_user.as_str()));
+        // No raw value, no key material, in the batch or any Debug output.
+        let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let debug = format!("{finding:?} {key:?} {built:?}");
+        for text in [&json, &debug] {
+            for v in &raw[..2] {
+                assert!(!text.contains(v), "raw value in {text}");
+            }
+            assert!(!text.contains("jane") && !text.contains("smith"));
+            assert!(!text.contains(&key_hex));
+            assert!(!text.contains("5a5a5a5a"));
+        }
     }
 }

@@ -219,16 +219,12 @@ fn invalid_fixtures_are_rejected_or_allowlisted() {
 /// Gate for the agent's `discovery.scan` mapping: an empty filter list must
 /// never be read as "absent = all". serde accepts `[]` (it does not enforce
 /// `minItems`), but the generated `Option<Vec<_>>` keeps it distinguishable.
-/// For this console -> agent payload, the agent mapping is the enforcement
-/// point.
-///
-/// TODO(ROADMAP P2-B "Bounded sampling", first scan-job consumer; also P2-C):
-/// when `TryFrom<&DiscoveryScanParams>` for the scanner configuration lands,
-/// add to this test, for each of the 4 fixtures below, the assertion
-/// `assert!(ScanConfig::try_from(&job.params).is_err(), "{file}")`
-/// (empty `databases` / `schemas` / `include_objects` / `classifiers` =>
-/// `Err`, job reported `failed`), and that the valid `JobList` fixtures map
-/// to `Ok`.
+/// The refusal itself is asserted where the mapping lives (this crate may
+/// not depend on the core, see `generated_shape.rs`):
+/// `databastion-core` `tests/job_fixtures.rs` checks that
+/// `ScanParams::try_from(&job.params)` is `Err` for these 4 fixtures (job
+/// reported `failed` / `invalid_params`) and `Ok` for the valid `JobList`
+/// fixtures.
 #[test]
 fn empty_scan_filters_stay_distinct_from_absent() {
     let invalid = fixtures_dir("invalid");

@@ -313,6 +313,10 @@ async fn heartbeat_sends_contract_headers_and_clamps_interval() {
     assert_eq!(hb["targets"][0]["reachable"], false);
     assert_eq!(hb["targets"][0]["last_error"], "unsupported");
     assert!(hb["metrics"]["heartbeats_sent_total"].is_number());
+    assert_eq!(
+        hb["classifiers_version"],
+        databastion_classifiers::id::CLASSIFIERS_VERSION
+    );
     // No target address nor account in the heartbeat (I3).
     let text = String::from_utf8_lossy(&last.body).to_string();
     assert!(!text.contains("127.0.0.1") && !text.contains("\"databastion\""));
@@ -1781,4 +1785,307 @@ async fn connector_failure_code_is_reported_as_last_error() {
         assert_eq!(statuses[0].last_error, expected);
         assert_eq!(statuses[0].reachable, health.reachable);
     }
+}
+
+// ------------------------------------------------------- discovery scans
+
+/// Records the bounds it receives and submits one e-mail finding built
+/// through `ScanJob::classify`.
+/// What a connector saw: sample rows, statement timeout, classifiers.
+type SeenBounds = (
+    u32,
+    u32,
+    Option<Vec<databastion_classifiers::id::ClassifierId>>,
+);
+
+struct Scanner(StdMutex<Vec<SeenBounds>>);
+
+#[async_trait::async_trait]
+impl Connector for Scanner {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        use databastion_classifiers::masking::{FindingLocation, RawSample};
+        use databastion_classifiers::names::normalize_path;
+        self.0.lock().unwrap().push((
+            job.sample_rows(),
+            job.statement_timeout_ms(),
+            job.classifiers().map(<[_]>::to_vec),
+        ));
+        let raw = ["jane.doe@example.com", "john.smith@example.org"];
+        let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+        for f in job.classify("email", &values) {
+            let location = FindingLocation {
+                database: normalize_path("shop"),
+                schema: Some(normalize_path("crm")),
+                object: normalize_path("customers"),
+                field: normalize_path("email"),
+            };
+            sink.submit(f.into_finding(location)).await?;
+        }
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn discovery_scans_go_through_the_gate_and_spool_fingerprinted_findings() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let scanner = Arc::new(Scanner(StdMutex::new(Vec::new())));
+    struct Shared(Arc<Scanner>);
+    #[async_trait::async_trait]
+    impl Connector for Shared {
+        fn engine(&self) -> Engine {
+            self.0.engine()
+        }
+        async fn check(&self) -> TargetHealth {
+            self.0.check().await
+        }
+        async fn discover(
+            &self,
+            job: &crate::ScanJob,
+            sink: &crate::FindingSink,
+        ) -> Result<(), crate::ConnectorError> {
+            self.0.discover(job, sink).await
+        }
+        async fn audit_stream(
+            &self,
+            cfg: &crate::AuditConfig,
+            sink: &crate::EventSink,
+        ) -> Result<(), crate::ConnectorError> {
+            self.0.audit_stream(cfg, sink).await
+        }
+    }
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Shared(Arc::clone(&scanner)))],
+    )
+    .unwrap();
+    let ok = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f81";
+    let empty = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f82";
+    let unknown_id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f83";
+    let bad_timeout = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f84";
+    let unknown_target = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f85";
+    let scan = |id: &str, target: &str, params: serde_json::Value| {
+        serde_json::json!({
+            "job_id": id, "type": "discovery.scan", "created_at": "2026-09-28T14:00:00Z",
+            "target_id": target, "classifiers_version": "2026.09.1", "params": params
+        })
+    };
+    let body = serde_json::json!({ "jobs": [
+        // 10000 rows requested, local cap 1000; timeout 0 -> local cap.
+        scan(ok, "pg-main", serde_json::json!({
+            "sample_rows": 10000, "max_duration_s": 900, "statement_timeout_ms": 0,
+            "classifiers": ["pii.email"]})),
+        scan(empty, "pg-main", serde_json::json!({
+            "sample_rows": 200, "max_duration_s": 900, "databases": []})),
+        scan(unknown_id, "pg-main", serde_json::json!({
+            "sample_rows": 200, "max_duration_s": 900, "classifiers": ["pii.unknown"]})),
+        scan(bad_timeout, "pg-main", serde_json::json!({
+            "sample_rows": 200, "max_duration_s": 900, "statement_timeout_ms": 50})),
+        scan(unknown_target, "pg-other", serde_json::json!({
+            "sample_rows": 200, "max_duration_s": 900})),
+    ]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    // Refused jobs are reported at once; the valid one waits for the worker,
+    // and a redelivery does not queue it twice.
+    assert!(statuses(&server).await.iter().all(|(i, _)| i != ok));
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rt.lock_scans().queued.len(), 1);
+    run_queued_scans(&rt).await;
+    let got = statuses(&server).await;
+    let find = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    assert_eq!(find(ok)["status"], "succeeded");
+    for id in [empty, unknown_id, bad_timeout] {
+        assert_eq!(find(id)["error"]["code"], "invalid_params", "{id}");
+    }
+    assert_eq!(find(unknown_target)["error"]["code"], "unknown_target");
+    assert_eq!(rt.counters.jobs_invalid_params.load(Ordering::Relaxed), 3);
+    assert_eq!(rt.counters.findings_received.load(Ordering::Relaxed), 1);
+
+    // Only the gated job reached the connector, clamped.
+    let seen = scanner.0.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![(
+            1000,
+            30_000,
+            Some(vec![databastion_classifiers::id::ClassifierId::Email])
+        )]
+    );
+
+    drain(&rt).await;
+    let batches = sent_batches(&server).await;
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    serde_json::from_value::<databastion_protocol::FindingsBatch>(batch.clone()).unwrap();
+    assert_eq!(
+        batch["classifiers_version"],
+        databastion_classifiers::id::CLASSIFIERS_VERSION
+    );
+    let item = &batch["findings"][0];
+    assert_eq!(item["job_id"], serde_json::Value::Null);
+    assert_eq!(batch["job_id"], ok);
+    assert_eq!(item["masked_samples"].as_array().unwrap().len(), 2);
+    let fps = item["fingerprints"].as_array().unwrap();
+    assert_eq!(fps.len(), 2);
+    // Fingerprints use the enrolled agent key.
+    let key = databastion_classifiers::masking::HmacKey::new(&env.state.load_hmac_key().unwrap())
+        .unwrap();
+    let jane = key
+        .fingerprint(
+            databastion_classifiers::id::ClassifierId::Email,
+            &databastion_classifiers::masking::RawSample::new("jane.doe@example.com"),
+        )
+        .unwrap();
+    assert!(fps.iter().any(|f| f == jane.as_str()));
+    let text = batch.to_string();
+    assert!(!text.contains("jane") && !text.contains("smith"), "{text}");
+}
+
+/// Runs every queued scan (the scan worker, without its loop).
+async fn run_queued_scans(rt: &Runtime) {
+    loop {
+        let next = rt.lock_scans().queued.pop_front();
+        let Some(prepared) = next else {
+            return;
+        };
+        rt.run_prepared_scan(prepared, std::future::pending()).await;
+    }
+}
+
+/// Submits one finding, then never returns (a stuck scan).
+struct Stuck;
+
+#[async_trait::async_trait]
+impl Connector for Stuck {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        use databastion_classifiers::masking::{FindingLocation, RawSample};
+        use databastion_classifiers::names::normalize_path;
+        let values = [RawSample::new("jane.doe@example.com")];
+        for f in job.classify("email", &values) {
+            let location = FindingLocation {
+                database: normalize_path("shop"),
+                schema: None,
+                object: normalize_path("customers"),
+                field: normalize_path("email"),
+            };
+            sink.submit(f.into_finding(location)).await?;
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn suspension_cancels_a_running_scan_and_flushes_its_findings() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(&env.config_path, env.config.clone(), vec![Box::new(Stuck)]).unwrap();
+    let id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f91";
+    let reload = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f92";
+    let body = serde_json::json!({ "jobs": [{
+        "job_id": id, "type": "discovery.scan", "created_at": "2026-09-28T14:00:00Z",
+        "target_id": "pg-main", "classifiers_version": "2026.09.1",
+        "params": {"sample_rows": 200, "max_duration_s": 900}
+    }]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown) = watch::channel(false);
+    let worker = rt.scan_loop(shutdown);
+    let driver = async {
+        // The jobs path is free while the scan runs.
+        for _ in 0..50 {
+            if rt.counters.findings_received.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rt.handle_job_list(
+            &serde_json::to_vec(&serde_json::json!({"jobs": [
+                job(reload, "agent.config.reload", serde_json::json!({}))
+            ]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(statuses(&server).await.iter().any(|(i, _)| i == reload));
+        // Revocation: a fatal 401 suspends the agent.
+        rt.set_state(RunState::Suspended);
+        for _ in 0..50 {
+            if statuses(&server).await.iter().any(|(i, _)| i == id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown_tx.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == id).unwrap().1;
+    assert_eq!(update["error"]["code"], "cancelled");
+    // The finding handed over before the cancellation was spooled.
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    assert_eq!(rt.counters.findings_lost.load(Ordering::Relaxed), 0);
+    assert!(rt.lock_scans().in_flight.is_empty());
 }

@@ -163,6 +163,10 @@ pub struct Limits {
     /// Maximum duration of a scan, in seconds.
     #[serde(default = "default_scan_duration")]
     pub max_scan_duration_s: u32,
+    /// Shortest polling interval of audit sources, in seconds (console
+    /// `poll_interval_s` values below it are raised to it).
+    #[serde(default = "default_audit_poll")]
+    pub min_audit_poll_interval_s: u32,
 }
 
 const fn default_sample_rows() -> u32 {
@@ -174,6 +178,9 @@ const fn default_statement_timeout() -> u32 {
 const fn default_scan_duration() -> u32 {
     3_600
 }
+const fn default_audit_poll() -> u32 {
+    5
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -181,6 +188,7 @@ impl Default for Limits {
             max_sample_rows: default_sample_rows(),
             statement_timeout_ms: default_statement_timeout(),
             max_scan_duration_s: default_scan_duration(),
+            min_audit_poll_interval_s: default_audit_poll(),
         }
     }
 }
@@ -270,6 +278,31 @@ pub struct TargetConfig {
     pub account: String,
     /// Where the account secret is read from. Never the secret itself (I3).
     pub secret: SecretRef,
+    /// Region of national phone numbers without `+` in this target (`fr`),
+    /// used to normalize them before fingerprinting. Absent: unknown (the
+    /// digits are fingerprinted as they are).
+    #[serde(default)]
+    pub phone_region: Option<PhoneRegionConfig>,
+}
+
+/// Phone region of a target (`agent.yaml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhoneRegionConfig {
+    /// France: `0X XX XX XX XX` is `+33 X XX XX XX XX`.
+    Fr,
+}
+
+impl TargetConfig {
+    /// Phone region handed to the column classifier.
+    #[must_use]
+    pub fn phone_region(&self) -> databastion_classifiers::masking::PhoneRegion {
+        use databastion_classifiers::masking::PhoneRegion;
+        match self.phone_region {
+            Some(PhoneRegionConfig::Fr) => PhoneRegion::Fr,
+            None => PhoneRegion::Unknown,
+        }
+    }
 }
 
 /// Reference to a database secret: exactly one of `env` (variable name) or
@@ -319,6 +352,12 @@ const KNOWN_KEYS: &[&str] = &[
     "max_sample_rows",
     "statement_timeout_ms",
     "max_scan_duration_s",
+    "min_audit_poll_interval_s",
+    "phone_region",
+    // Values of closed enums (`engine`, `phone_region`) are listed too, so
+    // that an "unknown variant" error can name the expected ones; they are
+    // schema constants, never user data.
+    "fr",
     "targets",
     "id",
     "engine",
@@ -491,6 +530,12 @@ impl AgentConfig {
             return Err(invalid(
                 "limits.max_scan_duration_s",
                 "must be in 60..=86400",
+            ));
+        }
+        if !in_range(l.min_audit_poll_interval_s, (1, 3_600)) {
+            return Err(invalid(
+                "limits.min_audit_poll_interval_s",
+                "must be in 1..=3600",
             ));
         }
         if !(2 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&self.spool.max_bytes) {
@@ -671,6 +716,20 @@ targets:
             "https://console.example.internal/api/agent/v1"
         );
         assert_eq!(cfg.targets[1].engine.connector(), Engine::Openldap);
+        assert_eq!(
+            cfg.targets[0].phone_region(),
+            databastion_classifiers::masking::PhoneRegion::Unknown
+        );
+        let fr = parse(&BASE.replace("    port: 5432\n", "    port: 5432\n    phone_region: fr\n"))
+            .unwrap();
+        assert_eq!(
+            fr.targets[0].phone_region(),
+            databastion_classifiers::masking::PhoneRegion::Fr
+        );
+        assert!(
+            err(&BASE.replace("    port: 5432\n", "    port: 5432\n    phone_region: xx\n"))
+                .contains("phone_region")
+        );
     }
 
     #[test]
@@ -764,6 +823,7 @@ targets:
             ("statement_timeout_ms", "0"),
             ("statement_timeout_ms", "600001"),
             ("max_scan_duration_s", "10"),
+            ("min_audit_poll_interval_s", "0"),
         ] {
             let text = format!("{BASE}limits:\n  {key}: {value}\n");
             assert!(err(&text).contains(key), "{key}={value}");
@@ -776,6 +836,7 @@ targets:
             max_sample_rows: 500,
             statement_timeout_ms: 10_000,
             max_scan_duration_s: 600,
+            min_audit_poll_interval_s: 5,
         };
         assert_eq!(limits.clamp_sample_rows(0), 1);
         assert_eq!(limits.clamp_sample_rows(10_000), 500);

@@ -5,14 +5,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use databastion_classifiers::id::CLASSIFIERS_VERSION;
+use databastion_classifiers::masking::{HmacKey, MaskedFinding};
 use databastion_protocol::{
-    AgentVersion, Connector as ProtoConnector, ConnectorList, Count, DetectedTarget, EnrollRequest,
-    EnrollRequestArch, EnrollRequestOs, EnrollResponse, EnrollmentToken, FailureCode,
-    HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate, MetricsMap,
-    MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
+    AgentVersion, ClassifiersVersion, Connector as ProtoConnector, ConnectorList, Count,
+    DetectedTarget, EnrollRequest, EnrollRequestArch, EnrollRequestOs, EnrollResponse,
+    EnrollmentToken, FailureCode, HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError,
+    JobStatusUpdate, MetricsMap, MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
 };
 use reqwest::Method;
 use tokio::sync::watch;
@@ -24,8 +26,10 @@ use crate::connector::Connector;
 use crate::detect;
 use crate::engine::{AuditLevel, Engine};
 use crate::identity::{Identity, IdentityError, StateDir};
+use crate::job::{ScanJob, ScanParams};
 use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
 use crate::session::{CallError, RotateOutcome, Session};
+use crate::sink::FindingSink;
 use crate::spool::Spool;
 use crate::uplink::{self, Auth, ResultBatch, Uplink, UplinkError};
 
@@ -70,6 +74,17 @@ impl From<CallError> for AgentError {
 fn now() -> Timestamp {
     Timestamp(chrono::DateTime::<chrono::Utc>::from(SystemTime::now()))
 }
+
+/// The classifier set of this build (`CLASSIFIERS_VERSION`), reported in
+/// heartbeats and findings batches.
+fn classifiers_version() -> Option<ClassifiersVersion> {
+    ClassifiersVersion::try_from(CLASSIFIERS_VERSION).ok()
+}
+
+/// Findings of a scan converted and spooled per chunk of this many.
+const FINDINGS_CHUNK: usize = 500;
+/// Capacity of the finding channel between a connector and the core.
+const FINDINGS_CHANNEL: usize = 64;
 
 fn agent_version() -> Result<AgentVersion, AgentError> {
     AgentVersion::try_from(env!("CARGO_PKG_VERSION"))
@@ -264,7 +279,34 @@ struct Counters {
     /// Batches lost because their serialization failed (on spooling or when
     /// splitting a spooled batch).
     batches_serialization_failed: AtomicU64,
+    /// Jobs refused by the parameter gates (`invalid_params`).
+    jobs_invalid_params: AtomicU64,
+    /// Findings received from connectors (before sanitization).
+    findings_received: AtomicU64,
+    /// Findings lost because they could not be spooled.
+    findings_lost: AtomicU64,
 }
+
+/// A `discovery.scan` that passed the gates, waiting for the scan worker.
+struct PreparedScan {
+    id: Uuid,
+    target_id: TargetId,
+    engine: databastion_protocol::Engine,
+    /// Index in `Runtime::connectors`.
+    connector: usize,
+    scan: ScanJob,
+}
+
+/// Scans waiting for the worker, and the ids queued or running (a
+/// redelivered job is not queued twice).
+#[derive(Default)]
+struct ScanQueue {
+    queued: std::collections::VecDeque<PreparedScan>,
+    in_flight: std::collections::HashSet<Uuid>,
+}
+
+/// Scans queued at most; more are left unacknowledged and redelivered.
+const MAX_QUEUED_SCANS: usize = 16;
 
 fn bump(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
@@ -280,6 +322,14 @@ struct Runtime {
     ledger: Mutex<Ledger>,
     state: watch::Sender<RunState>,
     spool: Mutex<Spool>,
+    /// Agent-local HMAC key (fingerprints, sample order), loaded once at
+    /// startup from `<state_dir>/hmac.key`. Never sent, logged or
+    /// serialized (redacted `Debug`, zeroized on drop).
+    hmac: Arc<HmacKey>,
+    /// Scans waiting for, or run by, the scan worker.
+    scans: Mutex<ScanQueue>,
+    /// Wakes the scan worker when a scan is queued.
+    scan_ready: tokio::sync::Notify,
     /// Host root for local detection (`/`; a fixture tree in tests).
     host_root: PathBuf,
     /// Heartbeats refused with a fatal `401` since the last success.
@@ -339,8 +389,14 @@ impl Runtime {
     ) -> Result<Self, AgentError> {
         let state = StateDir::new(&config.state_dir);
         let identity = state.load_identity()?;
-        // The HMAC key must exist (fingerprints, P2); it is never sent.
-        state.load_hmac_key()?;
+        // The HMAC key (fingerprints); it is never sent. The raw bytes are
+        // zeroized once the keyed HMAC state is built.
+        let hmac = {
+            let bytes = state.load_hmac_key()?;
+            HmacKey::new(&bytes)
+                .map(Arc::new)
+                .map_err(|_| IdentityError::Corrupt(state.hmac_key_path()))?
+        };
         let uplink = Uplink::new(&config)?;
         tracing::info!(agent_id = %identity.agent_id, "identity loaded");
         let spool = Spool::open(&config.state_dir, &config.spool).map_err(|e| {
@@ -360,6 +416,9 @@ impl Runtime {
             ledger: Mutex::new(Ledger::default()),
             state: watch::channel(RunState::Active).0,
             spool: Mutex::new(spool),
+            hmac,
+            scans: Mutex::new(ScanQueue::default()),
+            scan_ready: tokio::sync::Notify::new(),
             host_root: PathBuf::from("/"),
             detection: Mutex::new(None),
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
@@ -369,10 +428,12 @@ impl Runtime {
     async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let heartbeat = self.heartbeat_loop(shutdown.clone());
         let jobs = self.jobs_loop(shutdown.clone());
+        let scans = self.scan_loop(shutdown.clone());
         let spool = self.spool_loop(shutdown);
         tokio::select! {
             r = heartbeat => r,
             r = jobs => r,
+            r = scans => r,
             r = spool => r,
         }
     }
@@ -436,6 +497,9 @@ impl Runtime {
             ("jobs_failed_total", &c.jobs_failed),
             ("jobs_unparseable_total", &c.jobs_unparseable),
             ("jobs_deferred_total", &c.jobs_deferred),
+            ("jobs_invalid_params_total", &c.jobs_invalid_params),
+            ("findings_received_total", &c.findings_received),
+            ("findings_lost_total", &c.findings_lost),
             ("batches_sent_total", &c.batches_sent),
             ("batches_duplicate_total", &c.batches_duplicate),
             ("batches_rejected_total", &c.batches_rejected),
@@ -505,7 +569,7 @@ impl Runtime {
         let detected_targets = self.detected_targets(&config).await;
         Ok(HeartbeatRequest {
             agent_version: agent_version()?,
-            classifiers_version: None,
+            classifiers_version: classifiers_version(),
             connectors: connector_list(&engines),
             detected_targets,
             metrics: Some(self.metrics()),
@@ -676,11 +740,7 @@ impl Runtime {
     }
 
     /// Converts masked findings of a job (the single conversion in
-    /// `uplink::to_batches`) and spools them. Wired to connectors in P2.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "connectors produce findings in P2")
-    )]
+    /// `uplink::to_batches`) and spools them.
     pub(crate) fn spool_findings(
         &self,
         job_id: Uuid,
@@ -1021,18 +1081,231 @@ impl Runtime {
     /// Executes a job. `None`: leave it unacknowledged (redelivered later).
     async fn execute(&self, job: &Job, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         match job {
-            // TODO(P2): `DiscoveryScanParams` / `AuditConfigureParams` must
-            // be mapped into `ScanJob` / `AuditConfig` only through a
-            // `TryFrom` enforcing the contract ranges, then clamped with
-            // `Limits::clamp_*` from `agent.yaml` (I4) BEFORE building the
-            // job handed to a connector; never pass raw console values.
-            Job::DiscoveryScanJob(_) | Job::AuditConfigureJob(_) => {
-                // P2 / P4: not implemented in this build.
-                Ok(Some(Outcome::failed(FailureCode::Unsupported)))
+            Job::DiscoveryScanJob(scan) => Ok(self.queue_scan(scan, id)),
+            Job::AuditConfigureJob(audit) => {
+                // Gate now; audit collection lands in P4.
+                let outcome = match crate::job::AuditParams::try_from(&audit.params) {
+                    Ok(_) => Outcome::failed(FailureCode::Unsupported),
+                    Err(e) => self.invalid_params(id, &e),
+                };
+                Ok(Some(outcome))
             }
             Job::AgentConfigReloadJob(_) => Ok(Some(self.reload_config())),
             Job::AgentRotateSecretJob(_) => self.rotate_for_job(id).await,
         }
+    }
+
+    fn invalid_params(&self, id: Uuid, e: &crate::job::ParamsError) -> Outcome {
+        bump(&self.counters.jobs_invalid_params, 1);
+        tracing::warn!(job_id = %id, field = e.field, reason = e.reason, "job parameters refused");
+        Outcome::failed(FailureCode::InvalidParams)
+    }
+
+    /// Checks a `discovery.scan` and queues it for the scan worker.
+    /// Parameters go through the contract gate (`ScanParams::try_from`) and
+    /// the `agent.yaml` clamp (`ScanJob::new`) here, so a refused job is
+    /// reported at once. `None`: queued, already running, or queue full
+    /// (left unacknowledged, redelivered later).
+    fn queue_scan(
+        &self,
+        job: &databastion_protocol::DiscoveryScanJob,
+        id: Uuid,
+    ) -> Option<Outcome> {
+        let params = match ScanParams::try_from(&job.params) {
+            Ok(p) => p,
+            Err(e) => return Some(self.invalid_params(id, &e)),
+        };
+        let config = self.config();
+        let Some(target) = config
+            .targets
+            .iter()
+            .find(|t| t.id == job.target_id.as_str())
+        else {
+            tracing::warn!(job_id = %id, "scan job for an undeclared target");
+            return Some(Outcome::failed(FailureCode::UnknownTarget));
+        };
+        let Some(connector) = self
+            .connectors
+            .iter()
+            .position(|c| c.engine() == target.engine.connector())
+        else {
+            return Some(Outcome::failed(FailureCode::Unsupported));
+        };
+        let mut queue = self.lock_scans();
+        if queue.in_flight.contains(&id) {
+            return None;
+        }
+        if queue.queued.len() >= MAX_QUEUED_SCANS {
+            tracing::warn!(job_id = %id, "scan queue full; the job will be redelivered");
+            return None;
+        }
+        queue.in_flight.insert(id);
+        queue.queued.push_back(PreparedScan {
+            id,
+            target_id: job.target_id.clone(),
+            engine: proto_engine(target.engine),
+            connector,
+            scan: ScanJob::new(params, target, &config.limits, Arc::clone(&self.hmac)),
+        });
+        drop(queue);
+        self.scan_ready.notify_one();
+        None
+    }
+
+    fn lock_scans(&self) -> std::sync::MutexGuard<'_, ScanQueue> {
+        self.scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Scan worker: runs queued scans one at a time, next to the jobs loop,
+    /// so that `rotate` / `reload` jobs never wait behind a scan.
+    async fn scan_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let next = self.lock_scans().queued.pop_front();
+            let Some(prepared) = next else {
+                tokio::select! {
+                    () = self.scan_ready.notified() => {}
+                    _ = shutdown.changed() => {}
+                }
+                continue;
+            };
+            let cancel = {
+                let mut shutdown = shutdown.clone();
+                async move {
+                    let _ = shutdown.wait_for(|stop| *stop).await;
+                }
+            };
+            self.run_prepared_scan(prepared, cancel).await;
+        }
+    }
+
+    /// Runs one prepared scan and reports its outcome.
+    async fn run_prepared_scan(
+        &self,
+        prepared: PreparedScan,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
+        let id = prepared.id;
+        let outcome = self.discovery_scan(prepared, shutdown).await;
+        self.lock_scans().in_flight.remove(&id);
+        self.finish(id, outcome).await;
+    }
+
+    /// Resolves once the agent leaves [`RunState::Active`] (suspension
+    /// after a fatal `401`, i.e. revocation).
+    fn inactive(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let mut state = self.state.subscribe();
+        async move {
+            if state.wait_for(|s| *s != RunState::Active).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Runs a queued scan. Findings are spooled per chunk while it runs.
+    /// The connector future is dropped at the clamped deadline (`timeout`),
+    /// when the agent is suspended or revoked, or on shutdown (`cancelled`);
+    /// findings already handed over are flushed first. Findings that cannot
+    /// be spooled are counted as lost.
+    async fn discovery_scan(
+        &self,
+        prepared: PreparedScan,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Outcome {
+        let PreparedScan {
+            id,
+            target_id,
+            engine,
+            connector,
+            scan,
+        } = prepared;
+        let Some(connector) = self.connectors.get(connector) else {
+            return Outcome::failed(FailureCode::Unsupported);
+        };
+        let Some(version) = classifiers_version() else {
+            return Outcome::failed(FailureCode::Internal);
+        };
+        let deadline = scan.max_duration();
+        let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
+        let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
+        let spool_failed = std::sync::atomic::AtomicBool::new(false);
+        let flush = || {
+            let mut chunk = chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if chunk.is_empty() {
+                return;
+            }
+            if let Err(e) = self.spool_findings(id, &target_id, engine, &version, &chunk) {
+                let lost = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                bump(&self.counters.findings_lost, lost);
+                tracing::error!(job_id = %id, error = %e.kind(), lost, "cannot spool findings");
+                spool_failed.store(true, Ordering::Relaxed);
+            }
+            chunk.clear();
+        };
+        let outcome = {
+            let run = async {
+                let r = connector.discover(&scan, &sink).await;
+                drop(sink);
+                r
+            };
+            let collect = async {
+                while let Some(f) = rx.recv().await {
+                    bump(&self.counters.findings_received, 1);
+                    let full = {
+                        let mut c = chunk
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        c.push(f);
+                        c.len() >= FINDINGS_CHUNK
+                    };
+                    if full {
+                        flush();
+                    }
+                }
+            };
+            let work = async { tokio::join!(run, collect).0 };
+            tokio::select! {
+                r = work => match r {
+                    Ok(()) => Outcome::SUCCEEDED,
+                    Err(crate::ConnectorError::NotImplemented { .. }) => {
+                        Outcome::failed(FailureCode::Unsupported)
+                    }
+                    Err(e) => {
+                        tracing::warn!(job_id = %id, error = %e, "scan failed");
+                        Outcome::failed(FailureCode::Internal)
+                    }
+                },
+                () = tokio::time::sleep(deadline) => {
+                    tracing::warn!(job_id = %id, "scan stopped at its maximum duration");
+                    Outcome::failed(FailureCode::Timeout)
+                }
+                () = self.inactive() => {
+                    tracing::warn!(job_id = %id, "scan cancelled: the agent is no longer active");
+                    Outcome::failed(FailureCode::Cancelled)
+                }
+                () = shutdown => Outcome::failed(FailureCode::Cancelled),
+            }
+        };
+        // The connector future (and its sink) is dropped: drain what it
+        // handed over, then flush the partial chunk.
+        while let Ok(f) = rx.try_recv() {
+            bump(&self.counters.findings_received, 1);
+            chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(f);
+        }
+        flush();
+        if spool_failed.load(Ordering::Relaxed) && outcome.error.is_none() {
+            return Outcome::failed(FailureCode::ResourceLimit);
+        }
+        outcome
     }
 
     fn reload_config(&self) -> Outcome {
