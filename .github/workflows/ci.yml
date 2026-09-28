@@ -118,6 +118,10 @@ jobs:
       # licenses compatible with Apache-2.0, crates.io only.
       - name: cargo-deny (bans, licenses, sources)
         run: cargo deny --locked check bans licenses sources
+      # agent/deny-dev.toml: licenses and sources for the full graph, dev-dependencies
+      # included (deny.toml excludes them so that test-only crates do not trip the bans).
+      - name: cargo-deny dev-dependencies (licenses, sources)
+        run: cargo deny --config deny-dev.toml --locked check licenses sources
 
   protocol:
     name: Protocol
