@@ -9,7 +9,9 @@ Server side of the agent ↔ console protocol.
 | `GET /jobs?wait=` | implemented (P1-A), long-poll | `handlePollJobs` |
 | `POST /jobs/{job_id}/status` | implemented (P1-A) | `handleJobStatus` |
 | `POST /rotate` | implemented (P1-A part 2), ADR-0008 + ADR-0010 | `handleRotate`, logic in `src/server/rotation.ts` |
-| `POST /findings`, `POST /events` | `501` (catch-all `[...path]/route.ts`, body never read) | later phases (P2-D, P3) |
+| `POST /findings` | implemented (P2-D) | `handleFindings`, logic in `src/server/findings.ts` |
+| `POST /events` | `501` with a contract `Error` body (`unavailable`, `Retry-After`), body never read | phase 4 |
+| any other path | `501` (catch-all `[...path]/route.ts`, body never read) | |
 
 Route files are thin: the logic lives in `src/server/agent-api/` (pipeline, auth, long-poll hub)
 and `src/server/{agents,jobs,enrollment}.ts`.
@@ -51,6 +53,24 @@ agent's revocation state every 30 s and claims jobs on a job wake-up; when it is
 every 5 s. Held-poll slots are reserved before any await, also for `wait=0`: at most 2 per agent
 (`429`) and 2000 per process (`503`). Revocation closes held polls with `401`. A job delivered 5 times without any
 status is marked `failed` (`timeout`).
+
+`/findings` (P2-D), after `validateSchema` + `checkSemantics`, in one transaction serialized per
+agent (advisory lock):
+1. idempotency on (`agent_id`, `batch_id`) with the SHA-256 of the validated batch: same content
+   `202 duplicate: true` (not processed again), other content `409 batch_conflict`;
+2. `job_id` must be a `discovery.scan` job of the agent that was delivered (`delivered`, `running`,
+   `succeeded` or `failed`: batches may overtake the `running` status or arrive after the final one);
+   otherwise `404` with pointer `/job_id` (keyword `notFound`);
+3. every `target_id` reported by the agent in a heartbeat: otherwise `404`, pointers
+   `/findings/<i>/target_id` (keyword `notFound`);
+4. per item, `400`: `target_id` = the job's target (`const`), `location.engine` = the engine last
+   reported for the target (`const`), `matched <= sampled` and `sampled <= params.sample_rows`
+   (`maximum`), classifier within the job's `params.classifiers` when set (`enum`);
+5. upsert of the findings (masked samples encrypted, see the console README "Data at rest") and of
+   the batch record; `202` `BatchAck`.
+
+Any `400` on `/findings`, a `batch_conflict` and a foreign `target_id` write an agent-integrity
+event (`security_events` + audit log). `413` (over 4 MiB) and a `404` on `job_id` do not.
 
 Rules for the endpoints to come (see [docs/09-agent-protocol.md](../../../../../../docs/09-agent-protocol.md)):
 

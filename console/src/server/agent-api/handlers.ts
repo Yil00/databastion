@@ -2,8 +2,10 @@ import { eq } from "drizzle-orm";
 
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
-import { validateSchema } from "@/lib/protocol/validate";
+import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
+import { ingestFindings } from "@/server/findings";
+import { recordIntegrityEvent } from "@/server/integrity";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
 import {
@@ -284,11 +286,65 @@ function rotateResponse(outcome: RotateOutcome): Response {
   }
 }
 
-async function errorDetails(res: Response): Promise<{ pointer: string }[]> {
+async function errorDetails(res: Response): Promise<{ pointer: string; keyword: string }[]> {
   try {
-    const body = (await res.clone().json()) as { details?: { pointer: string }[] };
+    const body = (await res.clone().json()) as { details?: { pointer: string; keyword: string }[] };
     return body.details ?? [];
   } catch {
     return [];
   }
+}
+
+/**
+ * `POST /findings` (P2-D). Pipeline: headers, authentication, body (4 MiB cap: `413`),
+ * `validateSchema` then `checkSemantics` (`400`), then `ingestFindings`: idempotency on
+ * (`agent_id`, `batch_id`), job and target ownership (`404`), cross-field checks (`400`), storage.
+ * A rejected batch (`400`), a `batch_conflict` and a finding for a target the agent does not own
+ * are agent-integrity events (audit log + `security_events`). The body is never logged.
+ */
+export function handleFindings(req: Request): Promise<Response> {
+  return guarded("findings", async () => {
+    const auth = await preamble(req);
+    if (!auth.ok) return auth.response;
+    const agentId = auth.agent.id;
+    const ip = clientIp(req);
+    const integrity = (kind: "batch_rejected" | "batch_conflict" | "foreign_target", status: number, details?: ValidationDetail[]) =>
+      recordIntegrityEvent(getDb(), { agentId, kind, endpoint: "findings", status, details, ip });
+    const body = validateBody(await readJsonBody(req), "FindingsBatch");
+    if (!body.ok) {
+      if (body.response.status === 400) {
+        await integrity("batch_rejected", 400, (await errorDetails(body.response)) as ValidationDetail[]);
+      }
+      return body.response;
+    }
+    const outcome = await ingestFindings(getDb(), agentId, body.value);
+    switch (outcome.kind) {
+      case "accepted":
+        return conformingJson(
+          "BatchAck",
+          { batch_id: body.value.batch_id, duplicate: outcome.duplicate },
+          { status: 202 },
+        );
+      case "batch_conflict":
+        await integrity("batch_conflict", 409);
+        return agentError(409, "batch_conflict");
+      case "job_not_found":
+        return agentError(404, "not_found", { details: outcome.details });
+      case "foreign_target":
+        await integrity("foreign_target", 404, outcome.details);
+        return agentError(404, "not_found", { details: outcome.details });
+      case "invalid":
+        await integrity("batch_rejected", 400, outcome.details);
+        return invalidRequest(outcome.details);
+    }
+  });
+}
+
+/**
+ * `POST /events`: Audit lands in phase 4. Answers `501` with a contract `Error` body (`unavailable`:
+ * the closest code; the contract has no "not implemented" one), without reading the body or
+ * authenticating: nothing is stored, the agent keeps its spool and retries with backoff.
+ */
+export function handleEventsNotImplemented(): Response {
+  return agentError(501, "unavailable", { retryAfterS: 3600 });
 }

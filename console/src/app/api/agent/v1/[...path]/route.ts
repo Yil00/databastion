@@ -3,9 +3,9 @@ import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 /**
- * Placeholder for the agent API endpoints not implemented yet (`/findings`, `/events`,
- * and any unknown path). The request body is never read. Implemented endpoints are sibling routes
- * (`enroll/`, `heartbeat/`, `jobs/`, `jobs/[job_id]/status/`, `rotate/`), which take precedence. See ./README.md.
+ * Catch-all for unknown agent API paths and methods. The request body is never read. Endpoints are
+ * sibling routes (`enroll/`, `heartbeat/`, `jobs/`, `jobs/[job_id]/status/`, `rotate/`, `findings/`,
+ * `events/`), which take precedence. See ./README.md.
  */
 function notImplemented(): NextResponse {
   return NextResponse.json(
