@@ -43,6 +43,13 @@
       "when": 1790610489276,
       "tag": "0005_security_events",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790611831213,
+      "tag": "0006_promoted_grace_deadline",
+      "breakpoints": true
     }
   ]
 }

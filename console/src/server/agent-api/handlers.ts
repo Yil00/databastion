@@ -124,10 +124,10 @@ export function handlePollJobs(req: Request): Promise<Response> {
         if (remaining <= 0) break;
         // No database connection is held while waiting.
         const reason = await jobHub.wait(agentId, remaining, req.signal, seq);
-        if (reason === "revoked") return unauthorized();
         if (reason === "aborted") break;
-        // Revocation / lock may have come from a console process whose NOTIFY we missed.
-        if (!(await stillActive(agentId))) return unauthorized();
+        // Revocation, lock or promotion (L2: the poll is bound to the secret it was opened with),
+        // possibly from a console process whose NOTIFY we missed.
+        if (!(await stillActive(agentId, auth.matchedHash))) return unauthorized();
         if (reason === "timeout") break;
         // M3: claim only on a job wake-up, or when the listener is down (polling fallback).
         claim = reason === "job" || !jobHub.listening;
@@ -141,13 +141,14 @@ export function handlePollJobs(req: Request): Promise<Response> {
 
 const noContent = () => new Response(null, { status: 204, headers: NO_STORE });
 
-async function stillActive(agentId: string): Promise<boolean> {
+/** The agent is active AND the secret that authenticated the poll is still its current one. */
+async function stillActive(agentId: string, matchedHash: string): Promise<boolean> {
   const [row] = await getDb()
     .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, hash: agents.currentSecretHash })
     .from(agents)
     .where(eq(agents.id, agentId))
     .limit(1);
-  return !!row && row.revokedAt === null && row.lockedAt === null && row.hash !== null;
+  return !!row && row.revokedAt === null && row.lockedAt === null && row.hash === matchedHash;
 }
 
 /** Console-side clock skew tolerance on agent timestamps (contract: 5 min). */

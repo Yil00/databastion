@@ -16,6 +16,7 @@ import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket } from "@/server/request";
 
 import { rateLimited, unauthorized, unavailable } from "./errors";
+import { jobHub, REVOKED_CHANNEL } from "./job-hub";
 
 /**
  * Agent authentication (contract `agentSecret` security scheme).
@@ -110,6 +111,7 @@ const unrecognizedInFlight = new Set<string>();
 export const TOLERANCE_WINDOW_MS = 60_000;
 
 /**
+ * `stale`: `S0` presented after the tolerance window (`/rotate` only, see `allowPrevious`).
  * Which stored secret the presented one matched:
  * - `current`: the current secret (which is `S0` while a rotation is pending);
  * - `pending`: the pending `S1`, promoted by this very request (first successful use);
@@ -121,7 +123,7 @@ export const TOLERANCE_WINDOW_MS = 60_000;
 export type SecretSlot = "current" | "pending" | "previous";
 
 export type AuthResult =
-  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string }
+  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
   | { ok: false; response: Response; staleSecret?: undefined }
   /** `S0` used after the tolerance window: the caller locks the agent (`rotation_conflict`). */
   | { ok: false; staleSecret: true; agentId: string; response?: undefined };
@@ -159,7 +161,10 @@ export async function promotePending(
         currentSecretHash: pendingHash,
         previousSecretHash: currentHash,
         pendingSecretHash: null,
-        promotedAt: promotedAt === "now" ? sql`now()` : promotedAt,
+        // L1: every rotation instant uses the console (Node) clock, like the window checks.
+        promotedAt: promotedAt === "now" ? new Date() : promotedAt,
+        // L4: the deadline of this rotation, answered to late S0 + S1 retries (ADR-0011).
+        promotedGraceExpiresAt: sql`${agents.graceExpiresAt}`,
       })
       .where(
         and(
@@ -183,6 +188,10 @@ export async function promotePending(
   });
   // The cache entries are bound to the old current hash: they are dead already; purge anyway.
   purgeSecretCache(agentId);
+  // L2: wake held long-polls here and in every console process; each one re-checks that the secret
+  // it was opened with is still the current one (polls opened with S0 are closed).
+  jobHub.closeAgent(agentId);
+  await getDb().execute(sql`select pg_notify(${REVOKED_CHANNEL}, ${agentId})`);
 }
 
 export async function authenticateAgent(req: Request, opts: AuthOptions = {}): Promise<AuthResult> {
@@ -278,9 +287,11 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
     refundIp();
     refundAgent();
     const promotedAt = agent.promotedAt?.getTime() ?? 0;
-    if (Date.now() - promotedAt >= TOLERANCE_WINDOW_MS) return { ok: false, staleSecret: true, agentId };
-    if (!opts.allowPrevious) return denied();
-    return { ok: true, agent, via: "previous", matchedHash };
+    const stale = Date.now() - promotedAt >= TOLERANCE_WINDOW_MS;
+    // `/rotate` decides itself (ADR-0011): S0 + the promoted S1 is a harmless retry at any time.
+    if (opts.allowPrevious) return { ok: true, agent, via: "previous", matchedHash, stale };
+    if (stale) return { ok: false, staleSecret: true, agentId };
+    return denied();
   }
   if (slot === "pending") {
     await promotePending(agentId, storedHash, matchedHash, "now", "first_use");

@@ -20,7 +20,8 @@ import { RateLimiter } from "./rate-limit";
  *   promotion: same `S1` -> `duplicate: true`; different `new_secret` -> `rotation_conflict`.
  * - `/rotate` authenticated with the current secret (e.g. `S1` after promotion) always starts a new
  *   rotation, never a conflict.
- * - `S0` after the window (any endpoint): `rotation_conflict` (see `authenticateAgent`).
+ * - `/rotate` with `S0` and the promoted `S1` (current hash): `duplicate` at any time (ADR-0011).
+ * - Any other use of `S0` after the window: `rotation_conflict` (see `authenticateAgent`).
  * - `rotation_conflict` locks the agent: every secret revoked, held long-polls closed, jobs
  *   cancelled, audit entry + security event.
  * Promotion (first use of `S1`, or the deadline) is done by `authenticateAgent`.
@@ -58,6 +59,7 @@ export async function lockAgentForConflict(
         pendingSecretHash: null,
         previousSecretHash: null,
         graceExpiresAt: null,
+        promotedGraceExpiresAt: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.lockedAt), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
@@ -148,13 +150,17 @@ export async function rotateSecret(
       else return { kind: "unauthorized" };
 
       if (slot === "previous") {
-        const promotedAt = row.promotedAt?.getTime() ?? 0;
-        if (Date.now() - promotedAt >= TOLERANCE_WINDOW_MS) return conflict("stale_secret");
-        // `S0` inside the window: only a retry of the just-promoted `S1` is acceptable.
+        // ADR-0011 (M1): `S0` + the promoted `S1` (the current hash) is a late retry of a rotation
+        // whose response was lost, at ANY time: only the holder of `S1` can send it. Answered with
+        // that rotation's deadline (L4), even if a newer rotation has started since.
         if (await verify(row.currentSecretHash)) {
-          return { kind: "duplicate", graceExpiresAt: row.graceExpiresAt ?? row.promotedAt ?? new Date() };
+          return {
+            kind: "duplicate",
+            graceExpiresAt: row.promotedGraceExpiresAt ?? row.promotedAt ?? new Date(),
+          };
         }
-        return conflict("different_new_secret");
+        const promotedAt = row.promotedAt?.getTime() ?? 0;
+        return conflict(Date.now() - promotedAt >= TOLERANCE_WINDOW_MS ? "stale_secret" : "different_new_secret");
       }
 
       if (row.pendingSecretHash) {

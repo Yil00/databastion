@@ -113,6 +113,11 @@ export const agents = pgTable(
     /** Previous secret hash, kept for the 60 s tolerance window after promotion (ADR-0008). */
     previousSecretHash: text("previous_secret_hash"),
     promotedAt: tsz("promoted_at"),
+    /**
+     * `grace_expires_at` of the rotation that produced the current secret, copied at promotion: the
+     * deadline answered to a late `S0 + S1` retry, even after a newer rotation started (ADR-0011).
+     */
+    promotedGraceExpiresAt: tsz("promoted_grace_expires_at"),
     lockedAt: tsz("locked_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),

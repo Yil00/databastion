@@ -178,6 +178,7 @@ export async function revokeAgent(
         pendingSecretHash: null,
         previousSecretHash: null,
         graceExpiresAt: null,
+        promotedGraceExpiresAt: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt)))
       .returning({ id: agents.id });

@@ -218,11 +218,78 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
     expect((await heartbeat(s1)).status).toBe(401);
   });
 
-  it("treats a /rotate with S0 and the same S1 after the window as rotation_conflict", async () => {
+  it("ADR-0011: S0 + the promoted S1 after the window is a duplicate; S0 + another secret locks", async () => {
     const { s0, s1 } = await rotated();
     await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
-    expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(409);
+    const late = await rotate(s0, { new_secret: s1.secret });
+    expect(late.status).toBe(200);
+    expect(((await late.json()) as { duplicate: boolean }).duplicate).toBe(true);
+    await expectNotLocked(s0.agentId);
+    expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(409);
     await expectLocked(s0.agentId);
+  });
+
+  it("ADR-0011: response lost, agent offline beyond grace + 60 s, then S0 + same S1 is a duplicate", async () => {
+    const s0 = await enroll();
+    const s1 = newAgentSecret();
+    const first = (await (await rotate(s0, { new_secret: s1 })).json()) as { grace_expires_at: string };
+    // Deadline passed long ago: lazy promotion at the deadline, S0 is now far outside the window.
+    const deadline = new Date(Date.now() - TOLERANCE_WINDOW_MS - 120_000);
+    await getDb().update(agents).set({ graceExpiresAt: deadline }).where(eq(agents.id, s0.agentId));
+    expireVerifiedCacheForTests();
+    const retry = await rotate(s0, { new_secret: s1 });
+    expect(retry.status).toBe(200);
+    const body = (await retry.json()) as { grace_expires_at: string; duplicate: boolean };
+    expect(body.duplicate).toBe(true);
+    expect(body.grace_expires_at).toBe(deadline.toISOString());
+    expect(first.grace_expires_at).not.toBe(body.grace_expires_at); // test moved the deadline
+    await expectNotLocked(s0.agentId);
+    expect((await heartbeat({ agentId: s0.agentId, secret: s1 })).status).toBe(200);
+  });
+
+  it("L4: a late S0 + S1 duplicate keeps S1's deadline even after S1 -> S2 started", async () => {
+    const s0 = await enroll();
+    const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+    const first = (await (await rotate(s0, { new_secret: s1.secret })).json()) as { grace_expires_at: string };
+    expect((await heartbeat(s1)).status).toBe(200); // promotion
+    await new Promise((r) => setTimeout(r, 20));
+    const second = (await (await rotate(s1, { new_secret: newAgentSecret() })).json()) as { grace_expires_at: string };
+    expect(second.grace_expires_at).not.toBe(first.grace_expires_at);
+    const late = (await (await rotate(s0, { new_secret: s1.secret })).json()) as { grace_expires_at: string; duplicate: boolean };
+    expect(late).toEqual({ grace_expires_at: first.grace_expires_at, duplicate: true });
+    await expectNotLocked(s0.agentId);
+  });
+
+  it("L1: promotion time and deadline use the console clock", async () => {
+    const s0 = await enroll();
+    const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+    const before = Date.now();
+    expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+    expect((await heartbeat(s1)).status).toBe(200);
+    const after = Date.now();
+    const a = await row(s0.agentId);
+    expect(a?.promotedAt?.getTime()).toBeGreaterThanOrEqual(before);
+    expect(a?.promotedAt?.getTime()).toBeLessThanOrEqual(after);
+    expect(a?.promotedGraceExpiresAt?.getTime()).toBe(a?.graceExpiresAt?.getTime());
+  });
+
+  it("L2: a long-poll opened with S0 is closed when S1 is promoted", async () => {
+    const s0 = await enroll();
+    const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+    await jobHub.ready();
+    expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+    const poll = handlePollJobs(agentRequest("GET", "/jobs?wait=25", { auth: s0 }));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(jobHub.heldPolls(s0.agentId)).toBe(1);
+    const started = Date.now();
+    expect((await heartbeat(s1)).status).toBe(200); // promotion
+    expect((await poll).status).toBe(401);
+    expect(Date.now() - started).toBeLessThan(5000);
+    // A poll opened with the current secret is not affected by a wake-up.
+    const p1 = handlePollJobs(agentRequest("GET", "/jobs?wait=1", { auth: s1 }));
+    await new Promise((r) => setTimeout(r, 100));
+    jobHub.closeAgent(s0.agentId);
+    expect((await p1).status).toBe(204);
   });
 
   it("promotes S1 at the grace deadline; S0 then follows the same window rules", async () => {
