@@ -121,6 +121,64 @@ pub(crate) enum Auth<'a> {
 pub(crate) struct Reply {
     pub(crate) status: StatusCode,
     pub(crate) body: Vec<u8>,
+    /// Whether the `Content-Type` media type is `application/json`.
+    pub(crate) json: bool,
+}
+
+/// Whether a `Content-Type` value has the `application/json` media type
+/// (parameters such as `charset` are ignored).
+fn is_json_media_type(value: Option<&HeaderValue>) -> bool {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Per-endpoint acceptance of a `2xx` reply (contract status, media type
+/// and body). A reply is only acted upon, and a pending secret only
+/// promoted, once its checker accepts it: a middlebox's `200` page proves
+/// nothing (see `Session::call`).
+pub(crate) mod accept {
+    use databastion_protocol::{BatchAck, HeartbeatResponse, UuidV7};
+    use reqwest::StatusCode;
+
+    use super::Reply;
+    use crate::jobs::{self, PolledList};
+
+    fn json<T: serde::de::DeserializeOwned>(reply: &Reply, status: StatusCode) -> Option<T> {
+        if reply.status != status || !reply.json {
+            return None;
+        }
+        serde_json::from_slice(&reply.body).ok()
+    }
+
+    /// `POST /heartbeat`: `200` + `HeartbeatResponse`.
+    pub(crate) fn heartbeat(reply: &Reply) -> Option<HeartbeatResponse> {
+        json(reply, StatusCode::OK)
+    }
+
+    /// `POST /findings`, `POST /events`: `202` + `BatchAck` for `batch_id`.
+    pub(crate) fn batch_ack(batch_id: UuidV7) -> impl Fn(&Reply) -> Option<BatchAck> {
+        move |reply| {
+            json::<BatchAck>(reply, StatusCode::ACCEPTED).filter(|a| a.batch_id == batch_id)
+        }
+    }
+
+    /// `GET /jobs`: `204` (no job, `None`) or `200` + a job list.
+    pub(crate) fn job_list(reply: &Reply) -> Option<Option<PolledList>> {
+        if reply.status == StatusCode::NO_CONTENT {
+            return Some(None);
+        }
+        if reply.status != StatusCode::OK || !reply.json {
+            return None;
+        }
+        jobs::parse_job_list(&reply.body).ok().map(Some)
+    }
+
+    /// `POST /jobs/{id}/status`: exactly `204`.
+    pub(crate) fn no_content(reply: &Reply) -> Option<()> {
+        (reply.status == StatusCode::NO_CONTENT).then_some(())
+    }
 }
 
 /// Client towards the console agent API.
@@ -217,6 +275,7 @@ impl Uplink {
         }
         let response = request.send().await.map_err(|e| transport(&e))?;
         let status = response.status();
+        let json = is_json_media_type(response.headers().get(header::CONTENT_TYPE));
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
@@ -224,7 +283,7 @@ impl Uplink {
             .and_then(backoff::parse_retry_after);
         let body = read_limited(response).await?;
         if status.is_success() {
-            return Ok(Reply { status, body });
+            return Ok(Reply { status, body, json });
         }
         Err(classify(path, status, retry_after, &body))
     }
@@ -356,17 +415,41 @@ enum Parsed {
     Events(EventsBatch),
 }
 
+/// A batch could not be serialized, or (when splitting) its spooled bytes
+/// could not be decoded for re-encoding. Its content is lost: both are
+/// deterministic, so a retry would fail again.
+/// Callers count it (`batches_serialization_failed_total`); nothing of its
+/// content is kept or logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unserializable;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: makes every batch serialization fail on
+    /// this thread (`#[tokio::test]` runs on a single thread by default).
+    pub(crate) static FAIL_BATCH_SERIALIZATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn serialize_batch<T: serde::Serialize>(batch: &T) -> Result<Vec<u8>, Unserializable> {
+    #[cfg(test)]
+    if FAIL_BATCH_SERIALIZATION.with(std::cell::Cell::get) {
+        return Err(Unserializable);
+    }
+    serde_json::to_vec(batch).map_err(|_| Unserializable)
+}
+
 impl Parsed {
-    fn into_batch(self) -> Option<ResultBatch> {
+    fn into_batch(self) -> Result<ResultBatch, Unserializable> {
         let (findings, batch_id, len, bytes) = match &self {
-            Self::Findings(b) => (true, b.batch_id, b.findings.len(), serde_json::to_vec(b)),
-            Self::Events(b) => (false, b.batch_id, b.events.len(), serde_json::to_vec(b)),
+            Self::Findings(b) => (true, b.batch_id, b.findings.len(), serialize_batch(b)),
+            Self::Events(b) => (false, b.batch_id, b.events.len(), serialize_batch(b)),
         };
-        Some(ResultBatch {
+        Ok(ResultBatch {
             findings,
             batch_id,
             len,
-            bytes: bytes.ok()?,
+            bytes: bytes?,
         })
     }
 }
@@ -426,8 +509,9 @@ impl ResultBatch {
     }
 
     /// The same batch without the items at `drop` (sorted), under a **new**
-    /// `batch_id`; `None` if nothing is left.
-    pub(crate) fn without(&self, drop: &[usize]) -> Option<Self> {
+    /// `batch_id`; `Ok(None)` if nothing is left, `Err` if this batch could
+    /// not be decoded or the new batch could not be serialized.
+    pub(crate) fn without(&self, drop: &[usize]) -> Result<Option<Self>, Unserializable> {
         fn keep<T: Clone>(items: &[T], drop: &[usize]) -> Vec<T> {
             items
                 .iter()
@@ -436,7 +520,10 @@ impl ResultBatch {
                 .map(|(_, x)| x.clone())
                 .collect()
         }
-        let out = match Self::decode(self.findings, &self.bytes)? {
+        // The bytes were validated when this batch was built or parsed: a
+        // decode failure is an error, never "nothing left".
+        let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
+        let out = match parsed {
             Parsed::Findings(b) => Parsed::Findings(FindingsBatch {
                 batch_id: new_batch_id(),
                 findings: keep(&b.findings, drop),
@@ -448,19 +535,24 @@ impl ResultBatch {
             }),
         }
         .into_batch()?;
-        (out.len > 0).then_some(out)
+        Ok((out.len > 0).then_some(out))
     }
 
-    /// Two halves, each under a new `batch_id` (`413`); `None` for a single
-    /// item.
-    pub(crate) fn halves(&self) -> Option<(Self, Self)> {
+    /// Two halves, each under a new `batch_id` (`413`); `Ok(None)` for a
+    /// single item, `Err` if a half could not be serialized.
+    pub(crate) fn halves(&self) -> Result<Option<(Self, Self)>, Unserializable> {
         let n = self.len;
         if n < 2 {
-            return None;
+            return Ok(None);
         }
         let first: Vec<usize> = (0..n / 2).collect();
         let second: Vec<usize> = (n / 2..n).collect();
-        Some((self.without(&second)?, self.without(&first)?))
+        let (a, b) = (self.without(&second)?, self.without(&first)?);
+        debug_assert!(a.is_some() && b.is_some(), "both halves hold items");
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((a, b))),
+            _ => Err(Unserializable),
+        }
     }
 }
 
@@ -468,7 +560,28 @@ impl ResultBatch {
 #[derive(Debug, Default)]
 pub(crate) struct Built {
     pub(crate) batches: Vec<ResultBatch>,
+    /// Items dropped (invalid, oversized, or in a batch that could not be
+    /// serialized).
     pub(crate) dropped_items: u64,
+    /// Batches lost because their serialization failed.
+    pub(crate) unserializable_batches: u64,
+}
+
+impl Built {
+    /// Adds a packed batch, or counts it (and its items) as lost.
+    fn push(&mut self, parsed: Parsed) {
+        let items = match &parsed {
+            Parsed::Findings(b) => b.findings.len(),
+            Parsed::Events(b) => b.events.len(),
+        };
+        match parsed.into_batch() {
+            Ok(batch) => self.batches.push(batch),
+            Err(Unserializable) => {
+                self.unserializable_batches += 1;
+                self.dropped_items += u64::try_from(items).unwrap_or(u64::MAX);
+            }
+        }
+    }
 }
 
 /// Masked results handed to [`to_batches`].
@@ -521,6 +634,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             Built {
                 batches: Vec::new(),
                 dropped_items: u64::try_from(events.len()).unwrap_or(u64::MAX),
+                unserializable_batches: 0,
             }
         }
     }
@@ -582,18 +696,14 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
             continue;
         }
         if current.len() == MAX_FINDINGS_PER_BATCH || size + len > MAX_BATCH_BYTES {
-            built
-                .batches
-                .extend(Parsed::Findings(make(std::mem::take(&mut current))).into_batch());
+            built.push(Parsed::Findings(make(std::mem::take(&mut current))));
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built
-            .batches
-            .extend(Parsed::Findings(make(current)).into_batch());
+        built.push(Parsed::Findings(make(current)));
     }
     built
 }
@@ -624,18 +734,14 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
             continue;
         }
         if current.len() == MAX_EVENTS_PER_BATCH || size + len > MAX_BATCH_BYTES {
-            built
-                .batches
-                .extend(Parsed::Events(make(std::mem::take(&mut current))).into_batch());
+            built.push(Parsed::Events(make(std::mem::take(&mut current))));
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built
-            .batches
-            .extend(Parsed::Events(make(current)).into_batch());
+        built.push(Parsed::Events(make(current)));
     }
     built
 }
@@ -643,6 +749,68 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(status: u16, json: bool, body: &[u8]) -> Reply {
+        Reply {
+            status: StatusCode::from_u16(status).unwrap(),
+            body: body.to_vec(),
+            json,
+        }
+    }
+
+    #[test]
+    fn json_media_type_ignores_parameters_and_case() {
+        let check = |v: &str| is_json_media_type(Some(&HeaderValue::from_str(v).unwrap()));
+        assert!(check("application/json"));
+        assert!(check("Application/JSON; charset=utf-8"));
+        assert!(!check("text/html"));
+        assert!(!check("application/jsonp"));
+        assert!(!is_json_media_type(None));
+    }
+
+    #[test]
+    fn acceptance_follows_the_endpoint_contract() {
+        let hb = br#"{"console_min_protocol":1,"heartbeat_interval_s":30,"server_time":"2026-09-28T14:02:00Z"}"#;
+        assert!(accept::heartbeat(&reply(200, true, hb)).is_some());
+        assert!(accept::heartbeat(&reply(200, false, hb)).is_none());
+        assert!(accept::heartbeat(&reply(202, true, hb)).is_none());
+        assert!(accept::heartbeat(&reply(200, true, b"<html>")).is_none());
+
+        let id = new_batch_id();
+        let ack =
+            serde_json::to_vec(&serde_json::json!({"batch_id": id, "duplicate": false})).unwrap();
+        assert!(accept::batch_ack(id)(&reply(202, true, &ack)).is_some());
+        assert!(accept::batch_ack(id)(&reply(200, true, &ack)).is_none());
+        assert!(accept::batch_ack(id)(&reply(202, false, &ack)).is_none());
+        assert!(accept::batch_ack(new_batch_id())(&reply(202, true, &ack)).is_none());
+
+        assert!(matches!(
+            accept::job_list(&reply(204, false, b"")),
+            Some(None)
+        ));
+        assert!(matches!(
+            accept::job_list(&reply(200, true, br#"{"jobs":[]}"#)),
+            Some(Some(_))
+        ));
+        assert!(accept::job_list(&reply(200, false, br#"{"jobs":[]}"#)).is_none());
+        assert!(accept::job_list(&reply(200, true, b"[]")).is_none());
+
+        assert!(accept::no_content(&reply(204, false, b"")).is_some());
+        assert!(accept::no_content(&reply(200, true, b"{}")).is_none());
+        assert!(accept::no_content(&reply(202, false, b"")).is_none());
+    }
+
+    #[test]
+    fn splitting_an_undecodable_batch_is_an_error() {
+        let batch = ResultBatch {
+            findings: true,
+            batch_id: new_batch_id(),
+            len: 4,
+            bytes: b"not a batch".to_vec(),
+        };
+        assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
+        assert_eq!(batch.halves().unwrap_err(), Unserializable);
+    }
 
     #[test]
     fn classify_maps_statuses() {

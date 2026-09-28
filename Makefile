@@ -8,7 +8,7 @@ WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb
 
-.PHONY: help dev-dirs dev dev-smoke dev-down dev-reset dev-logs dev-ps seed seed-check test-dev
+.PHONY: help dev-dirs dev-metrics-token dev dev-smoke dev-down dev-reset dev-logs dev-ps seed seed-check test-dev
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -20,7 +20,16 @@ dev-dirs: ## Create the engine log directories (world-writable: engines run as n
 	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS))
 	chmod 0777 $(addprefix dev/.state/logs/,$(LOG_DIRS))
 
-dev: dev/.env dev-dirs ## Start the dev environment (databases, Mailpit, Prometheus, Grafana) and wait until healthy
+dev-metrics-token: ## Create dev/.state/metrics_token (48 random chars, 0600) if missing; never committed
+	@mkdir -p dev/.state
+	@if [ -d dev/.state/metrics_token ]; then rmdir dev/.state/metrics_token; fi
+	@if [ ! -f dev/.state/metrics_token ] || [ ! -s dev/.state/metrics_token ]; then \
+	  (umask 077; head -c 36 /dev/urandom | base64 | tr '+/' '-_' | tr -d '\n' > dev/.state/metrics_token); \
+	  echo "Generated dev/.state/metrics_token"; \
+	fi
+	@chmod 0600 dev/.state/metrics_token
+
+dev: dev/.env dev-dirs dev-metrics-token ## Start the dev environment (databases, Mailpit, Prometheus, Grafana) and wait until healthy
 	timeout $(UP_TIMEOUT) $(COMPOSE) up -d --build --wait --wait-timeout $(WAIT_TIMEOUT)
 	@echo "Dev environment ready. Console and agent are not containerized yet: see dev/README.md."
 

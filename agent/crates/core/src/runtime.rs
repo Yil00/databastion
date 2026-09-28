@@ -14,7 +14,7 @@ use databastion_protocol::{
     HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate, MetricsMap,
     MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
 };
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
@@ -261,6 +261,9 @@ struct Counters {
     batches_rejected: AtomicU64,
     batch_conflicts: AtomicU64,
     batches_unexpected_response: AtomicU64,
+    /// Batches lost because their serialization failed (on spooling or when
+    /// splitting a spooled batch).
+    batches_serialization_failed: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, n: u64) {
@@ -441,6 +444,10 @@ impl Runtime {
                 "batches_unexpected_response_total",
                 &c.batches_unexpected_response,
             ),
+            (
+                "batches_serialization_failed_total",
+                &c.batches_serialization_failed,
+            ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -525,7 +532,7 @@ impl Runtime {
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
         let body = serde_json::to_vec(&request)
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let reply = self
+        let response: HeartbeatResponse = self
             .session
             .call(
                 Method::POST,
@@ -533,13 +540,9 @@ impl Runtime {
                 &[],
                 Some(&body),
                 uplink::REQUEST_TIMEOUT,
+                uplink::accept::heartbeat,
             )
             .await?;
-        let response: HeartbeatResponse = serde_json::from_slice(&reply.body).map_err(|_| {
-            CallError::Uplink(UplinkError::UnexpectedResponse {
-                status: reply.status.as_u16(),
-            })
-        })?;
         let value = response.heartbeat_interval_s.0;
         let clamped = backoff::clamp_heartbeat_interval(value);
         if clamped.is_none() {
@@ -657,6 +660,15 @@ impl Runtime {
 
     // ---------------------------------------------------------------- spool
 
+    /// Counts batches lost to a serialization failure, with a warning that
+    /// carries only the count (never any content).
+    fn count_unserializable(&self, batches: u64) {
+        if batches > 0 {
+            bump(&self.counters.batches_serialization_failed, batches);
+            tracing::warn!(batches, "result batches could not be serialized; dropped");
+        }
+    }
+
     fn lock_spool(&self) -> std::sync::MutexGuard<'_, Spool> {
         self.spool
             .lock()
@@ -684,6 +696,7 @@ impl Runtime {
             engine,
             findings,
         });
+        self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();
         spool.counters.dropped_items += built.dropped_items;
         if built.dropped_items > 0 {
@@ -754,6 +767,7 @@ impl Runtime {
                 &[],
                 Some(batch.bytes()),
                 uplink::REQUEST_TIMEOUT,
+                uplink::accept::batch_ack(batch.batch_id()),
             )
             .await;
         let io = |e: std::io::Error| {
@@ -762,26 +776,14 @@ impl Runtime {
         };
         let retry = || Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
         match result {
-            Ok(reply) => {
-                match serde_json::from_slice::<databastion_protocol::BatchAck>(&reply.body) {
-                    Ok(ack) if ack.batch_id == batch.batch_id() => {
-                        if ack.duplicate {
-                            bump(&self.counters.batches_duplicate, 1);
-                            tracing::info!(batch_id = %ack.batch_id, "batch already received (duplicate)");
-                        }
-                        bump(&self.counters.batches_sent, 1);
-                        self.lock_spool().remove(&key);
-                        Ok(Flush::Progress)
-                    }
-                    _ => {
-                        bump(&self.counters.batches_unexpected_response, 1);
-                        tracing::warn!(
-                            status = reply.status.as_u16(),
-                            "batch answered without a matching acknowledgement; kept for retry"
-                        );
-                        Ok(retry())
-                    }
+            Ok(ack) => {
+                if ack.duplicate {
+                    bump(&self.counters.batches_duplicate, 1);
+                    tracing::info!(batch_id = %ack.batch_id, "batch already received (duplicate)");
                 }
+                bump(&self.counters.batches_sent, 1);
+                self.lock_spool().remove(&key);
+                Ok(Flush::Progress)
             }
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. }))
                 if items.iter().any(|&i| i >= batch.len()) =>
@@ -798,7 +800,13 @@ impl Runtime {
                     items = dropped,
                     "console rejected batch items; resending the rest"
                 );
-                let rest: Vec<ResultBatch> = batch.without(&items).into_iter().collect();
+                let rest: Vec<ResultBatch> = match batch.without(&items) {
+                    Ok(rest) => rest.into_iter().collect(),
+                    Err(uplink::Unserializable) => {
+                        self.count_unserializable(1);
+                        Vec::new()
+                    }
+                };
                 let left_out = u64::try_from(batch.len()).unwrap_or(u64::MAX)
                     - u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>()).unwrap_or(0);
                 if self
@@ -814,13 +822,17 @@ impl Runtime {
             Err(CallError::Uplink(UplinkError::Rejected { status: 413, .. })) => {
                 let mut spool = self.lock_spool();
                 match batch.halves() {
-                    Some((a, b)) => {
+                    Ok(Some((a, b))) => {
                         if spool.replace(&key, &[a, b], 0).map_err(io).is_err() {
                             return Ok(retry());
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         tracing::warn!("single-item batch too large; dropped");
+                        spool.drop_batch(&key);
+                    }
+                    Err(uplink::Unserializable) => {
+                        self.count_unserializable(1);
                         spool.drop_batch(&key);
                     }
                 }
@@ -881,19 +893,24 @@ impl Runtime {
             let timeout = Duration::from_secs(u64::from(wait) + 15);
             let query = [("wait", wait.to_string())];
             let started = Instant::now();
-            let poll = self
-                .session
-                .call(Method::GET, "/jobs", &query, None, timeout);
+            let poll = self.session.call(
+                Method::GET,
+                "/jobs",
+                &query,
+                None,
+                timeout,
+                uplink::accept::job_list,
+            );
             let result = tokio::select! {
                 r = poll => r,
                 _ = shutdown.changed() => return Ok(()),
             };
             let delay = match result {
-                Ok(reply) => {
+                Ok(list) => {
                     failures = 0;
-                    let got_jobs = reply.status == StatusCode::OK;
-                    if got_jobs {
-                        self.handle_job_list(&reply.body).await?;
+                    let got_jobs = list.is_some();
+                    if let Some(list) = list {
+                        self.handle_polled_list(list).await?;
                     }
                     poll_gap(
                         started.elapsed(),
@@ -901,6 +918,14 @@ impl Runtime {
                         &mut fast_empty,
                         backoff::random_fraction(),
                     )
+                }
+                Err(CallError::Uplink(u @ UplinkError::UnexpectedResponse { .. })) => {
+                    // Not a contract answer (malformed list, proxy page):
+                    // counted, then retried with backoff.
+                    failures = failures.saturating_add(1);
+                    bump(&self.counters.jobs_unparseable, 1);
+                    u.retry_delay(failures.saturating_sub(1))
+                        .min(Duration::from_secs(300))
                 }
                 Err(e) => {
                     failures = failures.saturating_add(1);
@@ -921,6 +946,9 @@ impl Runtime {
         }
     }
 
+    /// Parses and handles a job list body (tests; the poll loop gets the
+    /// list already parsed by `uplink::accept::job_list`).
+    #[cfg(test)]
     async fn handle_job_list(&self, body: &[u8]) -> Result<(), AgentError> {
         let list = match jobs::parse_job_list(body) {
             Ok(list) => list,
@@ -930,6 +958,10 @@ impl Runtime {
                 return Ok(());
             }
         };
+        self.handle_polled_list(list).await
+    }
+
+    async fn handle_polled_list(&self, list: jobs::PolledList) -> Result<(), AgentError> {
         if list.deferred > 0 {
             bump(&self.counters.jobs_deferred, list.deferred as u64);
             tracing::warn!(
@@ -1112,10 +1144,11 @@ impl Runtime {
                     &[],
                     Some(&body),
                     uplink::REQUEST_TIMEOUT,
+                    uplink::accept::no_content,
                 )
                 .await
             {
-                Ok(_) => return true,
+                Ok(()) => return true,
                 // Terminal already, or not ours: nothing more to report.
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
