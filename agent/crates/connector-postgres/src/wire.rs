@@ -211,6 +211,18 @@ impl<'a> FromSql<'a> for WireBytes<'a> {
     }
 }
 
+/// A text / `name` column of a catalog row. `Ok(None)` for NULL or for
+/// bytes that are not UTF-8 (a `SQL_ASCII` database can hold any bytes in
+/// names): the caller skips that row instead of failing the scan (L1).
+pub(crate) fn catalog_text(
+    row: &tokio_postgres::Row,
+    i: usize,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    Ok(row
+        .try_get::<_, Option<WireBytes<'_>>>(i)?
+        .and_then(|WireBytes(raw)| std::str::from_utf8(raw).ok().map(str::to_owned)))
+}
+
 impl std::fmt::Debug for WireBytes<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WireBytes(<redacted>)")

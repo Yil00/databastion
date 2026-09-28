@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use tokio_postgres::types::Type;
 
 use crate::catalog::{self, Coverage, Member, Unit};
-use crate::conn::{ReadTx, Session, Timeouts};
+use crate::conn::{ReadTx, Session, Streamed, Timeouts};
 use crate::error::{PgError, Stage};
 use crate::sql;
 use crate::wire::{Decoder, WireBytes};
@@ -79,7 +79,7 @@ async fn scan_database(
     sink: &FindingSink,
 ) -> Result<(), ConnectorError> {
     let db_name = normalize(database);
-    let session = Session::connect(target, database, timeouts)
+    let mut session = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
     let relations = {
@@ -104,6 +104,12 @@ async fn scan_database(
     log_coverage(target, &db_name, &coverage);
     let mut skipped = 0usize;
     for unit in &units {
+        if session.is_poisoned() {
+            // A cancel request may be in flight on the old session.
+            session = Session::connect(target, database, timeouts)
+                .await
+                .map_err(|e| fail(target, &db_name, e))?;
+        }
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
         let sample = match sample_unit(&session, unit, job.sample_rows(), timeouts).await {
@@ -193,10 +199,19 @@ fn log_coverage(target: &TargetConfig, db: &NormalizedName, c: &Coverage) {
 }
 
 /// Sampled values of one object, per column (raw column names; values
-/// zeroized on drop).
+/// zeroized on drop). `Debug` shows counts only.
 pub(crate) struct UnitSample {
     pub(crate) columns: Vec<(String, Vec<RawValue>)>,
     pub(crate) estimated_rows: Option<u64>,
+}
+
+impl std::fmt::Debug for UnitSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitSample")
+            .field("columns", &self.columns.len())
+            .field("estimated_rows", &self.estimated_rows)
+            .finish()
+    }
 }
 
 /// Samples the members of a unit within a budget of `sample_rows` rows.
@@ -212,7 +227,7 @@ async fn sample_unit(
     let mut sampled_any = false;
     let mut last_error = None;
     for (i, member) in unit.members.iter().enumerate() {
-        if remaining == 0 {
+        if remaining == 0 || session.is_poisoned() {
             break;
         }
         let left = u32::try_from(n - i).unwrap_or(u32::MAX);
@@ -315,7 +330,10 @@ async fn read_member(
             row.try_get(5).map_err(get)?,
         );
         if let Some(d) = decoder {
-            cols.push((row.try_get(1).map_err(get)?, d));
+            // A column name that is not UTF-8 (L1): not sampled.
+            if let Some(name) = crate::wire::catalog_text(&row, 1).map_err(get)? {
+                cols.push((name, d));
+            }
         }
     }
     if cols.is_empty() {
@@ -336,8 +354,8 @@ async fn read_member(
         )
         .await?;
         // A short sample (stale statistics, clustered free space): fall
-        // back to a plain bounded read.
-        if rows.saturating_mul(2) >= limit {
+        // back to a plain bounded read, unless the byte budget stopped it.
+        if rows.saturating_mul(2) >= limit || tx.is_poisoned() {
             return Ok((cols.into_iter().map(|(n, _)| n).collect(), values, rows));
         }
     }
@@ -363,22 +381,30 @@ async fn read_rows(
         let mut bytes = 0usize;
         while let Some(row) = stream.next().await {
             let row = row?;
+            let mut raws = Vec::with_capacity(decoders.len());
+            let mut row_bytes = 0usize;
+            for i in 0..decoders.len() {
+                let raw = row.try_get::<_, Option<WireBytes<'_>>>(i)?;
+                row_bytes = row_bytes.saturating_add(raw.as_ref().map_or(0, |r| r.0.len()));
+                raws.push(raw);
+            }
+            // Budget checked per row, before decoding it (M1). The row
+            // itself was already received whole by the driver: one row is
+            // the residual peak. The statement is cancelled, the rest is
+            // not read.
+            if bytes.saturating_add(row_bytes) > MAX_SAMPLE_BYTES {
+                tracing::info!(rows, "sample byte budget reached: statement cancelled");
+                return Ok(Streamed::Stopped((values, rows)));
+            }
+            bytes += row_bytes;
             rows += 1;
-            for (i, decoder) in decoders.iter().enumerate() {
-                let Some(WireBytes(raw)) = row.try_get::<_, Option<WireBytes<'_>>>(i)? else {
-                    continue;
-                };
-                bytes = bytes.saturating_add(raw.len());
-                if let Some(v) = decoder.decode(raw) {
-                    values[i].push(RawValue::new(v));
+            for ((raw, decoder), out) in raws.into_iter().zip(decoders).zip(values.iter_mut()) {
+                if let Some(v) = raw.and_then(|WireBytes(r)| decoder.decode(r)) {
+                    out.push(RawValue::new(v));
                 }
             }
-            if bytes > MAX_SAMPLE_BYTES {
-                tracing::debug!("sample byte budget reached");
-                break;
-            }
         }
-        Ok((values, rows))
+        Ok(Streamed::Complete((values, rows)))
     })
     .await
 }

@@ -21,6 +21,8 @@ mod check;
 mod conn;
 mod discover;
 mod error;
+mod net;
+mod policy;
 mod sql;
 mod tls;
 mod wire;

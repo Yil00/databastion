@@ -118,8 +118,13 @@ impl Drop for TempDir {
     }
 }
 
+thread_local! {
+    /// TLS settings of the targets built by [`target`] on this thread.
+    static TLS: std::cell::RefCell<String> = std::cell::RefCell::new("tls: disable".to_owned());
+}
+
 /// A declared target for `u` (password in a `0600` file), TLS disabled
-/// (loopback test server).
+/// (loopback test server) unless [`TLS`] says otherwise.
 fn target(
     u: &Url,
     user: &str,
@@ -137,10 +142,11 @@ fn target(
         .open(&file)
         .unwrap();
     f.write_all(password.as_bytes()).unwrap();
+    let tls = TLS.with(|t| t.borrow().clone());
     let yaml = format!(
         "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: pg-it\n    \
          engine: postgres\n    host: \"{}\"\n    port: {}\n    account: \"{user}\"\n    \
-         secret: {{file: \"{}\"}}\n    postgres: {{databases: [\"{db}\"], tls: disable, \
+         secret: {{file: \"{}\"}}\n    postgres: {{databases: [\"{db}\"], {tls}, \
          extended_grants: {extended}}}\n",
         u.host,
         u.port,
@@ -615,6 +621,29 @@ INSERT INTO probe.stale SELECT i, 'stale.user' || i || '@example.com' FROM gener
 ANALYZE probe.stale;
 DELETE FROM probe.stale WHERE id > 30;
 
+-- H1: policies calling pinned built-ins that run SQL text or resolve names at run time
+-- (no pg_depend row): skipped. A policy on allowed built-ins only (current_setting): sampled.
+CREATE TABLE probe.rls_qxml (owner text, email text);
+INSERT INTO probe.rls_qxml SELECT 'o', 'qxml.user' || i || '@example.com' FROM generate_series(1, 40) i;
+ALTER TABLE probe.rls_qxml ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON probe.rls_qxml
+  USING (pg_catalog.query_to_xml('select probe.pol(''x'')', true, false, '') IS NOT NULL);
+CREATE TABLE probe.rls_toreg (owner text, email text);
+INSERT INTO probe.rls_toreg SELECT 'o', 'toreg.user' || i || '@example.com' FROM generate_series(1, 40) i;
+ALTER TABLE probe.rls_toreg ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON probe.rls_toreg USING (pg_catalog.to_regclass(owner) IS NULL);
+CREATE TABLE probe.rls_setting (owner text, email text);
+INSERT INTO probe.rls_setting SELECT 'databastion-agent', 'setting.user' || i || '@example.com'
+  FROM generate_series(1, 40) i;
+ALTER TABLE probe.rls_setting ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON probe.rls_setting
+  USING (owner = pg_catalog.current_setting('application_name') AND length(email) > 0);
+
+-- M1: rows of 12 MiB each; the 32 MiB per-relation budget stops the sample after two.
+CREATE TABLE probe.a_wide (email text, blob text);
+INSERT INTO probe.a_wide SELECT 'wide.user' || i || '@example.com', repeat('x', 12 * 1024 * 1024)
+  FROM generate_series(1, 10) i;
+
 GRANT USAGE ON SCHEMA probe TO databastion;
 GRANT SELECT ON ALL TABLES IN SCHEMA probe TO databastion;
 REVOKE SELECT ON probe.no_grant FROM databastion;
@@ -653,6 +682,89 @@ async fn probe_fixtures(admin_url: &Url, agent_user: &str) {
     .unwrap();
     let p = admin(admin_url, PROBE_DB).await;
     p.batch_execute(PROBE_FIXTURES).await.unwrap();
+
+    // L5: foreign leaf / child on a server that is reachable (this cluster,
+    // database databastion_fdw_sink): any connection would be counted in
+    // pg_stat_database.sessions of the sink.
+    for statement in [
+        format!("DROP DATABASE IF EXISTS {SINK_DB} WITH (FORCE)"),
+        format!("CREATE DATABASE {SINK_DB}"),
+    ] {
+        a.batch_execute(&statement).await.unwrap();
+    }
+    let sink_user_exists = a
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&SINK_ROLE])
+        .await
+        .unwrap()
+        .is_some();
+    if !sink_user_exists {
+        a.batch_execute(&format!(
+            "SET log_min_error_statement = panic; \
+             CREATE ROLE {SINK_ROLE} LOGIN PASSWORD '{SINK_PASSWORD}';"
+        ))
+        .await
+        .unwrap();
+    }
+    a.batch_execute(&format!(
+        "GRANT CONNECT ON DATABASE {SINK_DB} TO {SINK_ROLE}"
+    ))
+    .await
+    .unwrap();
+    let port: String = p
+        .query_one("SELECT current_setting('port')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    p.batch_execute(&format!(
+        "CREATE SERVER local_sink FOREIGN DATA WRAPPER postgres_fdw \
+           OPTIONS (host '127.0.0.1', port '{port}', dbname '{SINK_DB}'); \
+         CREATE USER MAPPING FOR PUBLIC SERVER local_sink \
+           OPTIONS (user '{SINK_ROLE}', password '{SINK_PASSWORD}'); \
+         GRANT USAGE ON FOREIGN SERVER local_sink TO PUBLIC; \
+         CREATE TABLE probe.q (id int, email text) PARTITION BY RANGE (id); \
+         CREATE TABLE probe.q_local PARTITION OF probe.q FOR VALUES FROM (0) TO (1000); \
+         CREATE FOREIGN TABLE probe.q_remote PARTITION OF probe.q \
+           FOR VALUES FROM (1000) TO (2000) SERVER local_sink; \
+         INSERT INTO probe.q_local SELECT i, 'q.user' || i || '@example.com' \
+           FROM generate_series(1, 40) i; \
+         CREATE TABLE probe.qparent (id int, email text); \
+         CREATE FOREIGN TABLE probe.qparent_remote () INHERITS (probe.qparent) SERVER local_sink; \
+         INSERT INTO probe.qparent SELECT i, 'qp.user' || i || '@example.com' \
+           FROM generate_series(1, 40) i; \
+         GRANT SELECT ON ALL TABLES IN SCHEMA probe TO databastion; \
+         REVOKE SELECT ON probe.no_grant FROM databastion;"
+    ))
+    .await
+    .unwrap();
+}
+
+const SINK_DB: &str = "databastion_fdw_sink";
+const SINK_ROLE: &str = "databastion_it_sink";
+const SINK_PASSWORD: &str = "dev-only-it-sink-FAKE";
+
+/// Sessions opened so far on the sink database (after the stats of ended
+/// sessions are flushed).
+async fn sink_sessions(admin: &tokio_postgres::Client) -> i64 {
+    admin
+        .query_one(
+            "SELECT sessions FROM pg_stat_database WHERE datname = $1",
+            &[&SINK_DB],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Waits until the sink session count differs from `from` (max 5 s).
+async fn sink_sessions_change(admin: &tokio_postgres::Client, from: i64) -> i64 {
+    for _ in 0..50 {
+        let now = sink_sessions(admin).await;
+        if now != from {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    from
 }
 
 #[tokio::test]
@@ -688,6 +800,19 @@ async fn adr_0012_probes() {
         .get(0);
     assert_eq!(touched, 0);
 
+    // Control for the foreign leaf proof: reading the root (not `ONLY`)
+    // connects to the sink, which the session counter shows.
+    let before = sink_sessions(&a).await;
+    {
+        let c = admin(&adm, PROBE_DB).await;
+        let _ = c.query("SELECT count(*) FROM probe.q", &[]).await;
+    }
+    let after_control = sink_sessions_change(&a, before).await;
+    assert!(
+        after_control > before,
+        "control: a read through the root must reach the sink"
+    );
+
     // Scan of the probe database.
     let logs = Logs::default();
     let (r, findings) = {
@@ -713,6 +838,16 @@ async fn adr_0012_probes() {
         "{text}"
     );
     assert!(!text.contains("08001"), "{text}");
+    assert!(found.contains(&key_of("probe", "q", "email", "pii.email")));
+    assert!(found.contains(&key_of("probe", "qparent", "email", "pii.email")));
+    // M1: the wide relation stopped at its byte budget (two 12 MiB rows),
+    // the statement cancelled, the next objects sampled on a new session.
+    assert!(text.contains("sample byte budget reached"), "{text}");
+    let wide = findings
+        .iter()
+        .find(|f| f.location().unwrap().object.as_str() == "a_wide")
+        .map(MaskedFinding::sampled);
+    assert_eq!(wide, Some(2));
     // Bounded sampling: TABLESAMPLE on the large relation, LIMIT fallback
     // when the sample comes back short (stale statistics).
     let sampled = |object: &str| {
@@ -747,12 +882,28 @@ async fn adr_0012_probes() {
         eprintln!("skipped: pg_stat_statements not queryable (TABLESAMPLE statement check)");
     }
 
+    // No connection reached the sink during the scan (L5).
+    assert_eq!(
+        sink_sessions_change(&a, after_control).await,
+        after_control,
+        "the scan connected to the foreign server"
+    );
+
     // RLS: built-in policy sampled (and logged as possibly incomplete);
     // user function / view-subquery policies and the leaf of an RLS root
     // are skipped and reported as not covered.
     assert!(objects.contains("rls_builtin"));
     assert!(text.contains("the sample may be incomplete"));
+    assert!(objects.contains("rls_setting"));
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("object not covered") && l.contains("rls_setting")),
+        "current_setting policy must be sampled"
+    );
     for skipped in [
+        "rls_qxml",
+        "rls_toreg",
         "rls_func",
         "rls_view",
         "rls_root",
@@ -774,6 +925,14 @@ async fn adr_0012_probes() {
         ),
         ("rls_root_leaf", "row-level security on an ancestor"),
         ("no_grant", "no SELECT privilege"),
+        (
+            "rls_qxml",
+            "row-level security policy with user code or another relation",
+        ),
+        (
+            "rls_toreg",
+            "row-level security policy with user code or another relation",
+        ),
     ] {
         assert!(
             text.lines().any(|l| l.contains("object not covered")
@@ -793,7 +952,7 @@ async fn adr_0012_probes() {
     assert!(
         detail.contains("1 schema(s) without USAGE")
             && detail.contains("1 relation(s) without SELECT")
-            && detail.contains("3 relation(s) skipped for row-level security"),
+            && detail.contains("5 relation(s) skipped for row-level security"),
         "{detail}"
     );
     assert!(logs.text().contains("probe_hidden"));
@@ -862,4 +1021,102 @@ async fn extended_variant_leaks_no_catalog_marker() {
         detail.contains("over-privileged") && detail.contains("pg_read_all_data"),
         "{detail}"
     );
+}
+
+#[tokio::test]
+async fn idle_in_transaction_timeout_ends_the_session() {
+    let Some(u) = agent_url() else { return };
+    let _serial = SERIAL.lock().await;
+    let (_dir, t) = target(&u, &u.user, &u.password, &u.dbname, false);
+    let timeouts = Timeouts::new(Duration::from_secs(5)).with_idle(Duration::from_millis(500));
+    let session = Session::connect(&t, &u.dbname, timeouts).await.unwrap();
+    let tx = session.begin(timeouts).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let e = tx.query(Stage::Sample, "SELECT 1", &[]).await.unwrap_err();
+    // The server ended the session (FATAL 25P03, then the connection
+    // closes): fatal, never retried on this session.
+    assert!(e.fatal, "{e:?}");
+    assert!(
+        matches!(e.sqlstate(), Some("25P03") | None),
+        "{:?}",
+        e.sqlstate()
+    );
+}
+
+#[tokio::test]
+async fn cleartext_and_md5_passwords_are_refused_without_tls() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let a = admin(&adm, "postgres").await;
+    // Needs pg_hba lines for these roles (dev/postgres/local-cluster.sh).
+    let methods: Vec<(String, String)> = a
+        .query(
+            "SELECT u, auth_method FROM pg_hba_file_rules, unnest(user_name) AS u \
+             WHERE u IN ('databastion_it_md5', 'databastion_it_clear')",
+            &[],
+        )
+        .await
+        .map(|rows| rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+        .unwrap_or_default();
+    if methods.len() < 2 {
+        eprintln!("skipped: no md5 / password pg_hba lines for the test roles");
+        return;
+    }
+    for (role, encryption) in [
+        ("databastion_it_md5", "md5"),
+        ("databastion_it_clear", "scram-sha-256"),
+    ] {
+        a.batch_execute(&format!(
+            "SET log_min_error_statement = panic; SET password_encryption = '{encryption}'; \
+             DO $$ BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN \
+                 CREATE ROLE {role} LOGIN; \
+               END IF; \
+             END $$; \
+             ALTER ROLE {role} PASSWORD 'dev-only-it-weak-FAKE'; \
+             GRANT CONNECT ON DATABASE \"{}\" TO {role};",
+            u.dbname
+        ))
+        .await
+        .unwrap();
+        let (_dir, t) = target(&u, role, "dev-only-it-weak-FAKE", &u.dbname, false);
+        let logs = Logs::default();
+        let health = {
+            let _guard = logs.capture();
+            PostgresConnector::new().check(&t).await
+        };
+        assert!(!health.reachable, "{role}");
+        assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+        assert!(
+            logs.text().contains("cleartext or MD5 password"),
+            "{role}: {}",
+            logs.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn verify_full_tls_with_a_pinned_ca() {
+    let Some(u) = agent_url() else { return };
+    let Ok(ca) = std::env::var("DATABASTION_TEST_PG_CA_FILE") else {
+        eprintln!("skipped: DATABASTION_TEST_PG_CA_FILE is not set (TLS test)");
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    TLS.with(|t| *t.borrow_mut() = format!("tls: verify_full, ca_file: \"{ca}\""));
+    let (_dir, t) = target(&u, &u.user, &u.password, &u.dbname, false);
+    let health = PostgresConnector::new().check(&t).await;
+    assert!(health.reachable, "{health:?}");
+    let (r, findings) = scan(&t, ScanParams::contract_defaults()).await;
+    r.unwrap();
+    assert!(!findings.is_empty());
+    // System roots only: the throwaway CA is not trusted.
+    TLS.with(|t| *t.borrow_mut() = "tls: verify_full".to_owned());
+    let (_dir, t) = target(&u, &u.user, &u.password, &u.dbname, false);
+    let health = PostgresConnector::new().check(&t).await;
+    TLS.with(|t| *t.borrow_mut() = "tls: disable".to_owned());
+    assert!(!health.reachable);
+    assert_eq!(health.failure, Some(FailureCode::TargetUnreachable));
 }

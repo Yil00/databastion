@@ -217,6 +217,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     let timeouts = Timeouts::new(CHECK_STATEMENT_TIMEOUT);
     let mut level = AuditLevel::None;
     let mut notes: Vec<String> = Vec::new();
+    if settings.tls == databastion_core::config::PgTlsMode::DisableInsecure {
+        notes.push(
+            "INSECURE: TLS disabled on a network connection (tls: disable_insecure)".to_owned(),
+        );
+    }
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
             Ok(s) => s,
@@ -456,7 +461,11 @@ async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result
         .unwrap_or_default();
     let mut memberships = Vec::new();
     for r in probe(session, timeouts, sql::MEMBERSHIPS).await? {
-        memberships.push((col::<String>(&r, 0)?, col::<bool>(&r, 1)?));
+        let name = crate::wire::catalog_text(&r, 0)
+            .map_err(|e| PgError::from_driver(&e, Stage::Check))?
+            // Not UTF-8: counted as a non-predefined role.
+            .unwrap_or_default();
+        memberships.push((name, col::<bool>(&r, 1)?));
     }
     let count = |rows: Vec<tokio_postgres::Row>| -> Result<i64, PgError> {
         rows.first()
@@ -471,7 +480,11 @@ async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result
         pg17 && count(probe(session, timeouts, sql::LOGIN_EVENT_TRIGGERS).await?)? > 0;
     let mut schemas_not_covered = Vec::new();
     for r in probe(session, timeouts, sql::SCHEMAS_WITHOUT_USAGE).await? {
-        schemas_not_covered.push(col::<String>(&r, 0)?);
+        schemas_not_covered.push(
+            crate::wire::catalog_text(&r, 0)
+                .map_err(|e| PgError::from_driver(&e, Stage::Check))?
+                .unwrap_or_else(|| "*".to_owned()),
+        );
     }
     let relations = {
         let tx = session.begin(timeouts).await?;

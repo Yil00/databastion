@@ -161,6 +161,68 @@ pub(crate) const COLUMNS: &str = "SELECT a.attrelid, a.attname, t.oid, t.typtype
        AND pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT') \
      ORDER BY a.attrelid, a.attnum";
 
+/// Expressions of the policies evaluated for `SELECT` (`polcmd` `r` or
+/// `*`) of a set of relations (`$1`: `oid[]`), as `pg_node_tree` text. Read
+/// only to extract oids (`policy`), never logged (H1).
+pub(crate) const POLICY_TREES: &str = "SELECT p.polrelid, p.polqual::pg_catalog.text, \
+       p.polwithcheck::pg_catalog.text \
+     FROM pg_catalog.pg_policy p \
+     WHERE p.polrelid = ANY ($1) AND p.polcmd IN ('r', '*')";
+
+/// A function allowed in a policy expression evaluated by the agent's
+/// session (H1): a `pg_catalog` function, aggregate or not, that is
+/// immutable and outside the denylist, or one of a few stable built-ins
+/// that only read the session state. The denylist holds the built-ins that
+/// run SQL text or resolve object names at run time (`query_to_xml`,
+/// `cursor_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml` and
+/// their schema variants, `ts_stat`, `ts_rewrite`, `reg*in`, `to_reg*`),
+/// and the ones with side effects or file access.
+macro_rules! policy_function_ok {
+    ($f:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM pg_catalog.pg_proc p WHERE p.oid = ",
+            $f,
+            " AND p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace \
+               AND p.prokind IN ('f', 'a') \
+               AND ((p.provolatile = 'i' AND p.proname !~ \
+                     '^(query_to_xml|query_to_xmlschema|query_to_xml_and_xmlschema\
+|cursor_to_xml|cursor_to_xmlschema|table_to_xml|table_to_xmlschema\
+|table_to_xml_and_xmlschema|schema_to_xml|schema_to_xmlschema\
+|schema_to_xml_and_xmlschema|database_to_xml|database_to_xmlschema\
+|database_to_xml_and_xmlschema|ts_stat|ts_rewrite|to_reg.*|reg[a-z]*(in|recv)\
+|set_config|pg_sleep.*|pg_read_.*|pg_ls_.*|pg_stat_file|lo_.*|pg_.*advisory.*\
+|pg_cancel_backend|pg_terminate_backend|pg_notify|pg_reload_conf|pg_rotate_logfile\
+|dblink.*|nextval|setval|currval|lastval|txid_.*|pg_current_.*)$') \
+                    OR p.oid IN ( \
+                      'pg_catalog.current_setting(pg_catalog.text)'::pg_catalog.regprocedure, \
+                      'pg_catalog.current_setting(pg_catalog.text, pg_catalog.bool)'\
+                        ::pg_catalog.regprocedure, \
+                      'pg_catalog.now()'::pg_catalog.regprocedure, \
+                      'pg_catalog.current_database()'::pg_catalog.regprocedure, \
+                      'pg_catalog.current_schema()'::pg_catalog.regprocedure)))"
+        )
+    };
+}
+
+/// Counts the policy references (`$1` functions, `$2` operators, `$3` I/O
+/// coercion result types, `oid[]`) that are not allowed: functions per
+/// `policy_function_ok`, operators and types in `pg_catalog` whose
+/// function (`oprcode`, `typinput`) is allowed.
+pub(crate) const POLICY_REFS_REJECTED: &str = concat!(
+    "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($1::pg_catalog.oid[]) AS f(o) \
+             WHERE NOT ",
+    policy_function_ok!("f.o"),
+    ") + (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($2::pg_catalog.oid[]) AS x(o) \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_operator op WHERE op.oid = x.o \
+               AND op.oprnamespace = 'pg_catalog'::pg_catalog.regnamespace AND ",
+    policy_function_ok!("op.oprcode"),
+    ")) + (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($3::pg_catalog.oid[]) AS t(o) \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type ty WHERE ty.oid = t.o \
+               AND ty.typnamespace = 'pg_catalog'::pg_catalog.regnamespace AND ",
+    policy_function_ok!("ty.typinput"),
+    "))"
+);
+
 /// Builds the sampling statement of one relation: `FROM ONLY` (never an
 /// inheritance child or partition through its parent, obligation 1), the
 /// columns by name, no expression on them.
@@ -333,6 +395,8 @@ mod tests {
             ROLLBACK.to_owned(),
             SET_LOCAL_TIMEOUTS.to_owned(),
             INTROSPECT.to_owned(),
+            POLICY_TREES.to_owned(),
+            POLICY_REFS_REJECTED.to_owned(),
             COLUMNS.to_owned(),
             ROLE_ATTRIBUTES.to_owned(),
             MEMBERSHIPS.to_owned(),
@@ -366,13 +430,19 @@ mod tests {
             "lo_",
             "rolpassword",
             "rolconfig",
-            "polqual",
-            "polwithcheck",
             "pg_read_file",
             "pg_ls_",
             "dblink",
         ];
         for s in all_statements() {
+            // The policy-function denylist regex names denied functions.
+            let mut s = s;
+            while let (Some(a), Some(b)) = (s.find("'^("), s.find(")$'")) {
+                if a >= b {
+                    break;
+                }
+                s = format!("{}{}", &s[..a], &s[b + 3..]);
+            }
             let lower = s.to_lowercase();
             for d in denied {
                 assert!(!lower.contains(d), "{d} in {s}");

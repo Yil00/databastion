@@ -336,9 +336,14 @@ pub enum PgTlsMode {
     /// TLS required, certificate and host name verified (rustls).
     #[default]
     VerifyFull,
-    /// No TLS. For a Unix socket, a loopback address, or an isolated
-    /// network; the connector logs a warning for any other host.
+    /// No TLS: a Unix socket or a loopback IP literal only (rejected for
+    /// any other host). Cleartext and MD5 password requests are refused by
+    /// the connector.
     Disable,
+    /// No TLS on a network connection: explicit, insecure opt-in (e.g. an
+    /// isolated container network). Traffic is readable and alterable on
+    /// the path; warned at every connection and in `check()`.
+    DisableInsecure,
 }
 
 impl TargetConfig {
@@ -420,10 +425,20 @@ impl SecretRef {
                 .map_err(|_| SecretError::Env)?
                 .into_bytes(),
             (None, Some(path)) => {
-                crate::fsutil::read_private(path).map_err(|e| SecretError::File(e.kind()))?
+                return Self::finish(
+                    crate::fsutil::read_private_secret(path, MAX_SECRET_BYTES + 2)
+                        .map_err(|e| SecretError::File(e.kind()))?,
+                );
             }
             (None, None) => return Err(SecretError::Missing),
         });
+        Self::finish(bytes)
+    }
+
+    /// Trims one trailing newline and checks the size and encoding.
+    fn finish(
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<zeroize::Zeroizing<String>, SecretError> {
         let mut end = bytes.len();
         if bytes[..end].ends_with(b"\n") {
             end -= 1;
@@ -478,6 +493,7 @@ const KNOWN_KEYS: &[&str] = &[
     "tls",
     "verify_full",
     "disable",
+    "disable_insecure",
     "extended_grants",
     // Values of closed enums (`engine`, `phone_region`) are listed too, so
     // that an "unknown variant" error can name the expected ones; they are
@@ -778,6 +794,9 @@ impl TargetConfig {
         if let Some(pg) = &self.postgres {
             self.validate_postgres(pg, i)?;
         }
+        if self.engine == TargetEngine::Postgres {
+            self.validate_postgres_tls(i)?;
+        }
         match (&self.secret.env, &self.secret.file) {
             (Some(name), None) if !is_env_name(name) => Err(invalid(
                 f("secret.env"),
@@ -791,6 +810,27 @@ impl TargetConfig {
                 f("secret"),
                 "exactly one of env or file is required",
             )),
+        }
+    }
+
+    fn validate_postgres_tls(&self, i: usize) -> Result<(), ConfigError> {
+        let field = format!("targets[{i}].postgres.tls");
+        let loopback = self
+            .host
+            .as_deref()
+            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        match (self.postgres_settings().tls, self.socket.is_some()) {
+            (PgTlsMode::VerifyFull, true) => Err(invalid(
+                field,
+                "a Unix socket has no TLS: set `tls: disable` for this target",
+            )),
+            (PgTlsMode::Disable, false) if !loopback => Err(invalid(
+                field,
+                "`disable` is only for a Unix socket or a loopback IP literal; use \
+                 `verify_full`, or `disable_insecure` to accept cleartext on this network",
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -817,8 +857,8 @@ impl TargetConfig {
         if pg.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
             return Err(invalid(f("ca_file"), "must be an absolute path"));
         }
-        if pg.ca_file.is_some() && pg.tls == PgTlsMode::Disable {
-            return Err(invalid(f("ca_file"), "not allowed with tls: disable"));
+        if pg.ca_file.is_some() && pg.tls != PgTlsMode::VerifyFull {
+            return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
         Ok(())
     }
@@ -1060,21 +1100,23 @@ targets:
         let with =
             |block: &str| BASE.replace("    port: 5432\n", &format!("    port: 5432\n{block}"));
         let cfg = parse(&with(
-            "    postgres:\n      databases: [shop, crm]\n      tls: disable\n      extended_grants: true\n",
+            "    postgres:\n      databases: [shop, crm]\n      tls: disable_insecure\n      extended_grants: true\n",
         ))
         .unwrap();
         let pg = cfg.targets[0].postgres_settings();
         assert_eq!(pg.databases, ["shop", "crm"]);
-        assert_eq!(pg.tls, PgTlsMode::Disable);
+        assert_eq!(pg.tls, PgTlsMode::DisableInsecure);
         assert!(pg.extended_grants);
         let cases = [
             ("    postgres:\n      databases: []\n", "postgres.databases"),
             ("    postgres:\n      databases: [a, a]\n", "duplicate"),
             ("    postgres:\n      ca_file: ca.pem\n", "postgres.ca_file"),
             (
-                "    postgres:\n      tls: disable\n      ca_file: /etc/ca.pem\n",
+                "    postgres:\n      tls: disable_insecure\n      ca_file: /etc/ca.pem\n",
                 "postgres.ca_file",
             ),
+            // M2: `disable` only for a socket or a loopback literal.
+            ("    postgres:\n      tls: disable\n", "postgres.tls"),
             ("    postgres:\n      tls: prefer\n", "invalid value"),
             (
                 "    postgres:\n      password: hunter2-SECRET\n",
@@ -1086,6 +1128,32 @@ targets:
             assert!(message.contains(expected), "{expected}: {message}");
             assert!(!message.contains("hunter2"), "{message}");
         }
+        // `disable` on a loopback literal; never `localhost`.
+        let local = |host: &str, tls: &str| {
+            BASE.replace("host: db1.internal", &format!("host: \"{host}\""))
+                .replace(
+                    "    port: 5432\n",
+                    &format!("    port: 5432\n    postgres: {{tls: {tls}}}\n"),
+                )
+        };
+        assert!(parse(&local("127.0.0.1", "disable")).is_ok());
+        assert!(parse(&local("::1", "disable")).is_ok());
+        assert!(err(&local("localhost", "disable")).contains("postgres.tls"));
+        // L4: a Unix socket needs `tls: disable` (fail closed, clear message).
+        let socket = BASE.replace(
+            "    host: db1.internal\n    port: 5432\n",
+            "    socket: /run/postgresql\n",
+        );
+        assert!(
+            err(&socket).contains("a Unix socket has no TLS"),
+            "{}",
+            err(&socket)
+        );
+        let socket = socket.replace(
+            "    socket: /run/postgresql\n",
+            "    socket: /run/postgresql\n    postgres: {tls: disable}\n",
+        );
+        assert!(parse(&socket).is_ok());
         // Only for engine postgres.
         let ldap = BASE.replace(
             "      file: /etc/databastion/secrets/ldap\n",

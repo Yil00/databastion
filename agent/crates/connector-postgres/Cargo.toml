@@ -16,7 +16,7 @@ databastion-core.workspace = true
 databastion-classifiers.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net"] }
 tracing.workspace = true
 zeroize.workspace = true
 # Driver (extended protocol, binary results, server-side cancellation) and

@@ -82,6 +82,17 @@ impl RustlsConnector {
     }
 }
 
+impl RustlsConnector {
+    /// The handshake for `domain` (connections opened by the connector
+    /// itself: `connect_raw`, `cancel_query_raw`).
+    pub(crate) fn connector_for(&self, domain: &str) -> RustlsConnect {
+        RustlsConnect {
+            config: self.config.clone(),
+            server_name: ServerName::try_from(domain.to_owned()).ok(),
+        }
+    }
+}
+
 impl<S> MakeTlsConnect<S> for RustlsConnector
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -93,10 +104,7 @@ where
     fn make_tls_connect(&mut self, domain: &str) -> io::Result<RustlsConnect> {
         // Resolved lazily: with `tls: disable` (or a Unix socket) the
         // handshake is never attempted and no server name is needed.
-        Ok(RustlsConnect {
-            config: self.config.clone(),
-            server_name: ServerName::try_from(domain.to_owned()).ok(),
-        })
+        Ok(self.connector_for(domain))
     }
 }
 

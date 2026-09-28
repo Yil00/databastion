@@ -13,11 +13,14 @@
 //! one root form one [`Unit`], sampled leaf by leaf (`FROM ONLY`) within the
 //! job's `sample_rows` budget, and classified together.
 
+use std::collections::BTreeMap;
+
 use tokio_postgres::types::Type;
 
 use crate::conn::ReadTx;
 use crate::error::{PgError, Stage};
 use crate::sql;
+use crate::wire::catalog_text;
 
 /// Most relations introspected per database.
 pub(crate) const MAX_RELATIONS: i64 = 100_000;
@@ -25,8 +28,8 @@ pub(crate) const MAX_RELATIONS: i64 = 100_000;
 pub(crate) const MAX_LEAVES: usize = 64;
 
 /// One relation from the catalogs (names are raw: never sent or logged
-/// without normalization).
-#[derive(Debug, Clone, PartialEq)]
+/// without normalization; `Debug` shows neither).
+#[derive(Clone, PartialEq)]
 pub(crate) struct Relation {
     pub(crate) oid: u32,
     pub(crate) schema: String,
@@ -41,7 +44,18 @@ pub(crate) struct Relation {
     pub(crate) rls_blocked: bool,
 }
 
-/// Reads the relations in scope of obligation 1 (one statement).
+impl std::fmt::Debug for Relation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Relation")
+            .field("oid", &self.oid)
+            .field("kind", &char::from(self.kind))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reads the relations in scope of obligation 1, then checks the policy
+/// expressions of the row-level security tables not already blocked by
+/// `pg_depend` (H1). Rows whose names are not UTF-8 are skipped (L1).
 pub(crate) async fn introspect(tx: &ReadTx<'_>) -> Result<Vec<Relation>, PgError> {
     let rows = tx
         .query(
@@ -52,12 +66,20 @@ pub(crate) async fn introspect(tx: &ReadTx<'_>) -> Result<Vec<Relation>, PgError
         .await?;
     let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Introspection);
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut undecodable = 0usize;
+    for row in &rows {
+        let (Some(schema), Some(name)) = (
+            catalog_text(row, 1).map_err(get)?,
+            catalog_text(row, 2).map_err(get)?,
+        ) else {
+            undecodable += 1;
+            continue;
+        };
         let kind: i8 = row.try_get(3).map_err(get)?;
         out.push(Relation {
             oid: row.try_get(0).map_err(get)?,
-            schema: row.try_get(1).map_err(get)?,
-            name: row.try_get(2).map_err(get)?,
+            schema,
+            name,
             kind: kind.to_ne_bytes()[0],
             is_partition: row.try_get(4).map_err(get)?,
             reltuples: row.try_get(5).map_err(get)?,
@@ -68,18 +90,96 @@ pub(crate) async fn introspect(tx: &ReadTx<'_>) -> Result<Vec<Relation>, PgError
             rls_blocked: row.try_get(10).map_err(get)?,
         });
     }
-    if out.len() >= usize::try_from(MAX_RELATIONS).unwrap_or(usize::MAX) {
+    if undecodable > 0 {
+        tracing::warn!(
+            count = undecodable,
+            "relations with names that are not valid UTF-8 are not covered"
+        );
+    }
+    if rows.len() >= usize::try_from(MAX_RELATIONS).unwrap_or(usize::MAX) {
         tracing::warn!(
             limit = MAX_RELATIONS,
             "introspection reached its relation limit; later relations are not covered"
         );
     }
+    check_policies(tx, &mut out).await?;
     Ok(out)
+}
+
+/// Marks as blocked the row-level security relations whose `SELECT`
+/// policies use a node type, function, operator or I/O coercion outside
+/// the allow-lists (`policy`, `sql::POLICY_REFS_REJECTED`).
+async fn check_policies(tx: &ReadTx<'_>, relations: &mut [Relation]) -> Result<(), PgError> {
+    let candidates: Vec<u32> = relations
+        .iter()
+        .filter(|r| r.rls && !r.rls_blocked)
+        .map(|r| r.oid)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Introspection);
+    let rows = tx
+        .query(
+            Stage::Introspection,
+            sql::POLICY_TREES,
+            &[(&candidates, Type::OID_ARRAY)],
+        )
+        .await?;
+    let mut trees: BTreeMap<u32, Vec<Option<String>>> = BTreeMap::new();
+    for row in &rows {
+        let rel: u32 = row.try_get(0).map_err(get)?;
+        let entry = trees.entry(rel).or_default();
+        for i in [1, 2] {
+            if row
+                .try_get::<_, Option<crate::wire::WireBytes<'_>>>(i)
+                .map_err(get)?
+                .is_some()
+            {
+                // Present but not UTF-8: unsupported (None).
+                entry.push(catalog_text(row, i).map_err(get)?);
+            }
+        }
+    }
+    for rel in relations.iter_mut().filter(|r| r.rls && !r.rls_blocked) {
+        let Some(exprs) = trees.get(&rel.oid) else {
+            continue; // no SELECT policy: default deny, nothing runs
+        };
+        let texts: Option<Vec<&str>> = exprs.iter().map(Option::as_deref).collect();
+        let Some(refs) = texts.and_then(|t| crate::policy::scan(&t)) else {
+            rel.rls_blocked = true;
+            continue;
+        };
+        let as_vec = |s: &std::collections::BTreeSet<u32>| s.iter().copied().collect::<Vec<u32>>();
+        let (f, o, t) = (
+            as_vec(&refs.functions),
+            as_vec(&refs.operators),
+            as_vec(&refs.io_types),
+        );
+        let rejected: i64 = tx
+            .query(
+                Stage::Introspection,
+                sql::POLICY_REFS_REJECTED,
+                &[
+                    (&f, Type::OID_ARRAY),
+                    (&o, Type::OID_ARRAY),
+                    (&t, Type::OID_ARRAY),
+                ],
+            )
+            .await?
+            .first()
+            .map(|r| r.try_get(0))
+            .transpose()
+            .map_err(get)?
+            .unwrap_or(1);
+        rel.rls_blocked = rejected > 0;
+    }
+    Ok(())
 }
 
 /// A relation read directly (a table, a materialized view, or a leaf of a
 /// partitioned root).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct Member {
     pub(crate) oid: u32,
     pub(crate) schema: String,
@@ -89,7 +189,7 @@ pub(crate) struct Member {
 
 /// What is reported as one object: a table / materialized view, or a
 /// partitioned root with its readable leaves.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct Unit {
     pub(crate) schema: String,
     pub(crate) name: String,
@@ -122,7 +222,7 @@ impl Unit {
 
 /// Relations in the job's scope that are not sampled, by reason (raw names:
 /// normalize before logging).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Coverage {
     /// No `SELECT` on any column.
     pub(crate) not_readable: Vec<(String, String)>,
@@ -141,6 +241,35 @@ pub(crate) struct Coverage {
 impl Coverage {
     pub(crate) fn not_covered(&self) -> usize {
         self.not_readable.len() + self.rls_policy.len() + self.rls_ancestor.len()
+    }
+}
+
+impl std::fmt::Debug for Member {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Member")
+            .field("oid", &self.oid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Unit")
+            .field("members", &self.members)
+            .field("rls", &self.rls)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Coverage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Coverage")
+            .field("not_readable", &self.not_readable.len())
+            .field("rls_policy", &self.rls_policy.len())
+            .field("rls_ancestor", &self.rls_ancestor.len())
+            .field("foreign", &self.foreign)
+            .field("leaves_over_limit", &self.leaves_over_limit)
+            .finish()
     }
 }
 

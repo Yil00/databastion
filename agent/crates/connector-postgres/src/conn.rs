@@ -20,7 +20,6 @@
 //!   are discarded, errors reduced to a SQLSTATE (`error`).
 
 use std::future::Future;
-use std::path::Path;
 use std::time::Duration;
 
 use databastion_core::FailureCode;
@@ -29,13 +28,12 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{CancelToken, Client, Row, RowStream};
 
 use crate::error::{PgError, Stage};
+use crate::net::{AuthGuard, Endpoint, REFUSED_AUTH};
 use crate::sql;
 use crate::tls::RustlsConnector;
 
 /// `application_name` of every connector session.
 pub(crate) const APPLICATION_NAME: &str = "databastion-agent";
-/// TCP connect timeout.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole connection setup (TCP, TLS, authentication, session settings).
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound on sending a cancel request.
@@ -51,6 +49,7 @@ pub(crate) const IDLE_IN_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Timeouts {
     statement_ms: u32,
+    idle_ms: u128,
 }
 
 impl Timeouts {
@@ -60,7 +59,15 @@ impl Timeouts {
         let ms = u32::try_from(statement.as_millis()).unwrap_or(u32::MAX);
         Self {
             statement_ms: ms.max(100),
+            idle_ms: IDLE_IN_TRANSACTION_TIMEOUT.as_millis(),
         }
+    }
+
+    /// Shorter idle-in-transaction timeout (tests).
+    #[cfg(test)]
+    pub(crate) fn with_idle(mut self, idle: Duration) -> Self {
+        self.idle_ms = idle.as_millis();
+        self
     }
 
     #[cfg(test)]
@@ -74,7 +81,7 @@ impl Timeouts {
         [
             self.statement_ms.to_string(),
             LOCK_TIMEOUT.as_millis().to_string(),
-            IDLE_IN_TRANSACTION_TIMEOUT.as_millis().to_string(),
+            self.idle_ms.to_string(),
         ]
     }
 }
@@ -83,7 +90,7 @@ impl Timeouts {
 /// dropped while armed.
 struct CancelOnDrop {
     token: Option<CancelToken>,
-    tls: RustlsConnector,
+    endpoint: Endpoint,
 }
 
 impl CancelOnDrop {
@@ -100,15 +107,26 @@ impl Drop for CancelOnDrop {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let tls = self.tls.clone();
+        let endpoint = self.endpoint.clone();
         runtime.spawn(async move {
-            match tokio::time::timeout(CANCEL_TIMEOUT, token.cancel_query(tls)).await {
+            let cancel = async {
+                let stream = endpoint.open().await.map_err(|e| {
+                    tracing::warn!(kind = %e.kind(), "cannot connect to send a cancel request");
+                })?;
+                token
+                    .cancel_query_raw(stream, endpoint.tls_connect())
+                    .await
+                    .map_err(|e| {
+                        // The error text is not logged (obligation 7).
+                        tracing::warn!(
+                            sqlstate = e.code().map(|c| c.code()),
+                            "cancel request failed"
+                        );
+                    })
+            };
+            match tokio::time::timeout(CANCEL_TIMEOUT, cancel).await {
                 Ok(Ok(())) => tracing::debug!("statement cancelled on the server"),
-                // The error text is not logged (obligation 7).
-                Ok(Err(e)) => tracing::warn!(
-                    sqlstate = e.code().map(|c| c.code()),
-                    "cancel request failed"
-                ),
+                Ok(Err(())) => {}
                 Err(_) => tracing::warn!("cancel request timed out"),
             }
         });
@@ -118,8 +136,11 @@ impl Drop for CancelOnDrop {
 /// A connection to one database of a target.
 pub(crate) struct Session {
     client: Client,
-    tls: RustlsConnector,
+    endpoint: Endpoint,
     server_version_num: u32,
+    /// A cancel request may still be in flight (a sample stopped at its
+    /// byte budget): no further statement is sent on this session.
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -147,14 +168,13 @@ impl Session {
     ) -> Result<Self, PgError> {
         let settings = target.postgres_settings();
         let tls = match settings.tls {
-            PgTlsMode::Disable => {
-                if !is_local(target) {
-                    tracing::warn!(
-                        target_id = %target.id,
-                        "TLS is disabled for a target that is neither a Unix socket nor a \
-                         loopback address"
-                    );
-                }
+            PgTlsMode::Disable => RustlsConnector::disabled(),
+            PgTlsMode::DisableInsecure => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    "TLS disabled on a network connection (tls: disable_insecure): samples and \
+                     statements travel in clear"
+                );
                 RustlsConnector::disabled()
             }
             PgTlsMode::VerifyFull => RustlsConnector::verify_full(settings.ca_file.as_deref())
@@ -162,6 +182,12 @@ impl Session {
                     tracing::warn!(target_id = %target.id, error = %e, "TLS setup failed");
                     PgError::new(FailureCode::TargetUnreachable, Stage::Tls)
                 })?,
+        };
+        let plaintext = settings.tls != PgTlsMode::VerifyFull;
+        let endpoint = match (&target.host, &target.socket) {
+            (Some(host), _) => Endpoint::tcp(host, target.port.unwrap_or(5432), tls),
+            (None, Some(socket)) if plaintext => Endpoint::unix(socket),
+            _ => return Err(PgError::new(FailureCode::TargetUnreachable, Stage::Connect)),
         };
         let secret = target.secret.read().map_err(|e| {
             // `SecretError` never carries the value.
@@ -174,31 +200,33 @@ impl Session {
             .password(secret.as_bytes())
             .dbname(database)
             .application_name(APPLICATION_NAME)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .keepalives(true)
-            .ssl_mode(match settings.tls {
-                PgTlsMode::Disable => tokio_postgres::config::SslMode::Disable,
-                PgTlsMode::VerifyFull => tokio_postgres::config::SslMode::Require,
+            .ssl_mode(if plaintext {
+                tokio_postgres::config::SslMode::Disable
+            } else {
+                tokio_postgres::config::SslMode::Require
             });
         drop(secret);
-        match (&target.host, &target.socket) {
-            (Some(host), _) => {
-                config.host(host).port(target.port.unwrap_or(5432));
-            }
-            (None, Some(socket)) => {
-                let (dir, port) = socket_dir_and_port(socket);
-                config.host_path(dir).port(port);
-            }
-            (None, None) => {
-                return Err(PgError::new(FailureCode::TargetUnreachable, Stage::Connect));
-            }
-        }
-        let (client, mut connection) = config
-            .connect(tls.clone())
-            .await
-            .map_err(|e| PgError::from_driver(&e, Stage::Connect))?;
+        let stream = endpoint.open().await.map_err(|e| {
+            tracing::warn!(target_id = %target.id, kind = %e.kind(), "cannot connect to the target");
+            PgError::new(FailureCode::TargetUnreachable, Stage::Connect)
+        })?;
+        let connected = config
+            .connect_raw(AuthGuard::new(stream, plaintext), endpoint.tls_connect())
+            .await;
         // `config` holds a copy of the password: dropped right away.
         drop(config);
+        let (client, mut connection) = connected.map_err(|e| {
+            if refused_auth(&e) {
+                tracing::warn!(
+                    target_id = %target.id,
+                    "the server asked for a cleartext or MD5 password on a connection without \
+                     TLS: refused (use SCRAM, or TLS)"
+                );
+                PgError::new(FailureCode::AuthenticationFailed, Stage::Connect)
+            } else {
+                PgError::from_driver(&e, Stage::Connect)
+            }
+        })?;
         tokio::spawn(async move {
             // Drives the connection. Notices and notifications are
             // discarded unread (their text is server data, obligation 7);
@@ -208,8 +236,9 @@ impl Session {
         });
         let mut session = Self {
             client,
-            tls,
+            endpoint,
             server_version_num: 0,
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         };
         let [st, lock, idle] = timeouts.params();
         let row = session
@@ -237,17 +266,30 @@ impl Session {
     /// Runs `fut` (a statement of this session) under a cancel-on-drop
     /// guard.
     async fn guarded<T>(&self, fut: impl Future<Output = T>) -> T {
-        let guard = CancelOnDrop {
-            token: Some(self.client.cancel_token()),
-            tls: self.tls.clone(),
-        };
+        let guard = self.cancel_guard();
         let out = fut.await;
         guard.disarm();
         out
     }
 
+    fn cancel_guard(&self) -> CancelOnDrop {
+        CancelOnDrop {
+            token: Some(self.client.cancel_token()),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+
+    /// Whether a cancel request may be in flight: the caller opens a new
+    /// session instead of sending another statement.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Opens a read-only transaction with `SET LOCAL` timeouts.
     pub(crate) async fn begin(&self, timeouts: Timeouts) -> Result<ReadTx<'_>, PgError> {
+        if self.is_poisoned() {
+            return Err(PgError::new(FailureCode::Internal, Stage::Begin));
+        }
         self.guarded(self.client.execute_typed(sql::BEGIN, &[]))
             .await
             .map_err(|e| PgError::from_driver(&e, Stage::Begin))?;
@@ -294,6 +336,11 @@ pub(crate) struct ReadTx<'s> {
 }
 
 impl ReadTx<'_> {
+    /// See [`Session::is_poisoned`].
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.session.is_poisoned()
+    }
+
     /// Runs one statement and collects its rows.
     pub(crate) async fn query(
         &self,
@@ -307,9 +354,12 @@ impl ReadTx<'_> {
             .map_err(|e| PgError::from_driver(&e, stage))
     }
 
-    /// Runs one statement and hands its row stream to `consume`, which
-    /// must return once it has read what it needs. The cancel guard covers
-    /// the whole consumption (the statement runs while rows are read).
+    /// Runs one statement and hands its row stream to `consume`. The cancel
+    /// guard covers the whole consumption (the statement runs while rows
+    /// are read). When `consume` stops early ([`Streamed::Stopped`]), the
+    /// guard stays armed: a cancel request is sent, the remaining rows are
+    /// not drained, and the session is poisoned (no further statement:
+    /// the caller reconnects).
     pub(crate) async fn query_stream<T, F, Fut>(
         &self,
         stage: Stage,
@@ -319,24 +369,45 @@ impl ReadTx<'_> {
     ) -> Result<T, PgError>
     where
         F: FnOnce(RowStream) -> Fut,
-        Fut: Future<Output = Result<T, tokio_postgres::Error>>,
+        Fut: Future<Output = Result<Streamed<T>, tokio_postgres::Error>>,
     {
-        self.session
-            .guarded(async {
-                let stream = self
-                    .session
-                    .client
-                    .query_typed_raw(statement, params.iter().map(|(v, t)| (*v, t.clone())))
-                    .await?;
-                consume(stream).await
-            })
-            .await
-            .map_err(|e| PgError::from_driver(&e, stage))
+        let guard = self.session.cancel_guard();
+        let result = async {
+            let stream = self
+                .session
+                .client
+                .query_typed_raw(statement, params.iter().map(|(v, t)| (*v, t.clone())))
+                .await?;
+            consume(stream).await
+        }
+        .await;
+        match result {
+            Ok(Streamed::Complete(v)) => {
+                guard.disarm();
+                Ok(v)
+            }
+            Ok(Streamed::Stopped(v)) => {
+                self.session
+                    .poisoned
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                drop(guard);
+                Ok(v)
+            }
+            Err(e) => {
+                guard.disarm();
+                Err(PgError::from_driver(&e, stage))
+            }
+        }
     }
 
     /// Commits (a read-only transaction: ends it).
     pub(crate) async fn commit(mut self) -> Result<(), PgError> {
         self.open = false;
+        if self.session.is_poisoned() {
+            // Nothing more is sent; closing the connection ends the
+            // transaction.
+            return Ok(());
+        }
         self.session
             .guarded(self.session.client.execute_typed(sql::COMMIT, &[]))
             .await
@@ -347,6 +418,9 @@ impl ReadTx<'_> {
     /// Rolls back, ignoring errors (the session may be broken).
     pub(crate) async fn rollback(mut self) {
         self.open = false;
+        if self.session.is_poisoned() {
+            return;
+        }
         let _ = self
             .session
             .guarded(self.session.client.execute_typed(sql::ROLLBACK, &[]))
@@ -364,28 +438,26 @@ impl Drop for ReadTx<'_> {
     }
 }
 
-/// Whether the target is a Unix socket or a loopback IP literal.
-fn is_local(target: &TargetConfig) -> bool {
-    target.socket.is_some()
-        || target
-            .host
-            .as_deref()
-            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback())
+/// How [`ReadTx::query_stream`]'s consumer ended.
+pub(crate) enum Streamed<T> {
+    /// Every row was read.
+    Complete(T),
+    /// Stopped early (byte budget): the statement is cancelled.
+    Stopped(T),
 }
 
-/// `agent.yaml` `socket` is either the socket file
-/// (`/run/postgresql/.s.PGSQL.5432`) or its directory (port 5432).
-fn socket_dir_and_port(socket: &Path) -> (&Path, u16) {
-    let port = socket
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix(".s.PGSQL."))
-        .and_then(|p| p.parse::<u16>().ok());
-    match (port, socket.parent()) {
-        (Some(port), Some(dir)) => (dir, port),
-        _ => (socket, 5432),
+/// Whether a connection error is the [`AuthGuard`] refusal.
+fn refused_auth(e: &tokio_postgres::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        if s.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == REFUSED_AUTH)
+        {
+            return true;
+        }
+        source = s.source();
     }
+    false
 }
 
 #[cfg(test)]
@@ -404,18 +476,6 @@ mod tests {
         assert_eq!(
             (st.as_str(), lock.as_str(), idle.as_str()),
             ("30000", "2000", "10000")
-        );
-    }
-
-    #[test]
-    fn socket_paths() {
-        assert_eq!(
-            socket_dir_and_port(Path::new("/run/postgresql/.s.PGSQL.5433")),
-            (Path::new("/run/postgresql"), 5433)
-        );
-        assert_eq!(
-            socket_dir_and_port(Path::new("/run/postgresql")),
-            (Path::new("/run/postgresql"), 5432)
         );
     }
 }
