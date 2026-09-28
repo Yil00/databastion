@@ -76,6 +76,27 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 `make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
 
+## Connector integration tests
+The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
+environment when these variables are set, and are skipped otherwise:
+
+```sh
+set -a; . dev/.env; set +a
+export DATABASTION_TEST_PG_URL="postgresql://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:${POSTGRES_PORT:-5432}/shop"
+# ADR-0012 fixture probes (database databastion_probe, role databastion_it_ext): a superuser.
+export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:$POSTGRES_ADMIN_PASSWORD@127.0.0.1:${POSTGRES_PORT:-5432}/shop"
+(cd agent && cargo test -p databastion-connector-postgres -- --nocapture)
+```
+
+Without Docker, [postgres/local-cluster.sh](postgres/local-cluster.sh) starts a throwaway cluster
+from the host's PostgreSQL binaries (127.0.0.1:55432, same seed, same `20-databastion.sh`, no
+pgaudit unless installed; TLS with a throwaway CA, exported as `DATABASTION_TEST_PG_CA_FILE` for the
+`verify_full` test; `pg_hba` lines for the md5 / cleartext refusal test) and prints the variables: `eval "$(dev/postgres/local-cluster.sh start)"`,
+then `dev/postgres/local-cluster.sh stop` (deletes it). The pgaudit probe of ADR-0012 only runs
+where pgaudit is loaded (the dev image). A skipped check prints `skipped: …`;
+`DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`, `pgaudit`, `weak-auth`, `tls`,
+or `all`) turns the listed skips into failures, as CI does for each server.
+
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
 

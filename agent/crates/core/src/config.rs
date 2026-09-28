@@ -283,6 +283,75 @@ pub struct TargetConfig {
     /// digits are fingerprinted as they are).
     #[serde(default)]
     pub phone_region: Option<PhoneRegionConfig>,
+    /// PostgreSQL settings (`engine: postgres` only).
+    #[serde(default)]
+    pub postgres: Option<PostgresTargetConfig>,
+}
+
+/// Maximum number of databases declared for one PostgreSQL target.
+pub const MAX_PG_DATABASES: usize = 16;
+
+/// PostgreSQL settings of a target.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresTargetConfig {
+    /// Databases the agent connects to (1..=16), in order. A scan covers
+    /// those matching the job's `databases` filter. Default: `postgres`.
+    #[serde(default = "default_pg_databases")]
+    pub databases: Vec<String>,
+    /// TLS to the server. Default: `verify_full`.
+    #[serde(default)]
+    pub tls: PgTlsMode,
+    /// PEM CA file trusted for the server certificate (`verify_full`).
+    /// When set, it is the only trusted root; otherwise the system store.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// ADR-0012 extended grant variant: the role is expected to be a member
+    /// of `pg_read_all_data` / `pg_read_all_settings`. `check()` then
+    /// reports that membership as an expected warning instead of
+    /// over-privilege.
+    #[serde(default)]
+    pub extended_grants: bool,
+}
+
+fn default_pg_databases() -> Vec<String> {
+    vec!["postgres".to_owned()]
+}
+
+impl Default for PostgresTargetConfig {
+    fn default() -> Self {
+        Self {
+            databases: default_pg_databases(),
+            tls: PgTlsMode::default(),
+            ca_file: None,
+            extended_grants: false,
+        }
+    }
+}
+
+/// TLS mode of a PostgreSQL target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PgTlsMode {
+    /// TLS required, certificate and host name verified (rustls).
+    #[default]
+    VerifyFull,
+    /// No TLS: a Unix socket or a loopback IP literal only (rejected for
+    /// any other host). Cleartext and MD5 password requests are refused by
+    /// the connector.
+    Disable,
+    /// No TLS on a network connection: explicit, insecure opt-in (e.g. an
+    /// isolated container network). Traffic is readable and alterable on
+    /// the path; warned at every connection and in `check()`.
+    DisableInsecure,
+}
+
+impl TargetConfig {
+    /// PostgreSQL settings, defaults when absent.
+    #[must_use]
+    pub fn postgres_settings(&self) -> PostgresTargetConfig {
+        self.postgres.clone().unwrap_or_default()
+    }
 }
 
 /// Phone region of a target (`agent.yaml`).
@@ -317,6 +386,72 @@ pub struct SecretRef {
     /// Absolute path of a file.
     #[serde(default)]
     pub file: Option<PathBuf>,
+}
+
+/// Why a database secret could not be read. Never carries the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SecretError {
+    /// Neither `env` nor `file` is set.
+    #[error("no secret reference")]
+    Missing,
+    /// The environment variable is unset or not UTF-8.
+    #[error("secret environment variable is unset or not valid UTF-8")]
+    Env,
+    /// The file cannot be read, or is not a private (`0600`, owned by the
+    /// agent user, not a symlink) regular file.
+    #[error("cannot read secret file: {0}")]
+    File(std::io::ErrorKind),
+    /// Empty, larger than 4 KiB, or not UTF-8.
+    #[error("secret is empty, too large or not valid UTF-8")]
+    Invalid,
+}
+
+/// Largest accepted secret, in bytes.
+const MAX_SECRET_BYTES: usize = 4096;
+
+impl SecretRef {
+    /// Reads the secret on the agent host (I3). A file must be a private
+    /// regular file (`0600`, owned by the agent user, not a symlink); one
+    /// trailing newline is removed. The value is zeroized on drop.
+    ///
+    /// # Errors
+    /// [`SecretError`], without the value.
+    pub fn read(&self) -> Result<zeroize::Zeroizing<String>, SecretError> {
+        let bytes = zeroize::Zeroizing::new(match (&self.env, &self.file) {
+            (Some(name), _) => std::env::var_os(name)
+                .ok_or(SecretError::Env)?
+                .into_string()
+                .map_err(|_| SecretError::Env)?
+                .into_bytes(),
+            (None, Some(path)) => {
+                return Self::finish(
+                    crate::fsutil::read_private_secret(path, MAX_SECRET_BYTES + 2)
+                        .map_err(|e| SecretError::File(e.kind()))?,
+                );
+            }
+            (None, None) => return Err(SecretError::Missing),
+        });
+        Self::finish(bytes)
+    }
+
+    /// Trims one trailing newline and checks the size and encoding.
+    fn finish(
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<zeroize::Zeroizing<String>, SecretError> {
+        let mut end = bytes.len();
+        if bytes[..end].ends_with(b"\n") {
+            end -= 1;
+            if bytes[..end].ends_with(b"\r") {
+                end -= 1;
+            }
+        }
+        if end == 0 || end > MAX_SECRET_BYTES {
+            return Err(SecretError::Invalid);
+        }
+        let text = std::str::from_utf8(&bytes[..end]).map_err(|_| SecretError::Invalid)?;
+        Ok(zeroize::Zeroizing::new(text.to_owned()))
+    }
 }
 
 impl fmt::Debug for SecretRef {
@@ -354,6 +489,12 @@ const KNOWN_KEYS: &[&str] = &[
     "max_scan_duration_s",
     "min_audit_poll_interval_s",
     "phone_region",
+    "databases",
+    "tls",
+    "verify_full",
+    "disable",
+    "disable_insecure",
+    "extended_grants",
     // Values of closed enums (`engine`, `phone_region`) are listed too, so
     // that an "unknown variant" error can name the expected ones; they are
     // schema constants, never user data.
@@ -650,6 +791,12 @@ impl TargetConfig {
                 "must be 1 to 128 characters without control characters",
             ));
         }
+        if let Some(pg) = &self.postgres {
+            self.validate_postgres(pg, i)?;
+        }
+        if self.engine == TargetEngine::Postgres {
+            self.validate_postgres_tls(i)?;
+        }
         match (&self.secret.env, &self.secret.file) {
             (Some(name), None) if !is_env_name(name) => Err(invalid(
                 f("secret.env"),
@@ -664,6 +811,56 @@ impl TargetConfig {
                 "exactly one of env or file is required",
             )),
         }
+    }
+
+    fn validate_postgres_tls(&self, i: usize) -> Result<(), ConfigError> {
+        let field = format!("targets[{i}].postgres.tls");
+        let loopback = self
+            .host
+            .as_deref()
+            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        match (self.postgres_settings().tls, self.socket.is_some()) {
+            (PgTlsMode::VerifyFull, true) => Err(invalid(
+                field,
+                "a Unix socket has no TLS: set `tls: disable` for this target",
+            )),
+            (PgTlsMode::Disable, false) if !loopback => Err(invalid(
+                field,
+                "`disable` is only for a Unix socket or a loopback IP literal; use \
+                 `verify_full`, or `disable_insecure` to accept cleartext on this network",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_postgres(&self, pg: &PostgresTargetConfig, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].postgres.{name}");
+        if self.engine != TargetEngine::Postgres {
+            return Err(invalid(f("databases"), "only for engine postgres"));
+        }
+        if pg.databases.is_empty() || pg.databases.len() > MAX_PG_DATABASES {
+            return Err(invalid(f("databases"), "must list 1 to 16 databases"));
+        }
+        let mut seen = HashSet::new();
+        for db in &pg.databases {
+            if db.is_empty() || db.len() > 63 || db.chars().any(char::is_control) {
+                return Err(invalid(
+                    f("databases"),
+                    "a database name is 1 to 63 bytes without control characters",
+                ));
+            }
+            if !seen.insert(db.as_str()) {
+                return Err(invalid(f("databases"), "duplicate database"));
+            }
+        }
+        if pg.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            return Err(invalid(f("ca_file"), "must be an absolute path"));
+        }
+        if pg.ca_file.is_some() && pg.tls != PgTlsMode::VerifyFull {
+            return Err(invalid(f("ca_file"), "only with tls: verify_full"));
+        }
+        Ok(())
     }
 }
 
@@ -890,6 +1087,105 @@ targets:
         }
         let dup = BASE.replace("id: ldap", "id: pg-main");
         assert!(err(&dup).contains("duplicate"));
+    }
+
+    #[test]
+    fn postgres_settings() {
+        let cfg = parse(BASE).unwrap();
+        assert_eq!(
+            cfg.targets[0].postgres_settings(),
+            PostgresTargetConfig::default()
+        );
+        assert_eq!(cfg.targets[0].postgres_settings().databases, ["postgres"]);
+        let with =
+            |block: &str| BASE.replace("    port: 5432\n", &format!("    port: 5432\n{block}"));
+        let cfg = parse(&with(
+            "    postgres:\n      databases: [shop, crm]\n      tls: disable_insecure\n      extended_grants: true\n",
+        ))
+        .unwrap();
+        let pg = cfg.targets[0].postgres_settings();
+        assert_eq!(pg.databases, ["shop", "crm"]);
+        assert_eq!(pg.tls, PgTlsMode::DisableInsecure);
+        assert!(pg.extended_grants);
+        let cases = [
+            ("    postgres:\n      databases: []\n", "postgres.databases"),
+            ("    postgres:\n      databases: [a, a]\n", "duplicate"),
+            ("    postgres:\n      ca_file: ca.pem\n", "postgres.ca_file"),
+            (
+                "    postgres:\n      tls: disable_insecure\n      ca_file: /etc/ca.pem\n",
+                "postgres.ca_file",
+            ),
+            // M2: `disable` only for a socket or a loopback literal.
+            ("    postgres:\n      tls: disable\n", "postgres.tls"),
+            ("    postgres:\n      tls: prefer\n", "invalid value"),
+            (
+                "    postgres:\n      password: hunter2-SECRET\n",
+                "unknown field",
+            ),
+        ];
+        for (block, expected) in cases {
+            let message = err(&with(block));
+            assert!(message.contains(expected), "{expected}: {message}");
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+        // `disable` on a loopback literal; never `localhost`.
+        let local = |host: &str, tls: &str| {
+            BASE.replace("host: db1.internal", &format!("host: \"{host}\""))
+                .replace(
+                    "    port: 5432\n",
+                    &format!("    port: 5432\n    postgres: {{tls: {tls}}}\n"),
+                )
+        };
+        assert!(parse(&local("127.0.0.1", "disable")).is_ok());
+        assert!(parse(&local("::1", "disable")).is_ok());
+        assert!(err(&local("localhost", "disable")).contains("postgres.tls"));
+        // L4: a Unix socket needs `tls: disable` (fail closed, clear message).
+        let socket = BASE.replace(
+            "    host: db1.internal\n    port: 5432\n",
+            "    socket: /run/postgresql\n",
+        );
+        assert!(
+            err(&socket).contains("a Unix socket has no TLS"),
+            "{}",
+            err(&socket)
+        );
+        let socket = socket.replace(
+            "    socket: /run/postgresql\n",
+            "    socket: /run/postgresql\n    postgres: {tls: disable}\n",
+        );
+        assert!(parse(&socket).is_ok());
+        // Only for engine postgres.
+        let ldap = BASE.replace(
+            "      file: /etc/databastion/secrets/ldap\n",
+            "      file: /etc/databastion/secrets/ldap\n    postgres:\n      databases: [x]\n",
+        );
+        assert!(err(&ldap).contains("targets[1].postgres"), "{}", err(&ldap));
+    }
+
+    #[test]
+    fn secret_file_is_read_private_and_trimmed() {
+        use crate::fsutil::test_dir::TempDir;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let path = dir.path().join("pw");
+        crate::fsutil::write_private_atomic(&path, b"s3cret-FAKE\n").unwrap();
+        let secret = SecretRef {
+            env: None,
+            file: Some(path.clone()),
+        };
+        assert_eq!(secret.read().unwrap().as_str(), "s3cret-FAKE");
+        crate::fsutil::write_private_atomic(&path, b"\n").unwrap();
+        assert_eq!(secret.read().unwrap_err(), SecretError::Invalid);
+        crate::fsutil::write_private_atomic(&path, b"s3cret-FAKE").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let e = secret.read().unwrap_err();
+        assert!(matches!(e, SecretError::File(_)), "{e:?}");
+        assert!(!e.to_string().contains("s3cret"));
+        let unset = SecretRef {
+            env: Some("DATABASTION_TEST_UNSET_SECRET_VARIABLE".to_owned()),
+            file: None,
+        };
+        assert_eq!(unset.read().unwrap_err(), SecretError::Env);
     }
 
     #[test]

@@ -37,8 +37,10 @@ cannot reach the console database or the outside. Only the proxy is published, o
    command line), run `databastion-agent enroll --token-file …` and assert that
    `identity.json` is `10001:10001 0600`, then `databastion-agent run`.
 5. Assert through `GET /api/agents` that the agent is `online` with target `pg-e2e` reported
-   (the PostgreSQL connector is still a stub: the target is reported unreachable, audit level
-   `none`, which is printed but not asserted), that `databastion_agent` has exactly the
+   and `reachable` (the PostgreSQL connector connects with `databastion_agent`, TLS disabled on
+   the internal network through the explicit insecure opt-in
+   `postgres: {databases: [app], tls: disable_insecure}` in `agent.yaml`, SCRAM only; the audit
+   level, `none` without `pg_stat_statements`, is printed but not asserted), that `databastion_agent` has exactly the
    attributes above (memberships exactly `pg_read_all_stats`, role settings in
    `pg_db_role_setting` exactly the four defaults) and, in its own session, gets the defaults and
    is denied `pg_authid` / `pg_user_mapping`, and that `/metrics` (scraped from inside the web

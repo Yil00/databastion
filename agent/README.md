@@ -16,7 +16,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-agent` | `crates/agent` | Binary: CLI (`--config`), JSON logs, connector selection by Cargo feature |
 | `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, `agent.yaml`, enrollment, runtime (heartbeat / jobs), crate-private HTTPS uplink and session |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
-| `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector (stub) |
+| `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B); Audit is P4-A |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector (stub) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
@@ -192,7 +192,48 @@ review remain the primary controls.
 capped at `warn`: drivers and HTTP clients may log parameters or payloads at
 debug/trace level.
 
-### Future database drivers (sqlx, mongodb, ldap3)
+### PostgreSQL connector
+tokio-postgres with the connector's own rustls adapter
+(`crates/connector-postgres/src/tls.rs`: `verify_full` against a pinned CA or the system
+store; `disable` for a Unix socket or loopback literal; `disable_insecure`, an explicit and
+warned opt-in, on a network). The connector opens the connection itself (`src/net.rs`) and,
+without TLS, refuses cleartext and MD5 password requests before the driver answers (SCRAM
+only). Chosen over sqlx for its cancel requests (server-side
+cancellation of a dropped statement) and its explicit extended-protocol API. It follows the
+[ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) obligations:
+
+- scope: tables and materialized views read `FROM ONLY`; partitioned tables through their
+  leaves (reported under the root); never foreign tables, system schemas, extension objects
+  or the credential-bearing catalogs; RLS tables are sampled only when their `SELECT` policies
+  (the stored expression, scanned locally, plus `pg_depend`) use allow-listed node types and
+  immutable `pg_catalog` functions / operators / I/O coercions outside a denylist (`query_to_xml`
+  and the other SQL-text or run-time name functions), or a few stable built-ins
+  (`current_setting`, `now`…); others, and leaves / children of an RLS ancestor, are skipped
+  and reported as not covered;
+- every unit of work in `BEGIN TRANSACTION READ ONLY` with `SET LOCAL` `statement_timeout`
+  (clamped job parameter, never `0`), `lock_timeout` and `idle_in_transaction_session_timeout`;
+  `search_path = ''`, `pg_catalog`-qualified built-ins only, catalog identifiers quoted by one
+  function, no expression on sampled columns (binary values decoded in Rust);
+- transactions are committed before `FindingSink::submit().await`; a statement whose future is
+  dropped gets a cancel request; a sample stopped at its byte budget (32 MiB per relation,
+  checked per row) is cancelled, not drained, and the next object uses a new session;
+- server messages are reduced to a SQLSTATE and a stage; notices are discarded;
+- `check()`: reachability, audit level (Limited with `pg_stat_statements` and
+  `pg_read_all_stats`; Full is not reported before the audit log path exists, P4-A),
+  over-privilege and coverage (logged, summarized in the target detail).
+
+Target settings: the `postgres` block of a target in `agent.example.yaml`. Integration tests
+(`src/it.rs`) run against the dev environment or `dev/postgres/local-cluster.sh` when
+`DATABASTION_TEST_PG_URL` (and, for the ADR-0012 fixture probes,
+`DATABASTION_TEST_PG_ADMIN_URL`) is set, and are skipped otherwise:
+
+```sh
+eval "$(../dev/postgres/local-cluster.sh start)"   # or the dev/.env values with `make dev`
+cargo test -p databastion-connector-postgres -- --nocapture
+../dev/postgres/local-cluster.sh stop
+```
+
+### Future database drivers (mysql, mongodb, ldap3)
 Add them with `default-features = false` and rustls-only TLS features, and
 re-check `Cargo.lock` for OpenSSL. Every query gets a timeout and bounded
 sampling (I4). Driver errors can echo query text or values: map them to

@@ -1,0 +1,618 @@
+//! `check()`: reachability, honest audit level, over-privilege and
+//! coverage (ADR-0012 obligation 6).
+//!
+//! Audit level, per docs/08 and obligation 6, reporting only what can be
+//! proven without `pg_read_all_settings`:
+//! - **Limited**: `pg_stat_statements` is installed in a monitored database
+//!   and loaded (its `pg_stat_statements_info` view, a member of the
+//!   extension, answers), and the role sees other users' statements
+//!   (member of `pg_read_all_stats`, or superuser).
+//! - **Full** also needs pgaudit and a readable audit log file. The log
+//!   path is not configured before P4-A, so Full is never reported yet: a
+//!   loaded pgaudit is only mentioned in the detail.
+//! - **None** otherwise.
+//!
+//! Over-privilege (warned, not refused): superuser, `BYPASSRLS`,
+//! replication, `CREATEROLE` / `CREATEDB`, membership of any role but
+//! `pg_read_all_stats` (and `pg_read_all_data` / `pg_read_all_settings`
+//! with the extended-variant flag, then an expected warning), write-type
+//! privileges on user relations, `UPDATE` on sequences, ownership of
+//! objects. Coverage: schemas without `USAGE`, relations without
+//! `SELECT`, relations skipped for row-level security, and an enabled
+//! `login` event trigger (PostgreSQL 17+).
+//!
+//! The detailed report (privileges, coverage) is recomputed at most every
+//! [`REPORT_INTERVAL`] per database and logged when it changes; the
+//! reachability and the audit level are checked on every call.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use databastion_core::config::TargetConfig;
+use databastion_core::{AuditLevel, FailureCode, TargetHealth};
+
+use crate::catalog;
+use crate::conn::{Session, Timeouts};
+use crate::discover::normalize;
+use crate::error::{PgError, Stage};
+use crate::sql;
+
+/// Statement timeout of `check()` queries.
+const CHECK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound of a whole `check()` (the core allows 10 s).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
+/// Period of the detailed report.
+pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
+/// Most names listed per category in a log line.
+const MAX_LOGGED_NAMES: usize = 20;
+
+/// Audit prerequisites of one database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AuditProbe {
+    pub(crate) pss_installed: bool,
+    pub(crate) pss_loaded: bool,
+    pub(crate) stats_visible: bool,
+    pub(crate) pgaudit_installed: bool,
+    /// `pgaudit.log` is readable (pgaudit loaded) without
+    /// `pg_read_all_settings`: `Some(true)`; not loaded: `Some(false)`;
+    /// not readable: `None`.
+    pub(crate) pgaudit_loaded: Option<bool>,
+}
+
+impl AuditProbe {
+    pub(crate) fn level(&self) -> AuditLevel {
+        if self.pss_installed && self.pss_loaded && self.stats_visible {
+            AuditLevel::Limited
+        } else {
+            AuditLevel::None
+        }
+    }
+}
+
+/// Privileges and coverage of the role in one database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Report {
+    /// Closed labels (role attributes, predefined roles, counts).
+    pub(crate) over_privileged: Vec<String>,
+    /// Expected with the extended-variant flag.
+    pub(crate) expected: Vec<String>,
+    pub(crate) schemas_not_covered: Vec<String>,
+    pub(crate) coverage: catalog::Coverage,
+    pub(crate) login_event_trigger: bool,
+}
+
+/// Role attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RoleAttributes {
+    pub(crate) superuser: bool,
+    pub(crate) bypassrls: bool,
+    pub(crate) replication: bool,
+    pub(crate) createrole: bool,
+    pub(crate) createdb: bool,
+}
+
+/// Evaluates over-privilege (obligation 6). Returns (over-privileged,
+/// expected) labels.
+pub(crate) fn evaluate_privileges(
+    attrs: RoleAttributes,
+    memberships: &[(String, bool)],
+    write_relations: i64,
+    owned_objects: i64,
+    extended: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut over = Vec::new();
+    let mut expected = Vec::new();
+    for (flag, label) in [
+        (attrs.superuser, "superuser"),
+        (attrs.bypassrls, "bypassrls"),
+        (attrs.replication, "replication"),
+        (attrs.createrole, "createrole"),
+        (attrs.createdb, "createdb"),
+    ] {
+        if flag {
+            over.push(label.to_owned());
+        }
+    }
+    let mut other_roles = 0usize;
+    for (name, predefined) in memberships {
+        match (name.as_str(), predefined) {
+            ("pg_read_all_stats", true) => {}
+            ("pg_read_all_data" | "pg_read_all_settings", true) if extended => {
+                expected.push(format!("member of {name}"));
+            }
+            // Predefined role names are PostgreSQL constants.
+            (_, true) if name.starts_with("pg_") && name.len() <= 64 => {
+                over.push(format!("member of {name}"));
+            }
+            _ => other_roles += 1,
+        }
+    }
+    if other_roles > 0 {
+        over.push(format!("member of {other_roles} non-predefined role(s)"));
+    }
+    if write_relations > 0 {
+        over.push(format!("write privilege on {write_relations} relation(s)"));
+    }
+    if owned_objects > 0 {
+        over.push(format!("owner of {owned_objects} object(s)"));
+    }
+    (over, expected)
+}
+
+struct Cached {
+    at: Instant,
+    report: Report,
+}
+
+/// Per target and database: last detailed report.
+#[derive(Default)]
+pub(crate) struct CheckState {
+    reports: Mutex<HashMap<(String, String), Cached>>,
+}
+
+impl CheckState {
+    fn due(&self, key: &(String, String)) -> bool {
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .is_none_or(|c| c.at.elapsed() >= REPORT_INTERVAL)
+    }
+
+    /// Stores a report; `true` if it differs from the previous one.
+    fn store(&self, key: (String, String), report: Report) -> bool {
+        let mut map = self
+            .reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = map.get(&key).is_none_or(|c| c.report != report);
+        map.insert(
+            key,
+            Cached {
+                at: Instant::now(),
+                report,
+            },
+        );
+        changed
+    }
+
+    fn cached(&self, key: &(String, String)) -> Option<Report> {
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .map(|c| c.report.clone())
+    }
+}
+
+fn unreachable(e: &PgError) -> TargetHealth {
+    TargetHealth {
+        reachable: false,
+        audit_level: AuditLevel::None,
+        failure: Some(e.code),
+        detail: Some(format!(
+            "{} failed (SQLSTATE {})",
+            e.stage.as_str(),
+            e.sqlstate().unwrap_or("none")
+        )),
+    }
+}
+
+/// `check()` of a target.
+pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
+    match tokio::time::timeout(CHECK_TIMEOUT, check_inner(state, target)).await {
+        Ok(h) => h,
+        Err(_) => TargetHealth {
+            reachable: false,
+            audit_level: AuditLevel::None,
+            failure: Some(FailureCode::Timeout),
+            detail: Some("check timed out".to_owned()),
+        },
+    }
+}
+
+async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth {
+    let settings = target.postgres_settings();
+    let timeouts = Timeouts::new(CHECK_STATEMENT_TIMEOUT);
+    let mut level = AuditLevel::None;
+    let mut notes: Vec<String> = Vec::new();
+    if settings.tls == databastion_core::config::PgTlsMode::DisableInsecure {
+        notes.push(
+            "INSECURE: TLS disabled on a network connection (tls: disable_insecure): traffic \
+             in clear, read-only not guaranteed"
+                .to_owned(),
+        );
+    }
+    for database in &settings.databases {
+        let session = match Session::connect(target, database, timeouts).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    stage = e.stage.as_str(),
+                    sqlstate = e.sqlstate(),
+                    code = %e.code,
+                    "target check failed"
+                );
+                return unreachable(&e);
+            }
+        };
+        let probe = match audit_probe(&session, timeouts).await {
+            Ok(p) => p,
+            Err(e) => return unreachable(&e),
+        };
+        level = level.max(probe.level());
+        if probe.pgaudit_installed || probe.pgaudit_loaded == Some(true) {
+            notes.push(
+                "pgaudit present; Full needs a readable audit log (log path not configured)"
+                    .to_owned(),
+            );
+        }
+        let key = (target.id.clone(), database.clone());
+        if state.due(&key) {
+            match report(&session, timeouts, settings.extended_grants).await {
+                Ok(r) => {
+                    if state.store(key.clone(), r.clone()) {
+                        log_report(target, database, &r);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    stage = e.stage.as_str(),
+                    sqlstate = e.sqlstate(),
+                    "privilege report failed"
+                ),
+            }
+        }
+        if let Some(r) = state.cached(&key) {
+            notes.extend(summary(&r));
+        }
+    }
+    notes.sort();
+    notes.dedup();
+    TargetHealth {
+        reachable: true,
+        audit_level: level,
+        failure: None,
+        detail: Some(format!(
+            "audit level {level:?}{}{}",
+            if notes.is_empty() { "" } else { "; " },
+            notes.join("; ")
+        )),
+    }
+}
+
+fn summary(r: &Report) -> Vec<String> {
+    let mut out = Vec::new();
+    if !r.over_privileged.is_empty() {
+        out.push(format!("over-privileged: {}", r.over_privileged.join(", ")));
+    }
+    if !r.expected.is_empty() {
+        out.push(format!("extended variant: {}", r.expected.join(", ")));
+    }
+    let c = &r.coverage;
+    if !r.schemas_not_covered.is_empty() || c.not_covered() > 0 {
+        out.push(format!(
+            "not covered: {} schema(s) without USAGE, {} relation(s) without SELECT, {} \
+             relation(s) skipped for row-level security",
+            r.schemas_not_covered.len(),
+            c.not_readable.len(),
+            c.rls_policy.len() + c.rls_ancestor.len()
+        ));
+    }
+    if r.login_event_trigger {
+        out.push("an enabled login event trigger runs user code at connection".to_owned());
+    }
+    out
+}
+
+fn log_report(target: &TargetConfig, database: &str, r: &Report) {
+    let db = normalize(database);
+    if r.over_privileged.is_empty() {
+        tracing::info!(target_id = %target.id, database = db.as_str(), "role privileges match ADR-0012");
+    } else {
+        tracing::warn!(
+            target_id = %target.id,
+            database = db.as_str(),
+            over_privileged = r.over_privileged.join(", "),
+            "the agent role is over-privileged (ADR-0012)"
+        );
+    }
+    if !r.expected.is_empty() {
+        tracing::warn!(
+            target_id = %target.id,
+            database = db.as_str(),
+            memberships = r.expected.join(", "),
+            "extended grant variant: catalog tables with credentials are readable by the agent \
+             role (the connector never reads them)"
+        );
+    }
+    let names = |v: &mut dyn Iterator<Item = String>| -> String {
+        v.take(MAX_LOGGED_NAMES).collect::<Vec<_>>().join(", ")
+    };
+    if !r.schemas_not_covered.is_empty() {
+        tracing::warn!(
+            target_id = %target.id,
+            database = db.as_str(),
+            count = r.schemas_not_covered.len(),
+            schemas = names(&mut r.schemas_not_covered.iter().map(|s| normalize(s).as_str().to_owned())),
+            "schemas without USAGE are not covered by Discovery"
+        );
+    }
+    let c = &r.coverage;
+    for (reason, list) in [
+        ("no SELECT privilege", &c.not_readable),
+        (
+            "row-level security policy with user code or another relation",
+            &c.rls_policy,
+        ),
+        ("row-level security on an ancestor", &c.rls_ancestor),
+    ] {
+        if !list.is_empty() {
+            tracing::warn!(
+                target_id = %target.id,
+                database = db.as_str(),
+                count = list.len(),
+                reason,
+                objects = names(&mut list.iter().map(|(s, n)| {
+                    format!("{}.{}", normalize(s).as_str(), normalize(n).as_str())
+                })),
+                "relations not covered by Discovery"
+            );
+        }
+    }
+    if r.login_event_trigger {
+        tracing::warn!(
+            target_id = %target.id,
+            database = db.as_str(),
+            "an enabled login event trigger runs user code when the agent connects"
+        );
+    }
+}
+
+/// Runs one statement in its own read-only transaction (a failing probe
+/// does not abort the others).
+async fn probe(
+    session: &Session,
+    timeouts: Timeouts,
+    statement: &str,
+) -> Result<Vec<tokio_postgres::Row>, PgError> {
+    let tx = session.begin(timeouts).await?;
+    match tx.query(Stage::Check, statement, &[]).await {
+        Ok(rows) => {
+            tx.commit().await?;
+            Ok(rows)
+        }
+        Err(e) => {
+            tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+fn col<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a tokio_postgres::Row,
+    i: usize,
+) -> Result<T, PgError> {
+    row.try_get(i)
+        .map_err(|e| PgError::from_driver(&e, Stage::Check))
+}
+
+pub(crate) async fn audit_probe(
+    session: &Session,
+    timeouts: Timeouts,
+) -> Result<AuditProbe, PgError> {
+    let rows = probe(session, timeouts, sql::AUDIT_PREREQUISITES).await?;
+    let row = rows
+        .first()
+        .ok_or(PgError::new(FailureCode::Internal, Stage::Check))?;
+    let mut p = AuditProbe {
+        pss_installed: col(row, 0)?,
+        pgaudit_installed: col(row, 1)?,
+        stats_visible: col(row, 3)?,
+        ..AuditProbe::default()
+    };
+    let info_schema: Option<String> = col(row, 2)?;
+    let superuser = probe(session, timeouts, sql::ROLE_ATTRIBUTES)
+        .await?
+        .first()
+        .map(|r| col::<bool>(r, 0))
+        .transpose()?
+        .unwrap_or(false);
+    p.stats_visible |= superuser;
+    if let Some(statement) = info_schema.as_deref().and_then(sql::pss_probe) {
+        p.pss_loaded = match probe(session, timeouts, &statement).await {
+            Ok(_) => true,
+            Err(e) if e.fatal => return Err(e),
+            Err(_) => false,
+        };
+    }
+    // ADR-0012 open question: is `pgaudit.log` readable without
+    // `pg_read_all_settings`? `NULL` when pgaudit is not loaded.
+    p.pgaudit_loaded = match probe(session, timeouts, sql::PGAUDIT_LOG).await {
+        Ok(rows) => Some(
+            rows.first()
+                .map(|r| col::<Option<String>>(r, 0))
+                .transpose()?
+                .flatten()
+                .is_some(),
+        ),
+        Err(e) if e.fatal => return Err(e),
+        Err(_) => None,
+    };
+    Ok(p)
+}
+
+async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result<Report, PgError> {
+    let attrs = probe(session, timeouts, sql::ROLE_ATTRIBUTES)
+        .await?
+        .first()
+        .map(|r| -> Result<RoleAttributes, PgError> {
+            Ok(RoleAttributes {
+                superuser: col(r, 0)?,
+                bypassrls: col(r, 1)?,
+                replication: col(r, 2)?,
+                createrole: col(r, 3)?,
+                createdb: col(r, 4)?,
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut memberships = Vec::new();
+    for r in probe(session, timeouts, sql::MEMBERSHIPS).await? {
+        let name = crate::wire::catalog_text(&r, 0)
+            .map_err(|e| PgError::from_driver(&e, Stage::Check))?
+            // Not UTF-8: counted as a non-predefined role.
+            .unwrap_or_default();
+        memberships.push((name, col::<bool>(&r, 1)?));
+    }
+    let count = |rows: Vec<tokio_postgres::Row>| -> Result<i64, PgError> {
+        rows.first()
+            .map(|r| col::<i64>(r, 0))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let pg17 = session.server_version_num() >= 170_000;
+    let writes = count(probe(session, timeouts, &sql::write_privileges(pg17)).await?)?;
+    let owned = count(probe(session, timeouts, sql::OWNERSHIP).await?)?;
+    let login_event_trigger =
+        pg17 && count(probe(session, timeouts, sql::LOGIN_EVENT_TRIGGERS).await?)? > 0;
+    let mut schemas_not_covered = Vec::new();
+    for r in probe(session, timeouts, sql::SCHEMAS_WITHOUT_USAGE).await? {
+        schemas_not_covered.push(
+            crate::wire::catalog_text(&r, 0)
+                .map_err(|e| PgError::from_driver(&e, Stage::Check))?
+                .unwrap_or_else(|| "*".to_owned()),
+        );
+    }
+    let relations = {
+        let tx = session.begin(timeouts).await?;
+        match catalog::introspect(&tx).await {
+            Ok(r) => {
+                tx.commit().await?;
+                r
+            }
+            Err(e) => {
+                tx.rollback().await;
+                return Err(e);
+            }
+        }
+    };
+    let (_, coverage) = catalog::plan(&relations, |_, _| true);
+    let (over_privileged, expected) =
+        evaluate_privileges(attrs, &memberships, writes, owned, extended);
+    Ok(Report {
+        over_privileged,
+        expected,
+        schemas_not_covered,
+        coverage,
+        login_event_trigger,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(name: &str) -> (String, bool) {
+        (name.to_owned(), true)
+    }
+
+    #[test]
+    fn minimal_variant_is_not_over_privileged() {
+        let (over, expected) = evaluate_privileges(
+            RoleAttributes::default(),
+            &[m("pg_read_all_stats")],
+            0,
+            0,
+            false,
+        );
+        assert!(over.is_empty() && expected.is_empty(), "{over:?}");
+    }
+
+    #[test]
+    fn over_privileges_are_reported() {
+        let attrs = RoleAttributes {
+            superuser: true,
+            bypassrls: true,
+            ..RoleAttributes::default()
+        };
+        let (over, _) = evaluate_privileges(
+            attrs,
+            &[
+                m("pg_monitor"),
+                m("pg_read_all_data"),
+                m("pg_write_all_data"),
+                m("pg_read_server_files"),
+                ("app_owner".to_owned(), false),
+            ],
+            3,
+            1,
+            false,
+        );
+        for label in [
+            "superuser",
+            "bypassrls",
+            "member of pg_monitor",
+            "member of pg_read_all_data",
+            "member of pg_write_all_data",
+            "member of pg_read_server_files",
+            "member of 1 non-predefined role(s)",
+            "write privilege on 3 relation(s)",
+            "owner of 1 object(s)",
+        ] {
+            assert!(over.iter().any(|o| o == label), "{label}: {over:?}");
+        }
+        // A non-predefined role name is never echoed.
+        assert!(!over.iter().any(|o| o.contains("app_owner")));
+    }
+
+    #[test]
+    fn extended_variant_is_an_expected_warning() {
+        let memberships = [
+            m("pg_read_all_data"),
+            m("pg_read_all_settings"),
+            m("pg_read_all_stats"),
+        ];
+        let (over, expected) =
+            evaluate_privileges(RoleAttributes::default(), &memberships, 0, 0, true);
+        assert!(over.is_empty(), "{over:?}");
+        assert_eq!(expected.len(), 2);
+        let (over, expected) =
+            evaluate_privileges(RoleAttributes::default(), &memberships, 0, 0, false);
+        assert_eq!(over.len(), 2);
+        assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn audit_level_is_proven_not_assumed() {
+        let full_prereqs = AuditProbe {
+            pss_installed: true,
+            pss_loaded: true,
+            stats_visible: true,
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+        };
+        // Full needs the audit log, which cannot be checked yet.
+        assert_eq!(full_prereqs.level(), AuditLevel::Limited);
+        for p in [
+            AuditProbe {
+                pss_loaded: false,
+                ..full_prereqs.clone()
+            },
+            AuditProbe {
+                stats_visible: false,
+                ..full_prereqs.clone()
+            },
+            AuditProbe {
+                pss_installed: false,
+                ..full_prereqs.clone()
+            },
+        ] {
+            assert_eq!(p.level(), AuditLevel::None);
+        }
+    }
+}

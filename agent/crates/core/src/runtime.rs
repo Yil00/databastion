@@ -554,10 +554,12 @@ impl Runtime {
                 .find(|c| c.engine() == target.engine.connector());
             let (reachable, level, last_error) = match connector {
                 None => (false, AuditLevel::None, Some(FailureCode::Unsupported)),
-                Some(c) => match tokio::time::timeout(Duration::from_secs(10), c.check()).await {
-                    Ok(h) => (h.reachable, h.audit_level, h.failure),
-                    Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
-                },
+                Some(c) => {
+                    match tokio::time::timeout(Duration::from_secs(10), c.check(target)).await {
+                        Ok(h) => (h.reachable, h.audit_level, h.failure),
+                        Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
+                    }
+                }
             };
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
@@ -1547,6 +1549,15 @@ impl Runtime {
                     Some(Ok(())) => Outcome::SUCCEEDED,
                     Some(Err(crate::ConnectorError::NotImplemented { .. })) => {
                         Outcome::failed(FailureCode::Unsupported)
+                    }
+                    Some(Err(crate::ConnectorError::Target { code, engine_code, .. })) => {
+                        tracing::warn!(
+                            job_id = %id,
+                            code = %code,
+                            engine_code = engine_code.as_deref(),
+                            "scan failed"
+                        );
+                        Outcome::failed(code)
                     }
                     Some(Err(e)) => {
                         tracing::warn!(job_id = %id, error = %e, "scan failed");

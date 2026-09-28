@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::engine::{Engine, TargetHealth};
+use crate::config::TargetConfig;
+use crate::engine::{Engine, FailureCode, TargetHealth};
 pub use crate::job::{AuditConfig, ScanJob};
 use crate::sink::{EventSink, FindingSink, SinkClosed};
 
@@ -23,6 +24,19 @@ pub enum ConnectorError {
     /// The core stopped consuming results.
     #[error(transparent)]
     SinkClosed(#[from] SinkClosed),
+    /// The target failed the operation. Reported to the console as `code`
+    /// only; `engine_code` is the engine's error code (e.g. a SQLSTATE),
+    /// never its message, detail or context text (ADR-0012 obligation 7).
+    #[error("{engine}: target error {code} (engine code {engine_code:?})")]
+    Target {
+        /// Engine of the connector.
+        engine: Engine,
+        /// Closed failure cause.
+        code: FailureCode,
+        /// Engine error code: `[A-Za-z0-9_]{1,16}` only (contract
+        /// `EngineCode`), e.g. a SQLSTATE.
+        engine_code: Option<String>,
+    },
 }
 
 /// Common interface of every engine connector.
@@ -39,10 +53,10 @@ pub trait Connector: Send + Sync {
     /// Engine handled by this connector.
     fn engine(&self) -> Engine;
 
-    /// Reachability and audit level actually available on the target. A
-    /// degraded audit level (e.g. PostgreSQL without pgaudit) is reported as
-    /// such.
-    async fn check(&self) -> TargetHealth;
+    /// Reachability and audit level actually available on `target` (one
+    /// connector serves every declared target of its engine). A degraded
+    /// audit level (e.g. PostgreSQL without pgaudit) is reported as such.
+    async fn check(&self, target: &TargetConfig) -> TargetHealth;
 
     /// Runs a Discovery scan on `job.target()` and pushes masked findings
     /// into `sink`.
@@ -57,12 +71,11 @@ pub trait Connector: Send + Sync {
     /// The core stops the scan after `job.max_duration()`, or when the
     /// agent is suspended or revoked, by dropping this future.
     ///
-    /// TODO(P2-B / P2-C, security review L6): dropping the future does not
-    /// stop a statement already running on the server. Connectors must also
-    /// cancel it server-side on drop (PostgreSQL `CancelRequest` /
-    /// `pg_cancel_backend` through the client's cancel token, MySQL
-    /// `KILL QUERY` on a separate connection) and rely on the statement
-    /// timeout as the last bound.
+    /// Dropping the future does not by itself stop a statement already
+    /// running on the server: connectors cancel it server-side on drop
+    /// (PostgreSQL: a cancel request through the client's cancel token;
+    /// MySQL: `KILL QUERY` on a separate connection, P2-C) and rely on the
+    /// statement timeout as the last bound.
     async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError>;
 
     /// Streams normalized access events into `sink` until stopped.
@@ -83,7 +96,7 @@ mod tests {
             Engine::Postgres
         }
 
-        async fn check(&self) -> TargetHealth {
+        async fn check(&self, _: &TargetConfig) -> TargetHealth {
             TargetHealth::not_implemented(self.engine())
         }
 
@@ -106,7 +119,11 @@ mod tests {
     async fn connector_is_dyn_compatible() {
         let connectors: Vec<Box<dyn Connector>> = vec![Box::new(Dummy)];
         for connector in &connectors {
-            assert_eq!(connector.check().await.audit_level, AuditLevel::None);
+            let target: TargetConfig = serde_yaml_ng::from_str(
+                "{id: pg, engine: postgres, host: db, account: a, secret: {env: PW}}",
+            )
+            .unwrap();
+            assert_eq!(connector.check(&target).await.audit_level, AuditLevel::None);
         }
     }
 

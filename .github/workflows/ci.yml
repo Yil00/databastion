@@ -220,10 +220,59 @@ jobs:
           npm test
 
   # Single status check required by branch protection.
+  # PostgreSQL connector integration tests (P2-B) against the dev image (dev/postgres: PostgreSQL
+  # 17 + pgaudit, seed, agent role with the ADR-0012 minimal grants), so that the pgaudit probe of
+  # ADR-0012 runs. Dev-only credentials from dev/.env.example; the server listens on 127.0.0.1.
+  agent-pg:
+    name: Agent PostgreSQL integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev PostgreSQL service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 postgres
+      # DATABASTION_TEST_REQUIRE turns the listed skips into failures: each run must exercise
+      # what only its server provides (pgaudit in the dev image; TLS with a pinned CA and the
+      # md5 / cleartext refusal on the local cluster).
+      - name: Connector integration tests (dev image, pgaudit)
+        working-directory: agent
+        run: |
+          set -a; . ../dev/.env; set +a
+          export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
+          export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit
+          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
+      - name: Connector integration tests (local cluster, TLS and weak authentication)
+        run: |
+          if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends postgresql
+          fi
+          eval "$(dev/postgres/local-cluster.sh start)"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls
+          (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
+          dev/postgres/local-cluster.sh stop
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 postgres
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, protocol]
+    needs: [detect, docs, secrets, console, agent, agent-pg, protocol]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

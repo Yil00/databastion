@@ -134,6 +134,29 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Reads a private file of at most `max` bytes into a zeroizing buffer
+/// allocated once (no reallocation leaves unzeroized copies of a secret).
+/// A larger file is refused.
+pub(crate) fn read_private_secret(
+    path: &Path,
+    max: usize,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let file = open_private(path)?;
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    if len > max {
+        return Err(denied("secret file is too large"));
+    }
+    // One more byte than allowed, to detect a file that grew meanwhile.
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(max + 1));
+    let n = file
+        .take(u64::try_from(max + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut out)?;
+    if n > max {
+        return Err(denied("secret file is too large"));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) mod test_dir {
     use std::path::{Path, PathBuf};
