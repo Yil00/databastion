@@ -1,8 +1,8 @@
 name: Release
 
-# Au merge d'une PR vers main (dev → main ou hotfix/* → main) :
-# calcule la version, génère le CHANGELOG, pose le tag, crée une release GitHub en brouillon,
-# puis publie les images. Ajouter [skip-release] au titre de la PR pour ne rien publier.
+# When a PR is merged into main (dev → main or hotfix/* → main):
+# computes the version, generates the CHANGELOG, creates the tag, creates a draft GitHub release,
+# then publishes the images. Add [skip-release] to the PR title to publish nothing.
 
 on:
   pull_request:
@@ -26,12 +26,12 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Vérifier le jeton de release
+      - name: Check release token
         env:
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           if [ -z "$RELEASE_TOKEN" ]; then
-            echo "::error::Secret RELEASE_TOKEN absent : voir RELEASE.md, section « Configuration du dépôt »."
+            echo "::error::RELEASE_TOKEN secret missing: see RELEASE.md, 'Repository configuration' section."
             exit 1
           fi
 
@@ -48,15 +48,15 @@ jobs:
 
       - run: npm ci --ignore-scripts
 
-      - name: Rust (pour mettre à jour agent/Cargo.lock)
+      - name: Rust (to update agent/Cargo.lock)
         if: hashFiles('agent/Cargo.lock') != ''
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
-      # Le commit de release porte l'identité noreply du propriétaire du dépôt :
-      # aucun compte bot n'apparaît parmi les contributeurs.
-      - name: Identité git
+      # The release commit carries the repository owner's noreply identity:
+      # no bot account appears among the contributors.
+      - name: Git identity
         env:
           GIT_NAME: ${{ vars.RELEASE_GIT_NAME || github.repository_owner }}
           GIT_EMAIL: ${{ vars.RELEASE_GIT_EMAIL || format('{0}+{1}@users.noreply.github.com', github.repository_owner_id, github.repository_owner) }}
@@ -70,12 +70,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           VERSION=$(npx release-it --ci --release-version)
-          echo "Version calculée : $VERSION"
+          echo "Computed version: $VERSION"
           npx release-it --ci
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publication des images
+    name: Publish images
     needs: release
     uses: ./.github/workflows/publish.yml
     with:

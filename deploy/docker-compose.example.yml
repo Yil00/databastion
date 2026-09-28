@@ -1,8 +1,8 @@
-# Exemple de docker-compose pour DataBastion (MVP)
-# À adapter selon l'implémentation réelle. Images publiées sur GHCR (voir RELEASE.md).
+# Example docker-compose for DataBastion (MVP)
+# Adapt to the actual implementation. Images are published on GHCR (see RELEASE.md).
 #
-# Seule la console expose un port, et elle doit être placée derrière un
-# reverse-proxy HTTPS. Les agents n'exposent AUCUN port (outbound only).
+# Only the console exposes a port, and it must be placed behind an
+# HTTPS reverse proxy. Agents expose NO port (outbound-only).
 
 name: databastion
 
@@ -12,7 +12,7 @@ services:
     command: ["web"]
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:3000"   # à publier via le reverse-proxy HTTPS
+      - "127.0.0.1:8080:3000"   # to be published through the HTTPS reverse proxy
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
@@ -30,7 +30,7 @@ services:
 
   worker:
     image: ghcr.io/yil00/databastion-console:latest
-    command: ["worker"]          # politiques, corrélation, alerting
+    command: ["worker"]          # policies, correlation, alerting
     restart: unless-stopped
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
@@ -56,7 +56,7 @@ services:
     secrets: [db_password]
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    # Pas de "ports:" : la base interne n'est jamais exposée.
+    # No "ports:": the internal database is never exposed.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U databastion -d databastion"]
       interval: 10s
@@ -67,7 +67,7 @@ secrets:
   db_password:
     file: ./secrets/db_password
   db_url:
-    file: ./secrets/db_url            # postgresql://databastion:<mdp>@db:5432/databastion
+    file: ./secrets/db_url            # postgresql://databastion:<password>@db:5432/databastion
   encryption_key:
     file: ./secrets/encryption_key    # openssl rand -base64 32
 
@@ -75,19 +75,19 @@ volumes:
   postgres-data:
 
 # ---------------------------------------------------------------------------
-# Exemple d'agent : à déployer sur l'hôte / le réseau des bases surveillées,
-# PAS avec la console. Aucun port exposé.
+# Agent example: deploy on the host / network of the monitored databases,
+# NOT alongside the console. No port exposed.
 #
 #  agent:
 #    image: ghcr.io/yil00/databastion-agent:latest
 #    restart: unless-stopped
 #    environment:
 #      DATABASTION_CONSOLE_URL: https://databastion.example.com
-#      DATABASTION_ENROLLMENT_TOKEN_FILE: /run/secrets/enrollment_token  # usage unique
+#      DATABASTION_ENROLLMENT_TOKEN_FILE: /run/secrets/enrollment_token  # single use
 #    volumes:
-#      - ./agent.yaml:/etc/databastion/agent.yaml:ro     # cibles + réf. aux secrets
-#      - agent-state:/var/lib/databastion                # identité, clé HMAC, spool
-#      - /var/log/postgresql:/logs/postgresql:ro         # journaux natifs (Audit)
+#      - ./agent.yaml:/etc/databastion/agent.yaml:ro     # targets + secret refs
+#      - agent-state:/var/lib/databastion                # identity, HMAC key, spool
+#      - /var/log/postgresql:/logs/postgresql:ro         # native logs (Audit)
 #    secrets: [enrollment_token, pg_password]
 #    user: "10001:10001"
 #    read_only: true

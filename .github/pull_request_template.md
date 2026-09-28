@@ -1,20 +1,20 @@
-## Résumé
-<!-- Ce que fait cette PR, en deux ou trois phrases. Titre au format Conventional Commits : feat(agent): … -->
+## Summary
+<!-- What this PR does, in two or three sentences. Title in Conventional Commits format: feat(agent): … -->
 
-## Tâche ROADMAP
-<!-- ex. P2-B -->
+## ROADMAP task
+<!-- e.g. P2-B -->
 
-## Compte rendu
-- **Fait :**
-- **Pas fait (et pourquoi) :**
-- **Décisions qui mériteraient un ADR :**
-- **Fichiers d'autres propriétaires à modifier :**
+## Task report
+- **Done:**
+- **Not done (and why):**
+- **Decisions that would warrant an ADR:**
+- **Files from other owners to modify:**
 
 ## Invariants
-- [ ] Cette PR touche au réseau, aux données échantillonnées, au protocole ou aux secrets → invariants I1–I7 vérifiés et revue `security-reviewer` faite
-- [ ] Sinon : non concernée
+- [ ] This PR touches the network, sampled data, the protocol or secrets → invariants I1–I7 checked and `security-reviewer` review done
+- [ ] Otherwise: not applicable
 
 ## Checklist
-- [ ] Lint et tests verts pour le composant touché
-- [ ] Documentation et ROADMAP à jour
-- [ ] Commits signés DCO (`git commit -s`)
+- [ ] Lint and tests green for the affected component
+- [ ] Documentation and ROADMAP up to date
+- [ ] DCO-signed commits (`git commit -s`)
