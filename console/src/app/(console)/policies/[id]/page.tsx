@@ -8,6 +8,7 @@ import { PolicyForm } from "@/components/console/policy-form";
 import { SeverityBadge } from "@/components/console/incidents-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
+import { channelStates, listChannels } from "@/server/channels";
 import { getPolicy, listExceptions } from "@/server/policies";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -24,6 +25,9 @@ export default async function PolicyPage({ params }: { params: Promise<{ id: str
   const [policy, exceptions] = await Promise.all([getPolicy(db, id), listExceptions(db, id)]);
   if (!policy) notFound();
   const isAdmin = session.user.role === "admin";
+  const [states, channelRows] = await Promise.all([channelStates(db, policy.notifyChannels), isAdmin ? listChannels(db) : []]);
+  const channels = channelRows.map((c) => ({ slug: c.slug, enabled: c.enabled }));
+  const broken = policy.notifyChannels.filter((c) => states[c] !== "ok");
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-wrap items-start gap-3">
@@ -61,6 +65,12 @@ export default async function PolicyPage({ params }: { params: Promise<{ id: str
             open an incident of severity <SeverityBadge severity={policy.severity} />
             {policy.notifyChannels.length > 0 ? ` and notify ${policy.notifyChannels.join(", ")}` : ""}.
           </p>
+          {broken.length > 0 && (
+            <p role="alert" className="text-sm text-destructive">
+              {broken.map((c) => `${c}: ${states[c] === "disabled" ? "channel disabled" : "no such channel"}`).join("; ")}. Incidents
+              are still opened; these notifications are recorded as skipped.
+            </p>
+          )}
           <Link className="hover:underline" prefetch={false} href={incidentsHref({ status: "all" })}>
             See the incidents
           </Link>
@@ -81,7 +91,7 @@ export default async function PolicyPage({ params }: { params: Promise<{ id: str
             <CardTitle>Edit</CardTitle>
           </CardHeader>
           <CardContent>
-            <PolicyForm csrfToken={session.csrfToken} policyId={policy.id} initial={policyFormValues(policy)} />
+            <PolicyForm csrfToken={session.csrfToken} policyId={policy.id} initial={policyFormValues(policy)} channels={channels} />
           </CardContent>
         </Card>
       )}

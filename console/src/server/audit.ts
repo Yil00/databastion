@@ -35,6 +35,13 @@ export type AuditAction =
   | "policy_exception.delete"
   | "incident.create"
   | "incident.transition"
+  | "notification_channel.create"
+  | "notification_channel.update"
+  | "notification_channel.delete"
+  | "notification_channel.rotate_signing_key"
+  | "notification_channel.test"
+  | "agent.silent"
+  | "agent.recovered"
   | "job.timeout"
   | "user.access_denied";
 

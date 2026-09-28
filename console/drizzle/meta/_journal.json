@@ -127,6 +127,20 @@
       "when": 1790625436847,
       "tag": "0017_jobs_first_delivered_at",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790626026745,
+      "tag": "0018_p3c_alerting",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790626036835,
+      "tag": "0019_notification_deliveries_grants",
+      "breakpoints": true
     }
   ]
 }

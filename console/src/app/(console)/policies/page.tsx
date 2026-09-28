@@ -3,6 +3,7 @@ import { ExceptionForm } from "@/components/console/policy-actions";
 import { PolicyForm } from "@/components/console/policy-form";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
+import { listChannels } from "@/server/channels";
 import { listExceptions, listPolicies } from "@/server/policies";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -16,7 +17,8 @@ export default async function PoliciesPage() {
   const session = await requirePageSession();
   const isAdmin = session.user.role === "admin";
   const db = getDb();
-  const [rows, exceptions] = await Promise.all([listPolicies(db), listExceptions(db)]);
+  const [rows, exceptions, channelRows] = await Promise.all([listPolicies(db), listExceptions(db), isAdmin ? listChannels(db) : []]);
+  const channels = channelRows.map((c) => ({ slug: c.slug, enabled: c.enabled }));
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold tracking-tight">Policies</h1>
@@ -50,7 +52,7 @@ export default async function PoliciesPage() {
             <CardTitle>New policy</CardTitle>
           </CardHeader>
           <CardContent>
-            <PolicyForm csrfToken={session.csrfToken} />
+            <PolicyForm csrfToken={session.csrfToken} channels={channels} />
           </CardContent>
         </Card>
       ) : (

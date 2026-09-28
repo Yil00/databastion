@@ -12,13 +12,17 @@ import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { startupErrors, startupFatal } from "@/server/startup-checks";
 
 import { getDb } from "@/db/client";
+import { alertingWarnings } from "@/server/alerting-config";
+import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 
 import {
   createNoopHandler,
   NOOP_QUEUE,
   pgBossOptions,
+  registerNotificationQueue,
   registerPolicyQueue,
+  scheduleNotificationQueue,
   schedulePolicyQueue,
   type NoopPayload,
 } from "./queues";
@@ -31,6 +35,7 @@ async function main(): Promise<void> {
   const fatal = startupFatal();
   if (fatal !== null) throw new Error(fatal);
   for (const message of startupErrors()) log.error(message);
+  for (const warning of alertingWarnings()) log.warn(warning);
 
   const boss = new PgBoss(pgBossOptions(getDatabaseUrl()));
 
@@ -70,8 +75,11 @@ async function main(): Promise<void> {
   await boss.work<NoopPayload>(NOOP_QUEUE, createNoopHandler(log));
   await registerPolicyQueue(boss, getDb, log);
   await schedulePolicyQueue(boss);
+  // P3-C: notification delivery (outbound webhooks / SMTP happen in the worker only).
+  await registerNotificationQueue(boss, getDb, log);
+  await scheduleNotificationQueue(boss);
 
-  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE] }, "worker started");
+  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE] }, "worker started");
 }
 
 main().catch((err: unknown) => {

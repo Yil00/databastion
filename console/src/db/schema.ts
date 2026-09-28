@@ -30,7 +30,8 @@ import {
  * - agent-provided strings stored here (hostname, target ids, versions) are bounded by the protocol
  *   schema and are escaped on display;
  * - AES-256-GCM encryption at rest (`DATABASTION_ENCRYPTION_KEY`, HKDF subkey per domain):
- *   `findings.masked_samples` (P2-D, domain `masked-samples.v1`), later webhook / SMTP settings.
+ *   `findings.masked_samples` (P2-D, domain `masked-samples.v1`), `notification_channels.secret`
+ *   (P3-C, domain `notification-channels.v1`: SMTP password, webhook signing secret).
  */
 
 const tsz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
@@ -139,6 +140,12 @@ export const agents = pgTable(
      */
     knownGoodPendingFingerprint: text("known_good_pending_fingerprint"),
     lockedAt: tsz("locked_at"),
+    /**
+     * P3-C "silent agent" alert: `last_seen_at` of the silence episode already alerted (one alert
+     * per episode). Set by the worker when it raises the alert, cleared when a later heartbeat ends
+     * the episode (recovery).
+     */
+    silenceAlertedFor: tsz("silence_alerted_for"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),
   },
@@ -517,5 +524,90 @@ export const incidents = pgTable(
     index("incidents_finding_idx").on(t.findingId),
     check("incidents_policy_name_len", sql`char_length(${t.policyName}) between 1 and 100`),
     check("incidents_match_count", sql`${t.matchCount} >= 1`),
+  ],
+);
+
+// --------------------------------------------------------------- alerting (P3-C)
+
+export const notificationChannelType = pgEnum("notification_channel_type", ["email", "webhook"]);
+
+/**
+ * Notification channels, referenced by `slug` from the policies' `notify` actions (copied to
+ * `incidents.notify_channels`). `config` holds the non-secret settings only (SMTP host, port, TLS
+ * mode, sender, recipients, username; webhook URL), validated by `src/lib/notification-model.ts`.
+ * `secret` is the only secret (SMTP password or webhook signing secret): AES-256-GCM under the
+ * subkey `notification-channels.v1`, AAD bound to the channel id; never returned by the API.
+ * `system_alerts`: the channel also receives the console's own alerts (silent agents,
+ * agent-integrity events).
+ */
+export const notificationChannels = pgTable(
+  "notification_channels",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull(),
+    type: notificationChannelType("type").notNull(),
+    enabled: boolean("enabled").notNull().default(true),
+    systemAlerts: boolean("system_alerts").notNull().default(false),
+    config: jsonb("config").$type<Record<string, unknown>>().notNull(),
+    secret: bytea("secret"),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedAt: tsz("updated_at").notNull().defaultNow(),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [
+    uniqueIndex("notification_channels_slug_key").on(t.slug),
+    check("notification_channels_slug_format", sql`${t.slug} ~ '^[a-z0-9][a-z0-9_.-]{0,62}$'`),
+  ],
+);
+
+export const notificationDeliveryStatus = pgEnum("notification_delivery_status", [
+  "pending",
+  "sending",
+  "delivered",
+  "failed",
+  "skipped",
+]);
+
+/**
+ * Transactional outbox of notifications. A row is written in the same transaction as the event it
+ * reports (incident creation, silent agent, agent-integrity event), one per (subject, event,
+ * channel): `idempotency_key` is unique, so a retried evaluation never notifies twice. The worker
+ * claims due rows (`SKIP LOCKED`, lease), sends them and records the outcome: attempts, next
+ * attempt (exponential backoff, capped), `last_error` (a closed error code, never a server
+ * response). `payload` holds identifiers, counts, names and the console URL only: never a sampled
+ * value, masked or not (I2). The runtime role cannot delete rows nor rewrite the key, subject or
+ * payload (migration 0019).
+ */
+export const notificationDeliveries = pgTable(
+  "notification_deliveries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    event: text("event").notNull(),
+    channelId: uuid("channel_id").references(() => notificationChannels.id, { onDelete: "set null" }),
+    /** Slug as referenced (kept when the channel is deleted or was never found). */
+    channelSlug: text("channel_slug").notNull(),
+    incidentId: uuid("incident_id").references(() => incidents.id, { onDelete: "set null" }),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
+    securityEventId: uuid("security_event_id").references(() => securityEvents.id, { onDelete: "set null" }),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    status: notificationDeliveryStatus("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: tsz("next_attempt_at").notNull().defaultNow(),
+    leaseUntil: tsz("lease_until"),
+    lastAttemptAt: tsz("last_attempt_at"),
+    deliveredAt: tsz("delivered_at"),
+    lastError: text("last_error"),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("notification_deliveries_idempotency_key").on(t.idempotencyKey),
+    index("notification_deliveries_due_idx")
+      .on(t.nextAttemptAt)
+      .where(sql`${t.status} in ('pending', 'sending')`),
+    index("notification_deliveries_incident_idx").on(t.incidentId),
+    check("notification_deliveries_attempts", sql`${t.attempts} >= 0`),
+    check("notification_deliveries_last_error_format", sql`${t.lastError} ~ '^[a-z0-9_]{1,64}$'`),
   ],
 );

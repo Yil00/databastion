@@ -26,9 +26,14 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
             Policies
           </Link>
           {session.user.role === "admin" && (
-            <Link href="/enrollment-tokens" className="hover:underline">
-              Enrollment tokens
-            </Link>
+            <>
+              <Link href="/notifications" prefetch={false} className="hover:underline">
+                Notifications
+              </Link>
+              <Link href="/enrollment-tokens" className="hover:underline">
+                Enrollment tokens
+              </Link>
+            </>
           )}
           <span className="ml-auto text-muted-foreground">
             {session.user.username} ({session.user.role})

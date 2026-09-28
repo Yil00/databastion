@@ -1,3 +1,4 @@
+import { alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
 import { trustedProxyHops } from "./request";
 
@@ -23,6 +24,7 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
       "/metrics is served on the main port: set DATABASTION_METRICS_PORT to move it to a dedicated listener, or block /metrics at the reverse proxy.",
     );
   }
+  warnings.push(...alertingWarnings(env));
   return warnings;
 }
 

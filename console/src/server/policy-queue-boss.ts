@@ -4,6 +4,7 @@ import { getDatabaseUrl } from "@/config/env";
 import { errorSummary, logger } from "@/lib/logger";
 import { pgBossOptions } from "@/worker/queues";
 
+import { NOTIFICATION_QUEUE, setNotificationJobSender } from "./notification-queue";
 import { POLICY_QUEUE, setPolicyJobSender } from "./policy-queue";
 
 /**
@@ -32,8 +33,12 @@ function boss(): Promise<PgBoss> {
   return starting;
 }
 
+/** Installs the web process senders: policy engine and notification delivery wake-ups. */
 export function installPgBossPolicySender(): void {
   setPolicyJobSender(async () => {
     await (await boss()).send(POLICY_QUEUE, {});
+  });
+  setNotificationJobSender(async () => {
+    await (await boss()).send(NOTIFICATION_QUEUE, {});
   });
 }

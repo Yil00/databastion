@@ -5,13 +5,14 @@ import type { ValidationDetail } from "@/lib/protocol/validate";
 
 import { writeAudit, type AuditAction } from "./audit";
 import { RateLimiter } from "./rate-limit";
+import { requestNotificationDelivery } from "./notification-queue";
+import { notifyIntegrityEvent } from "./system-alerts";
 
 /**
  * Agent-integrity events of the results endpoints (docs/09-agent-protocol.md, ADR-0009): a rejected
  * (`400`) findings batch, a `batch_conflict` (`409`) and a finding for a target the agent does not
- * own (`404`) cannot come from a conforming agent. Each one writes a `security_events` row (the
- * placeholder of the phase 3 incident model; alerting comes with P3) and an `audit_log` entry, in
- * one transaction.
+ * own (`404`) cannot come from a conforming agent. Each one writes a `security_events` row, an
+ * `audit_log` entry and (P3-C) the notifications of the system-alert channels, in one transaction.
  *
  * Details are console-computed scalars only: the endpoint, the HTTP status, the number of error
  * details and the first `{pointer, keyword}` (pointers are built from contract property names and
@@ -78,12 +79,26 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
   };
   suppressedSince.delete(event.agentId);
   await db.transaction(async (tx) => {
-    await tx.insert(securityEvents).values({
-      kind: `agent.${event.kind}`,
-      severity: "high",
-      agentId: event.agentId,
-      details,
-    });
+    const [row] = await tx
+      .insert(securityEvents)
+      .values({
+        kind: `agent.${event.kind}`,
+        severity: "high",
+        agentId: event.agentId,
+        details,
+      })
+      .returning({ id: securityEvents.id, at: securityEvents.at });
+    // P3-C: alert the system-alert channels (at most once per agent, kind and hour).
+    if (row) {
+      await notifyIntegrityEvent(tx, {
+        securityEventId: row.id,
+        agentId: event.agentId,
+        kind: `agent.${event.kind}`,
+        severity: "high",
+        details,
+        at: row.at,
+      });
+    }
     await writeAudit(tx, {
       actorType: "agent",
       actorId: event.agentId,
@@ -95,6 +110,7 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
       details,
     });
   });
+  void requestNotificationDelivery();
   integrityStats.recorded++;
   logger.warn({ agentId: event.agentId, kind: event.kind, status: event.status }, "agent-integrity event recorded");
   return true;

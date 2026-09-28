@@ -20,8 +20,10 @@ import {
   type Severity,
 } from "@/lib/policy-model";
 
+import { consoleUrl } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { applyFalsePositive, fpResetNeeded, type Tx } from "./findings";
+import { enqueueIncidentNotifications } from "./notifications";
 
 /**
  * Policy engine (P3-A, worker) and incidents (P3-B).
@@ -261,6 +263,20 @@ async function applyPolicy(
       classifier: f.classifier,
       severity: policy.severity,
     },
+  });
+  // P3-C: the notifications of the policy's `notify` channels, in the same transaction (outbox).
+  await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, {
+    event: "incident.opened",
+    occurred_at: now.toISOString(),
+    url: consoleUrl(`/incidents/${row.id}`),
+    incident: { id: row.id, severity: policy.severity, status: "open", reopened_from: latest?.status === "resolved" ? latest.id : null },
+    policy: { id: policy.id, name: policy.name, revision: policy.revision },
+    agent_id: f.agentId,
+    target_id: f.targetId,
+    classifier: f.classifier,
+    classifiers_version: f.classifiersVersion,
+    location: { engine: f.engine, database: f.databaseName, schema: f.schemaName, object: f.objectName, field: f.fieldName },
+    counts: { sampled: f.sampled, matched: f.matched, confidence: f.confidence },
   });
   return "created";
 }
@@ -593,12 +609,12 @@ export async function activeIncidentCounts(db: Database): Promise<Record<Severit
   return out;
 }
 
-/** Worker entry point: drains, logs a summary (counts only), and reports whether work remains. */
-export async function runPolicyEvaluation(db: Database, budgetMs?: number): Promise<boolean> {
+/** Worker entry point: drains and logs a summary (counts only). */
+export async function runPolicyEvaluation(db: Database, budgetMs?: number): Promise<DrainStats> {
   try {
     const stats = await drainPolicyWork(db, { budgetMs });
     if (stats.findings > 0 || stats.policyPasses > 0) log.info({ ...stats }, "policy evaluation");
-    return stats.more;
+    return stats;
   } catch (err) {
     log.error({ error: errorSummary(err) }, "policy evaluation failed");
     throw err;
