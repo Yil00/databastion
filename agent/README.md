@@ -24,19 +24,47 @@ Dependency direction: `classifiers` ← `core` ← `connector-*` ← `agent`.
 `postgres`, `mysql`, `mongodb`, `openldap`: all enabled by default. A minimal
 binary: `cargo build --no-default-features --features postgres`.
 
+## Security boundaries
+
 ### Masking boundary (invariant I2)
 - Connectors never get the uplink; they push results into `FindingSink` /
-  `EventSink` from `core`.
+  `EventSink` from `core`. The uplink module is crate-private in `core`:
+  connectors can neither name nor construct it. The core runtime (to come)
+  will own it; the binary only gets that runtime.
 - Sinks and the uplink only accept `MaskedFinding` / `MaskedEvent` from
-  `classifiers::masking`. These types have private fields; a `MaskedSample`
-  can only be produced by `masking::mask`, and a `MaskedFinding` only from
-  `MaskedSample`s. Passing an unmasked value to the uplink does not compile.
-- Raw values are wrapped in `RawSample`, whose `Debug` is redacted and which
-  has no `Display` nor serialization.
-- `crates/agent/tests/architecture.rs` also checks that connectors do not
-  depend on an HTTP client or reference the uplink, that no listening socket
-  appears in agent code (I1), and that `Cargo.lock` contains no OpenSSL /
-  native-tls (rustls only).
+  `classifiers::masking`. These types hold no caller-provided `String`: a
+  `MaskedSample` only comes from `masking::mask`, the classifier is a closed
+  `ClassifierId` created inside `classifiers`, and a `MaskedFinding` is built
+  only from those. `compile_fail` doctests in `masking.rs` prove a connector
+  cannot build them from a string.
+- Raw values are wrapped in `RawSample`: redacted `Debug`, no `Display`, no
+  serialization, and `expose()` is crate-private to `classifiers`.
+
+### Guards
+`crates/agent/tests/architecture.rs` checks that connectors do not depend on
+an HTTP client or `socket2` (including `[dependencies.x]` tables and
+`package = "…"` renames) nor reference the uplink, that no listening or raw
+socket API appears in any crate's `src/`, `tests/`, `examples/`, `benches/`
+or `build.rs` (I1), and that `Cargo.lock` contains no OpenSSL / native-tls.
+These are text-level guards against honest mistakes; the types and code
+review remain the primary controls.
+
+### Logs
+`DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
+capped at `warn`: drivers and HTTP clients may log parameters or payloads at
+debug/trace level.
+
+### Future database drivers (sqlx, mongodb, ldap3)
+Add them with `default-features = false` and rustls-only TLS features, and
+re-check `Cargo.lock` for OpenSSL. Every query gets a timeout and bounded
+sampling (I4). Driver errors can echo query text or values: map them to
+`ConnectorError` variants without the driver message before logging.
+
+### Generated protocol types
+Generated types (P0-B) must not become a bypass: connectors never build them
+directly. `MaskedFinding` / `MaskedEvent` wrap them, and only
+`classifiers::masking` converts to them. No `Deserialize` into masked types,
+and `additionalProperties: false` in the schema.
 
 ### Protocol types
 Protocol types are generated from `shared/protocol/openapi.yaml` and never

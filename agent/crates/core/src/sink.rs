@@ -62,12 +62,15 @@ impl EventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databastion_classifiers::masking::{RawSample, mask};
+    use databastion_classifiers::masking::{ClassifierId, RawSample, mask};
 
     #[tokio::test]
     async fn finding_sink_delivers_masked_findings() {
         let (sink, mut rx) = FindingSink::channel(1);
-        let finding = MaskedFinding::new("pii.email", vec![mask(&RawSample::new("a@b.c"))]);
+        let finding = MaskedFinding::new(
+            ClassifierId::PII_EMAIL,
+            vec![mask(&RawSample::new("a@b.c"))],
+        );
         sink.submit(finding.clone()).await.unwrap();
         assert_eq!(rx.recv().await, Some(finding));
     }
@@ -76,7 +79,7 @@ mod tests {
     async fn finding_sink_reports_closed_receiver() {
         let (sink, rx) = FindingSink::channel(1);
         drop(rx);
-        let finding = MaskedFinding::new("pii.email", Vec::new());
+        let finding = MaskedFinding::new(ClassifierId::PII_EMAIL, Vec::new());
         assert_eq!(sink.submit(finding).await, Err(SinkClosed));
     }
 }
