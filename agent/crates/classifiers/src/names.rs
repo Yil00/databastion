@@ -29,8 +29,8 @@
 //!   `jane.doe@…`, so the conservative reading wins: use
 //!   [`normalize_field_path`] with the real keys to keep `contacts`), the
 //!   domain ends at the shortest valid address;
-//! - percent-encoded bytes (`%40`) make a segment a value, and `%40` is
-//!   read as an `@`; password-hash prefixes (`$2b$`, `$argon2`…) mask the
+//! - percent-encoded bytes (`%40`) and `%uXXXX` escapes make a segment a
+//!   value, and `%40` / `%u0040` are read as an `@`; password-hash prefixes (`$2b$`, `$argon2`…) mask the
 //!   hash to its end; AWS key ids split by separators are found;
 //! - digit runs split by single separators (`.`, `_`, `-`, space, `+`) with
 //!   more than [`MAX_INDEX_DIGITS`] digits in total are values
@@ -43,7 +43,9 @@
 //!   are lowercased;
 //! - anything that still does not conform becomes `*`, and so does a name
 //!   with a run of more than [`MAX_INDEX_DIGITS`] or more than
-//!   [`MAX_TOTAL_DIGITS`] numeric characters in total, in any script;
+//!   [`MAX_TOTAL_DIGITS`] numeric characters in total, in any script
+//!   (CJK ideographic digits `零〇一二三四五六七八九` included, see
+//!   [`is_numeric_like`]);
 //! - an LDAP DN value that is empty or BER-encoded (`#…`) becomes `*`.
 //!
 //! Known gap: a surname alone, or a first name missing from the list, is
@@ -99,9 +101,10 @@ impl NormalizedName {
     /// Final gate: the contract `Identifier` (pattern and `not` rule), no
     /// run of more than [`MAX_INDEX_DIGITS`] numeric characters in any
     /// script, at most [`MAX_TOTAL_DIGITS`] numeric characters in the whole
-    /// name, no percent-encoded byte; `*` otherwise.
+    /// name (both counted with [`is_numeric_like`]), no percent-encoded
+    /// byte or `%uXXXX` escape; `*` otherwise.
     fn checked(candidate: String) -> Self {
-        let digits = candidate.chars().filter(|c| c.is_numeric()).count();
+        let digits = candidate.chars().filter(|c| is_numeric_like(*c)).count();
         if conforms(&candidate)
             && longest_digit_run(&candidate) <= MAX_INDEX_DIGITS
             && digits <= MAX_TOTAL_DIGITS
@@ -197,14 +200,28 @@ pub fn conforms(name: &str) -> bool {
     })
 }
 
-/// Longest run of consecutive numeric characters, in any script
-/// (`char::is_numeric`: ASCII, fullwidth, Arabic-Indic, mathematical
-/// digits…).
+/// CJK ideographic digits that `char::is_numeric` does not report (they are
+/// letters, `Lo`, in Unicode; `〇` is already numeric).
+const CJK_DIGITS: [char; 11] = [
+    '零', '〇', '一', '二', '三', '四', '五', '六', '七', '八', '九',
+];
+
+/// Whether `c` counts as a digit for the digit bounds: a numeric character
+/// in any script (`char::is_numeric`: ASCII, fullwidth, Arabic-Indic,
+/// mathematical digits…) or a CJK ideographic digit
+/// (`零〇一二三四五六七八九`), so a number written with them is bounded
+/// like any other.
+#[must_use]
+pub fn is_numeric_like(c: char) -> bool {
+    c.is_numeric() || CJK_DIGITS.contains(&c)
+}
+
+/// Longest run of consecutive digits, in any script ([`is_numeric_like`]).
 #[must_use]
 pub fn longest_digit_run(s: &str) -> usize {
     let (mut best, mut run) = (0, 0);
     for c in s.chars() {
-        run = if c.is_numeric() { run + 1 } else { 0 };
+        run = if is_numeric_like(c) { run + 1 } else { 0 };
         best = best.max(run);
     }
     best
@@ -415,7 +432,7 @@ pub fn segment_looks_like_value(segment: &str) -> bool {
     // Digit content beyond an array index, consecutive or mixed with
     // letters / separators (dates, phone and account numbers, IDs).
     // Counted in any script (NFKC leaves Arabic-Indic digits as they are).
-    if segment.chars().filter(|c| c.is_numeric()).count() > MAX_INDEX_DIGITS {
+    if segment.chars().filter(|c| is_numeric_like(*c)).count() > MAX_INDEX_DIGITS {
         return true;
     }
     // Numeric characters outside ASCII are never part of a plain name.
@@ -425,7 +442,8 @@ pub fn segment_looks_like_value(segment: &str) -> bool {
     {
         return true;
     }
-    // Percent-encoded bytes (`pdupont%40example%2Ecom`).
+    // Percent-encoded bytes (`pdupont%40example%2Ecom`) and `%uXXXX`
+    // escapes.
     if has_percent_escape(segment) {
         return true;
     }
@@ -479,11 +497,17 @@ fn value_spans(s: &str) -> Vec<Range<usize>> {
     spans
 }
 
-/// Whether `s` holds a percent-encoded byte (`%` + 2 hex digits).
+/// Whether `s` holds a percent-encoded byte (`%` + 2 hex digits) or a
+/// `%uXXXX` escape (`%u` / `%U` + 4 hex digits).
 fn has_percent_escape(s: &str) -> bool {
     let b = s.as_bytes();
     b.windows(3)
         .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit())
+        || b.windows(6).any(|w| {
+            w[0] == b'%'
+                && w[1].eq_ignore_ascii_case(&b'u')
+                && w[2..].iter().all(u8::is_ascii_hexdigit)
+        })
 }
 
 /// Password-hash prefixes: from the prefix to the end of the following
@@ -566,9 +590,12 @@ fn shortest_email(s: &str, range: Range<usize>) -> Range<usize> {
 fn address_spans(s: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let encoded = s.char_indices().filter(|(i, _)| {
-        s[*i..]
-            .get(..3)
-            .is_some_and(|x| x.eq_ignore_ascii_case("%40"))
+        let at = |len: usize, form: &str| {
+            s[*i..]
+                .get(..len)
+                .is_some_and(|x| x.eq_ignore_ascii_case(form))
+        };
+        at(3, "%40") || at(6, "%u0040")
     });
     let ats: Vec<usize> = s
         .match_indices('@')
@@ -593,7 +620,7 @@ fn address_spans(s: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Runs of numeric characters (any script) separated by single `.`, `_`,
+/// Runs of digits (any script, [`is_numeric_like`]) separated by single `.`, `_`,
 /// `-`, space or `+`, with more than [`MAX_INDEX_DIGITS`] digits in total: a
 /// value split across segments (`0612.345678`, `ab4111_1111.1111.1111`).
 fn split_digit_runs(s: &str) -> Vec<Range<usize>> {
@@ -602,7 +629,7 @@ fn split_digit_runs(s: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if !chars[i].1.is_numeric() {
+        if !is_numeric_like(chars[i].1) {
             i += 1;
             continue;
         }
@@ -611,11 +638,11 @@ fn split_digit_runs(s: &str) -> Vec<Range<usize>> {
         let mut digits = 0usize;
         let mut j = i;
         loop {
-            if j < chars.len() && chars[j].1.is_numeric() {
+            if j < chars.len() && is_numeric_like(chars[j].1) {
                 digits += 1;
                 end_idx = j;
                 j += 1;
-            } else if j + 1 < chars.len() && is_sep(chars[j].1) && chars[j + 1].1.is_numeric() {
+            } else if j + 1 < chars.len() && is_sep(chars[j].1) && is_numeric_like(chars[j + 1].1) {
                 j += 1;
             } else {
                 break;
@@ -729,14 +756,19 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
     if total > MAX_INPUT_BYTES {
         return NormalizedName::wildcard();
     }
-    // Every key folded once (NFKC); `None` for indices.
-    let folded: Vec<Option<String>> = parts
-        .iter()
-        .map(|p| match p {
-            PathPart::Key(k) => Some(fold(k).unwrap_or_else(|| "#".to_owned())),
+    // Every key folded once (NFKC); `None` for indices. A key that cannot
+    // be folded within the bound (NFKC expansion) makes the whole path `*`:
+    // the joined path would exceed the bound anyway.
+    let mut folded: Vec<Option<String>> = Vec::with_capacity(parts.len());
+    for p in parts {
+        folded.push(match p {
+            PathPart::Key(k) => match fold(k) {
+                Some(k) => Some(k),
+                None => return NormalizedName::wildcard(),
+            },
             PathPart::Index => None,
-        })
-        .collect();
+        });
+    }
     // Pass 1: keys that are dynamic or values on their own.
     let keys: Vec<Option<String>> = folded
         .iter()
@@ -769,6 +801,11 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
             (None, _) => joined.push('#'),
         }
         ranges.push(start..joined.len());
+    }
+    // NFKC may expand the keys beyond the raw bound: the detectors only
+    // scan bounded input.
+    if joined.len() > MAX_INPUT_BYTES {
+        return NormalizedName::wildcard();
     }
     let spans = value_spans(&joined);
     let mut out: Vec<String> = Vec::new();
@@ -810,6 +847,11 @@ pub fn normalize_ldap_attribute(raw: &str) -> NormalizedName {
 /// cannot be parsed simply (escapes, multi-valued RDNs) becomes `*`.
 #[must_use]
 pub fn normalize_ldap_dn(raw: &str) -> NormalizedName {
+    // Bounded before folding, like `normalize_path`: NFKC never runs on an
+    // oversized input.
+    if raw.len() > MAX_INPUT_BYTES {
+        return NormalizedName::wildcard();
+    }
     let Some(cleaned) = fold(raw) else {
         return NormalizedName::wildcard();
     };
@@ -1009,6 +1051,121 @@ mod tests {
         ] {
             assert_eq!(normalize_ldap_dn(dn).as_str(), want, "{dn}");
         }
+    }
+
+    /// `U+FDFA` folds (NFKC) to 18 characters, 33 bytes, from 3 bytes.
+    const EXPANDING: &str = "\u{FDFA}";
+
+    #[test]
+    fn unfoldable_field_path_key_is_a_wildcard_never_a_literal() {
+        use PathPart::Key;
+        // Re-review L1: one key over the bound once folded.
+        let big = EXPANDING.repeat(1300);
+        assert!(big.len() <= MAX_INPUT_BYTES);
+        assert!(fold(&big).is_none());
+        let out = normalize_field_path(&[Key("contacts"), Key(&big), Key("phone")]);
+        assert_eq!(out.as_str(), "*");
+        assert!(!out.as_str().contains('#'));
+    }
+
+    #[test]
+    fn joined_field_path_is_bounded_after_folding() {
+        use PathPart::Key;
+        // Re-review L2: every key fits once folded, the joined path does not.
+        let key = EXPANDING.repeat(10);
+        assert!(fold(&key).is_some());
+        let parts: Vec<PathPart<'_>> = (0..100).map(|_| Key(&key)).collect();
+        let raw: usize = parts.len() * (key.len() + 1);
+        assert!(raw <= MAX_INPUT_BYTES);
+        assert_eq!(normalize_field_path(&parts).as_str(), "*");
+        // Below the bound, the same shape is normalized as usual.
+        assert_eq!(
+            normalize_field_path(&[Key("a"), PathPart::Index, Key("b")]).as_str(),
+            "a[].b"
+        );
+    }
+
+    #[test]
+    fn oversized_ldap_dn_is_refused_before_folding() {
+        // Re-review L3: format characters stripped by folding would bring
+        // it under the bound; the raw length decides first.
+        let raw = format!("ou=people,dc=x{}", "\u{200B}".repeat(2000));
+        assert!(raw.len() > MAX_INPUT_BYTES);
+        assert!(fold(&raw).is_some());
+        assert_eq!(normalize_ldap_dn(&raw).as_str(), "*");
+        assert_eq!(
+            normalize_ldap_dn("ou=people,dc=x\u{200B}").as_str(),
+            "ou=people,dc=x"
+        );
+    }
+
+    #[test]
+    fn percent_u_escapes_are_values() {
+        use PathPart::Key;
+        // Re-review L4: `%uXXXX` like `%XX`, `%u0040` read as `@`.
+        assert!(has_percent_escape("a%u0040b"));
+        assert!(has_percent_escape("a%U00e9"));
+        assert!(!has_percent_escape("a%u00"));
+        assert!(!has_percent_escape("a%uzzzz"));
+        for raw in [
+            "contacts.pdupont%u0040example%u002Ecom.phone",
+            "contacts.pdupont%U0040example.com",
+            "x.name%u00e9",
+        ] {
+            let out = normalize_path(raw);
+            assert!(!out.as_str().contains("pdupont"), "{raw} -> {out:?}");
+            assert!(!out.as_str().contains('%'), "{raw} -> {out:?}");
+        }
+        // Read as an address (as `%40`): masked, conservatively to the end.
+        assert_eq!(
+            normalize_path("contacts.pdupont%u0040example%u002Ecom.phone").as_str(),
+            normalize_path("contacts.pdupont%40example%2Ecom.phone").as_str()
+        );
+        assert_eq!(
+            normalize_field_path(&[
+                Key("contacts"),
+                Key("pdupont%u0040example%u002Ecom"),
+                Key("phone"),
+            ])
+            .as_str(),
+            "contacts.*.phone"
+        );
+        assert_eq!(
+            normalize_ldap_dn("ou=pdupont%u0040example.com,dc=x").as_str(),
+            "ou=*,dc=x"
+        );
+        assert!(!address_spans("jdoe%u0040example.com").is_empty());
+    }
+
+    #[test]
+    fn cjk_ideographic_digits_are_counted() {
+        // Re-review L4: `零〇一二三四五六七八九` count as digits.
+        for c in "零〇一二三四五六七八九".chars() {
+            assert!(is_numeric_like(c), "{c}");
+        }
+        assert!(!is_numeric_like('日') && !is_numeric_like('a'));
+        assert_eq!(longest_digit_run("tel_六一二三四五六七八"), 9);
+        for raw in [
+            "tel_六一二三四五六七八",
+            "users.零六一二三四五六七八.phone",
+            "a.x零六一二三四.y五六七八",
+        ] {
+            let out = normalize_path(raw);
+            assert!(
+                !out.as_str().chars().any(is_numeric_like),
+                "{raw} -> {out:?}"
+            );
+        }
+        // Gate: every segment below the per-segment bound, the total above
+        // `MAX_TOTAL_DIGITS`.
+        assert_eq!(
+            NormalizedName::checked("ou=一二三四,dc=五六七八九".to_owned()).as_str(),
+            "*"
+        );
+        assert_eq!(normalize_ldap_dn("ou=一二三四,dc=五六七八九").as_str(), "*");
+        // A few ideographic digits in an ordinary name are kept.
+        assert_eq!(normalize_path("第一名").as_str(), "第一名");
+        assert_eq!(normalize_path("sales.一月").as_str(), "sales.一月");
     }
 
     #[test]

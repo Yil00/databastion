@@ -5,8 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use databastion_classifiers::names::{
-    MAX_INDEX_DIGITS, NormalizedName, conforms, longest_digit_run, normalize_ldap_attribute,
-    normalize_ldap_dn, normalize_path, violates_numeric_rule,
+    MAX_INDEX_DIGITS, MAX_TOTAL_DIGITS, NormalizedName, PathPart, conforms, is_numeric_like,
+    longest_digit_run, normalize_field_path, normalize_ldap_attribute, normalize_ldap_dn,
+    normalize_path, violates_numeric_rule,
 };
 
 /// xorshift64*: reproducible, dependency-free.
@@ -83,6 +84,17 @@ const ALPHABET: &[&str] = &[
     "＠",
     "．",
     "%40",
+    // Security re-review of #39, L1 / L2 / L4: NFKC expansion, `%uXXXX`
+    // escapes, CJK ideographic digits.
+    "\u{FDFA}",
+    "%u0040",
+    "%U002E",
+    "零",
+    "〇",
+    "一",
+    "五",
+    "九",
+    "六一二三四五六七八",
 ];
 
 fn random_input(rng: &mut Rng) -> String {
@@ -127,6 +139,15 @@ fn check(input: &str, name: &NormalizedName) {
         longest_digit_run(s) <= MAX_INDEX_DIGITS,
         "{input:?} -> {s:?} keeps more than 6 consecutive digits"
     );
+    assert!(
+        s.chars().filter(|c| is_numeric_like(*c)).count() <= MAX_TOTAL_DIGITS,
+        "{input:?} -> {s:?} keeps more than 8 digits"
+    );
+    assert!(
+        !s.contains('%') || s == "*",
+        "{input:?} -> {s:?} keeps a percent escape"
+    );
+    assert!(!s.contains('#'), "{input:?} -> {s:?} keeps a placeholder");
     for seg in numeric_segments(input) {
         assert!(!s.contains(&seg), "{input:?} -> {s:?} leaks {seg:?}");
     }
@@ -140,6 +161,39 @@ fn normalized_names_always_match_the_contract() {
         check(&input, &normalize_path(&input));
         check(&input, &normalize_ldap_dn(&input));
         check(&input, &normalize_ldap_attribute(&input));
+        let keys: Vec<PathPart<'_>> = input
+            .split('/')
+            .map(|k| {
+                if k == "*" {
+                    PathPart::Index
+                } else {
+                    PathPart::Key(k)
+                }
+            })
+            .collect();
+        check(&input, &normalize_field_path(&keys));
+    }
+}
+
+#[test]
+fn nfkc_expansion_is_bounded() {
+    // U+FDFA folds to 18 characters: bounded before and after folding.
+    let mut rng = Rng(7);
+    for _ in 0..200 {
+        let n = 1 + rng.below(2000);
+        let big = "\u{FDFA}".repeat(n);
+        let out = normalize_path(&big);
+        check(&big, &out);
+        let keys = vec![PathPart::Key("a"); rng.below(4)]
+            .into_iter()
+            .chain([PathPart::Key(big.as_str())])
+            .collect::<Vec<_>>();
+        let out = normalize_field_path(&keys);
+        check(&big, &out);
+        check(&big, &normalize_ldap_dn(&format!("ou={big},dc=x")));
+        if n * 33 > 4096 {
+            assert_eq!(out.as_str(), "*", "{n}");
+        }
     }
 }
 
