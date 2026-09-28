@@ -112,6 +112,9 @@ Values are located in the **whole** name, so a value split across separators is 
 detectors above run on the name as is and with `.`, `_`, `-`, `/` read as spaces; an `@` masks the
 address around it; digit runs split by single separators with more than 6 digits are values. Every
 segment a value touches becomes `*` (`a.0612.345678` -> `a.*`, `card_4111_1111_1111_1111` -> `*`).
+Inputs are NFKC-folded first (fullwidth digits, `＠`, `．`); percent-encoded bytes make a segment a
+value; password-hash prefixes and split AWS key ids are masked; the final gate rejects any name with
+more than 6 numeric characters in a row or 8 in total, in any script.
 
 A dotted string cannot tell a container from the local part of an address:
 `normalize_path("contacts.jane@example.com.phone")` gives `*.phone` (conservative), while

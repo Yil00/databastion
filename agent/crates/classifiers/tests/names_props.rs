@@ -74,6 +74,15 @@ const ALPHABET: &[&str] = &[
     "4111 1111 1111 1111",
     "+33 6 12 34 56 78",
     "jane@example.com",
+    // Security review H1 / H2: non-ASCII digits and compatibility forms.
+    "０",
+    "９",
+    "٠",
+    "٩",
+    "𝟎",
+    "＠",
+    "．",
+    "%40",
 ];
 
 fn random_input(rng: &mut Rng) -> String {
