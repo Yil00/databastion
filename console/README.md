@@ -7,9 +7,10 @@ database (also used as the job queue: no Redis). See
 [docs/02-architecture.md](../docs/02-architecture.md) and
 [docs/03-tech-stack.md](../docs/03-tech-stack.md).
 
-> Status: phase 1 backend (ROADMAP P1-A part 1): database schema, local auth, console audit
-> log, enrollment tokens, agent API `/enroll`, `/heartbeat`, `/jobs` (long-poll),
-> `/jobs/{job_id}/status`. No UI page yet.
+> Status: phase 1 (ROADMAP P1-A): database schema, local auth, console audit log, enrollment
+> tokens, agent API `/enroll`, `/heartbeat`, `/jobs` (long-poll), `/jobs/{job_id}/status`,
+> `/rotate`; Prometheus `/metrics`; UI pages (login, agents, agent detail, enrollment tokens);
+> Docker image.
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -26,6 +27,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
+| `DATABASTION_METRICS_TOKEN` / `_FILE` | Bearer token required by `GET /metrics` (at least 32 characters, e.g. `openssl rand -base64 32`). Unset or too short: `/metrics` answers `404`. See "Metrics" |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
@@ -126,7 +128,8 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 |-------|---------|
 | `GET /api/health` | Liveness: `{"status":"ok"}`, never touches the database |
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
-| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events`, `/rotate` still `501` |
+| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events` still `501` |
+| `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP and per username |
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/auth/session` | Current user + CSRF token |
@@ -134,6 +137,26 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `DELETE /api/enrollment-tokens/{id}` | Revoke an unused token (admin) |
 | `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
+| `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
+
+UI pages (server components; data read server-side, only the user and the CSRF token reach the
+browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
+90 s) / revoked / locked, last seen, targets with audit level), `/agents/{id}` (targets; admin:
+"Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
+`dbe_…` token is shown once with a copy button; list; revoke). Agent-reported strings are rendered
+as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
+(new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the
+confirmation dialog uses the native `<dialog>` element).
+
+### Security headers
+- UI pages: `Content-Security-Policy` with a per-request nonce set by `src/proxy.ts`
+  (`script-src 'self' 'nonce-…' 'strict-dynamic'`, `style-src 'self' 'nonce-…'`, `object-src 'none'`,
+  `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`; `'unsafe-eval'` in `next dev`
+  only). Every page is rendered per request (root layout `force-dynamic`), so no prerendered page
+  lacks the nonce. Not applied to `/api/*` and `/metrics` (no HTML).
+- Every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy` / `-Resource-Policy: same-origin`,
+  a restrictive `Permissions-Policy` (`next.config.ts`). HSTS is set by the TLS reverse proxy.
 
 User sessions: 256-bit cookie (`HttpOnly`, `SameSite=Strict`, `Secure` + `__Host-` prefix in
 production), only its SHA-256 stored, 12 h absolute / 2 h idle. State-changing user routes require
@@ -152,10 +175,89 @@ presenting their last verified secret, so a login flood can never block agents. 
 unknown usernames share a process-wide budget (30 per minute). Per-IP limits bucket IPv6
 addresses by /64.
 
+## Agent secret rotation
+`POST /api/agent/v1/rotate` follows [ADR-0008](../docs/adr/0008-agent-generated-secret-rotation.md)
+as refined by ADR-0010 (`S0` previous secret, `S1` new one):
+- the agent sends `S1` (`AgentSecret` format; a malformed or low-entropy value, fewer than 16
+  distinct characters, or `S1` equal to the current secret: `400 invalid_secret`), authenticated
+  with its current secret; the console stores its argon2id hash as pending, `grace_expires_at` =
+  now + 300 s (never extended);
+- same `S1` again with `S0` (while pending, or within 60 s of the promotion): `200 duplicate: true`;
+- promotion: first successful request with `S1`, or the deadline (applied lazily on the agent's
+  next request, with the deadline as promotion time);
+- `S0` within 60 s of the promotion: `401` without incident on every endpoint but `/rotate`;
+- `rotation_conflict` (`409`): `/rotate` with `S0` and a different `S1` while pending or within the
+  window, or any request with `S0` after the window. The agent is locked (every secret hash
+  cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
+  audit log and a `critical` row to `security_events`. Only revocation + re-enrollment recovers;
+- `/rotate` authenticated with the current secret (e.g. `S1` right after promotion) always starts
+  a new rotation, never a conflict.
+
+The previous hash is kept after the 60 s window, until the next promotion replaces it, only to
+detect a later use of `S0`; it never authenticates. A wrong secret therefore costs up to three
+argon2id verifications (current, pending, previous) under a single pool slot and a single
+rate-limit attempt. `/rotate` runs its own argon2id work (hash of `S1`, comparison with the
+pending / promoted hash) in a dedicated pool of 2 (`503` + `Retry-After` beyond) and is limited
+to 10 calls per agent per 5 min (`429`). Concurrent `/rotate` calls are serialized by conditional
+updates: of two different secrets sent together with `S0`, one is registered and the other one
+locks the agent. The body is never logged; responses are `no-store`.
+
+`security_events` is a placeholder for the incident model of phase 3 (agent-integrity alerts:
+`rotation_conflict` today, rejected batches and `batch_conflict` with P2-D).
+
+## Metrics
+`GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
+Prometheus scrapes the console only, never the agents. Protected by
+`Authorization: Bearer <DATABASTION_METRICS_TOKEN>` (constant-time comparison; `401` otherwise,
+`404` when the token is unset). **Internal network only**: do not publish `/metrics` through the
+public reverse proxy (block the path there) and scrape the console directly.
+
+Frozen names (renaming one is a breaking change; the provisional Grafana dashboard in
+`dev/grafana/` uses the first and the spool one):
+
+| Metric | Labels | Source |
+|--------|--------|--------|
+| `databastion_agent_last_seen_seconds` | `agent_id` | console: seconds since the last heartbeat |
+| `databastion_agent_up` | `agent_id` | console: 1 if the last heartbeat is < 90 s old |
+| `databastion_agent_clock_skew_seconds` | `agent_id` | console: agent minus console clock |
+| `databastion_agent_target_reachable` | `agent_id`, `target_id` | heartbeat target status (1 / 0) |
+| `databastion_agent_target_audit_level` | `agent_id`, `target_id` | full 3, partial 2, limited 1, none 0 |
+| `databastion_agent_reported_uptime_seconds` | `agent_id` | heartbeat `uptime_s` |
+| `databastion_agent_reported_spool_bytes`, `_spool_max_bytes`, `_spool_batches` | `agent_id` | heartbeat `spool` |
+| `databastion_agent_reported_<name>` | `agent_id` | heartbeat `metrics` map |
+| `databastion_agent_reported_target_<name>` | `agent_id`, `target_id` | heartbeat `targets[].metrics` map |
+| `databastion_agents` | `status` | agents by status |
+| `databastion_jobs` | `status` | jobs by status |
+| `databastion_enrollment_tokens_active` | | usable enrollment tokens |
+| `databastion_security_events` | | rows of `security_events` |
+| `databastion_console_argon2_operations_total` | | argon2id operations of this process |
+| `databastion_metrics_series_dropped` | | series dropped by the caps in the last scrape |
+
+Per-agent series cover enrolled / online agents (not revoked or locked). Agent-provided metric
+names (contract: `^[a-z][a-z0-9_]{0,63}$`, numeric values) on the reserved list (`last_seen_seconds`,
+`up`, `revoked`, `locked`, `status`, `info`, `clock_skew_seconds`, `uptime_seconds`, `spool_*`) or,
+at agent level, starting with `target_` are ignored, so an agent cannot shadow a console series.
+Cardinality caps: 1000 agents, 50 000 agent-reported series per scrape (the contract already caps
+128 metrics per map and 64 targets per agent).
+
+## Docker image
+[`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,
+`next build` with `NEXT_OUTPUT_STANDALONE=1`, runtime as uid/gid 10001 with root-owned, read-only
+files: compatible with `read_only: true` (only `/tmp` as tmpfs). Entrypoint commands
+([docker/entrypoint.sh](docker/entrypoint.sh)): `web` (default, standalone `server.js` on port
+3000), `worker`, `migrate`, `bootstrap-admin`. The worker, the migrator and the bootstrap command run
+from the TypeScript sources with `tsx` (`node --import tsx`, cache disabled): `tsx` is already the
+production runner of `pnpm worker` / `pnpm db:migrate`, so the image runs exactly the code the tests
+run, with no second bundler configuration to keep in sync; the cost is a larger image (production
+`node_modules` next to the standalone web bundle) and a short transpilation at startup.
+`HEALTHCHECK` ([docker/healthcheck.sh](docker/healthcheck.sh)) probes `/api/health` for `web` and
+reports healthy for the other commands. The image is not built by the CI yet.
+
 ## Data at rest
 | Data | Storage |
 |------|---------|
 | User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
+| Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
@@ -172,8 +274,13 @@ scripts/protocol/         protocol code generator (`pnpm protocol:generate`)
 src/app/                  Next.js App Router (UI + API routes)
 src/app/api/agent/v1/     agent API routes (thin, logic in src/server/agent-api/)
 src/app/api/{auth,agents,enrollment-tokens}/  user API routes (logic in src/server/user-api.ts)
+src/app/(console)/, src/app/login/  UI pages (server components)
+src/app/metrics/          Prometheus endpoint (logic in src/server/metrics.ts)
+src/components/           UI components (ui/: shadcn-style primitives, console/: pages' parts)
+src/proxy.ts              per-request CSP nonce for UI pages
+docker/                   image entrypoint and healthcheck
 src/cli/                  admin bootstrap command
-src/server/               auth, audit log, enrollment, agents, jobs, rate limiting
+src/server/               auth, audit log, enrollment, agents, jobs, rotation, metrics, rate limiting
 src/test/                 test harness (throwaway PostgreSQL cluster, fixture helpers)
 src/config/               configuration loading (NAME / NAME_FILE)
 src/db/                   Drizzle schema, client, migrator
