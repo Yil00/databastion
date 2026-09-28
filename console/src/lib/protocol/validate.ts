@@ -28,6 +28,7 @@ export interface ValidationDetail {
   keyword: string;
 }
 
+/** Result of `validateSchema` / `checkSemantics`. For `validateSchema`, `ok: true` is schema-only. */
 export type ValidationResult<T> =
   | { ok: true; value: T }
   | { ok: false; details: ValidationDetail[] };
@@ -75,7 +76,10 @@ for (const name of Object.keys(defs)) {
   validators.set(name, fn);
 }
 
-const INDEX = /^(0|[1-9][0-9]{0,8})$/;
+// ErrorDetail.pointer (contract): `^(/([a-z][a-z0-9_]{0,63}|[0-9]{1,6}))*$`, maxLength 256.
+const INDEX = /^(0|[1-9][0-9]{0,5})$/;
+const NAME_SEGMENT = /^[a-z][a-z0-9_]{0,63}$/;
+export const MAX_POINTER_LENGTH = 256;
 
 function unescapeSegment(segment: string): string {
   return segment.replace(/~1/g, "/").replace(/~0/g, "~");
@@ -83,7 +87,10 @@ function unescapeSegment(segment: string): string {
 
 /**
  * Rebuilds Ajv's `instancePath` without leaking data: walks the body along the path and keeps a
- * segment only if it indexes a real array or is a contract property name of a real object.
+ * segment only if it indexes a real array or is a contract property name of a real object. The
+ * pointer is truncated at the first segment that cannot be disclosed (e.g. a key of the open
+ * metrics map: `/metrics/<key>` -> `/metrics`) and at 256 characters, so it always conforms to
+ * the contract's `ErrorDetail.pointer`.
  */
 function safePointer(instancePath: string, body: unknown): string {
   if (instancePath === "") return "";
@@ -91,35 +98,55 @@ function safePointer(instancePath: string, body: unknown): string {
   let pointer = "";
   for (const raw of instancePath.slice(1).split("/")) {
     const segment = unescapeSegment(raw);
-    let safe: string | undefined;
     let next: unknown;
     if (Array.isArray(current) && INDEX.test(segment)) {
-      safe = segment;
       next = current[Number(segment)];
-    } else if (current !== null && typeof current === "object" && !Array.isArray(current)) {
+    } else if (
+      current !== null &&
+      typeof current === "object" &&
+      !Array.isArray(current) &&
+      KNOWN_PROPERTIES.has(segment) &&
+      NAME_SEGMENT.test(segment)
+    ) {
       next = Object.hasOwn(current, segment)
         ? (current as Record<string, unknown>)[segment]
         : undefined;
-      if (KNOWN_PROPERTIES.has(segment)) safe = segment;
+    } else {
+      break;
     }
-    // Contract names contain neither `~` nor `/`, so no escaping is needed for kept segments.
-    pointer += `/${safe ?? "*"}`;
+    if (pointer.length + 1 + segment.length > MAX_POINTER_LENGTH) break;
+    pointer += `/${segment}`;
     current = next;
   }
   return pointer;
+}
+
+// ErrorDetail.keyword (contract): `^[A-Za-z]+$`, maxLength 32. Ajv reports a `false` subschema
+// as "false schema".
+const KEYWORD = /^[A-Za-z]{1,32}$/;
+
+function safeKeyword(keyword: string): string {
+  if (keyword === "false schema") return "falseSchema";
+  return KEYWORD.test(keyword) ? keyword : "invalid";
 }
 
 function toDetails(errors: ErrorObject[] | null | undefined, body: unknown): ValidationDetail[] {
   const details: ValidationDetail[] = [];
   for (const error of errors ?? []) {
     if (details.length >= MAX_VALIDATION_DETAILS) break;
-    details.push({ pointer: safePointer(error.instancePath, body), keyword: error.keyword });
+    details.push({ pointer: safePointer(error.instancePath, body), keyword: safeKeyword(error.keyword) });
   }
   if (details.length === 0) details.push({ pointer: "", keyword: "invalid" });
   return details;
 }
 
-/** Validates `body` (already JSON-parsed) against `components.schemas[name]` of the contract. */
+/**
+ * Validates `body` (already JSON-parsed) against `components.schemas[name]` of the contract.
+ *
+ * `ok: true` means **schema-valid only**. Rules that JSON Schema cannot express are checked by
+ * `checkSemantics(name, value)`, which every agent API endpoint must call on the validated value
+ * before using it.
+ */
 export function validateSchema<K extends SchemaName>(
   name: K,
   body: unknown,
@@ -128,6 +155,63 @@ export function validateSchema<K extends SchemaName>(
   if (!fn) throw new Error(`unknown protocol schema ${String(name)}`);
   if (fn(body)) return { ok: true, value: body as Schemas[K] };
   return { ok: false, details: toDetails(fn.errors, body) };
+}
+
+function maxBytesOf(name: string): number | undefined {
+  const schema = defs[name];
+  if (schema === null || typeof schema !== "object") return undefined;
+  const max = (schema as Record<string, unknown>)["x-databastion-max-bytes"];
+  return typeof max === "number" ? max : undefined;
+}
+
+const MASK_COUNTED = /[\p{L}\p{N}*]/u;
+
+/**
+ * Console rule on `MaskedSample` (see its description in the contract): at least 50 % of the
+ * letters, digits and `*` must be `*` (spaces and punctuation ignored).
+ */
+export function isSufficientlyMasked(sample: string): boolean {
+  let counted = 0;
+  let stars = 0;
+  for (const ch of sample) {
+    if (!MASK_COUNTED.test(ch)) continue;
+    counted++;
+    if (ch === "*") stars++;
+  }
+  return counted > 0 && stars * 2 >= counted;
+}
+
+const encoder = new TextEncoder();
+
+/**
+ * Second pass, after `validateSchema` returned `ok: true`: the contract rules that JSON Schema
+ * cannot express.
+ * - `x-databastion-max-bytes`: serialized size of the value (keyword `maxBytes`, pointer `""`).
+ * - `MaskedSample`: at least 50 % `*` (keyword `maskRatio`). `MaskedSample` is only used in
+ *   `FindingsBatch.findings[].masked_samples[]`; a test fails if the contract adds another use.
+ * Reserved metric names (`HeartbeatRequest.metrics`) are not rejected: the contract says they are
+ * ignored, which is the job of the `/metrics` exporter.
+ */
+export function checkSemantics<K extends SchemaName>(
+  name: K,
+  value: Schemas[K],
+): ValidationResult<Schemas[K]> {
+  const details: ValidationDetail[] = [];
+  const maxBytes = maxBytesOf(name);
+  if (maxBytes !== undefined && encoder.encode(JSON.stringify(value)).byteLength > maxBytes) {
+    details.push({ pointer: "", keyword: "maxBytes" });
+  }
+  if (name === "FindingsBatch") {
+    const batch = value as Schemas["FindingsBatch"];
+    batch.findings.forEach((finding, i) => {
+      (finding.masked_samples ?? []).forEach((sample, j) => {
+        if (details.length < MAX_VALIDATION_DETAILS && !isSufficientlyMasked(sample)) {
+          details.push({ pointer: `/findings/${i}/masked_samples/${j}`, keyword: "maskRatio" });
+        }
+      });
+    });
+  }
+  return details.length === 0 ? { ok: true, value } : { ok: false, details };
 }
 
 /** Names of every schema of the contract (for tests and diagnostics). */

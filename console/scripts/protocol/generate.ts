@@ -43,6 +43,23 @@ function rewriteRefs(value: Json): Json {
   return value;
 }
 
+/**
+ * Rejects any `$ref` that is not local to the document (`#/...`): no remote or file ref may be
+ * resolved at generation time, so the generator never touches the network nor other files.
+ */
+export function assertLocalRefs(value: unknown, path = "#"): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => assertLocalRefs(item, `${path}/${i}`));
+  } else if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "$ref" && (typeof v !== "string" || !v.startsWith("#/"))) {
+        throw new Error(`non-local $ref at ${path}: only "#/..." refs are allowed`);
+      }
+      assertLocalRefs(v, `${path}/${k}`);
+    }
+  }
+}
+
 export interface Artifacts {
   types: string;
   schemas: string;
@@ -50,7 +67,9 @@ export interface Artifacts {
 
 export async function renderArtifacts(): Promise<Artifacts> {
   const yamlText = await readFile(OPENAPI_URL, "utf8");
-  const doc = parse(yamlText) as { components?: { schemas?: { [key: string]: Json } } };
+  const parsed: unknown = parse(yamlText);
+  assertLocalRefs(parsed);
+  const doc = parsed as { components?: { schemas?: { [key: string]: Json } } };
   const schemas = doc.components?.schemas;
   if (!schemas || Object.keys(schemas).length === 0) {
     throw new Error("openapi.yaml has no components.schemas");
