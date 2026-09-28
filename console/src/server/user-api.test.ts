@@ -126,6 +126,12 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
       await handleLogin(userReq("POST", "/api/auth/login", { body: { username: `rnd${i}`, password: "wrong wrong" } }));
     }
     expect(argon2Stats.started - before).toBeLessThanOrEqual(loginFailuresUnknownUser.limit);
+    // L2: beyond the budget, unknown usernames get the same 401 (after a delay), never 429.
+    const beyond = await handleLogin(
+      userReq("POST", "/api/auth/login", { body: { username: "rnd-beyond", password: "wrong wrong" } }),
+    );
+    expect(beyond.status).toBe(401);
+    expect(await beyond.json()).toEqual({ error: "invalid_credentials" });
     // Known usernames keep their own per-user budget.
     expect((await login()).res.status).toBe(200);
   });

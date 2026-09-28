@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { and, eq, sql } from "drizzle-orm";
 import { Client } from "pg";
+import { PgBoss } from "pg-boss";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { getDb } from "@/db/client";
+import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
@@ -17,7 +18,9 @@ import {
 } from "@/server/crypto";
 import { handleLogin, loginFailuresUnknownUser } from "@/server/user-api";
 import { enqueueJob, MAX_JOB_ATTEMPTS } from "@/server/jobs";
-import { hasDb, setupTestDatabase } from "@/test/db";
+import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
+import { runtimeRoleWarnings } from "@/server/db-role-check";
+import { pgBossOptions } from "@/worker/queues";
 import {
   adminUser,
   agentRequest,
@@ -376,6 +379,20 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
   });
 
   describe("argon2id pool isolation (security re-review N1)", () => {
+    it("allows one unrecognized verification in flight per agent id (L1)", async () => {
+      const auth = await enroll();
+      const wrong = (await enroll("l1-other")).secret;
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      expect(results.filter((r) => r.status === 401)).toHaveLength(1);
+      expect(results.filter((r) => r.status === 503)).toHaveLength(5);
+    });
+
     it("saturated login and wrong-secret pools never block a known-good agent", async () => {
       const auth = await enroll();
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
@@ -527,6 +544,8 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
 
     it("caps held polls per agent, reserving slots before any await (M2)", async () => {
       const auth = await enroll();
+      // Warm the verified-secret cache (L1 allows one unrecognized verification per agent at once).
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
       pollClock.msPerSecond = 100;
       const results = await Promise.all(
         Array.from({ length: 5 }, () => handlePollJobs(agentRequest("GET", "/jobs?wait=2", { auth }))),
@@ -635,33 +654,79 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     });
   });
 
-  describe("database roles (R1)", () => {
-    it("the runtime role cannot alter, delete or unprotect the audit log", async () => {
+  describe("database roles (R1, N2, L3, L4)", () => {
+    it("the runtime role cannot create schemas, create in public, or touch the audit log", async () => {
       await adminUser();
-      const role = `t_rt_${randomUUID().slice(0, 8)}`;
-      const db = new URL(String(process.env.DATABASE_URL));
-      await getDb().execute(sql.raw(`create role ${role} login in role databastion_app`));
-      const url = new URL(db);
-      url.username = role;
-      const client = new Client({ connectionString: url.toString() });
+      const { url } = await createRuntimeRole();
+      const client = new Client({ connectionString: url });
       await client.connect();
       try {
         const [row] = (await client.query("select count(*)::int as n from users")).rows as { n: number }[];
         expect(row?.n).toBeGreaterThan(0);
         await client.query("insert into audit_log (actor_type, action) values ('system', 'user.bootstrap')");
         for (const stmt of [
+          "create schema databastion",
+          "create schema attacker",
+          "create table public.planted (x int)",
+          "create function public.format(text, name) returns text language sql as 'select 1::text'",
           "update audit_log set action = 'x'",
           "delete from audit_log",
           "truncate audit_log",
-          "alter table audit_log disable trigger all",
-          "drop trigger audit_log_no_update_delete on audit_log",
-          "drop table audit_log",
+          "alter table public.audit_log disable trigger all",
+          "drop trigger audit_log_no_update_delete on public.audit_log",
+          "drop table public.audit_log",
         ]) {
           await expect(client.query(stmt), stmt).rejects.toThrow();
         }
+        expect(await runtimeRoleWarnings(client)).toEqual([]);
       } finally {
         await client.end();
       }
+    });
+
+    it("databastion_app has no UPDATE, DELETE or TRUNCATE on audit_log and no CREATE on the database (L4)", async () => {
+      const { rows } = await getDb().execute(sql`
+        select has_table_privilege('databastion_app', 'public.audit_log', 'UPDATE') as upd,
+               has_table_privilege('databastion_app', 'public.audit_log', 'DELETE') as del,
+               has_table_privilege('databastion_app', 'public.audit_log', 'TRUNCATE') as trunc,
+               has_table_privilege('databastion_app', 'public.audit_log', 'INSERT') as ins,
+               has_database_privilege('databastion_app', current_database(), 'CREATE') as db_create,
+               has_schema_privilege('databastion_app', 'public', 'CREATE') as public_create,
+               has_schema_privilege('databastion_app', 'pgboss', 'CREATE') as pgboss_create`);
+      expect(rows[0]).toEqual({
+        upd: false,
+        del: false,
+        trunc: false,
+        ins: true,
+        db_create: false,
+        public_create: false,
+        pgboss_create: true,
+      });
+    });
+
+    it("warns when the console connects as the owner of audit_log (L3)", async () => {
+      const warnings = await runtimeRoleWarnings(getPool());
+      expect(warnings.some((w) => w.includes("owner of audit_log"))).toBe(true);
+    });
+
+    it("pg-boss installs and works as the runtime role in the pgboss schema", async () => {
+      const { url } = await createRuntimeRole();
+      const boss = new PgBoss(pgBossOptions(url));
+      boss.on("error", () => undefined);
+      await boss.start();
+      try {
+        await boss.createQueue("test.queue");
+        const id = await boss.send("test.queue", { n: 1 });
+        expect(id).toBeTruthy();
+        const jobsFetched = await boss.fetch("test.queue");
+        expect(jobsFetched.map((j) => j.id)).toEqual([id]);
+      } finally {
+        await boss.stop({ graceful: false });
+      }
+      const { rows } = await getDb().execute(
+        sql`select count(*)::int as n from pg_catalog.pg_tables where schemaname = 'pgboss'`,
+      );
+      expect(Number(rows[0]?.n)).toBeGreaterThan(0);
     });
   });
 

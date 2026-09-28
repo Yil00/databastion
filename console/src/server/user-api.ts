@@ -22,7 +22,7 @@ import {
   listEnrollmentTokens,
   revokeEnrollmentToken,
 } from "@/server/enrollment";
-import { loginArgon2Gate, sha256Hex } from "@/server/crypto";
+import { argon2MedianMs, loginArgon2Gate, sha256Hex } from "@/server/crypto";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket, readJsonBody } from "@/server/request";
 
@@ -85,8 +85,8 @@ async function requireUser(
 /** Failed logins: per source IP and per username, checked before argon2id. */
 export const loginFailuresPerIp = new RateLimiter(20, 15 * 60_000);
 export const loginFailuresPerUser = new RateLimiter(5, 15 * 60_000);
-/** Process-wide budget of failed logins on unknown usernames. */
-export const loginFailuresUnknownUser = new RateLimiter(30, 60_000);
+/** Process-wide budget of argon2id-backed failed logins on unknown usernames (slow refill). */
+export const loginFailuresUnknownUser = new RateLimiter(30, 5 * 60_000);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -138,8 +138,10 @@ export function handleLogin(req: Request): Promise<Response> {
     if (!user) {
       const reserved = loginFailuresUnknownUser.reserve("global");
       if (!reserved) {
-        const retry = loginFailuresUnknownUser.check("global").retryAfterS;
-        return error(429, "rate_limited", { "Retry-After": String(retry) });
+        // L2: same answer as a wrong password, after a delay close to an argon2id verification,
+        // without running one (no username enumeration through 429 vs 401 during a flood).
+        await new Promise((r) => setTimeout(r, argon2MedianMs()));
+        return error(401, "invalid_credentials");
       }
       refundUnknown = reserved;
     }

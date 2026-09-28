@@ -98,6 +98,9 @@ export function purgeSecretCache(agentId?: string): void {
   knownGood.delete(agentId);
 }
 
+/** Agent ids with an unrecognized-secret verification in flight (bounded by the pool size). */
+const unrecognizedInFlight = new Set<string>();
+
 export type AuthResult = { ok: true; agent: AgentRow } | { ok: false; response: Response };
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
@@ -149,7 +152,16 @@ export async function authenticateAgent(req: Request): Promise<AuthResult> {
     return limitedResponse({ agent: exempt ? undefined : key }) ?? { ok: false, response: rateLimited(1) };
   }
   // N1: the legitimate secret uses a reserved pool that floods of wrong secrets cannot fill.
-  const release = (exempt ? agentKnownGoodGate : agentArgon2Gate).tryAcquire();
+  // L1: in the shared pool, at most one verification in flight per agent id (fair allocation).
+  const fair = exempt ? true : !unrecognizedInFlight.has(agentId);
+  const gate = fair ? (exempt ? agentKnownGoodGate : agentArgon2Gate).tryAcquire() : null;
+  if (!exempt && gate) unrecognizedInFlight.add(agentId);
+  const release = gate
+    ? () => {
+        gate();
+        if (!exempt) unrecognizedInFlight.delete(agentId);
+      }
+    : null;
   if (!release) {
     // Not a failed attempt: give the reservations back.
     refundIp();

@@ -22,14 +22,28 @@ const ARGON2_OPTIONS = {
 /** Counters for tests and metrics: argon2 operations started, running, and peak concurrency. */
 export const argon2Stats = { started: 0, active: 0, maxActive: 0 };
 
+const recentDurations: number[] = [];
+const DEFAULT_ARGON2_MS = 50;
+
+/** Median duration of the last 32 argon2id operations (clamped), for timing-equivalent delays. */
+export function argon2MedianMs(): number {
+  if (recentDurations.length === 0) return DEFAULT_ARGON2_MS;
+  const sorted = [...recentDurations].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] ?? DEFAULT_ARGON2_MS;
+  return Math.min(1000, Math.max(10, Math.round(median)));
+}
+
 async function tracked<T>(op: () => Promise<T>): Promise<T> {
   argon2Stats.started++;
   argon2Stats.active++;
   argon2Stats.maxActive = Math.max(argon2Stats.maxActive, argon2Stats.active);
+  const start = performance.now();
   try {
     return await op();
   } finally {
     argon2Stats.active--;
+    recentDurations.push(performance.now() - start);
+    if (recentDurations.length > 32) recentDurations.shift();
   }
 }
 
