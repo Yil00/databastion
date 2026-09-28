@@ -348,9 +348,7 @@ fn every_ground_truth_id_is_a_frozen_classifier_id() {
     }
 }
 
-#[test]
-fn recall_and_precision_meet_the_phase_2_exit_criterion() {
-    let truth = load_truth();
+fn load_columns() -> BTreeMap<Key, Vec<String>> {
     let mut columns: BTreeMap<Key, Vec<String>> = BTreeMap::new();
     load_sql(
         "seed/out/postgres.sql",
@@ -369,26 +367,26 @@ fn recall_and_precision_meet_the_phase_2_exit_criterion() {
     );
     load_mongo(&mut columns);
     load_ldap(&mut columns);
+    columns
+}
 
-    // Every labelled location must exist in the seed (catches parser drift).
-    for key in truth.expected.keys() {
-        assert!(
-            columns.contains_key(key) || excluded(key),
-            "ground-truth location missing from the seed: {}",
-            shown(key)
-        );
-    }
-
+/// Evaluates every seed location, the column name given by `name`.
+/// Returns the per-classifier counts and the error lines (locations only).
+fn evaluate(
+    truth: &Truth,
+    columns: &BTreeMap<Key, Vec<String>>,
+    name: &dyn Fn(usize, &Key) -> String,
+) -> (BTreeMap<ClassifierId, Counts>, Vec<String>, usize) {
     let mut counts: BTreeMap<ClassifierId, Counts> = BTreeMap::new();
     let mut errors = Vec::new();
     let mut evaluated = 0;
-    for (key, values) in &columns {
+    for (i, (key, values)) in columns.iter().enumerate() {
         if excluded(key) {
             continue;
         }
         evaluated += 1;
         let raws: Vec<RawSample<'_>> = values.iter().map(|v| RawSample::new(v)).collect();
-        let got: BTreeSet<ClassifierId> = classify_column(&key.4, &raws)
+        let got: BTreeSet<ClassifierId> = classify_column(&name(i, key), &raws)
             .iter()
             .map(|f| f.classifier())
             .collect();
@@ -413,15 +411,18 @@ fn recall_and_precision_meet_the_phase_2_exit_criterion() {
             }
         }
     }
+    (counts, errors, evaluated)
+}
 
-    eprintln!("evaluated locations: {evaluated}");
+/// Prints the table; returns the classifiers below the exit criterion.
+fn report(counts: &BTreeMap<ClassifierId, Counts>, errors: &[String]) -> Vec<&'static str> {
     eprintln!(
         "{:<22} {:>4} {:>4} {:>4} {:>8} {:>10}",
         "classifier", "TP", "FP", "FN", "recall", "precision"
     );
     let mut failed = Vec::new();
     let (mut tp, mut fp, mut fn_) = (0, 0, 0);
-    for (c, k) in &counts {
+    for (c, k) in counts {
         let recall = f64::from(k.tp) / f64::from((k.tp + k.fn_).max(1));
         let precision = f64::from(k.tp) / f64::from((k.tp + k.fp).max(1));
         eprintln!(
@@ -443,13 +444,49 @@ fn recall_and_precision_meet_the_phase_2_exit_criterion() {
     eprintln!(
         "{:<22} {tp:>4} {fp:>4} {fn_:>4} {:>7.1}% {:>9.1}%",
         "overall (micro)",
-        f64::from(tp) / f64::from(tp + fn_) * 100.0,
-        f64::from(tp) / f64::from(tp + fp) * 100.0
+        f64::from(tp) / f64::from((tp + fn_).max(1)) * 100.0,
+        f64::from(tp) / f64::from((tp + fp).max(1)) * 100.0
     );
-    for e in &errors {
+    for e in errors {
         // Locations only (names are seed metadata), never values.
         eprintln!("{e}");
     }
+    failed
+}
+
+#[test]
+fn recall_and_precision_meet_the_phase_2_exit_criterion() {
+    let truth = load_truth();
+    let columns = load_columns();
+
+    // Every labelled location must exist in the seed (catches parser drift).
+    for key in truth.expected.keys() {
+        assert!(
+            columns.contains_key(key) || excluded(key),
+            "ground-truth location missing from the seed: {}",
+            shown(key)
+        );
+    }
+
+    let (counts, errors, evaluated) = evaluate(&truth, &columns, &|_, key| key.4.clone());
+    eprintln!("evaluated locations: {evaluated}");
+    let failed = report(&counts, &errors);
+    assert!(
+        failed.is_empty(),
+        "below the exit criterion: {failed:?}\n{}",
+        errors.join("\n")
+    );
+}
+
+/// The same seed values under opaque column names (`col_17`): values alone
+/// must carry the decision (the names only lower thresholds).
+#[test]
+fn values_alone_meet_the_exit_criterion_under_opaque_names() {
+    let truth = load_truth();
+    let columns = load_columns();
+    let (counts, errors, evaluated) = evaluate(&truth, &columns, &|i, _| format!("col_{i}"));
+    eprintln!("evaluated locations (opaque names): {evaluated}");
+    let failed = report(&counts, &errors);
     assert!(
         failed.is_empty(),
         "below the exit criterion: {failed:?}\n{}",
