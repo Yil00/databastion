@@ -23,6 +23,7 @@ An accepted ADR is not edited. A new ADR either supersedes it, or refines it (a 
 | [0015](0015-postgresql-connector-decisions.md) | PostgreSQL connector: TLS policy, authentication refusals, RLS policy allow-list, audit level before P4-A, partition and byte bounds (refines 0012) | Accepted |
 | [0016](0016-classifier-semantics-2026-09-1.md) | Classifier semantics for set 2026.09.1: value-based decision, personal e-mail, placeholders, age reference year, NFC, held-out evaluation process | Accepted |
 | [0017](0017-alerting.md) | Alerting: webhook signature, channel secrets, outbox delivery, skipped slugs, system alerts, SMTP client, SSRF model, volume bounds | Accepted |
+| [0018](0018-mysql-mariadb-grants-and-connector.md) | MySQL / MariaDB agent grants (minimal variant) and connector decisions: engine allow-list, own protocol client, authentication and TLS policy, audit level before P4-B | Accepted |
 | [0019](0019-incident-reopen-cutoff.md) | "Seen after the resolution" decided on the scan job's first delivery (refines 0014) | Accepted |
 
 Template: copy [template.md](template.md).

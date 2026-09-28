@@ -204,14 +204,26 @@ GRANT pg_read_all_stats TO databastion_agent;
 - For clusters with many or dynamically created schemas, ADR-0012 also defines an opt-in **extended variant** (`pg_read_all_data`, `pg_read_all_settings`), which exposes credential-bearing catalogs to the account; read the ADR before choosing it. Never grant `pg_monitor`, `SUPERUSER`, `BYPASSRLS` or any write privilege (full list in the ADR).
 - The dev environment (`dev/`, per-schema grants on `crm`, `billing`, `ops`) and the end-to-end harness (`e2e/`, no application schema yet, so `CONNECT` + `pg_read_all_stats` only) use the minimal variant (#31). As a test-only deviation, they set the role password with a `PASSWORD` literal in a session that does not record it.
 
-**MySQL / MariaDB**
+**MySQL / MariaDB** ([ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md), minimal variant, recommended default). Discovery through per-database `SELECT` only.
 ```sql
-CREATE USER 'databastion'@'localhost' IDENTIFIED BY '...';
-GRANT SELECT, PROCESS, SHOW VIEW ON *.* TO 'databastion'@'localhost';
-GRANT SELECT ON performance_schema.* TO 'databastion'@'localhost';
-```
+-- Restrict the host to the agent's address; require TLS; at least 2 connections
+-- (sampling + the separate KILL QUERY connection), 4 recommended.
+CREATE USER 'databastion'@'10.0.0.15' IDENTIFIED BY '...'
+  REQUIRE SSL WITH MAX_USER_CONNECTIONS 4;
+-- MariaDB only: a safety net, the connector sets its own statement timeout.
+-- ALTER USER 'databastion'@'10.0.0.15' WITH MAX_STATEMENT_TIME 30;
 
-**MySQL / MariaDB system schemas**: `SELECT ON *.*` also grants read access to `mysql.user` (password hashes) and the other system tables. Discovery must exclude the system schemas `mysql`, `information_schema`, `performance_schema` and `sys` from sampling (`performance_schema` is read for Audit only). Where practical, grant `SELECT` on the application databases only instead of `*.*`.
+-- Discovery: per application database
+GRANT SELECT ON app.* TO 'databastion'@'10.0.0.15';
+
+-- Audit (phase 4) only: statement history. Omit for a Discovery-only target.
+-- GRANT SELECT ON performance_schema.* TO 'databastion'@'10.0.0.15';
+```
+- Never grant `SELECT ON *.*` in the minimal variant: it reads `mysql.user` / `mysql.global_priv` (password hashes; a `mysql_native_password` hash is enough to log in), `mysql.servers` (`FEDERATED` credentials) and the general and slow log tables. No `PROCESS` (other sessions' statement text) and no `SHOW VIEW` either. `check()` reports any global privilege, any privilege beyond `SELECT`, `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, granted roles and `init_connect` as over-privilege.
+- `performance_schema` statement text carries literals: once Audit reads it (phase 4), it goes through the query normalizer before leaving the agent, like PostgreSQL query text (ADR-0012, obligation 5).
+- ADR-0018 also defines an **extended variant** (global `SELECT`) behind an explicit `extended_grants` opt-in; the opt-in is not implemented yet, so a global `SELECT` is reported as over-privilege.
+- The connector (P2-C, in review) samples base tables of local storage engines only (never `FEDERATED`, `CONNECT`, `SPIDER`, `S3`, `SPHINX`, NDB or `MERGE` tables, views or virtual generated columns), reads no statistics column during introspection (on MySQL 8.4, `TABLE_ROWS` makes a `FEDERATED` table connect to its remote server), refuses cleartext, PAM, `sha256_password`, `client_ed25519` and RSA key retrieval, and does not support proxies (ProxySQL, MaxScale). Details and residual risks in ADR-0018.
+- The dev environment (`dev/mysql/`, `dev/mariadb/`) still grants `SELECT, PROCESS, SHOW VIEW ON *.*` and is not a reference until it moves to the minimal variant.
 
 MongoDB: `read` roles on the targeted databases + `clusterMonitor`. OpenLDAP: a service DN with read rights on the tree and on `cn=accesslog`.
 
