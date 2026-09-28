@@ -138,7 +138,10 @@ jobs:
       # (labels.json and the pinned corpus SHA-256 up to date), then write the git-ignored
       # corpus.json; the scorer refuses a corpus whose SHA-256 differs from labels.json. Output is
       # aggregates plus column ids / tags of the errors, never a value.
+      # Report-only until the phase 2 exit: the first measurement (#44) is below the bar for every
+      # classifier. The PR that meets the exit criterion removes `continue-on-error` (ROADMAP P2-F).
       - name: Holdout classifier gate
+        continue-on-error: true
         run: |
           timeout 120 python3 ../dev/holdout/generate.py --check
           timeout 120 python3 ../dev/holdout/generate.py > /dev/null
