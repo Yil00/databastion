@@ -10,5 +10,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0004](0004-observability-via-console.md) | Agent metrics reported through the console | Accepted |
 | [0005](0005-open-core-license.md) | Apache 2.0, open-core model | Accepted |
 | [0006](0006-target-discovery.md) | Declared targets + local detection, no network scanning | Accepted |
+| [0007](0007-mask-access-events.md) | Audit access events are masked in the agent (extends 0003) | Accepted |
 
 Template: copy [template.md](template.md).
