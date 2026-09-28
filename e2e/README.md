@@ -24,9 +24,11 @@ cannot reach the console database or the outside. Only the proxy is published, o
 ## Flow
 1. Generate every secret (database passwords, metrics token, admin password, target superuser
    and agent passwords) and the test CA + proxy certificate into a private temporary directory,
-   write `agent.yaml`. The agent connects to the target as `databastion_agent` (`LOGIN`, no
-   superuser / createdb / createrole, `CONNECT`, `pg_read_all_data`, `pg_monitor`,
-   `default_transaction_read_only = on`: I4); the superuser password never leaves `target-pg`.
+   write `agent.yaml`. The agent connects to the target as `databastion_agent` (minimal
+   variant of [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md): `LOGIN`, no superuser /
+   createdb / createrole / replication / bypassrls, `CONNECTION LIMIT 4`, `CONNECT`,
+   `pg_read_all_stats`, role defaults `default_transaction_read_only = on` and statement / lock /
+   idle-in-transaction timeouts; no per-schema grants while `app` has no application schema: I4); the superuser password never leaves `target-pg`.
 2. Build the console and agent images, start the console stack and the target, wait for
    `/api/health/ready` through the proxy.
 3. `bootstrap-admin` with the random password (Docker secret file), log in through the user API
@@ -37,7 +39,9 @@ cannot reach the console database or the outside. Only the proxy is published, o
 5. Assert through `GET /api/agents` that the agent is `online` with target `pg-e2e` reported
    (the PostgreSQL connector is still a stub: the target is reported unreachable, audit level
    `none`, which is printed but not asserted), that `databastion_agent` has exactly the
-   attributes above and gets read-only sessions, and that `/metrics` (scraped from inside the web
+   attributes above (memberships exactly `pg_read_all_stats`, role settings in
+   `pg_db_role_setting` exactly the four defaults) and, in its own session, gets the defaults and
+   is denied `pg_authid` / `pg_user_mapping`, and that `/metrics` (scraped from inside the web
    container with the metrics token) shows `databastion_agent_up{agent_id="…"} 1`.
 6. Revoke the agent through the user API; within 60 s the agent must log
    `console rejected the current secret (401)`; the measured latency is printed and the test

@@ -38,6 +38,8 @@ services:
       - log_directory=/var/log/databastion
       - -c
       - log_filename=postgresql.log
+      # Dev-only convenience (logs readable from the host through the bind mount); production uses
+      # 0640 plus an ACL for the agent's OS user on log_directory only (ADR-0012).
       - -c
       - log_file_mode=0644
       # pgaudit: nothing server-wide; `read, write` on the `shop` database (ALTER DATABASE in

@@ -44,10 +44,12 @@ Dev-only values in [.env.example](.env.example), copied to `dev/.env` (git-ignor
 
 | Engine | Account | Rights |
 |--------|---------|--------|
-| PostgreSQL | `databastion` | `pg_read_all_data`, `pg_monitor`, `default_transaction_read_only=on` |
+| PostgreSQL | `databastion` | [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) minimal variant: `CONNECTION LIMIT 4`, no superuser / createdb / createrole / replication / bypassrls; `CONNECT`, `USAGE` + `SELECT` on `crm`, `billing`, `ops` (+ default privileges `FOR ROLE postgres`), `pg_read_all_stats`; role defaults `default_transaction_read_only=on`, `statement_timeout=30s`, `lock_timeout=2s`, `idle_in_transaction_session_timeout=60s` |
 | MariaDB / MySQL | `databastion@'%'` | `SELECT, PROCESS, SHOW VIEW ON *.*`, `SELECT ON performance_schema.*` |
 | MongoDB | `databastion` (auth db `admin`) | `read` on `app`, `clusterMonitor` |
 | OpenLDAP | `cn=databastion,ou=services,dc=example,dc=org` | read on the tree (except `userPassword`) and on `cn=accesslog` |
+
+PostgreSQL: no `pg_read_all_data` / `pg_monitor` (they expose `pg_authid`, `pg_user_mapping`, `pg_subscription`, large objects and raw statistics, ADR-0012); a schema added to the seed needs its own `USAGE` / `SELECT` grants in [postgres/initdb/20-databastion.sh](postgres/initdb/20-databastion.sh). `make dev-smoke` checks that the account cannot read `pg_authid` nor `pg_user_mapping`.
 
 MySQL / MariaDB: `SELECT ON *.*` also covers the system schemas; Discovery excludes `mysql`, `information_schema`, `performance_schema` and `sys` from sampling. The `'%'` host is only because the agent connects through the published port in dev.
 
@@ -66,7 +68,7 @@ ldapsearch -x -H ldap://127.0.0.1:1389 -D cn=databastion,ou=services,dc=example,
 Without local clients, use `docker compose -f dev/docker-compose.yml exec <service> …`.
 
 ## Engine configuration
-- **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`.
+- **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`, with `log_file_mode=0644` as a dev-only convenience (production: `0640` plus an ACL for the agent's OS user, ADR-0012).
 - **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the audit trail. Log: `dev/.state/logs/mariadb/server_audit.log`.
 - **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements).
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
