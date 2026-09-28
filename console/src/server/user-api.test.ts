@@ -3,7 +3,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { getDb } from "@/db/client";
 import { agents, auditLog, sessions, users } from "@/db/schema";
-import { argon2Stats, argon2VerifyDummy, MAX_CONCURRENT_LOGIN_ARGON2 } from "@/server/crypto";
+import { argon2Hash, argon2Stats, argon2VerifyDummy, MAX_CONCURRENT_LOGIN_ARGON2 } from "@/server/crypto";
+import { issueDeviceCookie } from "@/server/auth/device-cookie";
 import { bootstrapAdmin, BootstrapError } from "@/server/auth/users";
 import { handleEnroll } from "@/server/agent-api/handlers";
 import { hasDb, setupTestDatabase } from "@/test/db";
@@ -21,6 +22,7 @@ import {
   handleSession,
   loginFailuresPerIp,
   loginFailuresPerUser,
+  loginFailuresPerDevice,
   loginFailuresPerUserGlobal,
   loginFailuresUnknownUser,
   loginSlowdown,
@@ -48,12 +50,14 @@ function userReq(
   });
 }
 
-async function login(username = "admin", password = PASSWORD, ip?: string) {
+async function login(username = "admin", password = PASSWORD, ip?: string, cookie?: string) {
   const headers = ip ? { "X-Forwarded-For": ip } : undefined;
-  const res = await handleLogin(userReq("POST", "/api/auth/login", { body: { username, password }, headers }));
-  const setCookie = res.headers.get("set-cookie") ?? "";
+  const res = await handleLogin(userReq("POST", "/api/auth/login", { body: { username, password }, headers, cookie }));
+  const cookies = res.headers.getSetCookie();
+  const setCookie = cookies.find((c) => c.startsWith("databastion_session=")) ?? "";
+  const device = (cookies.find((c) => c.startsWith("databastion_device=")) ?? "").split(";")[0] ?? "";
   const body = res.status === 200 ? ((await res.json()) as { csrf_token: string }) : undefined;
-  return { res, setCookie, cookie: setCookie.split(";")[0] ?? "", csrf: body?.csrf_token ?? "" };
+  return { res, setCookie, cookie: setCookie.split(";")[0] ?? "", device, csrf: body?.csrf_token ?? "" };
 }
 
 async function auditCount(action: string, outcome = "success") {
@@ -71,6 +75,7 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     loginFailuresPerIp.clear();
     loginFailuresPerUser.clear();
     loginFailuresPerUserGlobal.clear();
+    loginFailuresPerDevice.clear();
     loginFailuresUnknownUser.clear();
   });
 
@@ -102,11 +107,45 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     expect(String(dump.rows[0]?.s)).not.toContain(ok.cookie.split("=")[1]);
   });
 
-  it("rate limits failed logins per username", async () => {
-    const statuses: number[] = [];
-    for (let i = 0; i < 6; i++) statuses.push((await login("admin", "not the password")).res.status);
-    expect(statuses.slice(0, 5)).toEqual([401, 401, 401, 401, 401]);
-    expect(statuses[5]).toBe(429);
+  it("unknown IP: the per-username limit degrades to the slow-down, never a hard 429 (N2)", async () => {
+    loginSlowdown.ms = 150;
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 5; i++) statuses.push((await login("admin", "not the password")).res.status);
+      expect(statuses).toEqual([401, 401, 401, 401, 401]);
+      // Over the limit: still 401 for a wrong password, after the slow-down.
+      let start = performance.now();
+      expect((await login("admin", "not the password")).res.status).toBe(401);
+      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
+      // One attempt in flight: concurrent ones get 503.
+      const burst = await Promise.all([login("admin", "nope nope"), login("admin", "nope nope")]);
+      expect(burst.map((r) => r.res.status).sort()).toEqual([401, 503]);
+      // The right password still logs in (slowed down).
+      start = performance.now();
+      expect((await login()).res.status).toBe(200);
+      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
+    } finally {
+      loginSlowdown.ms = 2000;
+    }
+  });
+
+  it("unknown IP: a valid device cookie skips the degraded slot (N1, N2)", async () => {
+    const first = await login();
+    expect(first.res.status).toBe(200);
+    expect(first.device).toMatch(/^databastion_device=v1\./);
+    for (let i = 0; i < 5; i++) await login("admin", "not the password");
+    loginSlowdown.ms = 1000;
+    try {
+      const attacker = login("admin", "held slot guess");
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await login()).res.status).toBe(503);
+      const start = performance.now();
+      expect((await login("admin", PASSWORD, undefined, first.device)).res.status).toBe(200);
+      expect(performance.now() - start).toBeLessThan(900);
+      expect((await attacker).res.status).toBe(401);
+    } finally {
+      loginSlowdown.ms = 2000;
+    }
   });
 
   describe("P1-D M2: no remote lock-out of an account", () => {
@@ -152,6 +191,59 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
       const other = performance.now();
       expect((await login("someone-else", "nope nope", "198.51.100.205")).res.status).toBe(401);
       expect(performance.now() - other).toBeLessThan(140 + 1000);
+    });
+
+    it("a valid device cookie for that username skips the global cap and a held slot (N1)", async () => {
+      const admin = await login("admin", PASSWORD, "198.51.100.60");
+      expect(admin.res.status).toBe(200);
+      expect(admin.device).not.toBe("");
+      // Another user, with its own valid device cookie.
+      await getDb()
+        .insert(users)
+        .values({ username: "analyst-n1", role: "analyst", passwordHash: await argon2Hash(PASSWORD) })
+        .onConflictDoNothing();
+      const analyst = await login("analyst-n1", PASSWORD, "198.51.100.61");
+      expect(analyst.res.status).toBe(200);
+      const [adminRow] = await getDb().select().from(users).where(eq(users.username, "admin"));
+      const tampered = admin.device.slice(0, -1) + (admin.device.endsWith("0") ? "1" : "0");
+      const otherKey = (
+        issueDeviceCookie(adminRow?.id ?? "", {
+          ...process.env,
+          DATABASTION_ENCRYPTION_KEY: "another-server-key-0123456789abcdefghijklmnop",
+        }) ?? ""
+      ).split(";")[0];
+
+      for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
+      loginSlowdown.ms = 1000;
+      // A distributed attacker holds the single degraded slot.
+      const attacker = login("admin", "distributed guess", "203.0.113.90");
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await login("admin", PASSWORD, "198.51.100.62")).res.status).toBe(503);
+      for (const cookie of [analyst.device, tampered, otherKey]) {
+        expect((await login("admin", PASSWORD, "198.51.100.62", cookie)).res.status).toBe(503);
+      }
+      const start = performance.now();
+      const ok = await login("admin", PASSWORD, "198.51.100.62", admin.device);
+      expect(ok.res.status).toBe(200);
+      expect(performance.now() - start).toBeLessThan(900);
+      // A fresh device cookie is issued on every successful login.
+      expect(ok.device).not.toBe("");
+      expect(ok.device).not.toBe(admin.device);
+      expect((await attacker).res.status).toBe(401);
+    });
+
+    it("a device cookie stays subject to the (username, IP) limit and its own failure limit (N1)", async () => {
+      const admin = await login("admin", PASSWORD, "198.51.100.70");
+      for (let i = 0; i < 5; i++) await login("admin", "not the password", "198.51.100.71", admin.device);
+      // Same IP: 429 even with the cookie.
+      expect((await login("admin", PASSWORD, "198.51.100.71", admin.device)).res.status).toBe(429);
+      // The cookie saw 5 failures: no bypass any more (a stolen cookie cannot be used to guess).
+      for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
+      loginSlowdown.ms = 1000;
+      const attacker = login("admin", "distributed guess", "203.0.113.91");
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await login("admin", PASSWORD, "198.51.100.72", admin.device)).res.status).toBe(503);
+      await attacker;
     });
 
     it("counts failures from every IP toward the global cap", async () => {

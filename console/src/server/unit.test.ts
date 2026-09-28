@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { assertSafeDetails } from "./audit";
 import { jobHub } from "./agent-api/job-hub";
-import { startupWarnings } from "./startup-checks";
+import { DEVICE_COOKIE_TTL_S, issueDeviceCookie, readDeviceCookie } from "./auth/device-cookie";
+import { startupErrors, startupWarnings } from "./startup-checks";
 import { parseWait } from "./agent-api/handlers";
 import {
   argon2Hash,
@@ -73,6 +74,14 @@ describe("ipBucket", () => {
     expect(ipBucket("::ffff:198.51.100.7")).toBe("198.51.100.7");
     expect(ipBucket("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
   });
+
+  it("aggregates IPv6 by /56 on request (logins, P1-D N1)", () => {
+    expect(ipBucket("2001:db8:1:2ab::1", 56)).toBe("2001:db8:1:200::/56");
+    expect(ipBucket("2001:db8:1:2ff:ffff::", 56)).toBe("2001:db8:1:200::/56");
+    expect(ipBucket("2001:db8:1:300::1", 56)).toBe("2001:db8:1:300::/56");
+    expect(ipBucket("192.0.2.1", 56)).toBe("192.0.2.1");
+    expect(ipBucket("::ffff:198.51.100.7", 56)).toBe("198.51.100.7");
+  });
 });
 
 describe("X-Forwarded-For misconfiguration warning (L-b)", () => {
@@ -122,11 +131,66 @@ describe("startupWarnings", () => {
     expect(startupWarnings(env(prod))).toHaveLength(1);
     expect(startupWarnings(env({ ...prod, DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
     expect(startupWarnings(env({ ...prod, DATABASTION_TRUST_PROXY: "1", DATABASTION_INSECURE_COOKIES: "1" }))).toHaveLength(1);
-    // P1-D I2: no server key, no known-good fingerprints.
-    const noKey = startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }));
-    expect(noKey).toHaveLength(1);
-    expect(noKey[0]).toContain("DATABASTION_ENCRYPTION_KEY");
+    // The missing server key is an error now (startupErrors, P1-D N3), not a warning.
+    expect(startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
     expect(startupWarnings(env({ NODE_ENV: "development" }))).toHaveLength(0);
+  });
+});
+
+describe("startupErrors (P1-D N3)", () => {
+  const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
+  it("names the disabled protections when the server key is missing, short or unreadable in production", () => {
+    const cases: Record<string, string>[] = [
+      { NODE_ENV: "production" },
+      { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "too-short" },
+      { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: "/nonexistent/encryption_key" },
+    ];
+    for (const e of cases) {
+      const errors = startupErrors(env(e));
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("DATABASTION_ENCRYPTION_KEY");
+      expect(errors[0]).toContain("shared (NAT / proxy) IP");
+      expect(errors[0]).toContain("device cookies");
+      expect(errors[0]).not.toContain("too-short");
+    }
+    expect(startupErrors(env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) }))).toEqual([]);
+    expect(startupErrors(env({ NODE_ENV: "development" }))).toEqual([]);
+  });
+});
+
+describe("login device cookies (P1-D N1)", () => {
+  const KEY_A = "device-cookie-test-key-A-0123456789abcdefghijkl";
+  const KEY_B = "device-cookie-test-key-B-0123456789abcdefghijkl";
+  const USER = "0192f0a1-0000-7000-8000-000000000001";
+  const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
+  const req = (cookie: string) => new Request("http://console.test/api/auth/login", { headers: { cookie } });
+  const pair = (setCookie: string | null) => (setCookie ?? "").split(";")[0] ?? "";
+
+  it("is signed, bound to the user id, and has the expected attributes", () => {
+    const set = issueDeviceCookie(USER, env({ NODE_ENV: "test", DATABASTION_ENCRYPTION_KEY: KEY_A }));
+    expect(set).toMatch(/^databastion_device=v1\./);
+    expect(set).toContain("HttpOnly");
+    expect(set).toContain("SameSite=Strict");
+    expect(set).toContain("Path=/");
+    const cookie = readDeviceCookie(req(pair(set)), env({ NODE_ENV: "test", DATABASTION_ENCRYPTION_KEY: KEY_A }));
+    expect(cookie?.userId).toBe(USER);
+    expect(cookie?.nonce).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    const prod = issueDeviceCookie(USER, env({ NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: KEY_A }));
+    expect(prod).toMatch(/^__Host-databastion_device=/);
+    expect(prod).toContain("Secure");
+  });
+
+  it("rejects a tampered cookie, another key, an expired one, and everything without a key", () => {
+    const e = env({ NODE_ENV: "test", DATABASTION_ENCRYPTION_KEY: KEY_A });
+    const value = pair(issueDeviceCookie(USER, e));
+    const other = value.replace(USER, "0192f0a1-0000-7000-8000-000000000002");
+    const flipped = value.slice(0, -1) + (value.endsWith("0") ? "1" : "0");
+    expect(readDeviceCookie(req(other), e)).toBeNull();
+    expect(readDeviceCookie(req(flipped), e)).toBeNull();
+    expect(readDeviceCookie(req(value), env({ NODE_ENV: "test", DATABASTION_ENCRYPTION_KEY: KEY_B }))).toBeNull();
+    expect(readDeviceCookie(req(value), e, Date.now() + DEVICE_COOKIE_TTL_S * 1000)).toBeNull();
+    expect(issueDeviceCookie(USER, env({ NODE_ENV: "test" }))).toBeNull();
+    expect(readDeviceCookie(req(value), env({ NODE_ENV: "test" }))).toBeNull();
   });
 });
 
