@@ -415,8 +415,9 @@ enum Parsed {
     Events(EventsBatch),
 }
 
-/// A batch could not be serialized. Its content is lost: serializing the
-/// same content again is deterministic, so a retry would fail again.
+/// A batch could not be serialized, or (when splitting) its spooled bytes
+/// could not be decoded for re-encoding. Its content is lost: both are
+/// deterministic, so a retry would fail again.
 /// Callers count it (`batches_serialization_failed_total`); nothing of its
 /// content is kept or logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,8 +509,8 @@ impl ResultBatch {
     }
 
     /// The same batch without the items at `drop` (sorted), under a **new**
-    /// `batch_id`; `Ok(None)` if nothing is left, `Err` if the new batch
-    /// could not be serialized.
+    /// `batch_id`; `Ok(None)` if nothing is left, `Err` if this batch could
+    /// not be decoded or the new batch could not be serialized.
     pub(crate) fn without(&self, drop: &[usize]) -> Result<Option<Self>, Unserializable> {
         fn keep<T: Clone>(items: &[T], drop: &[usize]) -> Vec<T> {
             items
@@ -519,10 +520,9 @@ impl ResultBatch {
                 .map(|(_, x)| x.clone())
                 .collect()
         }
-        // The bytes were validated when this batch was built or parsed.
-        let Some(parsed) = Self::decode(self.findings, &self.bytes) else {
-            return Ok(None);
-        };
+        // The bytes were validated when this batch was built or parsed: a
+        // decode failure is an error, never "nothing left".
+        let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
         let out = match parsed {
             Parsed::Findings(b) => Parsed::Findings(FindingsBatch {
                 batch_id: new_batch_id(),
@@ -547,10 +547,12 @@ impl ResultBatch {
         }
         let first: Vec<usize> = (0..n / 2).collect();
         let second: Vec<usize> = (n / 2..n).collect();
-        let (Some(a), Some(b)) = (self.without(&second)?, self.without(&first)?) else {
-            return Ok(None);
-        };
-        Ok(Some((a, b)))
+        let (a, b) = (self.without(&second)?, self.without(&first)?);
+        debug_assert!(a.is_some() && b.is_some(), "both halves hold items");
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((a, b))),
+            _ => Err(Unserializable),
+        }
     }
 }
 
@@ -796,6 +798,18 @@ mod tests {
         assert!(accept::no_content(&reply(204, false, b"")).is_some());
         assert!(accept::no_content(&reply(200, true, b"{}")).is_none());
         assert!(accept::no_content(&reply(202, false, b"")).is_none());
+    }
+
+    #[test]
+    fn splitting_an_undecodable_batch_is_an_error() {
+        let batch = ResultBatch {
+            findings: true,
+            batch_id: new_batch_id(),
+            len: 4,
+            bytes: b"not a batch".to_vec(),
+        };
+        assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
+        assert_eq!(batch.halves().unwrap_err(), Unserializable);
     }
 
     #[test]
