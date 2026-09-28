@@ -32,8 +32,8 @@ import { argon2Stats } from "./crypto";
  *
  * Agent-provided names are restricted by the contract to `^[a-z][a-z0-9_]{0,63}$` (values: numbers).
  * Names on `RESERVED_REPORTED_NAMES` (or starting with `target_` at agent level) are ignored, so an
- * agent cannot shadow a console-computed series. Cardinality caps: `MAX_AGENTS` agents,
- * `MAX_REPORTED_SERIES` agent-reported series per scrape.
+ * agent cannot shadow a console-computed series. Cardinality caps: `MAX_AGENTS` agents (in SQL),
+ * `MAX_REPORTED_SERIES` agent-driven series per scrape (agent-reported and per-target series).
  */
 
 export const SILENT_AFTER_S = 90;
@@ -188,16 +188,22 @@ export async function collectMetrics(db: Database): Promise<string> {
 
   const targetRows = (
     await db.execute<TargetMetricsRow>(sql`
-      select agent_id, target_id, reachable, audit_level::text as audit_level, metrics
-      from agent_targets where present order by agent_id, target_id`)
+      select t.agent_id, t.target_id, t.reachable, t.audit_level::text as audit_level, t.metrics
+      from agent_targets t
+      join (select id from agents where revoked_at is null and locked_at is null
+            order by enrolled_at, id limit ${MAX_AGENTS}) a on a.id = t.agent_id
+      where t.present
+      order by t.agent_id, t.target_id
+      limit ${MAX_REPORTED_SERIES + 1}`)
   ).rows;
   for (const t of targetRows) {
     if (!exported.has(t.agent_id)) continue;
     const labels = { agent_id: t.agent_id, target_id: t.target_id };
-    x.add("databastion_agent_target_reachable", "gauge", "Whether the agent reached the target at its last check.", t.reachable ? 1 : 0, labels);
+    // Per-target series are agent-driven cardinality: counted against the same cap.
+    addReported("databastion_agent_target_reachable", "Whether the agent reached the target at its last check.", t.reachable ? 1 : 0, labels);
     const level = AUDIT_LEVEL_VALUE[t.audit_level];
     if (level !== undefined) {
-      x.add("databastion_agent_target_audit_level", "gauge", "Audit level of the target: full 3, partial 2, limited 1, none 0.", level, labels);
+      addReported("databastion_agent_target_audit_level", "Audit level of the target: full 3, partial 2, limited 1, none 0.", level, labels);
     }
     for (const [name, value] of Object.entries(t.metrics ?? {})) {
       const v = num(value);
