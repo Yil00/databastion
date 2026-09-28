@@ -18,7 +18,7 @@ The MySQL / MariaDB block of [05-security.md](../05-security.md) recommended `GR
    - `SELECT` per application database only (`GRANT SELECT ON app.* …`), never `ON *.*`.
    - `SELECT ON performance_schema.*` only when Audit (phase 4) is enabled for the target. It comes with the statement-text obligation of ADR-0012 obligation 5: any `SQL_TEXT` / `DIGEST_TEXT` read goes through the query normalizer before it reaches the uplink or a log line.
    - No `PROCESS`, no `SHOW VIEW`, no global privilege.
-   - Account options: `REQUIRE SSL`, `MAX_USER_CONNECTIONS` of at least 2 (the sampling connection plus the separate connection used for `KILL QUERY`; 4 recommended), a restricted host instead of `'%'`. MariaDB: `MAX_STATEMENT_TIME` on the account as a safety net (the connector sets its own).
+   - Account options: `REQUIRE SSL`, `MAX_USER_CONNECTIONS` of at least 3 (a running scan, a concurrent `check()` and the separate connection used for `KILL QUERY`; 4 recommended), a restricted host instead of `'%'`. MariaDB: `MAX_STATEMENT_TIME` on the account as a safety net (the connector sets its own).
    - **Extended variant**: a global `SELECT`, for servers with many or dynamically created databases, behind an explicit `extended_grants` opt-in in `agent.yaml`, reported by `check()` as an expected warning. The opt-in is not implemented yet; until it is, a global `SELECT` is reported as over-privilege.
    - `check()` reports over-privilege (warned, not refused): any global privilege (including `SELECT ON *.*`, `PROCESS`, `SUPER`, `FILE`), any privilege other than `SELECT` (including `CREATE TEMPORARY TABLES`), any grant `WITH GRANT OPTION`, `SELECT` on the `mysql` or `sys` database, granted roles (their privileges are not evaluated), and a non-empty `init_connect`.
 2. **Connector obligations.**
@@ -53,7 +53,7 @@ Listed, not decided here:
 - The console shows at most Partial for MySQL / MariaDB targets until P4-B, even with an audit plugin active.
 
 ### Residual risks
-- **`disable_insecure`** accepts the `caching_sha2_password` fast-path scramble on a network without TLS: an observer can attack it offline, and an active attacker can relay the authentication and send its own statements (no read-only guarantee), as with PostgreSQL.
+- **`disable_insecure`** accepts the `caching_sha2_password` fast-path scramble on a network without TLS: an observer can brute-force the password offline, exactly as with `mysql_native_password`, and an active attacker can force this path with an auth switch, and an active attacker can relay the authentication and send its own statements (no read-only guarantee), as with PostgreSQL.
 - **Engine change race**: a table altered to a remote engine between the in-transaction engine check and the `SELECT` would be read once through that engine (a small window; it needs `ALTER` rights on the table).
 - **Temporary tables**: a read-only transaction still allows `CREATE TEMPORARY TABLE`. The connector never creates one, and the privilege is flagged as over-privilege.
 - **Sampling bias**: `LIMIT` without `ORDER BY` reads the first rows in storage order (no `ORDER BY RAND()`, which is a full scan and sort), so the sample is not random.
