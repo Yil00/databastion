@@ -91,7 +91,8 @@ Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
-objects), then run `migrate` again. The roles and passwords are created outside migrations (the
+objects), then run `migrate` again. `migrate` repeats the same check as a pre-flight on every run,
+before any migration SQL (also when no migration is pending). The roles and passwords are created outside migrations (the
 owner has no `CREATEROLE`); with the example compose file,
 [deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
 first database initialization, reading the passwords from the Docker secret files inside psql
