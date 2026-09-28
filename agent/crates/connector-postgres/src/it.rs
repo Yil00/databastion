@@ -75,12 +75,28 @@ fn url(var: &str) -> Option<Url> {
     })
 }
 
+/// Reports a skipped check. When its prerequisite is listed in
+/// `DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`,
+/// `pgaudit`, `weak-auth`, `tls`, or `all`), the skip is a failure: CI
+/// lists what each run must exercise.
+fn skip(prerequisite: &str, message: &str) {
+    let required = std::env::var("DATABASTION_TEST_REQUIRE").unwrap_or_default();
+    assert!(
+        !required
+            .split(',')
+            .any(|r| r.trim() == prerequisite || r.trim() == "all"),
+        "required test prerequisite `{prerequisite}` missing: {message}"
+    );
+    eprintln!("skipped: {message}");
+}
+
 fn agent_url() -> Option<Url> {
     let u = url("DATABASTION_TEST_PG_URL");
     if u.is_none() {
-        eprintln!(
-            "skipped: DATABASTION_TEST_PG_URL is not set (start `make dev` or \
-             dev/postgres/local-cluster.sh)"
+        skip(
+            "pg",
+            "DATABASTION_TEST_PG_URL is not set (start `make dev` or \
+             dev/postgres/local-cluster.sh)",
         );
     }
     u
@@ -89,7 +105,10 @@ fn agent_url() -> Option<Url> {
 fn admin_url() -> Option<Url> {
     let u = url("DATABASTION_TEST_PG_ADMIN_URL");
     if u.is_none() {
-        eprintln!("skipped: DATABASTION_TEST_PG_ADMIN_URL is not set (ADR-0012 fixture probes)");
+        skip(
+            "admin",
+            "DATABASTION_TEST_PG_ADMIN_URL is not set (ADR-0012 fixture probes)",
+        );
     }
     u
 }
@@ -473,10 +492,7 @@ async fn seed_recall_regression() {
         .filter(|l| l["engine"] == "postgresql" && l["database"] == u.dbname.as_str())
         .collect();
     if pg.is_empty() {
-        eprintln!(
-            "skipped: no ground-truth location for database {}",
-            u.dbname
-        );
+        skip("pg", "no ground-truth location for this database");
         return;
     }
     let (_dir, t) = target(&u, &u.user, &u.password, &u.dbname, false);
@@ -879,7 +895,10 @@ async fn adr_0012_probes() {
             "TABLESAMPLE statements seen by pg_stat_statements"
         );
     } else {
-        eprintln!("skipped: pg_stat_statements not queryable (TABLESAMPLE statement check)");
+        skip(
+            "pss",
+            "pg_stat_statements not queryable (TABLESAMPLE statement check)",
+        );
     }
 
     // No connection reached the sink during the scan (L5).
@@ -976,7 +995,10 @@ async fn adr_0012_probes() {
         eprintln!("pgaudit loaded; pgaudit.log readable without pg_read_all_settings");
     } else {
         assert_eq!(probe.pgaudit_loaded, Some(false));
-        eprintln!("skipped: pgaudit is not loaded on this server (pgaudit.log probe)");
+        skip(
+            "pgaudit",
+            "pgaudit is not loaded on this server (pgaudit.log probe)",
+        );
     }
 }
 
@@ -1061,7 +1083,10 @@ async fn cleartext_and_md5_passwords_are_refused_without_tls() {
         .map(|rows| rows.iter().map(|r| (r.get(0), r.get(1))).collect())
         .unwrap_or_default();
     if methods.len() < 2 {
-        eprintln!("skipped: no md5 / password pg_hba lines for the test roles");
+        skip(
+            "weak-auth",
+            "no md5 / password pg_hba lines for the test roles",
+        );
         return;
     }
     for (role, encryption) in [
@@ -1101,7 +1126,7 @@ async fn cleartext_and_md5_passwords_are_refused_without_tls() {
 async fn verify_full_tls_with_a_pinned_ca() {
     let Some(u) = agent_url() else { return };
     let Ok(ca) = std::env::var("DATABASTION_TEST_PG_CA_FILE") else {
-        eprintln!("skipped: DATABASTION_TEST_PG_CA_FILE is not set (TLS test)");
+        skip("tls", "DATABASTION_TEST_PG_CA_FILE is not set (TLS test)");
         return;
     };
     let _serial = SERIAL.lock().await;
@@ -1119,4 +1144,76 @@ async fn verify_full_tls_with_a_pinned_ca() {
     TLS.with(|t| *t.borrow_mut() = "tls: disable".to_owned());
     assert!(!health.reachable);
     assert_eq!(health.failure, Some(FailureCode::TargetUnreachable));
+}
+
+#[tokio::test]
+async fn poisoned_session_is_closed_before_submit() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    probe_fixtures(&adm, &u.user).await;
+    let (_dir, t) = target(&u, &u.user, &u.password, PROBE_DB, false);
+    let observer = admin(&adm, PROBE_DB).await;
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &t,
+        &Limits::default(),
+        key(),
+    );
+    // Capacity 1, already full: the first submit blocks. `probe.a_wide`
+    // is the first object: its sample stops at the byte budget, then the
+    // scan blocks in submit.
+    let (sink, mut rx) = FindingSink::channel(1);
+    sink.submit(MaskedFinding::new(
+        databastion_classifiers::masking::ClassifierId::PII_EMAIL,
+        Vec::new(),
+    ))
+    .await
+    .unwrap();
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let connector = PostgresConnector::new();
+    let scan = connector.discover(&job, &sink);
+    tokio::pin!(scan);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut scan)
+            .await
+            .is_err()
+    );
+    assert!(logs.text().contains("sample byte budget reached"));
+    // No agent backend left in a transaction, no lock on the relation.
+    let mut held: (i64, i64) = (-1, -1);
+    for _ in 0..30 {
+        let row = observer
+            .query_one(
+                "SELECT (SELECT count(*) FROM pg_stat_activity \
+                         WHERE application_name = 'databastion-agent' \
+                           AND state LIKE 'idle in transaction%'), \
+                        (SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) \
+                         WHERE a.application_name = 'databastion-agent' \
+                           AND l.relation = 'probe.a_wide'::regclass)",
+                &[],
+            )
+            .await
+            .unwrap();
+        held = (row.get(0), row.get(1));
+        if held == (0, 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(held, (0, 0), "transaction or lock held across submit");
+    // Drain: the scan completes on a new session.
+    let mut n = 0;
+    loop {
+        tokio::select! {
+            r = &mut scan => {
+                r.unwrap();
+                break;
+            }
+            f = rx.recv() => n += usize::from(f.is_some()),
+        }
+    }
+    assert!(n > 1);
 }

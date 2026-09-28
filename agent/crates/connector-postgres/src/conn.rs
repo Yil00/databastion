@@ -173,7 +173,9 @@ impl Session {
                 tracing::warn!(
                     target_id = %target.id,
                     "TLS disabled on a network connection (tls: disable_insecure): samples and \
-                     statements travel in clear"
+                     statements travel in clear, and read-only is not guaranteed (an attacker \
+                     on the path can relay the SCRAM exchange, which has no channel binding, \
+                     and send its own statements)"
                 );
                 RustlsConnector::disabled()
             }
@@ -219,8 +221,9 @@ impl Session {
             if refused_auth(&e) {
                 tracing::warn!(
                     target_id = %target.id,
-                    "the server asked for a cleartext or MD5 password on a connection without \
-                     TLS: refused (use SCRAM, or TLS)"
+                    "the server asked for a cleartext or MD5 password, or weak SCRAM parameters \
+                     (fewer than 4096 iterations), on a connection without TLS: refused (use \
+                     SCRAM, or TLS)"
                 );
                 PgError::new(FailureCode::AuthenticationFailed, Stage::Connect)
             } else {

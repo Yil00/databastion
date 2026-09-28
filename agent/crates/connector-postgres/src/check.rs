@@ -219,7 +219,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     let mut notes: Vec<String> = Vec::new();
     if settings.tls == databastion_core::config::PgTlsMode::DisableInsecure {
         notes.push(
-            "INSECURE: TLS disabled on a network connection (tls: disable_insecure)".to_owned(),
+            "INSECURE: TLS disabled on a network connection (tls: disable_insecure): traffic \
+             in clear, read-only not guaranteed"
+                .to_owned(),
         );
     }
     for database in &settings.databases {

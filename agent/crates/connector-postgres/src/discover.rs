@@ -79,11 +79,11 @@ async fn scan_database(
     sink: &FindingSink,
 ) -> Result<(), ConnectorError> {
     let db_name = normalize(database);
-    let mut session = Session::connect(target, database, timeouts)
+    let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
     let relations = {
-        let tx = session
+        let tx = first
             .begin(timeouts)
             .await
             .map_err(|e| fail(target, &db_name, e))?;
@@ -98,21 +98,32 @@ async fn scan_database(
             }
         }
     };
+    let mut session = Some(first);
     let (units, coverage) = catalog::plan(&relations, |schema, name| {
         job.includes_schema(schema) && job.includes_object(name)
     });
     log_coverage(target, &db_name, &coverage);
     let mut skipped = 0usize;
     for unit in &units {
-        if session.is_poisoned() {
-            // A cancel request may be in flight on the old session.
-            session = Session::connect(target, database, timeouts)
+        let current = match session.take() {
+            Some(s) => s,
+            // Replaced after a budget stop.
+            None => Session::connect(target, database, timeouts)
                 .await
-                .map_err(|e| fail(target, &db_name, e))?;
-        }
+                .map_err(|e| fail(target, &db_name, e))?,
+        };
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sample = match sample_unit(&session, unit, job.sample_rows(), timeouts).await {
+        let sampled = sample_unit(&current, unit, job.sample_rows(), timeouts).await;
+        // A poisoned session (budget stop: cancel in flight, aborted
+        // transaction still open, AccessShareLock held) is closed here,
+        // before any submit (L-new-1); the next object reconnects.
+        if current.is_poisoned() {
+            drop(current);
+        } else {
+            session = Some(current);
+        }
+        let sample = match sampled {
             Ok(s) => s,
             Err(e) if !e.fatal => {
                 skipped += 1;

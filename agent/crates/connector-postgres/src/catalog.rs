@@ -146,7 +146,7 @@ async fn check_policies(tx: &ReadTx<'_>, relations: &mut [Relation]) -> Result<(
             continue; // no SELECT policy: default deny, nothing runs
         };
         let texts: Option<Vec<&str>> = exprs.iter().map(Option::as_deref).collect();
-        let Some(refs) = texts.and_then(|t| crate::policy::scan(&t)) else {
+        let Some(refs) = texts.and_then(|t| crate::policy::scan(&t, rel.oid)) else {
             rel.rls_blocked = true;
             continue;
         };

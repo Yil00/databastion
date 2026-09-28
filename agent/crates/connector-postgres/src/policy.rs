@@ -129,9 +129,12 @@ fn oid(token: Option<&String>) -> Option<u32> {
     token?.parse().ok()
 }
 
-/// Scans policy expressions. `None`: unsupported (too large, unknown node
-/// type, malformed): the relation is not sampled.
-pub(crate) fn scan(trees: &[&str]) -> Option<PolicyRefs> {
+/// Scans the policy expressions of relation `own`. `None`: unsupported
+/// (too large, unknown node type, malformed, or a subquery reading another
+/// relation than `own`, catalogs included: under the extended variant a
+/// policy could otherwise make visibility depend on `pg_authid`): the
+/// relation is not sampled.
+pub(crate) fn scan(trees: &[&str], own: u32) -> Option<PolicyRefs> {
     let mut refs = PolicyRefs::default();
     for tree in trees {
         if tree.len() > MAX_TREE_BYTES {
@@ -184,6 +187,16 @@ pub(crate) fn scan(trees: &[&str]) -> Option<PolicyRefs> {
                         i += 1;
                     }
                 }
+                ":relid"
+                    if matches!(stack.last(), Some(&("RANGETBLENTRY" | "RTEPERMISSIONINFO"))) =>
+                {
+                    let v = oid(t.get(i + 1))?;
+                    if v != 0 && v != own {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
                 ":resulttype" if stack.last() == Some(&"COERCEVIAIO") => {
                     refs.io_types.insert(oid(t.get(i + 1))?);
                     i += 2;
@@ -215,7 +228,7 @@ mod tests {
 
     #[test]
     fn collects_functions_operators_and_io_types() {
-        let r = scan(&[BUILTINS]).unwrap();
+        let r = scan(&[BUILTINS], 1).unwrap();
         assert_eq!(r.functions.into_iter().collect::<Vec<_>>(), [65, 67, 2077]);
         assert_eq!(
             r.operators.into_iter().collect::<Vec<_>>(),
@@ -229,24 +242,38 @@ mod tests {
         // USING (pg_catalog.query_to_xml('select evil()', true, false, '') IS NOT NULL)
         let tree = "{NULLTEST :arg {FUNCEXPR :funcid 2925 :funcresulttype 142 :args \
             ({CONST :consttype 25 :constvalue 17 [ 68 0 0 0 115 ]})} :nulltesttype 1}";
-        assert!(scan(&[tree]).unwrap().functions.contains(&2925));
+        assert!(scan(&[tree], 1).unwrap().functions.contains(&2925));
     }
 
     #[test]
     fn unknown_or_malformed_trees_fail_closed() {
-        assert!(scan(&["{WINDOWFUNC :winfnoid 3100}"]).is_none());
-        assert!(scan(&["{JSONEXPR :op 1}"]).is_none());
-        assert!(scan(&["{FUNCEXPR :funcid x}"]).is_none());
-        assert!(scan(&["{FUNCEXPR :funcid 1"]).is_none());
-        assert!(scan(&["{FUNCEXPR :funcid 1}}"]).is_none());
-        assert!(scan(&["{ROWCOMPAREEXPR :opnos (96)}"]).is_none());
-        assert!(scan(&[&"{CONST}".repeat(MAX_TREE_BYTES)]).is_none());
+        assert!(scan(&["{WINDOWFUNC :winfnoid 3100}"], 1).is_none());
+        assert!(scan(&["{JSONEXPR :op 1}"], 1).is_none());
+        assert!(scan(&["{FUNCEXPR :funcid x}"], 1).is_none());
+        assert!(scan(&["{FUNCEXPR :funcid 1"], 1).is_none());
+        assert!(scan(&["{FUNCEXPR :funcid 1}}"], 1).is_none());
+        assert!(scan(&["{ROWCOMPAREEXPR :opnos (96)}"], 1).is_none());
+        assert!(scan(&[&"{CONST}".repeat(MAX_TREE_BYTES)], 1).is_none());
+    }
+
+    #[test]
+    fn subqueries_only_on_the_policy_table() {
+        let sub = |relid: u32| {
+            format!(
+                "{{SUBLINK :subLinkType 0 :subselect {{QUERY :rtable ({{RANGETBLENTRY \
+                 :rtekind 0 :relid {relid} :relkind r}}) :rteperminfos \
+                 ({{RTEPERMISSIONINFO :relid {relid} :inh true}})}}}}"
+            )
+        };
+        assert!(scan(&[&sub(1)], 1).is_some());
+        // Another relation, e.g. pg_authid (1260): unsupported.
+        assert!(scan(&[&sub(1260)], 1).is_none());
     }
 
     #[test]
     fn escaped_text_does_not_inject_keys() {
         // An alias `x :funcid 99` is printed with escaped spaces.
-        let r = scan(&["{ALIAS :aliasname x\\ :funcid\\ 99 :colnames <>}"]).unwrap();
+        let r = scan(&["{ALIAS :aliasname x\\ :funcid\\ 99 :colnames <>}"], 1).unwrap();
         assert!(r.functions.is_empty());
     }
 }

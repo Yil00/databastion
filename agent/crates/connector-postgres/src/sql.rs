@@ -146,6 +146,9 @@ pub(crate) const INTROSPECT: &str = concat!(
 );
 
 /// Columns the role may read, for a set of relations (`$1`: `oid[]`).
+/// Virtual generated columns (PostgreSQL 18, `attgenerated = 'v'`) are
+/// computed on read by an expression that may call functions: never
+/// selected.
 /// Columns: relation, name, type oid, `typtype`, `typbasetype`, and whether
 /// the type is `citext` from the `citext` extension.
 pub(crate) const COLUMNS: &str = "SELECT a.attrelid, a.attname, t.oid, t.typtype, t.typbasetype, \
@@ -158,6 +161,7 @@ pub(crate) const COLUMNS: &str = "SELECT a.attrelid, a.attname, t.oid, t.typtype
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
      WHERE a.attrelid = ANY ($1) AND a.attnum > 0 AND NOT a.attisdropped \
+       AND a.attgenerated <> 'v' \
        AND pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT') \
      ORDER BY a.attrelid, a.attnum";
 
@@ -357,6 +361,11 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_generated_columns_are_never_selected() {
+        assert!(COLUMNS.contains("a.attgenerated <> 'v'"));
+    }
 
     #[test]
     fn identifiers_are_quoted_and_quotes_doubled() {

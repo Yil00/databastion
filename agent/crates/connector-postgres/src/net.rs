@@ -147,6 +147,13 @@ impl AsyncWrite for Transport {
 const AUTH_OK: u32 = 0;
 const AUTH_CLEARTEXT: u32 = 3;
 const AUTH_MD5: u32 = 5;
+const AUTH_SASL_CONTINUE: u32 = 11;
+/// Lowest SCRAM iteration count accepted without TLS (PostgreSQL's
+/// default; an attacker on the path could otherwise ask for 1 to make the
+/// relayed proof cheap to attack offline).
+const MIN_SCRAM_ITERATIONS: u64 = 4096;
+/// Largest `SASLContinue` body parsed.
+const MAX_SASL_BODY: usize = 2048;
 
 /// Error kind of a refused authentication method.
 pub(crate) const REFUSED_AUTH: io::ErrorKind = io::ErrorKind::PermissionDenied;
@@ -156,6 +163,18 @@ pub(crate) const REFUSED_AUTH: io::ErrorKind = io::ErrorKind::PermissionDenied;
 struct AuthParse {
     header: Vec<u8>,
     skip: usize,
+    /// Body of a `SASLContinue` being collected, and its remaining length.
+    sasl: Option<(Vec<u8>, usize)>,
+}
+
+/// `i=` of a SCRAM server-first-message (`r=…,s=…,i=4096`).
+fn scram_iterations(body: &[u8]) -> Option<u64> {
+    std::str::from_utf8(body)
+        .ok()?
+        .split(',')
+        .find_map(|f| f.strip_prefix("i="))?
+        .parse()
+        .ok()
 }
 
 impl AuthParse {
@@ -163,6 +182,19 @@ impl AuthParse {
     /// ended (success or error message).
     fn feed(&mut self, mut bytes: &[u8]) -> Result<bool, ()> {
         while !bytes.is_empty() {
+            if let Some((body, left)) = &mut self.sasl {
+                let n = (*left).min(bytes.len());
+                body.extend_from_slice(&bytes[..n]);
+                *left -= n;
+                bytes = &bytes[n..];
+                if *left == 0 {
+                    if scram_iterations(body).is_none_or(|i| i < MIN_SCRAM_ITERATIONS) {
+                        return Err(());
+                    }
+                    self.sasl = None;
+                }
+                continue;
+            }
             if self.skip > 0 {
                 let n = self.skip.min(bytes.len());
                 self.skip -= n;
@@ -198,6 +230,17 @@ impl AuthParse {
                     match code {
                         AUTH_CLEARTEXT | AUTH_MD5 => return Err(()),
                         AUTH_OK => return Ok(true),
+                        AUTH_SASL_CONTINUE => {
+                            if len - 8 > MAX_SASL_BODY {
+                                return Err(());
+                            }
+                            self.sasl = Some((Vec::with_capacity(len - 8), len - 8));
+                            self.header.clear();
+                            if len == 8 {
+                                return Err(());
+                            }
+                            continue;
+                        }
                         _ => {}
                     }
                     self.skip = len - 8;
@@ -250,7 +293,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for AuthGuard<S> {
                     buf.set_filled(before);
                     return Poll::Ready(Err(io::Error::new(
                         REFUSED_AUTH,
-                        "cleartext or MD5 password requested on a connection without TLS",
+                        "cleartext or MD5 password, or weak SCRAM parameters, requested on a \
+                         connection without TLS",
                     )));
                 }
                 Ok(true) => this.parse = None,
@@ -316,7 +360,7 @@ mod tests {
     #[test]
     fn scram_passes_byte_by_byte() {
         let mut stream = auth(10, b"SCRAM-SHA-256\0\0");
-        stream.extend(auth(11, b"r=nonce"));
+        stream.extend(auth(11, b"r=nonce,s=c2FsdA==,i=4096"));
         stream.extend(auth(12, b"v=sig"));
         stream.extend(auth(0, &[]));
         let mut p = AuthParse::default();
@@ -330,6 +374,26 @@ mod tests {
         let mut stream = auth(10, b"SCRAM-SHA-256\0\0");
         stream.extend(auth(3, &[]));
         assert!(p.feed(&stream).is_err());
+    }
+
+    #[test]
+    fn weak_scram_iterations_are_refused() {
+        for body in [
+            &b"r=nonce,s=c2FsdA==,i=1"[..],
+            b"r=nonce,s=c2FsdA==,i=4095",
+            b"r=nonce,s=c2FsdA==",
+            b"r=nonce,s=c2FsdA==,i=x",
+        ] {
+            let mut stream = auth(10, b"SCRAM-SHA-256\0\0");
+            stream.extend(auth(11, body));
+            assert!(AuthParse::default().feed(&stream).is_err(), "{body:?}");
+        }
+        let mut p = AuthParse::default();
+        let ok = auth(11, b"r=nonce,s=c2FsdA==,i=600000");
+        for b in &ok {
+            assert_eq!(p.feed(std::slice::from_ref(b)), Ok(false));
+        }
+        assert!(AuthParse::default().feed(&auth(11, &[b'x'; 4096])).is_err());
     }
 
     #[test]
