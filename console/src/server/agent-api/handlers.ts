@@ -6,9 +6,10 @@ import { validateSchema } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
+import { lockAgentForConflict, rotatePerAgent, rotateSecret } from "@/server/rotation";
 import { clientIp, ipBucket } from "@/server/request";
 
-import { authenticateAgent } from "./auth";
+import { authenticateAgent, type AgentRow, type AuthOptions, type SecretSlot } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -51,10 +52,21 @@ export function handleEnroll(req: Request): Promise<Response> {
   });
 }
 
-async function preamble(req: Request) {
+type Preamble =
+  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string }
+  | { ok: false; response: Response };
+
+async function preamble(req: Request, opts: AuthOptions = {}): Promise<Preamble> {
   const headers = checkProtocolHeaders(req);
-  if (headers) return { ok: false as const, response: headers };
-  return authenticateAgent(req);
+  if (headers) return { ok: false, response: headers };
+  const auth = await authenticateAgent(req, opts);
+  if (auth.ok) return auth;
+  if (auth.staleSecret) {
+    // `S0` used after the tolerance window (ADR-0008 / ADR-0010): treated like rotation_conflict.
+    await lockAgentForConflict(getDb(), auth.agentId, "stale_secret", clientIp(req));
+    return { ok: false, response: agentError(409, "rotation_conflict") };
+  }
+  return { ok: false, response: auth.response };
 }
 
 export function handleHeartbeat(req: Request): Promise<Response> {
@@ -156,4 +168,59 @@ export function handleJobStatus(req: Request, jobId: string): Promise<Response> 
     if (outcome === "conflict") return agentError(409, "conflict");
     return noContent();
   });
+}
+
+/**
+ * `POST /rotate` (ADR-0008, ADR-0010). The body carries a secret: it is never logged, and an error
+ * never echoes it. A new secret that fails the `AgentSecret` format is answered `invalid_secret`.
+ */
+export function handleRotate(req: Request): Promise<Response> {
+  return guarded("rotate", async () => {
+    const auth = await preamble(req, { allowPrevious: true });
+    if (!auth.ok) return auth.response;
+    const limit = rotatePerAgent.hit(auth.agent.id);
+    if (limit.limited) return rateLimited(limit.retryAfterS);
+    const body = await readValidBody(req, "RotateRequest");
+    if (!body.ok) {
+      const details = await errorDetails(body.response);
+      if (details.length > 0 && details.every((d) => d.pointer === "/new_secret")) {
+        return agentError(400, "invalid_secret");
+      }
+      return body.response;
+    }
+    const presented = /^Bearer (\S+)$/.exec(req.headers.get("authorization") ?? "")?.[1] ?? "";
+    const outcome = await rotateSecret(
+      getDb(),
+      { agentId: auth.agent.id, via: auth.via, presented, matchedHash: auth.matchedHash },
+      body.value,
+      clientIp(req),
+    );
+    switch (outcome.kind) {
+      case "registered":
+      case "duplicate":
+        return conformingJson("RotateResponse", {
+          grace_expires_at: outcome.graceExpiresAt.toISOString(),
+          duplicate: outcome.kind === "duplicate",
+        });
+      case "invalid_secret":
+        return agentError(400, "invalid_secret");
+      case "not_found":
+        return agentError(404, "not_found");
+      case "conflict":
+        return agentError(409, "rotation_conflict");
+      case "busy":
+        return unavailable();
+      case "unauthorized":
+        return unauthorized();
+    }
+  });
+}
+
+async function errorDetails(res: Response): Promise<{ pointer: string }[]> {
+  try {
+    const body = (await res.clone().json()) as { details?: { pointer: string }[] };
+    return body.details ?? [];
+  } catch {
+    return [];
+  }
 }

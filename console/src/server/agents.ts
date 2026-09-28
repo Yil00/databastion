@@ -229,6 +229,9 @@ export async function listAgents(db: Database) {
       lockedAt: agents.lockedAt,
       connectors: agents.connectors,
       classifiersVersion: agents.classifiersVersion,
+      rotationPending: sql<boolean>`${agents.pendingSecretHash} is not null`,
+      graceExpiresAt: agents.graceExpiresAt,
+      promotedAt: agents.promotedAt,
     })
     .from(agents)
     .orderBy(agents.enrolledAt)

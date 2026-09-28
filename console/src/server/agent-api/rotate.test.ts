@@ -1,0 +1,362 @@
+import { and, eq } from "drizzle-orm";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+
+import { getDb } from "@/db/client";
+import { agents, auditLog, jobs, securityEvents } from "@/db/schema";
+import { validateSchema } from "@/lib/protocol/validate";
+import {
+  agentArgon2Gate,
+  loginArgon2Gate,
+  MAX_CONCURRENT_ROTATE_ARGON2,
+  newAgentSecret,
+  rotateArgon2Gate,
+} from "@/server/crypto";
+import { claimJobs } from "@/server/jobs";
+import { requestSecretRotation, rotatePerAgent, rotateStats, rotationBlocked } from "@/server/rotation";
+import { hasDb, setupTestDatabase } from "@/test/db";
+import { adminUser, agentRequest, enroll, expectConformingError } from "@/test/helpers";
+
+import { expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp, TOLERANCE_WINDOW_MS } from "./auth";
+import { handleHeartbeat, handlePollJobs, handleRotate, pollClock } from "./handlers";
+import { jobHub } from "./job-hub";
+
+type Creds = { agentId: string; secret: string };
+
+const HEARTBEAT = () => ({
+  ts: new Date().toISOString(),
+  agent_version: "0.1.0",
+  uptime_s: 1,
+  connectors: ["postgres"],
+  targets: [],
+  detected_targets: [],
+  spool: { bytes: 0, max_bytes: 1024, batches: 0 },
+});
+
+const rotate = (auth: Creds, body: Record<string, unknown>) =>
+  handleRotate(agentRequest("POST", "/rotate", { auth, body }));
+const heartbeat = (auth: Creds) => handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: HEARTBEAT() }));
+
+const row = async (agentId: string) =>
+  (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+
+async function shiftPromotion(agentId: string, msAgo: number): Promise<void> {
+  await getDb()
+    .update(agents)
+    .set({ promotedAt: new Date(Date.now() - msAgo) })
+    .where(eq(agents.id, agentId));
+}
+
+async function expectLocked(agentId: string): Promise<void> {
+  const a = await row(agentId);
+  expect(a?.status).toBe("locked");
+  expect(a?.lockedAt).not.toBeNull();
+  expect(a?.currentSecretHash).toBeNull();
+  expect(a?.pendingSecretHash).toBeNull();
+  expect(a?.previousSecretHash).toBeNull();
+  const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, agentId));
+  expect(events).toHaveLength(1);
+  expect(events[0]?.kind).toBe("agent.rotation_conflict");
+  const audit = await getDb()
+    .select()
+    .from(auditLog)
+    .where(and(eq(auditLog.targetId, agentId), eq(auditLog.action, "agent.rotation_conflict")));
+  expect(audit).toHaveLength(1);
+}
+
+async function expectNotLocked(agentId: string): Promise<void> {
+  const a = await row(agentId);
+  expect(a?.lockedAt).toBeNull();
+  const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, agentId));
+  expect(events).toHaveLength(0);
+}
+
+/** Registers S1 and promotes it by a first use; returns S0 / S1 credentials. */
+async function rotated(): Promise<{ s0: Creds; s1: Creds }> {
+  const s0 = await enroll();
+  const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+  expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+  expect((await heartbeat(s1)).status).toBe(200);
+  return { s0, s1 };
+}
+
+describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
+  let teardown: () => Promise<void>;
+
+  beforeAll(async () => {
+    teardown = await setupTestDatabase();
+    await adminUser();
+  });
+  afterAll(async () => {
+    pollClock.msPerSecond = 1000;
+    await teardown?.();
+  });
+  beforeEach(() => {
+    failuresPerAgent.clear();
+    failuresPerIp.clear();
+    rotatePerAgent.clear();
+  });
+
+  it("registers the new secret as a pending argon2id hash, 300 s grace, no-store, audited", async () => {
+    const s0 = await enroll();
+    const s1 = newAgentSecret();
+    const before = Date.now();
+    const res = await rotate(s0, { new_secret: s1 });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const text = await res.text();
+    expect(text).not.toContain(s1);
+    const body = JSON.parse(text) as { grace_expires_at: string; duplicate: boolean };
+    expect(validateSchema("RotateResponse", body).ok).toBe(true);
+    expect(body.duplicate).toBe(false);
+    const grace = Date.parse(body.grace_expires_at);
+    expect(grace).toBeGreaterThanOrEqual(before + 299_000);
+    expect(grace).toBeLessThanOrEqual(Date.now() + 301_000);
+    const a = await row(s0.agentId);
+    expect(a?.pendingSecretHash).toMatch(/^\$argon2id\$/);
+    expect(JSON.stringify(a)).not.toContain(s1);
+    const audit = await getDb()
+      .select()
+      .from(auditLog)
+      .where(and(eq(auditLog.targetId, s0.agentId), eq(auditLog.action, "agent.rotate")));
+    expect(audit).toHaveLength(1);
+    expect(JSON.stringify(audit)).not.toContain(s1);
+    // S0 is still the current secret while S1 is pending.
+    expect((await heartbeat(s0)).status).toBe(200);
+  });
+
+  it("answers an idempotent retry (same S1 with S0) with duplicate and the unchanged deadline", async () => {
+    const s0 = await enroll();
+    const s1 = newAgentSecret();
+    const first = (await (await rotate(s0, { new_secret: s1 })).json()) as { grace_expires_at: string };
+    await new Promise((r) => setTimeout(r, 20));
+    const retry = await rotate(s0, { new_secret: s1 });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ grace_expires_at: first.grace_expires_at, duplicate: true });
+    await expectNotLocked(s0.agentId);
+  });
+
+  it("rejects a malformed, low-entropy or current new secret with invalid_secret (no lock)", async () => {
+    const s0 = await enroll();
+    for (const bad of ["dbs_short", `dbs_${"A".repeat(43)}`, `dbs_${"AbCdEfGh".repeat(5)}abc`, s0.secret]) {
+      const res = await rotate(s0, { new_secret: bad });
+      expect(res.status).toBe(400);
+      const body = await expectConformingError(res, { new_secret: bad });
+      expect(body.code).toBe("invalid_secret");
+    }
+    // Unknown field: plain invalid_request (schema), never stored.
+    const extra = await rotate(s0, { new_secret: newAgentSecret(), other: 1 });
+    expect(extra.status).toBe(400);
+    expect(((await extra.json()) as { code: string }).code).toBe("invalid_request");
+    expect((await row(s0.agentId))?.pendingSecretHash).toBeNull();
+    await expectNotLocked(s0.agentId);
+  });
+
+  it("answers 404 for a job_id that is not a rotate job of this agent", async () => {
+    const s0 = await enroll();
+    const res = await rotate(s0, { new_secret: newAgentSecret(), job_id: "01890a5d-ac96-774b-bcce-b302099a8057" });
+    expect(res.status).toBe(404);
+  });
+
+  it("promotes S1 on its first successful use; S0 inside the window gets 401 without incident", async () => {
+    const { s0, s1 } = await rotated();
+    const a = await row(s0.agentId);
+    expect(a?.pendingSecretHash).toBeNull();
+    expect(a?.previousSecretHash).toMatch(/^\$argon2id\$/);
+    expect(a?.promotedAt).not.toBeNull();
+    expireVerifiedCacheForTests();
+    const late = await heartbeat(s0);
+    expect(late.status).toBe(401);
+    expect(((await late.json()) as { code: string }).code).toBe("unauthorized");
+    await expectNotLocked(s0.agentId);
+    expect((await heartbeat(s1)).status).toBe(200);
+  });
+
+  it("answers a /rotate with S0 and the same S1 inside the window as a duplicate", async () => {
+    const { s0, s1 } = await rotated();
+    const res = await rotate(s0, { new_secret: s1.secret });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { duplicate: boolean }).duplicate).toBe(true);
+    await expectNotLocked(s0.agentId);
+  });
+
+  it("locks on a /rotate with S0 and a different secret while S1 is pending", async () => {
+    const s0 = await enroll();
+    expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(200);
+    const res = await rotate(s0, { new_secret: newAgentSecret() });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { code: string }).code).toBe("rotation_conflict");
+    await expectLocked(s0.agentId);
+    expect((await heartbeat(s0)).status).toBe(401);
+  });
+
+  it("locks on a /rotate with S0 and a different secret inside the window; S1 is revoked too", async () => {
+    const { s0, s1 } = await rotated();
+    const res = await rotate(s0, { new_secret: newAgentSecret() });
+    expect(res.status).toBe(409);
+    await expectLocked(s0.agentId);
+    expect((await heartbeat(s1)).status).toBe(401);
+  });
+
+  it("never treats a /rotate authenticated with the current secret as a conflict (new rotation)", async () => {
+    const { s0, s1 } = await rotated();
+    const s2 = newAgentSecret();
+    const res = await rotate(s1, { new_secret: s2 });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { duplicate: boolean }).duplicate).toBe(false);
+    await expectNotLocked(s0.agentId);
+    expect((await row(s0.agentId))?.pendingSecretHash).toMatch(/^\$argon2id\$/);
+  });
+
+  it("treats any use of S0 after the 60 s window as rotation_conflict", async () => {
+    const { s0, s1 } = await rotated();
+    await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+    expireVerifiedCacheForTests();
+    const res = await heartbeat(s0);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { code: string }).code).toBe("rotation_conflict");
+    await expectLocked(s0.agentId);
+    expect((await heartbeat(s1)).status).toBe(401);
+  });
+
+  it("treats a /rotate with S0 and the same S1 after the window as rotation_conflict", async () => {
+    const { s0, s1 } = await rotated();
+    await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+    expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(409);
+    await expectLocked(s0.agentId);
+  });
+
+  it("promotes S1 at the grace deadline; S0 then follows the same window rules", async () => {
+    const s0 = await enroll();
+    const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+    expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+    await getDb()
+      .update(agents)
+      .set({ graceExpiresAt: new Date(Date.now() - 10_000) })
+      .where(eq(agents.id, s0.agentId));
+    expireVerifiedCacheForTests();
+    expect((await heartbeat(s0)).status).toBe(401); // promoted 10 s ago: inside the window
+    const a = await row(s0.agentId);
+    expect(a?.pendingSecretHash).toBeNull();
+    expect(a?.promotedAt?.getTime()).toBe(a?.graceExpiresAt?.getTime());
+    expect((await heartbeat(s1)).status).toBe(200);
+    await expectNotLocked(s0.agentId);
+
+    const other = await enroll();
+    expect((await rotate(other, { new_secret: newAgentSecret() })).status).toBe(200);
+    await getDb()
+      .update(agents)
+      .set({ graceExpiresAt: new Date(Date.now() - TOLERANCE_WINDOW_MS - 5000) })
+      .where(eq(agents.id, other.agentId));
+    expireVerifiedCacheForTests();
+    expect((await heartbeat(other)).status).toBe(409);
+    await expectLocked(other.agentId);
+  });
+
+  it("closes held long-polls on a conflict", async () => {
+    const s0 = await enroll();
+    await jobHub.ready();
+    const poll = handlePollJobs(agentRequest("GET", "/jobs?wait=25", { auth: s0 }));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(jobHub.heldPolls(s0.agentId)).toBe(1);
+    expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(200);
+    expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(409);
+    expect((await poll).status).toBe(401);
+  });
+
+  describe("concurrency", () => {
+    // Authentication allows one unrecognized-secret verification per agent at a time (503 beyond):
+    // the verified cache is warmed first so that the race happens inside /rotate itself.
+    it("two concurrent /rotate with S0 and different secrets: one registers, the other locks", async () => {
+      const s0 = await enroll();
+      expect((await heartbeat(s0)).status).toBe(200);
+      const results = await Promise.all([
+        rotate(s0, { new_secret: newAgentSecret() }),
+        rotate(s0, { new_secret: newAgentSecret() }),
+      ]);
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      await expectLocked(s0.agentId);
+    });
+
+    it("two concurrent /rotate with the same S1: one registration, one duplicate, no lock", async () => {
+      const s0 = await enroll();
+      expect((await heartbeat(s0)).status).toBe(200);
+      const s1 = newAgentSecret();
+      const results = await Promise.all([rotate(s0, { new_secret: s1 }), rotate(s0, { new_secret: s1 })]);
+      expect(results.map((r) => r.status)).toEqual([200, 200]);
+      const bodies = (await Promise.all(results.map((r) => r.json()))) as { duplicate: boolean; grace_expires_at: string }[];
+      expect(bodies.map((b) => b.duplicate).sort()).toEqual([false, true]);
+      expect(bodies[0]?.grace_expires_at).toBe(bodies[1]?.grace_expires_at);
+      await expectNotLocked(s0.agentId);
+    });
+  });
+
+  describe("argon2 pools", () => {
+    it("runs its argon2 work in the dedicated rotate pool: 503 when saturated, other pools untouched", async () => {
+      const s0 = await enroll();
+      await heartbeat(s0); // warm the verified cache: authentication needs no pool
+      const held = Array.from({ length: MAX_CONCURRENT_ROTATE_ARGON2 }, () => rotateArgon2Gate.tryAcquire());
+      try {
+        const res = await rotate(s0, { new_secret: newAgentSecret() });
+        expect(res.status).toBe(503);
+        expect(res.headers.get("retry-after")).toBe("5");
+      } finally {
+        held.forEach((r) => r?.());
+      }
+      expect(rotateArgon2Gate.inUse).toBe(0);
+      const ops = rotateStats.argon2Ops;
+      expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(200);
+      expect(rotateStats.argon2Ops).toBe(ops + 1); // one argon2id hash of the new secret
+      expect(rotateArgon2Gate.inUse).toBe(0);
+      expect(agentArgon2Gate.inUse).toBe(0);
+      expect(loginArgon2Gate.inUse).toBe(0);
+    });
+
+    it("rate limits /rotate per agent", async () => {
+      const s0 = await enroll();
+      const s1 = newAgentSecret();
+      let last = 0;
+      for (let i = 0; i < 11; i++) last = (await rotate(s0, { new_secret: s1 })).status;
+      expect(last).toBe(429);
+    });
+  });
+
+  describe("console-issued rotate jobs", () => {
+    it("queues a job carrying no secret, refused while pending, within 60 s of promotion or while open", async () => {
+      const userId = await adminUser();
+      const actor = { userId, ip: null };
+      const s0 = await enroll();
+      const first = await requestSecretRotation(getDb(), s0.agentId, actor);
+      expect(first.outcome).toBe("queued");
+      expect((await requestSecretRotation(getDb(), s0.agentId, actor)).outcome).toBe("busy"); // open job
+      const claimed = await claimJobs(getDb(), s0.agentId);
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0]).toMatchObject({ type: "agent.rotate_secret", params: { reason: "manual" } });
+      expect(JSON.stringify(claimed)).not.toMatch(/dbs_/);
+
+      const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+      expect((await rotate(s0, { new_secret: s1.secret, job_id: first.jobId })).status).toBe(200);
+      await getDb().update(jobs).set({ status: "succeeded" }).where(eq(jobs.id, first.jobId as string));
+      expect((await requestSecretRotation(getDb(), s0.agentId, actor)).outcome).toBe("busy"); // pending
+      expect((await heartbeat(s1)).status).toBe(200); // promotion
+      expect((await requestSecretRotation(getDb(), s0.agentId, actor)).outcome).toBe("busy"); // < 60 s
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      expect((await requestSecretRotation(getDb(), s0.agentId, actor)).outcome).toBe("queued");
+      const audit = await getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.targetId, s0.agentId), eq(auditLog.action, "agent.rotate_request")));
+      expect(audit.map((a) => a.outcome).sort()).toEqual(["failure", "failure", "failure", "success", "success"]);
+    });
+
+    it("computes the ADR-0010 blocking window", () => {
+      const now = Date.now();
+      const none = { pendingSecretHash: null, graceExpiresAt: null, promotedAt: null };
+      expect(rotationBlocked(none, now)).toBe(false);
+      expect(rotationBlocked({ ...none, promotedAt: new Date(now - 59_000) }, now)).toBe(true);
+      expect(rotationBlocked({ ...none, promotedAt: new Date(now - 61_000) }, now)).toBe(false);
+      expect(rotationBlocked({ ...none, pendingSecretHash: "h", graceExpiresAt: new Date(now + 1000) }, now)).toBe(true);
+      expect(rotationBlocked({ ...none, pendingSecretHash: "h", graceExpiresAt: new Date(now - 30_000) }, now)).toBe(true);
+      expect(rotationBlocked({ ...none, pendingSecretHash: "h", graceExpiresAt: new Date(now - 61_000) }, now)).toBe(false);
+    });
+  });
+});

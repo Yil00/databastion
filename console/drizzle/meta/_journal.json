@@ -36,6 +36,13 @@
       "when": 1790609649760,
       "tag": "0004_pgboss_schema_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790610489276,
+      "tag": "0005_security_events",
+      "breakpoints": true
     }
   ]
 }

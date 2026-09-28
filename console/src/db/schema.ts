@@ -231,3 +231,26 @@ export const auditLog = pgTable(
   },
   (t) => [index("audit_log_at_idx").on(t.at), index("audit_log_action_idx").on(t.action)],
 );
+
+// ------------------------------------------------------------------ security events
+
+/**
+ * Agent-integrity security events (placeholder for the P3 `incidents` model): `rotation_conflict`
+ * today, rejected batches and `batch_conflict` with P2-D. Raised by the console itself, never from
+ * agent-provided text: `details` only holds console-computed scalars (no secret, no hash).
+ */
+export const securityEvents = pgTable(
+  "security_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    at: tsz("at").notNull().defaultNow(),
+    /** Closed set, e.g. `agent.rotation_conflict`. */
+    kind: text("kind").notNull(),
+    severity: text("severity").notNull(),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
+    details: jsonb("details").$type<Record<string, string | number | boolean | null>>(),
+    acknowledgedAt: tsz("acknowledged_at"),
+    acknowledgedBy: uuid("acknowledged_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [index("security_events_at_idx").on(t.at), index("security_events_agent_idx").on(t.agentId)],
+);

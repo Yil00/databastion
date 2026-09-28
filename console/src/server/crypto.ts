@@ -100,6 +100,13 @@ export const MAX_CONCURRENT_KNOWN_GOOD_ARGON2 = 4;
 export const loginArgon2Gate = new Semaphore(MAX_CONCURRENT_LOGIN_ARGON2);
 export const agentArgon2Gate = new Semaphore(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
 export const agentKnownGoodGate = new Semaphore(MAX_CONCURRENT_KNOWN_GOOD_ARGON2);
+/**
+ * `/rotate` (authenticated agents only): hashing the new secret and comparing it with the pending /
+ * just-promoted one. Its own small pool, so rotations can neither starve nor be starved by
+ * authentication or logins.
+ */
+export const MAX_CONCURRENT_ROTATE_ARGON2 = 2;
+export const rotateArgon2Gate = new Semaphore(MAX_CONCURRENT_ROTATE_ARGON2);
 
 let dummyHash: Promise<string> | undefined;
 
