@@ -332,6 +332,16 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
       expect(await getDb().select().from(jobs).where(eq(jobs.agentId, auth.agentId))).toHaveLength(0);
     });
 
+    it("bounds the unknown ids kept in the audit entry", async () => {
+      const auth = await agentWithTarget();
+      const classifiers = Array.from({ length: 25 }, (_, i) => `pii.unknown_${i}`);
+      const res = await scan(auth.agentId, { classifiers });
+      expect(res.status).toBe(422);
+      const [audit] = await failures(auth.agentId);
+      expect(audit?.details).toMatchObject({ reason: "unknown_classifiers", unknown_count: 25 });
+      expect(String(audit?.details?.unknown_classifiers).split(",")).toHaveLength(10);
+    });
+
     it("the JobList gate never serves a scan job with an unregistered version or unknown ids", async () => {
       const auth = await agentWithTarget();
       const base = { agentId: auth.agentId, type: "discovery.scan" as const, targetId: "pg-prod-1" };

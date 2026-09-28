@@ -15,6 +15,9 @@ import { writeAudit } from "./audit";
  * validated again when the job is served (`claimJobs`, `conformingJson`).
  */
 
+/** Unknown classifier ids kept in a refused scan request's audit entry. */
+const MAX_AUDITED_UNKNOWN_CLASSIFIERS = 10;
+
 export type DiscoveryScanParams = Schemas["DiscoveryScanParams"];
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
@@ -212,7 +215,13 @@ export async function requestScan(
         ...(result.outcome === "classifiers_version_unregistered" || result.outcome === "unknown_classifiers"
           ? { classifiers_version: result.classifiersVersion }
           : {}),
-        ...(result.outcome === "unknown_classifiers" ? { unknown_classifiers: result.unknown.join(",") } : {}),
+        ...(result.outcome === "unknown_classifiers"
+          ? {
+              // Bounded: the first ids are enough to diagnose, the count says how many there were.
+              unknown_classifiers: result.unknown.slice(0, MAX_AUDITED_UNKNOWN_CLASSIFIERS).join(","),
+              unknown_count: result.unknown.length,
+            }
+          : {}),
       },
     });
   }

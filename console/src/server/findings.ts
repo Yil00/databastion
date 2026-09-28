@@ -134,9 +134,9 @@ function crossFieldDetails(
     }
     if (f.matched > f.sampled) push({ pointer: `/findings/${i}/matched`, keyword: "maximum" });
     if (f.sampled > sampleRows) push({ pointer: `/findings/${i}/sampled`, keyword: "maximum" });
-    // An id of the batch's version (skipped when the version itself is unknown: the whole batch is
-    // already rejected), and of the job's `params.classifiers` when present. Set lookups only.
-    if ((registered && !registered.has(f.classifier)) || (allowed && !allowed.has(f.classifier))) {
+    // An id of the batch's version and of the job's `params.classifiers` when present; both skipped
+    // when the version itself is unknown (the whole batch is already rejected). Set lookups only.
+    if (registered && (!registered.has(f.classifier) || (allowed && !allowed.has(f.classifier)))) {
       push({ pointer: `/findings/${i}/classifier`, keyword: "enum" });
     }
   });

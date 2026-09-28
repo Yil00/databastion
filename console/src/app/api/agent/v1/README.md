@@ -78,8 +78,8 @@ agent (advisory lock):
    drop the whole batch. Then per item: `target_id` = the job's target (`const`),
    `location.engine` = the engine last reported for the target (`const`), `matched <= sampled` and
    `sampled <= params.sample_rows` (`maximum`), `classifier` an id of the batch's registered version
-   and within the job's `params.classifiers` when set (`/findings/<i>/classifier`, `enum`; not
-   reported per item when the version itself is unknown);
+   and within the job's `params.classifiers` when set (`/findings/<i>/classifier`, `enum`; neither
+   is reported per item when the version itself is unknown);
 5. at most 50 000 findings per job over all its batches (`MAX_FINDINGS_PER_JOB`): beyond, `400`
    with pointer `/findings` (keyword `maxItems`);
 6. upsert of the findings (masked samples encrypted, see the console README "Data at rest") and of
