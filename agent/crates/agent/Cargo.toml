@@ -26,5 +26,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# tests/architecture.rs parses `cargo metadata`.
+serde_json = "1"
+
 [lints]
 workspace = true

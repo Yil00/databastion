@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 databastion-classifiers.workspace = true
+# Used by the crate-private uplink only; never re-exported.
+databastion-protocol.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }

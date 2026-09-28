@@ -8,6 +8,8 @@ members = [
     "crates/connector-mysql",
     "crates/connector-mongodb",
     "crates/connector-openldap",
+    "crates/protocol",
+    "crates/protocol-codegen",
 ]
 
 # `version` is rewritten by scripts/bump-version.mjs: keep it the first
@@ -28,6 +30,8 @@ databastion-connector-postgres = { path = "crates/connector-postgres" }
 databastion-connector-mysql = { path = "crates/connector-mysql" }
 databastion-connector-mongodb = { path = "crates/connector-mongodb" }
 databastion-connector-openldap = { path = "crates/connector-openldap" }
+databastion-protocol = { path = "crates/protocol" }
+databastion-protocol-codegen = { path = "crates/protocol-codegen" }
 
 # Third-party crates: default features off, opt in explicitly.
 # TLS policy: rustls only. openssl / native-tls are forbidden (see

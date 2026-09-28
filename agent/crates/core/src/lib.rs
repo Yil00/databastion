@@ -9,8 +9,12 @@
 //!   It is not exported: connectors depend on this crate but can neither name
 //!   nor construct it. The core runtime (not written yet) will own it and
 //!   drain the sinks into it; the binary will only get that runtime.
-//! - [`protocol`]: placeholder for the types generated from
-//!   `shared/protocol/openapi.yaml` (I6).
+//!
+//! Protocol types are generated from `shared/protocol/openapi.yaml` in the
+//! `databastion-protocol` crate (I6). Only the crate-private uplink uses
+//! them, and this crate does not re-export them: connectors cannot build a
+//! protocol payload (they are also barred from depending on
+//! `databastion-protocol`, see `crates/agent/tests/architecture.rs`).
 //!
 //! Skeleton status (P0-D): no enrollment, scheduler, spool or network code.
 
@@ -18,7 +22,6 @@
 
 pub mod connector;
 pub mod engine;
-pub mod protocol;
 pub mod sink;
 #[allow(
     dead_code,

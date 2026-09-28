@@ -11,14 +11,17 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | Crate | Path | Role |
 |-------|------|------|
 | `databastion-agent` | `crates/agent` | Binary: CLI (`--config`), JSON logs, connector selection by Cargo feature |
-| `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, HTTPS uplink (stub), protocol placeholder |
+| `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, HTTPS uplink (stub) |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector (stub) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector (stub) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
+| `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
+| `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
 
-Dependency direction: `classifiers` ← `core` ← `connector-*` ← `agent`.
+Dependency direction: `classifiers` ← `core` ← `connector-*` ← `agent`;
+`protocol` ← `core` (uplink only, not re-exported).
 
 ### Cargo features (binary)
 `postgres`, `mysql`, `mongodb`, `openldap`: all enabled by default. A minimal
@@ -68,9 +71,24 @@ and `additionalProperties: false` in the schema.
 
 ### Protocol types
 Protocol types are generated from `shared/protocol/openapi.yaml` and never
-written by hand (I6). `databastion_core::protocol` is an empty placeholder
-until the contract (P0-B) lands; `ScanJob` and `AuditConfig` are opaque
-placeholders.
+written by hand (I6): `crates/protocol/src/generated.rs` is produced by
+`databastion-protocol-codegen` (typify) and committed. Its header lists the
+schema rewrites applied before generation and the keywords that serde does
+not enforce (`if` / `then` / `else`, `not`, numeric bounds, `minItems` /
+`maxItems`…). The console's Ajv validation enforces them; checking received
+values on the agent side is a required future step (P1-B heartbeat
+scheduler, P2 scan / audit parameter mapping), not an existing guarantee
+(`crates/protocol/tests/fixtures.rs` lists the affected invalid fixtures).
+`AgentSecret` / `EnrollmentToken` are hand-written wrappers (redacted
+`Debug`, zeroized on drop), as are `Uuid` / `UuidV7` (canonical, version
+checked).
+
+The generator (developer tool only, never linked into the binary) parses
+YAML with `serde_yaml_ng`, a maintained fork of the deprecated `serde_yaml`.
+Only the crate-private uplink uses these types; connectors may not depend on
+`databastion-protocol` (architecture test). `ScanJob` and `AuditConfig`
+remain opaque placeholders that the core will map from the generated job
+parameters.
 
 ## Commands
 Run from `agent/` (same as CI):
@@ -80,6 +98,8 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --no-default-features --locked   # minimal binary, no connector
+cargo deny --locked check bans licenses sources
+cargo run -p databastion-protocol-codegen      # after changing shared/protocol/openapi.yaml
 cargo run -- --config /etc/databastion/agent.yaml
 ```
 
