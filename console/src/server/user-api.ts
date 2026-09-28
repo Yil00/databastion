@@ -126,10 +126,15 @@ export const loginFailuresPerUserGlobal = new RateLimiter(100, 15 * 60_000);
 /** Failed logins per device cookie (nonce): beyond, the cookie gives no bypass (a stolen cookie). */
 export const loginFailuresPerDevice = new RateLimiter(5, 15 * 60_000);
 /**
- * Delay before each verification of a degraded login (test hook: tests shorten it). Unknown IP:
- * `ms * 2^n` for the n-th failed degraded attempt of the username in the window, at most `maxMs`.
+ * Delay before each verification of a degraded login. Unknown IP: `ms * 2^n` for the n-th failed
+ * degraded attempt of the username in the window, at most `maxMs`. Test hooks: tests shorten the
+ * delays and replace `sleep` (the wait itself) to observe and control it without wall-clock timing.
  */
-export const loginSlowdown = { ms: 2000, maxMs: 30_000 };
+export const loginSlowdown = {
+  ms: 2000,
+  maxMs: 30_000,
+  sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)),
+};
 /** Failed degraded logins per username with an unknown IP (drives the growing slow-down). */
 export const loginDegradedFailures = new RateLimiter(Number.MAX_SAFE_INTEGER, 15 * 60_000);
 
@@ -223,7 +228,7 @@ export function handleLogin(req: Request): Promise<Response> {
       try {
         // Counted before the delay (refunded on success), so the next attempt waits longer.
         const refunds = degradeUnknownIp ? [...baseRefunds, loginDegradedFailures.charge(userKey)] : baseRefunds;
-        await new Promise((r) => setTimeout(r, delayMs));
+        await loginSlowdown.sleep(delayMs);
         return await verifyLogin(req, username, password, ip, refunds);
       } finally {
         degradedLoginsInFlight.delete(userKey);
