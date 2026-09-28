@@ -58,7 +58,7 @@ An agent can monitor several targets, of different engines, on the same host.
 2. **Data minimization at the source** ([ADR-0003](adr/0003-data-minimization-at-source.md)): the agent only sends metadata (location, detected type, volume, **masked** sample, HMAC fingerprint). If the console is compromised, no sensitive data and no database credential is exposed.
 3. **Database credentials local to the agent**: the console never knows the database passwords.
 4. **Declared targets + local detection** ([ADR-0006](adr/0006-target-discovery.md)): no network scanning.
-5. **Observability via the console** ([ADR-0004](adr/0004-observability-via-console.md)): agents expose no port; their metrics travel in the heartbeat.
+5. **Observability via the console** ([ADR-0004](adr/0004-observability-via-console.md)): agents expose no port; their metrics travel in the heartbeat. The console re-exposes them on its `/metrics` endpoint under the distinct prefix `databastion_agent_reported_` (labels `agent_id`, and `target_id` for target metrics), and ignores names on a reserved-name blocklist (e.g. `last_seen_seconds`, `up`, `revoked`), so an agent cannot shadow a console-computed metric.
 
 ## Agent operating modes
 1. **Discovery**: periodic traversal of schemas / collections / entries, sampling, classification. Produces *findings* ("column `clients.email` contains email addresses, confidence 0.97").
@@ -81,9 +81,9 @@ An event's score = f(signals, location sensitivity, deviation from baseline). Po
 ## Console ↔ agent communication
 Detailed specification: [09-agent-protocol.md](09-agent-protocol.md).
 
-- **Transport**: HTTPS (TLS 1.3), versioned JSON, OpenAPI contract in `shared/protocol/`
+- **Transport**: HTTPS (TLS 1.3), versioned JSON; the OpenAPI contract [`shared/protocol/openapi.yaml`](../shared/protocol/openapi.yaml) is the source of truth
 - **Responsiveness**: *long-poll* on `GET /jobs` (request held for up to 25 s), which gives near-real-time responsiveness without WebSocket or gRPC
-- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable. mTLS as an option (phase 2).
+- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable (the agent generates the new secret, [ADR-0008](adr/0008-agent-generated-secret-rotation.md)). mTLS as an option (phase 2).
 - **Resilience**: if the console is unreachable, the agent queues to disk (bounded spool) and resends on reconnection.
 
 ## Agent deployment modes

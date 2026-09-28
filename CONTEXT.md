@@ -8,7 +8,8 @@ DataBastion is an open-source DLP (Apache 2.0) that finds sensitive data in Post
 ## Where the project stands
 - **Current phase**: 0 – Foundations (see [docs/ROADMAP.md](docs/ROADMAP.md))
 - Skeletons only (P0-D): `console/` (Next.js + Drizzle + pg-boss, health endpoints, agent API placeholder answering `501`) and `agent/` (Cargo workspace that compiles; connectors are stubs). No enrollment, uplink, Discovery or Audit logic yet.
-- In progress: protocol contract `shared/protocol/` (P0-B, in security review); to do: dev environment `dev/` (P0-C).
+- Protocol v1 contract merged (P0-B): `shared/protocol/openapi.yaml` + fixtures is the source of truth ([docs/09-agent-protocol.md](docs/09-agent-protocol.md) is an overview). Neither side implements it yet; TS and Rust type generation is in progress.
+- To do: dev environment `dev/` (P0-C).
 
 ## Invariants (non-negotiable)
 | # | Invariant | Source |
