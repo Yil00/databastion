@@ -31,7 +31,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
 -- log_statement do not log ROLE statements here, and a failing statement is not logged either.
 SET pg_stat_statements.track_utility = off;
 SET log_min_error_statement = panic;
+-- pgaudit is always available in the dev image; the host cluster of
+-- dev/postgres/local-cluster.sh (no Docker) may not have it.
+SELECT count(*) > 0 AS has_pgaudit FROM pg_available_extensions WHERE name = 'pgaudit' \gset
+\if :has_pgaudit
 CREATE EXTENSION IF NOT EXISTS pgaudit;
+\endif
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 \set ro_password `printenv DATABASTION_DB_PASSWORD`
@@ -57,5 +62,7 @@ GRANT pg_read_all_stats TO databastion;
 CREATE ROLE databastion_auditor NOLOGIN;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA crm, billing, ops TO databastion_auditor;
 
+\if :has_pgaudit
 ALTER DATABASE :"dbname" SET pgaudit.log = 'read, write';
+\endif
 EOSQL
