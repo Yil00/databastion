@@ -173,6 +173,21 @@ fn banned_workspace_aliases() -> Vec<String> {
         .collect()
 }
 
+/// The classifiers use case-insensitive groups (`(?i:…)`); without the
+/// `unicode-case` feature `Regex::new` fails and the detector is silently
+/// disabled in the shipped binary. Test builds of the whole workspace get
+/// the feature through dev-dependencies (feature unification), so only the
+/// manifest can be checked.
+#[test]
+fn regex_keeps_unicode_case() {
+    let root = fs::read_to_string(workspace_root().join("Cargo.toml")).unwrap();
+    let line = root
+        .lines()
+        .find(|l| l.trim_start().starts_with("regex ="))
+        .expect("workspace regex dependency");
+    assert!(line.contains("\"unicode-case\""), "{line}");
+}
+
 #[test]
 fn lockfile_has_no_openssl_or_native_tls() {
     let lock = fs::read_to_string(workspace_root().join("Cargo.lock")).unwrap();
