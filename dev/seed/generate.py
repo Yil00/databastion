@@ -416,7 +416,9 @@ CREATE TABLE ops.app_credentials (
 def gen_mysql(f: Fake, t: Truth) -> str:
     E, DB = "mysql", "hr"
     people = [f.person() for _ in range(120)]
-    s = [HEADER.format(seed=SEED), "CREATE DATABASE hr CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;\nUSE hr;\n\n"]
+    # SET NAMES: the MySQL image entrypoint loads this file with a client whose default character set
+    # follows the container locale (latin1): without it, every non-ASCII value is double-encoded.
+    s = [HEADER.format(seed=SEED), "SET NAMES utf8mb4;\nCREATE DATABASE hr CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;\nUSE hr;\n\n"]
     s.append("""CREATE TABLE employees (
   id INT PRIMARY KEY, full_name VARCHAR(120) NOT NULL, work_email VARCHAR(160) NOT NULL,
   mobile_phone VARCHAR(32), birth_date DATE, home_address VARCHAR(255), nir VARCHAR(32),
@@ -466,7 +468,7 @@ def gen_mysql(f: Fake, t: Truth) -> str:
 def gen_mariadb(f: Fake, t: Truth) -> str:
     E, DB = "mariadb", "support"
     people = [f.person() for _ in range(100)]
-    s = [HEADER.format(seed=SEED), "CREATE DATABASE support CHARACTER SET utf8mb4;\nUSE support;\n\n"]
+    s = [HEADER.format(seed=SEED), "SET NAMES utf8mb4;\nCREATE DATABASE support CHARACTER SET utf8mb4;\nUSE support;\n\n"]
     s.append("""CREATE TABLE tickets (
   id INT PRIMARY KEY, requester_name VARCHAR(120) NOT NULL, requester_email VARCHAR(160) NOT NULL,
   requester_phone VARCHAR(32), subject VARCHAR(200) NOT NULL, body TEXT NOT NULL, status VARCHAR(16) NOT NULL

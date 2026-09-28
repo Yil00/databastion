@@ -69,8 +69,8 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 ## Engine configuration
 - **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`, with `log_file_mode=0644` as a dev-only convenience (production: `0640` plus an ACL for the agent's OS user, ADR-0012).
-- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the audit trail. Log: `dev/.state/logs/mariadb/server_audit.log`.
-- **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements).
+- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the audit trail. Log: `dev/.state/logs/mariadb/server_audit.log`. TLS with dev-only material from [mariadb/initdb/30-tls.sh](mariadb/initdb/30-tls.sh) (below).
+- **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements). The `FEDERATED` engine is enabled as a test fixture only (the connector test proves such a table is never read). TLS with dev-only material from [mysql/initdb/30-tls.sh](mysql/initdb/30-tls.sh) (below).
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
 - **OpenLDAP**: image built from Debian's `slapd` package ([openldap/Dockerfile](openldap/Dockerfile)): osixia/openldap is unmaintained and the Bitnami catalog no longer publishes free versioned tags. Configuration in [openldap/config.ldif](openldap/config.ldif) (`olcAccessLogOps: reads writes session`, purge after 7 days). Healthchecks use `ldapi://` on `cn=config`, so they do not add entries to `cn=accesslog`.
 
@@ -97,8 +97,38 @@ where pgaudit is loaded (the dev image). A skipped check prints `skipped: …`;
 `DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`, `pgaudit`, `weak-auth`, `tls`,
 or `all`) turns the listed skips into failures, as CI does for each server.
 
+The MySQL / MariaDB connector tests (`agent/crates/connector-mysql/src/it.rs`) run against the
+`mysql` and `mariadb` services the same way. Both servers use dev-only TLS material created at
+initialization by `initdb/30-tls.sh` (a throwaway CA, whose key is deleted, signs a certificate for
+`127.0.0.1`, `::1`, `localhost` and the service name), so that the tests use the connector's default
+`tls: verify_full` with the CA pinned. Export the CAs once the services are up (on volumes created
+before this script existed, run `make dev-reset dev` first):
+
+```sh
+set -a; . dev/.env; set +a
+mkdir -p dev/.state/tls
+docker compose -f dev/docker-compose.yml exec -T mysql cat /var/lib/mysql/ca.pem > dev/.state/tls/mysql-ca.pem
+docker compose -f dev/docker-compose.yml exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
+export DATABASTION_TEST_MYSQL_URL="mysql://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:${MYSQL_PORT:-3306}/hr"
+export DATABASTION_TEST_MYSQL_ADMIN_URL="mysql://root:$MYSQL_ROOT_PASSWORD@127.0.0.1:${MYSQL_PORT:-3306}/"
+export DATABASTION_TEST_MYSQL_CA_FILE="$PWD/dev/.state/tls/mysql-ca.pem"
+export DATABASTION_TEST_MARIADB_URL="mysql://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:${MARIADB_PORT:-3307}/support"
+export DATABASTION_TEST_MARIADB_ADMIN_URL="mysql://root:$MARIADB_ROOT_PASSWORD@127.0.0.1:${MARIADB_PORT:-3307}/"
+export DATABASTION_TEST_MARIADB_CA_FILE="$PWD/dev/.state/tls/mariadb-ca.pem"
+# Optional: the container address, for the mysql_native_password refusal on a network without TLS.
+export DATABASTION_TEST_MARIADB_NETWORK_HOST="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' databastion-dev-mariadb-1)"
+(cd agent && cargo test -p databastion-connector-mysql -- --nocapture)
+```
+
+The admin URLs are for the probe fixtures (databases `databastion_probe` and
+`databastion_probe_sink`, accounts `databastion_it_*`, the `ha_federatedx` and `auth_pam` plugins
+installed on MariaDB). MySQL accounts use `caching_sha2_password`, whose full authentication the
+connector only performs over TLS: without `DATABASTION_TEST_MYSQL_CA_FILE` the MySQL fixture tests are
+skipped. `DATABASTION_TEST_REQUIRE` accepts `mysql`, `mariadb`, `mysql-admin`, `mariadb-admin`,
+`mysql-tls`, `mariadb-tls`, `federated`, `pam`, `network` (or `all`).
+
 ## Seed data and ground truth
-[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
+[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
 
 All values are fake: `example.com/.org/.net` e-mails, French phone numbers in the ARCEP ranges reserved for fiction, UK 07700 900xxx, US 555-01xx, IBANs with valid mod-97 on fictitious bank codes, NIRs with a valid key, Luhn-valid card numbers from the 411111 / 555555 test ranges, AWS-shaped keys containing `EXAMPLE`.
 
