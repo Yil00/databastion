@@ -80,10 +80,20 @@ binary: `cargo build --no-default-features --features postgres`.
   pointers all designate items → those items dropped, the rest resent under
   a new `batch_id` at the same queue position; `413` → two halves with new
   ids (a single item is dropped); `409 batch_conflict` → dropped, counted
-  (`batch_conflicts_total`), warned, never resent; other `4xx` → dropped;
-  network / `5xx` / `429` → kept and retried with backoff; `401` / `426` →
-  kept (spooling continues within bounds). Real stats go into the heartbeat
-  `spool` section.
+  (`batch_conflicts_total`), warned, never resent; other `4xx` with a
+  parseable contract `Error` body → dropped. Anything that is not a contract
+  answer (a proxy's HTML `200`, a bare `404` / `409`, an unparseable or
+  mismatched `BatchAck`) is kept, counted
+  (`batches_unexpected_response_total`) and retried, so a middlebox cannot
+  empty the spool. Network / `5xx` / `429` → kept and retried; retries back
+  off exponentially (1 s doubling to 5 min, full jitter) over consecutive
+  failures. `401` / `426` → kept (spooling continues within bounds). Stored
+  bytes are sent verbatim (parsed only for `batch_id`, item count and
+  splitting). Quarantine is only for unparseable files or files refused by
+  the state-file checks (symlink, owner, mode, not regular; opened with
+  `O_NONBLOCK` so a planted FIFO cannot block); transient errors (`EMFILE`,
+  `ENOMEM`) are retried. `spool_quarantined_total` is exported in the
+  heartbeat metrics. Real stats go into the heartbeat `spool` section.
 
 ### Local engine detection (ADR-0006, I5)
 `detect` looks at the agent host only, read-only, with no network I/O: a
@@ -94,8 +104,14 @@ never reported); `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`,
 `mongod`, `slapd` (never the command line). Declared targets are excluded
 (same socket; loopback host with the same port; a local target of the same
 engine family hides the process entry). At most 16 entries, reported as
-`detected_targets` in each heartbeat. The host root is injectable; tests use
-fixture trees.
+`detected_targets` in the heartbeat. Detection runs in `spawn_blocking` and
+is cached for 5 minutes (reset on `agent.config.reload`). The host root is
+injectable; tests use fixture trees.
+
+`/proc/net/tcp{,6}` only lists sockets of the agent's **network
+namespace**: an agent running in a container (without host networking)
+detects no listening port of the host, and its `/proc` shows only its own
+processes. Sockets are only seen if their directory is mounted in.
 
 ### Guards
 `crates/agent/tests/architecture.rs` checks that connectors do not depend on

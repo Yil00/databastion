@@ -9,7 +9,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use databastion_protocol::{
-    AgentVersion, Connector as ProtoConnector, ConnectorList, Count, EnrollRequest,
+    AgentVersion, Connector as ProtoConnector, ConnectorList, Count, DetectedTarget, EnrollRequest,
     EnrollRequestArch, EnrollRequestOs, EnrollResponse, EnrollmentToken, FailureCode,
     HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate, MetricsMap,
     MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
@@ -260,6 +260,7 @@ struct Counters {
     batches_duplicate: AtomicU64,
     batches_rejected: AtomicU64,
     batch_conflicts: AtomicU64,
+    batches_unexpected_response: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, n: u64) {
@@ -278,6 +279,22 @@ struct Runtime {
     spool: Mutex<Spool>,
     /// Host root for local detection (`/`; a fixture tree in tests).
     host_root: PathBuf,
+    /// Last local detection result and when it was computed.
+    detection: Mutex<Option<(Instant, Vec<DetectedTarget>)>>,
+}
+
+/// How long a local detection result is reused.
+const DETECTION_TTL: Duration = Duration::from_secs(300);
+
+/// Longest delay between two attempts to send the same spooled batch.
+const SPOOL_MAX_RETRY: Duration = Duration::from_secs(300);
+
+/// Backoff before retrying a spooled batch after `failures` consecutive
+/// failures (1-based): 1 s doubling up to 5 min, full jitter.
+fn spool_backoff(failures: u32, fraction: f64) -> Duration {
+    backoff::Backoff::CONSOLE
+        .delay(failures.saturating_sub(1), fraction)
+        .min(SPOOL_MAX_RETRY)
 }
 
 /// A spool write failed (logged by kind only).
@@ -339,6 +356,7 @@ impl Runtime {
             state: watch::channel(RunState::Active).0,
             spool: Mutex::new(spool),
             host_root: PathBuf::from("/"),
+            detection: Mutex::new(None),
         })
     }
 
@@ -416,13 +434,57 @@ impl Runtime {
             ("batches_duplicate_total", &c.batches_duplicate),
             ("batches_rejected_total", &c.batches_rejected),
             ("batch_conflicts_total", &c.batch_conflicts),
+            (
+                "batches_unexpected_response_total",
+                &c.batches_unexpected_response,
+            ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
                 map.insert(key, value.load(Ordering::Relaxed) as f64);
             }
         }
+        let quarantined = self.lock_spool().counters.quarantined;
+        if let Ok(key) = MetricsMapKey::try_from("spool_quarantined_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, quarantined as f64);
+        }
         MetricsMap(map)
+    }
+
+    /// Local detection (ADR-0006), off the async threads and cached for
+    /// [`DETECTION_TTL`]: it walks `/proc`.
+    async fn detected_targets(&self, config: &AgentConfig) -> Vec<DetectedTarget> {
+        {
+            let cache = self
+                .detection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, found)) = cache.as_ref() {
+                if at.elapsed() < DETECTION_TTL {
+                    return found.clone();
+                }
+            }
+        }
+        let root = self.host_root.clone();
+        let targets = config.targets.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            detect::detect(
+                &detect::HostView {
+                    root: &root,
+                    is_socket: detect::is_unix_socket,
+                },
+                &targets,
+            )
+        })
+        .await
+        .unwrap_or_default();
+        *self
+            .detection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Instant::now(), found.clone()));
+        found
     }
 
     async fn build_heartbeat(&self) -> Result<HeartbeatRequest, AgentError> {
@@ -430,17 +492,12 @@ impl Runtime {
         let engines: Vec<Engine> = self.connectors.iter().map(|c| c.engine()).collect();
         let uptime = i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX);
         let spool = self.lock_spool().status();
+        let detected_targets = self.detected_targets(&config).await;
         Ok(HeartbeatRequest {
             agent_version: agent_version()?,
             classifiers_version: None,
             connectors: connector_list(&engines),
-            detected_targets: detect::detect(
-                &detect::HostView {
-                    root: &self.host_root,
-                    is_socket: detect::is_unix_socket,
-                },
-                &config.targets,
-            ),
+            detected_targets,
             metrics: Some(self.metrics()),
             running_jobs: None,
             spool,
@@ -633,7 +690,7 @@ impl Runtime {
                     _ = shutdown.changed() => continue,
                 }
             }
-            let delay = match self.flush_once().await? {
+            let delay = match self.flush_once(failures.saturating_add(1)).await? {
                 Flush::Progress => {
                     failures = 0;
                     continue;
@@ -653,14 +710,20 @@ impl Runtime {
 
     /// Sends the batch at the head of the spool and applies the outcome
     /// (docs/09 error table).
-    async fn flush_once(&self) -> Result<Flush, AgentError> {
+    /// Sends the batch at the head of the spool and applies the outcome
+    /// (docs/09 error table). `failures` counts consecutive failed attempts,
+    /// including this one (backoff).
+    ///
+    /// A batch is only removed on a valid `BatchAck` for its `batch_id`, and
+    /// only dropped on a contract answer: a `4xx` with a parseable `Error`
+    /// body, valid item pointers, or `413` (split, no data lost). Anything
+    /// else (a proxy's HTML page, a bare `404`, an unparseable or mismatched
+    /// ack) is retried with backoff and counted, so a misbehaving middlebox
+    /// cannot empty the spool.
+    async fn flush_once(&self, failures: u32) -> Result<Flush, AgentError> {
         let front = self.lock_spool().front();
         let Some((key, batch)) = front else {
             return Ok(Flush::Idle);
-        };
-        let Some(body) = batch.to_bytes() else {
-            self.lock_spool().drop_batch(&key);
-            return Ok(Flush::Progress);
         };
         let result = self
             .session
@@ -668,7 +731,7 @@ impl Runtime {
                 Method::POST,
                 batch.path(),
                 &[],
-                Some(&body),
+                Some(batch.bytes()),
                 uplink::REQUEST_TIMEOUT,
             )
             .await;
@@ -676,6 +739,7 @@ impl Runtime {
             tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
             SpoolIo
         };
+        let retry = || Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
         match result {
             Ok(reply) => {
                 match serde_json::from_slice::<databastion_protocol::BatchAck>(&reply.body) {
@@ -684,12 +748,19 @@ impl Runtime {
                             bump(&self.counters.batches_duplicate, 1);
                             tracing::info!(batch_id = %ack.batch_id, "batch already received (duplicate)");
                         }
+                        bump(&self.counters.batches_sent, 1);
+                        self.lock_spool().remove(&key);
+                        Ok(Flush::Progress)
                     }
-                    _ => tracing::warn!("batch accepted with an unexpected acknowledgement"),
+                    _ => {
+                        bump(&self.counters.batches_unexpected_response, 1);
+                        tracing::warn!(
+                            status = reply.status.as_u16(),
+                            "batch answered without a matching acknowledgement; kept for retry"
+                        );
+                        Ok(retry())
+                    }
                 }
-                bump(&self.counters.batches_sent, 1);
-                self.lock_spool().remove(&key);
-                Ok(Flush::Progress)
             }
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. }))
                 if items.iter().any(|&i| i >= batch.len()) =>
@@ -715,7 +786,7 @@ impl Runtime {
                     .map_err(io)
                     .is_err()
                 {
-                    return Ok(Flush::Retry(Duration::from_secs(30)));
+                    return Ok(retry());
                 }
                 Ok(Flush::Progress)
             }
@@ -724,7 +795,7 @@ impl Runtime {
                 match batch.halves() {
                     Some((a, b)) => {
                         if spool.replace(&key, &[a, b], 0).map_err(io).is_err() {
-                            return Ok(Flush::Retry(Duration::from_secs(30)));
+                            return Ok(retry());
                         }
                     }
                     None => {
@@ -734,8 +805,11 @@ impl Runtime {
                 }
                 Ok(Flush::Progress)
             }
-            Err(CallError::Uplink(UplinkError::Rejected { status, code })) => {
-                if code == Some(databastion_protocol::ErrorCode::BatchConflict) {
+            Err(CallError::Uplink(UplinkError::Rejected {
+                status,
+                code: Some(code),
+            })) => {
+                if code == databastion_protocol::ErrorCode::BatchConflict {
                     bump(&self.counters.batch_conflicts, 1);
                     tracing::warn!(
                         batch_id = %batch.batch_id(),
@@ -743,14 +817,24 @@ impl Runtime {
                     );
                 } else {
                     bump(&self.counters.batches_rejected, 1);
-                    tracing::warn!(status, "batch rejected (not retryable); dropped");
+                    tracing::warn!(status, %code, "batch rejected (not retryable); dropped");
                 }
                 self.lock_spool().drop_batch(&key);
                 Ok(Flush::Progress)
             }
+            Err(CallError::Uplink(
+                UplinkError::Rejected { status, code: None }
+                | UplinkError::UnexpectedResponse { status },
+            )) => {
+                bump(&self.counters.batches_unexpected_response, 1);
+                tracing::warn!(
+                    status,
+                    "batch answered without a contract error body; kept for retry"
+                );
+                Ok(retry())
+            }
             Err(e) => {
-                let normal = Duration::from_secs(30);
-                let delay = self.on_call_error("spool", &e, 1, normal)?;
+                let delay = self.on_call_error("spool", &e, failures, SPOOL_MAX_RETRY)?;
                 Ok(Flush::Retry(delay))
             }
         }
@@ -901,6 +985,11 @@ impl Runtime {
     fn reload_config(&self) -> Outcome {
         match AgentConfig::load(&self.config_path) {
             Ok(new) => {
+                // Declared targets may change: detect again next heartbeat.
+                *self
+                    .detection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 let mut current = self
                     .config
                     .write()

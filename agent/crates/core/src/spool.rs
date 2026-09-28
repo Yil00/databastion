@@ -18,6 +18,7 @@
 //!   the agent. Its content is never logged.
 
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ use crate::uplink::{MAX_BATCH_BYTES, ResultBatch};
 pub(crate) const MAX_QUARANTINED: usize = 32;
 /// Deepest replacement key (bounded splits).
 const MAX_KEY_DEPTH: usize = 16;
+/// Largest child key part (4 digits in file names).
+const MAX_CHILD: u64 = 9999;
 /// Largest spool file read.
 const MAX_FILE_BYTES: u64 = (MAX_BATCH_BYTES as u64) * 4;
 
@@ -46,6 +49,17 @@ struct Entry {
     bytes: u64,
     items: u64,
     created: SystemTime,
+}
+
+/// Why a spooled file could not be read.
+#[derive(Debug)]
+enum ReadError {
+    /// Missing (removed meanwhile): forget the entry.
+    Gone,
+    /// Unparseable, or refused by the file checks: quarantine.
+    Corrupt,
+    /// Resource error (EMFILE, ENOMEM…): retry later.
+    Transient(io::Error),
 }
 
 /// Counters exported in the heartbeat.
@@ -89,7 +103,7 @@ fn parse_name(name: &str) -> Option<(Key, bool)> {
         let ok = if i == 0 {
             part.len() == 20
         } else {
-            part.len() == 1
+            (1..=4).contains(&part.len())
         };
         if !ok || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -122,8 +136,9 @@ impl Spool {
         let mut found = Vec::new();
         for entry in fs::read_dir(&spool.dir)? {
             let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                spool.quarantine(&entry.file_name().to_string_lossy());
+            let os_name = entry.file_name();
+            let Some(name) = os_name.to_str() else {
+                spool.quarantine(&os_name);
                 continue;
             };
             if name == "quarantine" {
@@ -133,24 +148,29 @@ impl Spool {
                 let _ = fs::remove_file(entry.path());
                 continue;
             }
-            match parse_name(&name) {
-                Some((key, findings)) => match spool.read(&key, findings) {
-                    Some((batch, bytes)) => {
-                        let created = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or_else(|_| SystemTime::now());
-                        found.push(Entry {
-                            key,
-                            findings,
-                            bytes: to_u64(bytes),
-                            items: to_u64(batch.len()),
-                            created,
-                        });
-                    }
-                    None => spool.quarantine(&name),
-                },
-                None => spool.quarantine(&name),
+            let Some((key, findings)) = parse_name(name) else {
+                spool.quarantine(&os_name);
+                continue;
+            };
+            match spool.read(&key, findings) {
+                Ok(batch) => {
+                    let created = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or_else(|_| SystemTime::now());
+                    found.push(Entry {
+                        key,
+                        findings,
+                        bytes: to_u64(batch.bytes().len()),
+                        items: to_u64(batch.len()),
+                        created,
+                    });
+                }
+                Err(ReadError::Corrupt) => spool.quarantine(&os_name),
+                Err(ReadError::Gone) => {}
+                // Transient (EMFILE, ENOMEM…): the agent cannot start
+                // consistently; the caller reports the error.
+                Err(ReadError::Transient(e)) => return Err(e),
             }
         }
         found.sort_by(|a, b| a.key.cmp(&b.key));
@@ -169,19 +189,28 @@ impl Spool {
         self.dir.join(file_name(key, findings))
     }
 
-    /// Reads and parses a spooled batch; `None` if unreadable or invalid.
-    fn read(&self, key: &[u64], findings: bool) -> Option<(ResultBatch, usize)> {
-        let file = fsutil::open_private(&self.path(key, findings)).ok()?;
+    /// Reads and parses a spooled batch.
+    fn read(&self, key: &[u64], findings: bool) -> Result<ResultBatch, ReadError> {
+        let classify = |e: io::Error| match e.kind() {
+            io::ErrorKind::NotFound => ReadError::Gone,
+            // Symlink, wrong owner / mode, not a regular file.
+            io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidData => ReadError::Corrupt,
+            _ => ReadError::Transient(e),
+        };
+        let file = fsutil::open_private(&self.path(key, findings)).map_err(classify)?;
         let mut bytes = Vec::new();
-        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+        file.take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(classify)?;
         if to_u64(bytes.len()) > MAX_FILE_BYTES {
-            return None;
+            return Err(ReadError::Corrupt);
         }
-        let batch = ResultBatch::parse(findings, &bytes)?;
-        (batch.len() > 0).then_some((batch, bytes.len()))
+        ResultBatch::parse(findings, bytes).ok_or(ReadError::Corrupt)
     }
 
-    fn quarantine(&mut self, name: &str) {
+    /// Moves a file to `quarantine/` (by its raw OS name, so non-UTF-8 names
+    /// are handled) and keeps at most [`MAX_QUARANTINED`] files there.
+    fn quarantine(&mut self, name: &OsStr) {
         self.counters.quarantined += 1;
         tracing::warn!("unreadable spool file moved to quarantine");
         let qdir = self.dir.join("quarantine");
@@ -189,6 +218,7 @@ impl Spool {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let safe: String = name
+            .to_string_lossy()
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '.' {
@@ -199,8 +229,9 @@ impl Spool {
             })
             .take(64)
             .collect();
-        if fs::rename(self.dir.join(name), qdir.join(format!("{stamp}-{safe}"))).is_err() {
-            let _ = fs::remove_file(self.dir.join(name));
+        let source = self.dir.join(name);
+        if fs::rename(&source, qdir.join(format!("{stamp:039}-{safe}"))).is_err() {
+            let _ = fs::remove_file(&source);
         }
         if let Ok(read) = fs::read_dir(&qdir) {
             let mut names: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -235,19 +266,23 @@ impl Spool {
         }
     }
 
+    /// Writes a batch file (after making room). `Ok(None)`: the batch can
+    /// never fit and was dropped (counted).
     fn write(&mut self, key: Key, batch: &ResultBatch) -> io::Result<Option<Entry>> {
         let items = to_u64(batch.len());
-        let bytes = batch
-            .to_bytes()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "batch serialization"))?;
+        let bytes = batch.bytes();
         let len = to_u64(bytes.len());
-        if len > self.max_bytes || len > to_u64(MAX_BATCH_BYTES) || key.len() > MAX_KEY_DEPTH {
+        if len > self.max_bytes
+            || len > to_u64(MAX_BATCH_BYTES)
+            || key.len() > MAX_KEY_DEPTH
+            || key.iter().skip(1).any(|p| *p > MAX_CHILD)
+        {
             self.counters.dropped_batches += 1;
             self.counters.dropped_items += items;
             return Ok(None);
         }
         self.make_room(len);
-        fsutil::write_private_atomic(&self.path(&key, batch.is_findings()), &bytes)?;
+        fsutil::write_private_atomic(&self.path(&key, batch.is_findings()), bytes)?;
         self.total += len;
         Ok(Some(Entry {
             key,
@@ -256,6 +291,12 @@ impl Spool {
             items,
             created: SystemTime::now(),
         }))
+    }
+
+    /// Inserts an entry at its key position (entries stay sorted by key).
+    fn insert_sorted(&mut self, entry: Entry) {
+        let at = self.entries.partition_point(|e| e.key < entry.key);
+        self.entries.insert(at, entry);
     }
 
     /// Appends a batch at the tail.
@@ -268,17 +309,26 @@ impl Spool {
         Ok(())
     }
 
-    /// The batch at the head of the queue. Unreadable files are quarantined
-    /// and skipped.
+    /// The batch at the head of the queue. Corrupt files are quarantined
+    /// and skipped; a transient read error (EMFILE, ENOMEM…) leaves the
+    /// queue untouched and returns `None` (retried later).
     pub(crate) fn front(&mut self) -> Option<(Key, ResultBatch)> {
         loop {
             let entry = self.entries.front()?.clone();
-            if let Some((batch, _)) = self.read(&entry.key, entry.findings) {
-                return Some((entry.key, batch));
+            match self.read(&entry.key, entry.findings) {
+                Ok(batch) => return Some((entry.key, batch)),
+                Err(ReadError::Transient(e)) => {
+                    tracing::warn!(kind = %e.kind(), "spool read failed; will retry");
+                    return None;
+                }
+                Err(err) => {
+                    self.entries.pop_front();
+                    self.total = self.total.saturating_sub(entry.bytes);
+                    if matches!(err, ReadError::Corrupt) {
+                        self.quarantine(OsStr::new(&file_name(&entry.key, entry.findings)));
+                    }
+                }
             }
-            self.entries.pop_front();
-            self.total = self.total.saturating_sub(entry.bytes);
-            self.quarantine(&file_name(&entry.key, entry.findings));
         }
     }
 
@@ -303,8 +353,11 @@ impl Spool {
     }
 
     /// Replaces a batch by `replacements` (new `batch_id`s) at the same
-    /// place in the queue; `dropped_items` counts the items left out. The
-    /// new files are written before the old one is removed.
+    /// place in the queue; `dropped_items` counts the items left out, only
+    /// once every replacement is written. Child keys never reuse a key
+    /// already in the queue (e.g. left by a crash during an earlier
+    /// replacement). The old file is removed last: a crash in between may
+    /// resend the old `batch_id` (idempotent on the console).
     pub(crate) fn replace(
         &mut self,
         key: &[u64],
@@ -314,27 +367,43 @@ impl Spool {
         let Some(index) = self.position(key) else {
             return Ok(()); // evicted meanwhile
         };
-        self.counters.dropped_items += dropped_items;
-        let mut new_entries = Vec::new();
+        // Out of the index first, so `make_room` cannot evict it while its
+        // replacements are written; its file stays until the end.
+        let Some(old) = self.entries.remove(index) else {
+            return Ok(());
+        };
+        self.total = self.total.saturating_sub(old.bytes);
+        let first_free = self
+            .entries
+            .iter()
+            .filter(|e| e.key.len() == key.len() + 1 && e.key.starts_with(key))
+            .filter_map(|e| e.key.last().copied())
+            .max()
+            .map_or(0, |m| m + 1);
+        let mut written = Vec::new();
         for (n, batch) in replacements.iter().enumerate() {
             let mut child = key.to_vec();
-            child.push(to_u64(n));
-            if let Some(e) = self.write(child, batch)? {
-                new_entries.push(e);
+            child.push(first_free + to_u64(n));
+            match self.write(child, batch) {
+                Ok(Some(e)) => written.push(e),
+                Ok(None) => {}
+                Err(e) => {
+                    // Roll back: remove the new files, restore the old entry.
+                    for w in written {
+                        let _ = fs::remove_file(self.path(&w.key, w.findings));
+                        self.total = self.total.saturating_sub(w.bytes);
+                    }
+                    self.total += old.bytes;
+                    self.insert_sorted(old);
+                    return Err(e);
+                }
             }
         }
-        // `write` may have evicted entries: find the old one again.
-        if let Some(i) = self.position(key) {
-            if let Some(old) = self.entries.remove(i) {
-                self.total = self.total.saturating_sub(old.bytes);
-                let _ = fs::remove_file(self.path(&old.key, old.findings));
-            }
+        self.counters.dropped_items += dropped_items;
+        for e in written {
+            self.insert_sorted(e);
         }
-        let at = index.min(self.entries.len());
-        for (offset, e) in new_entries.into_iter().enumerate() {
-            let at = (at + offset).min(self.entries.len());
-            self.entries.insert(at, e);
-        }
+        let _ = fs::remove_file(self.path(&old.key, old.findings));
         Ok(())
     }
 

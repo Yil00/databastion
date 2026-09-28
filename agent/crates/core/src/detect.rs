@@ -13,6 +13,9 @@
 //! The agent never connects to a detected engine. Engines already declared
 //! in `agent.yaml` are excluded; the result is capped at the contract limit
 //! (16). The root is injectable so tests use fixture trees.
+//!
+//! `/proc/net/tcp{,6}` only shows the agent's network namespace: a
+//! containerized agent without host networking detects no host port.
 
 use std::fs;
 use std::io::Read;

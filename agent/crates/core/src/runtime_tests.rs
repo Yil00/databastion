@@ -1058,7 +1058,7 @@ async fn sent_batches(server: &MockServer) -> Vec<serde_json::Value> {
 
 async fn drain(rt: &Runtime) {
     for _ in 0..20 {
-        if rt.flush_once().await.unwrap() == Flush::Idle {
+        if rt.flush_once(1).await.unwrap() == Flush::Idle {
             return;
         }
     }
@@ -1157,9 +1157,66 @@ async fn server_errors_keep_the_batch_for_retry() {
         &found,
     )
     .unwrap();
-    assert!(matches!(rt.flush_once().await.unwrap(), Flush::Retry(_)));
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
     let hb = rt.build_heartbeat().await.unwrap();
     assert_eq!(hb.spool.batches.0, 1);
     assert!(hb.spool.bytes.0 > 0);
     assert!(hb.spool.max_bytes.0 > 0);
+}
+
+#[test]
+fn spool_backoff_grows_and_is_capped() {
+    let top = |f| spool_backoff(f, 0.999_999);
+    assert!(top(1) <= Duration::from_secs(1));
+    assert!(top(2) > top(1));
+    assert!(top(6) > Duration::from_secs(30));
+    assert_eq!(top(40), Duration::from_secs(300).mul_f64(0.999_999));
+}
+
+async fn spool_answered_with(template: ResponseTemplate) -> Runtime {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(template)
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(2, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    for failures in 1..=3 {
+        assert!(matches!(
+            rt.flush_once(failures).await.unwrap(),
+            Flush::Retry(_)
+        ));
+    }
+    drop(server);
+    rt
+}
+
+#[tokio::test]
+async fn non_contract_answers_never_empty_the_spool() {
+    let html = ResponseTemplate::new(200).set_body_string("<html>proxy login</html>");
+    let bare_404 = ResponseTemplate::new(404);
+    let bare_409 = ResponseTemplate::new(409).set_body_string("conflict");
+    let wrong_ack = ResponseTemplate::new(202).set_body_json(serde_json::json!({
+        "batch_id": "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f", "duplicate": false
+    }));
+    for template in [html, bare_404, bare_409, wrong_ack] {
+        let rt = spool_answered_with(template).await;
+        let status = rt.lock_spool().status();
+        assert_eq!(status.batches.0, 1);
+        assert_eq!(status.dropped_batches.unwrap().0, 0);
+        let m = rt.metrics().0;
+        let unexpected = m[&MetricsMapKey::try_from("batches_unexpected_response_total").unwrap()];
+        assert!((unexpected - 3.0).abs() < f64::EPSILON);
+        assert!(m.contains_key(&MetricsMapKey::try_from("spool_quarantined_total").unwrap()));
+    }
 }

@@ -11,7 +11,7 @@ use databastion_protocol::{ClassifiersVersion, Engine, TargetId, Uuid};
 use super::*;
 use crate::config::SpoolConfig;
 use crate::fsutil::test_dir::TempDir;
-use crate::uplink::{MaskedResults, pack_events, to_batches};
+use crate::uplink::{MaskedResults, to_batches};
 
 pub(crate) fn masked(n: usize, field: &str) -> Vec<MaskedFinding> {
     (0..n)
@@ -66,7 +66,7 @@ fn conversion_caps_items_and_drops_invalid_ones() {
     let ids: std::collections::HashSet<_> = b.iter().map(|x| x.batch_id()).collect();
     assert_eq!(ids.len(), 3);
     for x in &b {
-        assert!(x.to_bytes().unwrap().len() <= MAX_BATCH_BYTES);
+        assert!(x.bytes().len() <= MAX_BATCH_BYTES);
     }
     // No location, sampled 0, matched > sampled: dropped and counted.
     let version = ClassifiersVersion::try_from("2026.09.1").unwrap();
@@ -83,30 +83,9 @@ fn conversion_caps_items_and_drops_invalid_ones() {
         findings: &findings,
     });
     assert_eq!(built.dropped_items, 3);
-    let body = String::from_utf8(built.batches[0].to_bytes().unwrap()).unwrap();
+    let body = String::from_utf8(built.batches[0].bytes().to_vec()).unwrap();
     assert!(body.contains(r#""field":"users.*.phone""#), "{body}");
     assert!(!body.contains("0612345678"));
-}
-
-#[test]
-fn event_packing_respects_the_byte_cap() {
-    let event = crate::sanitize::tests::event("read", 16);
-    let events: Vec<_> = (0..2000).map(|_| event.clone()).collect();
-    let built = pack_events(events);
-    assert!(built.batches.len() >= 4);
-    for b in &built.batches {
-        assert!(b.len() <= 500);
-        assert!(b.to_bytes().unwrap().len() <= MAX_BATCH_BYTES);
-    }
-    assert_eq!(built.dropped_items, 0);
-    assert_eq!(
-        pack_events(vec![crate::sanitize::tests::event("read", 0)]).dropped_items,
-        1
-    );
-    assert!(matches!(
-        to_batches(MaskedResults::Events(&[])).batches.as_slice(),
-        []
-    ));
 }
 
 #[test]
@@ -155,7 +134,7 @@ fn oldest_batches_are_dropped_first_when_full() {
     assert_eq!(spool.counters.dropped_items, 400);
     assert_eq!(spool.front().unwrap().1.batch_id(), b[2].batch_id());
     // Byte bound.
-    let one = b[0].to_bytes().unwrap().len() as u64;
+    let one = b[0].bytes().len() as u64;
     let dir2 = TempDir::new();
     let mut spool = Spool::open(dir2.path(), &config(one * 2 + 10, 100)).unwrap();
     for x in &b {
@@ -213,4 +192,73 @@ fn replacement_keeps_its_place_with_new_ids() {
     })
     .collect();
     assert_eq!(order, [h1.batch_id(), h2.batch_id(), b[1].batch_id()]);
+}
+
+#[test]
+fn stored_bytes_are_sent_verbatim() {
+    let dir = TempDir::new();
+    let b = batches(3);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    spool.push(&b[0]).unwrap();
+    drop(spool);
+    // Same content, different formatting: parsed for metadata only.
+    let mut pretty = b" ".to_vec();
+    pretty.extend_from_slice(b[0].bytes());
+    pretty.extend_from_slice(b"\n");
+    let file = dir.path().join("spool").join(file_name(&[0], true));
+    crate::fsutil::write_private_atomic(&file, &pretty).unwrap();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    let (_, front) = spool.front().unwrap();
+    assert_eq!(front.bytes(), pretty.as_slice());
+    assert_eq!(front.batch_id(), b[0].batch_id());
+}
+
+#[test]
+fn replacement_keys_never_collide_with_crash_leftovers() {
+    let dir = TempDir::new();
+    let b = batches(2 * 200);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    spool.push(&b[0]).unwrap();
+    spool.push(&b[1]).unwrap();
+    let (key, front) = spool.front().unwrap();
+    let (h1, h2) = front.halves().unwrap();
+    // Crash after writing the children but before removing the parent.
+    let sdir = dir.path().join("spool");
+    crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 0], true)), h1.bytes()).unwrap();
+    drop(spool);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    assert_eq!(spool.len(), 3);
+    spool.replace(&key, &[h1.clone(), h2.clone()], 7).unwrap();
+    assert_eq!(spool.counters.dropped_items, 7);
+    let keys: Vec<_> = spool.entries.iter().map(|e| e.key.clone()).collect();
+    assert_eq!(keys, vec![vec![0, 0], vec![0, 1], vec![0, 2], vec![1]]);
+    drop(spool);
+    let spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    assert_eq!(spool.len(), 4);
+}
+
+#[test]
+fn refused_and_non_utf8_files_are_quarantined() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new();
+    let b = batches(3);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    spool.push(&b[0]).unwrap();
+    drop(spool);
+    let sdir = dir.path().join("spool");
+    let file = sdir.join(file_name(&[0], true));
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(
+        sdir.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name")),
+        b"x",
+    )
+    .unwrap();
+    let spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    assert_eq!(spool.len(), 0);
+    assert_eq!(spool.counters.quarantined, 2);
+    let names: Vec<_> = fs::read_dir(&sdir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("quarantine")]);
 }

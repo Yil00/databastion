@@ -338,34 +338,72 @@ pub(crate) const MAX_FINDINGS_PER_BATCH: usize = 200;
 /// Contract `maxItems` of `EventsBatch.events`.
 pub(crate) const MAX_EVENTS_PER_BATCH: usize = 500;
 
-/// A findings or events batch, as spooled and sent. Built only by
-/// [`to_batches`] (from masked types) or by splitting such a batch.
+/// A findings or events batch, as spooled and sent. Opaque: its only
+/// constructors are [`to_batches`] (from masked types), [`ResultBatch::parse`]
+/// (a spooled body, validated against the generated types and then kept
+/// **verbatim**), and the splitting helpers [`ResultBatch::without`] /
+/// [`ResultBatch::halves`].
 #[derive(Debug, Clone)]
-pub(crate) enum ResultBatch {
-    /// `POST /findings`.
+pub(crate) struct ResultBatch {
+    findings: bool,
+    batch_id: UuidV7,
+    len: usize,
+    bytes: Vec<u8>,
+}
+
+enum Parsed {
     Findings(FindingsBatch),
-    /// `POST /events`.
     Events(EventsBatch),
 }
 
+impl Parsed {
+    fn into_batch(self) -> Option<ResultBatch> {
+        let (findings, batch_id, len, bytes) = match &self {
+            Self::Findings(b) => (true, b.batch_id, b.findings.len(), serde_json::to_vec(b)),
+            Self::Events(b) => (false, b.batch_id, b.events.len(), serde_json::to_vec(b)),
+        };
+        Some(ResultBatch {
+            findings,
+            batch_id,
+            len,
+            bytes: bytes.ok()?,
+        })
+    }
+}
+
 impl ResultBatch {
-    /// Parses a spooled body of the given kind.
-    pub(crate) fn parse(findings: bool, bytes: &[u8]) -> Option<Self> {
+    /// Parses a spooled body of the given kind; the bytes are kept as they
+    /// are (sent verbatim, so a resend is byte-identical for `batch_id`
+    /// deduplication). `None` if invalid or empty.
+    pub(crate) fn parse(findings: bool, bytes: Vec<u8>) -> Option<Self> {
+        let (batch_id, len) = match Self::decode(findings, &bytes)? {
+            Parsed::Findings(b) => (b.batch_id, b.findings.len()),
+            Parsed::Events(b) => (b.batch_id, b.events.len()),
+        };
+        (len > 0).then_some(Self {
+            findings,
+            batch_id,
+            len,
+            bytes,
+        })
+    }
+
+    fn decode(findings: bool, bytes: &[u8]) -> Option<Parsed> {
         if findings {
-            serde_json::from_slice(bytes).ok().map(Self::Findings)
+            serde_json::from_slice(bytes).ok().map(Parsed::Findings)
         } else {
-            serde_json::from_slice(bytes).ok().map(Self::Events)
+            serde_json::from_slice(bytes).ok().map(Parsed::Events)
         }
     }
 
     /// Whether this is a findings batch.
     pub(crate) fn is_findings(&self) -> bool {
-        matches!(self, Self::Findings(_))
+        self.findings
     }
 
     /// API path.
     pub(crate) fn path(&self) -> &'static str {
-        if self.is_findings() {
+        if self.findings {
             "/findings"
         } else {
             "/events"
@@ -374,29 +412,20 @@ impl ResultBatch {
 
     /// Idempotency key.
     pub(crate) fn batch_id(&self) -> UuidV7 {
-        match self {
-            Self::Findings(b) => b.batch_id,
-            Self::Events(b) => b.batch_id,
-        }
+        self.batch_id
     }
 
     /// Number of items.
     pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Findings(b) => b.findings.len(),
-            Self::Events(b) => b.events.len(),
-        }
+        self.len
     }
 
-    /// Serialized body.
-    pub(crate) fn to_bytes(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Findings(b) => serde_json::to_vec(b).ok(),
-            Self::Events(b) => serde_json::to_vec(b).ok(),
-        }
+    /// Serialized body, exactly as spooled.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
-    /// The same batch without the items at `drop`, under a **new**
+    /// The same batch without the items at `drop` (sorted), under a **new**
     /// `batch_id`; `None` if nothing is left.
     pub(crate) fn without(&self, drop: &[usize]) -> Option<Self> {
         fn keep<T: Clone>(items: &[T], drop: &[usize]) -> Vec<T> {
@@ -407,24 +436,25 @@ impl ResultBatch {
                 .map(|(_, x)| x.clone())
                 .collect()
         }
-        let out = match self {
-            Self::Findings(b) => Self::Findings(FindingsBatch {
+        let out = match Self::decode(self.findings, &self.bytes)? {
+            Parsed::Findings(b) => Parsed::Findings(FindingsBatch {
                 batch_id: new_batch_id(),
                 findings: keep(&b.findings, drop),
-                ..b.clone()
+                ..b
             }),
-            Self::Events(b) => Self::Events(EventsBatch {
+            Parsed::Events(b) => Parsed::Events(EventsBatch {
                 batch_id: new_batch_id(),
                 events: keep(&b.events, drop),
             }),
-        };
-        (out.len() > 0).then_some(out)
+        }
+        .into_batch()?;
+        (out.len > 0).then_some(out)
     }
 
     /// Two halves, each under a new `batch_id` (`413`); `None` for a single
     /// item.
     pub(crate) fn halves(&self) -> Option<(Self, Self)> {
-        let n = self.len();
+        let n = self.len;
         if n < 2 {
             return None;
         }
@@ -554,14 +584,16 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
         if current.len() == MAX_FINDINGS_PER_BATCH || size + len > MAX_BATCH_BYTES {
             built
                 .batches
-                .push(ResultBatch::Findings(make(std::mem::take(&mut current))));
+                .extend(Parsed::Findings(make(std::mem::take(&mut current))).into_batch());
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built.batches.push(ResultBatch::Findings(make(current)));
+        built
+            .batches
+            .extend(Parsed::Findings(make(current)).into_batch());
     }
     built
 }
@@ -569,7 +601,7 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
 /// Packs sanitized events under the item and byte caps (used once event
 /// masking produces content, P4; tested now).
 #[cfg_attr(not(test), allow(dead_code, reason = "event masking lands in P4"))]
-pub(crate) fn pack_events(items: Vec<AccessEvent>) -> Built {
+fn pack_events(items: Vec<AccessEvent>) -> Built {
     let make = |events: Vec<AccessEvent>| EventsBatch {
         batch_id: new_batch_id(),
         events,
@@ -594,14 +626,16 @@ pub(crate) fn pack_events(items: Vec<AccessEvent>) -> Built {
         if current.len() == MAX_EVENTS_PER_BATCH || size + len > MAX_BATCH_BYTES {
             built
                 .batches
-                .push(ResultBatch::Events(make(std::mem::take(&mut current))));
+                .extend(Parsed::Events(make(std::mem::take(&mut current))).into_batch());
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built.batches.push(ResultBatch::Events(make(current)));
+        built
+            .batches
+            .extend(Parsed::Events(make(current)).into_batch());
     }
     built
 }
@@ -669,5 +703,26 @@ mod tests {
         let ua = user_agent();
         let version = ua.strip_prefix("databastion-agent/").unwrap();
         assert_eq!(version.split('.').count(), 3);
+    }
+
+    #[test]
+    fn event_packing_respects_the_byte_cap() {
+        let event = crate::sanitize::tests::event("read", 16);
+        let events: Vec<_> = (0..2000).map(|_| event.clone()).collect();
+        let built = pack_events(events);
+        assert!(built.batches.len() >= 4);
+        for b in &built.batches {
+            assert!(b.len() <= 500);
+            assert!(b.bytes().len() <= MAX_BATCH_BYTES);
+        }
+        assert_eq!(built.dropped_items, 0);
+        assert_eq!(
+            pack_events(vec![crate::sanitize::tests::event("read", 0)]).dropped_items,
+            1
+        );
+        assert!(matches!(
+            to_batches(MaskedResults::Events(&[])).batches.as_slice(),
+            []
+        ));
     }
 }
