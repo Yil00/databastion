@@ -11,5 +11,7 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0005](0005-open-core-license.md) | Apache 2.0, open-core model | Accepted |
 | [0006](0006-target-discovery.md) | Declared targets + local detection, no network scanning | Accepted |
 | [0007](0007-mask-access-events.md) | Audit access events are masked in the agent (extends 0003) | Accepted |
+| [0008](0008-agent-generated-secret-rotation.md) | Agent-generated secret rotation with conflict lock | Accepted |
+| [0009](0009-name-normalization-and-item-sanitization.md) | Name normalization and per-item sanitization before the uplink | Accepted |
 
 Template: copy [template.md](template.md).
