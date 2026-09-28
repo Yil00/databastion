@@ -14,9 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Les composants n'existent pas encore tous : chaque job ne tourne que si son composant est présent.
+  # Not all components exist yet: each job only runs if its component is present.
   detect:
-    name: Détection des composants
+    name: Component detection
     runs-on: ubuntu-latest
     outputs:
       console: ${{ steps.detect.outputs.console }}
@@ -38,11 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Liens Markdown internes
+      - name: Internal Markdown links
         run: python3 scripts/check-md-links.py
 
   secrets:
-    name: Recherche de secrets (gitleaks)
+    name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: 8.30.1
@@ -50,14 +50,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Installer gitleaks (somme de contrôle vérifiée)
+      - name: Install gitleaks (checksum verified)
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           curl -sSfLO "$base/$archive"
           curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${archive}\$" | sha256sum -c -
           tar -xzf "$archive" gitleaks
-      - name: Analyse de l'historique
+      - name: Scan history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
 
   console:
@@ -105,7 +105,7 @@ jobs:
       - run: cargo test --all-features --locked
 
   protocol:
-    name: Protocole
+    name: Protocol
     needs: detect
     if: needs.detect.outputs.protocol == 'true'
     runs-on: ubuntu-latest
@@ -116,18 +116,18 @@ jobs:
           node-version: 24
       - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
 
-  # Point de contrôle unique exigé par la protection des branches.
+  # Single status check required by branch protection.
   ci-result:
     name: CI result
     if: always()
     needs: [detect, docs, secrets, console, agent, protocol]
     runs-on: ubuntu-latest
     steps:
-      - name: Tous les jobs sont verts ou ignorés
+      - name: All jobs are green or skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          echo "résultats : $RESULTS"
+          echo "results: $RESULTS"
           for r in $RESULTS; do
             case "$r" in success|skipped) ;; *) exit 1 ;; esac
           done

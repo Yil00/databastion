@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   title:
-    name: Titre Conventional Commits
+    name: Conventional Commits title
     runs-on: ubuntu-latest
     steps:
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
@@ -39,7 +39,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Chaque commit est signé DCO
+      - name: Every commit is DCO signed
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
@@ -49,7 +49,7 @@ jobs:
             author=$(git log -1 --format='%an' "$c")
             case "$author" in *"[bot]") continue ;; esac
             if ! git log -1 --format='%B' "$c" | grep -qE '^Signed-off-by: .+ <.+@.+>$'; then
-              echo "::error::Commit ${c:0:12} ($author) sans ligne Signed-off-by. Utiliser 'git commit -s' (voir CONTRIBUTING.md)."
+              echo "::error::Commit ${c:0:12} ($author) has no Signed-off-by line. Use 'git commit -s' (see CONTRIBUTING.md)."
               fail=1
             fi
           done

@@ -1,37 +1,37 @@
-# Contribuer à DataBastion
+# Contributing to DataBastion
 
-Merci de votre intérêt ! Le projet est en phase de conception : les discussions d'architecture sont aussi utiles que le code.
+Thank you for your interest! The project is in the design phase: architecture discussions are as useful as code.
 
-## Avant de commencer
-1. Lire [CONTEXT.md](CONTEXT.md) et les [décisions d'architecture](docs/adr/README.md).
-2. Pour toute évolution non triviale, ouvrir d'abord une issue pour en discuter.
-3. Une modification qui contredit un ADR accepté passe par un **nouvel ADR**, pas par une PR de code.
+## Before you start
+1. Read [CONTEXT.md](CONTEXT.md) and the [architecture decisions](docs/adr/README.md).
+2. For any non-trivial change, open an issue first to discuss it.
+3. A change that contradicts an accepted ADR goes through a **new ADR**, not a code PR.
 
-## Invariants à respecter
-Toute PR qui les enfreint sera refusée :
-- Les agents n'ouvrent **aucun** port entrant.
-- **Aucune valeur sensible brute** ne quitte l'agent (masquage + HMAC obligatoires).
-- Les identifiants des bases ne sont jamais envoyés à la console.
-- L'agent n'effectue que des opérations en **lecture**.
+## Invariants to respect
+Any PR that violates them will be rejected:
+- Agents open **no** inbound port.
+- **No raw sensitive value** leaves the agent (masking + HMAC required).
+- Database credentials are never sent to the console.
+- The agent only performs **read** operations.
 
 ## Workflow
-- **Les PR visent la branche `dev`**, jamais `main` directement (`main` = code publié).
-- Branche depuis `dev`, nommée selon le type : `feat/…`, `fix/…`, `docs/…`, `chore/…`, `ci/…`, `refactor/…`, `perf/…`, `test/…`
-- Commits et titres de PR au format [Conventional Commits](https://www.conventionalcommits.org/) : `feat(agent): …`, `fix(console): …`. Scopes : `console`, `agent`, `protocol`, `classifiers`, `postgres`, `mysql`, `mongodb`, `openldap`, `deploy`, `docs`
-- Changement cassant : `feat!:` ou pied de commit `BREAKING CHANGE: …`
-- Tests et lint verts en local ; hooks conseillés : `pre-commit install --hook-type pre-commit --hook-type commit-msg` (gitleaks + format des commits)
-- Une PR = un sujet ; elle est squashée au merge
+- **PRs target the `dev` branch**, never `main` directly (`main` = released code).
+- Branch from `dev`, named by type: `feat/…`, `fix/…`, `docs/…`, `chore/…`, `ci/…`, `refactor/…`, `perf/…`, `test/…`
+- Commits and PR titles in [Conventional Commits](https://www.conventionalcommits.org/) format: `feat(agent): …`, `fix(console): …`. Scopes: `console`, `agent`, `protocol`, `classifiers`, `postgres`, `mysql`, `mongodb`, `openldap`, `deploy`, `docs`
+- Breaking change: `feat!:` or a `BREAKING CHANGE: …` commit footer
+- Tests and lint green locally; recommended hooks: `pre-commit install --hook-type pre-commit --hook-type commit-msg` (gitleaks + commit format)
+- One PR = one topic; it is squashed on merge
 
-Règles complètes des branches, des tags et des releases : [RELEASE.md](RELEASE.md).
+Full rules for branches, tags and releases: [RELEASE.md](RELEASE.md).
 
 ## Developer Certificate of Origin (DCO)
-Chaque commit doit être signé, ce qui atteste que vous avez le droit de soumettre ce code sous licence Apache 2.0 ([developercertificate.org](https://developercertificate.org/)) :
+Every commit must be signed off, which certifies that you have the right to submit this code under the Apache 2.0 license ([developercertificate.org](https://developercertificate.org/)):
 
 ```bash
 git commit -s -m "feat(agent): add IBAN classifier"
 ```
 
-Cela ajoute la ligne `Signed-off-by: Votre Nom <email>`. Aucun CLA n'est demandé.
+This adds the line `Signed-off-by: Your Name <email>`. No CLA is required.
 
-## Licence des contributions
-Toute contribution est publiée sous [licence Apache 2.0](LICENSE) (section 5 de la licence).
+## License of contributions
+Every contribution is published under the [Apache 2.0 license](LICENSE) (section 5 of the license).

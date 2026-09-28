@@ -1,22 +1,22 @@
-# ADR-0001 : Transport HTTPS outbound avec long-poll
+# ADR-0001: Outbound HTTPS transport with long-poll
 
-- **Statut** : Accepté
-- **Date** : 2026-09-28
+- **Status**: Accepted
+- **Date**: 2026-09-28
 
-## Contexte
-Les bases sont dans des zones réseau sensibles. Ouvrir un port entrant vers elles est inacceptable pour la plupart des équipes sécurité. Les agents doivent aussi traverser des proxys d'entreprise.
+## Context
+Databases sit in sensitive network zones. Opening an inbound port to them is unacceptable for most security teams. Agents must also traverse corporate proxies.
 
-## Décision
-- L'agent est toujours client. Tout passe par HTTPS (TLS 1.3) sur le port 443 de la console.
-- La réactivité est obtenue par **long-poll** sur `GET /api/agent/v1/jobs` (25 s).
-- JSON versionné, contrat OpenAPI dans `shared/protocol/`.
+## Decision
+- The agent is always the client. Everything goes over HTTPS (TLS 1.3) on the console's port 443.
+- Responsiveness is achieved through **long-poll** on `GET /api/agent/v1/jobs` (25 s).
+- Versioned JSON, OpenAPI contract in `shared/protocol/`.
 
-## Conséquences
-- Fonctionne derrière n'importe quel proxy HTTP(S) et reverse-proxy standard.
-- Latence de commande console → agent < 1 s en pratique, sans connexion persistante bidirectionnelle.
-- Une requête HTTP ouverte par agent en permanence : dimensionner la console en conséquence (quelques centaines d'agents au MVP).
+## Consequences
+- Works behind any standard HTTP(S) proxy and reverse proxy.
+- Console → agent command latency < 1 s in practice, without a persistent bidirectional connection.
+- One HTTP request permanently open per agent: size the console accordingly (a few hundred agents for the MVP).
 
-## Alternatives écartées
-- **gRPC bidirectionnel** : plus efficace, mais passe mal certains proxys et ajoute de la complexité (HTTP/2 de bout en bout). À réévaluer en phase 2.
-- **WebSocket** : gain marginal par rapport au long-poll, gestion de reconnexion plus complexe.
-- **Polling simple toutes les 5-30 s** : plus de latence pour autant de requêtes.
+## Rejected alternatives
+- **Bidirectional gRPC**: more efficient, but passes poorly through some proxies and adds complexity (end-to-end HTTP/2). To be reassessed in phase 2.
+- **WebSocket**: marginal gain over long-poll, more complex reconnection handling.
+- **Simple polling every 5-30 s**: more latency for as many requests.

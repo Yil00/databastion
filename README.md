@@ -5,8 +5,8 @@
 <h1 align="center">DataBastion</h1>
 
 <p align="center">
-  <b>DLP open-source pour bases de données et annuaires.</b><br>
-  Savoir où sont vos données sensibles, et qui les extrait.
+  <b>Open-source DLP for databases and directories.</b><br>
+  Know where your sensitive data lives, and who is extracting it.
 </p>
 
 <p align="center">
@@ -15,54 +15,54 @@
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey.svg" alt="Platform: Linux">
 </p>
 
-> ⚠️ **Projet en phase de conception.** Rien n'est encore utilisable en production. Voir la [roadmap](docs/ROADMAP.md).
+> ⚠️ **Project in the design phase.** Nothing is production-ready yet. See the [roadmap](docs/ROADMAP.md).
 
-## Pourquoi
-Les DLP classiques surveillent les postes et le réseau. Ils ne savent ni **où** se trouvent les données sensibles dans vos bases, ni **qui** les exporte en masse (`pg_dump`, `mysqldump`, `mongoexport`, exports LDIF…).
+## Why
+Traditional DLPs monitor endpoints and the network. They know neither **where** sensitive data sits in your databases, nor **who** is exporting it in bulk (`pg_dump`, `mysqldump`, `mongoexport`, LDIF exports…).
 
-DataBastion se place **au plus près de la donnée** :
-- **Discovery** : classifie automatiquement les colonnes, champs et attributs qui contiennent des données personnelles ou des secrets.
-- **Audit** : exploite les journaux natifs des moteurs pour détecter les accès et les exports anormaux, pondérés par la sensibilité des données touchées.
+DataBastion sits **as close to the data as possible**:
+- **Discovery**: automatically classifies the columns, fields and attributes that contain personal data or secrets.
+- **Audit**: uses the engines' native logs to detect abnormal access and exports, weighted by the sensitivity of the data involved.
 
-## Moteurs supportés (MVP)
-PostgreSQL · MySQL / MariaDB · MongoDB · OpenLDAP — *CAS prévu juste après le MVP.*
+## Supported engines (MVP)
+PostgreSQL · MySQL / MariaDB · MongoDB · OpenLDAP — *CAS planned right after the MVP.*
 
-Le niveau d'audit dépend du moteur et de son édition : voir [la matrice de capacités](docs/08-CAPACITES-PAR-MOTEUR.md).
+The audit level depends on the engine and its edition: see [the capability matrix](docs/08-engine-capabilities.md).
 
-## Comment ça marche
+## How it works
 ```
-        Console DataBastion  (UI, politiques, incidents, alerting)
+        DataBastion Console  (UI, policies, incidents, alerting)
                   ▲
-                  │  HTTPS 443, initié uniquement par les agents
+                  │  HTTPS 443, initiated only by the agents
       ┌───────────┼───────────┐
-   Agent        Agent       Agent        ← aucun port entrant
+   Agent        Agent       Agent        ← no inbound port
      │            │           │
  PostgreSQL    MongoDB     OpenLDAP
 ```
-- **Outbound only** : aucun port à ouvrir vers vos serveurs de bases.
-- **Minimisation à la source** : aucune valeur sensible brute et aucun identifiant de base ne quitte l'agent. La console ne voit que des emplacements, des échantillons masqués et des empreintes.
-- **Linux, Docker, installation en moins de 15 minutes** (objectif MVP).
+- **Outbound-only**: no port to open toward your database servers.
+- **Data minimization at the source**: no raw sensitive value and no database credential ever leaves the agent. The console only sees locations, masked samples and fingerprints.
+- **Linux, Docker, installed in under 15 minutes** (MVP goal).
 
-Détails : [architecture](docs/02-ARCHITECTURE.md) · [sécurité](docs/05-SECURITE-ET-BONNES-PRATIQUES.md) · [protocole](docs/09-PROTOCOLE-AGENT.md).
+Details: [architecture](docs/02-architecture.md) · [security](docs/05-security.md) · [protocol](docs/09-agent-protocol.md).
 
-## Éditions
+## Editions
 | | Community | Enterprise |
 |---|---|---|
-| Licence | Apache 2.0 | Commerciale |
-| Discovery + Audit, tous connecteurs | ✅ | ✅ |
-| Politiques, incidents, alerting e-mail / webhook | ✅ | ✅ |
-| Auth locale + OIDC, journal d'audit console | ✅ | ✅ |
-| Multi-tenancy, RBAC fin, SAML / SCIM | | ✅ |
-| Mode Prevention avancé, export SIEM, rapports de conformité | | ✅ |
+| License | Apache 2.0 | Commercial |
+| Discovery + Audit, all connectors | ✅ | ✅ |
+| Policies, incidents, email / webhook alerting | ✅ | ✅ |
+| Local auth + OIDC, console audit log | ✅ | ✅ |
+| Multi-tenancy, fine-grained RBAC, SAML / SCIM | | ✅ |
+| Advanced Prevention mode, SIEM export, compliance reports | | ✅ |
 | Support & SLA | | ✅ |
 
-Détails : [docs/EDITIONS.md](docs/EDITIONS.md).
+Details: [docs/EDITIONS.md](docs/EDITIONS.md).
 
-## Contribuer
-Les contributions sont les bienvenues : voir [CONTRIBUTING.md](CONTRIBUTING.md). Les PR visent la branche `dev`.
-Versions et releases : [RELEASE.md](RELEASE.md) · [CHANGELOG.md](CHANGELOG.md).
-Vulnérabilités : **ne pas ouvrir d'issue publique**, voir [SECURITY.md](SECURITY.md).
+## Contributing
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). PRs target the `dev` branch.
+Versions and releases: [RELEASE.md](RELEASE.md) · [CHANGELOG.md](CHANGELOG.md).
+Vulnerabilities: **do not open a public issue**, see [SECURITY.md](SECURITY.md).
 
-## Licence
-DataBastion Community Edition est distribué sous [licence Apache 2.0](LICENSE).
-Le nom « DataBastion » et le logo ne sont pas couverts par cette licence : voir [TRADEMARKS.md](TRADEMARKS.md).
+## License
+DataBastion Community Edition is distributed under the [Apache 2.0 license](LICENSE).
+The "DataBastion" name and logo are not covered by this license: see [TRADEMARKS.md](TRADEMARKS.md).

@@ -1,13 +1,13 @@
-# OS / éditeurs
+# OS / editors
 .DS_Store
 .idea/
 .vscode/*
 !.vscode/extensions.json
 
-# Archives locales
+# Local archives
 *.zip
 
-# Secrets — ne jamais committer
+# Secrets — never commit
 .env
 .env.*
 !.env.example
@@ -25,9 +25,9 @@ coverage/
 # Rust
 target/
 
-# État local de l'agent en dev
+# Local agent state in dev
 dev/.state/
 
-# Claude Code — fichiers personnels
+# Claude Code — personal files
 CLAUDE.local.md
 .claude/settings.local.json

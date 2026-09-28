@@ -1,79 +1,79 @@
-# Roadmap MVP – DataBastion
+# MVP Roadmap – DataBastion
 
-Le MVP (v0.1.0) est découpé en phases. Chaque phase se divise en **chantiers** indépendants, attribuables à des agents différents qui travaillent en parallèle (voir [AGENTS.md](../AGENTS.md#travail-multi-agents)).
+The MVP (v0.1.0) is split into phases. Each phase is divided into independent **workstreams**, assignable to different agents working in parallel (see [AGENTS.md](../AGENTS.md#multi-agent-work)).
 
-Légende : `[ ]` à faire · `[~]` en cours · `[x]` terminé. Mettre ce fichier à jour à chaque fin de tâche.
+Legend: `[ ]` to do · `[~]` in progress · `[x]` done. Update this file at the end of every task.
 
-**Phase courante : 0**
+**Current phase: 0**
 
 ---
 
-## Phase 0 – Fondations
-*Objectif : un dépôt où plusieurs agents peuvent travailler sans se marcher dessus.*
+## Phase 0 – Foundations
+*Objective: a repository where several agents can work without stepping on each other's toes.*
 
-| Chantier | Propriétaire | Tâches |
+| Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P0-A Dépôt & CI | `docs-keeper` | [ ] Arborescence cible (`console/`, `agent/`, `shared/`, `dev/`) · [x] Branches `main` + `dev` protégées ([RELEASE.md](../RELEASE.md)) · [x] CI GitHub Actions : doc, gitleaks, console, agent, protocole (activés selon la présence du composant) · [x] Vérification DCO + format des titres de PR · [x] Workflow de release (`release-it` au merge vers `main`, `[skip-release]`) · [x] Workflow images multi-arch signées sur tags `-*` et release · [x] Script de bump de version · [x] Hooks pre-commit vérifiés · [x] Dependabot · [ ] Secret `RELEASE_TOKEN` configuré · [ ] Ajouter npm/cargo à Dependabot quand `console/` et `agent/` existent |
-| P0-B Protocole | `agent-engineer` + revue `security-reviewer` | [ ] `shared/protocol/openapi.yaml` v1 depuis [09-PROTOCOLE-AGENT.md](09-PROTOCOLE-AGENT.md) · [ ] Fixtures JSON valides / invalides · [ ] Génération des types TS et Rust |
-| P0-C Env. de dev | `agent-engineer` | [ ] `dev/docker-compose.yml` : PostgreSQL + pgaudit, MariaDB + server_audit, MySQL, MongoDB, OpenLDAP + accesslog · [ ] Jeux de fausses PII seedés (Faker, FR + intl) avec vérité terrain (`dev/ground-truth.json`) |
-| P0-D Squelettes | `console-engineer` / `agent-engineer` | [ ] Next.js + Drizzle + pg-boss qui démarre · [ ] Workspace Cargo qui compile, `cargo clippy -D warnings` vert |
+| P0-A Repository & CI | `docs-keeper` | [ ] Target directory tree (`console/`, `agent/`, `shared/`, `dev/`) · [x] Protected `main` + `dev` branches ([RELEASE.md](../RELEASE.md)) · [x] GitHub Actions CI: docs, gitleaks, console, agent, protocol (enabled depending on whether the component exists) · [x] DCO check + PR title format · [x] Release workflow (`release-it` on merge to `main`, `[skip-release]`) · [x] Signed multi-arch images workflow on `-*` tags and release · [x] Version bump script · [x] Pre-commit hooks verified · [x] Dependabot · [ ] `RELEASE_TOKEN` secret configured · [ ] Add npm/cargo to Dependabot once `console/` and `agent/` exist |
+| P0-B Protocol | `agent-engineer` + `security-reviewer` review | [ ] `shared/protocol/openapi.yaml` v1 from [09-agent-protocol.md](09-agent-protocol.md) · [ ] Valid / invalid JSON fixtures · [ ] TS and Rust type generation |
+| P0-C Dev env. | `agent-engineer` | [ ] `dev/docker-compose.yml`: PostgreSQL + pgaudit, MariaDB + server_audit, MySQL, MongoDB, OpenLDAP + accesslog · [ ] Seeded fake PII datasets (Faker, FR + intl) with ground truth (`dev/ground-truth.json`) |
+| P0-D Skeletons | `console-engineer` / `agent-engineer` | [ ] Next.js + Drizzle + pg-boss that starts · [ ] Cargo workspace that compiles, `cargo clippy -D warnings` green |
 
-**Critère de sortie** : `make dev` lance tout ; CI verte ; contrat de protocole validé.
+**Exit criterion**: `make dev` starts everything; CI green; protocol contract validated.
 
-## Phase 1 – Console socle & agent core
-*Objectif : un agent s'enrôle et apparaît « en ligne » dans la console.*
+## Phase 1 – Console foundation & agent core
+*Objective: an agent enrolls and shows up as "online" in the console.*
 
-| Chantier | Propriétaire | Tâches |
+| Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P1-A Console | `console-engineer` | [ ] Schéma DB (users, agents, targets, jobs, findings, events, incidents, policies, audit_log) · [ ] Auth locale (argon2id) · [ ] Journal d'audit console · [ ] Jetons d'enrôlement · [ ] API agent : `/enroll`, `/heartbeat`, `/jobs` (long-poll) · [ ] Page Agents & Cibles |
-| P1-B Agent core | `agent-engineer` | [ ] Config `agent.yaml` · [ ] Enrôlement + stockage d'identité `0600` · [ ] Uplink (retry, backoff, `batch_id`) · [ ] Spool disque borné · [ ] Heartbeat + métriques · [ ] Détection locale des moteurs (ADR-0006) |
-| P1-C Revue | `security-reviewer` | [ ] Revue enrôlement / stockage des secrets / validation des entrées API |
+| P1-A Console | `console-engineer` | [ ] DB schema (users, agents, targets, jobs, findings, events, incidents, policies, audit_log) · [ ] Local auth (argon2id) · [ ] Console audit log · [ ] Enrollment tokens · [ ] Agent API: `/enroll`, `/heartbeat`, `/jobs` (long-poll) · [ ] Agents & Targets page |
+| P1-B Agent core | `agent-engineer` | [ ] `agent.yaml` config · [ ] Enrollment + `0600` identity storage · [ ] Uplink (retry, backoff, `batch_id`) · [ ] Bounded disk spool · [ ] Heartbeat + metrics · [ ] Local engine detection (ADR-0006) |
+| P1-C Review | `security-reviewer` | [ ] Review of enrollment / secret storage / API input validation |
 
-**Critère de sortie** : enrôlement de bout en bout en conteneur ; révocation effective en < 60 s.
+**Exit criterion**: end-to-end enrollment in containers; revocation effective in < 60 s.
 
-## Phase 2 – Discovery SQL
-*Objectif : premiers findings réels sur PostgreSQL et MySQL/MariaDB.* → **v0.1.0-alpha**
+## Phase 2 – SQL Discovery
+*Objective: first real findings on PostgreSQL and MySQL/MariaDB.* → **v0.1.0-alpha**
 
-| Chantier | Propriétaire | Tâches |
+| Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P2-A Classifieurs | `agent-engineer` | [ ] Crate `classifiers` : regex + validateurs (Luhn, IBAN mod 97, NIR clé), secrets, indices sur les noms de colonnes · [ ] Masquage + HMAC · [ ] Tests de propriétés sur le masquage |
-| P2-B Connecteur PG | `agent-engineer` | [ ] Introspection du schéma · [ ] Échantillonnage borné (`TABLESAMPLE`, `statement_timeout`) · [ ] `check()` + niveau d'audit |
-| P2-C Connecteur MySQL | `agent-engineer` (autre instance) | [ ] Idem PG pour MySQL / MariaDB |
-| P2-D Console findings | `console-engineer` | [ ] Ingestion `/findings` (validation stricte) · [ ] Lancement de scans · [ ] Vue findings par cible / classifieur · [ ] Marquage faux positif |
-| P2-E Test d'invariant | `security-reviewer` | [ ] Test auto : aucune PII de `dev/ground-truth.json` en clair dans la base console |
+| P2-A Classifiers | `agent-engineer` | [ ] `classifiers` crate: regex + validators (Luhn, IBAN mod 97, NIR key), secrets, column-name hints · [ ] Masking + HMAC · [ ] Property tests on masking |
+| P2-B PG connector | `agent-engineer` | [ ] Schema introspection · [ ] Bounded sampling (`TABLESAMPLE`, `statement_timeout`) · [ ] `check()` + audit level |
+| P2-C MySQL connector | `agent-engineer` (another instance) | [ ] Same as PG for MySQL / MariaDB |
+| P2-D Console findings | `console-engineer` | [ ] `/findings` ingestion (strict validation) · [ ] Scan launching · [ ] Findings view per target / classifier · [ ] False positive marking |
+| P2-E Invariant test | `security-reviewer` | [ ] Automated test: no PII from `dev/ground-truth.json` in clear text in the console database |
 
-**Critère de sortie** : rappel ≥ 90 %, précision ≥ 85 % sur la vérité terrain ; test d'invariant vert.
+**Exit criterion**: recall ≥ 90 %, precision ≥ 85 % on the ground truth; invariant test green.
 
-## Phase 3 – Politiques, incidents, alerting
-| Chantier | Propriétaire | Tâches |
+## Phase 3 – Policies, incidents, alerting
+| Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P3-A Moteur de politiques | `console-engineer` | [ ] Modèle condition → action · [ ] Exécution dans le worker · [ ] Exceptions |
-| P3-B Incidents | `console-engineer` | [ ] Cycle de vie (ouvert, acquitté, résolu, faux positif) · [ ] UI |
-| P3-C Alerting | `console-engineer` | [ ] SMTP · [ ] Webhook signé HMAC · [ ] Alerte « agent silencieux » |
+| P3-A Policy engine | `console-engineer` | [ ] Condition → action model · [ ] Execution in the worker · [ ] Exceptions |
+| P3-B Incidents | `console-engineer` | [ ] Lifecycle (open, acknowledged, resolved, false positive) · [ ] UI |
+| P3-C Alerting | `console-engineer` | [ ] SMTP · [ ] HMAC-signed webhook · [ ] "Silent agent" alert |
 
-## Phase 4 – Audit SQL
-| Chantier | Propriétaire | Tâches |
+## Phase 4 – SQL Audit
+| Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P4-A Audit PG | `agent-engineer` | [ ] Lecture pgaudit (csvlog / jsonlog) · [ ] Mode dégradé `pg_stat_statements` · [ ] Signatures `pg_dump`, `COPY` |
-| P4-B Audit MySQL/MariaDB | `agent-engineer` | [ ] `server_audit` · [ ] Percona `audit_log` · [ ] `performance_schema` · [ ] Signatures `mysqldump`, `INTO OUTFILE` |
-| P4-C Corrélation | `console-engineer` | [ ] Ingestion `/events` · [ ] Score volume × sensibilité · [ ] Lignes de base par principal |
+| P4-A PG Audit | `agent-engineer` | [ ] pgaudit reading (csvlog / jsonlog) · [ ] `pg_stat_statements` degraded mode · [ ] `pg_dump`, `COPY` signatures |
+| P4-B MySQL/MariaDB Audit | `agent-engineer` | [ ] `server_audit` · [ ] Percona `audit_log` · [ ] `performance_schema` · [ ] `mysqldump`, `INTO OUTFILE` signatures |
+| P4-C Correlation | `console-engineer` | [ ] `/events` ingestion · [ ] Volume × sensitivity score · [ ] Per-principal baselines |
 
-**Critère de sortie** : `pg_dump` et `mysqldump` dans `dev/` → incident en < 2 min.
+**Exit criterion**: `pg_dump` and `mysqldump` in `dev/` → incident in < 2 min.
 
 ## Phase 5 – MongoDB
-[ ] Discovery (échantillonnage de documents, champs imbriqués) · [ ] Audit Enterprise/Percona (`auditLog`) · [ ] Audit Community (logs JSON + profiler, niveau affiché « Limité ») · [ ] Détection `mongodump` / `mongoexport`
+[ ] Discovery (document sampling, nested fields) · [ ] Enterprise/Percona audit (`auditLog`) · [ ] Community audit (JSON logs + profiler, level shown as "Limited") · [ ] `mongodump` / `mongoexport` detection
 
 ## Phase 6 – OpenLDAP
-[ ] Discovery (attributs sensibles : `userPassword`, `mail`, `telephoneNumber`, attributs personnalisés) · [ ] Audit via `cn=accesslog` · [ ] Détection des recherches massives
+[ ] Discovery (sensitive attributes: `userPassword`, `mail`, `telephoneNumber`, custom attributes) · [ ] Audit via `cn=accesslog` · [ ] Bulk search detection
 
-## Phase 7 – Durcissement & release v0.1.0
-[ ] Images multi-arch distroless signées (cosign) · [ ] Paquet `.deb` + unité systemd · [ ] Test « installation < 15 min » · [ ] Tests de charge / impact base · [ ] Test de stabilité 72 h · [ ] Documentation utilisateur · [ ] Politique de sécurité publiée
+## Phase 7 – Hardening & v0.1.0 release
+[ ] Signed distroless multi-arch images (cosign) · [ ] `.deb` package + systemd unit · [ ] "Installation < 15 min" test · [ ] Load / database impact tests · [ ] 72 h stability test · [ ] User documentation · [ ] Published security policy
 
 ---
 
-## Après le MVP
-| Phase | Contenu |
+## After the MVP
+| Phase | Contents |
 |-------|---------|
-| 1.5 | Connecteur CAS |
-| 2 | Mode Prevention (proxy), Helm, mTLS, gRPC, export OTLP, stockage des événements à grande échelle |
-| 3+ | ML de détection d'anomalies, autres OS |
+| 1.5 | CAS connector |
+| 2 | Prevention mode (proxy), Helm, mTLS, gRPC, OTLP export, large-scale event storage |
+| 3+ | Anomaly detection ML, other OSes |

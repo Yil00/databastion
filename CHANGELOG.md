@@ -1,20 +1,21 @@
 # Changelog
 
-Toutes les évolutions notables de DataBastion sont consignées ici.
+All notable changes to DataBastion are recorded here.
 
-Ce fichier est **généré automatiquement** à chaque release à partir des messages de commit ([Conventional Commits](https://www.conventionalcommits.org/)), voir [RELEASE.md](RELEASE.md). Ne pas l'éditer à la main, sauf pour la section « Non publié ».
-Le projet suit le [versionnage sémantique](https://semver.org/lang/fr/).
+This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
+The project follows [semantic versioning](https://semver.org/).
 
-## Non publié
+## Unreleased
 
 ### 📝 Documentation
-- Cadrage du MVP : vision, architecture, stack, périmètre, sécurité
-- Décisions d'architecture ADR-0001 à ADR-0006
-- Matrice des capacités d'audit par moteur
-- Brouillon du protocole agent ↔ console v1
-- Roadmap du MVP en phases 0 à 7
-- Licence Apache 2.0, politique de marque, guides de contribution et de release
+- MVP framing: vision, architecture, stack, scope, security
+- Architecture decisions ADR-0001 to ADR-0006
+- Audit capability matrix per engine
+- Draft of the agent ↔ console protocol v1
+- MVP roadmap in phases 0 to 7
+- Apache 2.0 license, trademark policy, contribution and release guides
+- Translate the whole repository to English
 
 ### 👷 CI
-- CI (documentation, gitleaks, console, agent, protocole), vérification des titres de PR et du DCO
-- Release automatisée avec release-it, images multi-arch signées avec cosign sur GHCR
+- CI (documentation, gitleaks, console, agent, protocol), PR title and DCO checks
+- Automated release with release-it, multi-arch images signed with cosign on GHCR

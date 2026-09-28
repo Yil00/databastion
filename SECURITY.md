@@ -1,20 +1,20 @@
-# Politique de sécurité
+# Security policy
 
-## Signaler une vulnérabilité
-**N'ouvrez pas d'issue publique.** Utilisez le signalement privé de GitHub : onglet **Security** → **Report a vulnerability**.
+## Reporting a vulnerability
+**Do not open a public issue.** Use GitHub private reporting: **Security** tab → **Report a vulnerability**.
 
-Merci d'inclure : la version ou le commit concerné, le composant (console / agent / connecteur), les étapes de reproduction et l'impact estimé.
+Please include: the affected version or commit, the component (console / agent / connector), reproduction steps and the estimated impact.
 
-## Engagement
-- Accusé de réception sous 72 h
-- Évaluation initiale sous 7 jours
-- Correctif et avis de sécurité coordonnés avec la personne qui a signalé le problème
+## Commitment
+- Acknowledgment within 72 h
+- Initial assessment within 7 days
+- Fix and security advisory coordinated with the person who reported the issue
 
-## Versions supportées
-Le projet est en pré-alpha : seule la branche `main` reçoit des correctifs.
+## Supported versions
+The project is pre-alpha: only the `main` branch receives fixes.
 
-## Périmètre particulièrement sensible
-- Toute fuite de valeur sensible brute hors de l'agent
-- Tout moyen pour la console, ou un tiers, d'initier une connexion vers un agent
-- Contournement de l'authentification agent ou console
-- Élévation de privilèges de l'agent sur les bases surveillées
+## Particularly sensitive scope
+- Any leak of a raw sensitive value outside the agent
+- Any way for the console, or a third party, to initiate a connection to an agent
+- Bypassing agent or console authentication
+- Agent privilege escalation on the monitored databases
