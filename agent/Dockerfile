@@ -26,7 +26,7 @@ COPY . .
 # Default features (every connector), exactly the lock file.
 RUN cargo build --release --locked -p databastion-agent \
  && install -D -m 0755 target/release/databastion-agent /out/databastion-agent \
- && install -d -m 0700 -o 10001 -g 10001 /out/state
+ && install -d -m 0700 -o 10001 -g 10001 /out/varlib/databastion
 
 # ---------------------------------------------------------------- runtime
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
@@ -37,7 +37,10 @@ LABEL org.opencontainers.image.title="databastion-agent" \
 COPY --from=build --chown=0:0 --chmod=0755 /out/databastion-agent /usr/local/bin/databastion-agent
 # State directory: owned by the agent user, 0700 (the agent refuses a group / world writable
 # state_dir). An empty named volume mounted here inherits this owner and mode.
-COPY --from=build --chown=10001:10001 --chmod=0700 /out/state /var/lib/databastion
+# The parent is copied so that `databastion/` is itself a copied entry and keeps its 0700 mode:
+# copying `/out/state` onto `/var/lib/databastion` would only copy its (empty) contents and
+# create the destination directory with the default 0755.
+COPY --from=build --chown=10001:10001 /out/varlib/ /var/lib/
 USER 10001:10001
 VOLUME ["/var/lib/databastion"]
 ENTRYPOINT ["/usr/local/bin/databastion-agent"]
