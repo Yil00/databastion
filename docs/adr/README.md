@@ -13,5 +13,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0007](0007-mask-access-events.md) | Audit access events are masked in the agent (extends 0003) | Accepted |
 | [0008](0008-agent-generated-secret-rotation.md) | Agent-generated secret rotation with conflict lock | Accepted |
 | [0009](0009-name-normalization-and-item-sanitization.md) | Name normalization and per-item sanitization before the uplink | Accepted |
+| [0010](0010-rotation-conflict-window.md) | Rotation conflict window and "just promoted" definition (refines 0008) | Accepted |
 
 Template: copy [template.md](template.md).
