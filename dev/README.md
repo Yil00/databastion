@@ -90,7 +90,8 @@ export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:$POSTGRES_ADMIN_PASS
 
 Without Docker, [postgres/local-cluster.sh](postgres/local-cluster.sh) starts a throwaway cluster
 from the host's PostgreSQL binaries (127.0.0.1:55432, same seed, same `20-databastion.sh`, no
-pgaudit unless installed) and prints the two variables: `eval "$(dev/postgres/local-cluster.sh start)"`,
+pgaudit unless installed; TLS with a throwaway CA, exported as `DATABASTION_TEST_PG_CA_FILE` for the
+`verify_full` test; `pg_hba` lines for the md5 / cleartext refusal test) and prints the variables: `eval "$(dev/postgres/local-cluster.sh start)"`,
 then `dev/postgres/local-cluster.sh stop` (deletes it). The pgaudit probe of ADR-0012 only runs
 where pgaudit is loaded (the dev image).
 

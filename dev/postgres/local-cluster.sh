@@ -11,7 +11,8 @@
 #
 # Listens on 127.0.0.1 only (DATABASTION_PG_LOCAL_PORT, default 55432) and on a Unix socket in the
 # data directory (DATABASTION_PG_LOCAL_DIR, default /tmp/databastion-pg-local). Dev-only passwords
-# from dev/.env.example. As root, the server runs as the `postgres` OS user.
+# from dev/.env.example. As root, the server runs as the `postgres` OS user. TLS with a throwaway
+# CA (DATABASTION_TEST_PG_CA_FILE); pg_hba lines for the md5 / cleartext refusal tests.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +43,7 @@ env_vars() {
   cat <<EOF
 export DATABASTION_TEST_PG_URL='postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PORT}/shop'
 export DATABASTION_TEST_PG_ADMIN_URL='postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${PORT}/shop'
+export DATABASTION_TEST_PG_CA_FILE='${DIR}/tls/ca.pem'
 EOF
 }
 
@@ -58,11 +60,33 @@ start() {
     as_owner "$BIN/initdb" -D "$DATA" -U postgres --pwfile="$pwfile" -A scram-sha-256 \
       --auth-local=trust -E UTF8 --locale=C.UTF-8 >/dev/null
     rm -f "$pwfile"
+    # Connector test roles authenticated with MD5 / cleartext passwords: the connector must
+    # refuse both without TLS (security review M2).
+    { printf 'host all databastion_it_md5 127.0.0.1/32 md5\n'
+      printf 'host all databastion_it_clear 127.0.0.1/32 password\n'
+      cat "$DATA/pg_hba.conf"; } >"$DIR/pg_hba.conf.new"
+    as_owner cp "$DIR/pg_hba.conf.new" "$DATA/pg_hba.conf"
+    rm -f "$DIR/pg_hba.conf.new"
+    # Throwaway CA and server certificate (SAN IP:127.0.0.1) for the connector's verify_full
+    # test; the openssl CLI is test tooling only (the agent links rustls).
+    mkdir -p "$DIR/tls"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=databastion-it-ca \
+      -keyout "$DIR/tls/ca.key" -out "$DIR/tls/ca.pem" 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -subj /CN=127.0.0.1 \
+      -keyout "$DIR/tls/server.key" -out "$DIR/tls/server.csr" 2>/dev/null
+    printf 'subjectAltName=IP:127.0.0.1\n' >"$DIR/tls/ext.cnf"
+    openssl x509 -req -in "$DIR/tls/server.csr" -CA "$DIR/tls/ca.pem" -CAkey "$DIR/tls/ca.key" \
+      -CAcreateserial -days 2 -extfile "$DIR/tls/ext.cnf" -out "$DIR/tls/server.pem" 2>/dev/null
+    rm -f "$DIR/tls/ca.key" "$DIR/tls/server.csr"
+    chmod 0600 "$DIR/tls/server.key"
+    if [ "$(id -u)" = 0 ]; then chown -R postgres: "$DIR/tls"; fi
   fi
   if ! as_owner "$BIN/pg_ctl" -D "$DATA" status >/dev/null 2>&1; then
     as_owner "$BIN/pg_ctl" -D "$DATA" -l "$DIR/server.log" -w start -o \
       "-c listen_addresses=127.0.0.1 -p $PORT -c unix_socket_directories=$DIR \
-       -c shared_preload_libraries=pg_stat_statements -c max_connections=50" >/dev/null
+       -c shared_preload_libraries=pg_stat_statements -c max_connections=50 \
+       -c ssl=on -c ssl_cert_file=$DIR/tls/server.pem -c ssl_key_file=$DIR/tls/server.key" \
+      >/dev/null
   fi
   if [ "$fresh" = 1 ]; then
     as_owner "$BIN/psql" -h "$DIR" -p "$PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
