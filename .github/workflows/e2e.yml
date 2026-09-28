@@ -37,8 +37,9 @@ jobs:
           openssl version
       - name: Run e2e/run.sh
         run: e2e/run.sh
-      # Logs hold no secret when the run passes (checked by run.sh); on failure they may, but every
-      # secret is random, generated for this run only and destroyed with its containers.
+      # run.sh redacts every generated secret from the logs on exit, whatever the result (and
+      # masks them in the job log); the secrets are random, for this run only, and destroyed
+      # with the containers.
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

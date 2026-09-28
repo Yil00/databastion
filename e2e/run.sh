@@ -5,7 +5,8 @@
 #
 # Every secret is generated here at run time (never committed), kept under a private temporary
 # directory and removed on exit. Logs of every container are written to $E2E_LOG_DIR and
-# checked for secrets before teardown.
+# checked for secrets before teardown; whatever the exit path, every registered secret is then
+# redacted from them in place (or the file is deleted) before they can be uploaded.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +30,67 @@ E2E_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-e2e.XXXXXX")"
 export E2E_WORK_DIR
 mkdir -p "$E2E_LOG_DIR"
 
+# --------------------------------------------------------------------------- secret registry
+# Every secret is registered as soon as it is generated or obtained: one file per secret,
+# $P/<name>, holding its value only. grep -Ff and awk read the value from that file, so it never
+# appears on a command line. Under GitHub Actions the value is also masked in the job log.
+P="$E2E_WORK_DIR/secret-patterns"
+mkdir -p "$P"
+register_secret() {
+  local name="$1" value="$2"
+  # An empty pattern would match every line; "null" is jq's output for a missing field.
+  [ -n "$value" ] && [ "$value" != null ] || return 0
+  printf '%s\n' "$value" >"$P/$name"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$value"; fi
+}
+
+# leak_scan DIR PATTERN_DIR: prints "<name>: <files>" for every secret of PATTERN_DIR found in
+# DIR (fixed strings; only the secret's name is printed). Returns 1 if any is found.
+leak_scan() {
+  local dir="$1" pdir="$2" f files found=0
+  for f in "$pdir"/*; do
+    [ -f "$f" ] || continue
+    files="$(LC_ALL=C grep -rlFf "$f" -- "$dir" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ' || true)"
+    if [ -n "$files" ]; then
+      printf '%s: %s\n' "$(basename "$f")" "$files"
+      found=1
+    fi
+  done
+  return "$found"
+}
+
+# Literal (not regex) replacement of the secret read from $SECRET_FILE by $REDACTION.
+# shellcheck disable=SC2016 # awk program, not shell
+REDACT_AWK='
+BEGIN { if ((getline s < ENVIRON["SECRET_FILE"]) <= 0 || s == "") exit 2; rep = ENVIRON["REDACTION"] }
+{
+  out = ""; line = $0
+  while ((i = index(line, s)) > 0) { out = out substr(line, 1, i - 1) rep; line = substr(line, i + length(s)) }
+  print out line
+}'
+
+# redact_dir DIR PATTERN_DIR: replaces every secret of PATTERN_DIR in the files of DIR, in place,
+# by <REDACTED:name>. A file that cannot be rewritten, or still matches afterwards, is deleted.
+redact_dir() {
+  local dir="$1" pdir="$2" f name file tmp="$E2E_WORK_DIR/redact.tmp"
+  local -a hits
+  [ -d "$dir" ] && [ -d "$pdir" ] || return 0
+  for f in "$pdir"/*; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    mapfile -t hits < <(LC_ALL=C grep -rlFf "$f" -- "$dir" 2>/dev/null)
+    for file in "${hits[@]}"; do
+      if LC_ALL=C SECRET_FILE="$f" REDACTION="<REDACTED:$name>" awk "$REDACT_AWK" "$file" >"$tmp" \
+          && ! LC_ALL=C grep -qFf "$f" -- "$tmp" && mv -f "$tmp" "$file"; then
+        log "redacted $name in $(basename "$file")"
+      else
+        rm -f -- "$file" "$tmp"
+        log "deleted $(basename "$file") (could not redact $name)"
+      fi
+    done
+  done
+}
+
 # Every docker call is bounded (`timeout`): a hung daemon cannot stall the job.
 compose() { timeout 120 docker compose -f "$HERE/docker-compose.yml" "$@"; }
 
@@ -46,6 +108,8 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  # Before teardown and before $E2E_WORK_DIR (the registry) goes away, whatever the exit path.
+  redact_dir "$E2E_LOG_DIR" "$P"
   log "tearing down"
   timeout 120 docker compose -f "$HERE/docker-compose.yml" --profile tools down -v --remove-orphans \
     >/dev/null 2>&1
@@ -71,6 +135,14 @@ METRICS_TOKEN="$(rand_hex 32)"
 ADMIN_PASSWORD="$(rand_hex 24)"
 TARGET_PG_PASSWORD="$(rand_hex 24)"     # target superuser: stays in target-pg
 TARGET_AGENT_PASSWORD="$(rand_hex 24)"  # databastion_agent (least privilege, read-only)
+register_secret db_password "$DB_PASSWORD"
+register_secret db_owner_password "$DB_OWNER_PASSWORD"
+register_secret db_app_password "$DB_APP_PASSWORD"
+register_secret encryption_key "$ENCRYPTION_KEY"
+register_secret metrics_token "$METRICS_TOKEN"
+register_secret admin_password "$ADMIN_PASSWORD"
+register_secret target_pg_password "$TARGET_PG_PASSWORD"
+register_secret target_agent_password "$TARGET_AGENT_PASSWORD"
 put_secret db_password "$DB_PASSWORD"
 put_secret db_owner_password "$DB_OWNER_PASSWORD"
 put_secret db_app_password "$DB_APP_PASSWORD"
@@ -178,6 +250,7 @@ rm -f "$E2E_WORK_DIR/login.json"
 CSRF="$(body_of "$r" | jq -r '.csrf_token')"
 [ -n "$CSRF" ] && [ "$CSRF" != null ] || fail "login: no CSRF token"
 SESSION_COOKIE="$(awk '$6 ~ /databastion_session$/ {print $7}' "$E2E_WORK_DIR/cookies")"
+register_secret session_cookie "$SESSION_COOKIE"
 [ -n "$SESSION_COOKIE" ] || fail "login: no session cookie"
 
 log "creating an enrollment token"
@@ -185,6 +258,7 @@ printf '{"label":"e2e"}' >"$E2E_WORK_DIR/token-req.json"
 r="$(api POST /api/enrollment-tokens "$E2E_WORK_DIR/token-req.json")"
 [ "$(status_of "$r")" = 201 ] || fail "enrollment token: HTTP $(status_of "$r")"
 ENROLLMENT_TOKEN="$(body_of "$r" | jq -r '.token')"
+register_secret enrollment_token "$ENROLLMENT_TOKEN"
 [[ "$ENROLLMENT_TOKEN" == dbe_* ]] || fail "enrollment token: unexpected format"
 
 # --------------------------------------------------------------------------- agent files
@@ -213,10 +287,14 @@ timeout 120 docker compose -f "$HERE/docker-compose.yml" run --rm -T agent \
   --token-file /run/databastion-secrets/enrollment_token \
   >"$E2E_LOG_DIR/agent-enroll.log" 2>&1 || fail "agent enroll failed (see agent-enroll.log)"
 files_agent 'rm -f /secrets/enrollment_token'
+identity_mode="$(files_agent 'stat -c "%u:%g %a" /state/identity.json')"
+[ "$identity_mode" = "10001:10001 600" ] \
+  || fail "identity.json is '$identity_mode', expected '10001:10001 600'"
 
 identity="$(files_agent 'cat /state/identity.json')"
 AGENT_ID="$(jq -r '.agent_id' <<<"$identity")"
 AGENT_SECRET="$(jq -r '.agent_secret' <<<"$identity")"
+register_secret agent_secret "$AGENT_SECRET"
 unset identity
 [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != null ] || fail "no agent_id in identity.json"
 [ -n "$AGENT_SECRET" ] && [ "$AGENT_SECRET" != null ] || fail "no agent_secret in identity.json"
@@ -315,29 +393,46 @@ polls="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" logs --no-color
 # --------------------------------------------------------------------------- secret hygiene
 log "checking that no secret appears in any log (I2 / secret hygiene)"
 dump_logs
-patterns="$E2E_WORK_DIR/patterns"
-{
-  printf 'enrollment_token\t%s\n' "$ENROLLMENT_TOKEN"
-  printf 'agent_secret\t%s\n' "$AGENT_SECRET"
-  printf 'admin_password\t%s\n' "$ADMIN_PASSWORD"
-  printf 'metrics_token\t%s\n' "$METRICS_TOKEN"
-  printf 'session_cookie\t%s\n' "$SESSION_COOKIE"
-  printf 'db_password\t%s\n' "$DB_PASSWORD"
-  printf 'db_owner_password\t%s\n' "$DB_OWNER_PASSWORD"
-  printf 'db_app_password\t%s\n' "$DB_APP_PASSWORD"
-  printf 'encryption_key\t%s\n' "$ENCRYPTION_KEY"
-  printf 'target_pg_password\t%s\n' "$TARGET_PG_PASSWORD"
-  printf 'target_agent_password\t%s\n' "$TARGET_AGENT_PASSWORD"
-} >"$patterns"
-leaks=0
-while IFS=$'\t' read -r name value; do
-  # Fixed-string search; only the secret's name is ever printed.
-  if grep -rqF -- "$value" "$E2E_LOG_DIR"; then
-    log "LEAK: $name found in $(grep -rlF -- "$value" "$E2E_LOG_DIR" | xargs -n1 basename | tr '\n' ' ')"
-    leaks=$((leaks + 1))
+for f in agent.log web.log; do
+  [ -s "$E2E_LOG_DIR/$f" ] || fail "$f is empty: the leak scan would prove nothing"
+done
+
+# Positive control: a random canary written to the log directory must be found by the scan and
+# redacted by the same code path that cleanup() uses; then it is removed.
+C="$E2E_WORK_DIR/canary-pattern"
+mkdir -p "$C"
+printf 'e2e-canary-%s\n' "$(rand_hex 16)" >"$C/canary"
+{ printf 'before '; cat "$C/canary"; printf 'after\n'; } >"$E2E_LOG_DIR/zz-canary.log"
+canary_hits="$(leak_scan "$E2E_LOG_DIR" "$C" || true)"
+[ "$canary_hits" = "canary: zz-canary.log " ] || fail "leak scan positive control: canary not detected"
+redact_dir "$E2E_LOG_DIR" "$C" 2>/dev/null
+if ! grep -qF '<REDACTED:canary>' "$E2E_LOG_DIR/zz-canary.log" \
+    || grep -qFf "$C/canary" -- "$E2E_LOG_DIR/zz-canary.log"; then
+  fail "redaction positive control: canary not redacted"
+fi
+rm -rf -- "$E2E_LOG_DIR/zz-canary.log" "$C"
+
+if ! leaked="$(leak_scan "$E2E_LOG_DIR" "$P")"; then
+  while IFS= read -r line; do log "LEAK: $line"; done <<<"$leaked"
+  fail "secret(s) found in container logs"
+fi
+
+log "checking that no secret is stored in clear text in the console database"
+# Written under the private work directory (removed on exit), never into the uploaded logs.
+db_dump="$E2E_WORK_DIR/console-db.sql"
+timeout 120 docker compose -f "$HERE/docker-compose.yml" exec -T db \
+  pg_dump -U postgres -d databastion >"$db_dump" 2>"$E2E_WORK_DIR/pg_dump.err" \
+  || fail "pg_dump of the console database failed"
+grep -q '^CREATE TABLE ' "$db_dump" || fail "the console database dump holds no table"
+db_leaks=0
+for name in agent_secret enrollment_token admin_password target_pg_password target_agent_password; do
+  [ -s "$P/$name" ] || fail "secret $name was never registered"
+  if LC_ALL=C grep -qFf "$P/$name" -- "$db_dump"; then
+    log "LEAK: $name stored in clear text in the console database"
+    db_leaks=$((db_leaks + 1))
   fi
-done <"$patterns"
-rm -f "$patterns"
-[ "$leaks" -eq 0 ] || fail "$leaks secret(s) found in container logs"
+done
+rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err"
+[ "$db_leaks" -eq 0 ] || fail "$db_leaks secret(s) in clear text in the console database"
 
 log "all checks passed (revocation latency ${latency} ms)"

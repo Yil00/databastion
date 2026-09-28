@@ -32,7 +32,8 @@ cannot reach the console database or the outside. Only the proxy is published, o
 3. `bootstrap-admin` with the random password (Docker secret file), log in through the user API
    (session cookie + `X-CSRF-Token`), create an enrollment token.
 4. Hand the token to the agent as a `0600` file owned by uid 10001 (sent on stdin, never on a
-   command line), run `databastion-agent enroll --token-file …`, then `databastion-agent run`.
+   command line), run `databastion-agent enroll --token-file …` and assert that
+   `identity.json` is `10001:10001 0600`, then `databastion-agent run`.
 5. Assert through `GET /api/agents` that the agent is `online` with target `pg-e2e` reported
    (the PostgreSQL connector is still a stub: the target is reported unreachable, audit level
    `none`, which is printed but not asserted), that `databastion_agent` has exactly the
@@ -42,12 +43,21 @@ cannot reach the console database or the outside. Only the proxy is published, o
    `console rejected the current secret (401)`; the measured latency is printed and the test
    fails at 60 s or more. The console must show `revoked`, and the proxy access log must show no
    `/api/agent/v1/jobs` request during a 10 s window afterwards.
-7. Dump every container log (plus the one-shot command outputs) and fail if any generated
-   secret (enrollment token, agent secret, admin password, session cookie, metrics token,
-   database passwords, encryption key) appears in clear text.
+7. Dump every container log (plus the one-shot command outputs); fail if `agent.log` or
+   `web.log` is empty; run a positive control (a random canary written to the log directory must
+   be found by the scan and redacted, then it is removed); fail if any generated secret
+   (enrollment token, agent secret, admin password, session cookie, metrics token, database and
+   target passwords, encryption key) appears in clear text.
+8. `pg_dump` the console database into the private temporary directory (never the log
+   directory) and fail if the agent secret, the enrollment token, the admin password or a
+   target password is stored in clear text.
 
-On exit, whatever the result: logs are written to `$E2E_LOG_DIR` (default `e2e/.logs/`,
-ignored by git), the stack and its volumes are removed, the temporary directory is deleted.
+Each secret is registered in a private pattern file as soon as it is generated or obtained
+(and masked with `::add-mask::` under GitHub Actions); values are matched from files
+(`grep -Ff`), never passed on a command line. On exit, whatever the result: logs are written to
+`$E2E_LOG_DIR` (default `e2e/.logs/`, ignored by git), every registered secret is replaced in
+them by `<REDACTED:name>` (a file that cannot be redacted is deleted), then the stack and its
+volumes are removed and the temporary directory is deleted.
 
 ## Running locally
 Requirements: Docker with Compose v2, `openssl`, `curl`, `jq`, bash.
