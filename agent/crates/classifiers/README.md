@@ -28,7 +28,7 @@ Tokens never overlap: detectors run from the most to the least specific (AWS key
 AWS secret key in context, e-mail, IBAN, card, NIR, labelled date of birth, phone), so phone-shaped
 digit groups inside an IBAN are not phones. All regular expressions run on the `regex` crate (linear
 time). A pattern that does not compile stops the agent with the pattern name
-(`detect::check_patterns` forces them all; call it at startup) instead of silently disabling a
+(`detect::check_patterns` forces them all; the agent calls it at startup, in `core::runtime::run`, before loading its configuration) instead of silently disabling a
 detector; the crate declares the `regex` features its patterns need (`unicode-case` for `(?i)`), and
 `tests/regex_features.rs` checks the production feature set without dev-dependency feature
 unification.
