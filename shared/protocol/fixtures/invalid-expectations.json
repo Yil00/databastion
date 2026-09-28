@@ -10,6 +10,7 @@
   "EnrollResponse.uppercase-agent-id.json": "pattern",
   "Error.echoes-value.json": "additionalProperties",
   "Error.message-too-long.json": "maxLength",
+  "Error.not-implemented-code.json": "enum",
   "Error.unknown-code.json": "enum",
   "Error.value-in-pointer.json": "pattern",
   "EventsBatch.application-too-long.json": "maxLength",

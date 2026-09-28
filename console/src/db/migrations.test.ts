@@ -5,7 +5,7 @@ import path from "node:path";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { MIGRATIONS_FOLDER, runMigrations } from "@/db/run-migrations";
+import { MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
 import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
 async function withClient<T>(url: string, fn: (c: Client) => Promise<T>): Promise<T> {
@@ -198,6 +198,13 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         await withClient(url, async (c) => {
           await expect(c.query(guardSql)).rejects.toThrow(/schema pgboss is owned by role/);
         });
+        // Every migrate run repeats the check as a pre-flight, even with no pending migration.
+        const preflight = runMigrations(url);
+        await expect(preflight).rejects.toBeInstanceOf(PgbossOwnerError);
+        await expect(preflight).rejects.toThrow(/schema pgboss is owned by role gx_/);
+        // Fixed ownership: migrate runs again.
+        await adminInDb(db, `alter schema pgboss owner to ${owner}`);
+        await expect(runMigrations(url)).resolves.toBeUndefined();
       } finally {
         await adminQuery(`drop database if exists ${db} with (force)`);
         await adminQuery(`drop role if exists ${owner}`);
@@ -205,8 +212,9 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
       }
     });
 
-    // On a fresh database, 0004 already fails there (its GRANT on a schema the owner does not own);
-    // the guard (0009) is what protects databases that applied 0004 earlier (test above).
+    // On a fresh database the pre-flight refuses before any migration (0004 would fail too, on its
+    // GRANT on a schema the owner does not own); 0009 and the pre-flight protect databases that
+    // applied 0004 earlier (test above).
     it("a fresh migration over a planted pgboss schema aborts with nothing applied", async () => {
       const suffix = randomBytes(6).toString("hex");
       const db = `p_${suffix}`;
@@ -218,7 +226,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
       try {
         await adminInDb(db, `create schema pgboss authorization ${other}`);
         const url = roleUrl(owner, db);
-        await expect(runMigrations(url)).rejects.toThrow();
+        await expect(runMigrations(url)).rejects.toBeInstanceOf(PgbossOwnerError);
         // One transaction: none of the migrations was applied.
         await withClient(url, async (c) => {
           const { rows } = await c.query("select to_regclass('public.agents') is null as absent");

@@ -24,8 +24,10 @@ import {
   loginFailuresPerUser,
   loginFailuresPerDevice,
   loginFailuresPerUserGlobal,
+  loginDegradedFailures,
   loginFailuresUnknownUser,
   loginSlowdown,
+  loginSlowdownMs,
 } from "./user-api";
 
 const ORIGIN = "http://console.test";
@@ -77,6 +79,7 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     loginFailuresPerUserGlobal.clear();
     loginFailuresPerDevice.clear();
     loginFailuresUnknownUser.clear();
+    loginDegradedFailures.clear();
   });
 
   it("bootstraps the first admin once, with no default password", async () => {
@@ -145,6 +148,93 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
       expect((await attacker).res.status).toBe(401);
     } finally {
       loginSlowdown.ms = 2000;
+    }
+  });
+
+  it("unknown IP: the slow-down past the per-username counter doubles per failure, capped (L)", async () => {
+    loginSlowdown.ms = 60;
+    loginSlowdown.maxMs = 250;
+    try {
+      for (let i = 0; i < loginFailuresPerUser.limit; i++) await login("admin", "not the password");
+      const elapsed: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const start = performance.now();
+        expect((await login("admin", "not the password")).res.status).toBe(401);
+        elapsed.push(performance.now() - start);
+      }
+      // 60, 120, 240, then capped at 250 ms (plus the argon2id verification).
+      expect(elapsed[0]).toBeGreaterThanOrEqual(55);
+      expect(elapsed[0]).toBeLessThan(115);
+      expect(elapsed[1]).toBeGreaterThanOrEqual(115);
+      expect(elapsed[2]).toBeGreaterThanOrEqual(235);
+      expect(elapsed[3]).toBeGreaterThanOrEqual(245);
+      expect(loginSlowdownMs("admin", true)).toBe(250);
+      // A concurrent attempt is told to retry after the current delay.
+      const held = login("admin", "held slot guess");
+      await new Promise((r) => setTimeout(r, 20));
+      const busy = await login("admin", "nope nope");
+      expect(busy.res.status).toBe(503);
+      expect(Number(busy.res.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
+      await held;
+      // Known IP over the global cap: the flat base delay.
+      expect(loginSlowdownMs("admin", false)).toBe(60);
+      // A success refunds its own count only.
+      const before = loginDegradedFailures.count("admin");
+      expect((await login()).res.status).toBe(200);
+      expect(loginDegradedFailures.count("admin")).toBe(before);
+    } finally {
+      loginSlowdown.ms = 2000;
+      loginSlowdown.maxMs = 30_000;
+    }
+  });
+
+  it("slow-down formula: 2 s, doubling, capped at 30 s", () => {
+    loginDegradedFailures.clear();
+    const seen: number[] = [];
+    for (let i = 0; i < 7; i++) {
+      seen.push(loginSlowdownMs("formula-user", true));
+      loginDegradedFailures.hit("formula-user");
+    }
+    expect(seen).toEqual([2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]);
+    for (let i = 0; i < 2000; i++) loginDegradedFailures.hit("formula-user");
+    expect(loginSlowdownMs("formula-user", true)).toBe(30_000);
+    expect(loginSlowdownMs("formula-user", false)).toBe(2000);
+  });
+
+  it("unknown IP: a device cookie bypasses the growing slow-down", async () => {
+    const first = await login();
+    expect(first.res.status).toBe(200);
+    for (let i = 0; i < loginFailuresPerUser.limit; i++) await login("admin", "not the password");
+    for (let i = 0; i < 10; i++) loginDegradedFailures.hit("admin");
+    expect(loginSlowdownMs("admin", true)).toBe(30_000);
+    const start = performance.now();
+    expect((await login("admin", PASSWORD, undefined, first.device)).res.status).toBe(200);
+    expect(performance.now() - start).toBeLessThan(1500);
+  });
+
+  it("device-cookie failures count toward the global per-username cap and the per-cookie limit", async () => {
+    process.env.DATABASTION_TRUST_PROXY = "1";
+    try {
+      const admin = await login("admin", PASSWORD, "198.51.100.80");
+      expect(admin.device).not.toBe("");
+      loginFailuresPerUserGlobal.clear();
+      for (let i = 0; i < 3; i++) {
+        expect((await login("admin", "not the password", "198.51.100.81", admin.device)).res.status).toBe(401);
+      }
+      expect(loginFailuresPerUserGlobal.count("admin")).toBe(3);
+      const nonce = admin.device.split(".")[3] ?? "";
+      expect(loginFailuresPerDevice.count(nonce)).toBe(3);
+      // A success with the cookie refunds its own reservation only.
+      expect((await login("admin", PASSWORD, "198.51.100.82", admin.device)).res.status).toBe(200);
+      expect(loginFailuresPerUserGlobal.count("admin")).toBe(3);
+      // Over the global cap the cookie still bypasses it, and its failures keep counting.
+      for (let i = loginFailuresPerUserGlobal.count("admin"); i < loginFailuresPerUserGlobal.limit; i++) {
+        loginFailuresPerUserGlobal.hit("admin");
+      }
+      expect((await login("admin", "not the password", "198.51.100.83", admin.device)).res.status).toBe(401);
+      expect(loginFailuresPerUserGlobal.count("admin")).toBe(loginFailuresPerUserGlobal.limit + 1);
+    } finally {
+      delete process.env.DATABASTION_TRUST_PROXY;
     }
   });
 

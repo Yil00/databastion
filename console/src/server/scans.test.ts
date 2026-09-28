@@ -190,6 +190,9 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     const [dead] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
     expect(dead?.status).toBe("failed");
     expect(dead?.error).toEqual({ code: "timeout" });
+    // finished_at is the scan's deadline, not the sweep time (the late-batch window starts there).
+    const deadline = past.getTime() + SCAN_DEFAULTS.max_duration_s * 1000 + SCAN_GRACE_MS;
+    expect(Math.abs((dead?.finishedAt?.getTime() ?? 0) - deadline)).toBeLessThan(1000);
     const [audit] = await getDb()
       .select()
       .from(auditLog)

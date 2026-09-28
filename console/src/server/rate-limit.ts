@@ -66,6 +66,14 @@ export class RateLimiter {
    */
   reserve(key: string): (() => void) | null {
     if (this.check(key).limited) return null;
+    return this.charge(key);
+  }
+
+  /**
+   * Counts an attempt even when `key` is over its limit (never refuses) and returns its `refund`.
+   * For attempts that bypass a limit but must still count toward it.
+   */
+  charge(key: string): () => void {
     this.hit(key);
     const w = this.windows.get(key);
     let refunded = false;
@@ -75,6 +83,11 @@ export class RateLimiter {
         w.count--;
       }
     };
+  }
+
+  /** Hits counted for `key` in its current window (0 when none). */
+  count(key: string): number {
+    return this.current(key)?.count ?? 0;
   }
 
   reset(key: string): void {

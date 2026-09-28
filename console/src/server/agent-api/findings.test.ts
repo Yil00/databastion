@@ -11,7 +11,9 @@ import {
   listFindings,
   MAX_FINDINGS_PER_JOB,
   MAX_LISTED_FINDINGS,
+  MAX_SUMMARY_GROUPS,
   setFalsePositive,
+  summarizeFindings,
 } from "@/server/findings";
 import { SCAN_GRACE_MS } from "@/server/scans";
 import { integrityStats, integrityWriteBudget } from "@/server/integrity";
@@ -21,7 +23,7 @@ import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
-import { findingsPerAgent, handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+import { findingsPerAgent, findingsRequestsPerAgent, handleEventsNotImplemented, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
 
 type Auth = { agentId: string; secret: string };
 type Body = Record<string, unknown> & { findings: Record<string, unknown>[] };
@@ -127,6 +129,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
     failuresPerAgent.clear();
     integrityWriteBudget.clear();
     findingsPerAgent.clear();
+    findingsRequestsPerAgent.clear();
   });
 
   describe("contract fixtures", () => {
@@ -323,7 +326,9 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       const auth = await agentWithTargets();
       for (const status of ["running", "succeeded", "failed"] as const) {
         const jobId = await deliveredScan(auth);
-        await getDb().update(jobs).set({ status }).where(eq(jobs.id, jobId));
+        // Terminal statuses always carry finished_at (recordJobStatus).
+        const finishedAt = status === "running" ? null : new Date();
+        await getDb().update(jobs).set({ status, finishedAt }).where(eq(jobs.id, jobId));
         expect((await post(auth, batch(jobId))).status).toBe(202);
       }
     });
@@ -436,6 +441,38 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect((await expectConformingError(res, {})).details).toEqual([{ pointer: "/job_id", keyword: "notFound" }]);
     });
 
+    it("finished scans: a null finished_at closes the window, and the scan's deadline bounds it", async () => {
+      const auth = await agentWithTargets();
+      // Fail closed on a missing finished_at.
+      const noFinish = await deliveredScan(auth);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: null }).where(eq(jobs.id, noFinish));
+      expect((await post(auth, batch(noFinish))).status).toBe(404);
+      // A final status sent long after the deadline does not reopen the window: delivered 30 h ago
+      // (deadline 30 h - 15 min - 1 h ago), "finished" 1 h ago.
+      const stale = await deliveredScan(auth);
+      await getDb()
+        .update(jobs)
+        .set({ status: "succeeded", deliveredAt: hoursAgo(30), finishedAt: hoursAgo(1) })
+        .where(eq(jobs.id, stale));
+      expect((await post(auth, batch(stale))).status).toBe(404);
+      await getDb().update(jobs).set({ status: "failed" }).where(eq(jobs.id, stale));
+      expect((await post(auth, batch(stale))).status).toBe(404);
+      // Deadline within the last 24 h: accepted.
+      const recent = await deliveredScan(auth);
+      await getDb()
+        .update(jobs)
+        .set({ status: "failed", deliveredAt: hoursAgo(20), finishedAt: hoursAgo(1) })
+        .where(eq(jobs.id, recent));
+      expect((await post(auth, batch(recent))).status).toBe(202);
+      // A finished job that was never delivered (no delivered_at): closed.
+      const undelivered = await deliveredScan(auth);
+      await getDb()
+        .update(jobs)
+        .set({ status: "failed", deliveredAt: null, finishedAt: hoursAgo(1) })
+        .where(eq(jobs.id, undelivered));
+      expect((await post(auth, batch(undelivered))).status).toBe(404);
+    });
+
     it("refuses batches of a running scan past delivered_at + max_duration_s + grace", async () => {
       const auth = await agentWithTargets();
       const jobId = await deliveredScan(auth, "pg-prod-1", { max_duration_s: 600 });
@@ -482,6 +519,54 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       // Other agents are not affected.
       const other = await agentWithTargets();
       expect((await post(other, batch(await deliveredScan(other)))).status).toBe(202);
+    });
+
+    it("limits every authenticated /findings request per agent (429), rejected and not-found included", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      // Schema-invalid, cross-field-invalid and unknown-job batches all count.
+      expect((await post(auth, { ...batch(jobId), extra: 1 })).status).toBe(400);
+      expect((await post(auth, batch(jobId, [{ ...PG_FINDING, matched: 999 }]))).status).toBe(400);
+      expect((await post(auth, batch(uuidv7()))).status).toBe(404);
+      expect(findingsRequestsPerAgent.check(auth.agentId).limited).toBe(false);
+      for (let i = 3; i < findingsRequestsPerAgent.limit; i++) findingsRequestsPerAgent.hit(auth.agentId);
+      expect(findingsRequestsPerAgent.limit).toBe(300);
+      // The stored-batch limiter is untouched, yet the request is refused.
+      expect(findingsPerAgent.check(auth.agentId).limited).toBe(false);
+      for (const body of [batch(jobId), batch(uuidv7()), { ...batch(jobId), extra: 1 }]) {
+        const res = await post(auth, body);
+        expect(res.status).toBe(429);
+        expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+        expect((await expectConformingError(res, {})).code).toBe("rate_limited");
+      }
+      expect(await getDb().select().from(findingsBatches).where(eq(findingsBatches.agentId, auth.agentId))).toHaveLength(0);
+      // Unauthenticated requests do not consume an agent's budget; other agents are not affected.
+      const other = await agentWithTargets();
+      expect((await post(other, batch(await deliveredScan(other)))).status).toBe(202);
+    });
+
+    it("summarizes fairly: a noisy agent cannot fill every summary group", async () => {
+      const noisy = await agentWithTargets();
+      const quiet = await agentWithTargets();
+      // MAX_SUMMARY_GROUPS + 20 groups for the noisy agent (distinct classifiers on one target).
+      await getDb().execute(sql`
+        insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+          field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id, last_seen_at)
+        select gen_random_uuid(), ${noisy.agentId}, 'pg-prod-1', md5(g::text) || md5(g::text), 'postgres', 'a',
+          'o', 'f', 'custom.c' || g, '2026.09.1', 0.5, 10, 5, gen_random_uuid(), now()
+        from generate_series(1, ${MAX_SUMMARY_GROUPS + 20}) g`);
+      expect((await post(quiet, batch(await deliveredScan(quiet)))).status).toBe(202);
+      const other = { ...PG_FINDING, target_id: "pg-other" };
+      expect((await post(quiet, batch(await deliveredScan(quiet, "pg-other"), [other]))).status).toBe(202);
+      await getDb().execute(sql`update findings set last_seen_at = now() - interval '1 day' where agent_id = ${quiet.agentId}`);
+      const summary = await summarizeFindings(getDb());
+      expect(summary).toHaveLength(MAX_SUMMARY_GROUPS);
+      const quietGroups = summary.filter((g) => g.agentId === quiet.agentId);
+      expect(quietGroups.map((g) => g.targetId).sort()).toEqual(["pg-other", "pg-prod-1"]);
+      expect(quietGroups.every((g) => g.findings === 1 && g.classifier === "pii.email")).toBe(true);
+      // Stable reading order.
+      const keys = summary.map((g) => `${g.agentName}\0${g.agentId}\0${g.targetId}\0${g.classifier}`);
+      expect(keys).toEqual([...keys].sort());
     });
 
     it("lists findings fairly: a noisy target cannot hide the others", async () => {

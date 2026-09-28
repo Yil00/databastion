@@ -1,0 +1,9 @@
+{
+  "code": "invalid_request",
+  "message": "The request does not match the job or the classifier registry.",
+  "details": [
+    { "pointer": "/findings/0/target_id", "keyword": "const" },
+    { "pointer": "/findings/1/matched", "keyword": "maximum" },
+    { "pointer": "/findings/2/classifier", "keyword": "enum" }
+  ]
+}
