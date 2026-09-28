@@ -196,6 +196,10 @@ targets:
     account: databastion_agent
     secret:
       file: /run/databastion-secrets/target_agent_password
+    # target-pg has no TLS; it sits on the internal agent network only.
+    postgres:
+      databases: [app]
+      tls: disable
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -324,16 +328,16 @@ deadline=$(( $(date +%s) + 90 ))
 online=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   a="$(agent_json || true)"
-  # TODO(P2): also assert `.reachable == true` once the PostgreSQL connector lands (it is a stub
-  # in phase 1: the target is reported unreachable, audit level `none`).
-  if [ -n "$a" ] && jq -e '.status == "online" and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present)' \
+  # The PostgreSQL connector (P2-B) connects with the least-privilege role: the target must be
+  # reachable. Its audit level (`none`: no pg_stat_statements on target-pg) is printed, not asserted.
+  if [ -n "$a" ] && jq -e '.status == "online" and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present and .reachable == true)' \
       <<<"$a" >/dev/null; then
     online="$a"
     break
   fi
   sleep 2
 done
-[ -n "$online" ] || fail "agent not online with target pg-e2e within 90 s"
+[ -n "$online" ] || fail "agent not online with target pg-e2e reachable within 90 s"
 log "agent online; target pg-e2e: $(jq -c '.targets[] | select(.targetId == "pg-e2e") | {reachable, auditLevel, lastError}' <<<"$online")"
 
 log "checking the agent's target account (ADR-0012 minimal variant, read-only: I4)"
