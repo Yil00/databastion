@@ -279,6 +279,8 @@ struct Runtime {
     spool: Mutex<Spool>,
     /// Host root for local detection (`/`; a fixture tree in tests).
     host_root: PathBuf,
+    /// Heartbeats refused with a fatal `401` since the last success.
+    unauthorized_heartbeats: std::sync::atomic::AtomicU32,
     /// Last local detection result and when it was computed.
     detection: Mutex<Option<(Instant, Vec<DetectedTarget>)>>,
 }
@@ -357,6 +359,7 @@ impl Runtime {
             spool: Mutex::new(spool),
             host_root: PathBuf::from("/"),
             detection: Mutex::new(None),
+            unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -507,6 +510,13 @@ impl Runtime {
         })
     }
 
+    /// Serialized heartbeat, used as the probe request before re-sending a
+    /// `/rotate` whose outcome is unknown.
+    async fn heartbeat_body(&self) -> Option<Vec<u8>> {
+        let request = self.build_heartbeat().await.ok()?;
+        serde_json::to_vec(&request).ok()
+    }
+
     /// Sends one heartbeat; returns the clamped interval from the console.
     async fn heartbeat_once(&self) -> Result<Option<u64>, CallError> {
         let request = self
@@ -549,6 +559,7 @@ impl Runtime {
                 Ok(new_interval) => {
                     failures = 0;
                     bump(&self.counters.heartbeats_sent, 1);
+                    self.unauthorized_heartbeats.store(0, Ordering::Relaxed);
                     if *self.state.borrow() == RunState::Suspended {
                         tracing::info!("console accepted the agent again; resuming");
                     }
@@ -579,7 +590,8 @@ impl Runtime {
         if !self.session.needs_rotation_retry() {
             return Ok(());
         }
-        match self.session.rotate(None).await {
+        let probe = self.heartbeat_body().await;
+        match self.session.rotate_probed(None, probe.as_deref()).await {
             Ok(_) => Ok(()),
             Err(CallError::RotationConflict) => Err(AgentError::RotationConflict),
             Err(e) => {
@@ -609,7 +621,16 @@ impl Runtime {
                      slow retry every 15 min"
                 );
                 self.set_state(RunState::Suspended);
-                Ok(backoff::unauthorized_retry_delay(backoff::random_fraction()))
+                // The first heartbeat retry after a fatal 401 comes quickly
+                // (a transient console-side issue), then every 15 min.
+                let first = what == "heartbeat"
+                    && self.unauthorized_heartbeats.fetch_add(1, Ordering::Relaxed) == 0;
+                let fraction = backoff::random_fraction();
+                Ok(if first {
+                    backoff::first_unauthorized_retry_delay(fraction)
+                } else {
+                    backoff::unauthorized_retry_delay(fraction)
+                })
             }
             CallError::Uplink(UplinkError::UpgradeRequired { min_protocol }) => {
                 tracing::error!(
@@ -1018,8 +1039,9 @@ impl Runtime {
     }
 
     async fn rotate_for_job(&self, id: Uuid) -> Result<Option<Outcome>, AgentError> {
+        let probe = self.heartbeat_body().await;
         for attempt in 0..3 {
-            match self.session.rotate(Some(id)).await {
+            match self.session.rotate_probed(Some(id), probe.as_deref()).await {
                 Ok(RotateOutcome::Registered { duplicate }) => {
                     tracing::info!(job_id = %id, duplicate, "new secret registered as pending");
                     return Ok(Some(Outcome::SUCCEEDED));

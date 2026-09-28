@@ -330,11 +330,28 @@ async fn unauthorized_with_current_secret_suspends_with_slow_retry() {
     let rt = runtime(&env);
     let err = rt.heartbeat_once().await.unwrap_err();
     assert!(matches!(err, CallError::Unauthorized));
-    let delay = rt
+    // First slow retry after 60-90 s, then every 15 min.
+    let first = rt
         .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
         .unwrap();
-    assert!(delay >= Duration::from_secs(900));
+    assert!(first >= Duration::from_secs(60) && first <= Duration::from_secs(90));
     assert_eq!(*rt.state.borrow(), RunState::Suspended);
+    for _ in 0..2 {
+        let delay = rt
+            .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+            .unwrap();
+        assert!(delay >= Duration::from_secs(900));
+    }
+    // A 401 seen by another loop does not consume the quick retry.
+    let rt = runtime(&env);
+    let other = rt
+        .on_call_error("jobs", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(other >= Duration::from_secs(900));
+    let hb = rt
+        .on_call_error("heartbeat", &err, 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(hb <= Duration::from_secs(90));
 }
 
 #[tokio::test]
@@ -1219,4 +1236,76 @@ async fn non_contract_answers_never_empty_the_spool() {
         assert!((unexpected - 3.0).abs() < f64::EPSILON);
         assert!(m.contains_key(&MetricsMapKey::try_from("spool_quarantined_total").unwrap()));
     }
+}
+
+#[tokio::test]
+async fn unknown_rotation_outcome_is_probed_with_s1_before_resending_rotate() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    // The console registered and promoted S1 meanwhile; S0 is past grace.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .respond_with(heartbeat_response(30))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let outcome = session.rotate_probed(None, Some(b"{}")).await.unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyDone);
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_eq!(stored.secret.expose(), s1);
+}
+
+#[tokio::test]
+async fn probe_refused_falls_back_to_rotate_with_s0() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(401, "unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(true))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        session.rotate_probed(None, Some(b"{}")).await.unwrap(),
+        RotateOutcome::Registered { duplicate: true }
+    );
+    assert!(env.state.load_identity().unwrap().pending.is_some());
 }

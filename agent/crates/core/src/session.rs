@@ -68,6 +68,12 @@ struct Creds {
     rotate_epoch: u64,
     /// Last promotion in this process: no new rotation within the console's
     /// 60 s tolerance window.
+    ///
+    /// In memory only, by design: after a restart the window is not
+    /// enforced. This is harmless under ADR-0010: a new rotation within 60 s
+    /// of a promotion only shortens the console's tolerance for the
+    /// previous secret, which the restarted agent no longer uses (it loads
+    /// the promoted secret from disk).
     promoted_at: Option<Instant>,
 }
 
@@ -288,13 +294,36 @@ impl Session {
     }
 
     /// `POST /rotate` with the current secret, registering the pending `S1`
-    /// (created and persisted first if needed).
+    /// (created and persisted first if needed). No probe: see
+    /// [`Self::rotate_probed`] (tests).
+    #[cfg(test)]
     pub(crate) async fn rotate(&self, job_id: Option<Uuid>) -> Result<RotateOutcome, CallError> {
+        self.rotate_probed(job_id, None).await
+    }
+
+    /// Like [`Self::rotate`], but when a pending `S1` already exists (its
+    /// registration outcome is unknown), first sends one ordinary request
+    /// (`POST /heartbeat` with `probe` as body) authenticated with `S1`
+    /// alone. If the console accepts it, `S1` was registered and promoted on
+    /// the console side: it is promoted here and no `/rotate` is sent with
+    /// `S0` (which may already be past its grace period and would count as a
+    /// rotation conflict).
+    pub(crate) async fn rotate_probed(
+        &self,
+        job_id: Option<Uuid>,
+        probe: Option<&[u8]>,
+    ) -> Result<RotateOutcome, CallError> {
+        let pending_before = self.lock().identity.pending.is_some();
         let s1 = match self.pending_or_create(job_id)? {
             Pending::Use(s1) => s1,
             Pending::AlreadyDone => return Ok(RotateOutcome::AlreadyDone),
             Pending::Deferred => return Ok(RotateOutcome::Deferred),
         };
+        if let (true, Some(body)) = (pending_before, probe) {
+            if self.probe_pending(&s1, body).await? {
+                return Ok(RotateOutcome::AlreadyDone);
+            }
+        }
         let (agent_id, s0) = {
             let mut creds = self.lock();
             // The outcome of this attempt may be unknown (lost response):
@@ -358,6 +387,38 @@ impl Session {
                 self.lock().pending_rejected = false;
                 Err(CallError::Unauthorized)
             }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Session {
+    /// Sends `POST /heartbeat` with `S1` only. `true`: accepted, `S1`
+    /// promoted. `false`: `401` (not registered yet).
+    async fn probe_pending(&self, s1: &AgentSecret, body: &[u8]) -> Result<bool, CallError> {
+        let agent_id = self.lock().identity.agent_id;
+        let auth = Auth::Agent {
+            agent_id: &agent_id,
+            secret: s1,
+        };
+        match self
+            .uplink
+            .request(
+                Method::POST,
+                "/heartbeat",
+                &[],
+                auth,
+                Some(body),
+                crate::uplink::REQUEST_TIMEOUT,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.promote(s1)?;
+                tracing::info!("pending secret already registered; promoted without /rotate");
+                Ok(true)
+            }
+            Err(UplinkError::Unauthorized) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
