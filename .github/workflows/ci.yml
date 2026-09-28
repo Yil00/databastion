@@ -159,6 +159,47 @@ jobs:
         with:
           node-version: 24
       - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
+      # Published classifier sets are immutable (shared/protocol/README.md, "Classifier registry"):
+      # `npm test` checks the registry against the lock, but a PR could edit both together. Here the
+      # lock is compared with the base branch: existing entries must be unchanged, only new keys may
+      # be added. The PR checkout is the merge commit, so the base tip (depth 1) is all that is needed.
+      - name: Classifier lock is append-only (pull requests)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          path = "shared/protocol/classifiers.lock.json"
+          ref = "origin/" + os.environ["BASE_REF"]
+          subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref], check=True, stdout=subprocess.DEVNULL)
+          if subprocess.run(["git", "cat-file", "-e", f"{ref}:{path}"], stderr=subprocess.DEVNULL).returncode != 0:
+              print(f"{path} does not exist on {ref}: nothing to compare")
+              sys.exit(0)
+          show = subprocess.run(["git", "show", f"{ref}:{path}"], check=True, capture_output=True, text=True)
+          base = json.loads(show.stdout)
+          try:
+              with open(path, encoding="utf-8") as f:
+                  head = json.load(f)
+          except FileNotFoundError:
+              head = {}
+          if not isinstance(base, dict) or not isinstance(head, dict):
+              sys.exit(f"{path} must be a JSON object")
+          errors = []
+          for version, digest in base.items():
+              if version not in head:
+                  errors.append(f"published version {version} was removed")
+              elif head[version] != digest:
+                  errors.append(f"published version {version} was changed")
+          if errors:
+              for e in errors:
+                  print(f"::error file={path}::{e} (lock entries are append-only: add a new classifiers_version instead)")
+              sys.exit(1)
+          added = sorted(set(head) - set(base))
+          print(f"{len(base)} published version(s) unchanged; added: {', '.join(added) or 'none'}")
+          PY
       - name: Contract tests (schemas + fixtures)
         working-directory: shared/protocol
         run: |
