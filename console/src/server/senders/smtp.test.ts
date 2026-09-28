@@ -33,6 +33,12 @@ class FakeSmtp {
       auth?: { user: string; pass: string };
       rcptReply?: string;
       silent?: boolean;
+      /** Listen address (default 127.0.0.1). */
+      host?: string;
+      /** Extra EHLO continuation lines (M2 tests). */
+      ehloExtra?: string[];
+      /** Bytes written in clear right after the STARTTLS `220` (L1 test). */
+      injectAfterStarttls?: string;
     } = {},
   ) {
     const onSocket = (socket: net.Socket, secure: boolean) => this.session(socket, secure);
@@ -42,7 +48,7 @@ class FakeSmtp {
   }
 
   async start(): Promise<number> {
-    await new Promise<void>((r) => this.server.listen(0, "127.0.0.1", r));
+    await new Promise<void>((r) => this.server.listen(0, this.opts.host ?? "127.0.0.1", r));
     this.port = (this.server.address() as net.AddressInfo).port;
     return this.port;
   }
@@ -89,13 +95,13 @@ class FakeSmtp {
       }
       const verb = line.split(" ")[0]?.toUpperCase();
       if (verb === "EHLO") {
-        const caps = ["250-fake.test"];
+        const caps = ["250-fake.test", ...(this.opts.ehloExtra ?? []).map((l) => `250-${l}`)];
         if (this.opts.cert && !secure && !this.opts.implicitTls) caps.push("250-STARTTLS");
         if (this.opts.auth) caps.push("250-AUTH LOGIN");
         caps.push("250 8BITMIME");
         socket.write(caps.map((c) => `${c}\r\n`).join(""));
       } else if (verb === "STARTTLS" && this.opts.cert) {
-        send("220 go ahead");
+        socket.write(`220 go ahead\r\n${this.opts.injectAfterStarttls ?? ""}`);
         socket.removeAllListeners("data");
         const secureSocket = new tls.TLSSocket(socket, { isServer: true, key: this.opts.cert.key, cert: this.opts.cert.cert });
         socket = secureSocket;
@@ -239,6 +245,20 @@ describe("SMTP sender against an in-process server", () => {
     }
   });
 
+  it("M2: an oversized multi-line reply is a protocol error (bounded memory)", async () => {
+    const many = new FakeSmtp({ ehloExtra: Array.from({ length: 150 }, (_, i) => `X-CAP-${i}`) });
+    const big = new FakeSmtp({ ehloExtra: Array.from({ length: 90 }, () => "Y".repeat(1000)) });
+    const [p1, p2] = [await many.start(), await big.start()];
+    try {
+      expect(await sendMail(config(p1), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(config(p2), null, MSG, { allowInsecure: false })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(many.mails).toHaveLength(0);
+    } finally {
+      await many.stop();
+      await big.stop();
+    }
+  });
+
   it("times out on a server that never greets", async () => {
     const mute = new FakeSmtp({ silent: true });
     const p = await mute.start();
@@ -279,6 +299,45 @@ describe.skipIf(!cert)("SMTP sender over TLS", () => {
     expect(await sendMail(cfg, "wrong", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_535", retryable: false });
     // Untrusted certificate: refused.
     expect(await sendMail(cfg, "s3cret pass", MSG, { allowInsecure: false })).toEqual({ ok: false, code: "tls_failed", retryable: true });
+  });
+
+  it("L1: bytes pipelined in clear after the STARTTLS 220 abort the session", async () => {
+    const injecting = new FakeSmtp({ cert, auth: { user: "dlp", pass: "s3cret pass" }, injectAfterStarttls: "250-AUTH PLAIN\r\n" });
+    const full = new FakeSmtp({ cert, injectAfterStarttls: "250 injected\r\n" });
+    const [a, b] = [await injecting.start(), await full.start()];
+    try {
+      const cfg = (p: number) => config(p, { host: "localhost", tls: "starttls", username: "dlp" });
+      expect(await sendMail(cfg(a), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(await sendMail(cfg(b), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: false, code: "smtp_protocol", retryable: false });
+      expect(injecting.mails).toHaveLength(0);
+      expect(full.mails).toHaveLength(0);
+    } finally {
+      await injecting.stop();
+      await full.stop();
+    }
+  });
+
+  it("L4: after STARTTLS the certificate is checked against the configured host, never a default name", async () => {
+    // The test certificate covers localhost and 127.0.0.1 only.
+    const other = new FakeSmtp({ cert, host: "127.0.0.2" });
+    const p = await other.start();
+    try {
+      expect(await sendMail(config(p, { host: "127.0.0.2", tls: "starttls" }), null, MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({
+        ok: false,
+        code: "tls_failed",
+        retryable: true,
+      });
+      const resolver = async () => [{ address: "127.0.0.1", family: 4 }];
+      expect(await sendMail(config(p1, { host: "mail.example.test", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert, resolver })).toEqual({
+        ok: false,
+        code: "tls_failed",
+        retryable: true,
+      });
+      // An IP literal covered by the certificate verifies against the IP.
+      expect(await sendMail(config(p1, { host: "127.0.0.1", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, { allowInsecure: false, ca: cert?.cert })).toEqual({ ok: true });
+    } finally {
+      await other.stop();
+    }
   });
 
   it("implicit TLS", async () => {

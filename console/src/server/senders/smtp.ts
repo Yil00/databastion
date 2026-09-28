@@ -19,7 +19,12 @@ import type { SendResult } from "./types";
  * - The host is resolved and checked (`net-guard.ts`): link-local, metadata, multicast and
  *   reserved addresses are refused; internal relays are allowed. The socket connects to the vetted
  *   address only.
- * - Timeouts: 10 s to connect, 30 s per reply, 60 s in total. Replies are capped (64 KiB).
+ * - Timeouts: 10 s to connect, 30 s per reply, 60 s in total. Each reply is capped at 64 KiB and
+ *   100 lines, and an unterminated line at 64 KiB (`smtp_protocol` beyond: a hostile server cannot
+ *   grow the worker's memory).
+ * - STARTTLS: any byte received after the `220` and before the TLS handshake is a protocol error
+ *   (no plaintext command or reply injection into the encrypted session). The certificate is
+ *   verified against the configured host (a name, or an IP literal), never a default name.
  * - Message: plain text, UTF-8, base64 body, RFC 2047 subject, `Message-ID` derived from the
  *   delivery id (stable across retries), `Auto-Submitted: auto-generated`.
  * - Outcome: a 4xx reply, a network or TLS error is retried; a 5xx reply fails (`smtp_<code>`).
@@ -29,6 +34,7 @@ export const SMTP_CONNECT_TIMEOUT_MS = 10_000;
 export const SMTP_REPLY_TIMEOUT_MS = 30_000;
 export const SMTP_TOTAL_TIMEOUT_MS = 60_000;
 const MAX_REPLY_BYTES = 64 * 1024;
+const MAX_REPLY_LINES = 100;
 
 export interface MailMessage {
   deliveryId: string;
@@ -71,6 +77,7 @@ interface Reply {
 class Conversation {
   private buffer = "";
   private lines: string[] = [];
+  private replyBytes = 0;
   private waiter: { resolve: (r: Reply) => void; reject: (e: Error) => void } | null = null;
   private failure: Error | null = null;
   socket: net.Socket;
@@ -122,9 +129,17 @@ class Conversation {
         return;
       }
       this.lines.push(m[3] ?? "");
+      this.replyBytes += line.length + 2;
+      // M2: a multi-line reply is bounded too, not only the unparsed buffer.
+      if (this.lines.length > MAX_REPLY_LINES || this.replyBytes > MAX_REPLY_BYTES) {
+        this.abort(fail("smtp_protocol", false));
+        this.socket.destroy();
+        return;
+      }
       if (m[2] === " ") {
         const reply = { code: Number(m[1]), lines: this.lines };
         this.lines = [];
+        this.replyBytes = 0;
         const w = this.waiter;
         this.waiter = null;
         if (w) w.resolve(reply);
@@ -135,6 +150,11 @@ class Conversation {
         }
       }
     }
+  }
+
+  /** Received bytes not yet consumed as an awaited reply (or an unsolicited reply already seen). */
+  hasPending(): boolean {
+    return this.buffer !== "" || this.lines.length > 0 || this.failure !== null;
   }
 
   read(): Promise<Reply> {
@@ -248,8 +268,10 @@ function tlsOrConnect(err: unknown): SmtpError {
 
 function upgrade(socket: net.Socket, config: EmailConfig, opts: SmtpOptions): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
+    // L4: `host` is what the certificate is verified against (without it Node falls back to
+    // "localhost"); SNI only for a name, never an IP literal.
     const servername = net.isIP(config.host) === 0 ? config.host : undefined;
-    const secure = tls.connect({ socket, servername, ca: opts.ca, rejectUnauthorized: true });
+    const secure = tls.connect({ socket, host: config.host, servername, ca: opts.ca, rejectUnauthorized: true });
     const timer = setTimeout(() => {
       secure.destroy();
       reject(fail("tls_failed", true));
@@ -292,6 +314,8 @@ export async function sendMail(config: EmailConfig, password: string | null, msg
     if (config.tls === "starttls") {
       if (!ehlo.lines.some((l) => /^STARTTLS\b/i.test(l))) throw fail("starttls_unavailable", false);
       await conv.command("STARTTLS", [220]);
+      // L1: nothing may follow the 220 in clear (STARTTLS response injection, CVE-2011-0411 class).
+      if (conv.hasPending()) throw fail("smtp_protocol", false);
       conv.detach();
       socket = await upgrade(socket, config, opts);
       conv.attach(socket);
