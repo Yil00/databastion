@@ -401,24 +401,33 @@ paths:
         The console rejects with `400` (`invalid_secret`) a `new_secret` equal to the current secret, or
         obviously low-entropy (see `AgentSecret`).
 
-        **Tolerance window** (ADR-0010): the **60 s** that follow the promotion of `S1`. "Just promoted"
-        means promoted less than 60 s ago.
+        **Terminology.** `S0` is the secret that authenticated the rotation and `S1` the new one. While
+        `S1` is pending, `S0` is still the current secret. Once `S1` is promoted, `S0` is the
+        *previous* secret. **Tolerance window** (ADR-0010): the **60 s** that follow the promotion of
+        `S1`. A *stale* `S0` is `S0` used **after** that window.
 
-        **Takeover detection** (someone else holds `S0`). The console decides from the secret that
-        authenticates the request:
-        - `/rotate` authenticated with `S0` whose `new_secret` is the **same** as the pending `S1`, or as
-          the `S1` promoted less than 60 s ago: idempotent retry, answered `200` with `duplicate: true`
-          and the unchanged `grace_expires_at`;
-        - `/rotate` authenticated with `S0` whose `new_secret` **differs** from the pending `S1`, or from
-          the `S1` promoted less than 60 s ago: `409` `rotation_conflict`;
-        - any other request authenticated with `S0` within the 60 s tolerance window (requests in flight
-          during the switch): plain `401`, no incident;
-        - any request authenticated with `S0` **after** the 60 s tolerance window, `/rotate` included:
-          `409` `rotation_conflict`.
+        **Takeover detection** (someone else holds `S0`, ADR-0010, ADR-0011). The console decides from
+        the secret that authenticates the request:
+        - `/rotate` authenticated with `S0` whose `new_secret` is the **same** as the pending `S1`, or
+          as the promoted (current) `S1`: idempotent retry, answered `200` with `duplicate: true` and
+          the original `grace_expires_at` of that rotation. For the promoted `S1` this holds **at any
+          time** after promotion, not only within the 60 s window (late retry, ADR-0011); it carries no
+          secret and changes no state. Only the holder of `S1` can produce it;
+        - `/rotate` authenticated with `S0` whose `new_secret` **differs** from the pending `S1`, or
+          from the promoted `S1`: `409` `rotation_conflict`;
+        - `/rotate` authenticated with a **stale** `S0` has exactly two outcomes: the late-retry
+          `duplicate` above, or `409` `rotation_conflict`. Anything else (body that fails validation,
+          low-entropy or other `new_secret`, unknown `job_id`) is a `rotation_conflict`: this path
+          never answers `400`, `404`, `429` or `503`. Late retries are bounded: more than **10** within
+          a sliding 5-minute window (the 11th) is a `rotation_conflict`;
+        - any request to another endpoint authenticated with `S0` within the 60 s tolerance window
+          (requests in flight during the switch): plain `401`, no incident;
+        - any request to another endpoint authenticated with a stale `S0`: `409` `rotation_conflict`.
 
-        A `/rotate` authenticated with the **current** secret while no secret is pending (in particular
+        A `/rotate` authenticated with the current secret while no secret is pending (in particular
         `S1` right after its promotion) always starts a new rotation and is **never** a
-        `rotation_conflict`; the `invalid_secret` checks above still apply.
+        `rotation_conflict`; the `invalid_secret` checks above still apply. The stale `S0` of the
+        previous rotation is then forgotten once the new one is promoted.
 
         On `rotation_conflict` (every case) the console **locks the agent, revokes every secret
         (current and pending), closes its long-polls and raises a security incident**. The agent that
@@ -457,11 +466,13 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            `rotation_conflict`: the request was authenticated with the previous secret `S0` and either
-            carries a `new_secret` different from the pending `S1` or from the `S1` promoted less than
-            60 s ago, or arrives after the 60 s tolerance window that follows promotion. Never returned to
-            a `/rotate` authenticated with the current secret. The agent has been locked and all its
-            secrets revoked; the agent stops and requires re-enrollment.
+            `rotation_conflict`: the request was authenticated with `S0` and either (a) its
+            `new_secret` differs from the pending `S1` or from the promoted `S1`, or (b) `S0` is stale
+            (after the 60 s tolerance window) and the request is anything other than a late retry
+            resending the promoted `S1` (invalid body, low-entropy secret, unknown `job_id`), or (c) it
+            is the 11th late retry within 5 minutes. Never returned to a `/rotate` authenticated with
+            the current secret while no secret is pending. The agent has been locked and all its secrets
+            revoked; the agent stops and requires re-enrollment.
           content:
             application/json:
               schema:
@@ -492,11 +503,13 @@ components:
           and on rotation;
         - revocation invalidates the current **and** the pending secret and closes the agent's held
           long-polls; it is effective in **less than 60 s** in every case;
-        - after a rotation, the console keeps the hash of the previous secret `S0` and the promotion
-          timestamp of the current secret, only to tell a request with `S0` inside the 60 s tolerance
-          window (plain `401`, or `duplicate` for a `/rotate` retry) from a `rotation_conflict` (see
-          `POST /rotate`). After promotion, `S0` grants no access: its only non-error answer is that
-          `duplicate` acknowledgement, which carries no secret and changes no state.
+        - after a rotation, the console keeps the hash of the previous secret `S0`, the promotion
+          timestamp and original deadline of the current secret, and a late-retry counter, only to tell
+          a harmless request with `S0` (plain `401` inside the 60 s tolerance window, or `duplicate` for
+          a bounded `/rotate` retry resending the current secret) from a `rotation_conflict` (see
+          `POST /rotate`).
+          After promotion, `S0` grants no access: its only non-error answer is that `duplicate`
+          acknowledgement, which carries no secret and changes no state.
 
   parameters:
     AgentId:
@@ -952,11 +965,14 @@ components:
           $ref: "#/components/schemas/HeartbeatIntervalSeconds"
     RotateRequest:
       description: |
-        Body of `POST /rotate`. A new rotation is authenticated with the current secret; a retry is
-        authenticated with `S0` and resends the same `new_secret`, which is answered `duplicate` while
-        `S1` is pending or was promoted less than 60 s ago (see `POST /rotate`). `new_secret` is
-        generated by the agent and persisted as pending before the call. A `new_secret` equal to the
-        current secret or obviously low-entropy is rejected with `400` `invalid_secret`.
+        Body of `POST /rotate`. A new rotation is authenticated with the current secret while no secret
+        is pending (`S0`); a retry is authenticated with the same `S0` and resends the same
+        `new_secret` (`S1`), which is answered `duplicate` while `S1` is pending and, after its
+        promotion, at any time within the late-retry bound (see `POST /rotate`). `new_secret` is
+        generated by the agent and persisted as pending before the call. On a new rotation, a
+        `new_secret` equal to the current secret or obviously low-entropy is rejected with `400`
+        `invalid_secret`; with a stale `S0` (after the 60 s tolerance window), any request other than a
+        late retry is a `409` `rotation_conflict`.
       type: object
       additionalProperties: false
       required: [new_secret]
@@ -983,8 +999,8 @@ components:
         duplicate:
           description: |
             `true` when the request was authenticated with `S0` and this exact secret is already pending,
-            or was promoted less than 60 s ago (idempotent retry). `grace_expires_at` is then the
-            original deadline.
+            or is the current secret promoted from it (idempotent or late retry). `grace_expires_at` is
+            then the original deadline.
           type: boolean
 
     # -------------------------------------------------------------- heartbeat
