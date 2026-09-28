@@ -121,6 +121,64 @@ pub(crate) enum Auth<'a> {
 pub(crate) struct Reply {
     pub(crate) status: StatusCode,
     pub(crate) body: Vec<u8>,
+    /// Whether the `Content-Type` media type is `application/json`.
+    pub(crate) json: bool,
+}
+
+/// Whether a `Content-Type` value has the `application/json` media type
+/// (parameters such as `charset` are ignored).
+fn is_json_media_type(value: Option<&HeaderValue>) -> bool {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Per-endpoint acceptance of a `2xx` reply (contract status, media type
+/// and body). A reply is only acted upon, and a pending secret only
+/// promoted, once its checker accepts it: a middlebox's `200` page proves
+/// nothing (see `Session::call`).
+pub(crate) mod accept {
+    use databastion_protocol::{BatchAck, HeartbeatResponse, UuidV7};
+    use reqwest::StatusCode;
+
+    use super::Reply;
+    use crate::jobs::{self, PolledList};
+
+    fn json<T: serde::de::DeserializeOwned>(reply: &Reply, status: StatusCode) -> Option<T> {
+        if reply.status != status || !reply.json {
+            return None;
+        }
+        serde_json::from_slice(&reply.body).ok()
+    }
+
+    /// `POST /heartbeat`: `200` + `HeartbeatResponse`.
+    pub(crate) fn heartbeat(reply: &Reply) -> Option<HeartbeatResponse> {
+        json(reply, StatusCode::OK)
+    }
+
+    /// `POST /findings`, `POST /events`: `202` + `BatchAck` for `batch_id`.
+    pub(crate) fn batch_ack(batch_id: UuidV7) -> impl Fn(&Reply) -> Option<BatchAck> {
+        move |reply| {
+            json::<BatchAck>(reply, StatusCode::ACCEPTED).filter(|a| a.batch_id == batch_id)
+        }
+    }
+
+    /// `GET /jobs`: `204` (no job, `None`) or `200` + a job list.
+    pub(crate) fn job_list(reply: &Reply) -> Option<Option<PolledList>> {
+        if reply.status == StatusCode::NO_CONTENT {
+            return Some(None);
+        }
+        if reply.status != StatusCode::OK || !reply.json {
+            return None;
+        }
+        jobs::parse_job_list(&reply.body).ok().map(Some)
+    }
+
+    /// `POST /jobs/{id}/status`: exactly `204`.
+    pub(crate) fn no_content(reply: &Reply) -> Option<()> {
+        (reply.status == StatusCode::NO_CONTENT).then_some(())
+    }
 }
 
 /// Client towards the console agent API.
@@ -217,6 +275,7 @@ impl Uplink {
         }
         let response = request.send().await.map_err(|e| transport(&e))?;
         let status = response.status();
+        let json = is_json_media_type(response.headers().get(header::CONTENT_TYPE));
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
@@ -224,7 +283,7 @@ impl Uplink {
             .and_then(backoff::parse_retry_after);
         let body = read_limited(response).await?;
         if status.is_success() {
-            return Ok(Reply { status, body });
+            return Ok(Reply { status, body, json });
         }
         Err(classify(path, status, retry_after, &body))
     }
@@ -688,6 +747,56 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reply(status: u16, json: bool, body: &[u8]) -> Reply {
+        Reply {
+            status: StatusCode::from_u16(status).unwrap(),
+            body: body.to_vec(),
+            json,
+        }
+    }
+
+    #[test]
+    fn json_media_type_ignores_parameters_and_case() {
+        let check = |v: &str| is_json_media_type(Some(&HeaderValue::from_str(v).unwrap()));
+        assert!(check("application/json"));
+        assert!(check("Application/JSON; charset=utf-8"));
+        assert!(!check("text/html"));
+        assert!(!check("application/jsonp"));
+        assert!(!is_json_media_type(None));
+    }
+
+    #[test]
+    fn acceptance_follows_the_endpoint_contract() {
+        let hb = br#"{"console_min_protocol":1,"heartbeat_interval_s":30,"server_time":"2026-09-28T14:02:00Z"}"#;
+        assert!(accept::heartbeat(&reply(200, true, hb)).is_some());
+        assert!(accept::heartbeat(&reply(200, false, hb)).is_none());
+        assert!(accept::heartbeat(&reply(202, true, hb)).is_none());
+        assert!(accept::heartbeat(&reply(200, true, b"<html>")).is_none());
+
+        let id = new_batch_id();
+        let ack =
+            serde_json::to_vec(&serde_json::json!({"batch_id": id, "duplicate": false})).unwrap();
+        assert!(accept::batch_ack(id)(&reply(202, true, &ack)).is_some());
+        assert!(accept::batch_ack(id)(&reply(200, true, &ack)).is_none());
+        assert!(accept::batch_ack(id)(&reply(202, false, &ack)).is_none());
+        assert!(accept::batch_ack(new_batch_id())(&reply(202, true, &ack)).is_none());
+
+        assert!(matches!(
+            accept::job_list(&reply(204, false, b"")),
+            Some(None)
+        ));
+        assert!(matches!(
+            accept::job_list(&reply(200, true, br#"{"jobs":[]}"#)),
+            Some(Some(_))
+        ));
+        assert!(accept::job_list(&reply(200, false, br#"{"jobs":[]}"#)).is_none());
+        assert!(accept::job_list(&reply(200, true, b"[]")).is_none());
+
+        assert!(accept::no_content(&reply(204, false, b"")).is_some());
+        assert!(accept::no_content(&reply(200, true, b"{}")).is_none());
+        assert!(accept::no_content(&reply(202, false, b"")).is_none());
+    }
 
     #[test]
     fn classify_maps_statuses() {

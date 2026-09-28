@@ -572,6 +572,7 @@ async fn rotation_persists_pending_first_reuses_it_and_promotes() {
             &[],
             Some(b"{}"),
             uplink::REQUEST_TIMEOUT,
+            uplink::accept::heartbeat,
         )
         .await
         .unwrap();
@@ -621,6 +622,7 @@ async fn unregistered_pending_secret_falls_back_to_current() {
             &[],
             Some(b"{}"),
             uplink::REQUEST_TIMEOUT,
+            uplink::accept::heartbeat,
         )
         .await
         .unwrap();
@@ -757,6 +759,7 @@ async fn lost_rotate_response_never_falls_back_to_s0() {
                 &[],
                 Some(b"{}"),
                 uplink::REQUEST_TIMEOUT,
+                uplink::accept::heartbeat,
             )
             .await
             .unwrap();
@@ -824,6 +827,7 @@ async fn s1_401_after_the_latest_rotate_attempt_puts_s0_first() {
             &[],
             Some(b"{}"),
             uplink::REQUEST_TIMEOUT,
+            uplink::accept::heartbeat,
         )
         .await
         .unwrap();
@@ -907,6 +911,7 @@ async fn every_job_satisfied_by_the_secret_is_acknowledged_and_new_rotation_defe
             &[],
             Some(b"{}"),
             uplink::REQUEST_TIMEOUT,
+            uplink::accept::heartbeat,
         )
         .await
         .unwrap();
@@ -1411,4 +1416,160 @@ async fn unserializable_halves_are_counted_and_dropped() {
     let status = rt.lock_spool().status();
     assert_eq!(status.batches.0, 0);
     assert_eq!(status.dropped_batches.unwrap().0, 1);
+}
+
+/// A runtime whose session holds a registered pending S1 (tried first),
+/// with every endpoint answering `200 text/html` (e.g. a TLS-inspection
+/// proxy's page).
+async fn s1_pending_behind_html_proxy(server: &MockServer) -> (Env, Runtime, String) {
+    let env = enrolled(server).await;
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount_as_scoped(server)
+        .await;
+    assert_eq!(
+        session(&env).rotate(None).await.unwrap(),
+        RotateOutcome::Registered { duplicate: false }
+    );
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    Mock::given(path_regex(r"^/api/agent/v1/"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>proxy</html>", "text/html"))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    (env, rt, s1)
+}
+
+fn assert_not_promoted(env: &Env, rt: &Runtime, s1: &str) {
+    let stored = env.state.load_identity().unwrap();
+    assert_eq!(stored.secret.expose(), S0);
+    assert_eq!(stored.pending.unwrap().expose(), s1);
+    let memory = rt.session.snapshot();
+    assert_eq!(memory.secret.expose(), S0);
+    assert_eq!(memory.pending.unwrap().expose(), s1);
+}
+
+fn assert_unexpected<T: std::fmt::Debug>(result: Result<T, CallError>) {
+    assert!(
+        matches!(
+            result,
+            Err(CallError::Uplink(UplinkError::UnexpectedResponse {
+                status: 200
+            }))
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn html_200_to_s1_heartbeat_does_not_promote() {
+    let server = MockServer::start().await;
+    let (env, rt, s1) = s1_pending_behind_html_proxy(&server).await;
+    assert_unexpected(rt.heartbeat_once().await);
+    assert_not_promoted(&env, &rt, &s1);
+    let auth = server.received_requests().await.unwrap();
+    let last = auth.last().unwrap();
+    assert!(last.url.path().ends_with("/heartbeat"));
+    assert_eq!(last.headers["authorization"], bearer(&s1).as_str());
+}
+
+#[tokio::test]
+async fn html_200_to_s1_batch_upload_does_not_promote() {
+    let server = MockServer::start().await;
+    let (env, rt, s1) = s1_pending_behind_html_proxy(&server).await;
+    let found = crate::spool::tests::masked(2, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
+    assert_not_promoted(&env, &rt, &s1);
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    let m = rt.metrics().0;
+    let unexpected = m[&MetricsMapKey::try_from("batches_unexpected_response_total").unwrap()];
+    assert!((unexpected - 1.0).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn html_200_to_s1_job_poll_does_not_promote() {
+    let server = MockServer::start().await;
+    let (env, rt, s1) = s1_pending_behind_html_proxy(&server).await;
+    let result = rt
+        .session
+        .call(
+            Method::GET,
+            "/jobs",
+            &[("wait", "0".to_owned())],
+            None,
+            uplink::REQUEST_TIMEOUT,
+            uplink::accept::job_list,
+        )
+        .await;
+    assert_unexpected(result.map(|l| l.is_some()));
+    assert_not_promoted(&env, &rt, &s1);
+}
+
+#[tokio::test]
+async fn html_200_to_s1_job_status_does_not_promote() {
+    let server = MockServer::start().await;
+    let (env, rt, s1) = s1_pending_behind_html_proxy(&server).await;
+    let result = rt
+        .session
+        .call(
+            Method::POST,
+            "/jobs/01920f5f-0c30-7e6f-a043-2b3c4d5e6f71/status",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+            uplink::accept::no_content,
+        )
+        .await;
+    assert_unexpected(result);
+    assert_not_promoted(&env, &rt, &s1);
+}
+
+#[tokio::test]
+async fn contract_answer_to_s1_promotes() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount_as_scoped(&server)
+        .await;
+    session(&env).rotate(None).await.unwrap();
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    rt.session
+        .call(
+            Method::POST,
+            "/jobs/01920f5f-0c30-7e6f-a043-2b3c4d5e6f71/status",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+            uplink::accept::no_content,
+        )
+        .await
+        .unwrap();
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_ne!(stored.secret.expose(), S0);
 }

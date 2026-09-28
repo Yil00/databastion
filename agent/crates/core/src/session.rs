@@ -4,7 +4,11 @@
 //! - with a pending secret `S1`, requests try `S1` first and fall back to
 //!   the current secret `S0` on `401` (`S1` never registered); a `401` with
 //!   `S0` while `S1` is pending is retried with `S1` before anything else;
-//! - the first success with `S1` promotes it (persisted atomically);
+//! - the first success with `S1` promotes it (persisted atomically). A
+//!   success only counts once the caller's per-endpoint checker
+//!   (`uplink::accept`) accepts the reply (status, media type, body): a
+//!   `2xx` from a middlebox (e.g. a TLS-inspection proxy's `200` page) is
+//!   an `UnexpectedResponse` and leaves `S0` current and `S1` pending;
 //! - a `401` for a secret that is no longer current (switched meanwhile) is
 //!   retried once with the current one;
 //! - otherwise the `401` is fatal for normal operation
@@ -18,9 +22,7 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use databastion_protocol::{
-    AgentSecret, ErrorCode, HeartbeatResponse, RotateRequest, RotateResponse, Uuid,
-};
+use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, RotateResponse, Uuid};
 use reqwest::Method;
 use zeroize::Zeroizing;
 
@@ -156,14 +158,19 @@ impl Session {
     }
 
     /// Sends an authenticated request, handling `401` per the contract.
-    pub(crate) async fn call(
+    /// `accept` checks a `2xx` reply against the endpoint contract and
+    /// extracts its value; a pending `S1` is promoted only after that. A
+    /// reply it refuses is `UnexpectedResponse` and changes no credential
+    /// state.
+    pub(crate) async fn call<T>(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
         body: Option<&[u8]>,
         timeout: Duration,
-    ) -> Result<Reply, CallError> {
+        accept: impl Fn(&Reply) -> Option<T>,
+    ) -> Result<T, CallError> {
         let mut retried_after_switch = false;
         loop {
             let (generation, epoch, agent_id, candidates) = self.candidates();
@@ -179,6 +186,16 @@ impl Session {
                     .await
                 {
                     Ok(reply) => {
+                        let Some(value) = accept(&reply) else {
+                            tracing::warn!(
+                                status = reply.status.as_u16(),
+                                "success reply does not match the contract; ignored"
+                            );
+                            return Err(UplinkError::UnexpectedResponse {
+                                status: reply.status.as_u16(),
+                            }
+                            .into());
+                        };
                         if *is_pending {
                             self.promote(secret)?;
                         } else if s1_unauthorized {
@@ -190,7 +207,7 @@ impl Session {
                                 );
                             }
                         }
-                        return Ok(reply);
+                        return Ok(value);
                     }
                     Err(UplinkError::Unauthorized) => {
                         if *is_pending {
@@ -419,13 +436,14 @@ impl Session {
             .await
         {
             Ok(reply) => {
-                // Parse before promoting: only a contract answer proves the
+                // Check before promoting: only a contract answer proves the
                 // console accepted S1.
-                serde_json::from_slice::<HeartbeatResponse>(&reply.body).map_err(|_| {
-                    UplinkError::UnexpectedResponse {
+                if crate::uplink::accept::heartbeat(&reply).is_none() {
+                    return Err(UplinkError::UnexpectedResponse {
                         status: reply.status.as_u16(),
                     }
-                })?;
+                    .into());
+                }
                 self.promote(s1)?;
                 tracing::info!("pending secret already registered; promoted without /rotate");
                 Ok(true)
