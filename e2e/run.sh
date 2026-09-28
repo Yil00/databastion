@@ -208,7 +208,8 @@ CSRF=""
 api() {
   local method="$1" path="$2" body="${3:-}" out="$E2E_WORK_DIR/resp"
   local args=(-X "$method" -o "$out" -w '%{http_code}' -H "Origin: ${BASE_URL}")
-  [ -n "$CSRF" ] && args+=(-H "X-CSRF-Token: ${CSRF}")
+  # The CSRF header is read from a 0600 file (curl -H @file) so the token is never on a command line.
+  [ -n "$CSRF" ] && args+=(-H "@$E2E_WORK_DIR/csrf.hdr")
   [ -n "$body" ] && args+=(-H 'Content-Type: application/json' --data-binary "@$body")
   local code
   code="$("${CURL[@]}" "${args[@]}" "${BASE_URL}${path}")" || code="000"
@@ -249,6 +250,8 @@ rm -f "$E2E_WORK_DIR/login.json"
 [ "$(status_of "$r")" = 200 ] || fail "login: HTTP $(status_of "$r")"
 CSRF="$(body_of "$r" | jq -r '.csrf_token')"
 [ -n "$CSRF" ] && [ "$CSRF" != null ] || fail "login: no CSRF token"
+register_secret csrf_token "$CSRF"
+printf 'X-CSRF-Token: %s\n' "$CSRF" >"$E2E_WORK_DIR/csrf.hdr"
 SESSION_COOKIE="$(awk '$6 ~ /databastion_session$/ {print $7}' "$E2E_WORK_DIR/cookies")"
 register_secret session_cookie "$SESSION_COOKIE"
 [ -n "$SESSION_COOKIE" ] || fail "login: no session cookie"
@@ -285,7 +288,13 @@ log "enrolling the agent (databastion-agent enroll)"
 timeout 120 docker compose -f "$HERE/docker-compose.yml" run --rm -T agent \
   enroll --config /etc/databastion/agent.yaml \
   --token-file /run/databastion-secrets/enrollment_token \
-  >"$E2E_LOG_DIR/agent-enroll.log" 2>&1 || fail "agent enroll failed (see agent-enroll.log)"
+  >"$E2E_LOG_DIR/agent-enroll.log" 2>&1 || {
+  # A failed enrollment may still have written (or logged) the agent secret: register it so the
+  # cleanup redacts it from the uploaded logs.
+  register_secret agent_secret "$(files_agent 'cat /state/identity.json' 2>/dev/null \
+    | jq -r '.agent_secret // empty' 2>/dev/null)"
+  fail "agent enroll failed (see agent-enroll.log)"
+}
 files_agent 'rm -f /secrets/enrollment_token'
 identity_mode="$(files_agent 'stat -c "%u:%g %a" /state/identity.json')"
 [ "$identity_mode" = "10001:10001 600" ] \
@@ -331,10 +340,15 @@ log "checking the agent's target account (least privilege, read-only: I4)"
 role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
   psql -XAt -v ON_ERROR_STOP=1 -U postgres -d app -c "SELECT concat_ws(',', rolcanlogin, rolsuper,
     rolcreatedb, rolcreaterole, rolreplication, rolbypassrls,
-    pg_has_role(oid, 'pg_read_all_data', 'MEMBER'), pg_has_role(oid, 'pg_monitor', 'MEMBER'),
-    has_database_privilege(oid, 'app', 'CONNECT'))
-    FROM pg_roles WHERE rolname = 'databastion_agent'")" || fail "cannot inspect databastion_agent"
-[ "$role" = "true,false,false,false,false,false,true,true,true" ] \
+    pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER'), pg_has_role(r.oid, 'pg_monitor', 'MEMBER'),
+    has_database_privilege(r.oid, 'app', 'CONNECT'),
+    (SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
+       JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = r.oid))
+    FROM pg_roles r WHERE rolname = 'databastion_agent'")" || fail "cannot inspect databastion_agent"
+# psql renders booleans as t / f. Direct memberships must be exactly these two roles: a later
+# grant of a write-capable role would otherwise pass (default_transaction_read_only is only a
+# session default).
+[ "$role" = "t,f,f,f,f,f,t,t,t,pg_monitor+pg_read_all_data" ] \
   || fail "databastion_agent has unexpected attributes: $role"
 # Logs in over TCP with its own password (read by the shell inside the container, never on a
 # command line) and checks that its sessions are read-only by default.
