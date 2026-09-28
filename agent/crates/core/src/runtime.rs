@@ -261,6 +261,9 @@ struct Counters {
     batches_rejected: AtomicU64,
     batch_conflicts: AtomicU64,
     batches_unexpected_response: AtomicU64,
+    /// Batches lost because their serialization failed (on spooling or when
+    /// splitting a spooled batch).
+    batches_serialization_failed: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, n: u64) {
@@ -440,6 +443,10 @@ impl Runtime {
             (
                 "batches_unexpected_response_total",
                 &c.batches_unexpected_response,
+            ),
+            (
+                "batches_serialization_failed_total",
+                &c.batches_serialization_failed,
             ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
@@ -657,6 +664,15 @@ impl Runtime {
 
     // ---------------------------------------------------------------- spool
 
+    /// Counts batches lost to a serialization failure, with a warning that
+    /// carries only the count (never any content).
+    fn count_unserializable(&self, batches: u64) {
+        if batches > 0 {
+            bump(&self.counters.batches_serialization_failed, batches);
+            tracing::warn!(batches, "result batches could not be serialized; dropped");
+        }
+    }
+
     fn lock_spool(&self) -> std::sync::MutexGuard<'_, Spool> {
         self.spool
             .lock()
@@ -684,6 +700,7 @@ impl Runtime {
             engine,
             findings,
         });
+        self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();
         spool.counters.dropped_items += built.dropped_items;
         if built.dropped_items > 0 {
@@ -798,7 +815,13 @@ impl Runtime {
                     items = dropped,
                     "console rejected batch items; resending the rest"
                 );
-                let rest: Vec<ResultBatch> = batch.without(&items).into_iter().collect();
+                let rest: Vec<ResultBatch> = match batch.without(&items) {
+                    Ok(rest) => rest.into_iter().collect(),
+                    Err(uplink::Unserializable) => {
+                        self.count_unserializable(1);
+                        Vec::new()
+                    }
+                };
                 let left_out = u64::try_from(batch.len()).unwrap_or(u64::MAX)
                     - u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>()).unwrap_or(0);
                 if self
@@ -814,13 +837,17 @@ impl Runtime {
             Err(CallError::Uplink(UplinkError::Rejected { status: 413, .. })) => {
                 let mut spool = self.lock_spool();
                 match batch.halves() {
-                    Some((a, b)) => {
+                    Ok(Some((a, b))) => {
                         if spool.replace(&key, &[a, b], 0).map_err(io).is_err() {
                             return Ok(retry());
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         tracing::warn!("single-item batch too large; dropped");
+                        spool.drop_batch(&key);
+                    }
+                    Err(uplink::Unserializable) => {
+                        self.count_unserializable(1);
                         spool.drop_batch(&key);
                     }
                 }

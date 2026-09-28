@@ -1353,3 +1353,62 @@ async fn probe_success_with_unparseable_body_does_not_promote() {
     assert_eq!(session.snapshot().secret.expose(), S0);
 }
 
+/// Resets the batch serialization fault injection on drop.
+struct FailSerialization;
+
+impl FailSerialization {
+    fn on() -> Self {
+        uplink::FAIL_BATCH_SERIALIZATION.with(|f| f.set(true));
+        Self
+    }
+}
+
+impl Drop for FailSerialization {
+    fn drop(&mut self) {
+        uplink::FAIL_BATCH_SERIALIZATION.with(|f| f.set(false));
+    }
+}
+
+fn serialization_failures(rt: &Runtime) -> f64 {
+    rt.metrics().0[&MetricsMapKey::try_from("batches_serialization_failed_total").unwrap()]
+}
+
+#[tokio::test]
+async fn unserializable_batches_are_counted_when_spooling() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    assert!(serialization_failures(&rt).abs() < f64::EPSILON);
+    let found = crate::spool::tests::masked(3, "email");
+    {
+        let _fail = FailSerialization::on();
+        rt.spool_findings(
+            Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+            &TargetId::try_from("pg-main").unwrap(),
+            databastion_protocol::Engine::Postgres,
+            &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+            &found,
+        )
+        .unwrap();
+    }
+    assert!((serialization_failures(&rt) - 1.0).abs() < f64::EPSILON);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 0);
+    assert_eq!(status.dropped_items.unwrap().0, 3);
+    // Reported in the heartbeat metrics.
+    let hb = serde_json::to_value(rt.build_heartbeat().await.unwrap()).unwrap();
+    assert_eq!(hb["metrics"]["batches_serialization_failed_total"], 1.0);
+}
+
+#[tokio::test]
+async fn unserializable_halves_are_counted_and_dropped() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::TooLarge], 4).await;
+    let _fail = FailSerialization::on();
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    assert!((serialization_failures(&rt) - 1.0).abs() < f64::EPSILON);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 0);
+    assert_eq!(status.dropped_batches.unwrap().0, 1);
+}

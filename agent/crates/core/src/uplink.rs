@@ -356,17 +356,40 @@ enum Parsed {
     Events(EventsBatch),
 }
 
+/// A batch could not be serialized. Its content is lost: serializing the
+/// same content again is deterministic, so a retry would fail again.
+/// Callers count it (`batches_serialization_failed_total`); nothing of its
+/// content is kept or logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unserializable;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: makes every batch serialization fail on
+    /// this thread (`#[tokio::test]` runs on a single thread by default).
+    pub(crate) static FAIL_BATCH_SERIALIZATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn serialize_batch<T: serde::Serialize>(batch: &T) -> Result<Vec<u8>, Unserializable> {
+    #[cfg(test)]
+    if FAIL_BATCH_SERIALIZATION.with(std::cell::Cell::get) {
+        return Err(Unserializable);
+    }
+    serde_json::to_vec(batch).map_err(|_| Unserializable)
+}
+
 impl Parsed {
-    fn into_batch(self) -> Option<ResultBatch> {
+    fn into_batch(self) -> Result<ResultBatch, Unserializable> {
         let (findings, batch_id, len, bytes) = match &self {
-            Self::Findings(b) => (true, b.batch_id, b.findings.len(), serde_json::to_vec(b)),
-            Self::Events(b) => (false, b.batch_id, b.events.len(), serde_json::to_vec(b)),
+            Self::Findings(b) => (true, b.batch_id, b.findings.len(), serialize_batch(b)),
+            Self::Events(b) => (false, b.batch_id, b.events.len(), serialize_batch(b)),
         };
-        Some(ResultBatch {
+        Ok(ResultBatch {
             findings,
             batch_id,
             len,
-            bytes: bytes.ok()?,
+            bytes: bytes?,
         })
     }
 }
@@ -426,8 +449,9 @@ impl ResultBatch {
     }
 
     /// The same batch without the items at `drop` (sorted), under a **new**
-    /// `batch_id`; `None` if nothing is left.
-    pub(crate) fn without(&self, drop: &[usize]) -> Option<Self> {
+    /// `batch_id`; `Ok(None)` if nothing is left, `Err` if the new batch
+    /// could not be serialized.
+    pub(crate) fn without(&self, drop: &[usize]) -> Result<Option<Self>, Unserializable> {
         fn keep<T: Clone>(items: &[T], drop: &[usize]) -> Vec<T> {
             items
                 .iter()
@@ -436,7 +460,11 @@ impl ResultBatch {
                 .map(|(_, x)| x.clone())
                 .collect()
         }
-        let out = match Self::decode(self.findings, &self.bytes)? {
+        // The bytes were validated when this batch was built or parsed.
+        let Some(parsed) = Self::decode(self.findings, &self.bytes) else {
+            return Ok(None);
+        };
+        let out = match parsed {
             Parsed::Findings(b) => Parsed::Findings(FindingsBatch {
                 batch_id: new_batch_id(),
                 findings: keep(&b.findings, drop),
@@ -448,19 +476,22 @@ impl ResultBatch {
             }),
         }
         .into_batch()?;
-        (out.len > 0).then_some(out)
+        Ok((out.len > 0).then_some(out))
     }
 
-    /// Two halves, each under a new `batch_id` (`413`); `None` for a single
-    /// item.
-    pub(crate) fn halves(&self) -> Option<(Self, Self)> {
+    /// Two halves, each under a new `batch_id` (`413`); `Ok(None)` for a
+    /// single item, `Err` if a half could not be serialized.
+    pub(crate) fn halves(&self) -> Result<Option<(Self, Self)>, Unserializable> {
         let n = self.len;
         if n < 2 {
-            return None;
+            return Ok(None);
         }
         let first: Vec<usize> = (0..n / 2).collect();
         let second: Vec<usize> = (n / 2..n).collect();
-        Some((self.without(&second)?, self.without(&first)?))
+        let (Some(a), Some(b)) = (self.without(&second)?, self.without(&first)?) else {
+            return Ok(None);
+        };
+        Ok(Some((a, b)))
     }
 }
 
@@ -468,7 +499,28 @@ impl ResultBatch {
 #[derive(Debug, Default)]
 pub(crate) struct Built {
     pub(crate) batches: Vec<ResultBatch>,
+    /// Items dropped (invalid, oversized, or in a batch that could not be
+    /// serialized).
     pub(crate) dropped_items: u64,
+    /// Batches lost because their serialization failed.
+    pub(crate) unserializable_batches: u64,
+}
+
+impl Built {
+    /// Adds a packed batch, or counts it (and its items) as lost.
+    fn push(&mut self, parsed: Parsed) {
+        let items = match &parsed {
+            Parsed::Findings(b) => b.findings.len(),
+            Parsed::Events(b) => b.events.len(),
+        };
+        match parsed.into_batch() {
+            Ok(batch) => self.batches.push(batch),
+            Err(Unserializable) => {
+                self.unserializable_batches += 1;
+                self.dropped_items += u64::try_from(items).unwrap_or(u64::MAX);
+            }
+        }
+    }
 }
 
 /// Masked results handed to [`to_batches`].
@@ -521,6 +573,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             Built {
                 batches: Vec::new(),
                 dropped_items: u64::try_from(events.len()).unwrap_or(u64::MAX),
+                unserializable_batches: 0,
             }
         }
     }
@@ -582,18 +635,14 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
             continue;
         }
         if current.len() == MAX_FINDINGS_PER_BATCH || size + len > MAX_BATCH_BYTES {
-            built
-                .batches
-                .extend(Parsed::Findings(make(std::mem::take(&mut current))).into_batch());
+            built.push(Parsed::Findings(make(std::mem::take(&mut current))));
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built
-            .batches
-            .extend(Parsed::Findings(make(current)).into_batch());
+        built.push(Parsed::Findings(make(current)));
     }
     built
 }
@@ -624,18 +673,14 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
             continue;
         }
         if current.len() == MAX_EVENTS_PER_BATCH || size + len > MAX_BATCH_BYTES {
-            built
-                .batches
-                .extend(Parsed::Events(make(std::mem::take(&mut current))).into_batch());
+            built.push(Parsed::Events(make(std::mem::take(&mut current))));
             size = envelope;
         }
         size += len;
         current.push(item);
     }
     if !current.is_empty() {
-        built
-            .batches
-            .extend(Parsed::Events(make(current)).into_batch());
+        built.push(Parsed::Events(make(current)));
     }
     built
 }
