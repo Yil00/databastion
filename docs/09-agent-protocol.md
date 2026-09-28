@@ -45,11 +45,11 @@ Codes: `invalid_request`, `unauthorized`, `not_found`, `conflict`, `batch_confli
 ### Agent handling
 | Response | Agent behavior |
 |----------|----------------|
-| `401` | If a secret is pending (rotation in progress), retry with it first. If the request was sent with a secret that is no longer current, retry once with the current one. Only a `401` on the **current** secret is fatal: the agent stops normal operation (no polling, no uploads), keeps spooling within its bounds, logs an error, and retries a single heartbeat every 15 min with jitter. Never an aggressive loop |
+| `401` | If a secret is pending (rotation in progress), retry with it first. If the request was sent with a secret that is no longer current, retry once with the current one. A `401` on `S1` received for a request sent before the last `/rotate` answer is stale and does not put `S0` first again (#30). Only a `401` on the **current** secret is fatal: the agent stops normal operation (no polling, no uploads), keeps spooling within its bounds, logs an error, and retries a single heartbeat every 15 min with jitter. Never an aggressive loop |
 | `400` / `404` on `/findings`, `/events` | If every `details[].pointer` designates an item (`/findings/<i>/…`, `/events/<i>/…`, including `404` on `/…/<i>/target_id`), the agent drops those items and resends the rest under a **new** `batch_id`. Otherwise (including `404` on `job_id`) it drops the batch |
 | `413` | Split the batch in two halves, each under a new `batch_id`; a single item still rejected is dropped |
 | `426` | Protocol too old (`min_protocol` in the body): log it and keep spooling to disk |
-| `429` / `503` | Exponential backoff with jitter, honoring `Retry-After` |
+| `429` / `503` | Exponential backoff with jitter, honoring `Retry-After`. With a pending `S1`, the retry uses `S1` again, **never** `S0`: the console answers `429` / `503` before recognizing the secret, so `S1` may already be promoted and `S0` past the 60 s window, where using it locks the agent ([ADR-0010](adr/0010-rotation-conflict-window.md), [ADR-0011](adr/0011-late-rotation-retry.md); #30) |
 | Other `400`, `404`, `409` | Not retryable: drop the request, increment a metric, log `code`, `pointer` and `keyword`, never the payload |
 | Network errors, `5xx` | Retry with backoff; batches are idempotent thanks to `batch_id` |
 
@@ -79,7 +79,7 @@ The **agent generates** the new secret; after enrollment the console never sends
 2. The agent generates `S1` (256 bits, CSPRNG) and persists it as *pending* next to its current secret `S0` (`0600` file, fsync) before any network call.
 3. `POST /rotate` with `{"new_secret": S1}` (the `RotateRequest`), authenticated with `S0`.
 4. The console stores the argon2id hash of `S1` as pending and answers `200` with `grace_expires_at` (300 s by default, at most 3600 s).
-5. The agent switches to `S1`. The first successful request with `S1`, or `grace_expires_at`, makes `S1` current and revokes `S0`.
+5. The agent switches to `S1`. The `/rotate` reply counts as a success only if it is a contract answer (`200`, JSON media type, a valid `RotateResponse`); any other reply (e.g. a middlebox page) leaves the outcome unknown, as after a network error (#30). The first successful request with `S1`, or `grace_expires_at`, makes `S1` current and revokes `S0`.
 
 ```json
 { "new_secret": "dbs_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE1",
@@ -207,7 +207,7 @@ Access events are masked in the agent before the uplink ([ADR-0007](adr/0007-mas
 - The agent **pre-aggregates** repetitive events (same principal, object set and action within the aggregation window, 60 s by default); `ts_last` and `aggregated_count` describe the merged events.
 
 ## Heartbeat
-Request: `ts`, `agent_version`, `uptime_s`, `classifiers_version`, enabled `connectors`, the status of each declared target (`reachable`, honest `audit_level` and `audit_source`, `server_version`, `last_error` as a closed failure code, target metrics), `detected_targets` found on the local host only ([ADR-0006](adr/0006-target-discovery.md)), `running_jobs`, `spool` state (including dropped batches and items), and a numeric `metrics` map.
+Request: `ts`, `agent_version`, `uptime_s`, `classifiers_version`, enabled `connectors`, the status of each declared target (`reachable`, honest `audit_level` and `audit_source`, `server_version`, `last_error` as a closed failure code, e.g. `unsupported` for a connector that is still a stub or `timeout` when `check()` exceeds 10 s, target metrics), `detected_targets` found on the local host only ([ADR-0006](adr/0006-target-discovery.md)), `running_jobs`, `spool` state (including dropped batches and items), and a numeric `metrics` map.
 
 The targets reported in heartbeats are the agent's targets: results referencing another `target_id` are rejected with `404`. The agent sends a heartbeat before the first result of a newly declared target.
 
