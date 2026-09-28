@@ -165,7 +165,9 @@ services:
     command: ["run", "--config", "/etc/databastion/agent.yaml"]
     restart: "no"
     environment:
-      DATABASTION_LOG: info
+      # Debug: the invariant I2 log scan (run.sh) also covers the agent's debug-level logging.
+      # Third-party crates stay capped at warn by the agent itself.
+      DATABASTION_LOG: debug
     volumes:
       - agent-state:/var/lib/databastion
       - agent-secrets:/run/databastion-secrets:ro

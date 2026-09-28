@@ -22,6 +22,8 @@ I2_CHECK="$HERE/i2_check.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
 TARGET_SEED="$HERE/../dev/seed/out/postgres.sql"
 SCAN_TIMEOUT_S=240
+SPOOL_TIMEOUT_S=90   # three heartbeat intervals (console HEARTBEAT_INTERVAL_S = 30)
+MAX_LISTED_FINDINGS=500  # console/src/server/findings.ts: the page lists at most this many
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[e2e %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -456,9 +458,36 @@ done
 log "scan job succeeded in $(( $(date +%s) - t_scan )) s"
 
 # The agent reports the job status before its spooled findings batches are uploaded (the console
-# accepts them in a late window): wait until the stored findings are non-zero and stable for 6 s.
-log "waiting for the findings of the scan to be ingested"
-deadline=$(( $(date +%s) + 90 ))
+# accepts them in a late window). Deterministic signal: a heartbeat received after the job ended
+# (its SpoolStatus is stored in agents.spool) reports an empty spool and no dropped batch or item.
+# Findings are spooled before the status is sent, so that heartbeat saw them.
+log "waiting for a heartbeat after the scan that reports an empty spool (at most ${SPOOL_TIMEOUT_S} s)"
+deadline=$(( $(date +%s) + SPOOL_TIMEOUT_S ))
+while :; do
+  spool="$(console_sql "SELECT concat_ws(',', a.last_seen_at > j.finished_at + interval '1 second',
+      coalesce(a.spool->>'batches', 'none'), coalesce(a.spool->>'dropped_batches', '0'),
+      coalesce(a.spool->>'dropped_items', '0'))
+    FROM agents a JOIN jobs j ON j.agent_id = a.id
+    WHERE a.id = '${AGENT_ID}' AND j.id = '${SCAN_JOB_ID}' AND j.finished_at IS NOT NULL")" \
+    || fail "cannot read the agent spool status"
+  case "$spool" in
+    t,*,*,*) IFS=, read -r _ batches dropped_batches dropped_items <<<"$spool"
+      [ "$dropped_batches" = 0 ] && [ "$dropped_items" = 0 ] \
+        || fail "the agent dropped findings ($dropped_batches batch(es), $dropped_items item(s))"
+      [ "$batches" = 0 ] && break ;;
+  esac
+  [ "$(date +%s)" -lt "$deadline" ] \
+    || fail "no heartbeat with an empty spool within ${SPOOL_TIMEOUT_S} s after the scan ('$spool')"
+  sleep 2
+done
+# Secondary: the agent log has no lost, dropped or rejected result batch.
+lost="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" logs --no-color agent 2>/dev/null \
+  | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|rejected batch items|unreadable spool file' || true)"
+[ "$lost" = 0 ] || fail "the agent log shows $lost lost / dropped / rejected result batch line(s)"
+unset spool batches dropped_batches dropped_items lost
+
+# Secondary: the stored findings are non-zero and stable for 6 s.
+deadline=$(( $(date +%s) + 60 ))
 prev=-1
 stable=0
 while :; do
@@ -466,7 +495,7 @@ while :; do
     || fail "cannot count the findings"
   if [ "$n" -gt 0 ] && [ "$n" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
   [ "$stable" -ge 3 ] && break
-  [ "$(date +%s)" -lt "$deadline" ] || fail "findings not ingested and stable within 90 s ($n stored)"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "findings not stable within 60 s ($n stored)"
   prev="$n"
   sleep 2
 done
@@ -485,12 +514,22 @@ timeout 60 python3 "$I2_CHECK" findings --ground-truth "$GROUND_TRUTH" --engine 
   "$E2E_WORK_DIR/findings.json" >&2 || fail "findings check failed (see above)"
 
 # The findings page renders the masked samples decrypted (they are encrypted at rest, so the
-# database dump cannot show a masking failure): it is scanned too, below.
+# database dump cannot show a masking failure): it is scanned too, below. It must be complete
+# (every finding listed, under the listing cap; every finding with samples shows them; none
+# `unavailable`) and no masked sample may keep more than 4 digits (partial masking regression).
+listed="$(console_sql "SELECT count(*) FROM findings WHERE false_positive_at IS NULL")" \
+  || fail "cannot count the listed findings"
+sampled="$(console_sql "SELECT count(*) FROM findings WHERE false_positive_at IS NULL
+  AND masked_samples IS NOT NULL")" || fail "cannot count the findings with masked samples"
+[ "$listed" -lt "$MAX_LISTED_FINDINGS" ] \
+  || fail "$listed findings: over the page listing cap, the page scan would be partial"
+[ "$sampled" -gt 0 ] || fail "no finding with masked samples: the page scan would prove nothing"
 code="$("${CURL[@]}" -o "$E2E_WORK_DIR/findings-page.html" -w '%{http_code}' "${BASE_URL}/findings")" \
   || code=000
 [ "$code" = 200 ] || fail "findings page: HTTP $code"
-grep -qF 'pii.card_number' "$E2E_WORK_DIR/findings-page.html" \
-  || fail "the findings page shows no pii.card_number finding: its scan would prove nothing"
+timeout 60 python3 "$I2_CHECK" page --expected-rows "$listed" --min-sampled-rows "$sampled" \
+  "$E2E_WORK_DIR/findings-page.html" >&2 || fail "findings page check failed (see above)"
+unset listed sampled
 
 # --------------------------------------------------------------------------- revocation
 agent_401_count() {

@@ -15,7 +15,7 @@ value-bearing object and field names*. [`run.sh`](run.sh) drives
 | `web`, `worker` | `console/Dockerfile` | Console processes (runtime role) |
 | `proxy` | Caddy | TLS 1.3 reverse proxy, certificate from a throwaway CA; `/metrics` answers `404` |
 | `target-pg` | PostgreSQL 17 | Declared target of the agent, database `shop` loaded with the committed dev seed [`dev/seed/out/postgres.sql`](../dev/seed/out/postgres.sql) (schemas `crm`, `billing`, `ops`, value-bearing table names included); [`target-initdb/`](target-initdb/) creates the agent's read-only role and its per-schema Discovery grants |
-| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA) |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA), `DATABASTION_LOG=debug` so the I2 log scan covers debug-level logging |
 | `bootstrap-admin`, `agent-files` | console / PostgreSQL | One-shot helpers (`tools` profile) |
 
 Networks: the agent sits on an `internal` network with the proxy and the target only; it
@@ -53,14 +53,20 @@ cannot reach the console database or the outside. Only the proxy is published, o
    the system catalogs, and that `/metrics` (scraped from inside the web
    container with the metrics token) shows `databastion_agent_up{agent_id="…"} 1`.
 6. Discovery (P2-E): launch a `discovery.scan` of `pg-e2e` through the user API (admin session +
-   CSRF), wait for the job to succeed (240 s at most), then for the findings to be stored and
-   stable (the agent reports the job status before its spooled findings batches are uploaded).
+   CSRF) and wait for the job to succeed (240 s at most). The agent reports the job status before
+   its spooled findings batches are uploaded, so the test then waits (90 s at most) for a
+   heartbeat received after the job ended whose spool status (`agents.spool`) reports no batch
+   left and no dropped batch or item, checks that the agent log shows no lost / dropped /
+   rejected result batch, and that the stored findings count is stable.
    [`i2_check.py findings`](i2_check.py) asserts at least one finding, the presence of
    `pii.email`, `pii.card_number`, `pii.iban` and `secret.aws_key`, that the value-bearing table
    `crm.export_client_<phone>` is stored under its `expected_normalized_name` (`*`) and that no
    finding stores a raw value-bearing name; it also prints how many ground-truth locations were
    found (informational). The findings page is fetched with the session (masked samples are
-   decrypted there; they are encrypted at rest in the database).
+   decrypted there; they are encrypted at rest in the database); [`i2_check.py page`](i2_check.py)
+   asserts it is complete (every finding listed, fewer than the 500-row listing cap, every
+   finding with stored samples renders them, none `unavailable`) and that no masked sample keeps
+   more than 4 digits (a partial masking regression the value search cannot see).
 7. Revoke the agent through the user API; within 60 s the agent must log
    `console rejected the current secret (401)`; the measured latency is printed and the test
    fails at 60 s or more. The console must show `revoked`, and the proxy access log must show no
@@ -81,15 +87,21 @@ cannot reach the console database or the outside. Only the proxy is published, o
 
 ### What "in clear" means (I2)
 The definition is in the docstring of [`i2_check.py`](i2_check.py); unit tests in
-[`test_i2_check.py`](test_i2_check.py) (`python3 -m unittest discover -s e2e -p 'test_*.py'`).
+[`test_i2_check.py`](test_i2_check.py) (`python3 -m unittest discover -s e2e -p 'test_*.py'`),
+including pg_dump COPY-format and React Server Components payload excerpts with planted leaks.
 - Case-, accent- and NFC / NFD-insensitive substring search, on the file as is and after decoding
   JSON `\uXXXX`, URL `%XX`, HTML character references and SQL doubled quotes.
 - Values with fewer than 8 letters / digits must stand at word boundaries (`_` is a boundary:
   `archive_lucas_martin` matches `martin`, `Martinez` does not).
 - Phones, cards, IBANs, NIRs and digit names (at least 9 letters / digits, 6 of them digits) are
   also searched without separators (space, `.`, `-`, `/`, `(`, `)`, `+`, `_`), in national and
-  international phone forms, never as part of a longer digit run. Masked samples (at most 4
-  digits, `*` elsewhere) cannot match: `*` is not a separator.
+  international phone forms and as the national significant number, IBANs also as their BBAN,
+  never as part of a longer digit run. Masked samples (at most 4 digits, `*` elsewhere) cannot
+  match: `*` is not a separator.
+- E-mail local parts with at least 8 letters / digits are extra needles, at word boundaries.
+- Partial digit runs (e.g. 8 of 16 card digits) are not searched in the dump and logs (the seed's
+  shared prefixes would match timestamps and hashes); the findings page check bounds the clear
+  digits of every masked sample instead.
 - Excluded, and counted in the output: values with fewer than 4 letters / digits (`Ava`, `Mia`,
   `Noé`, `Léa`, `Zoé`), and folded single words listed in `COMMON_WORDS` with a justification
   (empty today).
