@@ -1,0 +1,25 @@
+# gitleaks configuration, loaded automatically from the scanned repository root
+# (CI: `gitleaks git .`; pre-commit hook). Extends the default ruleset.
+title = "DataBastion gitleaks config"
+
+[extend]
+useDefault = true
+
+# Agent secret issued at enrollment: "dbs_" + 43 base64url characters (256 bits).
+[[rules]]
+id = "databastion-agent-secret"
+description = "DataBastion agent secret"
+regex = '''\bdbs_[A-Za-z0-9_-]{43}\b'''
+keywords = ["dbs_"]
+
+# Single-use enrollment token: "dbe_" + 43 base64url characters.
+[[rules]]
+id = "databastion-enrollment-token"
+description = "DataBastion enrollment token"
+regex = '''\bdbe_[A-Za-z0-9_-]{43}\b'''
+keywords = ["dbe_"]
+
+# Documentation and fixture placeholders, e.g. dbs_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE0
+[[allowlists]]
+description = "DataBastion example credentials"
+regexes = ['''db[se]_(EXAMPLE){6}[0-9]''']
