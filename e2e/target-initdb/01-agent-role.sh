@@ -12,8 +12,8 @@
 # pg_monitor: they expose credential-bearing catalogs and raw statistics (ADR-0012).
 #
 # Discovery grants are per application schema (USAGE, SELECT ON ALL TABLES, default privileges
-# FOR ROLE the owner). The `app` target has no application schema yet, so there are none; they
-# come with the schema once the PostgreSQL connector samples in E2E.
+# FOR ROLE the owner): 20-discovery-grants.sql adds them once the dev seed (10-seed.sql) has
+# created the schemas.
 #
 # The password is read by psql itself (`\set` with a backquoted `cat`) from the Docker secret
 # file and passed as a quoted literal (:'var'): it never appears on a command line, in the

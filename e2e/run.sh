@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end enrollment / revocation test (phase 1 exit criterion):
-#   "end-to-end enrollment in containers; revocation effective in < 60 s".
-# See e2e/README.md. Requires: docker (compose v2), openssl, curl, jq.
+#   "end-to-end enrollment in containers; revocation effective in < 60 s",
+# and invariant I2 test (P2-E): a Discovery scan of the seeded target leaves no ground-truth value
+# in clear text in the console database, the container logs or the findings page.
+# See e2e/README.md. Requires: docker (compose v2), openssl, curl, jq, python3.
 #
 # Every secret is generated here at run time (never committed), kept under a private temporary
 # directory and removed on exit. Logs of every container are written to $E2E_LOG_DIR and
@@ -16,14 +18,25 @@ REVOCATION_LIMIT_MS=60000
 HOSTNAME_CONSOLE="console.e2e.internal"
 BASE_URL="https://${HOSTNAME_CONSOLE}:${E2E_HTTPS_PORT}"
 AGENT_401_MESSAGE="console rejected the current secret (401)"
+I2_CHECK="$HERE/i2_check.py"
+GROUND_TRUTH="$HERE/../dev/ground-truth.json"
+TARGET_SEED="$HERE/../dev/seed/out/postgres.sql"
+SCAN_TIMEOUT_S=240
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[e2e %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
 now_ms() { date +%s%3N; }
 
-for tool in docker openssl curl jq timeout; do
+for tool in docker openssl curl jq timeout python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing tool: $tool"
 done
+
+# Invariant I2 scanner positive control, before anything starts: every searchable PostgreSQL
+# value of the ground truth (and every value-bearing name) must be visible in the committed seed
+# that target-pg loads. Counts and ids only are printed.
+timeout 60 python3 "$I2_CHECK" coverage --ground-truth "$GROUND_TRUTH" --engine postgresql \
+  "$TARGET_SEED" >&2 || fail "I2 scanner positive control failed (see above)"
 
 umask 077
 E2E_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-e2e.XXXXXX")"
@@ -199,7 +212,7 @@ targets:
     # target-pg has no TLS; it sits on the internal agent network only: explicit insecure
     # opt-in (the connector still refuses cleartext / MD5 passwords, SCRAM only).
     postgres:
-      databases: [app]
+      databases: [shop]
       tls: disable_insecure
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
@@ -343,11 +356,11 @@ log "agent online; target pg-e2e: $(jq -c '.targets[] | select(.targetId == "pg-
 
 log "checking the agent's target account (ADR-0012 minimal variant, read-only: I4)"
 role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
-  psql -XAt -v ON_ERROR_STOP=1 -U postgres -d app -c "SELECT concat_ws(',', rolcanlogin, rolsuper,
+  psql -XAt -v ON_ERROR_STOP=1 -U postgres -d shop -c "SELECT concat_ws(',', rolcanlogin, rolsuper,
     rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolconnlimit,
     pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER'), pg_has_role(r.oid, 'pg_monitor', 'MEMBER'),
     pg_has_role(r.oid, 'pg_read_all_stats', 'MEMBER'),
-    has_database_privilege(r.oid, 'app', 'CONNECT'),
+    has_database_privilege(r.oid, 'shop', 'CONNECT'),
     (SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
        JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = r.oid),
     (SELECT string_agg(c, '+' ORDER BY c COLLATE \"C\") FROM pg_db_role_setting s,
@@ -367,7 +380,7 @@ expected_role+="+lock_timeout=2s+statement_timeout=30s"
 # shellcheck disable=SC2016 # expanded by the container shell, on purpose
 ro="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg sh -c \
   'PGPASSWORD="$(cat /run/secrets/target_agent_password)" exec psql -XAt -h 127.0.0.1 \
-     -U databastion_agent -d app -c "SELECT concat_ws(\$\$,\$\$,
+     -U databastion_agent -d shop -c "SELECT concat_ws(\$\$,\$\$,
        current_setting(\$\$default_transaction_read_only\$\$),
        current_setting(\$\$statement_timeout\$\$)::interval = interval \$\$30s\$\$,
        current_setting(\$\$lock_timeout\$\$)::interval = interval \$\$2s\$\$,
@@ -377,7 +390,25 @@ ro="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg 
   || fail "databastion_agent cannot log in to the target"
 [ "$ro" = "on,t,t,t,f,f" ] \
   || fail "databastion_agent session defaults / catalog privileges are unexpected ($ro)"
-unset role expected_role ro
+# Discovery grants (target-initdb/20-discovery-grants.sql): USAGE without CREATE on the seeded
+# schemas, SELECT on every table there, and no write privilege on any relation outside the system
+# schemas (pg_catalog.pg_settings is UPDATE-able by PUBLIC by design: SET, not a table write).
+grants="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
+  psql -XAt -v ON_ERROR_STOP=1 -U postgres -d shop -c "SELECT concat_ws(',',
+    bool_and(has_schema_privilege('databastion_agent', n.nspname, 'USAGE')),
+    bool_or(has_schema_privilege('databastion_agent', n.nspname, 'CREATE')),
+    (SELECT bool_and(has_table_privilege('databastion_agent', c.oid, 'SELECT')) FROM pg_class c
+       JOIN pg_namespace s ON s.oid = c.relnamespace
+       WHERE s.nspname IN ('crm', 'billing', 'ops') AND c.relkind IN ('r', 'p')),
+    (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+       WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+         AND s.nspname <> 'information_schema' AND s.nspname NOT LIKE 'pg\_%'
+         AND has_table_privilege('databastion_agent', c.oid,
+               'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
+    FROM pg_namespace n WHERE n.nspname IN ('crm', 'billing', 'ops')")" \
+  || fail "cannot inspect the Discovery grants of databastion_agent"
+[ "$grants" = "t,f,t,0" ] || fail "databastion_agent Discovery grants are unexpected ($grants)"
+unset role expected_role ro grants
 
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
@@ -390,6 +421,76 @@ grep -Eq "^databastion_agent_up\{agent_id=\"${AGENT_ID}\"\} 1\$" <<<"$metrics" \
 unset metrics
 code="$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${BASE_URL}/metrics")"
 [ "$code" = 404 ] || fail "/metrics is reachable through the proxy (HTTP $code)"
+
+# --------------------------------------------------------------------------- Discovery (P2-E)
+# Read-only queries on the console database (the harness inspects state the user API does not
+# expose as JSON: job status, stored finding locations). Ids are checked before interpolation.
+console_sql() {
+  timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T db \
+    psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
+}
+[[ "$AGENT_ID" =~ $UUID_RE ]] || fail "agent id is not a UUID"
+
+log "launching a discovery.scan of pg-e2e through the user API"
+printf '{"sample_rows":100,"max_duration_s":300,"statement_timeout_ms":5000}' \
+  >"$E2E_WORK_DIR/scan-req.json"
+r="$(api POST "/api/agents/${AGENT_ID}/targets/pg-e2e/scan" "$E2E_WORK_DIR/scan-req.json")"
+[ "$(status_of "$r")" = 202 ] \
+  || fail "scan request: HTTP $(status_of "$r") ($(body_of "$r" | jq -r '.error // empty' 2>/dev/null || true))"
+SCAN_JOB_ID="$(body_of "$r" | jq -r '.job_id')"
+[[ "$SCAN_JOB_ID" =~ $UUID_RE ]] || fail "scan request: no job id"
+
+log "waiting for scan job $SCAN_JOB_ID to succeed (at most ${SCAN_TIMEOUT_S} s)"
+t_scan="$(date +%s)"
+deadline=$(( t_scan + SCAN_TIMEOUT_S ))
+while :; do
+  job="$(console_sql "SELECT status || ',' || coalesce(error->>'code', '') FROM jobs WHERE id = '${SCAN_JOB_ID}'")" \
+    || fail "cannot read the scan job status"
+  case "$job" in
+    succeeded,*) break ;;
+    failed,* | cancelled,* | expired,*) fail "scan job ended '$job'" ;;
+  esac
+  [ "$(date +%s)" -lt "$deadline" ] || fail "scan job not succeeded within ${SCAN_TIMEOUT_S} s (status '$job')"
+  sleep 2
+done
+log "scan job succeeded in $(( $(date +%s) - t_scan )) s"
+
+# The agent reports the job status before its spooled findings batches are uploaded (the console
+# accepts them in a late window): wait until the stored findings are non-zero and stable for 6 s.
+log "waiting for the findings of the scan to be ingested"
+deadline=$(( $(date +%s) + 90 ))
+prev=-1
+stable=0
+while :; do
+  n="$(console_sql "SELECT count(*) FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = 'pg-e2e'")" \
+    || fail "cannot count the findings"
+  if [ "$n" -gt 0 ] && [ "$n" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+  [ "$stable" -ge 3 ] && break
+  [ "$(date +%s)" -lt "$deadline" ] || fail "findings not ingested and stable within 90 s ($n stored)"
+  prev="$n"
+  sleep 2
+done
+log "$n finding(s) stored for pg-e2e"
+
+log "checking the ingested findings against dev/ground-truth.json (normalized value-bearing names)"
+# Written under the private work directory, never into the uploaded logs.
+console_sql "SELECT coalesce(json_agg(json_build_object('database_name', database_name,
+    'schema_name', schema_name, 'object_name', object_name, 'field_name', field_name,
+    'classifier', classifier) ORDER BY location_key, classifier), '[]')
+  FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = 'pg-e2e'" \
+  >"$E2E_WORK_DIR/findings.json" || fail "cannot read the findings"
+timeout 60 python3 "$I2_CHECK" findings --ground-truth "$GROUND_TRUTH" --engine postgresql \
+  --require-classifier pii.email --require-classifier pii.card_number \
+  --require-classifier pii.iban --require-classifier secret.aws_key \
+  "$E2E_WORK_DIR/findings.json" >&2 || fail "findings check failed (see above)"
+
+# The findings page renders the masked samples decrypted (they are encrypted at rest, so the
+# database dump cannot show a masking failure): it is scanned too, below.
+code="$("${CURL[@]}" -o "$E2E_WORK_DIR/findings-page.html" -w '%{http_code}' "${BASE_URL}/findings")" \
+  || code=000
+[ "$code" = 200 ] || fail "findings page: HTTP $code"
+grep -qF 'pii.card_number' "$E2E_WORK_DIR/findings-page.html" \
+  || fail "the findings page shows no pii.card_number finding: its scan would prove nothing"
 
 # --------------------------------------------------------------------------- revocation
 agent_401_count() {
@@ -466,7 +567,38 @@ for name in agent_secret enrollment_token admin_password target_pg_password targ
     db_leaks=$((db_leaks + 1))
   fi
 done
-rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err"
 [ "$db_leaks" -eq 0 ] || fail "$db_leaks secret(s) in clear text in the console database"
+
+# --------------------------------------------------------------------------- invariant I2 (P2-E)
+# No value of dev/ground-truth.json (engine postgresql), and no value-bearing table name, in clear
+# text (definition in i2_check.py) in: the plain pg_dump of the whole console database (every
+# schema: public, pgboss...), every console / agent / proxy log, and the rendered findings page.
+# target-pg's own log (the source database) and all.log (which includes it) are not console or
+# agent output. Only counts, needle ids and file names are printed, never a value.
+log "invariant I2: no ground-truth value in clear text in the console database, logs or findings page"
+i2_scan() {
+  timeout 300 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine postgresql "$@" >&2
+}
+grep -q '^CREATE SCHEMA pgboss;' "$db_dump" || fail "the console database dump has no pgboss schema"
+grep -q '^COPY public.findings ' "$db_dump" || fail "the console database dump has no findings table"
+i2_failed=0
+i2_scan --label console-db "$db_dump" || i2_failed=1
+# Positive control of the log scan: a canary file holding one ground-truth value, next to the
+# logs (in the private work directory), must be reported.
+mkdir -p "$E2E_WORK_DIR/i2-canary"
+jq -r '[.locations[] | select(.engine == "postgresql") | .values[]?] | .[0]' "$GROUND_TRUTH" \
+  >"$E2E_WORK_DIR/i2-canary/zz-i2-canary.log"
+canary_rc=0
+i2_scan --label log-canary --exclude target-pg.log --exclude all.log \
+  "$E2E_LOG_DIR" "$E2E_WORK_DIR/i2-canary" 2>"$E2E_WORK_DIR/i2-canary.out" || canary_rc=$?
+if [ "$canary_rc" -ne 1 ] || ! grep -q 'file=zz-i2-canary.log$' "$E2E_WORK_DIR/i2-canary.out"; then
+  fail "I2 log scan positive control: canary not detected"
+fi
+rm -rf -- "$E2E_WORK_DIR/i2-canary" "$E2E_WORK_DIR/i2-canary.out"
+i2_scan --label logs --exclude target-pg.log --exclude all.log "$E2E_LOG_DIR" || i2_failed=1
+i2_scan --label findings-page "$E2E_WORK_DIR/findings-page.html" || i2_failed=1
+rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err" "$E2E_WORK_DIR/findings-page.html" \
+  "$E2E_WORK_DIR/findings.json"
+[ "$i2_failed" -eq 0 ] || fail "invariant I2: ground-truth value(s) in clear text (ids above)"
 
 log "all checks passed (revocation latency ${latency} ms)"
