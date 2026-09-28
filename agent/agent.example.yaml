@@ -12,11 +12,11 @@ console:
   # Optional: PEM CA certificate of the console. When set, it is the only
   # trusted root (pinning); otherwise the system trust store is used.
   # ca_file: /etc/databastion/console-ca.pem
-  # Long-poll wait for GET /jobs (0..=25 s). Lower it behind a proxy with a
+  # Long-poll wait for GET /jobs (5..=25 s). Lower it behind a proxy with a
   # short idle timeout.
   long_poll_wait_s: 25
-  # Development only: allows http:// for a console on 127.0.0.1 / ::1 /
-  # localhost. Refused for any other host.
+  # Development only: allows http:// for a console on 127.0.0.1 or [::1]
+  # (IP literals only). Refused for any other host.
   # insecure_dev_http: false
 
 # Identity (0600), pending rotation secret, local HMAC key and spool.

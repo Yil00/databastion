@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use databastion_core::{AgentConfig, Connector, Engine};
+use databastion_core::{AgentConfig, Connector, Engine, EnrollOptions};
 use tokio::sync::watch;
 use tracing::Level;
 use tracing_subscriber::filter::{EnvFilter, filter_fn};
@@ -45,9 +45,14 @@ enum Command {
         /// line: it would be visible in the process list).
         #[arg(long, value_name = "PATH", env = "DATABASTION_ENROLLMENT_TOKEN_FILE")]
         token_file: PathBuf,
-        /// Replace an existing identity.
+        /// Replace an existing identity. Revoke the old agent in the console
+        /// first: its secret stays valid until revoked.
         #[arg(long)]
         force: bool,
+        /// With --force, also replace the local HMAC key (fingerprints will
+        /// no longer correlate with earlier ones). Kept by default.
+        #[arg(long, requires = "force")]
+        new_hmac_key: bool,
     },
     /// Run the agent.
     Run {
@@ -132,7 +137,7 @@ async fn run(config: PathBuf) -> ExitCode {
     }
 }
 
-async fn enroll(config: PathBuf, token_file: PathBuf, force: bool) -> ExitCode {
+async fn enroll(config: PathBuf, token_file: PathBuf, options: EnrollOptions) -> ExitCode {
     let config = match AgentConfig::load(&config) {
         Ok(config) => config,
         Err(e) => {
@@ -140,7 +145,7 @@ async fn enroll(config: PathBuf, token_file: PathBuf, force: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match databastion_core::enroll(&config, &token_file, force, &compiled_engines()).await {
+    match databastion_core::enroll(&config, &token_file, options, &compiled_engines()).await {
         Ok(agent_id) => {
             tracing::info!(agent_id, "enrollment complete");
             ExitCode::SUCCESS
@@ -171,7 +176,14 @@ async fn main() -> ExitCode {
             config,
             token_file,
             force,
-        } => enroll(config, token_file, force).await,
+            new_hmac_key,
+        } => {
+            let options = EnrollOptions {
+                force,
+                new_hmac_key,
+            };
+            enroll(config, token_file, options).await
+        }
         Command::Run { config } => run(config).await,
     }
 }

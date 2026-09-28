@@ -150,12 +150,16 @@ impl Uplink {
         if let Some(ca_file) = &config.console.ca_file {
             let pem =
                 std::fs::read(ca_file).map_err(|_| UplinkError::Setup("cannot read ca_file"))?;
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|_| UplinkError::Setup("ca_file is not a PEM certificate"))?;
-            // Pinning: the configured CA is the only trusted root.
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(cert);
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                .map_err(|_| UplinkError::Setup("ca_file is not a PEM certificate bundle"))?;
+            if certs.is_empty() {
+                return Err(UplinkError::Setup("ca_file contains no certificate"));
+            }
+            // Pinning: the configured CA bundle holds the only trusted roots.
+            builder = builder.tls_built_in_root_certs(false);
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
         }
         let http = builder
             .build()
@@ -185,7 +189,11 @@ impl Uplink {
             request = request.query(query);
         }
         if let Auth::Agent { agent_id, secret } = auth {
-            let mut value = HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
+            // The temporary string is zeroized; the header value itself is
+            // an immutable `Bytes` that reqwest owns and drops after the
+            // request (not zeroizable).
+            let bearer = zeroize::Zeroizing::new(format!("Bearer {}", secret.expose()));
+            let mut value = HeaderValue::from_str(&bearer)
                 .map_err(|_| UplinkError::Setup("invalid secret header"))?;
             value.set_sensitive(true);
             let id = HeaderValue::from_str(&agent_id.to_string())

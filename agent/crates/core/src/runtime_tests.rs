@@ -51,6 +51,7 @@ fn write_token(env: &Env) -> PathBuf {
     let path = env.config_path.with_file_name("token");
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(f, "{TOKEN}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     path
 }
 
@@ -92,9 +93,14 @@ async fn enrolled(server: &MockServer) -> Env {
         .respond_with(enroll_response())
         .mount_as_scoped(server)
         .await;
-    enroll(&env.config, &write_token(&env), false, &[Engine::Postgres])
-        .await
-        .unwrap();
+    enroll(
+        &env.config,
+        &write_token(&env),
+        EnrollOptions::default(),
+        &[Engine::Postgres],
+    )
+    .await
+    .unwrap();
     env
 }
 
@@ -128,13 +134,18 @@ async fn enroll_stores_identity_and_local_hmac_key() {
             "token": TOKEN, "connectors": ["postgres"], "os": "linux"
         })))
         .respond_with(enroll_response())
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
     let token = write_token(&env);
-    let id = enroll(&env.config, &token, false, &[Engine::Postgres])
-        .await
-        .unwrap();
+    let id = enroll(
+        &env.config,
+        &token,
+        EnrollOptions::default(),
+        &[Engine::Postgres],
+    )
+    .await
+    .unwrap();
     assert_eq!(id, AGENT_ID);
     for req in server.received_requests().await.unwrap() {
         assert!(req.headers.get("authorization").is_none());
@@ -153,16 +164,48 @@ async fn enroll_stores_identity_and_local_hmac_key() {
         assert!(!String::from_utf8_lossy(&req.body).contains(&hex));
     }
 
-    let err = enroll(&env.config, &token, false, &[Engine::Postgres])
-        .await
-        .unwrap_err();
+    let err = enroll(
+        &env.config,
+        &token,
+        EnrollOptions::default(),
+        &[Engine::Postgres],
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(
         err,
         AgentError::Identity(IdentityError::AlreadyEnrolled(_))
     ));
-    enroll(&env.config, &token, true, &[Engine::Postgres])
+    let force = EnrollOptions {
+        force: true,
+        new_hmac_key: false,
+    };
+    enroll(&env.config, &token, force, &[Engine::Postgres])
         .await
         .unwrap();
+    // --force keeps the existing HMAC key unless --new-hmac-key.
+    assert_eq!(*env.state.load_hmac_key().unwrap(), *key);
+    let renew = EnrollOptions {
+        force: true,
+        new_hmac_key: true,
+    };
+    enroll(&env.config, &token, renew, &[Engine::Postgres])
+        .await
+        .unwrap();
+    assert_ne!(*env.state.load_hmac_key().unwrap(), *key);
+}
+
+#[tokio::test]
+async fn world_readable_token_file_is_refused() {
+    let server = MockServer::start().await;
+    let env = env(&server);
+    let token = write_token(&env);
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = enroll(&env.config, &token, EnrollOptions::default(), &[])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("readable by others"), "{err}");
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -175,9 +218,14 @@ async fn enroll_401_is_not_retried() {
         .expect(1)
         .mount(&server)
         .await;
-    let err = enroll(&env.config, &write_token(&env), false, &[])
-        .await
-        .unwrap_err();
+    let err = enroll(
+        &env.config,
+        &write_token(&env),
+        EnrollOptions::default(),
+        &[],
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("not retried"), "{err}");
     assert!(!err.to_string().contains(TOKEN));
     assert!(!env.state.has_identity());
@@ -200,9 +248,14 @@ async fn enroll_honors_retry_after_on_503() {
         .mount(&server)
         .await;
     let start = Instant::now();
-    enroll(&env.config, &write_token(&env), false, &[])
-        .await
-        .unwrap();
+    enroll(
+        &env.config,
+        &write_token(&env),
+        EnrollOptions::default(),
+        &[],
+    )
+    .await
+    .unwrap();
     assert!(start.elapsed() >= Duration::from_secs(1));
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
@@ -213,7 +266,10 @@ async fn invalid_token_file_is_rejected_without_echo() {
     let env = env(&server);
     let path = env.config_path.with_file_name("token");
     std::fs::write(&path, "dbe_short-SECRETISH").unwrap();
-    let err = enroll(&env.config, &path, false, &[]).await.unwrap_err();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let err = enroll(&env.config, &path, EnrollOptions::default(), &[])
+        .await
+        .unwrap_err();
     assert!(!err.to_string().contains("SECRETISH"), "{err}");
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -639,4 +695,295 @@ async fn secrets_never_appear_in_logs_or_debug() {
         assert!(!logs.contains(secret), "secret in logs");
         assert!(!debug.contains(secret), "secret in Debug");
     }
+}
+
+// ------------------------------------------------------ review follow-ups
+
+#[tokio::test]
+async fn lost_rotate_response_never_falls_back_to_s0() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    // Unknown outcome: the console registered S1 but the response was lost.
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .mount(&server)
+        .await;
+    for _ in 0..3 {
+        session
+            .call(
+                Method::POST,
+                "/heartbeat",
+                &[],
+                Some(b"{}"),
+                uplink::REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+    }
+    let with_s0 = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/heartbeat"))
+        .filter(|r| r.headers["authorization"].to_str().unwrap() == bearer(S0))
+        .count();
+    assert_eq!(with_s0, 0);
+    assert_eq!(env.state.load_identity().unwrap().secret.expose(), s1);
+}
+
+#[tokio::test]
+async fn rotation_conflict_on_any_request_stops_the_agent() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let err = rt.heartbeat_once().await.unwrap_err();
+    assert!(matches!(err, CallError::RotationConflict));
+    assert!(matches!(
+        rt.on_call_error("heartbeat", &err, 1, Duration::from_secs(30)),
+        Err(AgentError::RotationConflict)
+    ));
+}
+
+#[tokio::test]
+async fn s1_401_after_the_latest_rotate_attempt_puts_s0_first() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    assert!(!session.needs_rotation_retry());
+    let s1 = session.snapshot().pending.unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(s1.expose()).as_str()))
+        .respond_with(error_body(401, "unauthorized"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    session
+        .call(
+            Method::POST,
+            "/heartbeat",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(session.needs_rotation_retry());
+}
+
+#[tokio::test]
+async fn invalid_secret_fails_the_job_and_clears_rotation_jobs() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let job = Uuid::try_from("01920f5f-1d40-7f70-b154-3c4d5e6f7090").unwrap();
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(400, "invalid_secret"))
+        .mount_as_scoped(&server)
+        .await;
+    let rt = runtime(&env);
+    assert_eq!(
+        rt.rotate_for_job(job).await.unwrap(),
+        Some(Outcome::failed(FailureCode::Internal))
+    );
+    let on_disk = env.state.load_identity().unwrap();
+    assert!(on_disk.pending.is_none());
+    assert!(on_disk.rotation_jobs.is_empty());
+    drop(guard);
+    // Redelivery of the same job: a new secret is generated and registered.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        rt.rotate_for_job(job).await.unwrap(),
+        Some(Outcome::SUCCEEDED)
+    );
+    let bodies = rotate_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 2);
+    assert_ne!(bodies[0]["new_secret"], bodies[1]["new_secret"]);
+}
+
+#[tokio::test]
+async fn every_job_satisfied_by_the_secret_is_acknowledged_and_new_rotation_deferred() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let jobs: Vec<Uuid> = (0..3)
+        .map(|i| {
+            Uuid::try_from(format!("01920f5f-1d40-7f70-b154-3c4d5e6f70a{i}").as_str()).unwrap()
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount(&server)
+        .await;
+    let session = session(&env);
+    for job in &jobs {
+        assert!(matches!(
+            session.rotate(Some(*job)).await.unwrap(),
+            RotateOutcome::Registered { .. }
+        ));
+    }
+    let bodies = rotate_bodies(&server.received_requests().await.unwrap());
+    assert!(
+        bodies
+            .iter()
+            .all(|b| b["new_secret"] == bodies[0]["new_secret"])
+    );
+    assert_eq!(env.state.load_identity().unwrap().rotation_jobs, jobs);
+    // Promotion.
+    let s1 = session.snapshot().pending.unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(s1.expose()).as_str()))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    session
+        .call(
+            Method::POST,
+            "/heartbeat",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    // Any of them redelivered after promotion (even after a restart):
+    // acknowledged without a new rotation.
+    let restarted = self::session(&env);
+    for job in &jobs {
+        assert_eq!(
+            restarted.rotate(Some(*job)).await.unwrap(),
+            RotateOutcome::AlreadyDone
+        );
+    }
+    // A new rotate job within 60 s of the promotion is deferred.
+    let new_job = Uuid::try_from("01920f5f-1d40-7f70-b154-3c4d5e6f70b0").unwrap();
+    assert_eq!(
+        session.rotate(Some(new_job)).await.unwrap(),
+        RotateOutcome::Deferred
+    );
+    assert_eq!(
+        rotate_bodies(&server.received_requests().await.unwrap()).len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn reload_refuses_console_or_state_dir_changes() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let text = std::fs::read_to_string(&env.config_path).unwrap();
+    std::fs::write(
+        &env.config_path,
+        text.replace(&server.uri(), "http://127.0.0.1:1"),
+    )
+    .unwrap();
+    assert_eq!(
+        rt.reload_config(),
+        Outcome::failed(FailureCode::InvalidParams)
+    );
+    assert_eq!(rt.config().console.url, server.uri());
+    std::fs::write(&env.config_path, text.replace("port: 5432", "port: 5433")).unwrap();
+    assert_eq!(rt.reload_config(), Outcome::SUCCEEDED);
+}
+
+#[test]
+fn poll_gap_prevents_hot_loop() {
+    let mut streak = 0;
+    let fast = Duration::from_millis(5);
+    let first = poll_gap(fast, false, &mut streak, 0.0);
+    assert_eq!(first, Duration::from_secs(1));
+    for _ in 0..20 {
+        assert!(poll_gap(fast, false, &mut streak, 0.5) >= Duration::from_secs(1));
+    }
+    assert!(poll_gap(fast, false, &mut streak, 1.0) <= Duration::from_secs(300));
+    assert_eq!(poll_gap(fast, true, &mut streak, 0.5), Duration::ZERO);
+    assert_eq!(streak, 0);
+    assert_eq!(
+        poll_gap(Duration::from_secs(25), false, &mut streak, 0.5),
+        Duration::ZERO
+    );
+}
+
+#[tokio::test]
+async fn immediate_204_does_not_hot_loop() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/jobs"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn({
+        let path = env.config_path.clone();
+        async move { run(&path, Vec::new(), rx).await }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let polls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/jobs"))
+        .count();
+    assert!((1..=3).contains(&polls), "{polls} polls in 1.5 s");
 }

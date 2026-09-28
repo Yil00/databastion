@@ -22,6 +22,8 @@ use crate::fsutil;
 
 const IDENTITY_FILE: &str = "identity.json";
 const HMAC_KEY_FILE: &str = "hmac.key";
+/// Rotate job ids remembered in `identity.json`.
+pub(crate) const MAX_ROTATION_JOBS: usize = 8;
 /// Length of the local HMAC key, in bytes.
 pub(crate) const HMAC_KEY_LEN: usize = 32;
 
@@ -58,7 +60,8 @@ fn io_err(path: &Path, e: &io::Error) -> IdentityError {
         path: path.to_owned(),
         kind: e.kind(),
         detail: if e.kind() == io::ErrorKind::PermissionDenied {
-            " (state files must be 0600 and owned by the agent user)"
+            " (state_dir must be owned by the agent user and not group/world writable; \
+             state files must be regular 0600 files owned by the agent user, not symlinks)"
         } else {
             ""
         },
@@ -71,8 +74,10 @@ pub struct Identity {
     pub(crate) agent_id: Uuid,
     pub(crate) secret: AgentSecret,
     pub(crate) pending: Option<AgentSecret>,
-    /// Job that created the last rotation (redelivery guard, ADR-0008).
-    pub(crate) rotation_job: Option<Uuid>,
+    /// Rotate jobs satisfied by the current pending or promoted secret
+    /// (redelivery guard, ADR-0008), most recent last, at most
+    /// [`MAX_ROTATION_JOBS`].
+    pub(crate) rotation_jobs: Vec<Uuid>,
     pub(crate) heartbeat_interval_s: u64,
 }
 
@@ -103,8 +108,8 @@ struct IdentityFile {
     agent_secret: AgentSecret,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_secret: Option<AgentSecret>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    rotation_job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rotation_job_ids: Vec<Uuid>,
     heartbeat_interval_s: u64,
 }
 
@@ -137,7 +142,23 @@ impl StateDir {
         fsutil::ensure_private_dir(&self.dir).map_err(|e| io_err(&self.dir, &e))
     }
 
+    /// Checks the state directory (owner, not group / world writable).
+    fn check_dir(&self) -> Result<(), IdentityError> {
+        match fsutil::check_private_dir(&self.dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(IdentityError::NotEnrolled(self.identity_path()))
+            }
+            Err(e) => Err(io_err(&self.dir, &e)),
+        }
+    }
+
+    pub(crate) fn has_hmac_key(&self) -> bool {
+        self.hmac_key_path().exists()
+    }
+
     pub(crate) fn load_identity(&self) -> Result<Identity, IdentityError> {
+        self.check_dir()?;
         let path = self.identity_path();
         let bytes = match fsutil::read_private(&path) {
             Ok(bytes) => Zeroizing::new(bytes),
@@ -152,7 +173,12 @@ impl StateDir {
             agent_id: file.agent_id,
             secret: file.agent_secret,
             pending: file.pending_secret,
-            rotation_job: file.rotation_job_id,
+            rotation_jobs: {
+                let mut jobs = file.rotation_job_ids;
+                let excess = jobs.len().saturating_sub(MAX_ROTATION_JOBS);
+                jobs.drain(..excess);
+                jobs
+            },
             heartbeat_interval_s: file.heartbeat_interval_s,
         })
     }
@@ -165,7 +191,7 @@ impl StateDir {
             agent_id: identity.agent_id,
             agent_secret: identity.secret.clone(),
             pending_secret: identity.pending.clone(),
-            rotation_job_id: identity.rotation_job,
+            rotation_job_ids: identity.rotation_jobs.clone(),
             heartbeat_interval_s: identity.heartbeat_interval_s,
         };
         let bytes = Zeroizing::new(
@@ -185,6 +211,7 @@ impl StateDir {
 
     /// Loads the local HMAC key, checking its permissions and length.
     pub(crate) fn load_hmac_key(&self) -> Result<Zeroizing<Vec<u8>>, IdentityError> {
+        self.check_dir()?;
         let path = self.hmac_key_path();
         let key = Zeroizing::new(fsutil::read_private(&path).map_err(|e| io_err(&path, &e))?);
         if key.len() == HMAC_KEY_LEN {
@@ -230,7 +257,7 @@ pub(crate) mod tests {
             agent_id: Uuid::try_from("01920f5f-0c30-7e6f-a043-2b3c4d5e6f70").unwrap(),
             secret: AgentSecret::try_from(S0).unwrap(),
             pending: None,
-            rotation_job: None,
+            rotation_jobs: Vec::new(),
             heartbeat_interval_s: 30,
         }
     }
@@ -288,6 +315,37 @@ pub(crate) mod tests {
         assert!(!debug.contains(S0), "{debug}");
         assert!(!debug.contains(&pending_text), "{debug}");
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn symlinked_hmac_key_is_refused() {
+        let dir = TempDir::new();
+        let state = StateDir::new(&dir.path().join("state"));
+        state.create_hmac_key().unwrap();
+        let real = dir.path().join("elsewhere.key");
+        std::fs::rename(state.hmac_key_path(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, state.hmac_key_path()).unwrap();
+        assert!(matches!(
+            state.load_hmac_key(),
+            Err(IdentityError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn group_writable_state_dir_is_refused() {
+        let dir = TempDir::new();
+        let state = StateDir::new(&dir.path().join("state"));
+        state.save_identity(&identity()).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("state"),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.load_identity(),
+            Err(IdentityError::Io { .. })
+        ));
+        assert!(state.save_identity(&identity()).is_err());
     }
 
     #[test]

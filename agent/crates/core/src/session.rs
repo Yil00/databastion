@@ -16,7 +16,7 @@
 //! redelivered job, restart). A `rotation_conflict` is fatal.
 
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, RotateResponse, Uuid};
 use reqwest::Method;
@@ -59,11 +59,20 @@ struct Creds {
     identity: Identity,
     /// Incremented on every change of the secret in use.
     generation: u64,
-    /// `S1` got a `401` in this process: use `S0` first (and redo `/rotate`).
+    /// `S1` got a `401` **after** the latest `/rotate` attempt: use `S0`
+    /// first (and redo `/rotate`). Reset by every `/rotate` attempt, since
+    /// an attempt with an unknown outcome may have registered `S1`.
     pending_rejected: bool,
-    /// Job id of the last rotation, persisted with the identity.
-    last_rotation_job: Option<Uuid>,
+    /// Incremented at the start of every `/rotate` attempt; a `401` on `S1`
+    /// only marks it rejected if no attempt started since the request.
+    rotate_epoch: u64,
+    /// Last promotion in this process: no new rotation within the console's
+    /// 60 s tolerance window.
+    promoted_at: Option<Instant>,
 }
+
+/// Console tolerance window after a promotion (ADR-0008).
+const PROMOTION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Outcome of [`Session::rotate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +81,9 @@ pub(crate) enum RotateOutcome {
     Registered { duplicate: bool },
     /// The job already completed a rotation (redelivery after promotion).
     AlreadyDone,
+    /// A promotion happened less than 60 s ago: the job is left
+    /// unacknowledged and will be redelivered.
+    Deferred,
 }
 
 /// Authenticated client.
@@ -83,7 +95,6 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn new(uplink: Uplink, state: StateDir, identity: Identity) -> Self {
-        let last_rotation_job = identity.rotation_job;
         Self {
             uplink,
             state,
@@ -91,7 +102,8 @@ impl Session {
                 identity,
                 generation: 0,
                 pending_rejected: false,
-                last_rotation_job,
+                rotate_epoch: 0,
+                promoted_at: None,
             }),
         }
     }
@@ -119,7 +131,7 @@ impl Session {
     }
 
     /// Secrets to try, in order, with a flag telling whether it is `S1`.
-    fn candidates(&self) -> (u64, Uuid, Vec<(AgentSecret, bool)>) {
+    fn candidates(&self) -> (u64, u64, Uuid, Vec<(AgentSecret, bool)>) {
         let creds = self.lock();
         let current = (creds.identity.secret.clone(), false);
         let list = match &creds.identity.pending {
@@ -127,7 +139,12 @@ impl Session {
             Some(s1) if creds.pending_rejected => vec![current, (s1.clone(), true)],
             Some(s1) => vec![(s1.clone(), true), current],
         };
-        (creds.generation, creds.identity.agent_id, list)
+        (
+            creds.generation,
+            creds.rotate_epoch,
+            creds.identity.agent_id,
+            list,
+        )
     }
 
     /// Sends an authenticated request, handling `401` per the contract.
@@ -141,7 +158,7 @@ impl Session {
     ) -> Result<Reply, CallError> {
         let mut retried_after_switch = false;
         loop {
-            let (generation, agent_id, candidates) = self.candidates();
+            let (generation, epoch, agent_id, candidates) = self.candidates();
             let mut s1_unauthorized = false;
             for (secret, is_pending) in &candidates {
                 let auth = Auth::Agent {
@@ -157,10 +174,13 @@ impl Session {
                         if *is_pending {
                             self.promote(secret)?;
                         } else if s1_unauthorized {
-                            self.lock().pending_rejected = true;
-                            tracing::warn!(
-                                "pending secret not registered by the console; rotation will be retried"
-                            );
+                            let mut creds = self.lock();
+                            if creds.rotate_epoch == epoch {
+                                creds.pending_rejected = true;
+                                tracing::warn!(
+                                    "pending secret not registered by the console; rotation will be retried"
+                                );
+                            }
                         }
                         return Ok(reply);
                     }
@@ -201,6 +221,7 @@ impl Session {
         creds.identity = next;
         creds.generation += 1;
         creds.pending_rejected = false;
+        creds.promoted_at = Some(Instant::now());
         tracing::info!("rotated agent secret promoted");
         Ok(())
     }
@@ -219,30 +240,47 @@ impl Session {
     }
 
     /// Returns the pending secret, creating and persisting one first if
-    /// there is none. Persistence happens before any network call.
-    fn pending_or_create(&self, job_id: Option<Uuid>) -> Result<Option<AgentSecret>, CallError> {
+    /// there is none. Persistence happens before any network call. The job
+    /// id joins the bounded set of jobs satisfied by this secret.
+    fn pending_or_create(&self, job_id: Option<Uuid>) -> Result<Pending, CallError> {
         let mut creds = self.lock();
-        if let Some(s1) = &creds.identity.pending {
-            return Ok(Some(s1.clone()));
+        if let Some(s1) = creds.identity.pending.clone() {
+            if let Some(id) = job_id {
+                if !creds.identity.rotation_jobs.contains(&id) {
+                    let mut next = creds.identity.clone();
+                    push_bounded(&mut next.rotation_jobs, id);
+                    self.state.save_identity(&next)?;
+                    creds.identity = next;
+                }
+            }
+            return Ok(Pending::Use(s1));
         }
-        if job_id.is_some() && job_id == creds.last_rotation_job {
-            return Ok(None);
+        if job_id.is_some_and(|id| creds.identity.rotation_jobs.contains(&id)) {
+            return Ok(Pending::AlreadyDone);
+        }
+        if creds
+            .promoted_at
+            .is_some_and(|t| t.elapsed() < PROMOTION_WINDOW)
+        {
+            return Ok(Pending::Deferred);
         }
         let s1 = identity::generate_secret()?;
         let mut next = creds.identity.clone();
         next.pending = Some(s1.clone());
-        next.rotation_job = job_id;
+        next.rotation_jobs = job_id.into_iter().collect();
         self.state.save_identity(&next)?;
         creds.identity = next;
-        creds.last_rotation_job = job_id;
         creds.pending_rejected = false;
-        Ok(Some(s1))
+        Ok(Pending::Use(s1))
     }
 
+    /// Drops a pending secret the console refused (never registered), and
+    /// the jobs it was meant to satisfy.
     fn discard_pending(&self) -> Result<(), IdentityError> {
         let mut creds = self.lock();
         let mut next = creds.identity.clone();
         next.pending = None;
+        next.rotation_jobs.clear();
         self.state.save_identity(&next)?;
         creds.identity = next;
         creds.pending_rejected = false;
@@ -252,11 +290,17 @@ impl Session {
     /// `POST /rotate` with the current secret, registering the pending `S1`
     /// (created and persisted first if needed).
     pub(crate) async fn rotate(&self, job_id: Option<Uuid>) -> Result<RotateOutcome, CallError> {
-        let Some(s1) = self.pending_or_create(job_id)? else {
-            return Ok(RotateOutcome::AlreadyDone);
+        let s1 = match self.pending_or_create(job_id)? {
+            Pending::Use(s1) => s1,
+            Pending::AlreadyDone => return Ok(RotateOutcome::AlreadyDone),
+            Pending::Deferred => return Ok(RotateOutcome::Deferred),
         };
         let (agent_id, s0) = {
-            let creds = self.lock();
+            let mut creds = self.lock();
+            // The outcome of this attempt may be unknown (lost response):
+            // S1 goes first again until it gets a 401 after this point.
+            creds.rotate_epoch += 1;
+            creds.pending_rejected = false;
             (creds.identity.agent_id, creds.identity.secret.clone())
         };
         let request = RotateRequest {
@@ -317,4 +361,17 @@ impl Session {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Pending secret to register, or why none is needed.
+enum Pending {
+    Use(AgentSecret),
+    AlreadyDone,
+    Deferred,
+}
+
+fn push_bounded(jobs: &mut Vec<Uuid>, id: Uuid) {
+    jobs.push(id);
+    let excess = jobs.len().saturating_sub(identity::MAX_ROTATION_JOBS);
+    jobs.drain(..excess);
 }

@@ -1,20 +1,60 @@
 //! Private-file helpers for the state directory (identity, pending secret,
 //! HMAC key). Unix only: files are `0600`, the directory `0700`.
+//!
+//! - The state directory must be a real directory (not a symlink) owned by
+//!   the effective uid and not writable by group or others; a mode other
+//!   than `0700` only warns.
+//! - State files are opened with `O_NOFOLLOW` (rustix, no `unsafe`) and
+//!   checked on the open handle (`fstat`): regular file, owned by the
+//!   effective uid, no group / other access.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-/// Creates `dir` (and parents) with mode `0700` if it does not exist.
-pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
+use rustix::fs::{Mode, OFlags};
+
+fn denied(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// Checks that `dir` is a directory (not a symlink) owned by the effective
+/// uid and not writable by group or others.
+pub(crate) fn check_private_dir(dir: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(denied("state_dir must be a directory, not a symlink"));
     }
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
+    if meta.uid() != euid() {
+        return Err(denied("state_dir must be owned by the agent user"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(denied("state_dir must not be writable by group or others"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        tracing::warn!(
+            mode = format!("{:o}", meta.mode() & 0o777),
+            "state_dir should be 0700"
+        );
+    }
+    Ok(())
+}
+
+/// Creates `dir` (and parents) with mode `0700` if it does not exist, then
+/// checks it with [`check_private_dir`].
+pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(dir).is_err() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    check_private_dir(dir)
 }
 
 /// Writes `bytes` to `path` atomically with mode `0600`: temporary file in
@@ -53,16 +93,43 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> 
     result
 }
 
-/// Reads a private file, refusing it if group or others have any access.
-pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
-    let meta = fs::metadata(path)?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+/// Opens a private file without following symlinks and checks the handle:
+/// regular file, owned by the effective uid, no group / other access.
+pub(crate) fn open_private(path: &Path) -> io::Result<File> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP {
+            denied("state file is a symlink")
+        } else {
+            io::Error::from(e)
+        }
+    })?;
+    let file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(denied("state file is not a regular file"));
+    }
+    if meta.uid() != euid() {
+        return Err(denied("state file is not owned by the agent user"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(denied(
             "file is accessible by group or others (expected 0600)",
         ));
     }
-    fs::read(path)
+    Ok(file)
+}
+
+/// Reads a private file (see [`open_private`]).
+pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_private(path)?;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -145,6 +212,43 @@ mod tests {
             read_private(&path).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn symlinked_state_file_is_refused() {
+        let dir = TempDir::new();
+        let real = dir.path().join("real.key");
+        write_private_atomic(&real, b"k").unwrap();
+        let link = dir.path().join("hmac.key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = read_private(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn non_regular_state_file_is_refused() {
+        let dir = TempDir::new();
+        let sub = dir.path().join("identity.json");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_private(&sub).is_err());
+    }
+
+    #[test]
+    fn group_writable_or_symlinked_state_dir_is_refused() {
+        let dir = TempDir::new();
+        let state = dir.path().join("state");
+        ensure_private_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            ensure_private_dir(&state).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        ensure_private_dir(&state).unwrap(); // warns only
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        assert!(check_private_dir(&link).is_err());
     }
 
     #[test]

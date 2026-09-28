@@ -27,6 +27,8 @@ pub const SAMPLE_ROWS_RANGE: (u32, u32) = (1, 10_000);
 pub const STATEMENT_TIMEOUT_MS_RANGE: (u32, u32) = (100, 600_000);
 /// Scan duration bounds, in seconds.
 pub const SCAN_DURATION_S_RANGE: (u32, u32) = (60, 86_400);
+/// Minimum long-poll wait outside the loopback development mode.
+pub const MIN_LONG_POLL_WAIT_S: u8 = 5;
 /// Maximum number of declared targets (contract `HeartbeatRequest.targets`).
 pub const MAX_TARGETS: usize = 64;
 
@@ -102,12 +104,13 @@ pub struct ConsoleConfig {
     /// used.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
-    /// Long-poll `wait` for `GET /jobs`, `0..=25` (lower it behind a proxy
-    /// with a short idle timeout).
+    /// Long-poll `wait` for `GET /jobs`, `5..=25` (lower it behind a proxy
+    /// with a short idle timeout). Values below 5 are only accepted with
+    /// `insecure_dev_http` (tests).
     #[serde(default = "default_wait")]
     pub long_poll_wait_s: u8,
-    /// Development only: allow `http://` for a console on `127.0.0.1`,
-    /// `::1` or `localhost`. Rejected for any other host.
+    /// Development only: allow `http://` for a console on `127.0.0.1` or
+    /// `[::1]` (IP literals only). Rejected for any other host.
     #[serde(default)]
     pub insecure_dev_http: bool,
 }
@@ -304,26 +307,72 @@ const KNOWN_KEYS: &[&str] = &[
     "openldap",
 ];
 
-/// Redacts every `` `quoted` `` or `"quoted"` token that is not a known key.
-fn sanitize_message(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut chars = message.chars();
-    while let Some(c) = chars.next() {
-        if c == '`' || c == '"' {
-            let token: String = chars.by_ref().take_while(|&d| d != c).collect();
-            if KNOWN_KEYS.contains(&token.as_str()) {
-                out.push(c);
-                out.push_str(&token);
-                out.push(c);
-            } else {
-                out.push_str("[redacted]");
-            }
-        } else {
-            out.push(c);
-        }
+/// Renders a YAML / serde error without deriving any text from it: a
+/// closed category, plus a key name and a path only when they are made of
+/// keys of this schema. A value can therefore never be echoed, whatever
+/// characters (quotes, backquotes, backslashes) it contains.
+fn render_parse_error(message: &str) -> String {
+    const CATEGORIES: [(&str, &str); 7] = [
+        ("unknown field `", "unknown field"),
+        ("missing field `", "missing field"),
+        ("duplicate field `", "duplicate field"),
+        ("unknown variant", "invalid value"),
+        ("invalid value", "invalid value"),
+        ("invalid length", "invalid value"),
+        ("invalid type", "invalid type"),
+    ];
+    let (category, key) = CATEGORIES
+        .iter()
+        .find_map(|(needle, category)| {
+            let pos = message.find(needle)?;
+            let key = needle
+                .ends_with('`')
+                .then(|| known_key_at(&message[pos + needle.len()..]))
+                .flatten();
+            Some((*category, key))
+        })
+        .unwrap_or(("syntax error", None));
+    let mut out = String::from(category);
+    if let Some(key) = key {
+        out.push_str(" `");
+        out.push_str(key);
+        out.push('`');
     }
-    // Drop anything after a line break (serde_yaml_ng may append context).
-    out.lines().next().unwrap_or("").chars().take(200).collect()
+    if let Some(path) = known_path(message) {
+        out.push_str(" at ");
+        out.push_str(path);
+    }
+    out
+}
+
+/// The known key that `rest` starts with, if it is followed by the closing
+/// backquote.
+fn known_key_at(rest: &str) -> Option<&'static str> {
+    KNOWN_KEYS
+        .iter()
+        .copied()
+        .filter(|k| {
+            rest.strip_prefix(k)
+                .is_some_and(|after| after.starts_with('`'))
+        })
+        .max_by_key(|k| k.len())
+}
+
+/// The `a.b[0].c: ` path prefix serde_yaml_ng puts in front of a message,
+/// if every name segment is a known key.
+fn known_path(message: &str) -> Option<&str> {
+    let (path, _) = message.split_once(": ")?;
+    let valid = !path.is_empty()
+        && path.len() <= 64
+        && path.split('.').all(|segment| {
+            let name = segment.split('[').next().unwrap_or("");
+            let index = &segment[name.len()..];
+            KNOWN_KEYS.contains(&name)
+                && index
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b'[' || b == b']')
+        });
+    valid.then_some(path)
 }
 
 impl AgentConfig {
@@ -349,7 +398,7 @@ impl AgentConfig {
             ConfigError::Parse {
                 line,
                 column,
-                message: sanitize_message(&e.to_string()),
+                message: render_parse_error(&e.to_string()),
             }
         })?;
         config.validate()?;
@@ -365,8 +414,10 @@ impl AgentConfig {
             ));
         }
         self.console_url()?;
-        if self.console.long_poll_wait_s > 25 {
-            return Err(invalid("console.long_poll_wait_s", "must be in 0..=25"));
+        let wait = self.console.long_poll_wait_s;
+        if wait > 25 || (wait < MIN_LONG_POLL_WAIT_S && !self.console.insecure_dev_http) {
+            // Below 5 s only for the loopback development console (tests).
+            return Err(invalid("console.long_poll_wait_s", "must be in 5..=25"));
         }
         if self
             .console
@@ -446,8 +497,7 @@ impl AgentConfig {
                 if !is_loopback_host(&url) {
                     return Err(invalid(
                         F,
-                        "http is only allowed for 127.0.0.1, ::1 or localhost \
-                         (insecure_dev_http)",
+                        "http is only allowed for 127.0.0.1 or [::1] (insecure_dev_http)",
                     ));
                 }
             }
@@ -461,7 +511,9 @@ impl AgentConfig {
 fn is_loopback_host(url: &reqwest::Url) -> bool {
     // `host_str` is normalized by the URL parser (lowercase, IPv6 in
     // brackets, IPv4 in dotted decimal).
-    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    // IP literals only: `localhost` could resolve elsewhere (hosts file,
+    // resolver), so it is not accepted.
+    matches!(url.host_str(), Some("127.0.0.1" | "[::1]"))
 }
 
 fn is_env_name(name: &str) -> bool {
@@ -642,17 +694,14 @@ targets:
                 &format!("  url: {url}\n  insecure_dev_http: true\n"),
             )
         };
-        for ok in [
-            "http://127.0.0.1:8080",
-            "http://localhost:3000",
-            "http://[::1]:3000",
-        ] {
+        for ok in ["http://127.0.0.1:8080", "http://[::1]:3000"] {
             assert!(parse(&dev(ok)).is_ok(), "{ok}");
         }
         for bad in [
             "http://10.0.0.1:8080",
             "http://console.example.internal",
             "http://127.0.0.2",
+            "http://localhost:3000",
             "https://console.example.internal",
         ] {
             assert!(parse(&dev(bad)).is_err(), "{bad}");
@@ -743,14 +792,73 @@ targets:
     }
 
     #[test]
-    fn sanitizer_keeps_known_keys_only() {
+    fn parse_errors_are_closed_categories() {
         assert_eq!(
-            sanitize_message("unknown field `password`, expected one of `id`, `engine`"),
-            "unknown field [redacted], expected one of `id`, `engine`"
+            render_parse_error("targets[0]: unknown field `password`, expected one of `id`"),
+            "unknown field at targets[0]"
         );
         assert_eq!(
-            sanitize_message("invalid type: string \"s3cr3t\", expected u16\nmore"),
-            "invalid type: string [redacted], expected u16"
+            render_parse_error("console: unknown field `port`, expected `url`"),
+            "unknown field `port` at console"
         );
+        assert_eq!(
+            render_parse_error("missing field `url` at line 2 column 3"),
+            "missing field `url`"
+        );
+        assert_eq!(
+            render_parse_error("targets[0].port: invalid type: string \"x\", expected u16"),
+            "invalid type at targets[0].port"
+        );
+        assert_eq!(render_parse_error("hunter2: something odd"), "syntax error");
+    }
+
+    /// Single-quoted YAML scalar (any character allowed).
+    fn yaml_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    #[test]
+    fn values_with_quotes_backquotes_backslashes_never_echo() {
+        const ALPHABET: &[u8] = b"\"`\\abcXYZ019 -_:,{}[]#&*!|>%@$";
+        for round in 0..300u32 {
+            let mut noise = [0u8; 12];
+            getrandom::fill(&mut noise).unwrap();
+            let noise: String = noise
+                .iter()
+                .map(|b| ALPHABET[usize::from(*b) % ALPHABET.len()] as char)
+                .collect();
+            // Always contains `"`, a backquote and `\`; the marker is what
+            // must never appear.
+            let marker = format!("SEKRET{round}");
+            let value = match round % 3 {
+                0 => format!("\"{marker}`{noise}\\"),
+                1 => format!("`{noise}\\{marker}\""),
+                _ => format!("{noise}\\\"`{marker}"),
+            };
+            let quoted = yaml_quote(&value);
+            let variants = [
+                BASE.replace("port: 5432", &format!("port: {quoted}")),
+                BASE.replace("engine: postgres", &format!("engine: {quoted}")),
+                BASE.replace("id: pg-main", &format!("id: {quoted}")),
+                BASE.replace("DATABASTION_PG_MAIN_PASSWORD", &quoted),
+                BASE.replace(
+                    "    account: databastion\n",
+                    &format!("    account: databastion\n    password: {quoted}\n"),
+                ),
+                BASE.replace(
+                    "    account: databastion\n",
+                    &format!("    account: databastion\n    {quoted}: x\n"),
+                ),
+                BASE.replace(
+                    "    secret:\n      env: DATABASTION_PG_MAIN_PASSWORD\n",
+                    &format!("    secret: {quoted}\n"),
+                ),
+                format!("{BASE}limits:\n  max_sample_rows: {quoted}\n"),
+            ];
+            for text in variants {
+                let message = parse(&text).unwrap_err().to_string();
+                assert!(!message.contains(&marker), "{value:?} -> {message}");
+            }
+        }
     }
 }

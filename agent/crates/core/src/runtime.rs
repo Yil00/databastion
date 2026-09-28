@@ -101,7 +101,28 @@ fn fallback_hostname() -> Hostname {
 }
 
 /// Reads the enrollment token from a file (surrounding whitespace ignored).
+/// Refused if others can read it; warns if the group can.
 fn read_token(path: &Path) -> Result<EnrollmentToken, AgentError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| {
+            AgentError::Enrollment(format!(
+                "cannot read the token file {}: {}",
+                path.display(),
+                e.kind()
+            ))
+        })?
+        .mode();
+    if mode & 0o007 != 0 {
+        return Err(AgentError::Enrollment(
+            "the token file is readable by others; restrict it to 0600 (and \
+             revoke the token in the console if it may have been read)"
+                .into(),
+        ));
+    }
+    if mode & 0o070 != 0 {
+        tracing::warn!("the token file is accessible by its group; 0600 is recommended");
+    }
     let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
         AgentError::Enrollment(format!(
             "cannot read the token file {}: {}",
@@ -117,18 +138,31 @@ fn read_token(path: &Path) -> Result<EnrollmentToken, AgentError> {
 /// Maximum attempts for `POST /enroll` on retryable errors.
 const ENROLL_ATTEMPTS: u32 = 5;
 
+/// Enrollment options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnrollOptions {
+    /// Replace an existing identity. Revoke the old agent in the console
+    /// first: its secret stays valid until then.
+    pub force: bool,
+    /// Also replace an existing local HMAC key (fingerprints computed
+    /// before will no longer correlate). Without it, an existing key is
+    /// kept.
+    pub new_hmac_key: bool,
+}
+
 /// Enrolls the agent: exchanges the token for an identity, stores it
-/// (`0600`, atomic) and generates the local HMAC key (never transmitted).
-/// Returns the agent id.
+/// (`0600`, atomic) and generates the local HMAC key (never transmitted)
+/// unless one exists and `new_hmac_key` is not set. Returns the agent id.
 ///
 /// # Errors
 /// [`AgentError`]; an existing identity is only replaced with `force`.
 pub async fn enroll(
     config: &AgentConfig,
     token_file: &Path,
-    force: bool,
+    options: EnrollOptions,
     engines: &[Engine],
 ) -> Result<String, AgentError> {
+    let force = options.force;
     let state = StateDir::new(&config.state_dir);
     if state.has_identity() && !force {
         return Err(IdentityError::AlreadyEnrolled(state.identity_path()).into());
@@ -165,7 +199,10 @@ pub async fn enroll(
             Ok(reply) => break reply,
             Err(UplinkError::Unauthorized) => {
                 return Err(AgentError::Enrollment(
-                    "token rejected (unknown, expired or already used); not retried".into(),
+                    "token rejected (unknown, expired or already used); not retried. If a \
+                     previous attempt with this token lost its response, the console may hold \
+                     an orphan agent: revoke it and create a new token"
+                        .into(),
                 ));
             }
             Err(e) if e.is_retryable() && attempt + 1 < ENROLL_ATTEMPTS => {
@@ -185,11 +222,17 @@ pub async fn enroll(
         agent_id: response.agent_id,
         secret: response.agent_secret,
         pending: None,
-        rotation_job: None,
+        rotation_jobs: Vec::new(),
         heartbeat_interval_s: interval,
     };
     state.save_identity(&identity)?;
-    state.create_hmac_key()?;
+    if options.new_hmac_key || !state.has_hmac_key() {
+        state.create_hmac_key()?;
+    } else {
+        // Validates permissions and length of the kept key.
+        state.load_hmac_key()?;
+        tracing::info!("existing local HMAC key kept");
+    }
     tracing::info!(agent_id = %identity.agent_id, "agent enrolled");
     Ok(identity.agent_id.to_string())
 }
@@ -503,6 +546,7 @@ impl Runtime {
     async fn jobs_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let mut state = self.state.subscribe();
         let mut failures: u32 = 0;
+        let mut fast_empty: u32 = 0;
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -516,6 +560,7 @@ impl Runtime {
             let wait = self.config().console.long_poll_wait_s;
             let timeout = Duration::from_secs(u64::from(wait) + 15);
             let query = [("wait", wait.to_string())];
+            let started = Instant::now();
             let poll = self
                 .session
                 .call(Method::GET, "/jobs", &query, None, timeout);
@@ -526,10 +571,16 @@ impl Runtime {
             let delay = match result {
                 Ok(reply) => {
                     failures = 0;
-                    if reply.status == StatusCode::OK {
+                    let got_jobs = reply.status == StatusCode::OK;
+                    if got_jobs {
                         self.handle_job_list(&reply.body).await?;
                     }
-                    Duration::ZERO
+                    poll_gap(
+                        started.elapsed(),
+                        got_jobs,
+                        &mut fast_empty,
+                        backoff::random_fraction(),
+                    )
                 }
                 Err(e) => {
                     failures = failures.saturating_add(1);
@@ -618,6 +669,11 @@ impl Runtime {
     /// Executes a job. `None`: leave it unacknowledged (redelivered later).
     async fn execute(&self, job: &Job, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         match job {
+            // TODO(P2): `DiscoveryScanParams` / `AuditConfigureParams` must
+            // be mapped into `ScanJob` / `AuditConfig` only through a
+            // `TryFrom` enforcing the contract ranges, then clamped with
+            // `Limits::clamp_*` from `agent.yaml` (I4) BEFORE building the
+            // job handed to a connector; never pass raw console values.
             Job::DiscoveryScanJob(_) | Job::AuditConfigureJob(_) => {
                 // P2 / P4: not implemented in this build.
                 Ok(Some(Outcome::failed(FailureCode::Unsupported)))
@@ -639,9 +695,12 @@ impl Runtime {
                     || new.console.insecure_dev_http != current.console.insecure_dev_http
                     || new.state_dir != current.state_dir
                 {
-                    tracing::warn!(
-                        "console or state_dir settings changed: they apply after a restart"
+                    tracing::error!(
+                        "reload refused: console.url, console.ca_file, \
+                         console.insecure_dev_http and state_dir require a restart; \
+                         keeping the previous configuration"
                     );
+                    return Outcome::failed(FailureCode::InvalidParams);
                 }
                 *current = new;
                 tracing::info!("configuration reloaded");
@@ -662,6 +721,20 @@ impl Runtime {
                     return Ok(Some(Outcome::SUCCEEDED));
                 }
                 Ok(RotateOutcome::AlreadyDone) => return Ok(Some(Outcome::SUCCEEDED)),
+                Ok(RotateOutcome::Deferred) => {
+                    tracing::info!(
+                        job_id = %id,
+                        "rotation deferred: previous promotion less than 60 s ago"
+                    );
+                    return Ok(None);
+                }
+                Err(CallError::Uplink(UplinkError::Rejected {
+                    code: Some(databastion_protocol::ErrorCode::InvalidSecret),
+                    ..
+                })) => {
+                    tracing::error!(job_id = %id, "console refused the new secret (invalid_secret)");
+                    return Ok(Some(Outcome::failed(FailureCode::Internal)));
+                }
                 Err(CallError::RotationConflict) => {
                     tracing::error!("rotation_conflict: the console locked this agent; stopping");
                     return Err(AgentError::RotationConflict);
@@ -732,6 +805,22 @@ impl Runtime {
         }
         false
     }
+}
+
+/// Minimum gap between two job polls. A poll that returns without jobs in
+/// less than 1 s (console ignoring `wait`, `wait=0`, proxy) is followed by
+/// `max(1 s, jittered backoff)` so the agent never hot-loops; a long-poll
+/// that was held, or a poll that delivered jobs, polls again immediately.
+fn poll_gap(elapsed: Duration, got_jobs: bool, fast_empty: &mut u32, fraction: f64) -> Duration {
+    if got_jobs || elapsed >= Duration::from_secs(1) {
+        *fast_empty = 0;
+        return Duration::ZERO;
+    }
+    let gap = backoff::Backoff::CONSOLE
+        .delay(*fast_empty, fraction)
+        .max(Duration::from_secs(1));
+    *fast_empty = fast_empty.saturating_add(1);
+    gap
 }
 
 fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
