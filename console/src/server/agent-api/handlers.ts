@@ -13,9 +13,10 @@ import {
   staleRotateRetry,
   type RotateOutcome,
 } from "@/server/rotation";
-import { clientIp, ipBucket } from "@/server/request";
+import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
+import { clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
-import { authenticateAgent, type AgentRow, type AuthOptions, type SecretSlot } from "./auth";
+import { authenticateAgent, type AuthOptions, type AuthResult } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -25,6 +26,7 @@ import {
   guarded,
   HEARTBEAT_INTERVAL_S,
   readValidBody,
+  validateBody,
 } from "./pipeline";
 
 /**
@@ -58,9 +60,7 @@ export function handleEnroll(req: Request): Promise<Response> {
   });
 }
 
-type Preamble =
-  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
-  | { ok: false; response: Response };
+type Preamble = Extract<AuthResult, { ok: true }> | { ok: false; response: Response };
 
 async function preamble(req: Request, opts: AuthOptions = {}): Promise<Preamble> {
   const headers = checkProtocolHeaders(req);
@@ -178,27 +178,56 @@ export function handleJobStatus(req: Request, jobId: string): Promise<Response> 
 }
 
 /**
+ * `/rotate` bodies are read BEFORE authentication (a `RotateRequest` is a few hundred bytes: 64 KiB
+ * cap, `413` after authentication beyond), so that the late-retry check of a stale `S0` runs under
+ * the argon2id pool slot of the authentication itself (P1-D). Nothing about the body is answered
+ * before the caller is authenticated.
+ */
+export const MAX_ROTATE_BODY_BYTES = 64 * 1024;
+
+/** A well-formed `new_secret` of a body not validated yet, for `AuthOptions.staleCandidate`. */
+function rotateCandidate(body: BodyResult): string | undefined {
+  if (!body.ok || typeof body.value !== "object" || body.value === null || Array.isArray(body.value)) {
+    return undefined;
+  }
+  const candidate = (body.value as Record<string, unknown>).new_secret;
+  if (typeof candidate !== "string" || !AGENT_SECRET_FORMAT.test(candidate) || isLowEntropySecret(candidate)) {
+    return undefined;
+  }
+  return candidate;
+}
+
+/**
  * `POST /rotate` (ADR-0008, ADR-0010). The body carries a secret: it is never logged, and an error
  * never echoes it. A new secret that fails the `AgentSecret` format is answered `invalid_secret`.
  */
 export function handleRotate(req: Request): Promise<Response> {
   return guarded("rotate", async () => {
-    const auth = await preamble(req, { allowPrevious: true });
+    const headers = checkProtocolHeaders(req);
+    if (headers) return headers;
+    const raw = await readJsonBody(req, MAX_ROTATE_BODY_BYTES);
+    const auth = await preamble(req, { allowPrevious: true, staleCandidate: rotateCandidate(raw) });
     if (!auth.ok) return auth.response;
     if (auth.via === "previous" && auth.stale) {
       // N1: stale S0. Handled before any other check: duplicate or lock, never another answer.
-      const body = await readValidBody(req, "RotateRequest");
+      const body = validateBody(raw, "RotateRequest");
       const outcome = await staleRotateRetry(
         getDb(),
-        { agentId: auth.agent.id, matchedHash: auth.matchedHash },
+        {
+          agentId: auth.agent.id,
+          matchedHash: auth.matchedHash,
+          verifiedCurrentHash: auth.agent.currentSecretHash,
+          staleDuplicate: auth.staleDuplicate,
+        },
         body.ok ? body.value : null,
         clientIp(req),
       );
+      if (outcome.kind === "duplicate") auth.refundAttempt?.();
       return rotateResponse(outcome);
     }
     const limit = rotatePerAgent.hit(auth.agent.id);
     if (limit.limited) return rateLimited(limit.retryAfterS);
-    const body = await readValidBody(req, "RotateRequest");
+    const body = validateBody(raw, "RotateRequest");
     if (!body.ok) {
       const details = await errorDetails(body.response);
       if (details.length > 0 && details.every((d) => d.pointer === "/new_secret")) {
@@ -213,6 +242,8 @@ export function handleRotate(req: Request): Promise<Response> {
       body.value,
       clientIp(req),
     );
+    // S0 inside the window: the attempt counted by authentication is given back on a duplicate.
+    if (outcome.kind === "duplicate") auth.refundAttempt?.();
     return rotateResponse(outcome);
   });
 }

@@ -1,6 +1,6 @@
 import { checkSemantics, validateSchema, type SchemaName, type Schemas } from "@/lib/protocol/validate";
 import { errorSummary, logger } from "@/lib/logger";
-import { readJsonBody } from "@/server/request";
+import { readJsonBody, type BodyResult } from "@/server/request";
 
 import { agentError, invalidRequest, NO_STORE, unavailable } from "./errors";
 
@@ -38,7 +38,14 @@ export async function readValidBody<K extends SchemaName>(
   req: Request,
   name: K,
 ): Promise<{ ok: true; value: Schemas[K] } | { ok: false; response: Response }> {
-  const body = await readJsonBody(req);
+  return validateBody(await readJsonBody(req), name);
+}
+
+/** Second half of {@link readValidBody}, for a body already read (e.g. `/rotate`, read before auth). */
+export function validateBody<K extends SchemaName>(
+  body: BodyResult,
+  name: K,
+): { ok: true; value: Schemas[K] } | { ok: false; response: Response } {
   if (!body.ok) {
     if (body.reason === "too_large") {
       return { ok: false, response: agentError(413, "payload_too_large") };

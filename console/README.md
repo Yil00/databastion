@@ -192,8 +192,11 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
   holder of `S1` can send it; this check runs only on the `/rotate` path authenticated with `S0`.
   After the window, a `/rotate` with `S0` has exactly two outcomes: that duplicate, or a lock.
   Any invalid body, low-entropy or other secret, unknown `job_id`, or more than 10 late retries in
-  5 min locks the agent; this path never answers `400` / `404` / `429` / `503`, never uses the
-  per-agent rotate bucket and runs at most one argon2id verification outside the rotate pool;
+  5 min locks the agent; once `S0` is recognized, this path never answers `400` / `404` / `429` /
+  `503` and never uses the per-agent rotate bucket. Its only argon2id work (does `new_secret`
+  verify against the current hash?) runs inside the authentication itself, under the pool slot and
+  the counted attempt that verified `S0` (P1-D): the `/rotate` body is read before authentication
+  for that (64 KiB cap, `413` after authentication beyond; nothing is answered about it before);
 - `rotation_conflict` (`409`): `/rotate` with `S0` and any other secret while pending or at any time
   after the promotion, or any other request with `S0` after the window. The agent is locked (every secret hash
   cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
@@ -204,7 +207,9 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
 The previous hash is kept after the 60 s window, until the next promotion replaces it, only to
 detect a later use of `S0`; it never authenticates. A wrong secret therefore costs up to three
 argon2id verifications (current, pending, previous) under a single pool slot and a single
-rate-limit attempt. `/rotate` runs its own argon2id work (hash of `S1`, comparison with the
+rate-limit attempt. A request with `S0` is genuine but never authenticates: its attempt stays
+counted against the per-agent / per-IP failure limits like a wrong secret (P1-D), so repeated uses
+of `S0` cannot cost unbounded argon2id work; only a `/rotate` answered `duplicate` gives it back. `/rotate` runs its own argon2id work (hash of `S1`, comparison with the
 pending / promoted hash) in a dedicated pool of 2 (`503` + `Retry-After` beyond) and is limited
 to 10 calls per agent per 5 min (`429`). Concurrent `/rotate` calls are serialized by conditional
 updates: of two different secrets sent together with `S0`, one is registered and the other one

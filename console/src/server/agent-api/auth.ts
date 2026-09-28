@@ -123,7 +123,24 @@ export const TOLERANCE_WINDOW_MS = 60_000;
 export type SecretSlot = "current" | "pending" | "previous";
 
 export type AuthResult =
-  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
+  | {
+      ok: true;
+      agent: AgentRow;
+      via: SecretSlot;
+      matchedHash: string;
+      stale?: boolean;
+      /**
+       * `S0` after the window on `/rotate` only: whether `staleCandidate` verified against the current
+       * hash (`agent.currentSecretHash`), computed under the same pool slot as `S0` itself.
+       * `undefined` when no well-formed candidate was given.
+       */
+      staleDuplicate?: boolean;
+      /**
+       * `via: "previous"` only: the failed-attempt reservations taken for this request are kept
+       * (a use of `S0` is counted like a failed attempt); `/rotate` gives them back on a duplicate.
+       */
+      refundAttempt?: () => void;
+    }
   | { ok: false; response: Response; staleSecret?: undefined }
   /** `S0` used after the tolerance window: the caller locks the agent (`rotation_conflict`). */
   | { ok: false; staleSecret: true; agentId: string; response?: undefined };
@@ -131,6 +148,13 @@ export type AuthResult =
 export interface AuthOptions {
   /** `/rotate` only: accept `S0` inside the tolerance window (the handler decides duplicate / conflict). */
   allowPrevious?: boolean;
+  /**
+   * `/rotate` only (with `allowPrevious`): the `new_secret` of the request body, read before
+   * authentication. When the presented secret is a stale `S0`, it is verified against the current
+   * hash under the SAME argon2id pool slot and the same counted attempt as `S0` (P1-D): the late
+   * retry check costs no verification outside the bounded pools.
+   */
+  staleCandidate?: string;
 }
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
@@ -272,11 +296,21 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   if (!exempt && agent.pendingSecretHash) candidates.push(["pending", agent.pendingSecretHash]);
   if (!exempt && agent.previousSecretHash) candidates.push(["previous", agent.previousSecretHash]);
   let match: [SecretSlot, string] | undefined;
+  let stale = false;
+  let staleDuplicate: boolean | undefined;
   try {
     for (const candidate of candidates) {
       if (await argon2Verify(candidate[1], secret)) {
         match = candidate;
         break;
+      }
+    }
+    if (match?.[0] === "previous") {
+      stale = Date.now() - (agent.promotedAt?.getTime() ?? 0) >= TOLERANCE_WINDOW_MS;
+      // P1-D: the late-retry check of a stale S0 on `/rotate` (ADR-0011) runs here, under the slot
+      // already held: at most one more verification, never outside the bounded pools, never a 503.
+      if (stale && opts.allowPrevious && opts.staleCandidate !== undefined) {
+        staleDuplicate = await argon2Verify(storedHash, opts.staleCandidate);
       }
     }
   } finally {
@@ -286,13 +320,17 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   const [slot, matchedHash] = match;
 
   if (slot === "previous") {
-    // Not a guessing attempt: the secret is genuine (old). Never counted against the limits.
-    refundIp();
-    refundAgent();
-    const promotedAt = agent.promotedAt?.getTime() ?? 0;
-    const stale = Date.now() - promotedAt >= TOLERANCE_WINDOW_MS;
+    // P1-D: the secret is genuine (old) but never authenticates. The attempt stays counted against
+    // the per-agent / per-IP limits, so repeated uses of S0 (each one up to three argon2id
+    // verifications) are bounded like wrong secrets; `/rotate` refunds it on a duplicate only.
+    const refundAttempt = () => {
+      refundIp();
+      refundAgent();
+    };
     // `/rotate` decides itself (ADR-0011): S0 + the promoted S1 is a harmless retry at any time.
-    if (opts.allowPrevious) return { ok: true, agent, via: "previous", matchedHash, stale };
+    if (opts.allowPrevious) {
+      return { ok: true, agent, via: "previous", matchedHash, stale, staleDuplicate, refundAttempt };
+    }
     if (stale) return { ok: false, staleSecret: true, agentId };
     return denied();
   }

@@ -35,7 +35,9 @@ from the per-agent failure limit (an attacker cannot lock the agent out); it nev
 
 Rotation: `authenticateAgent` also matches the pending secret (promoting it on first use) and the
 previous one (`401` inside the 60 s window, `/rotate` only gets it through; after the window the
-handler locks the agent, `409 rotation_conflict`). See the console README, "Agent secret rotation".
+handler locks the agent, `409 rotation_conflict`). A use of the previous secret stays counted as a
+failed attempt (a `/rotate` duplicate gives it back), and the late-retry check of `/rotate` runs
+under the authentication's pool slot: `S0` checks never run argon2id outside the bounded pools. See the console README, "Agent secret rotation".
 
 Long-poll: one `LISTEN` connection per process (`databastion_jobs`, `databastion_agent_revoked`),
 no database connection held while waiting. While the listener is up, a held poll re-reads only the

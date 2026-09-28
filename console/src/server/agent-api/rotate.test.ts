@@ -6,6 +6,7 @@ import { agents, auditLog, jobs, securityEvents } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import {
   agentArgon2Gate,
+  argon2Stats,
   loginArgon2Gate,
   MAX_CONCURRENT_ROTATE_ARGON2,
   newAgentSecret,
@@ -449,6 +450,66 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
       let last = 0;
       for (let i = 0; i < 11; i++) last = (await rotate(s0, { new_secret: s1 })).status;
       expect(last).toBe(429);
+    });
+  });
+
+  describe("P1-D: bounded argon2id cost of previous-secret (S0) checks", () => {
+    it("a stale S0 late retry runs its argon2id work only under the authentication pool slot", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      expireVerifiedCacheForTests();
+      // Shared agent pool saturated: nothing runs (no verification, no lock). Same answer as for any
+      // unrecognized secret, so it does not confirm S0.
+      const held = Array.from({ length: agentArgon2Gate.max }, () => agentArgon2Gate.tryAcquire());
+      try {
+        const started = argon2Stats.started;
+        const busy = await rotate(s0, { new_secret: s1.secret });
+        expect(busy.status).toBe(503);
+        expect(argon2Stats.started).toBe(started);
+        await expectNotLocked(s0.agentId);
+      } finally {
+        held.forEach((r) => r?.());
+      }
+      const started = argon2Stats.started;
+      const rotateOps = rotateStats.argon2Ops;
+      argon2Stats.maxActive = 0;
+      const ok = await rotate(s0, { new_secret: s1.secret });
+      expect(ok.status).toBe(200);
+      expect(((await ok.json()) as { duplicate: boolean }).duplicate).toBe(true);
+      // current (miss) + previous (S0) + the late-retry check, all in authenticateAgent's slot.
+      expect(argon2Stats.started - started).toBe(3);
+      expect(argon2Stats.maxActive).toBe(1);
+      expect(rotateStats.argon2Ops).toBe(rotateOps); // nothing outside the pool of authentication
+      expect(agentArgon2Gate.inUse).toBe(0);
+      await expectNotLocked(s0.agentId);
+    });
+
+    it("S0 inside the window counts as a failed attempt: bounded argon2id work, then 429", async () => {
+      const { s0, s1 } = await rotated();
+      expireVerifiedCacheForTests();
+      const started = argon2Stats.started;
+      const statuses: number[] = [];
+      for (let i = 0; i < 12; i++) statuses.push((await heartbeat(s0)).status);
+      expect(statuses.slice(0, failuresPerAgent.limit)).toEqual(Array(failuresPerAgent.limit).fill(401));
+      expect(statuses.slice(failuresPerAgent.limit)).toEqual([429, 429]);
+      // At most three verifications (current, pending, previous) per counted attempt.
+      expect(argon2Stats.started - started).toBeLessThanOrEqual(3 * failuresPerAgent.limit);
+      await expectNotLocked(s0.agentId);
+      // The current secret was verified before: known good, exempt from the per-agent limit.
+      expect((await heartbeat(s1)).status).toBe(200);
+    });
+
+    it("a /rotate duplicate with S0 gives its attempt back (inside and after the window)", async () => {
+      const { s0, s1 } = await rotated();
+      for (let i = 0; i < 5; i++) {
+        expireVerifiedCacheForTests();
+        expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      }
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      for (let i = 0; i < 5; i++) expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      // Ten counted attempts would have reached the per-agent limit.
+      expect(failuresPerAgent.check(s0.agentId).limited).toBe(false);
+      await expectNotLocked(s0.agentId);
     });
   });
 
