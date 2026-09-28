@@ -45,13 +45,13 @@ Dev-only values in [.env.example](.env.example), copied to `dev/.env` (git-ignor
 | Engine | Account | Rights |
 |--------|---------|--------|
 | PostgreSQL | `databastion` | [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) minimal variant: `CONNECTION LIMIT 4`, no superuser / createdb / createrole / replication / bypassrls; `CONNECT`, `USAGE` + `SELECT` on `crm`, `billing`, `ops` (+ default privileges `FOR ROLE postgres`), `pg_read_all_stats`; role defaults `default_transaction_read_only=on`, `statement_timeout=30s`, `lock_timeout=2s`, `idle_in_transaction_session_timeout=60s` |
-| MariaDB / MySQL | `databastion@'%'` | `SELECT, PROCESS, SHOW VIEW ON *.*`, `SELECT ON performance_schema.*` |
+| MariaDB / MySQL | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`, no `performance_schema` grant before Audit (P4-B) |
 | MongoDB | `databastion` (auth db `admin`) | `read` on `app`, `clusterMonitor` |
 | OpenLDAP | `cn=databastion,ou=services,dc=example,dc=org` | read on the tree (except `userPassword`) and on `cn=accesslog` |
 
 PostgreSQL: no `pg_read_all_data` / `pg_monitor` (they expose `pg_authid`, `pg_user_mapping`, `pg_subscription`, large objects and raw statistics, ADR-0012); a schema added to the seed needs its own `USAGE` / `SELECT` grants in [postgres/initdb/20-databastion.sh](postgres/initdb/20-databastion.sh). `make dev-smoke` checks that the account cannot read `pg_authid` nor `pg_user_mapping`.
 
-MySQL / MariaDB: `SELECT ON *.*` also covers the system schemas; Discovery excludes `mysql`, `information_schema`, `performance_schema` and `sys` from sampling. The `'%'` host is only because the agent connects through the published port in dev.
+MySQL / MariaDB: no `SELECT ON *.*` (it would expose the `mysql.user` / `mysql.global_priv` password hashes and `mysql.servers` credentials, ADR-0018); a database added to the seed needs its own `GRANT SELECT` in `initdb/20-databastion.sh`. The account requires TLS (clients: `--ssl-mode=REQUIRED` / `--ssl`, which the dev certificates allow). `make dev-smoke` checks that it cannot read `mysql.user` / `mysql.global_priv` nor connect without TLS. The `'%'` host is only because the agent connects through the published port in dev.
 
 Administrator accounts (`postgres`, `root`, `cn=admin,dc=example,dc=org`) exist for seeding and manual inspection only.
 
@@ -123,8 +123,10 @@ export DATABASTION_TEST_MARIADB_NETWORK_HOST="$(docker inspect -f '{{range .Netw
 The admin URLs are for the probe fixtures (databases `databastion_probe` and
 `databastion_probe_sink`, accounts `databastion_it_*`, the `ha_federatedx` and `auth_pam` plugins
 installed on MariaDB). MySQL accounts use `caching_sha2_password`, whose full authentication the
-connector only performs over TLS: without `DATABASTION_TEST_MYSQL_CA_FILE` the MySQL fixture tests are
-skipped. `DATABASTION_TEST_REQUIRE` accepts `mysql`, `mariadb`, `mysql-admin`, `mariadb-admin`,
+connector only performs over TLS, and the dev agent account requires TLS: without
+`DATABASTION_TEST_<S>_CA_FILE` the tests of that server are skipped. The probes scan with test
+accounts (`databastion_it_scan` on the probe database, `databastion_it_min`, `databastion_it_rw`,
+`databastion_it_ext` for the extended variant) so that the dev account keeps its minimal grants. `DATABASTION_TEST_REQUIRE` accepts `mysql`, `mariadb`, `mysql-admin`, `mariadb-admin`,
 `mysql-tls`, `mariadb-tls`, `federated`, `pam`, `network` (or `all`).
 
 ## Seed data and ground truth
