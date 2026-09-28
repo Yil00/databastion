@@ -84,6 +84,8 @@ CREATE USER 'databastion'@'localhost' IDENTIFIED BY '...';
 GRANT SELECT, PROCESS, SHOW VIEW ON *.* TO 'databastion'@'localhost';
 GRANT SELECT ON performance_schema.* TO 'databastion'@'localhost';
 ```
+**PostgreSQL grants are provisional.** `pg_read_all_data` likely exposes catalog tables such as `pg_authid` (SCRAM verifiers), and `pg_monitor` exposes other users' query text. The production grant set, and how catalog and query-text samples are masked, is decided before the PostgreSQL connector ships (ROADMAP P2-0). The grants used by the end-to-end harness (`e2e/`) are not a reference.
+
 **MySQL / MariaDB system schemas**: `SELECT ON *.*` also grants read access to `mysql.user` (password hashes) and the other system tables. Discovery must exclude the system schemas `mysql`, `information_schema`, `performance_schema` and `sys` from sampling (`performance_schema` is read for Audit only). Where practical, grant `SELECT` on the application databases only instead of `*.*`.
 
 MongoDB: `read` roles on the targeted databases + `clusterMonitor`. OpenLDAP: a service DN with read rights on the tree and on `cn=accesslog`.
@@ -91,6 +93,7 @@ MongoDB: `read` roles on the targeted databases + `clusterMonitor`. OpenLDAP: a 
 ## Deployment recommendations
 - Agents and console run as a **non-root** user, read-only file system, `cap_drop: ALL`, `no-new-privileges`
 - Console behind a reverse proxy (Traefik / Nginx / Caddy) with HTTPS
+- The reverse proxy must not log the `X-CSRF-Token`, `Authorization` or `Cookie` request headers. Caddy redacts only `Authorization`, `Cookie` and `Set-Cookie` by default; add a log filter for `X-CSRF-Token` (see [e2e/Caddyfile](../e2e/Caddyfile)). Check the equivalent settings on other proxies
 - The console's internal database is never exposed outside the Docker network
 - Enable the databases' native logs (pgaudit, MariaDB audit plugin, OpenLDAP `accesslog`…)
 
