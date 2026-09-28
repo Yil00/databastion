@@ -6,12 +6,15 @@ import io
 import json
 import os
 import tempfile
+import sys
 import unittest
 import unicodedata
 
-import i2_check
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # also runs from the repository root
+
+import i2_check  # noqa: E402
+
 REPO = os.path.dirname(HERE)
 GROUND_TRUTH = os.path.join(REPO, "dev", "ground-truth.json")
 SEED_PG = os.path.join(REPO, "dev", "seed", "out", "postgres.sql")
@@ -73,7 +76,7 @@ CLEAN = "\n".join([
     "masked: L*** M*** O*** C*** M***",
     "masked: **** **** **** 4578",
     "masked: DE** **** **** **** **** 85",
-    "masked: ** ** ** ** 59  +33 * ** ** ** 79  +44 **** ***404  +1 *** *** 0125",
+    "masked: ** ** ** ** 59  +33 * ** ** ** 79  +44 **** ****04  +1 *** *** **25",
     "masked: * ** ** ** *** *** **  ****-**-**",
     "ts: 2026-09-28T20:54:01.123Z 2026-09-28 20:54:01.123456+00 1759092841123",
     "sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -104,7 +107,27 @@ PLANTED = {
     "url-encoded": ("GET /x?q=manon.bernard%40example.com", "L0.v0"),
     "person name in a name": ("object archive_lucas_martin", "L9.object"),
     "person name alone": ("user martin logged in", "L1.v1"),
+    "phone national significant number": ("msisdn=639987879", "L5.v1"),
+    "uk phone national significant number": ("uk:7700900404", "L5.v2"),
+    "iban bban": ("bban=99942494871529048 5", "L4.v0"),
+    "e-mail local part": ("login manon.bernard failed", "L0.v0.local"),
 }
+
+# pg_dump COPY text format: backslashes doubled, jsonb with \uXXXX escapes (as text produced by
+# JSON.stringify of an escaped string), SQL literals with doubled quotes in function bodies.
+PG_DUMP_EXCERPT = "\n".join([
+    "COPY public.audit_log (id, action, details) FROM stdin;",
+    '1\tscan\t{"note": "Chlo\\u00e9 Lef\\u00e8vre", "tel": "01 99 00 27 59"}',
+    "\\.",
+    "CREATE FUNCTION public.f() RETURNS text LANGUAGE sql AS $$ SELECT 'O''Connor' $$;",
+])
+
+# Next.js React Server Components payload: JSON-escaped strings inside self.__next_f.push.
+RSC_EXCERPT = (
+    '<script>self.__next_f.push([1,"5:[\\"$\\",\\"li\\",\\"0\\",'
+    '{\\"children\\":\\"4111 1101 9561 4578\\"}]\\n6:[\\"$\\",\\"td\\",null,'
+    '{\\"children\\":\\"M\\u00fcller \\u0026 manon.bernard\\u0040example.com\\"}]\\n"])</script>'
+)
 
 
 def run(argv: list[str]) -> tuple[int, str]:
@@ -143,9 +166,19 @@ class FoldTest(unittest.TestCase):
         self.assertEqual(i2_check.fold("Straße"), "strasse")
 
     def test_phone_variants(self) -> None:
-        self.assertEqual(i2_check.phone_variants("01 99 00 27 59"), {"0199002759", "33199002759"})
-        self.assertEqual(i2_check.phone_variants("+33 6 39 98 78 79"), {"33639987879", "0639987879"})
+        self.assertEqual(i2_check.phone_variants("01 99 00 27 59"),
+                         {"0199002759", "33199002759", "199002759"})
+        self.assertEqual(i2_check.phone_variants("+33 6 39 98 78 79"),
+                         {"33639987879", "0639987879", "639987879"})
+        self.assertEqual(i2_check.phone_variants("+44 7700 900404"),
+                         {"447700900404", "07700900404", "7700900404"})
         self.assertEqual(i2_check.phone_variants("+1 202 555 0125"), {"12025550125", "2025550125"})
+
+    def test_iban_bban_and_email_local_part(self) -> None:
+        self.assertEqual(i2_check.iban_bban("DE09 9994 2494 8715 2904 85"), "999424948715290485")
+        self.assertIsNone(i2_check.iban_bban("1234 5678"))
+        self.assertEqual(i2_check.email_local_part("Manon.Bernard@example.com"), "manon.bernard")
+        self.assertIsNone(i2_check.email_local_part("ava.li@example.com"))  # < 8 alphanumerics
 
 
 class PlanTest(Base):
@@ -202,6 +235,26 @@ class ScanTest(Base):
     def test_no_partial_match_inside_longer_digit_runs(self) -> None:
         rc, out = self.scan(self.write("a.log", "id 90199002759 and 01990027591 and 141111101956145780"))
         self.assertEqual(rc, 0, out)
+        # The national significant number keeps the digit guard: not inside a longer run.
+        rc, out = self.scan(self.write("b.log", "id 5639987879 and 77009004041"))
+        self.assertEqual(rc, 0, out)
+
+    def test_email_local_part_is_bounded(self) -> None:
+        rc, out = self.scan(self.write("a.log", "xmanon.bernardx manon.bernard2"))
+        self.assertEqual(rc, 0, out)
+
+    def test_pg_dump_copy_excerpt(self) -> None:
+        rc, out = self.scan(self.write("dump.sql", CLEAN + "\n" + PG_DUMP_EXCERPT))
+        self.assertEqual(rc, 1, out)
+        for nid, view in (("L2.v0", "json-escapes"), ("L1.v0", "json-escapes"),
+                          ("L5.v0", "raw"), ("L1.v3", "sql-quotes")):
+            self.assertRegex(out, rf"LEAK {nid} .* view={view} ", nid)
+
+    def test_rsc_payload_excerpt(self) -> None:
+        rc, out = self.scan(self.write("page.html", CLEAN + "\n" + RSC_EXCERPT))
+        self.assertEqual(rc, 1, out)
+        for nid in ("L3.v0", "L1.v2", "L0.v0"):
+            self.assertIn(f"LEAK {nid} ", out)
 
     def test_masked_mixed_with_separators_do_not_join(self) -> None:
         # A masked card next to the kept digits of another sample: `*` breaks the projection.
@@ -283,6 +336,76 @@ class FindingsTest(Base):
         rc, out = self.check([r for r in self.ROWS if r["object_name"] != "*"])
         self.assertEqual(rc, 1, out)
         self.assertIn("expected normalized name", out)
+
+
+def page(rows: list[tuple[str, list[str] | str]]) -> str:
+    """A findings page shaped like console/src/components/console/findings-table.tsx."""
+    head = ("<table><thead><tr><th>Agent</th><th>Target</th><th>Classifier</th></tr></thead>"
+            "<tbody><tr><td>e2e</td><td>pg-e2e</td><td>pii.email</td></tr></tbody></table>")
+    cols = ["Target", "Location", "Classifier", "Confidence", "Matched / sampled", "Est. rows",
+            "Masked samples", "Fingerprints", "Last seen", ""]
+    out = [head, "<table><thead><tr>", "".join(f"<th>{c}</th>" for c in cols), "</tr></thead><tbody>"]
+    for cls, samples in rows:
+        if isinstance(samples, str):
+            cell = f'<span class="text-muted-foreground">{samples}</span>'
+        else:
+            cell = '<ul class="font-mono text-xs">' + "".join(f"<li>{x}</li>" for x in samples) + "</ul>"
+        out.append(f"<tr><td>e2e / pg-e2e<div>postgres</div></td><td>shop / crm / t / c</td>"
+                   f"<td>{cls}<!-- --></td><td>0.90</td><td>9 / 10</td><td>10</td><td>{cell}</td>"
+                   f"<td>3</td><td>1 min</td><td><button>Mark</button></td></tr>")
+    out.append("</tbody></table>")
+    return "".join(out)
+
+
+class PageTest(Base):
+    GOOD = [
+        ("pii.card_number", ["**** **** **** 4578", "**** **** **** 0484"]),
+        ("pii.iban", ["DE** **** **** **** **28 82"]),
+        ("pii.phone", ["+33 * ** ** ** 79", "+1 *** *** **25", "** ** ** ** 59"]),
+        ("pii.nir", ["* ** ** ** *** *** **"]),
+        ("pii.email", ["m***@e***.com"]),
+        ("pii.postal_address", "none"),
+    ]
+
+    def check(self, rows, expected: int | None, min_sampled: int) -> tuple[int, str]:
+        path = self.write("findings.html", page(rows))
+        argv = ["page", "--min-sampled-rows", str(min_sampled)]
+        if expected is not None:
+            argv += ["--expected-rows", str(expected)]
+        return run(argv + [path])
+
+    def test_ok(self) -> None:
+        rc, out = self.check(self.GOOD, 6, 5)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("6 row(s), 5 with rendered samples, 8 sample(s)", out)
+
+    def test_partial_masking_regression(self) -> None:
+        # 8 of 16 card digits kept: no full value, so the value search cannot see it.
+        planted = "4111 1101 **** 4578"
+        rows = self.GOOD + [("pii.card_number", [planted])]
+        rc, out = self.check(rows, 7, 6)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 masked sample(s) of pii.card_number keep more than 4 digits", out)
+        self.assertNotIn("4111", out)
+        rc, out = self.check(self.GOOD + [("pii.phone", ["+33 6 39 ** ** 79"])], 7, 6)
+        self.assertEqual(rc, 1, out)
+
+    def test_unavailable_samples(self) -> None:
+        rc, out = self.check(self.GOOD + [("pii.iban", "unavailable")], 7, 5)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("'unavailable'", out)
+
+    def test_vacuous_page(self) -> None:
+        rc, out = self.check(self.GOOD, 7, 5)  # a row missing (e.g. listing cap)
+        self.assertEqual(rc, 1, out)
+        rc, out = self.check(self.GOOD, 6, 6)  # fewer rows with samples than stored
+        self.assertEqual(rc, 1, out)
+        rc, out = self.check([("pii.email", "none")], 1, 0)  # nothing to scan
+        self.assertEqual(rc, 1, out)
+
+    def test_not_a_findings_page(self) -> None:
+        rc, out = run(["page", "--min-sampled-rows", "1", self.write("x.html", "<p>login</p>")])
+        self.assertEqual(rc, 2, out)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ Subcommands
   findings  Checks the console's findings rows (JSON array, see run.sh) against the ground truth:
             at least one finding, required classifiers present, value-bearing names stored in their
             expected normalized form (ADR-0009) and never in their raw form.
+  page      Checks the rendered findings page (masked samples decrypted): the table is complete
+            (expected row count, enough rendered samples, no `unavailable` samples) and no masked
+            sample keeps more than MAX_CLEAR_DIGITS digits (masking contract: at most 4 kept), which
+            catches partial masking regressions that the value search cannot see.
 
 Output: counts, needle ids (`L<location index>.v<value index>`, `.n<name value index>`,
 `.object`) and file names only. A matched value, or a value-bearing name, is never printed: the
@@ -32,7 +36,11 @@ What "in clear" means (a *needle* is one ground-truth value or value-bearing nam
   searched with their separators removed, in a projection of each view where runs of up to three
   separator characters (space, tab, . - / ( ) + _) between two letters / digits are deleted. The
   match must not be preceded or followed by a digit (no partial match inside a longer digit run).
-  Phones also get their international / national variants (+33 6 12... <-> 06 12..., +44, +1).
+  Phones also get their international / national variants (+33 6 12... <-> 06 12..., +44, +1)
+  and their national significant number (no trunk or country prefix); IBANs also their BBAN
+  (without the country code and check digits).
+  E-mail local parts with at least BOUNDED_BELOW letters / digits are extra bounded needles
+  ("jean.dubois" in "jean.dubois@other.example").
   Masked samples (at most 4 digits kept, `*` elsewhere) cannot match: `*` is not a separator.
 
 Exclusions (reported as counts, never silently)
@@ -42,6 +50,9 @@ Exclusions (reported as counts, never silently)
           independently of the target data. Keep this list tight and justified.
 Not searched: encrypted or encoded forms (base64, hex): masked samples are encrypted at rest in the
 console, which is why run.sh also scans the rendered findings page, where they are decrypted.
+Partial digit runs of a value (e.g. 8 of 16 card digits) are not needles: with the seed's shared
+prefixes (411111..., 01 99 00...) they would match timestamps and hashes. The `page` subcommand
+bounds the clear digits of every masked sample instead.
 """
 
 from __future__ import annotations
@@ -56,6 +67,7 @@ import sys
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Iterable, Iterator
 
 MIN_ALNUM = 4
@@ -63,6 +75,7 @@ BOUNDED_BELOW = 8
 COMPACT_MIN_ALNUM = 9
 COMPACT_MIN_DIGITS = 6
 MAX_FILE_BYTES = 512 * 1024 * 1024
+MAX_CLEAR_DIGITS = 4
 
 # Folded single words that also occur in the console independently of the target data.
 # word -> reason. Empty on purpose: add an entry only with evidence, never to hide a real leak.
@@ -92,21 +105,44 @@ def compact(s: str) -> str:
 
 
 def phone_variants(raw: str) -> set[str]:
-    """Digit-only forms of the same phone number (international <-> national)."""
+    """Digit-only forms of the same phone number: international, national (trunk prefix 0) and
+    national significant number (neither prefix)."""
     digits = "".join(c for c in raw if c.isdigit())
     out = {digits}
     s = raw.strip()
+    nsn = None
     if s.startswith("+"):
         for cc in _TRUNK_PREFIX_CODES:
             if digits.startswith(cc):
-                out.add("0" + digits[len(cc):])
+                nsn = digits[len(cc):]
+                out.add("0" + nsn)
         if digits.startswith("1") and len(digits) == 11:
-            out.add(digits[1:])
+            nsn = digits[1:]
     elif digits.startswith("0") and len(digits) == 10:
-        out.add("33" + digits[1:])
+        nsn = digits[1:]
+        out.add("33" + nsn)
     elif digits.startswith("33") and len(digits) == 11:
-        out.add("0" + digits[2:])
+        nsn = digits[2:]
+        out.add("0" + nsn)
+    if nsn:
+        out.add(nsn)
     return {d for d in out if len(d) >= COMPACT_MIN_ALNUM}
+
+
+def iban_bban(raw: str) -> str | None:
+    """The BBAN (IBAN without its country code and check digits), folded and compact."""
+    c = compact(fold(raw))
+    if len(c) > 4 and c[:2].isalpha() and c[2:4].isdigit():
+        return c[4:]
+    return None
+
+
+def email_local_part(raw: str) -> str | None:
+    folded = fold(raw)
+    if folded.count("@") != 1:
+        return None
+    local = folded.split("@", 1)[0]
+    return local if alnum_count(local) >= BOUNDED_BELOW else None
 
 
 @dataclass
@@ -173,7 +209,15 @@ def build_plan(ground_truth: dict, engine: str) -> Plan:
                 needle.compacts.add(c)
                 if "pii.phone" in cls:
                     needle.compacts |= phone_variants(raw)
+                if "pii.iban" in cls:
+                    bban = iban_bban(raw)
+                    if bban and len(bban) >= COMPACT_MIN_ALNUM:
+                        needle.compacts.add(bban)
             needles.append(needle)
+            if "pii.email" in cls:
+                local = email_local_part(raw)
+                if local:
+                    needles.append(Needle(f"{nid}.local", i, kind + "_local_part", local, True))
     return Plan(needles, excluded, locations)
 
 
@@ -231,6 +275,9 @@ class Hit:
 class Matcher:
     def __init__(self, plan: Plan) -> None:
         self.plan = plan
+        ids = [n.id for n in plan.needles]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate needle ids")
         self._bounded = {n.id: _bounded_regex(n.plain) for n in plan.needles if n.bounded}
         self._compact = {(n.id, c): _compact_regex(c) for n in plan.needles for c in n.compacts}
 
@@ -427,6 +474,120 @@ def cmd_findings(args: argparse.Namespace, out) -> int:
     return 1 if errors else 0
 
 
+# ---------------------------------------------------------------------------------- findings page
+class _FindingsTableParser(HTMLParser):
+    """Rows of the findings page's locations table (the one with a "Masked samples" column):
+    per row, the classifier cell text, the rendered samples (<li>) and the samples cell text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[dict] = []
+        self._stack: list[dict] = []
+        self._cell: list[str] | None = None
+        self._li: list[str] | None = None
+        self._in_head = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "table":
+            self._stack.append({"headers": [], "rows": []})
+        elif not self._stack:
+            return
+        elif tag == "thead":
+            self._in_head = True
+        elif tag == "tbody":
+            self._in_head = False
+        elif tag == "tr" and not self._in_head:
+            self._stack[-1]["rows"].append({"cells": [], "samples": []})
+        elif tag in ("td", "th"):
+            self._cell = []
+        elif tag == "li" and self._cell is not None:
+            self._li = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._stack:
+            return
+        t = self._stack[-1]
+        if tag == "table":
+            self.tables.append(self._stack.pop())
+        elif tag == "li" and self._li is not None:
+            if t["rows"]:
+                t["rows"][-1]["samples"].append(("".join(self._li), len(t["rows"][-1]["cells"])))
+            self._li = None
+        elif tag in ("td", "th") and self._cell is not None:
+            text = " ".join("".join(self._cell).split())
+            if self._in_head or tag == "th":
+                t["headers"].append(text)
+            elif t["rows"]:
+                t["rows"][-1]["cells"].append(text)
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+        if self._li is not None:
+            self._li.append(data)
+
+
+def parse_findings_page(text: str) -> list[dict]:
+    """[{classifier, samples: [str], samples_cell: str}] of the locations table."""
+    p = _FindingsTableParser()
+    p.feed(text)
+    p.close()
+    tables = [t for t in p.tables if "Masked samples" in t["headers"]]
+    if len(tables) != 1:
+        raise ValueError(f"expected one findings table with a 'Masked samples' column, found {len(tables)}")
+    t = tables[0]
+    h = t["headers"]
+    ci, si = h.index("Classifier"), h.index("Masked samples")
+    rows = []
+    for r in t["rows"]:
+        cells = r["cells"]
+        if len(cells) <= max(ci, si):
+            continue
+        rows.append({
+            "classifier": cells[ci].split(" ")[0],
+            "samples": [s for s, col in r["samples"] if col == si],
+            "samples_cell": cells[si],
+        })
+    return rows
+
+
+def check_page(rows: list[dict], expected_rows: int | None, min_sampled_rows: int) -> tuple[list[str], list[str]]:
+    """Returns (errors, info); never a sample."""
+    errors: list[str] = []
+    info: list[str] = []
+    with_samples = [r for r in rows if r["samples"]]
+    n_samples = sum(len(r["samples"]) for r in rows)
+    info.append(f"{len(rows)} row(s), {len(with_samples)} with rendered samples, {n_samples} sample(s)")
+    if expected_rows is not None and len(rows) != expected_rows:
+        errors.append(f"{len(rows)} row(s) rendered, {expected_rows} expected")
+    if min_sampled_rows <= 0:
+        errors.append("no finding with masked samples in the database: the page scan would prove nothing")
+    if len(with_samples) < min_sampled_rows:
+        errors.append(f"{len(with_samples)} row(s) with rendered samples, at least {min_sampled_rows} expected")
+    unavailable = sum(1 for r in rows if r["samples_cell"] == "unavailable")
+    if unavailable:
+        errors.append(f"{unavailable} row(s) with samples 'unavailable' (not decrypted: not scanned)")
+    over: dict[str, int] = {}
+    for r in rows:
+        for s in r["samples"]:
+            if sum(c.isdigit() for c in s) > MAX_CLEAR_DIGITS:
+                over[r["classifier"]] = over.get(r["classifier"], 0) + 1
+    for cls, n in sorted(over.items()):
+        errors.append(f"{n} masked sample(s) of {cls} keep more than {MAX_CLEAR_DIGITS} digits")
+    return errors, info
+
+
+def cmd_page(args: argparse.Namespace, out) -> int:
+    rows = parse_findings_page(read_text(args.page))
+    errors, info = check_page(rows, args.expected_rows, args.min_sampled_rows)
+    for line in info:
+        print(f"i2 page: {line}", file=out)
+    for line in errors:
+        print(f"i2 page: FAIL {line}", file=out)
+    return 1 if errors else 0
+
+
 def main(argv: list[str] | None = None, out=None) -> int:
     out = out or sys.stdout
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -444,12 +605,18 @@ def main(argv: list[str] | None = None, out=None) -> int:
     f.add_argument("--engine", required=True)
     f.add_argument("--require-classifier", action="append", default=[])
     f.add_argument("rows")
+    g = sub.add_parser("page")
+    g.add_argument("--expected-rows", type=int, default=None)
+    g.add_argument("--min-sampled-rows", type=int, required=True)
+    g.add_argument("page")
     args = p.parse_args(argv)
     try:
         if args.cmd == "scan":
             return cmd_scan(args, out)
         if args.cmd == "coverage":
             return cmd_coverage(args, out)
+        if args.cmd == "page":
+            return cmd_page(args, out)
         return cmd_findings(args, out)
     except (OSError, ValueError) as e:
         # OSError / ValueError messages hold file names only, never file contents.
