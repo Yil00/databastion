@@ -1,0 +1,4259 @@
+{
+ "_generated": "dev/seed/generate.py (seed 20260928); FAKE data only",
+ "collections": {
+  "address_books": [
+   {
+    "_id": "ab0001",
+    "contacts": {
+     "james.johnson@example.com": {
+      "name": "James Johnson",
+      "phone": "09 72 10 60 21"
+     },
+     "lea.bertrand1@example.net": {
+      "name": "Léa Bertrand",
+      "phone": "05 36 49 18 76"
+     },
+     "mia.nielsen@example.net": {
+      "name": "Mia Nielsen",
+      "phone": "03 53 01 19 57"
+     }
+    },
+    "owner": "u0001"
+   },
+   {
+    "_id": "ab0002",
+    "contacts": {
+     "arthur.thomas1@example.net": {
+      "name": "Arthur Thomas",
+      "phone": "01 99 00 90 39"
+     },
+     "noe.garcia@example.com": {
+      "name": "Noé Garcia",
+      "phone": "04 65 71 55 57"
+     },
+     "raphael.simon@example.net": {
+      "name": "Raphaël Simon",
+      "phone": "03 53 01 18 47"
+     }
+    },
+    "owner": "u0002"
+   },
+   {
+    "_id": "ab0003",
+    "contacts": {
+     "hugo.michel1@example.org": {
+      "name": "Hugo Michel",
+      "phone": "03 53 01 58 28"
+     },
+     "jean.richard@example.net": {
+      "name": "Jean Richard",
+      "phone": "01 99 00 83 01"
+     },
+     "raphael.david1@example.com": {
+      "name": "Raphaël David",
+      "phone": "06 39 98 95 15"
+     }
+    },
+    "owner": "u0003"
+   },
+   {
+    "_id": "ab0004",
+    "contacts": {
+     "elodie.vincent1@example.org": {
+      "name": "Élodie Vincent",
+      "phone": "02 61 91 35 45"
+     },
+     "hugo.durand@example.com": {
+      "name": "Hugo Durand",
+      "phone": "06 39 98 03 34"
+     },
+     "raphael.simon1@example.org": {
+      "name": "Raphaël Simon",
+      "phone": "09 72 10 04 24"
+     }
+    },
+    "owner": "u0004"
+   },
+   {
+    "_id": "ab0005",
+    "contacts": {
+     "hugo.bertrand1@example.net": {
+      "name": "Hugo Bertrand",
+      "phone": "09 72 10 96 13"
+     },
+     "manon.bernard@example.org": {
+      "name": "Manon Bernard",
+      "phone": "01 99 00 24 56"
+     },
+     "nathan.moreau@example.net": {
+      "name": "Nathan Moreau",
+      "phone": "09 72 10 89 44"
+     }
+    },
+    "owner": "u0005"
+   },
+   {
+    "_id": "ab0006",
+    "contacts": {
+     "chloe.moreau@example.net": {
+      "name": "Chloé Moreau",
+      "phone": "05 36 49 03 57"
+     },
+     "louis.roux@example.com": {
+      "name": "Louis Roux",
+      "phone": "06 39 98 76 51"
+     },
+     "zoe.dubois@example.com": {
+      "name": "Zoé Dubois",
+      "phone": "03 53 01 56 04"
+     }
+    },
+    "owner": "u0006"
+   },
+   {
+    "_id": "ab0007",
+    "contacts": {
+     "chloe.thomas1@example.net": {
+      "name": "Chloé Thomas",
+      "phone": "02 61 91 21 61"
+     },
+     "lea.lefevre@example.org": {
+      "name": "Léa Lefèvre",
+      "phone": "09 72 10 49 56"
+     },
+     "nathan.leroy1@example.com": {
+      "name": "Nathan Leroy",
+      "phone": "01 99 00 56 69"
+     }
+    },
+    "owner": "u0007"
+   },
+   {
+    "_id": "ab0008",
+    "contacts": {
+     "hannah.taylor1@example.net": {
+      "name": "Hannah Taylor",
+      "phone": "06 39 98 97 54"
+     },
+     "lea.garcia1@example.org": {
+      "name": "Léa Garcia",
+      "phone": "03 53 01 28 65"
+     },
+     "louis.leroy2@example.com": {
+      "name": "Louis Leroy",
+      "phone": "06 39 98 87 43"
+     }
+    },
+    "owner": "u0008"
+   },
+   {
+    "_id": "ab0009",
+    "contacts": {
+     "arthur.michel@example.net": {
+      "name": "Arthur Michel",
+      "phone": "09 72 10 98 44"
+     },
+     "nathan.durand@example.org": {
+      "name": "Nathan Durand",
+      "phone": "02 61 91 91 68"
+     },
+     "sofia.muller@example.com": {
+      "name": "Sofia Müller",
+      "phone": "02 61 91 26 28"
+     }
+    },
+    "owner": "u0009"
+   },
+   {
+    "_id": "ab0010",
+    "contacts": {
+     "camille.durand1@example.com": {
+      "name": "Camille Durand",
+      "phone": "09 72 10 60 15"
+     },
+     "louis.roux@example.net": {
+      "name": "Louis Roux",
+      "phone": "02 61 91 00 17"
+     },
+     "mateo.williams@example.net": {
+      "name": "Mateo Williams",
+      "phone": "05 36 49 57 28"
+     }
+    },
+    "owner": "u0010"
+   },
+   {
+    "_id": "ab0011",
+    "contacts": {
+     "elijah.muller@example.org": {
+      "name": "Elijah Müller",
+      "phone": "02 61 91 88 47"
+     },
+     "nathan.durand@example.com": {
+      "name": "Nathan Durand",
+      "phone": "04 65 71 10 33"
+     },
+     "raphael.durand1@example.net": {
+      "name": "Raphaël Durand",
+      "phone": "02 61 91 91 24"
+     }
+    },
+    "owner": "u0011"
+   },
+   {
+    "_id": "ab0012",
+    "contacts": {
+     "gabriel.robert1@example.org": {
+      "name": "Gabriel Robert",
+      "phone": "06 39 98 96 96"
+     },
+     "liam.evans@example.com": {
+      "name": "Liam Evans",
+      "phone": "06 39 98 94 64"
+     },
+     "oliver.schmidt1@example.net": {
+      "name": "Oliver Schmidt",
+      "phone": "09 72 10 90 06"
+     }
+    },
+    "owner": "u0012"
+   },
+   {
+    "_id": "ab0013",
+    "contacts": {
+     "jade.lefevre@example.org": {
+      "name": "Jade Lefèvre",
+      "phone": "01 99 00 07 77"
+     },
+     "james.johnson1@example.org": {
+      "name": "James Johnson",
+      "phone": "05 36 49 26 46"
+     },
+     "theo.david2@example.com": {
+      "name": "Théo David",
+      "phone": "06 39 98 74 31"
+     }
+    },
+    "owner": "u0013"
+   },
+   {
+    "_id": "ab0014",
+    "contacts": {
+     "nathan.durand1@example.net": {
+      "name": "Nathan Durand",
+      "phone": "05 36 49 74 06"
+     },
+     "noe.lefevre@example.net": {
+      "name": "Noé Lefèvre",
+      "phone": "09 72 10 06 67"
+     },
+     "raphael.simon@example.com": {
+      "name": "Raphaël Simon",
+      "phone": "06 39 98 97 32"
+     }
+    },
+    "owner": "u0014"
+   },
+   {
+    "_id": "ab0015",
+    "contacts": {
+     "jean.richard2@example.net": {
+      "name": "Jean Richard",
+      "phone": "06 39 98 33 35"
+     },
+     "manon.lefevre2@example.com": {
+      "name": "Manon Lefèvre",
+      "phone": "06 39 98 61 84"
+     },
+     "mateo.williams1@example.net": {
+      "name": "Mateo Williams",
+      "phone": "06 39 98 67 68"
+     }
+    },
+    "owner": "u0015"
+   },
+   {
+    "_id": "ab0016",
+    "contacts": {
+     "chloe.thomas@example.net": {
+      "name": "Chloé Thomas",
+      "phone": "04 65 71 86 05"
+     },
+     "emma.o-connor@example.org": {
+      "name": "Emma O'Connor",
+      "phone": "02 61 91 41 57"
+     },
+     "liam.taylor1@example.org": {
+      "name": "Liam Taylor",
+      "phone": "03 53 01 41 41"
+     }
+    },
+    "owner": "u0016"
+   },
+   {
+    "_id": "ab0017",
+    "contacts": {
+     "arthur.michel1@example.org": {
+      "name": "Arthur Michel",
+      "phone": "06 39 98 86 26"
+     },
+     "camille.robert1@example.org": {
+      "name": "Camille Robert",
+      "phone": "05 36 49 93 61"
+     },
+     "theo.petit@example.org": {
+      "name": "Théo Petit",
+      "phone": "05 36 49 08 35"
+     }
+    },
+    "owner": "u0017"
+   },
+   {
+    "_id": "ab0018",
+    "contacts": {
+     "chloe.lefevre@example.net": {
+      "name": "Chloé Lefèvre",
+      "phone": "05 36 49 92 23"
+     },
+     "jean.bertrand1@example.org": {
+      "name": "Jean Bertrand",
+      "phone": "03 53 01 39 38"
+     },
+     "zoe.moreau@example.com": {
+      "name": "Zoé Moreau",
+      "phone": "05 36 49 01 81"
+     }
+    },
+    "owner": "u0018"
+   },
+   {
+    "_id": "ab0019",
+    "contacts": {
+     "gabriel.david@example.net": {
+      "name": "Gabriel David",
+      "phone": "06 39 98 04 49"
+     },
+     "raphael.durand@example.org": {
+      "name": "Raphaël Durand",
+      "phone": "09 72 10 37 55"
+     },
+     "raphael.simon1@example.com": {
+      "name": "Raphaël Simon",
+      "phone": "09 72 10 15 84"
+     }
+    },
+    "owner": "u0019"
+   },
+   {
+    "_id": "ab0020",
+    "contacts": {
+     "lea.michel1@example.com": {
+      "name": "Léa Michel",
+      "phone": "09 72 10 00 18"
+     },
+     "mia.smith@example.com": {
+      "name": "Mia Smith",
+      "phone": "06 39 98 09 64"
+     },
+     "noe.lefevre1@example.org": {
+      "name": "Noé Lefèvre",
+      "phone": "09 72 10 45 62"
+     }
+    },
+    "owner": "u0020"
+   },
+   {
+    "_id": "ab0021",
+    "contacts": {
+     "ines.garcia@example.com": {
+      "name": "Inès Garcia",
+      "phone": "06 39 98 03 83"
+     },
+     "louis.leroy3@example.com": {
+      "name": "Louis Leroy",
+      "phone": "03 53 01 36 76"
+     },
+     "lucas.lefevre@example.net": {
+      "name": "Lucas Lefèvre",
+      "phone": "01 99 00 58 11"
+     }
+    },
+    "owner": "u0021"
+   },
+   {
+    "_id": "ab0022",
+    "contacts": {
+     "elodie.roux@example.net": {
+      "name": "Élodie Roux",
+      "phone": "05 36 49 46 65"
+     },
+     "hugo.durand1@example.com": {
+      "name": "Hugo Durand",
+      "phone": "09 72 10 60 09"
+     },
+     "lukas.kowalski@example.org": {
+      "name": "Lukas Kowalski",
+      "phone": "02 61 91 07 88"
+     }
+    },
+    "owner": "u0022"
+   },
+   {
+    "_id": "ab0023",
+    "contacts": {
+     "camille.fournier1@example.org": {
+      "name": "Camille Fournier",
+      "phone": "03 53 01 51 69"
+     },
+     "chloe.moreau1@example.org": {
+      "name": "Chloé Moreau",
+      "phone": "02 61 91 98 72"
+     },
+     "zoe.lefevre@example.org": {
+      "name": "Zoé Lefèvre",
+      "phone": "03 53 01 69 27"
+     }
+    },
+    "owner": "u0023"
+   },
+   {
+    "_id": "ab0024",
+    "contacts": {
+     "hugo.michel1@example.com": {
+      "name": "Hugo Michel",
+      "phone": "05 36 49 62 57"
+     },
+     "jade.lefevre@example.net": {
+      "name": "Jade Lefèvre",
+      "phone": "01 99 00 63 63"
+     },
+     "lea.michel@example.net": {
+      "name": "Léa Michel",
+      "phone": "05 36 49 21 33"
+     }
+    },
+    "owner": "u0024"
+   },
+   {
+    "_id": "ab0025",
+    "contacts": {
+     "lucas.lefevre1@example.com": {
+      "name": "Lucas Lefèvre",
+      "phone": "04 65 71 47 31"
+     },
+     "mia.nielsen@example.com": {
+      "name": "Mia Nielsen",
+      "phone": "01 99 00 86 31"
+     },
+     "nathan.durand2@example.org": {
+      "name": "Nathan Durand",
+      "phone": "04 65 71 44 15"
+     }
+    },
+    "owner": "u0025"
+   },
+   {
+    "_id": "ab0026",
+    "contacts": {
+     "camille.fournier@example.org": {
+      "name": "Camille Fournier",
+      "phone": "03 53 01 71 33"
+     },
+     "chloe.bertrand@example.com": {
+      "name": "Chloé Bertrand",
+      "phone": "04 65 71 46 85"
+     },
+     "theo.petit@example.com": {
+      "name": "Théo Petit",
+      "phone": "02 61 91 52 03"
+     }
+    },
+    "owner": "u0026"
+   },
+   {
+    "_id": "ab0027",
+    "contacts": {
+     "chloe.richard1@example.org": {
+      "name": "Chloé Richard",
+      "phone": "05 36 49 14 64"
+     },
+     "chloe.thomas1@example.com": {
+      "name": "Chloé Thomas",
+      "phone": "02 61 91 20 38"
+     },
+     "manon.garcia@example.net": {
+      "name": "Manon Garcia",
+      "phone": "06 39 98 35 14"
+     }
+    },
+    "owner": "u0027"
+   },
+   {
+    "_id": "ab0028",
+    "contacts": {
+     "arthur.dubois@example.com": {
+      "name": "Arthur Dubois",
+      "phone": "04 65 71 42 23"
+     },
+     "manon.petit@example.com": {
+      "name": "Manon Petit",
+      "phone": "09 72 10 13 44"
+     },
+     "theo.david@example.net": {
+      "name": "Théo David",
+      "phone": "06 39 98 50 93"
+     }
+    },
+    "owner": "u0028"
+   },
+   {
+    "_id": "ab0029",
+    "contacts": {
+     "arthur.vincent@example.com": {
+      "name": "Arthur Vincent",
+      "phone": "04 65 71 86 69"
+     },
+     "liam.taylor@example.org": {
+      "name": "Liam Taylor",
+      "phone": "04 65 71 91 29"
+     },
+     "zoe.lefevre1@example.net": {
+      "name": "Zoé Lefèvre",
+      "phone": "04 65 71 85 90"
+     }
+    },
+    "owner": "u0029"
+   },
+   {
+    "_id": "ab0030",
+    "contacts": {
+     "anais.michel@example.com": {
+      "name": "Anaïs Michel",
+      "phone": "01 99 00 53 76"
+     },
+     "elodie.vincent@example.com": {
+      "name": "Élodie Vincent",
+      "phone": "09 72 10 56 50"
+     },
+     "theo.bernard@example.org": {
+      "name": "Théo Bernard",
+      "phone": "02 61 91 12 28"
+     }
+    },
+    "owner": "u0030"
+   }
+  ],
+  "daily_stats": [
+   {
+    "_id": "d2026-09-01",
+    "hourly": {
+     "0": 34,
+     "1": 83,
+     "10": 30,
+     "11": 43,
+     "12": 35,
+     "13": 20,
+     "14": 95,
+     "15": 22,
+     "16": 51,
+     "17": 96,
+     "18": 91,
+     "19": 73,
+     "2": 19,
+     "20": 97,
+     "21": 1,
+     "22": 32,
+     "23": 28,
+     "3": 59,
+     "4": 44,
+     "5": 37,
+     "6": 17,
+     "7": 92,
+     "8": 59,
+     "9": 95
+    }
+   },
+   {
+    "_id": "d2026-09-02",
+    "hourly": {
+     "0": 78,
+     "1": 90,
+     "10": 12,
+     "11": 45,
+     "12": 25,
+     "13": 66,
+     "14": 33,
+     "15": 21,
+     "16": 95,
+     "17": 36,
+     "18": 56,
+     "19": 90,
+     "2": 67,
+     "20": 92,
+     "21": 67,
+     "22": 45,
+     "23": 83,
+     "3": 40,
+     "4": 47,
+     "5": 21,
+     "6": 12,
+     "7": 71,
+     "8": 92,
+     "9": 37
+    }
+   },
+   {
+    "_id": "d2026-09-03",
+    "hourly": {
+     "0": 50,
+     "1": 72,
+     "10": 49,
+     "11": 49,
+     "12": 29,
+     "13": 40,
+     "14": 62,
+     "15": 21,
+     "16": 56,
+     "17": 61,
+     "18": 31,
+     "19": 93,
+     "2": 45,
+     "20": 31,
+     "21": 92,
+     "22": 2,
+     "23": 34,
+     "3": 43,
+     "4": 22,
+     "5": 62,
+     "6": 37,
+     "7": 11,
+     "8": 41,
+     "9": 4
+    }
+   },
+   {
+    "_id": "d2026-09-04",
+    "hourly": {
+     "0": 46,
+     "1": 38,
+     "10": 6,
+     "11": 90,
+     "12": 79,
+     "13": 74,
+     "14": 30,
+     "15": 50,
+     "16": 21,
+     "17": 62,
+     "18": 78,
+     "19": 11,
+     "2": 60,
+     "20": 64,
+     "21": 12,
+     "22": 86,
+     "23": 13,
+     "3": 93,
+     "4": 63,
+     "5": 66,
+     "6": 67,
+     "7": 52,
+     "8": 50,
+     "9": 87
+    }
+   },
+   {
+    "_id": "d2026-09-05",
+    "hourly": {
+     "0": 19,
+     "1": 88,
+     "10": 19,
+     "11": 9,
+     "12": 96,
+     "13": 6,
+     "14": 42,
+     "15": 53,
+     "16": 66,
+     "17": 8,
+     "18": 62,
+     "19": 65,
+     "2": 96,
+     "20": 8,
+     "21": 15,
+     "22": 4,
+     "23": 52,
+     "3": 53,
+     "4": 9,
+     "5": 45,
+     "6": 23,
+     "7": 99,
+     "8": 32,
+     "9": 75
+    }
+   },
+   {
+    "_id": "d2026-09-06",
+    "hourly": {
+     "0": 80,
+     "1": 97,
+     "10": 29,
+     "11": 77,
+     "12": 3,
+     "13": 97,
+     "14": 32,
+     "15": 69,
+     "16": 57,
+     "17": 26,
+     "18": 21,
+     "19": 82,
+     "2": 26,
+     "20": 88,
+     "21": 80,
+     "22": 80,
+     "23": 5,
+     "3": 80,
+     "4": 6,
+     "5": 13,
+     "6": 54,
+     "7": 98,
+     "8": 9,
+     "9": 3
+    }
+   },
+   {
+    "_id": "d2026-09-07",
+    "hourly": {
+     "0": 74,
+     "1": 97,
+     "10": 33,
+     "11": 28,
+     "12": 81,
+     "13": 84,
+     "14": 29,
+     "15": 85,
+     "16": 23,
+     "17": 96,
+     "18": 44,
+     "19": 5,
+     "2": 7,
+     "20": 80,
+     "21": 66,
+     "22": 14,
+     "23": 88,
+     "3": 27,
+     "4": 6,
+     "5": 18,
+     "6": 29,
+     "7": 88,
+     "8": 64,
+     "9": 41
+    }
+   },
+   {
+    "_id": "d2026-09-08",
+    "hourly": {
+     "0": 82,
+     "1": 55,
+     "10": 16,
+     "11": 4,
+     "12": 89,
+     "13": 57,
+     "14": 43,
+     "15": 92,
+     "16": 92,
+     "17": 82,
+     "18": 28,
+     "19": 6,
+     "2": 77,
+     "20": 61,
+     "21": 64,
+     "22": 46,
+     "23": 83,
+     "3": 70,
+     "4": 16,
+     "5": 4,
+     "6": 94,
+     "7": 4,
+     "8": 98,
+     "9": 71
+    }
+   },
+   {
+    "_id": "d2026-09-09",
+    "hourly": {
+     "0": 13,
+     "1": 40,
+     "10": 24,
+     "11": 87,
+     "12": 77,
+     "13": 56,
+     "14": 96,
+     "15": 88,
+     "16": 58,
+     "17": 63,
+     "18": 68,
+     "19": 89,
+     "2": 67,
+     "20": 18,
+     "21": 36,
+     "22": 14,
+     "23": 24,
+     "3": 1,
+     "4": 51,
+     "5": 34,
+     "6": 41,
+     "7": 36,
+     "8": 78,
+     "9": 95
+    }
+   },
+   {
+    "_id": "d2026-09-10",
+    "hourly": {
+     "0": 44,
+     "1": 61,
+     "10": 42,
+     "11": 96,
+     "12": 13,
+     "13": 35,
+     "14": 67,
+     "15": 80,
+     "16": 3,
+     "17": 5,
+     "18": 13,
+     "19": 39,
+     "2": 78,
+     "20": 25,
+     "21": 85,
+     "22": 98,
+     "23": 67,
+     "3": 94,
+     "4": 63,
+     "5": 27,
+     "6": 85,
+     "7": 40,
+     "8": 88,
+     "9": 80
+    }
+   },
+   {
+    "_id": "d2026-09-11",
+    "hourly": {
+     "0": 14,
+     "1": 7,
+     "10": 73,
+     "11": 80,
+     "12": 87,
+     "13": 52,
+     "14": 68,
+     "15": 61,
+     "16": 31,
+     "17": 28,
+     "18": 65,
+     "19": 25,
+     "2": 6,
+     "20": 52,
+     "21": 51,
+     "22": 62,
+     "23": 91,
+     "3": 24,
+     "4": 65,
+     "5": 92,
+     "6": 89,
+     "7": 85,
+     "8": 33,
+     "9": 38
+    }
+   },
+   {
+    "_id": "d2026-09-12",
+    "hourly": {
+     "0": 85,
+     "1": 67,
+     "10": 22,
+     "11": 71,
+     "12": 4,
+     "13": 95,
+     "14": 70,
+     "15": 97,
+     "16": 51,
+     "17": 56,
+     "18": 39,
+     "19": 75,
+     "2": 64,
+     "20": 62,
+     "21": 86,
+     "22": 32,
+     "23": 24,
+     "3": 51,
+     "4": 8,
+     "5": 61,
+     "6": 47,
+     "7": 86,
+     "8": 52,
+     "9": 52
+    }
+   },
+   {
+    "_id": "d2026-09-13",
+    "hourly": {
+     "0": 19,
+     "1": 28,
+     "10": 92,
+     "11": 70,
+     "12": 32,
+     "13": 76,
+     "14": 81,
+     "15": 8,
+     "16": 24,
+     "17": 51,
+     "18": 19,
+     "19": 76,
+     "2": 17,
+     "20": 34,
+     "21": 17,
+     "22": 2,
+     "23": 32,
+     "3": 62,
+     "4": 55,
+     "5": 78,
+     "6": 99,
+     "7": 84,
+     "8": 34,
+     "9": 32
+    }
+   },
+   {
+    "_id": "d2026-09-14",
+    "hourly": {
+     "0": 40,
+     "1": 28,
+     "10": 36,
+     "11": 90,
+     "12": 63,
+     "13": 2,
+     "14": 24,
+     "15": 85,
+     "16": 61,
+     "17": 54,
+     "18": 90,
+     "19": 63,
+     "2": 65,
+     "20": 50,
+     "21": 16,
+     "22": 98,
+     "23": 37,
+     "3": 65,
+     "4": 44,
+     "5": 32,
+     "6": 13,
+     "7": 93,
+     "8": 70,
+     "9": 21
+    }
+   }
+  ],
+  "integrations": [
+   {
+    "_id": "int1",
+    "credentials": {
+     "accessKeyId": "AKIAHWZ43A3DWEXAMPLE",
+     "secretAccessKey": "3T2XZIPv622CGuJM0dWrlNhDBswEEcEXAMPLEKEY"
+    },
+    "service": "s3-archive"
+   },
+   {
+    "_id": "int2",
+    "credentials": {
+     "accessKeyId": "AKIA7CCF6EATSEXAMPLE",
+     "secretAccessKey": "lcnDzOYR5UM0vbpzgCotuhz0UciBsXEXAMPLEKEY"
+    },
+    "service": "ses-mailer"
+   },
+   {
+    "_id": "int3",
+    "credentials": {
+     "accessKeyId": "AKIAT5ZVJSRCDEXAMPLE",
+     "secretAccessKey": "MxyX0nVmdJxMv8M2SSQVmJ4mydenDVEXAMPLEKEY"
+    },
+    "service": "athena"
+   }
+  ],
+  "loyalty": [
+   {
+    "_id": "lp0001",
+    "members": {
+     "33199004673": {
+      "points": 748,
+      "tier": "gold"
+     },
+     "33536493795": {
+      "points": 2574,
+      "tier": "silver"
+     },
+     "33639984333": {
+      "points": 3399,
+      "tier": "gold"
+     },
+     "33972108544": {
+      "points": 3258,
+      "tier": "gold"
+     }
+    },
+    "program": "store-01"
+   },
+   {
+    "_id": "lp0002",
+    "members": {
+     "33199008089": {
+      "points": 3445,
+      "tier": "gold"
+     },
+     "33353011544": {
+      "points": 3968,
+      "tier": "silver"
+     },
+     "33465718352": {
+      "points": 1002,
+      "tier": "gold"
+     },
+     "33972109522": {
+      "points": 3143,
+      "tier": "silver"
+     }
+    },
+    "program": "store-02"
+   },
+   {
+    "_id": "lp0003",
+    "members": {
+     "33199009910": {
+      "points": 2535,
+      "tier": "silver"
+     },
+     "33353012649": {
+      "points": 3316,
+      "tier": "gold"
+     },
+     "33972108665": {
+      "points": 2512,
+      "tier": "silver"
+     },
+     "33972108914": {
+      "points": 3815,
+      "tier": "gold"
+     }
+    },
+    "program": "store-03"
+   },
+   {
+    "_id": "lp0004",
+    "members": {
+     "33261911371": {
+      "points": 888,
+      "tier": "gold"
+     },
+     "33353019019": {
+      "points": 1331,
+      "tier": "gold"
+     },
+     "33972102741": {
+      "points": 1205,
+      "tier": "silver"
+     },
+     "33972105048": {
+      "points": 1887,
+      "tier": "silver"
+     }
+    },
+    "program": "store-04"
+   },
+   {
+    "_id": "lp0005",
+    "members": {
+     "33199004213": {
+      "points": 2302,
+      "tier": "gold"
+     },
+     "33353012969": {
+      "points": 3298,
+      "tier": "gold"
+     },
+     "33353017943": {
+      "points": 1728,
+      "tier": "gold"
+     },
+     "33465713021": {
+      "points": 2273,
+      "tier": "gold"
+     }
+    },
+    "program": "store-05"
+   },
+   {
+    "_id": "lp0006",
+    "members": {
+     "33199002484": {
+      "points": 4061,
+      "tier": "silver"
+     },
+     "33199007752": {
+      "points": 358,
+      "tier": "gold"
+     },
+     "33353016812": {
+      "points": 3156,
+      "tier": "silver"
+     },
+     "33972105595": {
+      "points": 3998,
+      "tier": "silver"
+     }
+    },
+    "program": "store-06"
+   },
+   {
+    "_id": "lp0007",
+    "members": {
+     "33261910211": {
+      "points": 1495,
+      "tier": "silver"
+     },
+     "33261917293": {
+      "points": 2121,
+      "tier": "silver"
+     },
+     "33353010416": {
+      "points": 264,
+      "tier": "gold"
+     },
+     "33536495089": {
+      "points": 2639,
+      "tier": "silver"
+     }
+    },
+    "program": "store-07"
+   },
+   {
+    "_id": "lp0008",
+    "members": {
+     "33353019617": {
+      "points": 317,
+      "tier": "gold"
+     },
+     "33465712038": {
+      "points": 2463,
+      "tier": "silver"
+     },
+     "33639981239": {
+      "points": 836,
+      "tier": "silver"
+     },
+     "33972102792": {
+      "points": 4965,
+      "tier": "gold"
+     }
+    },
+    "program": "store-08"
+   },
+   {
+    "_id": "lp0009",
+    "members": {
+     "33261915001": {
+      "points": 3139,
+      "tier": "silver"
+     },
+     "33353015520": {
+      "points": 4929,
+      "tier": "gold"
+     },
+     "33353016515": {
+      "points": 3789,
+      "tier": "gold"
+     },
+     "33536490979": {
+      "points": 1545,
+      "tier": "gold"
+     }
+    },
+    "program": "store-09"
+   },
+   {
+    "_id": "lp0010",
+    "members": {
+     "33465719527": {
+      "points": 443,
+      "tier": "silver"
+     },
+     "33536496944": {
+      "points": 4247,
+      "tier": "gold"
+     },
+     "33536497480": {
+      "points": 748,
+      "tier": "silver"
+     },
+     "33972108539": {
+      "points": 1283,
+      "tier": "silver"
+     }
+    },
+    "program": "store-10"
+   },
+   {
+    "_id": "lp0011",
+    "members": {
+     "33199002840": {
+      "points": 3966,
+      "tier": "gold"
+     },
+     "33465712040": {
+      "points": 2923,
+      "tier": "silver"
+     },
+     "33465712675": {
+      "points": 3418,
+      "tier": "gold"
+     },
+     "33536493573": {
+      "points": 3048,
+      "tier": "gold"
+     }
+    },
+    "program": "store-11"
+   },
+   {
+    "_id": "lp0012",
+    "members": {
+     "33199002851": {
+      "points": 458,
+      "tier": "gold"
+     },
+     "33353019314": {
+      "points": 1109,
+      "tier": "gold"
+     },
+     "33972109437": {
+      "points": 3846,
+      "tier": "silver"
+     },
+     "33972109520": {
+      "points": 4270,
+      "tier": "silver"
+     }
+    },
+    "program": "store-12"
+   },
+   {
+    "_id": "lp0013",
+    "members": {
+     "33261917064": {
+      "points": 2471,
+      "tier": "gold"
+     },
+     "33261919137": {
+      "points": 2700,
+      "tier": "silver"
+     },
+     "33465711897": {
+      "points": 1104,
+      "tier": "silver"
+     },
+     "33536496553": {
+      "points": 1631,
+      "tier": "silver"
+     }
+    },
+    "program": "store-13"
+   },
+   {
+    "_id": "lp0014",
+    "members": {
+     "33199004813": {
+      "points": 3575,
+      "tier": "silver"
+     },
+     "33353019978": {
+      "points": 4473,
+      "tier": "silver"
+     },
+     "33465711225": {
+      "points": 4499,
+      "tier": "gold"
+     },
+     "33465718312": {
+      "points": 2354,
+      "tier": "gold"
+     }
+    },
+    "program": "store-14"
+   },
+   {
+    "_id": "lp0015",
+    "members": {
+     "33261917588": {
+      "points": 219,
+      "tier": "gold"
+     },
+     "33261919093": {
+      "points": 1362,
+      "tier": "gold"
+     },
+     "33353016720": {
+      "points": 901,
+      "tier": "gold"
+     },
+     "33639987058": {
+      "points": 4304,
+      "tier": "gold"
+     }
+    },
+    "program": "store-15"
+   },
+   {
+    "_id": "lp0016",
+    "members": {
+     "33199002930": {
+      "points": 4298,
+      "tier": "silver"
+     },
+     "33261914473": {
+      "points": 937,
+      "tier": "silver"
+     },
+     "33465717154": {
+      "points": 564,
+      "tier": "gold"
+     },
+     "33536499617": {
+      "points": 2508,
+      "tier": "silver"
+     }
+    },
+    "program": "store-16"
+   },
+   {
+    "_id": "lp0017",
+    "members": {
+     "33199003486": {
+      "points": 4064,
+      "tier": "silver"
+     },
+     "33465715605": {
+      "points": 2594,
+      "tier": "gold"
+     },
+     "33465717990": {
+      "points": 1919,
+      "tier": "silver"
+     },
+     "33972107535": {
+      "points": 283,
+      "tier": "silver"
+     }
+    },
+    "program": "store-17"
+   },
+   {
+    "_id": "lp0018",
+    "members": {
+     "33199003247": {
+      "points": 3928,
+      "tier": "gold"
+     },
+     "33199009669": {
+      "points": 4665,
+      "tier": "silver"
+     },
+     "33261911942": {
+      "points": 1521,
+      "tier": "gold"
+     },
+     "33536499242": {
+      "points": 1570,
+      "tier": "silver"
+     }
+    },
+    "program": "store-18"
+   },
+   {
+    "_id": "lp0019",
+    "members": {
+     "33199003442": {
+      "points": 4918,
+      "tier": "gold"
+     },
+     "33465710946": {
+      "points": 3770,
+      "tier": "silver"
+     },
+     "33536494057": {
+      "points": 3753,
+      "tier": "gold"
+     },
+     "33639985100": {
+      "points": 3367,
+      "tier": "silver"
+     }
+    },
+    "program": "store-19"
+   },
+   {
+    "_id": "lp0020",
+    "members": {
+     "33261910366": {
+      "points": 2321,
+      "tier": "gold"
+     },
+     "33639983093": {
+      "points": 380,
+      "tier": "silver"
+     },
+     "33639985693": {
+      "points": 3474,
+      "tier": "silver"
+     },
+     "33972104807": {
+      "points": 57,
+      "tier": "gold"
+     }
+    },
+    "program": "store-20"
+   }
+  ],
+  "users": [
+   {
+    "_id": "u0001",
+    "address": {
+     "city": "Nantes",
+     "country": "FR",
+     "postalCode": "44000",
+     "street": "161 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Nathan Moreau",
+      "number": "4111 1198 1688 1177"
+     }
+    ],
+    "createdAt": "2026-03-05T06:58:00Z",
+    "email": "nathan.moreau@example.org",
+    "email_verified": true,
+    "iban": "FR76 9951 4024 4734 6866 1004 885",
+    "name": {
+     "first": "Nathan",
+     "last": "Moreau"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 07 17",
+     "03 53 01 94 42"
+    ]
+   },
+   {
+    "_id": "u0002",
+    "address": {
+     "city": "Amsterdam",
+     "country": "NL",
+     "postalCode": "1011 AB",
+     "street": "57 Voorbeeldstraat"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Sophia Evans",
+      "number": "4111 1138 3386 4332"
+     }
+    ],
+    "createdAt": "2023-11-03T08:11:00Z",
+    "email": "sophia.evans@example.org",
+    "email_verified": false,
+    "iban": "FR76 9938 1323 0110 0638 5365 844",
+    "name": {
+     "first": "Sophia",
+     "last": "Evans"
+    },
+    "phone_country": "NL",
+    "phones": [
+     "+33 1 99 00 65 73"
+    ]
+   },
+   {
+    "_id": "u0003",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "20 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Inès Petit",
+      "number": "4111 1110 4702 7555"
+     }
+    ],
+    "createdAt": "2023-12-27T13:05:00Z",
+    "email": "ines.petit@example.org",
+    "email_verified": true,
+    "iban": "FR76 9984 4491 7493 0092 9408 074",
+    "name": {
+     "first": "Inès",
+     "last": "Petit"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 79 52"
+    ]
+   },
+   {
+    "_id": "u0004",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "174 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Raphaël Simon",
+      "number": "5555 5568 4760 1225"
+     }
+    ],
+    "createdAt": "2023-05-11T19:30:00Z",
+    "email": "raphael.simon@example.org",
+    "email_verified": false,
+    "iban": "FR76 9949 2130 2855 8963 5523 228",
+    "name": {
+     "first": "Raphaël",
+     "last": "Simon"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 89 49",
+     "05 36 49 07 48"
+    ]
+   },
+   {
+    "_id": "u0005",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "11 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Chloé Thomas",
+      "number": "4111 1148 1286 0218"
+     }
+    ],
+    "createdAt": "2025-12-17T21:55:00Z",
+    "email": "chloe.thomas@example.com",
+    "email_verified": true,
+    "iban": "FR76 9918 0627 3489 6804 0489 375",
+    "name": {
+     "first": "Chloé",
+     "last": "Thomas"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 03 94"
+    ]
+   },
+   {
+    "_id": "u0006",
+    "address": {
+     "city": "London",
+     "country": "GB",
+     "postalCode": "NW1 6XE",
+     "street": "86 Baker Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "James Taylor",
+      "number": "4111 1196 0003 1153"
+     }
+    ],
+    "createdAt": "2023-09-04T23:24:00Z",
+    "email": "james.taylor1@example.net",
+    "email_verified": false,
+    "iban": "FR76 9928 9850 5143 4340 7501 586",
+    "name": {
+     "first": "James",
+     "last": "Taylor"
+    },
+    "phone_country": "GB",
+    "phones": [
+     "+44 7700 900124"
+    ]
+   },
+   {
+    "_id": "u0007",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "154 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Lucas Lefèvre",
+      "number": "4111 1186 8798 4680"
+     }
+    ],
+    "createdAt": "2025-07-22T05:06:00Z",
+    "email": "lucas.lefevre@example.com",
+    "email_verified": false,
+    "iban": "FR76 9920 8557 5304 4721 3594 080",
+    "name": {
+     "first": "Lucas",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 76 06",
+     "04 65 71 03 93"
+    ]
+   },
+   {
+    "_id": "u0008",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "148 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Manon Leroy",
+      "number": "4111 1105 0647 2054"
+     }
+    ],
+    "createdAt": "2025-09-26T13:35:00Z",
+    "email": "manon.leroy@example.com",
+    "email_verified": true,
+    "iban": "FR76 9923 8555 9948 6500 1493 852",
+    "name": {
+     "first": "Manon",
+     "last": "Leroy"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 32 18"
+    ]
+   },
+   {
+    "_id": "u0009",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "150 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Raphaël Fournier",
+      "number": "4111 1174 3044 2939"
+     }
+    ],
+    "createdAt": "2026-01-23T11:47:00Z",
+    "email": "raphael.fournier@example.com",
+    "email_verified": false,
+    "iban": "FR76 9958 4720 6721 0523 0527 571",
+    "name": {
+     "first": "Raphaël",
+     "last": "Fournier"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 31 65"
+    ]
+   },
+   {
+    "_id": "u0010",
+    "address": {
+     "city": "London",
+     "country": "GB",
+     "postalCode": "NW1 6XE",
+     "street": "128 Baker Street"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "James Johnson",
+      "number": "5555 5515 0692 7888"
+     }
+    ],
+    "createdAt": "2023-04-23T07:18:00Z",
+    "email": "james.johnson@example.net",
+    "email_verified": false,
+    "iban": "FR76 9910 6391 6153 8606 8095 357",
+    "name": {
+     "first": "James",
+     "last": "Johnson"
+    },
+    "phone_country": "GB",
+    "phones": [
+     "+44 7700 900743",
+     "04 65 71 84 74"
+    ]
+   },
+   {
+    "_id": "u0011",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "75 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Camille Durand",
+      "number": "4111 1182 6686 2091"
+     }
+    ],
+    "createdAt": "2026-10-01T00:40:00Z",
+    "email": "camille.durand@example.org",
+    "email_verified": true,
+    "iban": "FR76 9976 6763 5591 0026 9417 690",
+    "name": {
+     "first": "Camille",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 20 60"
+    ]
+   },
+   {
+    "_id": "u0012",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "151 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Gabriel Richard",
+      "number": "5555 5598 4933 7392"
+     }
+    ],
+    "createdAt": "2025-11-18T07:46:00Z",
+    "email": "gabriel.richard@example.com",
+    "email_verified": false,
+    "iban": "FR76 9954 3256 8137 0248 0258 624",
+    "name": {
+     "first": "Gabriel",
+     "last": "Richard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 90 05"
+    ]
+   },
+   {
+    "_id": "u0013",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "44 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Jean Richard",
+      "number": "4111 1102 4800 0569"
+     }
+    ],
+    "createdAt": "2024-10-08T22:37:00Z",
+    "email": "jean.richard1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9900 1654 3802 3159 8479 697",
+    "name": {
+     "first": "Jean",
+     "last": "Richard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 86 06",
+     "01 99 00 54 03"
+    ]
+   },
+   {
+    "_id": "u0014",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "129 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Manon Bernard",
+      "number": "5555 5541 7457 3448"
+     }
+    ],
+    "createdAt": "2025-08-13T00:44:00Z",
+    "email": "manon.bernard1@example.com",
+    "email_verified": true,
+    "iban": "FR76 9914 3131 3010 3677 3984 456",
+    "name": {
+     "first": "Manon",
+     "last": "Bernard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 39 31"
+    ]
+   },
+   {
+    "_id": "u0015",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "49 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Théo David",
+      "number": "5555 5576 0276 4075"
+     }
+    ],
+    "createdAt": "2023-11-26T21:52:00Z",
+    "email": "theo.david1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9987 4210 2657 7170 4960 572",
+    "name": {
+     "first": "Théo",
+     "last": "David"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 11 72"
+    ]
+   },
+   {
+    "_id": "u0016",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "95 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Anaïs Bernard",
+      "number": "5555 5596 4760 0231"
+     }
+    ],
+    "createdAt": "2025-07-03T03:39:00Z",
+    "email": "anais.bernard@example.com",
+    "email_verified": false,
+    "iban": "FR76 9966 1390 1077 5375 0183 202",
+    "name": {
+     "first": "Anaïs",
+     "last": "Bernard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 95 64",
+     "01 99 00 30 78"
+    ]
+   },
+   {
+    "_id": "u0017",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "39 avenue de la République"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Élodie Vincent",
+      "number": "4111 1142 7888 0254"
+     }
+    ],
+    "createdAt": "2024-09-18T18:22:00Z",
+    "email": "elodie.vincent1@example.com",
+    "email_verified": true,
+    "iban": "FR76 9969 1101 6224 9071 1256 352",
+    "name": {
+     "first": "Élodie",
+     "last": "Vincent"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 56 53"
+    ]
+   },
+   {
+    "_id": "u0018",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "105 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Zoé Dubois",
+      "number": "4111 1151 7780 1184"
+     }
+    ],
+    "createdAt": "2026-06-18T06:12:00Z",
+    "email": "zoe.dubois@example.org",
+    "email_verified": true,
+    "iban": "FR76 9939 4904 8935 9381 9379 360",
+    "name": {
+     "first": "Zoé",
+     "last": "Dubois"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 63 05"
+    ]
+   },
+   {
+    "_id": "u0019",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "168 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Gabriel David",
+      "number": "5555 5537 6245 1967"
+     }
+    ],
+    "createdAt": "2024-10-20T08:16:00Z",
+    "email": "gabriel.david@example.org",
+    "email_verified": false,
+    "iban": "FR76 9934 0545 4778 2158 3296 357",
+    "name": {
+     "first": "Gabriel",
+     "last": "David"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 87 79",
+     "03 53 01 00 11"
+    ]
+   },
+   {
+    "_id": "u0020",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "110 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Liam Evans",
+      "number": "4111 1192 6602 8790"
+     }
+    ],
+    "createdAt": "2024-12-08T17:29:00Z",
+    "email": "liam.evans@example.net",
+    "email_verified": false,
+    "iban": "FR76 9947 3909 8547 8020 5239 841",
+    "name": {
+     "first": "Liam",
+     "last": "Evans"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 312 555 0145"
+    ]
+   },
+   {
+    "_id": "u0021",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "62 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Nathan Durand",
+      "number": "5555 5536 3925 7480"
+     }
+    ],
+    "createdAt": "2023-11-18T13:48:00Z",
+    "email": "nathan.durand1@example.com",
+    "email_verified": false,
+    "iban": "FR76 9915 7320 1792 4450 2334 545",
+    "name": {
+     "first": "Nathan",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 47 09"
+    ]
+   },
+   {
+    "_id": "u0022",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "53 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Manon Garcia",
+      "number": "4111 1135 2684 1761"
+     }
+    ],
+    "createdAt": "2025-12-13T05:58:00Z",
+    "email": "manon.garcia@example.com",
+    "email_verified": true,
+    "iban": "FR76 9965 5550 2854 5671 3060 878",
+    "name": {
+     "first": "Manon",
+     "last": "Garcia"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 83 45",
+     "09 72 10 46 73"
+    ]
+   },
+   {
+    "_id": "u0023",
+    "address": {
+     "city": "Amsterdam",
+     "country": "NL",
+     "postalCode": "1011 AB",
+     "street": "218 Voorbeeldstraat"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Sophia Evans",
+      "number": "4111 1164 9242 2490"
+     }
+    ],
+    "createdAt": "2024-01-04T14:36:00Z",
+    "email": "sophia.evans1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9959 4989 3263 1333 7849 678",
+    "name": {
+     "first": "Sophia",
+     "last": "Evans"
+    },
+    "phone_country": "NL",
+    "phones": [
+     "+33 6 39 98 32 70"
+    ]
+   },
+   {
+    "_id": "u0024",
+    "address": {
+     "city": "Berlin",
+     "country": "DE",
+     "postalCode": "10115",
+     "street": "174 Musterstraße"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Mia Smith",
+      "number": "5555 5532 5737 9228"
+     }
+    ],
+    "createdAt": "2025-01-03T14:22:00Z",
+    "email": "mia.smith@example.org",
+    "email_verified": true,
+    "iban": "DE52 9993 1617 0028 7373 27",
+    "name": {
+     "first": "Mia",
+     "last": "Smith"
+    },
+    "phone_country": "DE",
+    "phones": [
+     "+33 3 53 01 10 90"
+    ]
+   },
+   {
+    "_id": "u0025",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "100 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Théo Bernard",
+      "number": "5555 5568 4054 2590"
+     }
+    ],
+    "createdAt": "2023-12-14T05:31:00Z",
+    "email": "theo.bernard@example.com",
+    "email_verified": true,
+    "iban": "FR76 9905 7787 3961 2396 5484 583",
+    "name": {
+     "first": "Théo",
+     "last": "Bernard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 30 71",
+     "09 72 10 02 43"
+    ]
+   },
+   {
+    "_id": "u0026",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "169 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Chloé Lefèvre",
+      "number": "4111 1126 3865 9624"
+     }
+    ],
+    "createdAt": "2025-04-26T22:24:00Z",
+    "email": "chloe.lefevre@example.com",
+    "email_verified": false,
+    "iban": "FR76 9916 8861 7618 9305 8928 285",
+    "name": {
+     "first": "Chloé",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 63 44"
+    ]
+   },
+   {
+    "_id": "u0027",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "80 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Inès Thomas",
+      "number": "4111 1149 9554 9950"
+     }
+    ],
+    "createdAt": "2024-09-11T07:11:00Z",
+    "email": "ines.thomas1@example.com",
+    "email_verified": false,
+    "iban": "FR76 9904 1896 5144 5400 7092 987",
+    "name": {
+     "first": "Inès",
+     "last": "Thomas"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 30 26"
+    ]
+   },
+   {
+    "_id": "u0028",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "151 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Manon Lefèvre",
+      "number": "5555 5587 4542 9469"
+     }
+    ],
+    "createdAt": "2024-07-27T09:53:00Z",
+    "email": "manon.lefevre@example.org",
+    "email_verified": true,
+    "iban": "FR76 9963 4609 3989 0529 1208 486",
+    "name": {
+     "first": "Manon",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 86 13",
+     "01 99 00 57 00"
+    ]
+   },
+   {
+    "_id": "u0029",
+    "address": {
+     "city": "London",
+     "country": "GB",
+     "postalCode": "NW1 6XE",
+     "street": "108 Baker Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Sophia Jansen",
+      "number": "4111 1115 5369 0739"
+     }
+    ],
+    "createdAt": "2024-07-25T20:37:00Z",
+    "email": "sophia.jansen@example.com",
+    "email_verified": false,
+    "iban": "DE28 9999 7025 4909 1738 22",
+    "name": {
+     "first": "Sophia",
+     "last": "Jansen"
+    },
+    "phone_country": "GB",
+    "phones": [
+     "+44 7700 900940"
+    ]
+   },
+   {
+    "_id": "u0030",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "139 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Inès Garcia",
+      "number": "5555 5586 3564 7055"
+     }
+    ],
+    "createdAt": "2026-11-17T04:27:00Z",
+    "email": "ines.garcia@example.org",
+    "email_verified": false,
+    "iban": "FR76 9934 5966 0194 2401 8306 310",
+    "name": {
+     "first": "Inès",
+     "last": "Garcia"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 52 07"
+    ]
+   },
+   {
+    "_id": "u0031",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "154 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Arthur Michel",
+      "number": "4111 1168 0143 3295"
+     }
+    ],
+    "createdAt": "2025-03-22T03:52:00Z",
+    "email": "arthur.michel@example.com",
+    "email_verified": false,
+    "iban": "FR76 9904 3654 6629 7287 9509 976",
+    "name": {
+     "first": "Arthur",
+     "last": "Michel"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 78 96",
+     "04 65 71 05 14"
+    ]
+   },
+   {
+    "_id": "u0032",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "59 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Arthur Vincent",
+      "number": "4111 1191 3252 8197"
+     }
+    ],
+    "createdAt": "2024-05-23T12:44:00Z",
+    "email": "arthur.vincent@example.org",
+    "email_verified": true,
+    "iban": "FR76 9982 5869 7115 9876 5199 025",
+    "name": {
+     "first": "Arthur",
+     "last": "Vincent"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 62 16"
+    ]
+   },
+   {
+    "_id": "u0033",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "115 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Hugo Durand",
+      "number": "5555 5549 4711 1526"
+     }
+    ],
+    "createdAt": "2024-01-17T10:38:00Z",
+    "email": "hugo.durand@example.org",
+    "email_verified": true,
+    "iban": "FR76 9928 5225 3440 9441 5456 122",
+    "name": {
+     "first": "Hugo",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 99 99"
+    ]
+   },
+   {
+    "_id": "u0034",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "91 avenue de la République"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Élodie Roux",
+      "number": "5555 5550 6811 2755"
+     }
+    ],
+    "createdAt": "2025-10-10T14:48:00Z",
+    "email": "elodie.roux@example.org",
+    "email_verified": false,
+    "iban": "FR76 9918 9980 6100 1661 6342 836",
+    "name": {
+     "first": "Élodie",
+     "last": "Roux"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 04 26",
+     "03 53 01 73 06"
+    ]
+   },
+   {
+    "_id": "u0035",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "58 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Théo Petit",
+      "number": "5555 5553 8690 3687"
+     }
+    ],
+    "createdAt": "2025-10-04T05:02:00Z",
+    "email": "theo.petit@example.net",
+    "email_verified": false,
+    "iban": "FR76 9969 8489 2379 6307 4347 391",
+    "name": {
+     "first": "Théo",
+     "last": "Petit"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 14 74"
+    ]
+   },
+   {
+    "_id": "u0036",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "39 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Noé Martin",
+      "number": "5555 5581 4775 3045"
+     }
+    ],
+    "createdAt": "2023-12-03T14:27:00Z",
+    "email": "noe.martin@example.org",
+    "email_verified": false,
+    "iban": "FR76 9908 4564 6941 0211 0674 938",
+    "name": {
+     "first": "Noé",
+     "last": "Martin"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 12 60"
+    ]
+   },
+   {
+    "_id": "u0037",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "145 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Jade Lefèvre",
+      "number": "4111 1149 8247 8486"
+     }
+    ],
+    "createdAt": "2026-06-25T12:41:00Z",
+    "email": "jade.lefevre1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9977 0389 5911 0973 4336 865",
+    "name": {
+     "first": "Jade",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 18 36",
+     "01 99 00 43 96"
+    ]
+   },
+   {
+    "_id": "u0038",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "49 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Chloé Bertrand",
+      "number": "5555 5503 7299 6449"
+     }
+    ],
+    "createdAt": "2026-04-23T14:32:00Z",
+    "email": "chloe.bertrand@example.org",
+    "email_verified": false,
+    "iban": "FR76 9980 8766 1597 9023 9664 725",
+    "name": {
+     "first": "Chloé",
+     "last": "Bertrand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 41 80"
+    ]
+   },
+   {
+    "_id": "u0039",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "14 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Élodie Petit",
+      "number": "4111 1115 1779 1565"
+     }
+    ],
+    "createdAt": "2024-10-06T18:46:00Z",
+    "email": "elodie.petit1@example.net",
+    "email_verified": false,
+    "iban": "FR76 9914 4369 5908 1516 3853 258",
+    "name": {
+     "first": "Élodie",
+     "last": "Petit"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 87 13"
+    ]
+   },
+   {
+    "_id": "u0040",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "73 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Raphaël Durand",
+      "number": "4111 1141 0615 2330"
+     }
+    ],
+    "createdAt": "2026-07-12T00:43:00Z",
+    "email": "raphael.durand@example.com",
+    "email_verified": false,
+    "iban": "FR76 9950 6408 9434 5598 8888 891",
+    "name": {
+     "first": "Raphaël",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 39 93",
+     "04 65 71 36 05"
+    ]
+   },
+   {
+    "_id": "u0041",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "47 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Raphaël David",
+      "number": "5555 5546 1832 6320"
+     }
+    ],
+    "createdAt": "2026-11-24T06:51:00Z",
+    "email": "raphael.david@example.org",
+    "email_verified": false,
+    "iban": "FR76 9929 8097 6871 8543 8688 956",
+    "name": {
+     "first": "Raphaël",
+     "last": "David"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 27 48"
+    ]
+   },
+   {
+    "_id": "u0042",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "165 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Camille Robert",
+      "number": "5555 5541 9392 1305"
+     }
+    ],
+    "createdAt": "2024-07-07T19:51:00Z",
+    "email": "camille.robert@example.com",
+    "email_verified": true,
+    "iban": "FR76 9902 7395 7052 1225 3022 872",
+    "name": {
+     "first": "Camille",
+     "last": "Robert"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 20 74"
+    ]
+   },
+   {
+    "_id": "u0043",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "111 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Mia García",
+      "number": "4111 1195 5058 9564"
+     }
+    ],
+    "createdAt": "2025-08-28T12:38:00Z",
+    "email": "mia.garcía1@example.net",
+    "email_verified": false,
+    "iban": "DE83 9998 2592 0453 3215 55",
+    "name": {
+     "first": "Mia",
+     "last": "García"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 415 555 0149",
+     "06 39 98 04 91"
+    ]
+   },
+   {
+    "_id": "u0044",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "138 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Zoé Lefèvre",
+      "number": "4111 1126 0484 8185"
+     }
+    ],
+    "createdAt": "2025-04-10T11:37:00Z",
+    "email": "zoe.lefevre@example.net",
+    "email_verified": true,
+    "iban": "FR76 9992 1678 4732 3664 7443 944",
+    "name": {
+     "first": "Zoé",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 46 59"
+    ]
+   },
+   {
+    "_id": "u0045",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "108 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Gabriel Robert",
+      "number": "4111 1185 0493 8935"
+     }
+    ],
+    "createdAt": "2025-02-27T03:36:00Z",
+    "email": "gabriel.robert@example.net",
+    "email_verified": false,
+    "iban": "FR76 9916 5224 4913 0815 3086 427",
+    "name": {
+     "first": "Gabriel",
+     "last": "Robert"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 74 57"
+    ]
+   },
+   {
+    "_id": "u0046",
+    "address": {
+     "city": "Berlin",
+     "country": "DE",
+     "postalCode": "10115",
+     "street": "10 Musterstraße"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Lukas Kowalski",
+      "number": "4111 1124 1464 9641"
+     }
+    ],
+    "createdAt": "2026-09-22T12:41:00Z",
+    "email": "lukas.kowalski1@example.com",
+    "email_verified": true,
+    "iban": "DE62 9996 6143 9384 8222 92",
+    "name": {
+     "first": "Lukas",
+     "last": "Kowalski"
+    },
+    "phone_country": "DE",
+    "phones": [
+     "+33 6 39 98 63 62",
+     "01 99 00 17 15"
+    ]
+   },
+   {
+    "_id": "u0047",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "52 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Inès Richard",
+      "number": "4111 1196 3710 8495"
+     }
+    ],
+    "createdAt": "2024-11-07T23:29:00Z",
+    "email": "ines.richard@example.org",
+    "email_verified": false,
+    "iban": "FR76 9976 9601 2945 4803 7975 396",
+    "name": {
+     "first": "Inès",
+     "last": "Richard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 37 41"
+    ]
+   },
+   {
+    "_id": "u0048",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "100 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Nathan Fournier",
+      "number": "5555 5548 4256 8952"
+     }
+    ],
+    "createdAt": "2026-05-02T16:09:00Z",
+    "email": "nathan.fournier@example.net",
+    "email_verified": true,
+    "iban": "FR76 9919 9972 4817 4345 0402 434",
+    "name": {
+     "first": "Nathan",
+     "last": "Fournier"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 59 62"
+    ]
+   },
+   {
+    "_id": "u0049",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "90 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Lukas Silva",
+      "number": "4111 1115 2407 3379"
+     }
+    ],
+    "createdAt": "2026-02-17T02:22:00Z",
+    "email": "lukas.silva@example.net",
+    "email_verified": true,
+    "iban": "FR76 9908 2908 2738 5869 8457 328",
+    "name": {
+     "first": "Lukas",
+     "last": "Silva"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 312 555 0146",
+     "06 39 98 34 74"
+    ]
+   },
+   {
+    "_id": "u0050",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "109 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Hugo Martin",
+      "number": "5555 5504 5040 7491"
+     }
+    ],
+    "createdAt": "2024-04-05T23:27:00Z",
+    "email": "hugo.martin@example.org",
+    "email_verified": false,
+    "iban": "FR76 9999 7882 4619 1004 5244 622",
+    "name": {
+     "first": "Hugo",
+     "last": "Martin"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 32 98"
+    ]
+   },
+   {
+    "_id": "u0051",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "51 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Noé Garcia",
+      "number": "5555 5596 3265 4532"
+     }
+    ],
+    "createdAt": "2025-02-09T18:27:00Z",
+    "email": "noe.garcia@example.net",
+    "email_verified": true,
+    "iban": "FR76 9977 5146 8735 8712 4198 352",
+    "name": {
+     "first": "Noé",
+     "last": "Garcia"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 34 96"
+    ]
+   },
+   {
+    "_id": "u0052",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "54 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Mateo Novak",
+      "number": "4111 1138 0447 8013"
+     }
+    ],
+    "createdAt": "2026-02-07T05:44:00Z",
+    "email": "mateo.novak@example.net",
+    "email_verified": false,
+    "iban": "FR76 9984 7443 9363 0941 7210 435",
+    "name": {
+     "first": "Mateo",
+     "last": "Novak"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 312 555 0128",
+     "04 65 71 17 67"
+    ]
+   },
+   {
+    "_id": "u0053",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "93 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Louis Roux",
+      "number": "4111 1149 4520 3302"
+     }
+    ],
+    "createdAt": "2025-02-25T21:05:00Z",
+    "email": "louis.roux@example.org",
+    "email_verified": false,
+    "iban": "FR76 9959 3556 1703 6493 3727 015",
+    "name": {
+     "first": "Louis",
+     "last": "Roux"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 03 08"
+    ]
+   },
+   {
+    "_id": "u0054",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "38 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Anaïs Michel",
+      "number": "5555 5527 3595 9510"
+     }
+    ],
+    "createdAt": "2025-07-09T23:59:00Z",
+    "email": "anais.michel@example.net",
+    "email_verified": true,
+    "iban": "FR76 9936 9279 3121 9097 3246 738",
+    "name": {
+     "first": "Anaïs",
+     "last": "Michel"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 36 62"
+    ]
+   },
+   {
+    "_id": "u0055",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "70 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Camille Fournier",
+      "number": "4111 1173 8948 2217"
+     }
+    ],
+    "createdAt": "2026-01-26T04:00:00Z",
+    "email": "camille.fournier@example.net",
+    "email_verified": false,
+    "iban": "FR76 9982 0991 8825 3137 8546 290",
+    "name": {
+     "first": "Camille",
+     "last": "Fournier"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 59 40",
+     "02 61 91 69 75"
+    ]
+   },
+   {
+    "_id": "u0056",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "77 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Jade Richard",
+      "number": "4111 1128 7721 5450"
+     }
+    ],
+    "createdAt": "2023-07-03T19:38:00Z",
+    "email": "jade.richard1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9990 4487 7711 2978 2777 287",
+    "name": {
+     "first": "Jade",
+     "last": "Richard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 90 59"
+    ]
+   },
+   {
+    "_id": "u0057",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "85 avenue de la République"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Jade Durand",
+      "number": "5555 5508 8861 8628"
+     }
+    ],
+    "createdAt": "2026-12-28T14:47:00Z",
+    "email": "jade.durand@example.com",
+    "email_verified": false,
+    "iban": "FR76 9947 7809 4011 7152 8945 980",
+    "name": {
+     "first": "Jade",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 78 42"
+    ]
+   },
+   {
+    "_id": "u0058",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "11 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Noé Lefèvre",
+      "number": "5555 5585 7290 6951"
+     }
+    ],
+    "createdAt": "2024-12-16T20:03:00Z",
+    "email": "noe.lefevre@example.org",
+    "email_verified": true,
+    "iban": "FR76 9944 8880 1490 2128 1079 566",
+    "name": {
+     "first": "Noé",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 19 55",
+     "09 72 10 53 82"
+    ]
+   },
+   {
+    "_id": "u0059",
+    "address": {
+     "city": "Berlin",
+     "country": "DE",
+     "postalCode": "10115",
+     "street": "31 Musterstraße"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Mateo Williams",
+      "number": "4111 1166 7807 1749"
+     }
+    ],
+    "createdAt": "2025-06-06T05:16:00Z",
+    "email": "mateo.williams@example.org",
+    "email_verified": false,
+    "iban": "FR76 9998 0679 5645 9394 4404 823",
+    "name": {
+     "first": "Mateo",
+     "last": "Williams"
+    },
+    "phone_country": "DE",
+    "phones": [
+     "+33 4 65 71 42 87"
+    ]
+   },
+   {
+    "_id": "u0060",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "15 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Anaïs Bernard",
+      "number": "5555 5572 4743 8416"
+     }
+    ],
+    "createdAt": "2023-01-01T02:31:00Z",
+    "email": "anais.bernard@example.org",
+    "email_verified": false,
+    "iban": "FR76 9956 9714 2239 8801 2676 870",
+    "name": {
+     "first": "Anaïs",
+     "last": "Bernard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 48 05"
+    ]
+   },
+   {
+    "_id": "u0061",
+    "address": {
+     "city": "Berlin",
+     "country": "DE",
+     "postalCode": "10115",
+     "street": "126 Musterstraße"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Sofia Müller",
+      "number": "4111 1166 0819 4470"
+     }
+    ],
+    "createdAt": "2024-12-18T19:05:00Z",
+    "email": "sofia.muller@example.net",
+    "email_verified": true,
+    "iban": "FR76 9990 2762 1499 9881 5628 013",
+    "name": {
+     "first": "Sofia",
+     "last": "Müller"
+    },
+    "phone_country": "DE",
+    "phones": [
+     "+33 3 53 01 09 84",
+     "09 72 10 00 59"
+    ]
+   },
+   {
+    "_id": "u0062",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "99 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Arthur Thomas",
+      "number": "5555 5500 8869 7604"
+     }
+    ],
+    "createdAt": "2026-07-13T12:16:00Z",
+    "email": "arthur.thomas@example.org",
+    "email_verified": false,
+    "iban": "FR76 9996 1577 3095 9959 6877 306",
+    "name": {
+     "first": "Arthur",
+     "last": "Thomas"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 19 18"
+    ]
+   },
+   {
+    "_id": "u0063",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "66 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Sofia Johnson",
+      "number": "5555 5526 4187 7624"
+     }
+    ],
+    "createdAt": "2023-12-13T17:06:00Z",
+    "email": "sofia.johnson@example.com",
+    "email_verified": false,
+    "iban": "DE12 9990 2739 7433 5645 79",
+    "name": {
+     "first": "Sofia",
+     "last": "Johnson"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 202 555 0137"
+    ]
+   },
+   {
+    "_id": "u0064",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "45 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Emma O'Connor",
+      "number": "5555 5591 3767 2724"
+     }
+    ],
+    "createdAt": "2024-01-13T05:03:00Z",
+    "email": "emma.o-connor@example.net",
+    "email_verified": false,
+    "iban": "FR76 9904 4044 7801 0189 8157 794",
+    "name": {
+     "first": "Emma",
+     "last": "O'Connor"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 202 555 0104",
+     "05 36 49 16 93"
+    ]
+   },
+   {
+    "_id": "u0065",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "105 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Nathan Simon",
+      "number": "4111 1142 7895 2160"
+     }
+    ],
+    "createdAt": "2026-12-12T22:44:00Z",
+    "email": "nathan.simon1@example.org",
+    "email_verified": false,
+    "iban": "FR76 9961 0107 0716 3294 8477 397",
+    "name": {
+     "first": "Nathan",
+     "last": "Simon"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 43 19"
+    ]
+   },
+   {
+    "_id": "u0066",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "1 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Manon Petit",
+      "number": "4111 1166 7899 6564"
+     }
+    ],
+    "createdAt": "2025-08-03T01:18:00Z",
+    "email": "manon.petit@example.net",
+    "email_verified": true,
+    "iban": "FR76 9984 1259 1395 5585 0855 188",
+    "name": {
+     "first": "Manon",
+     "last": "Petit"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 43 65"
+    ]
+   },
+   {
+    "_id": "u0067",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "47 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Arthur Dubois",
+      "number": "4111 1131 2521 7629"
+     }
+    ],
+    "createdAt": "2025-02-12T14:28:00Z",
+    "email": "arthur.dubois@example.org",
+    "email_verified": true,
+    "iban": "FR76 9976 5246 1608 8802 2199 438",
+    "name": {
+     "first": "Arthur",
+     "last": "Dubois"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 26 91",
+     "09 72 10 10 91"
+    ]
+   },
+   {
+    "_id": "u0068",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "158 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Raphaël Bertrand",
+      "number": "5555 5549 1957 2069"
+     }
+    ],
+    "createdAt": "2024-06-14T07:50:00Z",
+    "email": "raphael.bertrand@example.com",
+    "email_verified": false,
+    "iban": "FR76 9916 7251 6017 4771 5964 629",
+    "name": {
+     "first": "Raphaël",
+     "last": "Bertrand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 62 56"
+    ]
+   },
+   {
+    "_id": "u0069",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "36 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Chloé Richard",
+      "number": "5555 5510 0076 0132"
+     }
+    ],
+    "createdAt": "2026-08-02T00:00:00Z",
+    "email": "chloe.richard1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9923 3808 5539 2665 4168 261",
+    "name": {
+     "first": "Chloé",
+     "last": "Richard"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 96 54"
+    ]
+   },
+   {
+    "_id": "u0070",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "145 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Inès Petit",
+      "number": "4111 1160 9547 7826"
+     }
+    ],
+    "createdAt": "2023-08-12T23:09:00Z",
+    "email": "ines.petit1@example.com",
+    "email_verified": true,
+    "iban": "FR76 9995 7550 8146 4472 3317 496",
+    "name": {
+     "first": "Inès",
+     "last": "Petit"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 63 69",
+     "03 53 01 99 65"
+    ]
+   },
+   {
+    "_id": "u0071",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "107 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Chloé Moreau",
+      "number": "5555 5561 0007 6198"
+     }
+    ],
+    "createdAt": "2024-08-18T01:34:00Z",
+    "email": "chloe.moreau@example.com",
+    "email_verified": true,
+    "iban": "FR76 9962 8849 0372 4642 9669 122",
+    "name": {
+     "first": "Chloé",
+     "last": "Moreau"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 63 61"
+    ]
+   },
+   {
+    "_id": "u0072",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "142 boulevard Victor Hugo"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Léa Michel",
+      "number": "5555 5531 9360 6684"
+     }
+    ],
+    "createdAt": "2026-04-20T03:03:00Z",
+    "email": "lea.michel@example.org",
+    "email_verified": true,
+    "iban": "FR76 9987 1634 7045 3517 1979 763",
+    "name": {
+     "first": "Léa",
+     "last": "Michel"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 42 21"
+    ]
+   },
+   {
+    "_id": "u0073",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "90 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Mia Nielsen",
+      "number": "4111 1173 2016 9618"
+     }
+    ],
+    "createdAt": "2025-07-23T01:33:00Z",
+    "email": "mia.nielsen@example.org",
+    "email_verified": true,
+    "iban": "DE90 9990 4075 0854 6607 94",
+    "name": {
+     "first": "Mia",
+     "last": "Nielsen"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 202 555 0116",
+     "02 61 91 33 52"
+    ]
+   },
+   {
+    "_id": "u0074",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "161 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Arthur Dubois",
+      "number": "4111 1119 5158 6307"
+     }
+    ],
+    "createdAt": "2026-10-06T12:13:00Z",
+    "email": "arthur.dubois@example.net",
+    "email_verified": false,
+    "iban": "FR76 9973 3298 1568 1062 1951 761",
+    "name": {
+     "first": "Arthur",
+     "last": "Dubois"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 26 97"
+    ]
+   },
+   {
+    "_id": "u0075",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "81 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Hugo Michel",
+      "number": "4111 1129 5452 7587"
+     }
+    ],
+    "createdAt": "2025-09-11T01:15:00Z",
+    "email": "hugo.michel1@example.net",
+    "email_verified": true,
+    "iban": "FR76 9948 5649 1966 8482 9030 296",
+    "name": {
+     "first": "Hugo",
+     "last": "Michel"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 99 58"
+    ]
+   },
+   {
+    "_id": "u0076",
+    "address": {
+     "city": "Nantes",
+     "country": "FR",
+     "postalCode": "44000",
+     "street": "51 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Marie Vincent",
+      "number": "5555 5523 7853 0255"
+     }
+    ],
+    "createdAt": "2025-06-14T16:12:00Z",
+    "email": "marie.vincent@example.net",
+    "email_verified": true,
+    "iban": "FR76 9912 7186 5749 7269 7038 659",
+    "name": {
+     "first": "Marie",
+     "last": "Vincent"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 28 89",
+     "03 53 01 32 86"
+    ]
+   },
+   {
+    "_id": "u0077",
+    "address": {
+     "city": "Toulouse",
+     "country": "FR",
+     "postalCode": "31000",
+     "street": "142 avenue de la République"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Chloé Simon",
+      "number": "5555 5524 2527 5482"
+     }
+    ],
+    "createdAt": "2024-11-27T16:10:00Z",
+    "email": "chloe.simon@example.org",
+    "email_verified": false,
+    "iban": "FR76 9934 6171 5845 5689 3710 202",
+    "name": {
+     "first": "Chloé",
+     "last": "Simon"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "01 99 00 48 25"
+    ]
+   },
+   {
+    "_id": "u0078",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "146 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Hugo Durand",
+      "number": "5555 5521 7779 5463"
+     }
+    ],
+    "createdAt": "2023-02-08T15:49:00Z",
+    "email": "hugo.durand1@example.org",
+    "email_verified": false,
+    "iban": "FR76 9964 4536 1854 0043 1046 353",
+    "name": {
+     "first": "Hugo",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 37 66"
+    ]
+   },
+   {
+    "_id": "u0079",
+    "address": {
+     "city": "Amsterdam",
+     "country": "NL",
+     "postalCode": "1011 AB",
+     "street": "185 Voorbeeldstraat"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Liam Taylor",
+      "number": "5555 5533 7319 1820"
+     }
+    ],
+    "createdAt": "2023-02-08T08:14:00Z",
+    "email": "liam.taylor@example.com",
+    "email_verified": false,
+    "iban": "FR76 9998 3472 9113 9899 7566 620",
+    "name": {
+     "first": "Liam",
+     "last": "Taylor"
+    },
+    "phone_country": "NL",
+    "phones": [
+     "+33 4 65 71 91 43",
+     "09 72 10 28 18"
+    ]
+   },
+   {
+    "_id": "u0080",
+    "address": {
+     "city": "London",
+     "country": "GB",
+     "postalCode": "NW1 6XE",
+     "street": "191 Baker Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Hannah Taylor",
+      "number": "4111 1108 4188 8329"
+     }
+    ],
+    "createdAt": "2025-03-14T23:45:00Z",
+    "email": "hannah.taylor@example.com",
+    "email_verified": false,
+    "iban": "FR76 9902 1993 6904 6061 6958 519",
+    "name": {
+     "first": "Hannah",
+     "last": "Taylor"
+    },
+    "phone_country": "GB",
+    "phones": [
+     "+44 7700 900794"
+    ]
+   },
+   {
+    "_id": "u0081",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "76 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Louis Leroy",
+      "number": "4111 1133 4453 8847"
+     }
+    ],
+    "createdAt": "2024-12-15T06:21:00Z",
+    "email": "louis.leroy1@example.net",
+    "email_verified": false,
+    "iban": "FR76 9937 0084 1570 2413 8277 492",
+    "name": {
+     "first": "Louis",
+     "last": "Leroy"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 72 95"
+    ]
+   },
+   {
+    "_id": "u0082",
+    "address": {
+     "city": "Amsterdam",
+     "country": "NL",
+     "postalCode": "1011 AB",
+     "street": "179 Voorbeeldstraat"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Emma Taylor",
+      "number": "5555 5501 0362 3015"
+     }
+    ],
+    "createdAt": "2025-11-07T14:59:00Z",
+    "email": "emma.taylor1@example.org",
+    "email_verified": false,
+    "iban": "DE22 9995 4732 1878 6461 44",
+    "name": {
+     "first": "Emma",
+     "last": "Taylor"
+    },
+    "phone_country": "NL",
+    "phones": [
+     "+33 4 65 71 90 51",
+     "04 65 71 72 10"
+    ]
+   },
+   {
+    "_id": "u0083",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "190 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Elijah Brown",
+      "number": "5555 5573 7624 6424"
+     }
+    ],
+    "createdAt": "2024-01-21T13:30:00Z",
+    "email": "elijah.brown@example.net",
+    "email_verified": true,
+    "iban": "DE61 9994 2195 6846 8360 74",
+    "name": {
+     "first": "Elijah",
+     "last": "Brown"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 415 555 0138"
+    ]
+   },
+   {
+    "_id": "u0084",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "103 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Léa Lefèvre",
+      "number": "5555 5590 7481 9049"
+     }
+    ],
+    "createdAt": "2024-03-04T06:30:00Z",
+    "email": "lea.lefevre@example.net",
+    "email_verified": true,
+    "iban": "FR76 9968 6020 6064 3908 4294 261",
+    "name": {
+     "first": "Léa",
+     "last": "Lefèvre"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "04 65 71 10 29"
+    ]
+   },
+   {
+    "_id": "u0085",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "44 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Nathan Leroy",
+      "number": "5555 5538 7176 8913"
+     }
+    ],
+    "createdAt": "2024-09-24T06:04:00Z",
+    "email": "nathan.leroy@example.net",
+    "email_verified": true,
+    "iban": "FR76 9963 8591 5728 6535 4389 243",
+    "name": {
+     "first": "Nathan",
+     "last": "Leroy"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 11 09",
+     "02 61 91 28 50"
+    ]
+   },
+   {
+    "_id": "u0086",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "46 allée des Peupliers"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Léa Bertrand",
+      "number": "5555 5537 0114 7965"
+     }
+    ],
+    "createdAt": "2023-12-24T11:56:00Z",
+    "email": "lea.bertrand1@example.org",
+    "email_verified": false,
+    "iban": "FR76 9979 6056 7904 7539 5613 230",
+    "name": {
+     "first": "Léa",
+     "last": "Bertrand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "05 36 49 17 55"
+    ]
+   },
+   {
+    "_id": "u0087",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "120 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Lukas Brown",
+      "number": "5555 5507 7578 5720"
+     }
+    ],
+    "createdAt": "2024-05-27T17:35:00Z",
+    "email": "lukas.brown@example.org",
+    "email_verified": false,
+    "iban": "DE61 9990 5296 3217 9307 30",
+    "name": {
+     "first": "Lukas",
+     "last": "Brown"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 202 555 0177"
+    ]
+   },
+   {
+    "_id": "u0088",
+    "address": {
+     "city": "Amsterdam",
+     "country": "NL",
+     "postalCode": "1011 AB",
+     "street": "146 Voorbeeldstraat"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Hannah Kowalski",
+      "number": "4111 1163 8297 7058"
+     }
+    ],
+    "createdAt": "2024-12-20T03:23:00Z",
+    "email": "hannah.kowalski@example.com",
+    "email_verified": true,
+    "iban": "FR76 9981 7500 9964 8579 2736 668",
+    "name": {
+     "first": "Hannah",
+     "last": "Kowalski"
+    },
+    "phone_country": "NL",
+    "phones": [
+     "+33 9 72 10 21 97",
+     "06 39 98 02 69"
+    ]
+   },
+   {
+    "_id": "u0089",
+    "address": {
+     "city": "Bordeaux",
+     "country": "FR",
+     "postalCode": "33000",
+     "street": "12 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Raphaël Garcia",
+      "number": "4111 1143 5407 5340"
+     }
+    ],
+    "createdAt": "2026-06-21T01:26:00Z",
+    "email": "raphael.garcia@example.net",
+    "email_verified": false,
+    "iban": "FR76 9983 9658 1471 9854 3743 560",
+    "name": {
+     "first": "Raphaël",
+     "last": "Garcia"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 77 19"
+    ]
+   },
+   {
+    "_id": "u0090",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "178 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Zoé Moreau",
+      "number": "4111 1143 2116 9077"
+     }
+    ],
+    "createdAt": "2026-06-19T23:27:00Z",
+    "email": "zoe.moreau@example.net",
+    "email_verified": true,
+    "iban": "FR76 9945 9657 7634 5892 0245 710",
+    "name": {
+     "first": "Zoé",
+     "last": "Moreau"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "02 61 91 13 46"
+    ]
+   },
+   {
+    "_id": "u0091",
+    "address": {
+     "city": "Paris",
+     "country": "FR",
+     "postalCode": "75011",
+     "street": "13 rue des Lilas"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Louis Simon",
+      "number": "5555 5507 0575 7682"
+     }
+    ],
+    "createdAt": "2024-06-14T10:53:00Z",
+    "email": "louis.simon@example.org",
+    "email_verified": true,
+    "iban": "FR76 9931 2258 1090 6385 1222 988",
+    "name": {
+     "first": "Louis",
+     "last": "Simon"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 05 61",
+     "01 99 00 90 30"
+    ]
+   },
+   {
+    "_id": "u0092",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "131 chemin des Vignes"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Léa Garcia",
+      "number": "4111 1193 9110 0035"
+     }
+    ],
+    "createdAt": "2023-07-09T02:46:00Z",
+    "email": "lea.garcia@example.net",
+    "email_verified": false,
+    "iban": "FR76 9955 2390 9718 1063 8150 983",
+    "name": {
+     "first": "Léa",
+     "last": "Garcia"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 09 22"
+    ]
+   },
+   {
+    "_id": "u0093",
+    "address": {
+     "city": "London",
+     "country": "GB",
+     "postalCode": "NW1 6XE",
+     "street": "154 Baker Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Oliver Schmidt",
+      "number": "4111 1179 6864 1670"
+     }
+    ],
+    "createdAt": "2026-05-03T22:17:00Z",
+    "email": "oliver.schmidt@example.net",
+    "email_verified": true,
+    "iban": "DE46 9997 3835 7530 7369 69",
+    "name": {
+     "first": "Oliver",
+     "last": "Schmidt"
+    },
+    "phone_country": "GB",
+    "phones": [
+     "+44 7700 900558"
+    ]
+   },
+   {
+    "_id": "u0094",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "122 place de l'Église"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Jean Bertrand",
+      "number": "4111 1167 2381 6650"
+     }
+    ],
+    "createdAt": "2025-10-11T17:03:00Z",
+    "email": "jean.bertrand2@example.net",
+    "email_verified": false,
+    "iban": "FR76 9982 7639 3277 1796 1991 955",
+    "name": {
+     "first": "Jean",
+     "last": "Bertrand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 47 12",
+     "01 99 00 55 50"
+    ]
+   },
+   {
+    "_id": "u0095",
+    "address": {
+     "city": "Marseille",
+     "country": "FR",
+     "postalCode": "13006",
+     "street": "101 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Anaïs Roux",
+      "number": "5555 5503 2187 0091"
+     }
+    ],
+    "createdAt": "2026-02-07T05:37:00Z",
+    "email": "anais.roux@example.com",
+    "email_verified": true,
+    "iban": "FR76 9908 9727 5112 8036 5583 831",
+    "name": {
+     "first": "Anaïs",
+     "last": "Roux"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 25 54"
+    ]
+   },
+   {
+    "_id": "u0096",
+    "address": {
+     "city": "Strasbourg",
+     "country": "FR",
+     "postalCode": "67000",
+     "street": "51 avenue de la République"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Hugo Bertrand",
+      "number": "5555 5592 1471 1205"
+     }
+    ],
+    "createdAt": "2026-10-20T05:30:00Z",
+    "email": "hugo.bertrand@example.org",
+    "email_verified": true,
+    "iban": "FR76 9922 2790 5287 2034 5655 157",
+    "name": {
+     "first": "Hugo",
+     "last": "Bertrand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "09 72 10 63 95"
+    ]
+   },
+   {
+    "_id": "u0097",
+    "address": {
+     "city": "Berlin",
+     "country": "DE",
+     "postalCode": "10115",
+     "street": "99 Musterstraße"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Elijah Müller",
+      "number": "4111 1101 5611 0384"
+     }
+    ],
+    "createdAt": "2023-03-27T04:54:00Z",
+    "email": "elijah.muller@example.com",
+    "email_verified": false,
+    "iban": "FR76 9978 0054 7561 2435 3211 733",
+    "name": {
+     "first": "Elijah",
+     "last": "Müller"
+    },
+    "phone_country": "DE",
+    "phones": [
+     "+33 3 53 01 88 88",
+     "05 36 49 02 92"
+    ]
+   },
+   {
+    "_id": "u0098",
+    "address": {
+     "city": "Lyon",
+     "country": "FR",
+     "postalCode": "69003",
+     "street": "124 rue du Moulin"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Marie Durand",
+      "number": "5555 5521 3140 1877"
+     }
+    ],
+    "createdAt": "2024-10-28T20:47:00Z",
+    "email": "marie.durand@example.org",
+    "email_verified": false,
+    "iban": "FR76 9927 2013 2536 1288 2795 877",
+    "name": {
+     "first": "Marie",
+     "last": "Durand"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "06 39 98 85 07"
+    ]
+   },
+   {
+    "_id": "u0099",
+    "address": {
+     "city": "Lille",
+     "country": "FR",
+     "postalCode": "59000",
+     "street": "80 impasse des Tilleuls"
+    },
+    "cards": [
+     {
+      "brand": "MASTERCARD",
+      "holder": "Manon Roux",
+      "number": "5555 5587 0613 9735"
+     }
+    ],
+    "createdAt": "2023-02-21T23:03:00Z",
+    "email": "manon.roux@example.org",
+    "email_verified": false,
+    "iban": "FR76 9907 6481 6370 1878 9072 342",
+    "name": {
+     "first": "Manon",
+     "last": "Roux"
+    },
+    "phone_country": "FR",
+    "phones": [
+     "03 53 01 59 60"
+    ]
+   },
+   {
+    "_id": "u0100",
+    "address": {
+     "city": "Springfield",
+     "country": "US",
+     "postalCode": "90210",
+     "street": "192 Elm Street"
+    },
+    "cards": [
+     {
+      "brand": "VISA",
+      "holder": "Noah Taylor",
+      "number": "4111 1109 4360 1240"
+     }
+    ],
+    "createdAt": "2026-05-06T16:12:00Z",
+    "email": "noah.taylor@example.com",
+    "email_verified": false,
+    "iban": "DE32 9990 6716 7517 4292 55",
+    "name": {
+     "first": "Noah",
+     "last": "Taylor"
+    },
+    "phone_country": "US",
+    "phones": [
+     "+1 202 555 0101",
+     "09 72 10 48 64"
+    ]
+   }
+  ]
+ }
+}

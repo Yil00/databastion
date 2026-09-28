@@ -19,6 +19,7 @@ secrets/
 node_modules/
 .next/
 out/
+!dev/seed/out/
 coverage/
 *.tsbuildinfo
 
