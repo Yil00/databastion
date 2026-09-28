@@ -19,5 +19,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0013](0013-frozen-error-codes.md) | Error codes are frozen within a protocol major version | Accepted |
 | [0014](0014-policy-and-incident-model.md) | Policy and incident model: per-source conditions, durable work markers, dedup (resolved means remediated) and false-positive alignment | Accepted |
 | [0015](0015-postgresql-connector-decisions.md) | PostgreSQL connector: TLS policy, authentication refusals, RLS policy allow-list, audit level before P4-A, partition and byte bounds (refines 0012) | Accepted |
+| [0016](0016-classifier-semantics-2026-09-1.md) | Classifier semantics for set 2026.09.1: value-based decision, personal e-mail, placeholders, age reference year, NFC, held-out evaluation process | Accepted |
 
 Template: copy [template.md](template.md).
