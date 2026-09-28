@@ -71,26 +71,29 @@ services:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: databastion
+      # Bootstrap superuser: used only by the initdb script below, never by the console.
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: databastion
-    secrets: [db_password, db_app_password]
+    secrets: [db_password, db_owner_password, db_app_password]
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # Creates the non-owner runtime role at first initialization (see the script).
+      # Creates the owner and runtime roles at first initialization (see the script).
       - ./initdb:/docker-entrypoint-initdb.d:ro
     # No "ports:": the internal database is never exposed.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U databastion -d databastion"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d databastion"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 secrets:
   db_password:
-    file: ./secrets/db_password       # OWNER role (POSTGRES_USER), used only by `migrate`
+    file: ./secrets/db_password       # bootstrap superuser (POSTGRES_USER), initdb only
+  db_owner_password:
+    file: ./secrets/db_owner_password # databastion_owner (NOSUPERUSER), used only by `migrate`
   db_owner_url:
-    file: ./secrets/db_owner_url      # postgresql://databastion:<db_password>@db:5432/databastion
+    file: ./secrets/db_owner_url      # postgresql://databastion_owner:<db_owner_password>@db:5432/databastion
   db_app_password:
     file: ./secrets/db_app_password   # runtime role databastion_runtime (web + worker)
   db_url:

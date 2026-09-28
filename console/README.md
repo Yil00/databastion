@@ -60,26 +60,47 @@ with a message and the unit tests still run.
 
 ## Database roles
 The append-only guarantee of `audit_log` (a trigger) only holds if the console cannot remove it,
-so production uses two roles:
+and migrations must never run code planted by the console. Production uses three roles:
 
 | Role | Used by | Rights |
 |------|---------|--------|
-| Owner (e.g. `POSTGRES_USER`) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns every table and trigger |
-| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, `CREATE` on the database (pg-boss schema) |
+| Bootstrap superuser (`POSTGRES_USER`) | the initdb script only | Creates the roles below, then is never used |
+| `databastion_owner` (LOGIN, NOSUPERUSER, NOCREATEROLE) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns the database, `public`, `pgboss` and every console table and trigger. `search_path` pinned to `public` (role setting and migration session) |
+| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
 
-The group role `databastion_app` and its grants come from migration `0003_runtime_role_grants.sql`
-(it creates the group role if missing, which needs `CREATEROLE` on the owner). The LOGIN role and
-its password are created outside migrations; with the example compose file,
+Grants come from migrations `0003_runtime_role_grants.sql` and `0004_pgboss_schema_hardening.sql`
+(custom, every name schema-qualified). The roles and passwords are created outside migrations (the
+owner has no `CREATEROLE`); with the example compose file,
 [deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
-first database initialization. Elsewhere, as the owner:
+first database initialization, reading the passwords from the Docker secret files inside psql
+(never on a command line). The worker runs pg-boss with `schema: 'pgboss'`, `createSchema: false`.
 
-```sql
-CREATE ROLE databastion_runtime LOGIN PASSWORD '...' IN ROLE databastion_app;
-```
+At startup, the web and worker processes log a warning if their database role is a superuser or
+owns `audit_log`.
 
 Limitation: in a single-role setup (`DATABASE_URL` is the owner or a superuser, e.g. development),
 the console could drop the trigger; the audit log is then append-only only against the application
 code, not against a compromised console process.
+
+### Upgrading an existing deployment
+Deployments created before the role split (single `POSTGRES_USER` role used by everything; the
+initdb script only runs on an empty data directory) switch as follows, once, as the superuser:
+
+```sql
+\set owner_password `cat /run/secrets/db_owner_password`
+\set app_password `cat /run/secrets/db_app_password`
+CREATE ROLE databastion_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD :'owner_password';
+ALTER ROLE databastion_owner SET search_path = public;
+CREATE ROLE databastion_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+CREATE ROLE databastion_runtime LOGIN IN ROLE databastion_app PASSWORD :'app_password';
+ALTER DATABASE databastion OWNER TO databastion_owner;
+REASSIGN OWNED BY <old console role> TO databastion_owner;  -- tables, triggers, schemas (incl. pgboss, drizzle)
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+Then drop any schema the old role created other than `public`, `pgboss` and `drizzle`, point
+`db_owner_url` at `databastion_owner` and `db_url` at `databastion_runtime`, run `migrate`, and
+restart the web and worker processes (check that they log no database role warning).
 
 ## First administrator
 There is no default account and no default password. After `pnpm db:migrate`:
