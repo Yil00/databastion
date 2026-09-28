@@ -15,6 +15,13 @@
       "when": 1790607582849,
       "tag": "0001_p1a_agents_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790608724492,
+      "tag": "0002_audit_log_append_only",
+      "breakpoints": true
     }
   ]
 }
