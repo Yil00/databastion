@@ -78,6 +78,11 @@ first database initialization, reading the passwords from the Docker secret file
 At startup, the web and worker processes log a warning if their database role is a superuser or
 owns `audit_log`.
 
+Rule: the owner role must never run SQL against objects inside schema `pgboss` (DML, DDL, manual
+maintenance). pg-boss creates them as the runtime role, so a trigger or function planted there by
+a compromised console would run with the owner's rights. A future migration that needs to touch
+`pgboss` must `SET ROLE databastion_runtime` first, or check object owners before acting.
+
 Limitation: in a single-role setup (`DATABASE_URL` is the owner or a superuser, e.g. development),
 the console could drop the trigger; the audit log is then append-only only against the application
 code, not against a compromised console process.
