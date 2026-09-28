@@ -38,8 +38,10 @@ databastion-protocol-codegen = { path = "crates/protocol-codegen" }
 # crates/agent/tests/architecture.rs).
 async-trait = "0.1"
 # RustCrypto HMAC-SHA256 for value fingerprints (classifiers::masking).
-hmac = { version = "0.13", default-features = false }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11", default-features = false }
+# NFC normalization of names and addresses before fingerprinting.
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 # Linear-time regex engine (no backtracking, no ReDoS) for the classifiers.
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-gencat"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }

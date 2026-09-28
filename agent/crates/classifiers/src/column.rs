@@ -20,14 +20,29 @@
 //! | birth date, person name, postal address, AWS secret key (whole value) | name hint **and** `ratio ≥ 0.8` (address: `0.6`) | `0.3 + 0.5·ratio` |
 //!
 //! Confidences are rounded to 3 decimals and capped at 1.
+//!
+//! In a column named `siret` / `siren`, 14-digit card candidates are
+//! dropped: SIRETs pass Luhn and may start with a Diners Club prefix.
+//!
+//! # Evidence selection
+//!
+//! Masked samples are **not** taken from the first rows: that would pick
+//! the same rows in every column of a table and let the console rebuild
+//! partial records. Each column keeps the [`MAX_MASKED_SAMPLES`] distinct
+//! masked samples whose values have the smallest
+//! `HMAC(key, "sample-order" 0x00 column_name 0x00 value)`: deterministic for
+//! a key, but independent across columns. Without the agent key, a random
+//! key is drawn for the call. Fingerprints are the [`MAX_FINGERPRINTS`]
+//! smallest distinct ones, emitted sorted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::detect;
 use crate::hints::NameHints;
 use crate::id::ClassifierId;
 use crate::masking::{
-    FindingLocation, Fingerprint, HmacKey, MaskedFinding, MaskedSample, RawSample, mask_as,
+    FindingLocation, Fingerprint, HmacKey, MaskedFinding, MaskedSample, PhoneRegion, RawSample,
+    mask_as,
 };
 
 /// Most values examined per column (contract `sample_rows` maximum).
@@ -80,14 +95,15 @@ impl ColumnFinding {
         self.matched
     }
 
-    /// Up to [`MAX_MASKED_SAMPLES`] distinct masked samples, in sample order.
+    /// Up to [`MAX_MASKED_SAMPLES`] distinct masked samples, in per-column
+    /// pseudo-random order (never the first rows).
     #[must_use]
     pub fn masked_samples(&self) -> &[MaskedSample] {
         &self.masked_samples
     }
 
-    /// Up to [`MAX_FINGERPRINTS`] distinct fingerprints, in sample order
-    /// (empty without an [`HmacKey`]).
+    /// Up to [`MAX_FINGERPRINTS`] distinct fingerprints, sorted (empty
+    /// without an [`HmacKey`]).
     #[must_use]
     pub fn fingerprints(&self) -> &[Fingerprint] {
         &self.fingerprints
@@ -109,15 +125,16 @@ impl ColumnFinding {
 pub struct ColumnClassifier<'k> {
     only: Option<Vec<ClassifierId>>,
     key: Option<&'k HmacKey>,
+    region: PhoneRegion,
 }
 
 #[derive(Default)]
 struct Acc {
     matched: u32,
-    masked: BTreeSet<MaskedSample>,
-    masked_order: Vec<MaskedSample>,
+    /// Smallest ordering key seen for each distinct masked sample.
+    samples: BTreeMap<MaskedSample, [u8; 32]>,
+    /// The smallest distinct fingerprints (at most [`MAX_FINGERPRINTS`]).
     fps: BTreeSet<Fingerprint>,
-    fps_order: Vec<Fingerprint>,
 }
 
 impl ColumnClassifier<'_> {
@@ -134,6 +151,14 @@ impl ColumnClassifier<'_> {
         self
     }
 
+    /// Phone region of the column or target (agent configuration), for the
+    /// normalization of national numbers before fingerprinting.
+    #[must_use]
+    pub fn phone_region(mut self, region: PhoneRegion) -> Self {
+        self.region = region;
+        self
+    }
+
     fn enabled(&self, c: ClassifierId) -> bool {
         self.only.as_ref().is_none_or(|o| o.contains(&c))
     }
@@ -144,6 +169,19 @@ impl ColumnClassifier<'_> {
     #[must_use]
     pub fn classify(&self, column_name: &str, values: &[RawSample<'_>]) -> Vec<ColumnFinding> {
         let hints = NameHints::of(column_name);
+        // Sample ordering key: the agent key, or a random one for this call.
+        let ephemeral;
+        let order: Option<&HmacKey> = match self.key {
+            Some(k) => Some(k),
+            None => {
+                ephemeral = HmacKey::ephemeral();
+                ephemeral.as_ref()
+            }
+        };
+        let ctx = Ctx {
+            column: column_name,
+            order,
+        };
         let mut acc: Vec<Acc> = ClassifierId::ALL.iter().map(|_| Acc::default()).collect();
         let mut sampled: u32 = 0;
         let whole_value: [WholeValue; 4] = [
@@ -179,12 +217,18 @@ impl ColumnClassifier<'_> {
             let mut hit = [false; ClassifierId::ALL.len()];
             for t in &tokens {
                 let token = &value[t.range.clone()];
-                self.record(&mut acc, &mut hit, t.classifier, token);
+                if t.classifier == ClassifierId::CardNumber
+                    && hints.siret()
+                    && token.chars().filter(char::is_ascii_digit).count() == 14
+                {
+                    continue;
+                }
+                self.record(&ctx, &mut acc, &mut hit, t.classifier, token);
             }
             if tokens.is_empty() {
                 for (c, gated, recognize) in whole_value {
                     if gated && self.enabled(c) && recognize(value) {
-                        self.record(&mut acc, &mut hit, c, value);
+                        self.record(&ctx, &mut acc, &mut hit, c, value);
                     }
                 }
             }
@@ -234,8 +278,8 @@ impl ColumnClassifier<'_> {
                 confidence: (confidence.min(1.0) * 1000.0).round() / 1000.0,
                 sampled,
                 matched: a.matched,
-                masked_samples: std::mem::take(&mut a.masked_order),
-                fingerprints: std::mem::take(&mut a.fps_order),
+                masked_samples: pick_samples(std::mem::take(&mut a.samples)),
+                fingerprints: std::mem::take(&mut a.fps).into_iter().collect(),
             });
         }
         out
@@ -243,6 +287,7 @@ impl ColumnClassifier<'_> {
 
     fn record(
         &self,
+        ctx: &Ctx<'_, '_>,
         acc: &mut [Acc],
         hit: &mut [bool; ClassifierId::ALL.len()],
         c: ClassifierId,
@@ -257,20 +302,42 @@ impl ColumnClassifier<'_> {
             a.matched += 1;
         }
         let raw = RawSample::new(token);
-        if a.masked_order.len() < MAX_MASKED_SAMPLES {
+        if let Some(order) = ctx.order {
+            let rank = order.sample_order(ctx.column, token);
             let m = mask_as(c, &raw);
-            if a.masked.insert(m.clone()) {
-                a.masked_order.push(m);
-            }
+            a.samples
+                .entry(m)
+                .and_modify(|best| *best = (*best).min(rank))
+                .or_insert(rank);
         }
         if let Some(key) = self.key
-            && a.fps_order.len() < MAX_FINGERPRINTS
-            && let Some(fp) = key.fingerprint(c, &raw)
-            && a.fps.insert(fp.clone())
+            && let Some(fp) = key.fingerprint_in(c, &raw, self.region)
         {
-            a.fps_order.push(fp);
+            a.fps.insert(fp);
+            if a.fps.len() > MAX_FINGERPRINTS {
+                a.fps.pop_last();
+            }
         }
     }
+}
+
+/// Per-call context of [`ColumnClassifier::classify`].
+struct Ctx<'c, 'k> {
+    column: &'c str,
+    order: Option<&'k HmacKey>,
+}
+
+/// The [`MAX_MASKED_SAMPLES`] masked samples with the smallest ordering keys,
+/// in that order.
+fn pick_samples(samples: BTreeMap<MaskedSample, [u8; 32]>) -> Vec<MaskedSample> {
+    let mut ranked: Vec<([u8; 32], MaskedSample)> =
+        samples.into_iter().map(|(m, rank)| (rank, m)).collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(MAX_MASKED_SAMPLES)
+        .map(|(_, m)| m)
+        .collect()
 }
 
 impl<'k> ColumnClassifier<'k> {
@@ -395,7 +462,101 @@ mod tests {
         assert_eq!(f.masked_samples().len(), 1);
         assert_eq!(f.masked_samples()[0].as_str(), "u***@e***.com");
         assert_eq!(f.fingerprints().len(), MAX_FINGERPRINTS);
+        assert!(f.fingerprints().windows(2).all(|w| w[0] < w[1]));
         let debug = format!("{a:?}");
         assert!(!debug.contains("user1@"));
+    }
+
+    fn card_for_row(i: usize) -> String {
+        let partial = format!("411111111111{i:03}");
+        (0..10)
+            .map(|d| format!("{partial}{d}"))
+            .find(|n| crate::validate::luhn_valid(n))
+            .unwrap_or_default()
+    }
+
+    /// Row indices behind the masked samples of `name`.
+    fn sampled_rows(
+        c: &ColumnClassifier<'_>,
+        name: &str,
+        class: ClassifierId,
+        rows: &[String],
+    ) -> Vec<usize> {
+        let raws: Vec<RawSample<'_>> = rows.iter().map(|v| RawSample::new(v)).collect();
+        let found = c.classify(name, &raws);
+        let f = found
+            .iter()
+            .find(|f| f.classifier() == class)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(f.masked_samples().len(), MAX_MASKED_SAMPLES);
+        f.masked_samples()
+            .iter()
+            .map(|m| {
+                rows.iter()
+                    .position(|v| mask_as(class, &RawSample::new(v)) == *m)
+                    .unwrap_or_else(|| unreachable!())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn samples_of_two_columns_are_not_row_aligned() {
+        // Every row masks differently, so a masked sample identifies its row.
+        let phones: Vec<String> = (0..100).map(|i| format!("+1 202 555 01{i:02}")).collect();
+        let cards: Vec<String> = (0..100).map(card_for_row).collect();
+        let key = HmacKey::new(&[8; 32]).unwrap_or_else(|_| unreachable!());
+        let c = ColumnClassifier::new().with_key(&key);
+        let a = sampled_rows(&c, "phone", C::Phone, &phones);
+        let b = sampled_rows(&c, "card_number", C::CardNumber, &cards);
+        let mut sa = a.clone();
+        let mut sb = b.clone();
+        sa.sort_unstable();
+        sb.sort_unstable();
+        assert_ne!(sa, sb, "same rows sampled in both columns");
+        // Not the first rows either.
+        assert_ne!(sa, [0, 1, 2, 3, 4]);
+        // Deterministic for a key.
+        assert_eq!(a, sampled_rows(&c, "phone", C::Phone, &phones));
+        // The same values under another column name are ordered differently.
+        let other = sampled_rows(&c, "mobile", C::Phone, &phones);
+        let mut so = other.clone();
+        so.sort_unstable();
+        assert_ne!(sa, so);
+        // Without a key: still bounded, random order per call.
+        let unkeyed = sampled_rows(&ColumnClassifier::new(), "phone", C::Phone, &phones);
+        assert_eq!(unkeyed.len(), MAX_MASKED_SAMPLES);
+    }
+
+    #[test]
+    fn siret_and_siren_are_not_cards() {
+        // Luhn-valid SIRETs starting with Diners prefixes 36 / 38 / 39, and
+        // SIRENs (9 digits).
+        let sirets: Vec<String> = ["3600000000000", "3800000000000", "3912345678901"]
+            .iter()
+            .map(|p| {
+                (0..10)
+                    .map(|d| format!("{p}{d}"))
+                    .find(|n| crate::validate::luhn_valid(n))
+                    .unwrap_or_default()
+            })
+            .collect();
+        for s in &sirets {
+            assert_eq!(s.len(), 14);
+            assert!(
+                crate::validate::card_prefix_valid(s),
+                "{s} looks like Diners"
+            );
+        }
+        let refs: Vec<&str> = sirets.iter().map(String::as_str).collect();
+        assert!(run("siret", &refs).is_empty());
+        assert!(run("num_siret", &refs).is_empty());
+        assert!(run("siren", &["362521879", "732829320"]).is_empty());
+        // Without the hint, a 14-digit Diners-shaped number is a card.
+        assert_eq!(run("reference", &refs), [(C::CardNumber, 3, 3)]);
+        // Real cards stay cards in a siret column.
+        assert_eq!(
+            run("siret", &["4111 1111 1111 1111"]),
+            [(C::CardNumber, 1, 1)]
+        );
     }
 }

@@ -229,6 +229,7 @@ pub struct NameHints {
     hinted: Vec<ClassifierId>,
     negative: bool,
     aws_secret: bool,
+    siret: bool,
 }
 
 impl NameHints {
@@ -270,10 +271,14 @@ impl NameHints {
         }
         hinted.sort();
         let negative = last.iter().any(|t| NEGATIVE.contains(&t.as_str()));
+        let siret = ["siret", "siren", "numsiret", "numsiren"]
+            .iter()
+            .any(|t| has(t));
         Self {
             hinted,
             negative,
             aws_secret,
+            siret,
         }
     }
 
@@ -288,6 +293,13 @@ impl NameHints {
     #[must_use]
     pub fn gates(&self, id: ClassifierId) -> bool {
         self.hints(id) && !self.negative
+    }
+
+    /// Whether the name designates a French company number (SIRET / SIREN):
+    /// 14-digit Luhn-valid values there are not card numbers.
+    #[must_use]
+    pub fn siret(&self) -> bool {
+        self.siret
     }
 
     /// Whether the name designates an AWS secret access key.

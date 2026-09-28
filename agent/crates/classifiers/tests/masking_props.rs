@@ -5,8 +5,8 @@
 //!   digits in total, so no run of more than 4 consecutive raw digits
 //!   survives;
 //! - masking is stable, and re-masking a masked sample never reveals more;
-//! - fingerprints are deterministic per key, differ across keys, and have
-//!   the contract shape;
+//! - fingerprints are deterministic per key, differ across keys and across
+//!   domains (classifiers, `db_user`), and have the contract shape;
 //! - no raw value appears in any `Debug` output.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -251,6 +251,21 @@ proptest! {
         prop_assert!(!f.as_str().contains(raw.as_str()));
         if k1 != k2 {
             prop_assert_ne!(Some(f), key(k2).fingerprint(c, &v));
+        }
+    }
+
+    #[test]
+    fn fingerprints_are_domain_separated((c, raw) in classified(), k in any::<u8>()) {
+        let v = RawSample::new(&raw);
+        let key = key(k);
+        let own = key.fingerprint(c, &v).unwrap();
+        prop_assert_ne!(&own, &key.fingerprint_db_user(&v));
+        for other in ClassifierId::ALL {
+            if other != c
+                && let Some(f) = key.fingerprint(other, &v)
+            {
+                prop_assert_ne!(&own, &f, "{} {}", c, other);
+            }
         }
     }
 
