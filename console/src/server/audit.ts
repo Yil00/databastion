@@ -28,6 +28,13 @@ export type AuditAction =
   | "discovery.scan_request"
   | "finding.false_positive"
   | "finding.false_positive_reset"
+  | "policy.create"
+  | "policy.update"
+  | "policy.delete"
+  | "policy_exception.create"
+  | "policy_exception.delete"
+  | "incident.create"
+  | "incident.transition"
   | "job.timeout"
   | "user.access_denied";
 

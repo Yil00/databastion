@@ -6,6 +6,7 @@ import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
+import { requestPolicyEvaluation } from "@/server/policy-queue";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
 import {
@@ -346,6 +347,8 @@ export function handleFindings(req: Request): Promise<Response> {
     if (outcome.kind !== "accepted" || outcome.duplicate) refund();
     switch (outcome.kind) {
       case "accepted":
+        // After the commit, not awaited: wakes the policy engine (the findings are durably pending).
+        if (!outcome.duplicate) void requestPolicyEvaluation();
         return conformingJson(
           "BatchAck",
           { batch_id: body.value.batch_id, duplicate: outcome.duplicate },

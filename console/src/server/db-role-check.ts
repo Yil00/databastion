@@ -15,6 +15,18 @@ export async function runtimeRoleWarnings(pool: Pick<Pool, "query">): Promise<st
      where r.rolname = current_user`);
   const row = rows[0];
   const warnings: string[] = [];
+  // Incidents (migrations 0015, 0016): never deletable, only lifecycle / re-match columns updatable.
+  const incidents = await pool.query<{ del: boolean | null; upd_snapshot: boolean | null }>(`
+    select case when pg_catalog.to_regclass('public.incidents') is null then null
+                else pg_catalog.has_table_privilege(current_user, 'public.incidents', 'DELETE') end as del,
+           case when pg_catalog.to_regclass('public.incidents') is null then null
+                else pg_catalog.has_column_privilege(current_user, 'public.incidents', 'severity', 'UPDATE') end as upd_snapshot`);
+  const inc = incidents.rows[0];
+  if (!row?.superuser && !row?.owns_audit_log && (inc?.del || inc?.upd_snapshot)) {
+    warnings.push(
+      "The console's database role can delete incidents or rewrite their policy snapshot: apply migrations 0015 and 0016 (README, Database roles).",
+    );
+  }
   if (row?.superuser) {
     warnings.push("The console connects to its database as a superuser: use the non-owner runtime role (README, Database roles).");
   }
