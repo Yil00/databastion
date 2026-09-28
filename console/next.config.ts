@@ -1,5 +1,7 @@
 import type { NextConfig } from "next";
 
+import { SECURITY_HEADERS } from "./src/lib/csp";
+
 const nextConfig: NextConfig = {
   // Self-contained server bundle for the Docker image (set by the image build).
   // Left off by default so that `pnpm start` (`next start`) keeps working locally.
@@ -11,6 +13,10 @@ const nextConfig: NextConfig = {
   agentRules: false,
   // Server-only packages loaded from node_modules at runtime, never bundled.
   serverExternalPackages: ["pg", "pg-boss", "pino", "@node-rs/argon2"],
+  // Static security headers on every response; the nonce-based CSP of UI pages is set in src/proxy.ts.
+  async headers() {
+    return [{ source: "/:path*", headers: [...SECURITY_HEADERS] }];
+  },
 };
 
 export default nextConfig;

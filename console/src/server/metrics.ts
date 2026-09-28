@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { sql } from "drizzle-orm";
 
-import { readEnvOrFile } from "@/config/env";
+import { readEnvOrFile, type Env } from "@/config/env";
 import type { Database } from "@/db/client";
 import { logger } from "@/lib/logger";
 
@@ -237,7 +237,7 @@ export const MIN_METRICS_TOKEN_LENGTH = 32;
  * both sides, so lengths never leak). Unset (or shorter than 32 characters): the endpoint is
  * disabled (`404`).
  */
-export function checkMetricsAuth(req: Request, env: NodeJS.ProcessEnv = process.env): MetricsAuth {
+export function checkMetricsAuth(req: Request, env: Env = process.env): MetricsAuth {
   const expected = readEnvOrFile("DATABASTION_METRICS_TOKEN", env);
   if (expected === undefined) return "disabled";
   if (expected.length < MIN_METRICS_TOKEN_LENGTH) {
