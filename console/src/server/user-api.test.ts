@@ -1,5 +1,5 @@
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { agents, auditLog, sessions, users } from "@/db/schema";
@@ -21,14 +21,24 @@ import {
   handleSession,
   loginFailuresPerIp,
   loginFailuresPerUser,
+  loginFailuresPerUserGlobal,
   loginFailuresUnknownUser,
+  loginSlowdown,
 } from "./user-api";
 
 const ORIGIN = "http://console.test";
 const PASSWORD = "correct horse battery staple";
 
-function userReq(method: string, p: string, opts: { body?: unknown; cookie?: string; csrf?: string; origin?: string } = {}) {
-  const headers: Record<string, string> = { "Content-Type": "application/json", Origin: opts.origin ?? ORIGIN };
+function userReq(
+  method: string,
+  p: string,
+  opts: { body?: unknown; cookie?: string; csrf?: string; origin?: string; headers?: Record<string, string> } = {},
+) {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Origin: opts.origin ?? ORIGIN,
+    ...opts.headers,
+  };
   if (opts.cookie) headers.Cookie = opts.cookie;
   if (opts.csrf) headers["X-CSRF-Token"] = opts.csrf;
   return new Request(`${ORIGIN}${p}`, {
@@ -38,8 +48,9 @@ function userReq(method: string, p: string, opts: { body?: unknown; cookie?: str
   });
 }
 
-async function login(username = "admin", password = PASSWORD) {
-  const res = await handleLogin(userReq("POST", "/api/auth/login", { body: { username, password } }));
+async function login(username = "admin", password = PASSWORD, ip?: string) {
+  const headers = ip ? { "X-Forwarded-For": ip } : undefined;
+  const res = await handleLogin(userReq("POST", "/api/auth/login", { body: { username, password }, headers }));
   const setCookie = res.headers.get("set-cookie") ?? "";
   const body = res.status === 200 ? ((await res.json()) as { csrf_token: string }) : undefined;
   return { res, setCookie, cookie: setCookie.split(";")[0] ?? "", csrf: body?.csrf_token ?? "" };
@@ -59,6 +70,7 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
   beforeEach(() => {
     loginFailuresPerIp.clear();
     loginFailuresPerUser.clear();
+    loginFailuresPerUserGlobal.clear();
     loginFailuresUnknownUser.clear();
   });
 
@@ -95,6 +107,64 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     for (let i = 0; i < 6; i++) statuses.push((await login("admin", "not the password")).res.status);
     expect(statuses.slice(0, 5)).toEqual([401, 401, 401, 401, 401]);
     expect(statuses[5]).toBe(429);
+  });
+
+  describe("P1-D M2: no remote lock-out of an account", () => {
+    beforeEach(() => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+    });
+    afterEach(() => {
+      delete process.env.DATABASTION_TRUST_PROXY;
+      loginSlowdown.ms = 2000;
+    });
+
+    it("the per-username limit is keyed by source IP when it is known", async () => {
+      const statuses: number[] = [];
+      for (let i = 0; i < 6; i++) statuses.push((await login("admin", "not the password", "203.0.113.5")).res.status);
+      expect(statuses).toEqual([401, 401, 401, 401, 401, 429]);
+      // The same IP stays limited, even with the right password; another IP logs in.
+      expect((await login("admin", PASSWORD, "203.0.113.5")).res.status).toBe(429);
+      expect((await login("admin", PASSWORD, "192.0.2.44")).res.status).toBe(200);
+      // IPv6 clients are bucketed by /64: another address of the same /64 is the same client.
+      for (let i = 0; i < 5; i++) await login("admin", "not the password", "2001:db8:1:2::1");
+      expect((await login("admin", PASSWORD, "2001:db8:1:2::ffff")).res.status).toBe(429);
+    });
+
+    it("the global per-username cap slows down and serializes, never locks the right password out", async () => {
+      for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
+      loginSlowdown.ms = 150;
+      // Correct password from a fresh IP: still logs in, after the slow-down.
+      const start = performance.now();
+      expect((await login("admin", PASSWORD, "198.51.100.200")).res.status).toBe(200);
+      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
+      // A wrong password is still a plain 401 (no enumeration of the degraded state through 429).
+      expect((await login("admin", "not the password", "198.51.100.201")).res.status).toBe(401);
+      // One attempt in flight per username: concurrent ones get 503 + Retry-After.
+      const results = await Promise.all(
+        ["198.51.100.202", "198.51.100.203", "198.51.100.204"].map((ip) => login("admin", "nope nope nope", ip)),
+      );
+      const statuses = results.map((r) => r.res.status).sort();
+      expect(statuses).toEqual([401, 503, 503]);
+      for (const r of results.filter((x) => x.res.status === 503)) {
+        expect(Number(r.res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+      }
+      // Other usernames are not affected.
+      const other = performance.now();
+      expect((await login("someone-else", "nope nope", "198.51.100.205")).res.status).toBe(401);
+      expect(performance.now() - other).toBeLessThan(140 + 1000);
+    });
+
+    it("counts failures from every IP toward the global cap", async () => {
+      for (let i = 0; i < 3; i++) await login("admin", "not the password", `198.51.100.${10 + i}`);
+      for (let i = 0; i < loginFailuresPerUserGlobal.limit - 4; i++) loginFailuresPerUserGlobal.hit("admin");
+      expect(loginFailuresPerUserGlobal.check("admin").limited).toBe(false);
+      await login("admin", "not the password", "198.51.100.20");
+      expect(loginFailuresPerUserGlobal.check("admin").limited).toBe(true);
+      // A success refunds its own reservation only.
+      loginFailuresPerUserGlobal.clear();
+      expect((await login("admin", PASSWORD, "198.51.100.21")).res.status).toBe(200);
+      expect(loginFailuresPerUserGlobal.check("admin").limited).toBe(false);
+    });
   });
 
   it("40 concurrent wrong logins: at most the per-user limit reaches argon2id (H1)", async () => {

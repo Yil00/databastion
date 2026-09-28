@@ -83,9 +83,23 @@ async function requireUser(
   return { ok: true, session, ip };
 }
 
-/** Failed logins: per source IP and per username, checked before argon2id. */
+/**
+ * Failed logins, checked before argon2id:
+ * - per source IP;
+ * - per username, keyed by `username|ipBucket` when the client IP is known (P1-D M2), so failures
+ *   from one IP never lock the account out for another; by username alone when the IP is unknown;
+ * - per username across all IPs (`loginFailuresPerUserGlobal`, much higher): reaching it never
+ *   refuses the login outright. It degrades to a slow-down (`loginSlowdown`) with at most one
+ *   attempt in flight per username (`503` + `Retry-After` for the others), so the correct password
+ *   from a fresh IP still gets through while distributed guessing is throttled.
+ */
 export const loginFailuresPerIp = new RateLimiter(20, 15 * 60_000);
 export const loginFailuresPerUser = new RateLimiter(5, 15 * 60_000);
+export const loginFailuresPerUserGlobal = new RateLimiter(100, 15 * 60_000);
+/** Delay before each verification of a username over its global cap (test hook: tests shorten it). */
+export const loginSlowdown = { ms: 2000 };
+/** Usernames over their global cap with a (slowed-down) attempt in flight. */
+const degradedLoginsInFlight = new Set<string>();
 /** Process-wide budget of argon2id-backed failed logins on unknown usernames (slow refill). */
 export const loginFailuresUnknownUser = new RateLimiter(30, 5 * 60_000);
 
@@ -118,80 +132,110 @@ export function handleLogin(req: Request): Promise<Response> {
     const ip = clientIp(req);
     const ipKey = ip ? ipBucket(ip) : null;
     const userKey = v.username.trim().toLowerCase();
+    // M2: per username AND source IP when the IP is known (no remote lock-out of the account).
+    const userIpKey = ipKey ? `${userKey}|${ipKey}` : userKey;
     // H1: attempts are reserved synchronously before argon2id and refunded on success, so
     // concurrent requests cannot overrun the limits. H2: no per-IP limit when the IP is unknown.
     const refundIp = ipKey ? loginFailuresPerIp.reserve(ipKey) : () => undefined;
-    const refundUser = loginFailuresPerUser.reserve(userKey);
+    const refundUser = loginFailuresPerUser.reserve(userIpKey);
     if (!refundIp || !refundUser) {
       refundIp?.();
       refundUser?.();
       const retry = Math.max(
         ipKey ? loginFailuresPerIp.check(ipKey).retryAfterS : 1,
-        loginFailuresPerUser.check(userKey).retryAfterS,
+        loginFailuresPerUser.check(userIpKey).retryAfterS,
       );
       return error(429, "rate_limited", { "Retry-After": String(retry) });
     }
-    const db = getDb();
-    const user = await findLoginUser(db, v.username);
-    // N1: failures on unknown usernames share one process-wide budget, so random-username
-    // floods (fresh per-username buckets, unknown IP) are bounded.
-    let refundUnknown: () => void = () => undefined;
-    if (!user) {
-      const reserved = loginFailuresUnknownUser.reserve("global");
-      if (!reserved) {
-        // L2: same answer as a wrong password, after a delay close to an argon2id verification,
-        // without running one (no username enumeration through 429 vs 401 during a flood).
-        await new Promise((r) => setTimeout(r, argon2MedianMs()));
-        return error(401, "invalid_credentials");
+    // M2: global per-username cap. Beyond it: slow-down, one attempt in flight per username; never
+    // a hard refusal (the correct password from a fresh IP still logs in).
+    const refundGlobal = loginFailuresPerUserGlobal.reserve(userKey);
+    if (!refundGlobal) {
+      if (degradedLoginsInFlight.has(userKey)) {
+        refundIp();
+        refundUser();
+        const retry = Math.max(1, Math.ceil(loginSlowdown.ms / 1000) + 1);
+        return error(503, "busy", { "Retry-After": String(retry) });
       }
-      refundUnknown = reserved;
+      degradedLoginsInFlight.add(userKey);
+      try {
+        await new Promise((r) => setTimeout(r, loginSlowdown.ms));
+        return await verifyLogin(req, v.username, v.password, ip, [refundIp, refundUser]);
+      } finally {
+        degradedLoginsInFlight.delete(userKey);
+      }
     }
-    // Login has its own argon2id pool: it can never starve agent authentication (N1).
-    const release = loginArgon2Gate.tryAcquire();
-    if (!release) {
-      refundIp();
-      refundUser();
-      refundUnknown();
-      return error(503, "busy", { "Retry-After": "1" });
-    }
-    let ok: boolean;
-    try {
-      ok = await checkPassword(user, v.password);
-    } finally {
-      release();
-    }
-    const result =
-      ok && user
-        ? { ok: true as const, user: { id: user.id, username: user.username, role: user.role } }
-        : { ok: false as const, userId: user?.id ?? null };
-    if (!result.ok) {
-      // The attempted username is not recorded for unknown users (it may be a mistyped password).
-      await writeAudit(db, {
-        actorType: "user",
-        actorId: result.userId,
-        action: "user.login",
-        outcome: "failure",
-        sourceIp: ip,
-      });
+    return verifyLogin(req, v.username, v.password, ip, [refundIp, refundUser, refundGlobal]);
+  });
+}
+
+/**
+ * The argon2id part of a login, after the failure limits reserved the attempt. `refunds` give the
+ * reservations back on success, or when the pool is full (not a failed attempt).
+ */
+async function verifyLogin(
+  req: Request,
+  username: string,
+  password: string,
+  ip: string | null,
+  refunds: (() => void)[],
+): Promise<Response> {
+  const refundAll = () => refunds.forEach((refund) => refund());
+  const db = getDb();
+  const user = await findLoginUser(db, username);
+  // N1: failures on unknown usernames share one process-wide budget, so random-username
+  // floods (fresh per-username buckets, unknown IP) are bounded.
+  if (!user) {
+    const reserved = loginFailuresUnknownUser.reserve("global");
+    if (!reserved) {
+      // L2: same answer as a wrong password, after a delay close to an argon2id verification,
+      // without running one (no username enumeration through 429 vs 401 during a flood).
+      await new Promise((r) => setTimeout(r, argon2MedianMs()));
       return error(401, "invalid_credentials");
     }
-    refundIp();
-    refundUser();
-    refundUnknown();
-    // L4: drop the session this browser already had, and expired / idle sessions.
-    const previous = readSessionToken(req);
-    if (previous) await deleteSession(db, sha256Hex(previous));
-    await purgeStaleSessions(db);
-    const session = await createSession(db, result.user.id);
+    refunds.push(reserved);
+  }
+  // Login has its own argon2id pool: it can never starve agent authentication (N1).
+  const release = loginArgon2Gate.tryAcquire();
+  if (!release) {
+    refundAll();
+    return error(503, "busy", { "Retry-After": "1" });
+  }
+  let ok: boolean;
+  try {
+    ok = await checkPassword(user, password);
+  } finally {
+    release();
+  }
+  const result =
+    ok && user
+      ? { ok: true as const, user: { id: user.id, username: user.username, role: user.role } }
+      : { ok: false as const, userId: user?.id ?? null };
+  if (!result.ok) {
+    // The attempted username is not recorded for unknown users (it may be a mistyped password).
     await writeAudit(db, {
       actorType: "user",
-      actorId: result.user.id,
+      actorId: result.userId,
       action: "user.login",
+      outcome: "failure",
       sourceIp: ip,
     });
-    return json({ user: result.user, csrf_token: session.csrfToken }, 200, {
-      "Set-Cookie": sessionCookie(session.token, Math.floor(SESSION_TTL_MS / 1000)),
-    });
+    return error(401, "invalid_credentials");
+  }
+  refundAll();
+  // L4: drop the session this browser already had, and expired / idle sessions.
+  const previous = readSessionToken(req);
+  if (previous) await deleteSession(db, sha256Hex(previous));
+  await purgeStaleSessions(db);
+  const session = await createSession(db, result.user.id);
+  await writeAudit(db, {
+    actorType: "user",
+    actorId: result.user.id,
+    action: "user.login",
+    sourceIp: ip,
+  });
+  return json({ user: result.user, csrf_token: session.csrfToken }, 200, {
+    "Set-Cookie": sessionCookie(session.token, Math.floor(SESSION_TTL_MS / 1000)),
   });
 }
 
