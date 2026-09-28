@@ -188,41 +188,105 @@ fn strip_default_derives(file: &mut syn::File) {
 /// invalid and must never be read as "all". typify turns an optional array
 /// into a `Vec` with `#[serde(default)]`, which merges the two cases; see
 /// [`OptionalNonEmptyVecs`].
-fn optional_non_empty_arrays(schema: &Value) -> Vec<(String, String)> {
+///
+/// Fails closed: `minItems >= 1` is only supported on a plain inline array
+/// property of a top-level schema (`#/$defs/<Name>/properties/<prop>` with
+/// `type: array`). Any other location (a named array schema reached through
+/// `$ref`, a `type` list such as `[array, "null"]`, a nested inline object,
+/// a composition such as `allOf` / `oneOf`…) is an error, so a new "absent =
+/// all" array cannot silently lose the absent / empty distinction. Run after
+/// [`strip_unsupported`]: conditionals are removed and reported separately.
+fn optional_non_empty_arrays(schema: &Value) -> Result<Vec<(String, String)>, CodegenError> {
+    let mut pointers = Vec::new();
+    let mut copy = schema.clone();
+    if let Some(defs) = copy.get_mut("$defs") {
+        walk_defs(defs, "#/$defs", &mut |map, pointer| {
+            if map.get("minItems").and_then(Value::as_u64).unwrap_or(0) >= 1 {
+                pointers.push(pointer.to_owned());
+            }
+        });
+    }
     let mut found = Vec::new();
-    let Some(Value::Object(defs)) = schema.get("$defs") else {
-        return found;
-    };
-    for (name, def) in defs {
-        let Some(Value::Object(properties)) = def.get("properties") else {
+    let mut unsupported = Vec::new();
+    for pointer in pointers {
+        let parts: Vec<&str> = pointer
+            .strip_prefix("#/$defs/")
+            .map(|rest| rest.split('/').collect())
+            .unwrap_or_default();
+        let [name, "properties", property] = parts.as_slice() else {
+            unsupported.push(pointer);
             continue;
         };
-        let required: Vec<&str> = def
+        let def = &schema["$defs"][*name];
+        if def["properties"][*property]
+            .get("type")
+            .and_then(Value::as_str)
+            != Some("array")
+        {
+            unsupported.push(pointer);
+            continue;
+        }
+        let required = def
             .get("required")
             .and_then(Value::as_array)
-            .map(|r| r.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        for (property, sub) in properties {
-            let is_array = sub.get("type").and_then(Value::as_str) == Some("array");
-            let min_items = sub.get("minItems").and_then(Value::as_u64).unwrap_or(0);
-            if is_array && min_items >= 1 && !required.contains(&property.as_str()) {
-                found.push((name.clone(), property.clone()));
-            }
+            .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(*property)));
+        if !required {
+            found.push(((*name).to_owned(), (*property).to_owned()));
         }
     }
+    if !unsupported.is_empty() {
+        unsupported.sort();
+        return Err(CodegenError::OptionalVecs(format!(
+            "minItems >= 1 outside a plain inline array property of a top-level schema: \
+             {unsupported:?}"
+        )));
+    }
     found.sort();
-    found
+    Ok(found)
 }
+
+/// Serde attribute entries typify puts on an optional `Vec` field; the only
+/// ones [`OptionalNonEmptyVecs`] may replace.
+const OPTIONAL_VEC_SERDE_ENTRIES: [&str; 2] = ["default", "skip_serializing_if"];
 
 /// Rewrites the fields listed by [`optional_non_empty_arrays`] from
 /// `Vec<T>` (`#[serde(default)]`) to `Option<Vec<T>>`, so that a received
-/// `[]` is `Some(vec![])` and can be rejected, instead of being merged with
-/// "absent". serde still accepts `Some(vec![])`: `minItems` is enforced by
-/// the console's Ajv validation, and the agent-side mapping must reject it
-/// (P2 gate, see `databastion-protocol`'s `fixtures` test).
+/// `[]` is `Some(vec![])`, distinct from "absent".
+///
+/// serde still accepts `Some(vec![])`. Enforcement points: for agent ->
+/// console bodies, the console's Ajv validation; for console -> agent
+/// payloads (`JobList`…), the **agent's** job mapping (`TryFrom`, ROADMAP
+/// P2-B / P2-C) must reject it, and the console must validate the outgoing
+/// `JobList` before serving it (defense in depth). See the P2 gate test in
+/// `databastion-protocol`'s `tests/fixtures.rs`.
+///
+/// Only the `default` / `skip_serializing_if` serde entries are replaced;
+/// any other serde entry (`rename`, `alias`…) or unexpected field type is
+/// reported in `unexpected` and fails the generation.
 struct OptionalNonEmptyVecs {
     targets: Vec<(String, String)>,
     rewritten: Vec<(String, String)>,
+    unexpected: Vec<String>,
+}
+
+/// Names of the entries of a `#[serde(...)]` attribute.
+fn serde_entries(attr: &syn::Attribute) -> Vec<String> {
+    let mut names = Vec::new();
+    let parsed = attr.parse_nested_meta(|meta| {
+        names.push(
+            meta.path
+                .get_ident()
+                .map_or_else(|| "<path>".to_owned(), ToString::to_string),
+        );
+        if meta.input.peek(syn::Token![=]) {
+            let _: syn::Expr = meta.value()?.parse()?;
+        }
+        Ok(())
+    });
+    if parsed.is_err() {
+        names.push("<unparsable>".to_owned());
+    }
+    names
 }
 
 impl OptionalNonEmptyVecs {
@@ -239,7 +303,9 @@ impl OptionalNonEmptyVecs {
             if !self.targets.contains(&key) {
                 continue;
             }
+            let label = format!("{name}.{}", key.1);
             let syn::Type::Path(path) = &field.ty else {
+                self.unexpected.push(format!("{label}: not a path type"));
                 continue;
             };
             match path.path.segments.last() {
@@ -249,7 +315,23 @@ impl OptionalNonEmptyVecs {
                     continue;
                 }
                 Some(s) if s.ident == "Vec" => {}
-                _ => continue,
+                _ => {
+                    self.unexpected
+                        .push(format!("{label}: neither Vec nor Option<Vec>"));
+                    continue;
+                }
+            }
+            let foreign: Vec<String> = field
+                .attrs
+                .iter()
+                .filter(|a| a.path().is_ident("serde"))
+                .flat_map(serde_entries)
+                .filter(|e| !OPTIONAL_VEC_SERDE_ENTRIES.contains(&e.as_str()))
+                .collect();
+            if !foreign.is_empty() {
+                self.unexpected
+                    .push(format!("{label}: unexpected serde entries {foreign:?}"));
+                continue;
             }
             let vec = std::mem::replace(&mut field.ty, syn::Type::Verbatim(Default::default()));
             field.ty = syn::parse_quote!(::std::option::Option<#vec>);
@@ -428,7 +510,7 @@ pub fn generate(openapi_yaml: &str) -> Result<String, CodegenError> {
     let negations = run_pass(&mut schema, collect_not);
     let constants = run_pass(&mut schema, const_to_enum);
     let wrapped = run_pass(&mut schema, wrap_pattern);
-    let non_empty = optional_non_empty_arrays(&schema);
+    let non_empty = optional_non_empty_arrays(&schema)?;
     let root: schemars::schema::RootSchema = serde_json::from_value(schema)?;
     let mut settings = typify::TypeSpaceSettings::default();
     settings.with_struct_builder(false);
@@ -442,11 +524,18 @@ pub fn generate(openapi_yaml: &str) -> Result<String, CodegenError> {
     let mut optional_vecs = OptionalNonEmptyVecs {
         targets: non_empty,
         rewritten: Vec::new(),
+        unexpected: Vec::new(),
     };
     for item in &mut file.items {
         if let syn::Item::Struct(item) = item {
             optional_vecs.rewrite_struct(item);
         }
+    }
+    if !optional_vecs.unexpected.is_empty() {
+        return Err(CodegenError::OptionalVecs(format!(
+            "{:?}",
+            optional_vecs.unexpected
+        )));
     }
     optional_vecs.rewritten.sort();
     if optional_vecs.rewritten != optional_vecs.targets {
@@ -650,7 +739,7 @@ components:
                 }
             }
         }));
-        let targets = optional_non_empty_arrays(&schema);
+        let targets = optional_non_empty_arrays(&schema).unwrap();
         assert_eq!(targets, [("A".to_owned(), "o".to_owned())]);
         let mut item: syn::ItemStruct = syn::parse_quote! {
             pub struct A {
@@ -664,9 +753,11 @@ components:
         let mut pass = OptionalNonEmptyVecs {
             targets,
             rewritten: Vec::new(),
+            unexpected: Vec::new(),
         };
         pass.rewrite_struct(&mut item);
         assert_eq!(pass.rewritten, [("A".to_owned(), "o".to_owned())]);
+        assert!(pass.unexpected.is_empty(), "{:?}", pass.unexpected);
         let text = quote::quote!(#item).to_string();
         assert!(
             text.contains("pub o : :: std :: option :: Option < :: std :: vec :: Vec < String > >"),
@@ -676,6 +767,75 @@ components:
             text.contains("pub e : :: std :: vec :: Vec < String >"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn non_empty_arrays_outside_inline_properties_fail_closed() {
+        let string_items = serde_json::json!({ "type": "string" });
+        let cases = [
+            // `$ref` to a named array schema.
+            serde_json::json!({
+                "L": { "type": "array", "minItems": 1, "items": string_items },
+                "A": { "type": "object", "properties": { "l": { "$ref": "#/$defs/L" } } }
+            }),
+            // `type` list including "null".
+            serde_json::json!({
+                "A": { "type": "object", "properties": {
+                    "l": { "type": ["array", "null"], "minItems": 1, "items": string_items }
+                } }
+            }),
+            // Nested inline object.
+            serde_json::json!({
+                "A": { "type": "object", "properties": { "n": {
+                    "type": "object",
+                    "properties": { "l": { "type": "array", "minItems": 1, "items": string_items } }
+                } } }
+            }),
+            // Composition.
+            serde_json::json!({
+                "A": { "type": "object", "properties": { "l": {
+                    "allOf": [{ "type": "array", "minItems": 1, "items": string_items }]
+                } } }
+            }),
+            serde_json::json!({
+                "A": { "oneOf": [{ "type": "array", "minItems": 1, "items": string_items }] }
+            }),
+        ];
+        for case in cases {
+            assert!(
+                matches!(
+                    optional_non_empty_arrays(&defs(case.clone())),
+                    Err(CodegenError::OptionalVecs(_))
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_refuses_foreign_serde_entries() {
+        let mut item: syn::ItemStruct = syn::parse_quote! {
+            pub struct A {
+                #[serde(rename = "x", default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+                pub o: ::std::vec::Vec<String>,
+            }
+        };
+        let before = quote::quote!(#item).to_string();
+        let mut pass = OptionalNonEmptyVecs {
+            targets: vec![("A".to_owned(), "o".to_owned())],
+            rewritten: Vec::new(),
+            unexpected: Vec::new(),
+        };
+        pass.rewrite_struct(&mut item);
+        assert!(pass.rewritten.is_empty());
+        assert_eq!(pass.unexpected.len(), 1, "{:?}", pass.unexpected);
+        assert!(
+            pass.unexpected[0].contains("rename"),
+            "{:?}",
+            pass.unexpected
+        );
+        // The field is left untouched.
+        assert_eq!(quote::quote!(#item).to_string(), before);
     }
 
     #[test]

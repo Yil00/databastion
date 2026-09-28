@@ -3,9 +3,10 @@
 //! - Every `valid/<Schema>.<case>.json` must deserialize into `<Schema>`.
 //! - Every `invalid/<Schema>.<case>.json` must be rejected by serde, except
 //!   those in [`NOT_ENFORCED_BY_SERDE`], which rely on a JSON Schema keyword
-//!   the generated types do not express. For those, the console's Ajv
-//!   validation is the enforcement point; agent-side checks of received
-//!   values are a required future step (P1-B, P2). The
+//!   the generated types do not express. For agent -> console bodies, the
+//!   console's Ajv validation is the enforcement point; for console -> agent
+//!   payloads (`JobList`, `HeartbeatResponse`…), the agent's mapping of
+//!   received values is (a required future step: P1-B, P2). The
 //!   allowlist is exact: a fixture listed here that starts failing (or an
 //!   unlisted one that starts passing) fails the test, so it cannot rot.
 
@@ -215,14 +216,19 @@ fn invalid_fixtures_are_rejected_or_allowlisted() {
     );
 }
 
-/// Gate for the P2 `discovery.scan` mapping: an empty filter list must never
-/// be read as "absent = all". serde accepts `[]` (it does not enforce
+/// Gate for the agent's `discovery.scan` mapping: an empty filter list must
+/// never be read as "absent = all". serde accepts `[]` (it does not enforce
 /// `minItems`), but the generated `Option<Vec<_>>` keeps it distinguishable.
+/// For this console -> agent payload, the agent mapping is the enforcement
+/// point.
 ///
-/// TODO(P2): the `TryFrom<DiscoveryScanParams>` mapping into the scanner's
-/// configuration must reject `Some(vec![])` for `databases`, `schemas`,
-/// `include_objects` and `classifiers` (job reported `failed`), and this test
-/// must then also assert that rejection.
+/// TODO(ROADMAP P2-B "Bounded sampling", first scan-job consumer; also P2-C):
+/// when `TryFrom<&DiscoveryScanParams>` for the scanner configuration lands,
+/// add to this test, for each of the 4 fixtures below, the assertion
+/// `assert!(ScanConfig::try_from(&job.params).is_err(), "{file}")`
+/// (empty `databases` / `schemas` / `include_objects` / `classifiers` =>
+/// `Err`, job reported `failed`), and that the valid `JobList` fixtures map
+/// to `Ok`.
 #[test]
 fn empty_scan_filters_stay_distinct_from_absent() {
     let invalid = fixtures_dir("invalid");

@@ -595,8 +595,9 @@ export interface components {
             min_rows?: components["schemas"]["Count"];
             /**
              * @description Objects classified as sensitive by Discovery, whose accesses are always reported. Absent or
-             *     empty = no object is flagged sensitive (the settings replace the previous ones as a whole, so
-             *     an empty list legitimately clears them; it cannot widen what is reported).
+             *     empty = no object is flagged sensitive: the settings replace the previous ones as a whole, so
+             *     an empty list legitimately clears them. An empty list narrows reporting to events that carry
+             *     a signal or reach `min_rows`; it can never widen what is reported.
              */
             sensitive_objects?: components["schemas"]["SensitiveObject"][];
         };

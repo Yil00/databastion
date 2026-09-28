@@ -410,8 +410,9 @@ reported when they return at least this many rows.
     #[serde(default = "defaults::default_nzu64::<::std::num::NonZeroU64, 10>")]
     pub poll_interval_s: ::std::num::NonZeroU64,
     /**Objects classified as sensitive by Discovery, whose accesses are always reported. Absent or
-empty = no object is flagged sensitive (the settings replace the previous ones as a whole, so
-an empty list legitimately clears them; it cannot widen what is reported).
+empty = no object is flagged sensitive: the settings replace the previous ones as a whole, so
+an empty list legitimately clears them. An empty list narrows reporting to events that carry
+a signal or reach `min_rows`; it can never widen what is reported.
 */
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub sensitive_objects: ::std::vec::Vec<SensitiveObject>,
