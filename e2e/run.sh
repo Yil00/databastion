@@ -196,10 +196,11 @@ targets:
     account: databastion_agent
     secret:
       file: /run/databastion-secrets/target_agent_password
-    # target-pg has no TLS; it sits on the internal agent network only.
+    # target-pg has no TLS; it sits on the internal agent network only: explicit insecure
+    # opt-in (the connector still refuses cleartext / MD5 passwords, SCRAM only).
     postgres:
       databases: [app]
-      tls: disable
+      tls: disable_insecure
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
