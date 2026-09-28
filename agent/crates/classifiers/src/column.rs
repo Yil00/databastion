@@ -166,6 +166,12 @@ impl ColumnClassifier<'_> {
     /// Classifies a column from its name (column, field path or attribute)
     /// and a sample of its values. Only the first [`MAX_SAMPLE_VALUES`]
     /// values are examined; empty and whitespace-only values are skipped.
+    ///
+    /// Production callers (the agent core) must set the agent key with
+    /// [`Self::with_key`]: without it, the sample order is drawn from a
+    /// random key per call, so each rescan would disclose a different set of
+    /// masked samples, and there are no fingerprints. If the random source
+    /// fails, the findings carry no samples (fail safe).
     #[must_use]
     pub fn classify(&self, column_name: &str, values: &[RawSample<'_>]) -> Vec<ColumnFinding> {
         let hints = NameHints::of(column_name);

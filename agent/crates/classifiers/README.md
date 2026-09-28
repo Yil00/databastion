@@ -136,7 +136,9 @@ Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separator
 and addresses NFC-normalized, trimmed, whitespace collapsed, lowercased; keys and hashes trimmed.
 
 `RawSample`, `RawValue` and `HmacKey` have a redacted `Debug` and no `Display`; `RawValue`, `HmacKey`
-(`hmac` `zeroize` feature) and the normalized values are zeroized on drop.
+(its keyed HMAC-SHA256 state, through the `zeroize` features of `hmac` and `sha2`, checked at compile
+time) and the normalized values are zeroized on drop. Production callers must pass the agent key
+(`ColumnClassifier::with_key`); without it the sample order is random per call.
 
 ## Tests
 

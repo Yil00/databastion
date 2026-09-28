@@ -496,6 +496,13 @@ impl fmt::Display for KeyTooShort {
 
 impl std::error::Error for KeyTooShort {}
 
+// The keyed HMAC state kept by `HmacKey` is key-equivalent: it must be wiped on drop. This fails
+// to compile if a dependency change drops sha2's `zeroize` feature.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: sha2::digest::zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<sha2::block_api::Sha256VarCore>();
+};
+
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 impl HmacKey {
