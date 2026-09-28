@@ -19,12 +19,14 @@
 //!
 //! Raw strings that are not names (`db_user`, `application`) go through
 //! [`clean_text`] / [`clean_application`] and fall back to the fingerprint
-//! path. **Stub**: HMAC fingerprints are not wired yet (P2-A), so
-//! [`NoFingerprints`] returns `None` and an event whose account name does not
-//! conform is dropped (counted) instead of fingerprinted.
+//! path: [`HmacFingerprints`] computes `db_user_fingerprint` with the agent
+//! HMAC key, in the `db_user` domain (`HmacKey::fingerprint_db_user`), so
+//! such an event carries a fingerprint instead of being dropped. An event is
+//! only dropped (and counted) if no conforming principal can be built at all.
 
 use std::collections::HashSet;
 
+use databastion_classifiers::masking::{HmacKey, RawSample};
 use databastion_classifiers::names::{is_forbidden_char, violates_numeric_rule};
 use databastion_protocol::{
     AccessEvent, AccessEventAction, ClientAddress, Count, Finding, Fingerprint, Identifier,
@@ -92,16 +94,18 @@ pub(crate) trait Fingerprinter {
     fn fingerprint(&self, value: &str) -> Option<Fingerprint>;
 }
 
-/// Stub until the HMAC key is wired into fingerprints (P2-A): always `None`.
+/// `db_user_fingerprint` with the agent HMAC key: exact bytes of the raw
+/// account name, `db_user` domain (never equal to a value fingerprint).
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "event masking produces raw account names in P4")
 )]
-pub(crate) struct NoFingerprints;
+pub(crate) struct HmacFingerprints<'k>(pub(crate) &'k HmacKey);
 
-impl Fingerprinter for NoFingerprints {
-    fn fingerprint(&self, _value: &str) -> Option<Fingerprint> {
-        None
+impl Fingerprinter for HmacFingerprints<'_> {
+    fn fingerprint(&self, value: &str) -> Option<Fingerprint> {
+        let fp = self.0.fingerprint_db_user(&RawSample::new(value));
+        Fingerprint::try_from(fp.as_str()).ok()
     }
 }
 
@@ -243,11 +247,15 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
-    struct FakeFingerprints;
-    impl Fingerprinter for FakeFingerprints {
+    struct NoFingerprints;
+    impl Fingerprinter for NoFingerprints {
         fn fingerprint(&self, _value: &str) -> Option<Fingerprint> {
-            Fingerprint::try_from(format!("hmac-sha256:{}", "ab".repeat(32))).ok()
+            None
         }
+    }
+
+    fn key() -> HmacKey {
+        HmacKey::new(&[7u8; 32]).unwrap()
     }
 
     pub(crate) fn finding() -> Finding {
@@ -336,23 +344,42 @@ pub(crate) mod tests {
         );
         assert!(matches!(p, Some(Principal::Variant0 { .. })));
         // Control character: never sent as a name.
-        let p = principal(
-            "bob\u{7}",
-            true,
-            Some("host.example"),
-            None,
-            &FakeFingerprints,
-        );
-        let Some(Principal::Variant1 { client_addr, .. }) = p else {
+        let key = key();
+        let fps = HmacFingerprints(&key);
+        let p = principal("bob\u{7}", true, Some("host.example"), None, &fps);
+        let Some(Principal::Variant1 {
+            client_addr,
+            db_user_fingerprint,
+            ..
+        }) = p
+        else {
             panic!("expected a fingerprint")
         };
         assert!(client_addr.is_none(), "a host name is not a client address");
-        // Failed authentication with an unknown account.
-        assert!(matches!(
-            principal("hunter2-SECRET", false, None, None, &FakeFingerprints),
-            Some(Principal::Variant1 { .. })
-        ));
-        // Stub: no HMAC wiring yet, the item cannot be built.
+        // Exact bytes, `db_user` domain.
+        assert_eq!(
+            db_user_fingerprint.as_str(),
+            key.fingerprint_db_user(&RawSample::new("bob\u{7}"))
+                .as_str()
+        );
+        // Failed authentication with an unknown account: fingerprinted, the
+        // raw name never appears.
+        let p = principal("hunter2-SECRET", false, None, None, &fps).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+        assert!(json.contains("db_user_fingerprint"), "{json}");
+        let email_fp = key
+            .fingerprint(
+                databastion_classifiers::masking::ClassifierId::Email,
+                &RawSample::new("a@example.com"),
+            )
+            .unwrap();
+        assert_ne!(
+            fps.fingerprint("a@example.com").unwrap().as_str(),
+            email_fp.as_str(),
+            "domain separation"
+        );
+        // Without any fingerprint source the item cannot be built.
         assert!(principal("hunter2-SECRET", false, None, None, &NoFingerprints).is_none());
     }
 }
