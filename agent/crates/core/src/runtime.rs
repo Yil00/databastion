@@ -85,6 +85,11 @@ fn classifiers_version() -> Option<ClassifiersVersion> {
 const FINDINGS_CHUNK: usize = 500;
 /// Capacity of the finding channel between a connector and the core.
 const FINDINGS_CHANNEL: usize = 64;
+/// Contract per-job findings cap (`MAX_FINDINGS_PER_JOB`, docs/09
+/// "Console-side checks"): a scan stops producing at this many findings and
+/// ends `failed` / `resource_limit`, so the console never has to answer `400`
+/// `maxItems`.
+pub(crate) const MAX_FINDINGS_PER_JOB: usize = 50_000;
 
 fn agent_version() -> Result<AgentVersion, AgentError> {
     AgentVersion::try_from(env!("CARGO_PKG_VERSION"))
@@ -285,6 +290,12 @@ struct Counters {
     findings_received: AtomicU64,
     /// Findings lost because they could not be spooled.
     findings_lost: AtomicU64,
+    /// Batches answered `501` (endpoint parked, batch kept).
+    batches_parked: AtomicU64,
+    /// Scans stopped at the per-job findings cap.
+    scans_findings_capped: AtomicU64,
+    /// Scans refused: classifier set not supported by this build.
+    jobs_unsupported_classifiers: AtomicU64,
 }
 
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
@@ -295,6 +306,10 @@ struct PreparedScan {
     /// Index in `Runtime::connectors`.
     connector: usize,
     scan: ScanJob,
+    /// When the job was received: its (clamped) `max_duration_s` runs from
+    /// here, whether the scan waits in the queue or runs, so it never
+    /// outlives the console's findings window for the job.
+    received: Instant,
 }
 
 /// Scans waiting for the worker, and the ids queued or running (a
@@ -336,6 +351,76 @@ struct Runtime {
     unauthorized_heartbeats: std::sync::atomic::AtomicU32,
     /// Last local detection result and when it was computed.
     detection: Mutex<Option<(Instant, Vec<DetectedTarget>)>>,
+    /// Result endpoints parked after a `501`.
+    parked: Mutex<Parked>,
+    /// Findings emitted per job at most ([`MAX_FINDINGS_PER_JOB`]; lowered
+    /// in tests).
+    findings_cap: usize,
+}
+
+/// A result endpoint parked after a `501` (not implemented by this
+/// console): its batches stay spooled and are not sent before `until`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Park {
+    until: Option<Instant>,
+    /// Consecutive `501`s (own backoff without `Retry-After`).
+    strikes: u32,
+}
+
+/// Parking state of `/findings` and `/events` (docs/09, "Agent handling",
+/// `501`): per endpoint, so a parked `/events` never blocks `/findings`.
+#[derive(Debug, Default)]
+struct Parked {
+    findings: Park,
+    events: Park,
+}
+
+impl Parked {
+    fn get(&mut self, findings: bool) -> &mut Park {
+        if findings {
+            &mut self.findings
+        } else {
+            &mut self.events
+        }
+    }
+
+    /// Whether the endpoint is parked at `now` (an elapsed park is cleared).
+    fn is_parked(&mut self, findings: bool, now: Instant) -> bool {
+        let park = self.get(findings);
+        match park.until {
+            Some(until) if until > now => true,
+            Some(_) => {
+                park.until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Parks the endpoint after a `501`; returns the parking delay:
+    /// `Retry-After` (already clamped to `1..=3600` s) plus jitter, else the
+    /// spool backoff of the consecutive `501`s.
+    fn park(
+        &mut self,
+        findings: bool,
+        retry_after: Option<Duration>,
+        now: Instant,
+        fraction: f64,
+    ) -> Duration {
+        let park = self.get(findings);
+        park.strikes = park.strikes.saturating_add(1);
+        let delay = retry_after.map_or_else(
+            || spool_backoff(park.strikes, fraction),
+            |ra| backoff::retry_after_delay(ra, fraction),
+        );
+        park.until = Some(now + delay);
+        delay
+    }
+
+    /// A batch of the endpoint was answered: its `501` streak ends.
+    fn answered(&mut self, findings: bool) {
+        *self.get(findings) = Park::default();
+    }
 }
 
 /// How long a local detection result is reused.
@@ -422,6 +507,8 @@ impl Runtime {
             host_root: PathBuf::from("/"),
             detection: Mutex::new(None),
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
+            parked: Mutex::new(Parked::default()),
+            findings_cap: MAX_FINDINGS_PER_JOB,
         })
     }
 
@@ -504,6 +591,12 @@ impl Runtime {
             ("batches_duplicate_total", &c.batches_duplicate),
             ("batches_rejected_total", &c.batches_rejected),
             ("batch_conflicts_total", &c.batch_conflicts),
+            ("batches_parked_total", &c.batches_parked),
+            ("scans_findings_capped_total", &c.scans_findings_capped),
+            (
+                "jobs_unsupported_classifiers_total",
+                &c.jobs_unsupported_classifiers,
+            ),
             (
                 "batches_unexpected_response_total",
                 &c.batches_unexpected_response,
@@ -733,6 +826,36 @@ impl Runtime {
         }
     }
 
+    fn lock_parked(&self) -> std::sync::MutexGuard<'_, Parked> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `/findings` (`true`) or `/events` (`false`) is parked after
+    /// a `501`: no new batches are produced for it meanwhile.
+    fn endpoint_parked(&self, findings: bool) -> bool {
+        self.lock_parked().is_parked(findings, Instant::now())
+    }
+
+    /// Resolves once `/findings` is no longer parked (at once if it is not).
+    async fn findings_unparked(&self) {
+        loop {
+            let until = {
+                let mut parked = self.lock_parked();
+                if parked.is_parked(true, Instant::now()) {
+                    parked.findings.until
+                } else {
+                    None
+                }
+            };
+            let Some(until) = until else {
+                return;
+            };
+            tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
+        }
+    }
+
     fn lock_spool(&self) -> std::sync::MutexGuard<'_, Spool> {
         self.spool
             .lock()
@@ -814,8 +937,18 @@ impl Runtime {
     /// else (a proxy's HTML page, a bare `404`, an unparseable or mismatched
     /// ack) is retried with backoff and counted, so a misbehaving middlebox
     /// cannot empty the spool.
+    ///
+    /// A `501` parks the batch's endpoint (`/findings` or `/events`) until
+    /// `Retry-After` (or the backoff) has elapsed; the batch stays spooled,
+    /// and the other endpoint's batches are still sent meanwhile (each
+    /// endpoint stays FIFO).
     async fn flush_once(&self, failures: u32) -> Result<Flush, AgentError> {
-        let front = self.lock_spool().front();
+        let front = {
+            let now = Instant::now();
+            let mut parked = self.lock_parked();
+            self.lock_spool()
+                .front_where(|findings| !parked.is_parked(findings, now))
+        };
         let Some((key, batch)) = front else {
             return Ok(Flush::Idle);
         };
@@ -835,6 +968,37 @@ impl Runtime {
             SpoolIo
         };
         let retry = || Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
+        if let Err(CallError::Uplink(UplinkError::Throttled {
+            status: 501,
+            retry_after,
+        })) = &result
+        {
+            let delay = self.lock_parked().park(
+                batch.is_findings(),
+                *retry_after,
+                Instant::now(),
+                backoff::random_fraction(),
+            );
+            bump(&self.counters.batches_parked, 1);
+            tracing::warn!(
+                path = batch.path(),
+                status = 501,
+                code = "unavailable",
+                parked_s = delay.as_secs(),
+                "endpoint not implemented by the console (501): parked, batches kept spooled"
+            );
+            return Ok(Flush::Progress);
+        }
+        if matches!(
+            result,
+            Ok(_)
+                | Err(CallError::Uplink(
+                    UplinkError::Rejected { .. } | UplinkError::ItemsRejected { .. }
+                ))
+        ) {
+            // The endpoint is implemented: its `501` streak ends.
+            self.lock_parked().answered(batch.is_findings());
+        }
         match result {
             Ok(ack) => {
                 if ack.duplicate {
@@ -1111,6 +1275,17 @@ impl Runtime {
         job: &databastion_protocol::DiscoveryScanJob,
         id: Uuid,
     ) -> Option<Outcome> {
+        // Capability check first, before any other work on the target (no
+        // connection, no query): the classifier set of this build.
+        if let Some(reason) = unsupported_classifiers(job) {
+            bump(&self.counters.jobs_unsupported_classifiers, 1);
+            tracing::warn!(
+                job_id = %id,
+                reason,
+                "scan refused: classifier set not supported by this agent build"
+            );
+            return Some(Outcome::failed(FailureCode::Unsupported));
+        }
         let params = match ScanParams::try_from(&job.params) {
             Ok(p) => p,
             Err(e) => return Some(self.invalid_params(id, &e)),
@@ -1146,6 +1321,7 @@ impl Runtime {
             engine: proto_engine(target.engine),
             connector,
             scan: ScanJob::new(params, target, &config.limits, Arc::clone(&self.hmac)),
+            received: Instant::now(),
         });
         drop(queue);
         self.scan_ready.notify_one();
@@ -1164,6 +1340,16 @@ impl Runtime {
         loop {
             if *shutdown.borrow() {
                 return Ok(());
+            }
+            if self.endpoint_parked(true) {
+                // `/findings` parked after a `501`: no new findings are
+                // produced meanwhile; queued scans wait (their window keeps
+                // running, see `discovery_scan`).
+                tokio::select! {
+                    () = self.findings_unparked() => {}
+                    _ = shutdown.changed() => {}
+                }
+                continue;
             }
             let next = self.lock_scans().queued.pop_front();
             let Some(prepared) = next else {
@@ -1211,6 +1397,22 @@ impl Runtime {
     /// when the agent is suspended or revoked, or on shutdown (`cancelled`);
     /// findings already handed over are flushed first. Findings that cannot
     /// be spooled are counted as lost.
+    ///
+    /// The scan's window is its clamped `max_duration_s` counted from the
+    /// job's reception: a scan popped after it (held behind a parked
+    /// `/findings`, or a long queue) ends `failed` / `timeout` without
+    /// touching the target, and a partly elapsed window shortens the
+    /// deadline.
+    ///
+    /// While `/findings` is parked, a full chunk is held (the connector is
+    /// back-pressured through the bounded channel) until the park ends or
+    /// the scan stops; the findings held when the scan stops are spooled
+    /// (bounded spool), never dropped.
+    ///
+    /// At most `findings_cap` ([`MAX_FINDINGS_PER_JOB`]) findings are
+    /// emitted for the job: the next one stops the scan (the connector
+    /// future is dropped), the findings kept so far are flushed and the job
+    /// ends `failed` / `resource_limit`.
     async fn discovery_scan(
         &self,
         prepared: PreparedScan,
@@ -1222,17 +1424,28 @@ impl Runtime {
             engine,
             connector,
             scan,
+            received,
         } = prepared;
+        let Some(deadline) = scan
+            .max_duration()
+            .checked_sub(received.elapsed())
+            .filter(|d| !d.is_zero())
+        else {
+            tracing::warn!(job_id = %id, "scan window elapsed before it could start");
+            return Outcome::failed(FailureCode::Timeout);
+        };
         let Some(connector) = self.connectors.get(connector) else {
             return Outcome::failed(FailureCode::Unsupported);
         };
         let Some(version) = classifiers_version() else {
             return Outcome::failed(FailureCode::Internal);
         };
-        let deadline = scan.max_duration();
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
         let spool_failed = std::sync::atomic::AtomicBool::new(false);
+        // Findings emitted for this job (per-job cap).
+        let emitted = std::sync::atomic::AtomicUsize::new(0);
+        let capped = std::sync::atomic::AtomicBool::new(false);
         let flush = || {
             let mut chunk = chunk
                 .lock()
@@ -1248,35 +1461,94 @@ impl Runtime {
             }
             chunk.clear();
         };
+        // Takes a finding into the current chunk. `Capped` once the per-job
+        // cap is reached (the finding is not kept, the scan must stop);
+        // `Full` when the chunk should be flushed.
+        let take = |f: MaskedFinding| -> Take {
+            bump(&self.counters.findings_received, 1);
+            if emitted.load(Ordering::Relaxed) >= self.findings_cap {
+                capped.store(true, Ordering::Relaxed);
+                return Take::Capped;
+            }
+            emitted.fetch_add(1, Ordering::Relaxed);
+            let mut c = chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            c.push(f);
+            if c.len() >= FINDINGS_CHUNK {
+                Take::Full
+            } else {
+                Take::Kept
+            }
+        };
+        // Set once the connector has returned: a chunk held for a parked
+        // `/findings` stops waiting then (the drain below spools it).
+        let (done_tx, done_rx) = watch::channel(false);
         let outcome = {
             let run = async {
                 let r = connector.discover(&scan, &sink).await;
                 drop(sink);
+                let _ = done_tx.send(true);
                 r
             };
+            // Resolves when the channel closes (`false`), or at the cap
+            // (`true`).
             let collect = async {
                 while let Some(f) = rx.recv().await {
-                    bump(&self.counters.findings_received, 1);
-                    let full = {
-                        let mut c = chunk
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        c.push(f);
-                        c.len() >= FINDINGS_CHUNK
-                    };
-                    if full {
-                        flush();
+                    match take(f) {
+                        Take::Capped => return true,
+                        Take::Full => {
+                            // No new batch for a parked `/findings`: hold
+                            // the chunk (the connector blocks on the full
+                            // channel) until the park ends, or until the
+                            // connector has returned (its result is then
+                            // known; the drain below spools the rest).
+                            let mut done = done_rx.clone();
+                            tokio::select! {
+                                () = self.findings_unparked() => flush(),
+                                _ = done.wait_for(|d| *d) => return false,
+                            }
+                        }
+                        Take::Kept => {}
+                    }
+                }
+                false
+            };
+            let work = async {
+                tokio::pin!(run);
+                tokio::pin!(collect);
+                let mut ran = None;
+                loop {
+                    tokio::select! {
+                        r = &mut run, if ran.is_none() => ran = Some(r),
+                        at_cap = &mut collect => {
+                            if at_cap {
+                                return None;
+                            }
+                            return Some(match ran {
+                                Some(r) => r,
+                                None => run.await,
+                            });
+                        }
                     }
                 }
             };
-            let work = async { tokio::join!(run, collect).0 };
             tokio::select! {
                 r = work => match r {
-                    Ok(()) => Outcome::SUCCEEDED,
-                    Err(crate::ConnectorError::NotImplemented { .. }) => {
+                    None => {
+                        bump(&self.counters.scans_findings_capped, 1);
+                        tracing::warn!(
+                            job_id = %id,
+                            cap = self.findings_cap,
+                            "scan stopped at the per-job findings cap"
+                        );
+                        Outcome::failed(FailureCode::ResourceLimit)
+                    }
+                    Some(Ok(())) => Outcome::SUCCEEDED,
+                    Some(Err(crate::ConnectorError::NotImplemented { .. })) => {
                         Outcome::failed(FailureCode::Unsupported)
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         tracing::warn!(job_id = %id, error = %e, "scan failed");
                         Outcome::failed(FailureCode::Internal)
                     }
@@ -1293,16 +1565,19 @@ impl Runtime {
             }
         };
         // The connector future (and its sink) is dropped: drain what it
-        // handed over, then flush the partial chunk.
+        // handed over (within the cap), then flush the partial chunk.
         while let Ok(f) = rx.try_recv() {
-            bump(&self.counters.findings_received, 1);
-            chunk
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(f);
+            match take(f) {
+                Take::Capped => break,
+                Take::Full => flush(),
+                Take::Kept => {}
+            }
         }
         flush();
         if spool_failed.load(Ordering::Relaxed) && outcome.error.is_none() {
+            return Outcome::failed(FailureCode::ResourceLimit);
+        }
+        if capped.load(Ordering::Relaxed) && outcome.error.is_none() {
             return Outcome::failed(FailureCode::ResourceLimit);
         }
         outcome
@@ -1437,6 +1712,32 @@ impl Runtime {
         }
         false
     }
+}
+
+/// Why a `discovery.scan` cannot run with this build's classifier set:
+/// its `classifiers_version` is not the compiled [`CLASSIFIERS_VERSION`], or
+/// `params.classifiers` names an id outside the compiled set. Reported
+/// `failed` / `unsupported` (docs/09: a capability mismatch of the agent
+/// build, not invalid parameters). The reason is a static text; the job's
+/// values are never logged.
+fn unsupported_classifiers(job: &databastion_protocol::DiscoveryScanJob) -> Option<&'static str> {
+    if job.classifiers_version.as_str() != CLASSIFIERS_VERSION {
+        return Some("classifiers_version differs from the compiled one");
+    }
+    let unknown = job.params.classifiers.as_ref().is_some_and(|ids| {
+        ids.iter()
+            .any(|id| databastion_classifiers::id::ClassifierId::parse(id.as_str()).is_none())
+    });
+    unknown.then_some("classifier id outside the compiled set")
+}
+
+/// What happened to a finding taken into a scan chunk.
+enum Take {
+    Kept,
+    /// Kept; the chunk is full.
+    Full,
+    /// Not kept: the per-job findings cap is reached.
+    Capped,
 }
 
 /// Minimum gap between two job polls. A poll that returns without jobs in
