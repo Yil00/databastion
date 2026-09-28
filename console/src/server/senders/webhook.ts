@@ -124,7 +124,11 @@ export async function sendWebhook(urlText: string, signingSecret: string, msg: W
     path: `${url.pathname}${url.search}`,
     headers,
     agent: false,
-    lookup: pinnedLookup(resolved.address, resolved.family) as unknown as https.RequestOptions["lookup"],
+    // Only the checked addresses, tried in order (a refused / unreachable one falls back to the
+    // next within the connect budget).
+    lookup: pinnedLookup(resolved.addresses) as unknown as https.RequestOptions["lookup"],
+    // Passed through to net.connect (not in the http RequestOptions typings).
+    ...({ autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 1_000 } as object),
     // `ca` (tests only) replaces the default roots for this request.
     // SNI and certificate checks use the host name (never an IP literal as SNI).
     ...(isHttps ? { ...(isIP(host) === 0 ? { servername: host } : {}), ...(opts.ca ? { ca: opts.ca } : {}) } : {}),

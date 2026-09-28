@@ -346,6 +346,18 @@ describe.skipIf(!cert)("SMTP sender over TLS", () => {
     }
   });
 
+  it("falls back to the next checked address (dual stack: ::1 refused, 127.0.0.1 answers), certificate still checked on the name", async () => {
+    const resolver = async () => [
+      { address: "::1", family: 6 },
+      { address: "127.0.0.1", family: 4 },
+    ];
+    const opts = { allowInsecure: false, allowAnyPort: true, ca: cert?.cert, resolver };
+    expect(await sendMail(config(p2, { host: "localhost", tls: "implicit" }), null, MSG, opts)).toEqual({ ok: true });
+    expect(await sendMail(config(p1, { host: "localhost", tls: "starttls", username: "dlp" }), "s3cret pass", MSG, opts)).toEqual({ ok: true });
+    // Same addresses, a name the certificate does not cover: refused.
+    expect(await sendMail(config(p2, { host: "mail.example.test", tls: "implicit" }), null, MSG, opts)).toEqual({ ok: false, code: "tls_failed", retryable: true });
+  });
+
   it("implicit TLS", async () => {
     expect(await sendMail(config(p2, { host: "localhost", tls: "implicit" }), null, MSG, { allowInsecure: false, allowAnyPort: true, ca: cert?.cert })).toEqual({ ok: true });
     expect(implicit.mails.at(-1)?.tls).toBe(true);

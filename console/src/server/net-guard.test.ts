@@ -104,7 +104,15 @@ describe("outbound address policy (SSRF)", () => {
       "meta.example": ["169.254.169.254"],
       "lan.example": ["192.168.0.10"],
     });
-    expect(await resolveOutbound("ok.example", { allowInternal: false, resolver: r })).toEqual({ ok: true, address: "93.184.216.34", family: 4 });
+    expect(await resolveOutbound("ok.example", { allowInternal: false, resolver: r })).toEqual({
+      ok: true,
+      address: "93.184.216.34",
+      family: 4,
+      addresses: [
+        { address: "93.184.216.34", family: 4 },
+        { address: "2606:2800:220:1::1", family: 6 },
+      ],
+    });
     expect(await resolveOutbound("mixed.example", { allowInternal: false, resolver: r })).toMatchObject({ ok: false, code: "address_internal" });
     // The dev flag allows internal addresses, never metadata / link-local ones.
     expect(await resolveOutbound("lan.example", { allowInternal: true, resolver: r })).toMatchObject({ ok: true, address: "192.168.0.10" });
@@ -118,13 +126,22 @@ describe("outbound address policy (SSRF)", () => {
     expect(await resolveOutbound("relay.example", { allowInternal: true, resolver: nat64 })).toMatchObject({ ok: false, code: "address_forbidden" });
   });
 
-  it("the pinned lookup answers the vetted address in both call styles", () => {
-    const lookup = pinnedLookup("93.184.216.34", 4);
+  it("the pinned lookup answers only the vetted addresses, in order, in both call styles", () => {
+    const lookup = pinnedLookup([
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:2800:220:1::1", family: 6 },
+    ]);
     let single: unknown[] = [];
     lookup("evil.example", {}, (...args) => (single = args));
     expect(single).toEqual([null, "93.184.216.34", 4]);
     let all: unknown[] = [];
     lookup("evil.example", { all: true }, (...args) => (all = args));
-    expect(all).toEqual([null, [{ address: "93.184.216.34", family: 4 }]]);
+    expect(all).toEqual([
+      null,
+      [
+        { address: "93.184.216.34", family: 4 },
+        { address: "2606:2800:220:1::1", family: 6 },
+      ],
+    ]);
   });
 });

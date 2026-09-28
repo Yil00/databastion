@@ -170,15 +170,21 @@ export type Resolver = (host: string) => Promise<{ address: string; family: numb
 
 const systemResolver: Resolver = (host) => dnsLookup(host, { all: true, verbatim: true });
 
+export interface CheckedAddress {
+  address: string;
+  family: 4 | 6;
+}
+
 export type ResolveOutcome =
-  | { ok: true; address: string; family: 4 | 6 }
+  | { ok: true; address: string; family: 4 | 6; addresses: CheckedAddress[] }
   | { ok: false; code: "dns_failed" | "address_forbidden" | "address_internal"; retryable: boolean };
 
 /**
  * Resolves `host` for an outbound connection and applies the address policy to EVERY resolved
  * address (a name resolving to one public and one internal address is refused: no mixed-record
- * tricks). The caller connects to the returned address only (pinned: no second resolution between
- * the check and the connection, so DNS rebinding cannot swap it).
+ * tricks). The caller connects to the checked addresses only (pinned: no second resolution between
+ * the check and the connection, so DNS rebinding cannot swap them), in the resolver's order with a
+ * fallback to the next one on a connection error (see `pinnedLookup`).
  */
 export async function resolveOutbound(
   host: string,
@@ -203,21 +209,30 @@ export async function resolveOutbound(
     if (cls === "internal") internalSeen = true;
   }
   if (internalSeen && !opts.allowInternal) return { ok: false, code: "address_internal", retryable: false };
-  const first = addresses[0] as { address: string; family: number };
-  return { ok: true, address: first.address, family: isIP(first.address) === 6 ? 6 : 4 };
+  const checked: CheckedAddress[] = addresses.map((a) => ({ address: a.address, family: isIP(a.address) === 6 ? 6 : 4 }));
+  const first = checked[0] as CheckedAddress;
+  return { ok: true, address: first.address, family: first.family, addresses: checked };
 }
 
 /**
- * `lookup` option for `net` / `tls` / `http(s)` that always answers the pinned address (handles
- * both the single-address and the `all: true` call styles of Node's socket code).
+ * `lookup` option for `net` / `tls` / `http(s)` that only ever answers the checked addresses. With
+ * `autoSelectFamily` (set by the senders), Node's socket code asks for all of them and tries them
+ * in turn (happy eyeballs: an unreachable AAAA does not fail a dual-stack destination); a caller
+ * asking for one address gets the first.
  */
-export function pinnedLookup(address: string, family: 4 | 6) {
+export function pinnedLookup(addresses: readonly CheckedAddress[]) {
+  const list = addresses.map((a) => ({ address: a.address, family: a.family }));
+  const first = list[0];
   return (
     _hostname: string,
     options: { all?: boolean } | number | undefined,
     callback: (err: NodeJS.ErrnoException | null, address: string | { address: string; family: number }[], family?: number) => void,
   ): void => {
-    if (typeof options === "object" && options?.all) callback(null, [{ address, family }]);
-    else callback(null, address, family);
+    if (!first) {
+      callback(Object.assign(new Error("no checked address"), { code: "ENOTFOUND" }), "", 4);
+      return;
+    }
+    if (typeof options === "object" && options?.all) callback(null, list);
+    else callback(null, first.address, first.family);
   };
 }

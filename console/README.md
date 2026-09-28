@@ -519,8 +519,10 @@ contents: `src/lib/notification-render.ts`.*
   delivery id, `Auto-Submitted: auto-generated`. 10 s to connect, 30 s per reply, 60 s in total. A 4xx
   reply or a network / TLS error is retried; a 5xx reply fails.
 - **SSRF defense** (webhooks; outbound connections are made by the worker only): the host is resolved
-  and **every** address checked; the socket connects to the vetted address (no second resolution, so
-  no DNS rebinding). Always refused: unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`,
+  and **every** address checked; the socket connects to the vetted addresses only (no second
+  resolution, so no DNS rebinding), in the resolver's order with a fallback to the next one on a
+  connection error (happy eyeballs, so an unreachable IPv6 address does not fail a dual-stack
+  destination); TLS is always verified against the host name. Always refused: unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`,
   `fe80::/10`, including the metadata endpoints `169.254.169.254`, `fd00:ec2::254`), multicast,
   broadcast, reserved. Refused unless `DATABASTION_ALERTING_INSECURE_DEV=1`: loopback, RFC 1918, CGNAT,
   ULA, documentation / benchmark ranges and the IPv6 prefixes embedding an IPv4 address (NAT64,

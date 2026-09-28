@@ -4,7 +4,7 @@ import tls from "node:tls";
 
 import { SMTP_PORTS, type EmailConfig } from "@/lib/notification-model";
 
-import { classifyAddress, resolveOutbound, type Resolver } from "../net-guard";
+import { classifyAddress, pinnedLookup, resolveOutbound, type CheckedAddress, type Resolver } from "../net-guard";
 import type { SendResult } from "./types";
 
 /**
@@ -237,15 +237,24 @@ export function dataPayload(message: string): string {
 
 function connectSocket(
   config: EmailConfig,
-  address: string,
+  addresses: readonly CheckedAddress[],
   opts: SmtpOptions,
 ): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const servername = net.isIP(config.host) === 0 ? config.host : undefined;
+    // The configured host (certificate identity) with a lookup that only answers the checked
+    // addresses, tried in order with a fallback to the next one (dual stack).
+    const target = {
+      host: config.host,
+      port: config.port,
+      lookup: pinnedLookup(addresses) as unknown as net.LookupFunction,
+      autoSelectFamily: true,
+      autoSelectFamilyAttemptTimeout: 1_000,
+    };
     const socket =
       config.tls === "implicit"
-        ? tls.connect({ host: address, port: config.port, servername, ca: opts.ca, rejectUnauthorized: true })
-        : net.connect({ host: address, port: config.port });
+        ? tls.connect({ ...target, servername, ca: opts.ca, rejectUnauthorized: true })
+        : net.connect(target);
     const timer = setTimeout(() => {
       socket.destroy();
       reject(fail("connect_timeout", true));
@@ -298,7 +307,8 @@ export async function sendMail(config: EmailConfig, password: string | null, msg
   const resolved = await resolveOutbound(config.host, { allowInternal: true, resolver: opts.resolver });
   if (!resolved.ok) return { ok: false, code: resolved.code, retryable: resolved.retryable };
   if (classifyAddress(resolved.address) === "forbidden") return { ok: false, code: "address_forbidden", retryable: false };
-  const loopback = isLoopbackAddress(resolved.address);
+  // Plain text / AUTH without TLS only when EVERY address that may be tried is loopback.
+  const loopback = resolved.addresses.every((a) => isLoopbackAddress(a.address));
   if (config.tls === "none" && !loopback && !opts.allowInsecure) return { ok: false, code: "insecure_refused", retryable: false };
 
   let socket: net.Socket | null = null;
@@ -310,7 +320,7 @@ export async function sendMail(config: EmailConfig, password: string | null, msg
     }, opts.totalTimeoutMs ?? SMTP_TOTAL_TIMEOUT_MS);
   });
   const run = async (): Promise<void> => {
-    socket = await connectSocket(config, resolved.address, opts);
+    socket = await connectSocket(config, resolved.addresses, opts);
     const conv = new Conversation(socket, opts.replyTimeoutMs ?? SMTP_REPLY_TIMEOUT_MS);
     let secure = config.tls === "implicit";
     await conv.command(null, [220]);

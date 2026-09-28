@@ -176,6 +176,28 @@ describe("webhook sender over HTTP (dev flag: internal address allowed)", () => 
     expect(await sendWebhook(`http://pinned.invalid:${port}/pinned`, SECRET, MSG, { ...dev, resolver })).toEqual({ ok: true });
     expect(r.received.at(-1)?.headers.host).toBe(`pinned.invalid:${port}`);
   });
+
+  it("falls back to the next checked address when the first one does not answer (dual stack)", async () => {
+    const port = new URL(base).port;
+    // The receiver listens on 127.0.0.1 only: ::1 is refused, 127.0.0.1 answers.
+    const resolver = async () => [
+      { address: "::1", family: 6 },
+      { address: "127.0.0.1", family: 4 },
+    ];
+    expect(await sendWebhook(`http://dual.invalid:${port}/dual`, SECRET, MSG, { ...dev, resolver })).toEqual({ ok: true });
+    expect(r.received.at(-1)?.path).toBe("/dual");
+  });
+
+  it("a forbidden address anywhere in the resolved set still refuses, before any connection", async () => {
+    const port = new URL(base).port;
+    const n = r.received.length;
+    const resolver = async () => [
+      { address: "127.0.0.1", family: 4 },
+      { address: "169.254.169.254", family: 4 },
+    ];
+    expect(await sendWebhook(`http://mixed.invalid:${port}/mixed`, SECRET, MSG, { ...dev, resolver })).toMatchObject({ code: "address_forbidden" });
+    expect(r.received.length).toBe(n);
+  });
 });
 
 const cert = selfSignedCert();
