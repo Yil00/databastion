@@ -4,6 +4,10 @@
 //! - with a pending secret `S1`, requests try `S1` first and fall back to
 //!   the current secret `S0` on `401` (`S1` never registered); a `401` with
 //!   `S0` while `S1` is pending is retried with `S1` before anything else;
+//! - any other error on `S1` (notably `429` / `503`, answered before the
+//!   console recognizes the secret) is returned as is, **without** falling
+//!   back to `S0`: `S1` may already be promoted and `S0` past the 60 s
+//!   window, where using it locks the agent (ADR-0010, ADR-0011);
 //! - the first success with `S1` promotes it (persisted atomically). A
 //!   success only counts once the caller's per-endpoint checker
 //!   (`uplink::accept`) accepts the reply (status, media type, body): a
@@ -22,7 +26,7 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, RotateResponse, Uuid};
+use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, Uuid};
 use reqwest::Method;
 use zeroize::Zeroizing;
 
@@ -67,8 +71,9 @@ struct Creds {
     /// first (and redo `/rotate`). Reset by every `/rotate` attempt, since
     /// an attempt with an unknown outcome may have registered `S1`.
     pending_rejected: bool,
-    /// Incremented at the start of every `/rotate` attempt; a `401` on `S1`
-    /// only marks it rejected if no attempt started since the request.
+    /// Incremented at the start of every `/rotate` attempt and when its
+    /// answer is received (`200`, or `401` with `S0`); a `401` on `S1` only
+    /// marks it rejected if neither happened since the request started.
     rotate_epoch: u64,
     /// Last promotion in this process: no new rotation within the console's
     /// 60 s tolerance window.
@@ -375,13 +380,25 @@ impl Session {
             .await;
         match result {
             Ok(reply) => {
-                let response: RotateResponse =
-                    serde_json::from_slice(&reply.body).map_err(|_| {
-                        UplinkError::UnexpectedResponse {
-                            status: reply.status.as_u16(),
-                        }
-                    })?;
+                // Same contract check as every other endpoint: a
+                // middlebox's `2xx` page proves nothing, and the outcome
+                // of this attempt stays unknown (S1 keeps going first).
+                let Some(response) = crate::uplink::accept::rotate(&reply) else {
+                    tracing::warn!(
+                        status = reply.status.as_u16(),
+                        "rotate reply does not match the contract; ignored"
+                    );
+                    return Err(UplinkError::UnexpectedResponse {
+                        status: reply.status.as_u16(),
+                    }
+                    .into());
+                };
                 let mut creds = self.lock();
+                // S1 is now registered: a `401` on S1 obtained by a request
+                // sent before this point is stale and must not put S0
+                // first again (it would outlive the 60 s window and lock
+                // the agent, ADR-0010).
+                creds.rotate_epoch += 1;
                 creds.pending_rejected = false;
                 // Subsequent requests use S1 first.
                 creds.generation += 1;
@@ -402,8 +419,11 @@ impl Session {
             }
             Err(UplinkError::Unauthorized) => {
                 // S0 refused while S1 is pending: S1 may already be promoted
-                // (deadline). Next calls try S1 first.
-                self.lock().pending_rejected = false;
+                // (deadline). Next calls try S1 first; a stale S1 `401`
+                // from before this answer must not undo that.
+                let mut creds = self.lock();
+                creds.rotate_epoch += 1;
+                creds.pending_rejected = false;
                 Err(CallError::Unauthorized)
             }
             Err(e) => Err(e.into()),

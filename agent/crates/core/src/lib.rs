@@ -43,6 +43,6 @@ mod uplink;
 
 pub use config::AgentConfig;
 pub use connector::{AuditConfig, Connector, ConnectorError, ScanJob};
-pub use engine::{AuditLevel, Engine, TargetHealth};
+pub use engine::{AuditLevel, Engine, FailureCode, TargetHealth};
 pub use runtime::{AgentError, EnrollOptions, enroll, run};
 pub use sink::{EventSink, FindingSink};
