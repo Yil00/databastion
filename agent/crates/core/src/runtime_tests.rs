@@ -834,6 +834,146 @@ async fn s1_401_after_the_latest_rotate_attempt_puts_s0_first() {
     assert!(session.needs_rotation_retry());
 }
 
+async fn heartbeat_call(session: &Session) -> Result<HeartbeatResponse, CallError> {
+    session
+        .call(
+            Method::POST,
+            "/heartbeat",
+            &[],
+            Some(b"{}"),
+            uplink::REQUEST_TIMEOUT,
+            uplink::accept::heartbeat,
+        )
+        .await
+}
+
+/// L1 (a): a `401` on S1 for a request sent while `/rotate` was in flight
+/// (S1 not registered yet), but handled after the `/rotate` `200`, is stale:
+/// it must not put S0 first again (a later S0 past the 60 s window would
+/// lock the agent).
+#[tokio::test]
+async fn stale_s1_401_handled_after_rotate_success_keeps_s1_first() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    // S0 answers slowly, so the heartbeat's S0 success is handled after the
+    // `/rotate` 200; S1 (anything but S0) is refused at once.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(heartbeat_response(30).set_delay(Duration::from_millis(900)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(401, "unauthorized"))
+        .mount(&server)
+        .await;
+    let (rotated, called) = tokio::join!(session.rotate(None), async {
+        // Starts after the attempt began (S1 pending, epoch bumped).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        heartbeat_call(&session).await
+    });
+    assert_eq!(
+        rotated.unwrap(),
+        RotateOutcome::Registered { duplicate: false }
+    );
+    called.unwrap();
+    let s1 = session.snapshot().pending.unwrap();
+    let auths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/heartbeat"))
+        .map(|r| r.headers["authorization"].to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(auths, [bearer(s1.expose()), bearer(S0)]);
+    // The stale 401 was ignored: S1 stays first, no /rotate retry needed.
+    assert!(!session.needs_rotation_retry());
+}
+
+/// L1 (b), decision: a `429` / `503` on the pending S1 is **not** retried
+/// with S0. The console answers it before recognizing the secret, so S1 may
+/// already be promoted and S0 past the 60 s window, where any use of S0
+/// locks the agent (ADR-0010, ADR-0011). The throttled error is returned
+/// (retryable, honoring `Retry-After`) and S1 stays first.
+#[tokio::test]
+async fn throttled_pending_s1_is_retried_later_never_with_s0() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(false))
+        .mount_as_scoped(&server)
+        .await;
+    session.rotate(None).await.unwrap();
+    drop(guard);
+    let s1 = session.snapshot().pending.unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(s1.expose()).as_str()))
+        .respond_with(error_body(503, "unavailable").insert_header("retry-after", "7"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(S0).as_str()))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for _ in 0..2 {
+        let err = heartbeat_call(&session).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CallError::Uplink(UplinkError::Throttled {
+                    status: 503,
+                    retry_after: Some(d)
+                }) if *d == Duration::from_secs(7)
+            ),
+            "{err:?}"
+        );
+    }
+    assert!(!session.needs_rotation_retry());
+    assert_eq!(session.snapshot().pending.unwrap().expose(), s1.expose());
+}
+
+/// `/rotate` success is checked like every other endpoint: a non-contract
+/// `200` registers nothing and leaves S1 pending with an unknown outcome.
+#[tokio::test]
+async fn non_contract_rotate_reply_is_unexpected() {
+    for template in [
+        ResponseTemplate::new(200).set_body_raw("<html>proxy</html>", "text/html"),
+        ResponseTemplate::new(200).set_body_raw(
+            r#"{"grace_expires_at":"2026-09-28T14:07:11Z","duplicate":false}"#,
+            "text/plain",
+        ),
+        heartbeat_response(30),
+    ] {
+        let server = MockServer::start().await;
+        let env = enrolled(&server).await;
+        let session = session(&env);
+        Mock::given(method("POST"))
+            .and(path("/api/agent/v1/rotate"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        assert_unexpected(session.rotate(None).await);
+        let stored = env.state.load_identity().unwrap();
+        assert_eq!(stored.secret.expose(), S0);
+        assert!(stored.pending.is_some());
+        assert!(!session.needs_rotation_retry());
+    }
+}
+
 #[tokio::test]
 async fn invalid_secret_fails_the_job_and_clears_rotation_jobs() {
     let server = MockServer::start().await;
