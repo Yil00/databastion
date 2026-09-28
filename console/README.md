@@ -19,12 +19,13 @@ database (also used as the job queue: no Redis). See
 ## Configuration
 | Variable | Purpose |
 |----------|---------|
-| `DATABASE_URL` / `DATABASE_URL_FILE` | Internal PostgreSQL connection string, directly or via a file (Docker secret). Setting both is an error. |
+| `DATABASE_URL` / `DATABASE_URL_FILE` | Internal PostgreSQL connection string used by the web and worker processes, directly or via a file (Docker secret). Setting both is an error. In production: the non-owner runtime role (see "Database roles") |
+| `DATABASE_MIGRATION_URL` / `_FILE` | `pnpm db:migrate` only: connection string of the OWNER role. Unset: `DATABASE_URL` is used (single-role development setups) |
 | `LOG_LEVEL` | pino level (`info` by default) |
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
-| `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY` |
+| `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
@@ -56,6 +57,29 @@ database credentials (invariant I3).
 directory, deleted afterwards; run as the `postgres` system user when the tests run as root) for
 the database tests. Without `TEST_DATABASE_URL` or PostgreSQL binaries, those tests are skipped
 with a message and the unit tests still run.
+
+## Database roles
+The append-only guarantee of `audit_log` (a trigger) only holds if the console cannot remove it,
+so production uses two roles:
+
+| Role | Used by | Rights |
+|------|---------|--------|
+| Owner (e.g. `POSTGRES_USER`) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns every table and trigger |
+| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, `CREATE` on the database (pg-boss schema) |
+
+The group role `databastion_app` and its grants come from migration `0003_runtime_role_grants.sql`
+(it creates the group role if missing, which needs `CREATEROLE` on the owner). The LOGIN role and
+its password are created outside migrations; with the example compose file,
+[deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
+first database initialization. Elsewhere, as the owner:
+
+```sql
+CREATE ROLE databastion_runtime LOGIN PASSWORD '...' IN ROLE databastion_app;
+```
+
+Limitation: in a single-role setup (`DATABASE_URL` is the owner or a superuser, e.g. development),
+the console could drop the trigger; the audit log is then append-only only against the application
+code, not against a compromised console process.
 
 ## First administrator
 There is no default account and no default password. After `pnpm db:migrate`:
@@ -96,8 +120,11 @@ logging in again from the same browser ends its previous session.
 
 Brute-force protection: every login or agent-authentication attempt that needs an argon2id
 verification is counted before it runs (and refunded on success), so concurrent requests cannot
-exceed the limits, and at most 8 such verifications run at once per process (`503` +
-`Retry-After` beyond).
+exceed the limits. Logins and agent authentications use separate argon2id pools (4 and 8 concurrent
+verifications per process, `503` + `Retry-After` beyond), plus a pool reserved for agents
+presenting their last verified secret, so a login flood can never block agents. Failed logins on
+unknown usernames share a process-wide budget (30 per minute). Per-IP limits bucket IPv6
+addresses by /64.
 
 ## Data at rest
 | Data | Storage |

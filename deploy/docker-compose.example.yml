@@ -7,6 +7,23 @@
 name: databastion
 
 services:
+  # One-shot: applies the console migrations as the database OWNER role, then exits.
+  migrate:
+    image: ghcr.io/yil00/databastion-console:latest
+    command: ["migrate"]         # pnpm db:migrate
+    restart: "no"
+    environment:
+      DATABASE_MIGRATION_URL_FILE: /run/secrets/db_owner_url
+    secrets: [db_owner_url]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      db:
+        condition: service_healthy
+
   console:
     image: ghcr.io/yil00/databastion-console:latest
     command: ["web"]
@@ -29,8 +46,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     image: ghcr.io/yil00/databastion-console:latest
@@ -47,8 +64,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   db:
     image: postgres:17-alpine
@@ -57,9 +74,11 @@ services:
       POSTGRES_USER: databastion
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: databastion
-    secrets: [db_password]
+    secrets: [db_password, db_app_password]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates the non-owner runtime role at first initialization (see the script).
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     # No "ports:": the internal database is never exposed.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U databastion -d databastion"]
@@ -69,9 +88,13 @@ services:
 
 secrets:
   db_password:
-    file: ./secrets/db_password
+    file: ./secrets/db_password       # OWNER role (POSTGRES_USER), used only by `migrate`
+  db_owner_url:
+    file: ./secrets/db_owner_url      # postgresql://databastion:<db_password>@db:5432/databastion
+  db_app_password:
+    file: ./secrets/db_app_password   # runtime role databastion_runtime (web + worker)
   db_url:
-    file: ./secrets/db_url            # postgresql://databastion:<password>@db:5432/databastion
+    file: ./secrets/db_url            # postgresql://databastion_runtime:<db_app_password>@db:5432/databastion
   encryption_key:
     file: ./secrets/encryption_key    # openssl rand -base64 32
 
