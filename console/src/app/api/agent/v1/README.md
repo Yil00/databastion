@@ -24,14 +24,18 @@ individually and a non-conforming job is marked `failed` and never served.
 
 Authentication: every attempt that needs an argon2id verification is counted before it runs
 (refunded on success), per (agent id, source IP) (10 / 5 min) and per source IP (50 / 5 min); the
-per-IP limit only applies when the IP is known (trusted proxy), and the per-agent key falls back to
-the agent id alone otherwise. At most 8 argon2id verifications of unrecognized secrets run at once per process (`503` +
+per-IP limits only apply when the IP is known (trusted proxy), and the per-agent key falls back to
+the agent id alone otherwise. Cheap failures (no argon2id: bad headers or secret format, unknown or
+inactive agent, trickled `/rotate` body) count only toward a separate per-IP limit (500 / 5 min)
+that gates reaching argon2id (P1-D M1). `/enroll` hashes the new secret in its own pool of 2
+(`503` + `Retry-After` beyond, token not consumed). At most 8 argon2id verifications of unrecognized secrets run at once per process (`503` +
 `Retry-After` beyond); secrets matching the last verified fingerprint use a separate reserved pool
 of 4, and logins have their own pool, so neither floods of wrong secrets nor login floods can block
 a legitimate agent. Verified secrets are cached 25 s, bound to the stored hash and purged on
 revocation; the agent row is read on every request, so a revocation from any console process is
 effective immediately. A 24 h "known good" fingerprint of the last verified secret only exempts it
-from the per-agent failure limit (an attacker cannot lock the agent out); it never authenticates.
+from every failure limit, per agent and per IP (an attacker cannot lock the agent out, not even from
+behind the same NAT IP; a secret in the 25 s cache is exempt too); it never authenticates.
 It is persisted in the agent row (hash-bound HMAC keyed by the console server key, no secret), so it
 survives console restarts; the pending secret registered by an authenticated `/rotate` gets one too.
 

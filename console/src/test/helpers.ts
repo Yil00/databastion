@@ -64,11 +64,18 @@ export async function newToken(): Promise<string> {
 
 export async function enroll(hostname = "db-host-1"): Promise<{ agentId: string; secret: string }> {
   const token = await newToken();
-  const res = await handleEnroll(
-    agentRequest("POST", "/enroll", {
-      body: { token, hostname, agent_version: "0.1.0", connectors: ["postgres"] },
-    }),
-  );
+  const attempt = () =>
+    handleEnroll(
+      agentRequest("POST", "/enroll", {
+        body: { token, hostname, agent_version: "0.1.0", connectors: ["postgres"] },
+      }),
+    );
+  let res = await attempt();
+  // Like the agent: retry while the bounded enroll argon2id pool is full (503, token not consumed).
+  for (let i = 0; res.status === 503 && i < 200; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+    res = await attempt();
+  }
   if (res.status !== 200) throw new Error(`enroll failed: ${res.status}`);
   const body = (await res.json()) as { agent_id: string; agent_secret: string };
   return { agentId: body.agent_id, secret: body.agent_secret };
