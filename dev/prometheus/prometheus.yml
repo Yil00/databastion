@@ -11,9 +11,13 @@ scrape_configs:
       - targets: ["localhost:9090"]
 
   # The console runs on the host (`pnpm dev`, port 3000) and is not containerized yet: this target is
-  # DOWN until the console exposes /metrics (P1). The endpoint will be authenticated (ADR-0004); add an
-  # `authorization.credentials_file` here once the console defines its scrape credentials.
+  # DOWN until the console is started. `/metrics` requires a bearer token (ADR-0004): `make dev`
+  # generates dev/.state/metrics_token (never committed), copied by the metrics-token-init service; start the host console with
+  # DATABASTION_METRICS_TOKEN_FILE=dev/.state/metrics_token (see dev/README.md).
   - job_name: databastion-console
     metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics_token
     static_configs:
       - targets: ["host.docker.internal:3000"]
