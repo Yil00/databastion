@@ -21,6 +21,9 @@ const nextConfig: NextConfig = {
       // UI page; this rule does not depend on the proxy matcher (e.g. prefetch requests).
       { source: "/findings", headers: [{ key: "Cache-Control", value: "no-store" }] },
       { source: "/findings/:path*", headers: [{ key: "Cache-Control", value: "no-store" }] },
+      // Incident pages show the linked finding's decrypted masked samples.
+      { source: "/incidents", headers: [{ key: "Cache-Control", value: "no-store" }] },
+      { source: "/incidents/:path*", headers: [{ key: "Cache-Control", value: "no-store" }] },
     ];
   },
 };

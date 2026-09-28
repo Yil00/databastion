@@ -11,7 +11,8 @@ database (also used as the job queue: no Redis). See
 > tokens, agent API `/enroll`, `/heartbeat`, `/jobs` (long-poll), `/jobs/{job_id}/status`,
 > `/rotate`; Prometheus `/metrics`; UI pages (login, agents, agent detail, enrollment tokens);
 > Docker image. Phase 2 (P2-D): `/findings` ingestion, scan launching, findings view, false
-> positives.
+> positives. Phase 3 (P3-A, P3-B): policy engine in the worker, exceptions, incidents and their
+> lifecycle (see "Policies and incidents").
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -86,8 +87,9 @@ and migrations must never run code planted by the console. Production uses three
 | `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, only `SELECT, INSERT` and `UPDATE (acknowledged_at, acknowledged_by)` on `security_events` (no `DELETE`: an integrity alert cannot be erased or rewritten), `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
 
 Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql`,
-`0010_security_events_no_delete.sql` and `0012_findings_runtime_grants.sql` (`findings_batches`:
-`SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`) (custom, every name schema-qualified). Migration
+`0010_security_events_no_delete.sql`, `0012_findings_runtime_grants.sql` (`findings_batches`:
+`SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`) and `0015_incidents_runtime_grants.sql`
+(`incidents`: no `DELETE`, `TRUNCATE`) (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
@@ -160,7 +162,12 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
 | `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (the agent's latest heartbeat carries no `classifiers_version`), `409 classifiers_version_unregistered` (that version is not in the contract classifier registry `classifiers.json`: no job is issued), `422 unknown_classifiers` (`classifiers` holds ids that are not classifiers of that version); each refusal is audited (`discovery.scan_request`, `failure`, with the reason and the version). The job carries the version of the agent's latest heartbeat. `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline) |
-| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor) |
+| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor). Marking closes the finding's open / acknowledged incidents as `false_positive` (audited `incident.transition`); unmarking makes the policies apply to it again |
+| `POST /api/policies` | Create a policy (admin, CSRF): `{name, description?, enabled?, source?, conditions, actions}`, strictly validated (see "Policies and incidents"); `201 {id}`, `400 {"error": "invalid_policy", "field"}`, `409 name_taken` (case-insensitive). Audited `policy.create` (identifiers, flags and counts only: never the name or description) |
+| `PATCH` / `DELETE /api/policies/{id}` | Update any subset of the create keys (`source` is fixed) / delete (admin, CSRF); `204`, `404`. A deleted policy's exceptions go with it, its incidents are kept. Audited `policy.update` (with the changed keys) / `policy.delete` |
+| `POST /api/policy-exceptions` | Create an exception (admin, CSRF): `{policy_id?, agent_id?, target_id?, classifier?, location?, reason, expires_at?}`, at least one of agent / target / classifier / location; `201 {id}`, `400 {"error": "invalid_exception", "field"}`, `404` unknown policy or agent. Audited `policy_exception.create` (never the reason) |
+| `DELETE /api/policy-exceptions/{id}` | Delete an exception (admin, CSRF); the policies it covered are re-applied to the existing findings. Audited |
+| `POST /api/incidents/{id}/transition` | `{"status": "acknowledged" \| "resolved" \| "false_positive"}` (CSRF). Any signed-in user acknowledges and resolves; `false_positive` is admin only (`403`, audited `user.access_denied`). `409 {"error": "invalid_transition", "from"}` outside the lifecycle; `204`. Audited `incident.transition` with actor, `from`, `to`; refusals as failures |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
@@ -173,7 +180,13 @@ row, admins only; analysts see a hint). The view fetches at most 500 rows round-
 (most recently seen first within each), so one noisy agent or target cannot hide the others; the
 counts show at most 1000 (target, classifier) groups, fetched round-robin over agents then over
 the targets of each agent. The agent detail page shows the last scan of each target, a link to its findings and (admin)
-a "Scan" dialog. A scan that failed with `unsupported` while its `classifiers_version` differs from
+a "Scan" dialog. `/incidents` lists the incidents (active ones by default; filters
+`?status=open|acknowledged|resolved|false_positive|all&severity=&agent=&target=`, at most 500, most
+severe first); `/incidents/{id}` shows the incident, its lifecycle (who and when), the transition
+buttons ("False positive" for admins only, with a confirmation) and the linked finding with its
+masked samples, decrypted server side through the same path as `/findings` (`no-store`).
+`/policies` lists the policies and exceptions (admin: create, enable / disable, delete, add or
+delete exceptions); `/policies/{id}` shows one policy with its exceptions (admin: edit form). A scan that failed with `unsupported` while its `classifiers_version` differs from
 the agent's current heartbeat version is shown as "classifier set mismatch" (the agent build runs
 another classifier set) instead of a bare `unsupported`. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
@@ -186,8 +199,9 @@ confirmation dialog uses the native `<dialog>` element).
   `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`; `'unsafe-eval'` in `next dev`
   only). Every page is rendered per request (root layout `force-dynamic`), so no prerendered page
   lacks the nonce. Not applied to `/api/*` and `/metrics` (no HTML). UI pages also get
-  `Cache-Control: no-store` (the findings view carries decrypted masked samples); `/findings` also
-  gets it from `next.config.ts` `headers()`, and links to it are not prefetched.
+  `Cache-Control: no-store` (the findings view carries decrypted masked samples); `/findings` and
+  `/incidents` (the incident page shows the linked finding's samples) also get it from
+  `next.config.ts` `headers()`, and links to them are not prefetched.
 - Every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy` / `-Resource-Policy: same-origin`,
   a restrictive `Permissions-Policy` (`next.config.ts`). HSTS is set by the TLS reverse proxy.
@@ -296,7 +310,8 @@ All rotation instants (registration deadline, promotion time, window checks) use
 revocation wakes them (locally and via `NOTIFY` in other processes) and a poll whose secret is no
 longer the current one is closed with `401`.
 
-`security_events` is a placeholder for the incident model of phase 3 (agent-integrity alerts):
+`security_events` holds agent-integrity alerts (they are not policy incidents: the P3-B `incidents`
+table only holds what policies raise; merging both views is left to a later task):
 `agent.rotation_conflict` (`critical`), and since P2-D `agent.batch_rejected` (a `400` on
 `/findings`), `agent.batch_conflict` and `agent.foreign_target` (a finding for a target the agent
 never reported), all `high`, each with an audit-log entry of the same name. Their details are the
@@ -379,6 +394,8 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Masked samples (`findings.masked_samples`) | AES-256-GCM, key = HKDF-SHA256 subkey `masked-samples.v1` of `DATABASTION_ENCRYPTION_KEY`, random 96-bit nonce, AAD = `"databastion.masked-samples.v1" ‖ 0x01 ‖ finding id`; layout `0x01 ‖ nonce ‖ ciphertext ‖ tag`. Without a usable key no sample is stored (the finding is); a key change makes stored samples "unavailable" in the view until the next scan |
 | HMAC fingerprints (`findings.fingerprints`) | as sent by the agent (keyed by its local key, which never leaves it) |
 | Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch in canonical JSON (keys sorted recursively), job, item count: idempotency only, never the body. Append-only for the runtime role (migration `0012`: no `UPDATE`, `DELETE`, `TRUNCATE`); `findings` rows cannot be deleted by it either |
+| Policies, exceptions (`policies`, `policy_exceptions`) | plain columns: admin-typed name, description, reason; condition and action documents holding only identifiers, globs on normalized names, thresholds, severities and channel references; never a sampled value |
+| Incidents (`incidents`) | plain columns: policy snapshot (id, name, revision), severity, status and who / when of each transition, finding id, agent, target, classifier, `matched` and `classifiers_version` snapshots, `dedup_key`; no sampled value (the samples stay encrypted on the finding). Never deleted by the runtime role (migration `0015`) |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
@@ -388,13 +405,57 @@ Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are
 process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the
 limiters (the secret cache is already safe across processes, as it is bound to the stored hash).
 
+## Policies and incidents
+*P3-A, P3-B. Model and lifecycle: `src/lib/policy-model.ts`, `src/lib/incident-lifecycle.ts`;
+engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
+
+- **Conditions** (source `finding`; every key optional, all present keys must hold, the values of a
+  list are alternatives): `classifiers` (registered ids of any classifier set, or families such as
+  `pii.*`), `agent_ids`, `target_ids`, `engines`, `location` (`database`, `schema`, `object`,
+  `field` globs on the normalized names: `*`, `?`, `\` escape, case-insensitive, matched in linear
+  time), `min_confidence`, `min_match_ratio` (matched / sampled), `min_matched`. Unknown keys are
+  rejected. Phase 4 adds the `access_event` source (a new `policy_source` enum value) with its own
+  keys (signals `signature.*`, `shape.*`, `volume.*`); a document is validated against its policy's
+  source, so existing policies keep their meaning.
+- **Actions**: exactly one `{"type": "create_incident", "severity": "low|medium|high|critical"}`,
+  and up to 5 `{"type": "notify", "channel": "<slug>"}`. Channel references are stored on the policy
+  and copied to each incident (`notify_channels`); delivery comes with P3-C.
+- **Exceptions**: scoped to one policy or to all, by agent, target, classifier (id or family) and / or
+  location globs (at least one), with a mandatory reason and an optional expiry. A covered finding
+  opens no incident; expired exceptions are listed as expired and ignored.
+- **Execution** (worker, pg-boss queue `policies.evaluate`, `stately`, no payload): the web process
+  sends a wake-up after the commit of an accepted findings batch and after a policy or exception
+  change; the worker also schedules it every minute. The work itself is recorded in the tables, so a
+  lost or repeated job loses or repeats nothing: a finding is pending while
+  `findings.policy_evaluated_at` differs from `last_seen_at` (every rescan, and unmarking a false
+  positive, makes it pending); a policy gets a full pass over the existing findings while
+  `evaluated_at` is older than `changed_at` (creation, edit of conditions / actions / enablement,
+  deletion of one of its exceptions) or than the expiry of one of its exceptions. Findings are
+  processed in chunks of 200 per transaction, row-locked (`SKIP LOCKED`: rows held by an ingestion
+  are left pending), so an evaluation never races an ingestion or a false-positive marking. A job
+  runs for at most 50 s and re-queues itself when work remains.
+- **Dedup**: `dedup_key = policy:<id>|finding:<id>`; a partial unique index allows one open or
+  acknowledged incident per key. A later scan of the same finding increments `match_count` once per
+  finding revision. After `resolved`, a new incident opens only when the finding matches more values
+  or is reclassified by another classifier set (the rule that also resets a false positive). A
+  false-positive finding never opens an incident. Incident creation is audited `incident.create`
+  (system actor).
+- **Lifecycle**: `open` -> `acknowledged` -> `resolved`, `open` -> `resolved`, `open` /
+  `acknowledged` -> `false_positive`; `resolved` and `false_positive` are final. Checked server side
+  under a row lock. `false_positive` is the finding's false-positive decision (admin only, as on
+  `/findings`): it marks the finding (with its `matched` / `classifiers_version` snapshot) and closes
+  every active incident of it.
+- The `audit.configure` confirmation of P3-A (warning when a change empties `sensitive_objects`)
+  depends on phase 4 and is not implemented.
+
 ## Layout
 ```
 drizzle/                  versioned SQL migrations (generated, never edited by hand)
 scripts/protocol/         protocol code generator (`pnpm protocol:generate`)
 src/app/                  Next.js App Router (UI + API routes)
 src/app/api/agent/v1/     agent API routes (thin, logic in src/server/agent-api/)
-src/app/api/{auth,agents,enrollment-tokens}/  user API routes (logic in src/server/user-api.ts)
+src/app/api/{auth,agents,enrollment-tokens,findings,policies,policy-exceptions,incidents}/
+                          user API routes (logic in src/server/user-api.ts)
 src/app/(console)/, src/app/login/  UI pages (server components)
 src/app/metrics/          Prometheus endpoint on the main port (logic in src/server/metrics.ts;
                           dedicated listener: src/server/metrics-listener.ts)
