@@ -57,7 +57,7 @@ database credentials (invariant I3).
 | `pnpm test` | Unit tests (vitest) |
 | `pnpm protocol:generate` | Regenerate `src/generated/protocol/` from `shared/protocol/openapi.yaml` (checked by `pnpm test`) |
 | `pnpm db:generate --name <slug>` | Generate a versioned SQL migration in `drizzle/` from `src/db/schema.ts` |
-| `pnpm db:generate --custom --name <slug>` | Empty versioned migration for SQL drizzle-kit cannot express (triggers); used only for `0002_audit_log_append_only.sql` |
+| `pnpm db:generate --custom --name <slug>` | Empty versioned migration for SQL drizzle-kit cannot express (triggers, grants, guards): `0002`–`0004`, `0009`, `0010` |
 | `pnpm db:migrate` | Apply pending migrations to `DATABASE_URL(_FILE)` |
 | `pnpm admin:bootstrap` | Create the first administrator (refused if any user exists) |
 
@@ -74,10 +74,14 @@ and migrations must never run code planted by the console. Production uses three
 |------|---------|--------|
 | Bootstrap superuser (`POSTGRES_USER`) | the initdb script only | Creates the roles below, then is never used |
 | `databastion_owner` (LOGIN, NOSUPERUSER, NOCREATEROLE) | `pnpm db:migrate` via `DATABASE_MIGRATION_URL(_FILE)` | Owns the database, `public`, `pgboss` and every console table and trigger. `search_path` pinned to `public` (role setting and migration session) |
-| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
+| `databastion_runtime` (LOGIN), member of `databastion_app` (NOLOGIN) | web + worker via `DATABASE_URL(_FILE)` | Not superuser, not owner. `SELECT, INSERT, UPDATE, DELETE` on the console tables, only `SELECT, INSERT` on `audit_log`, only `SELECT, INSERT` and `UPDATE (acknowledged_at, acknowledged_by)` on `security_events` (no `DELETE`: an integrity alert cannot be erased or rewritten), `USAGE, CREATE` on schema `pgboss` (pg-boss tables). **No** `CREATE` on the database (no new schemas) nor on `public` |
 
-Grants come from migrations `0003_runtime_role_grants.sql` and `0004_pgboss_schema_hardening.sql`
-(custom, every name schema-qualified). The roles and passwords are created outside migrations (the
+Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql` and
+`0010_security_events_no_delete.sql` (custom, every name schema-qualified). Migration
+`0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
+`pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
+superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
+objects), then run `migrate` again. The roles and passwords are created outside migrations (the
 owner has no `CREATEROLE`); with the example compose file,
 [deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
 first database initialization, reading the passwords from the Docker secret files inside psql
@@ -136,7 +140,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
 | `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events` still `501` |
 | `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
-| `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP and per username |
+| `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP, per username + IP, and per username (slow-down, never a lock-out; see "Brute-force protection") |
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/auth/session` | Current user + CSRF token |
 | `GET` / `POST /api/enrollment-tokens` | List / create (admin). The `dbe_…` token is returned once, only its SHA-256 is stored; valid 24 h |
@@ -175,11 +179,30 @@ logging in again from the same browser ends its previous session.
 
 Brute-force protection: every login or agent-authentication attempt that needs an argon2id
 verification is counted before it runs (and refunded on success), so concurrent requests cannot
-exceed the limits. Logins and agent authentications use separate argon2id pools (4 and 8 concurrent
-verifications per process, `503` + `Retry-After` beyond), plus a pool reserved for agents
-presenting their last verified secret, so a login flood can never block agents. Failed logins on
-unknown usernames share a process-wide budget (30 per minute). Per-IP limits bucket IPv6
-addresses by /64.
+exceed the limits. Logins, agent authentications and enrollments use separate argon2id pools (4, 8
+and 2 concurrent operations per process, `503` + `Retry-After` beyond; a `503` on `/enroll` does
+not consume the token), plus a pool reserved for agents presenting their last verified secret, so a
+login flood can never block agents. Failed logins on unknown usernames share a process-wide budget
+(30 per 5 minutes). Per-IP limits bucket IPv6 addresses by /64 and only apply when the client IP is
+known (trusted proxy).
+
+Failed logins (P1-D M2), all over 15 minutes:
+- 20 per source IP;
+- 5 per username **and** source IP (per username alone when the IP is unknown): a failure flood
+  from one IP never locks the account out for another IP;
+- 100 per username across all IPs. Reaching it never refuses the login: the username degrades to a
+  slow-down (2 s before the verification) with one attempt in flight at a time, other concurrent
+  attempts for that username get `503 busy` + `Retry-After`. The right password from a fresh IP
+  still logs in, while distributed guessing is throttled to about one attempt every 2 s per
+  username. Wrong passwords still answer `401` (the degraded state is not revealed as `429`).
+
+Failed agent authentications (P1-D M1), all over 5 minutes: 10 per (agent, source IP), 50 per
+source IP. Only failures that ran an argon2id verification count; cheap failures (missing or
+malformed headers or secret, unknown or inactive agent, `/rotate` body missing its read deadline)
+count toward a separate limit of 500 per source IP that only gates reaching argon2id. No failure
+limit holds a secret verified less than 25 s ago or a known-good secret (current or pending, see
+"Data at rest"): agents sharing a NAT or proxy IP cannot be blocked by junk requests from it, which
+need no secret.
 
 ## Agent secret rotation
 `POST /api/agent/v1/rotate` follows [ADR-0008](../docs/adr/0008-agent-generated-secret-rotation.md)
