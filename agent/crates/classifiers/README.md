@@ -26,7 +26,23 @@ renamed: a change of meaning is a new id in a new classifier set version.
 
 Tokens never overlap: detectors run from the most to the least specific (AWS key id, password hash,
 e-mail, IBAN, card, NIR, phone), so phone-shaped digit groups inside an IBAN are not phones. All
-regular expressions run on the `regex` crate (linear time). Values are scanned up to 8 KiB.
+regular expressions run on the `regex` crate (linear time).
+
+In a column named `siret` / `siren` (or `num_siret`…), 14-digit card candidates are dropped: SIRETs
+pass Luhn and some start with a Diners Club prefix (`36`, `38`, `39`). Real 14-digit Diners cards in
+such a column are missed; elsewhere, a Luhn-valid SIRET with those prefixes is reported as a card.
+
+### Known limits
+
+- **Scan bounds**: only the first 8 KiB of a value are scanned, and at most 64 tokens are kept per
+  value. A sensitive value past 8 KiB in a long text, or beyond the 64th token, is not seen; the
+  column can still be found through its other rows.
+- **Hint-gated classifiers** (`pii.person_name`, `pii.postal_address`, `pii.birth_date`, AWS secret
+  keys) find nothing in a column whose name gives no hint, and nothing in free text.
+- **Names used as identifiers** (a table named `archive_lucas_martin`) are not recognized by any
+  detector.
+- The recall / precision measured on the dev seed is in-sample: the detectors were written with
+  the seed generator in view.
 
 ### Column-name hints
 
@@ -54,13 +70,14 @@ the hint-gated classifiers.
 
 ```rust
 use databastion_classifiers::column::ColumnClassifier;
-use databastion_classifiers::masking::{HmacKey, RawSample};
+use databastion_classifiers::masking::{HmacKey, PhoneRegion, RawSample};
 
 let key = HmacKey::new(&key_bytes)?;               // agent-local key, >= 32 bytes
 let values: Vec<RawSample<'_>> = rows.iter().map(|v| RawSample::new(v)).collect();
 let findings = ColumnClassifier::new()
     .only(&job_classifiers)                          // optional job filter
     .with_key(&key)                                  // optional fingerprints
+    .phone_region(PhoneRegion::Fr)                   // optional, from agent.yaml
     .classify("customers.email", &values);           // at most 10 000 values examined
 for f in findings {
     // f.classifier(), f.confidence(), f.sampled(), f.matched(),
@@ -68,7 +85,14 @@ for f in findings {
 }
 ```
 
-Deterministic and stateless; raw values are only borrowed for the call. Decision rules
+Deterministic for a given key and stateless; raw values are only borrowed for the call.
+
+**Evidence selection.** Masked samples are never the first rows: that would pick the same rows in
+every column of a table and let the console rebuild partial records. Each column keeps the 5
+distinct masked samples whose values have the smallest
+`HMAC(key, "sample-order" 0x00 column_name 0x00 value)`, which is deterministic for a key but
+independent across columns. Without the agent key, a random key (OS CSPRNG) is drawn for the call.
+Fingerprints are the 50 smallest distinct ones, emitted sorted. Decision rules
 (`ratio = matched / sampled`, empty values skipped):
 
 | Classifiers | Reported when | Confidence |
@@ -82,14 +106,14 @@ Deterministic and stateless; raw values are only borrowed for the call. Decision
 
 Every masked sample is checked against the contract `MaskedSample` rules (ASCII, at least one `*`,
 no run of more than 4 letters or digits, at least 50 % `*` among letters, digits and `*`,
-≤ 128 characters) and falls back to `***` otherwise. At most 4 digits of a value are ever kept.
+≤ 128 characters), plus at most 4 digits in total, and falls back to `***` otherwise.
 
 | Classifier | Masked |
 |------------|--------|
 | `pii.email` | `j***@e***.com` (first character of local part and domain if ASCII alphanumeric; TLD if 2–4 ASCII letters, else `***`) |
 | `pii.iban` | `FR** **** **** **** **** ***0 189` (country code + last 4, check digits hidden) |
 | `pii.card_number` | `**** **** **** 1111` (last 4) |
-| `pii.phone` | `06 ** ** ** 78`, `+1 2** *** **25` (first 2 + last 2 digits, separators kept) |
+| `pii.phone` | `+33 * ** ** ** 78`, `+1 *** *** **25`, `+351 *** *** **8` (country code after `+`, then the last digits up to 4 kept in total); national `** ** ** ** 78` (last 2); separators kept |
 | `pii.nir` | `* ** ** ** *** *** **` |
 | `pii.birth_date` | `****-**-**` |
 | `pii.person_name` | `J*** D***` (ASCII initials, at most 4 words) |
@@ -99,21 +123,26 @@ no run of more than 4 letters or digits, at least 50 % `*` among letters, digits
 
 ## Fingerprints
 
-`hmac-sha256:<64 hex>` = `HMAC-SHA256(agent_local_key, normalized_value)` (RustCrypto `hmac` +
-`sha2`), keyed with the 32-byte `<state_dir>/hmac.key` generated at enrollment and loaded by the
-core. Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separators, uppercase;
-phone `+<digits>` (French `0X…` → `+33X…`, `00` → `+`); birth date ISO; names and addresses
-trimmed, whitespace collapsed, lowercased; keys and hashes trimmed. `HmacKey::fingerprint_exact`
-hashes without normalization (account names for `db_user_fingerprint`).
+`hmac-sha256:<64 hex>` =
+`HMAC-SHA256(agent_local_key, "databastion/fp/v1" 0x00 domain 0x00 normalized_value)` (RustCrypto
+`hmac` + `sha2`), where `domain` is the classifier id, or `db_user` for `db_user_fingerprint`
+(`HmacKey::fingerprint_db_user`, exact bytes). The domain keeps the same string under two classifiers,
+or as an account name, from correlating. The key is the 32-byte `<state_dir>/hmac.key` generated at
+enrollment and loaded by the core; `HmacKey` keys the HMAC state once and clones it per value.
 
-`RawSample`, `RawValue` and `HmacKey` have a redacted `Debug` and no `Display`; `RawValue` and
-`HmacKey` are zeroized on drop.
+Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separators, uppercase; phone
+`+<digits>` when written with `+`, national numbers as their digits (`0X…` → `+33X…` and `00…` →
+`+…` only with `PhoneRegion::Fr`, from the column or the agent configuration); birth date ISO; names
+and addresses NFC-normalized, trimmed, whitespace collapsed, lowercased; keys and hashes trimmed.
+
+`RawSample`, `RawValue` and `HmacKey` have a redacted `Debug` and no `Display`; `RawValue`, `HmacKey`
+(`hmac` `zeroize` feature) and the normalized values are zeroized on drop.
 
 ## Tests
 
 - unit tests: positive / negative cases per detector, validator, hint and masking format;
 - `tests/masking_props.rs` (proptest): contract conformance, no raw value or 5-digit run survives,
-  stability, keyed and deterministic fingerprints, no raw value in `Debug`;
+  stability, keyed, deterministic and domain-separated fingerprints, no raw value in `Debug`;
 - `tests/names_props.rs`: name normalizer (ADR-0009);
 - `tests/ground_truth.rs`: column-level recall / precision against `dev/ground-truth.json`, offline,
   from the committed seed (`dev/seed/out/`). `cargo test -p databastion-classifiers --test
