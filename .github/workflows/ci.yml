@@ -85,7 +85,31 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
+      # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
+      # rotation, metrics, migrations). A `docker run` step rather than a job service, because the
+      # server needs `-c max_connections=200` (parallel test files) and services cannot pass
+      # server arguments. Loopback only, trust auth: CI-only, no data. The tests create their own
+      # databases and non-superuser owner / runtime roles from this admin URL (src/test/db.ts).
+      - name: Start PostgreSQL 17 (DB test suites)
+        env:
+          PG_IMAGE: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+        run: |
+          docker run -d --name databastion-test-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            "$PG_IMAGE" -c max_connections=200 -c fsync=off
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' databastion-test-pg)" = healthy ]; then exit 0; fi
+            sleep 2
+          done
+          docker logs databastion-test-pg
+          exit 1
       - run: pnpm test
+        env:
+          # Admin URL used by src/test/pg-global-setup.ts; src/test/ci-guard.test.ts fails the job
+          # when the DB suites would be skipped (CI=true without a database).
+          TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
       - run: pnpm build
 
   agent:
