@@ -17,6 +17,7 @@ This file is for every coding agent (Claude Code, Codex, Cursor…) and the huma
 | `agent/` | Cargo workspace (core, classifiers, connectors) | `agent-engineer` |
 | `shared/protocol/` | OpenAPI + JSON Schemas + fixtures | `agent-engineer`, `security-reviewer` review **required** |
 | `dev/` | Dev environment, seeded databases, ground truth | `agent-engineer` |
+| `e2e/` | End-to-end harness (containers: console, agent, target) | `agent-engineer`, `security-reviewer` review for TLS / secrets changes |
 | `deploy/` | Compose, Helm later | `console-engineer` |
 | `docs/`, root `*.md` | Documentation, ROADMAP, ADRs | `docs-keeper` |
 
