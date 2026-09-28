@@ -44,7 +44,7 @@ A single binary, `databastion-agent`, with connectors enabled through Cargo *fea
 - Encryption **at rest** of the console's sensitive fields (masked samples, webhook secrets) with a key provided via Docker secret
 
 ## Observability
-- Console: `/metrics` endpoint in Prometheus format (internal network, authenticated), which aggregates the agent metrics received via heartbeat
+- Console: `/metrics` endpoint in Prometheus format (internal network, authenticated), which aggregates the agent metrics received via heartbeat, re-exposed under the prefix `databastion_agent_reported_` (reserved names ignored, see [02-architecture.md](02-architecture.md#key-principles))
 - Agent: **no port exposed by default**. Option `metrics.local_listen: 127.0.0.1:9464`, disabled by default, for local debugging.
 - Logs: structured JSON on stdout (console and agent)
 

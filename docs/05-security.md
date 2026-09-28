@@ -21,7 +21,8 @@ The map remains sensitive information: the console must be protected (HTTPS, aut
 
 ## Masking and fingerprints
 - **Masked sample**: `jane.doe@example.com` → `j*******@e******.com`; IBAN → `FR76 **** **** **** **** ***1 89`
-- **Fingerprint**: `HMAC-SHA256(agent_local_key, normalized_value)`. It allows deduplication and correlation without revealing the value. The key is generated at enrollment and **never leaves the agent**.
+- **Fingerprint**: `hmac-sha256:` + hex of `HMAC-SHA256(agent_local_key, normalized_value)`. It allows deduplication and correlation without revealing the value. The key is generated at enrollment and **never leaves the agent**.
+- **Names** (tables, fields, LDAP containers) can embed values: the agent normalizes them before the uplink and sanitizes each item rather than dropping the batch ([ADR-0009](adr/0009-name-normalization-and-item-sanitization.md)).
 - Masking is implemented in a single crate (`classifiers`/`masking`) and covered by regression tests.
 
 ## Encryption
@@ -30,10 +31,15 @@ The map remains sensitive information: the console must be protected (HTTPS, aut
 - Agent secrets are stored **hashed** (argon2id) on the console side.
 
 ## Agent secret management
-- Single-use, short-lived (24 h) enrollment token, generated in the console
-- At enrollment, the agent receives `agent_id` + a long secret; it stores it in a `0600` file
-- Rotation from the console (the agent retrieves the new secret on its next call)
-- Immediate revocation
+Normative details: [`shared/protocol/openapi.yaml`](../shared/protocol/openapi.yaml) (`/enroll`, `/rotate`, `agentSecret` security scheme); overview in [09-agent-protocol.md](09-agent-protocol.md#secret-rotation).
+
+- **Enrollment token**: single use, valid 24 h, generated in the console. The console stores only its SHA-256 hash and consumes it **atomically** (one conditional update: unused and not expired → used), so two concurrent enrollments with the same token cannot both succeed. `/enroll` is rate limited per source IP.
+- At enrollment, the agent receives `agent_id` + a 256-bit secret; it stores them in a `0600` file, then generates its local HMAC key (never transmitted).
+- **Secret storage**: argon2id hash on the console side. The bodies of `/enroll` and `/rotate` are excluded from every request, APM and error log, on both sides.
+- **Authentication**: failed authentications are rate limited per agent id **and** per source IP **before** the argon2id verification runs, so the hash cost cannot be used for denial of service. A cache of verified secrets, if any, keeps entries less than 30 s and is purged on revocation and on rotation.
+- **Rotation** ([ADR-0008](adr/0008-agent-generated-secret-rotation.md)): the **agent generates** the new secret, persists it as pending before any network call, and registers it with `POST /rotate`, authenticated with the current secret. Retries resend the same secret and are idempotent. The console rejects a new secret equal to the current one or obviously low-entropy (`invalid_secret`). A different new secret while one is pending, or use of the old secret after a **60 s tolerance window** following promotion, is a `rotation_conflict`: the console locks the agent, revokes all its secrets and raises a security incident; the agent stops and must be re-enrolled.
+- **Revocation** invalidates the current and the pending secret and closes the agent's held long-polls. It is effective in **less than 60 s**.
+- **Suspected compromise** of an agent secret is not handled by rotation (whoever holds the secret could rotate it too): the administrator revokes the agent and re-enrolls it.
 - Vault integration: later
 
 ## Recommended database accounts (read-only)
@@ -48,6 +54,8 @@ CREATE USER 'databastion'@'localhost' IDENTIFIED BY '...';
 GRANT SELECT, PROCESS, SHOW VIEW ON *.* TO 'databastion'@'localhost';
 GRANT SELECT ON performance_schema.* TO 'databastion'@'localhost';
 ```
+**MySQL / MariaDB system schemas**: `SELECT ON *.*` also grants read access to `mysql.user` (password hashes) and the other system tables. Discovery must exclude the system schemas `mysql`, `information_schema`, `performance_schema` and `sys` from sampling (`performance_schema` is read for Audit only). Where practical, grant `SELECT` on the application databases only instead of `*.*`.
+
 MongoDB: `read` roles on the targeted databases + `clusterMonitor`. OpenLDAP: a service DN with read rights on the tree and on `cn=accesslog`.
 
 ## Deployment recommendations
