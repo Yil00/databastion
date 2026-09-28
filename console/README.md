@@ -210,7 +210,9 @@ Failed logins (P1-D M2), all over 15 minutes:
 - 5 per username **and** source IP: a failure flood from one IP never locks the account out for
   another IP (`429` from that IP only);
 - when the client IP is unknown (no trusted proxy), that counter is per username alone, shared by
-  everyone: reaching it never answers `429`, the username degrades like below (N2);
+  everyone: reaching it never answers `429`, the username degrades like below (N2), with a
+  slow-down that grows with the username's failed degraded attempts: 2 s, doubling per failure
+  (4, 8, 16 s), capped at 30 s (15-minute window; a success refunds its own attempt only);
 - 100 per username across all IPs. Reaching it never refuses the login: the username degrades to a
   slow-down (2 s before the verification) with one attempt in flight at a time, other concurrent
   attempts for that username get `503 busy` + `Retry-After`. Wrong passwords still answer `401`
@@ -223,7 +225,8 @@ user id, the issue time and a random nonce, signed with HMAC-SHA256 under the se
 `login-device.v1`; nothing is stored server side. A login presenting a valid device cookie for the
 username it tries skips the global per-username cap and its degraded single slot, so an attacker
 spread over many IPs cannot keep the real user out by holding that slot. It never replaces the
-password, and stays subject to the per-(username, IP) limit, a limit of 5 failures per cookie
+password (nor the growing slow-down of an unknown IP), its failures still count toward the global
+per-username cap, and it stays subject to the per-(username, IP) limit, a limit of 5 failures per cookie
 (beyond, the cookie gives no bypass: a stolen cookie cannot be used to guess) and the login
 argon2id pool. A cookie for another user, tampered, expired or signed with another key is ignored.
 Without the server key, no device cookie is issued or accepted.
