@@ -9,15 +9,23 @@
 //! # Decision rules
 //!
 //! `sampled` counts the non-empty values examined (at most
-//! [`MAX_SAMPLE_VALUES`]), `matched` the values in which the classifier
-//! found a token (or that it recognized as a whole), and
-//! `ratio = matched / sampled`.
+//! [`MAX_SAMPLE_VALUES`]); `n` the informative ones among them (placeholders
+//! such as `N/A`, `null`, `-`, `unknown`, `0000-00-00` excluded), `matched`
+//! the values in which the classifier found a token (or that it recognized
+//! as a whole), and `ratio = matched / n`. Values are detected first; the
+//! column name only lowers thresholds (a *hint*, [`crate::hints`]).
 //!
 //! | Classifier | Reported when | Confidence |
 //! |---|---|---|
-//! | e-mail, IBAN, card, NIR, AWS access key id, password hash (validated tokens) | `matched ≥ 1` | `0.6 + 0.35·ratio (+0.05 name hint)` |
-//! | phone (no checksum) | `ratio ≥ 0.2`, or `matched ≥ 1` with a name hint | `0.4 + 0.4·ratio (+0.2 hint)` |
-//! | birth date, person name, postal address, AWS secret key (whole value) | name hint **and** `ratio ≥ 0.8` (address: `0.6`) | `0.3 + 0.5·ratio` |
+//! | IBAN, card, NIR (checksums) | `matched ≥ 1` and at least half of the checksum-shaped candidates are valid; card: not under an order / tracking / IMEI / SIRET name | `0.6 + 0.35·ratio (+0.05 hint)` |
+//! | AWS key id, secret key in context, password hash | `matched ≥ 1` | idem |
+//! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
+//! | phone | hint and `matched ≥ 1`, or `ratio ≥ 0.1`, or `matched ≥ 10` | `0.4 + 0.4·ratio (+0.2 hint)` |
+//! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
+//! | person name | hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 50 % with a known given name, surname or surname ending (60 % when the values are single words), 30 % with a listed one, 3 distinct | idem |
+//! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
+//! | AWS secret key (whole value) | secret-key hint and `≥ 0.5`; no hint: `≥ 0.8` and 3 values, and under a token / session / digest name 30 % with `/` or `+` | `0.6 + 0.35·ratio` |
+//! | password hash (raw hex / base64 digest) | password hint and `≥ 0.5` | idem |
 //!
 //! Confidences are rounded to 3 decimals and capped at 1.
 //!
@@ -52,12 +60,100 @@ pub const MAX_MASKED_SAMPLES: usize = 5;
 /// Most fingerprints per finding (contract `fingerprints.maxItems`).
 pub const MAX_FINGERPRINTS: usize = 50;
 
-/// A whole-value detector: classifier, gate from the name hints, recognizer.
-type WholeValue = (ClassifierId, bool, fn(&str) -> bool);
+/// Phone: share of values without a name hint.
+const PHONE_MIN_RATIO: f64 = 0.1;
+/// Phone: values without a name hint, whatever the share.
+const PHONE_MIN_MATCHED: u32 = 10;
+/// E-mail and labelled dates in text: share of values without a hint.
+const EMBEDDED_MIN_RATIO: f64 = 0.05;
+/// Tokens found in text: values whatever the share.
+const EMBEDDED_MIN_MATCHED: u32 = 3;
+/// Reference year of the age distribution of birth dates (classifier set
+/// `2026.09.1`; revised with [`crate::id::CLASSIFIERS_VERSION`]).
+const REFERENCE_YEAR: u32 = 2026;
 
-const PHONE_MIN_RATIO: f64 = 0.2;
-const WHOLE_VALUE_MIN_RATIO: f64 = 0.8;
-const ADDRESS_MIN_RATIO: f64 = 0.6;
+/// Values that stand for "no value" in sparse columns.
+const PLACEHOLDERS: &[&str] = &[
+    "n/a",
+    "na",
+    "n.a.",
+    "n.a",
+    "none",
+    "null",
+    "nil",
+    "-",
+    "--",
+    "---",
+    "?",
+    "??",
+    "unknown",
+    "inconnu",
+    "inconnue",
+    "non renseigné",
+    "non renseigne",
+    "nr",
+    "tbd",
+    "todo",
+    "0000-00-00",
+    "0000-00-00 00:00:00",
+    "undefined",
+    "(null)",
+    "<null>",
+    "empty",
+    "vide",
+    "x",
+    "xx",
+    "xxx",
+    "s/o",
+    "sans objet",
+    "not available",
+    "not applicable",
+    "redacted",
+    "[redacted]",
+    "***",
+    "0",
+];
+
+fn placeholder(value: &str) -> bool {
+    let v = value.trim();
+    v.len() <= 20 && PLACEHOLDERS.iter().any(|p| v.eq_ignore_ascii_case(p))
+}
+
+/// Per-column evidence beyond the matched counts.
+#[derive(Default)]
+struct Stats<'v> {
+    /// Informative values (non-empty, not a placeholder).
+    n: u32,
+    card_cand: u32,
+    iban_cand: u32,
+    nir_cand: u32,
+    /// Up to 2 distinct e-mail tokens (borrowed for the call).
+    emails: Vec<&'v str>,
+    /// Values with an AWS key id or a secret key in context.
+    aws_tokens: u32,
+    aws_whole: u32,
+    aws_slash: u32,
+    hash_tokens: u32,
+    raw_digests: u32,
+    /// Values with a labelled date of birth in text.
+    birth_labelled: u32,
+    /// Whole-value dates: year, time of day, day of month.
+    dates: Vec<(u32, detect::TimeOfDay, u32)>,
+    names_known: u32,
+    names_listed: u32,
+    /// Name-shaped values of a single word.
+    names_single: u32,
+    /// Up to 3 distinct name values (borrowed for the call).
+    names: Vec<&'v str>,
+    addr_strong: u32,
+    addr_weak: u32,
+}
+
+fn remember<'v>(set: &mut Vec<&'v str>, v: &'v str, max: usize) {
+    if set.len() < max && !set.contains(&v) {
+        set.push(v);
+    }
+}
 
 /// Result for one classifier on one column. No raw value.
 #[derive(Debug, Clone, PartialEq)]
@@ -190,28 +286,8 @@ impl ColumnClassifier<'_> {
         };
         let mut acc: Vec<Acc> = ClassifierId::ALL.iter().map(|_| Acc::default()).collect();
         let mut sampled: u32 = 0;
-        let whole_value: [WholeValue; 4] = [
-            (
-                ClassifierId::BirthDate,
-                hints.gates(ClassifierId::BirthDate),
-                detect::is_birth_date,
-            ),
-            (
-                ClassifierId::PersonName,
-                hints.gates(ClassifierId::PersonName),
-                detect::is_person_name,
-            ),
-            (
-                ClassifierId::PostalAddress,
-                hints.gates(ClassifierId::PostalAddress),
-                detect::is_postal_address,
-            ),
-            (
-                ClassifierId::AwsKey,
-                hints.aws_secret(),
-                detect::is_aws_secret_key,
-            ),
-        ];
+        let mut st = Stats::default();
+        let on = |c| self.enabled(c);
 
         for raw in values.iter().take(MAX_SAMPLE_VALUES) {
             let value = detect::bounded(raw.expose());
@@ -219,65 +295,104 @@ impl ColumnClassifier<'_> {
                 continue;
             }
             sampled += 1;
-            let tokens = detect::scan_tokens(value, &|c| self.enabled(c));
+            if placeholder(value) {
+                continue;
+            }
+            st.n += 1;
+            let (tokens, cand) = detect::scan(value, &on);
+            st.card_cand += u32::from(cand.card);
+            st.iban_cand += u32::from(cand.iban);
+            st.nir_cand += u32::from(cand.nir);
             let mut hit = [false; ClassifierId::ALL.len()];
+            let (mut aws, mut hash, mut labelled) = (false, false, false);
             for t in &tokens {
                 let token = &value[t.range.clone()];
-                if t.classifier == ClassifierId::CardNumber
-                    && hints.siret()
-                    && token.chars().filter(char::is_ascii_digit).count() == 14
-                {
-                    continue;
+                match t.classifier {
+                    ClassifierId::CardNumber
+                        if hints.siret()
+                            && token.chars().filter(char::is_ascii_digit).count() == 14 =>
+                    {
+                        continue;
+                    }
+                    ClassifierId::Email => remember(&mut st.emails, token, 2),
+                    ClassifierId::AwsKey => aws = true,
+                    ClassifierId::PasswordHash => hash = true,
+                    ClassifierId::BirthDate => labelled = true,
+                    _ => {}
                 }
                 self.record(&ctx, &mut acc, &mut hit, t.classifier, token);
             }
-            if tokens.is_empty() {
-                for (c, gated, recognize) in whole_value {
-                    if gated && self.enabled(c) && recognize(value) {
-                        self.record(&ctx, &mut acc, &mut hit, c, value);
+            st.aws_tokens += u32::from(aws);
+            st.hash_tokens += u32::from(hash);
+            st.birth_labelled += u32::from(labelled);
+
+            // Whole-value analyzers. An address may hold a token (a phone
+            // number); the others are whole values only.
+            if on(ClassifierId::PostalAddress) {
+                match detect::address_kind(value) {
+                    detect::AddressKind::Strong => {
+                        st.addr_strong += 1;
+                        self.record(&ctx, &mut acc, &mut hit, ClassifierId::PostalAddress, value);
                     }
+                    detect::AddressKind::Weak if tokens.is_empty() => {
+                        st.addr_weak += 1;
+                        self.record(&ctx, &mut acc, &mut hit, ClassifierId::PostalAddress, value);
+                    }
+                    _ => {}
                 }
             }
+            if !tokens.is_empty() {
+                continue;
+            }
+            if on(ClassifierId::BirthDate)
+                && let Some(d) = detect::parse_date(value)
+            {
+                st.dates.push((d.year, d.time, d.day));
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::BirthDate, value);
+            }
+            if on(ClassifierId::PersonName)
+                && let Some(e) = detect::name_evidence(value)
+            {
+                st.names_known += u32::from(e.known());
+                st.names_listed += u32::from(e.given || e.surname);
+                st.names_single += u32::from(e.words == 1);
+                remember(&mut st.names, value.trim(), 3);
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::PersonName, value);
+            }
+            if on(ClassifierId::AwsKey) && detect::is_aws_secret_key(value) {
+                st.aws_whole += 1;
+                st.aws_slash += u32::from(value.contains(['/', '+']));
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::AwsKey, value);
+            }
+            if on(ClassifierId::Phone)
+                && hints.gates(ClassifierId::Phone)
+                && let Some(r) = detect::phone_loose(value)
+            {
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::Phone, &value[r]);
+            }
+            if on(ClassifierId::PasswordHash) && hints.password() && detect::is_raw_digest(value) {
+                st.raw_digests += 1;
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::PasswordHash, value);
+            }
         }
-        if sampled == 0 {
+        if sampled == 0 || st.n == 0 {
             return Vec::new();
         }
 
         let mut out = Vec::new();
         for (i, c) in ClassifierId::ALL.into_iter().enumerate() {
             let a = &mut acc[i];
-            if a.matched == 0 {
+            if a.matched == 0 || !decide(c, a.matched, &st, &hints) {
                 continue;
             }
-            let ratio = f64::from(a.matched) / f64::from(sampled);
-            let hint = if hints.hints(c) { 1.0 } else { 0.0 };
+            let ratio = (f64::from(a.matched) / f64::from(st.n)).min(1.0);
+            let h = if hints.hints(c) { 1.0 } else { 0.0 };
             let confidence = match c {
-                ClassifierId::Phone => {
-                    if ratio < PHONE_MIN_RATIO && hint == 0.0 {
-                        continue;
-                    }
-                    0.4 + 0.4 * ratio + 0.2 * hint
-                }
-                ClassifierId::BirthDate | ClassifierId::PersonName => {
-                    if ratio < WHOLE_VALUE_MIN_RATIO {
-                        continue;
-                    }
-                    0.3 + 0.5 * ratio
-                }
-                ClassifierId::PostalAddress => {
-                    if ratio < ADDRESS_MIN_RATIO {
-                        continue;
-                    }
-                    0.3 + 0.5 * ratio
-                }
-                ClassifierId::AwsKey if hints.aws_secret() => {
-                    // Secret access keys (whole value) or key ids.
-                    if ratio < WHOLE_VALUE_MIN_RATIO {
-                        continue;
-                    }
-                    0.6 + 0.35 * ratio + 0.05 * hint
-                }
-                _ => 0.6 + 0.35 * ratio + 0.05 * hint,
+                ClassifierId::Phone => 0.4 + 0.4 * ratio + 0.2 * h,
+                ClassifierId::BirthDate
+                | ClassifierId::PersonName
+                | ClassifierId::PostalAddress => 0.3 + 0.5 * ratio + 0.15 * h,
+                _ => 0.6 + 0.35 * ratio + 0.05 * h,
             };
             out.push(ColumnFinding {
                 classifier: c,
@@ -325,6 +440,107 @@ impl ColumnClassifier<'_> {
             }
         }
     }
+}
+
+/// Whether classifier `c`, matched in `matched` values, is reported for the
+/// column (module table).
+fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> bool {
+    let hint = hints.hints(c);
+    let share = |k: u32| f64::from(k) / f64::from(st.n);
+    let ratio = share(matched);
+    // At least half of the checksum-shaped candidates pass the checksum.
+    let consistent = |cand: u32| matched * 2 >= cand;
+    match c {
+        ClassifierId::Iban => consistent(st.iban_cand),
+        ClassifierId::Nir => consistent(st.nir_cand),
+        ClassifierId::CardNumber => !hints.not_card() && consistent(st.card_cand),
+        ClassifierId::Email => {
+            let constant = st.emails.len() == 1 && matched >= EMBEDDED_MIN_MATCHED;
+            !constant && (hint || ratio >= EMBEDDED_MIN_RATIO || matched >= EMBEDDED_MIN_MATCHED)
+        }
+        ClassifierId::Phone => {
+            (hint && hints.gates(c)) || ratio >= PHONE_MIN_RATIO || matched >= PHONE_MIN_MATCHED
+        }
+        ClassifierId::AwsKey => {
+            let whole = share(st.aws_whole);
+            st.aws_tokens >= 1
+                || (hints.aws_secret() && whole >= 0.5)
+                || (whole >= 0.8
+                    && st.aws_whole >= 3
+                    && (!hints.other_token() || st.aws_slash * 10 >= st.aws_whole * 3))
+        }
+        ClassifierId::PasswordHash => st.hash_tokens >= 1 || share(st.raw_digests) >= 0.5,
+        ClassifierId::BirthDate => birth_dates(st, hints.gates(c)),
+        ClassifierId::PersonName => {
+            if hints.gates(c) && !hints.person_name_weak() {
+                ratio >= 0.6
+            } else if hints.gates(c) {
+                ratio >= 0.7 && share(st.names_known) >= 0.25
+            } else {
+                // Single words (`Austin`, `Madison`) are also places and
+                // brands: they need more known names.
+                let single = st.names_single * 5 >= matched * 4;
+                ratio >= 0.7
+                    && share(st.names_known) >= if single { 0.6 } else { 0.5 }
+                    && share(st.names_listed) >= 0.3
+                    && st.names.len() >= 3
+            }
+        }
+        ClassifierId::PostalAddress => {
+            let strong = share(st.addr_strong);
+            let any = share(st.addr_strong + st.addr_weak);
+            if hints.gates(c) {
+                any >= 0.5
+            } else {
+                strong >= 0.5
+                    || (any >= 0.8 && strong >= 0.25)
+                    || (st.addr_strong >= EMBEDDED_MIN_MATCHED && strong >= 0.1)
+            }
+        }
+    }
+}
+
+/// Birth-date decision: labelled dates in text, or a column of dates with
+/// a hint, or without one a column whose dates are distributed like ages
+/// (not event timestamps, not recent dates, spread over a lifetime).
+fn birth_dates(st: &Stats<'_>, hint: bool) -> bool {
+    let n = f64::from(st.n);
+    if st.birth_labelled >= 1
+        && (f64::from(st.birth_labelled) / n >= EMBEDDED_MIN_RATIO
+            || st.birth_labelled >= EMBEDDED_MIN_MATCHED)
+    {
+        return true;
+    }
+    let d = st.dates.len();
+    let plausible = st
+        .dates
+        .iter()
+        .filter(|(_, t, _)| *t != detect::TimeOfDay::Other)
+        .count();
+    #[allow(clippy::cast_precision_loss)] // at most MAX_SAMPLE_VALUES
+    let dates = d as f64;
+    if hint {
+        return (dates + f64::from(st.birth_labelled)) / n >= 0.5;
+    }
+    if d < 3 || dates / n < 0.7 {
+        return false;
+    }
+    let timed = d - plausible;
+    let mut years: Vec<u32> = st.dates.iter().map(|(y, _, _)| *y).collect();
+    years.sort_unstable();
+    let median = years[d / 2];
+    let p10 = years[d / 10];
+    let p90 = years[(d * 9 / 10).min(d - 1)];
+    let recent = years.iter().filter(|y| **y >= 2015).count();
+    let first_of_month = st.dates.iter().all(|(_, _, day)| *day == 1);
+    let ages = years[d - 1] <= REFERENCE_YEAR
+        && median <= 2002
+        && p90 - p10 >= 10
+        && recent * 100 <= d * 15
+        && !first_of_month;
+    // Timestamps with a time of day are usually events; birth dates with
+    // a time part need a clearly adult distribution.
+    ages && (timed * 5 <= d || (median <= 1995 && recent * 100 <= d * 5))
 }
 
 /// Per-call context of [`ColumnClassifier::classify`].
@@ -439,6 +655,76 @@ mod tests {
         assert!(run("badge_id", &["01234567"]).is_empty());
         assert!(run("x", &[]).is_empty());
         assert!(run("x", &["", "  "]).is_empty());
+    }
+
+    #[test]
+    fn values_decide_without_a_hint() {
+        let names = [
+            "Jean Dupont",
+            "Marie Curie",
+            "Paul Martin",
+            "Lucie Bernard",
+            "Hugo Petit",
+        ];
+        assert_eq!(run("col_17", &names), [(C::PersonName, 5, 5)]);
+        let dates = [
+            "1950-12-01",
+            "17/05/1980",
+            "1962-07-30",
+            "2001-03-09",
+            "1975-11-02",
+        ];
+        assert_eq!(run("f3", &dates), [(C::BirthDate, 5, 5)]);
+        let addresses = [
+            "10 rue des Lilas, 75011 Paris",
+            "221B Baker Street, London NW1 6XE",
+            "Musterstraße 12, 10115 Berlin",
+        ];
+        assert_eq!(run("attr_x", &addresses), [(C::PostalAddress, 3, 3)]);
+        // Event timestamps, cities and products are not.
+        let events = [
+            "2024-05-03 10:22:31",
+            "2025-01-17 08:01:02",
+            "2023-11-30 23:59:10",
+            "2024-02-29 12:00:01",
+        ];
+        assert!(run("f4", &events).is_empty());
+        assert!(run("f5", &["Paris", "Lyon", "Marseille", "Toulouse", "Nice"]).is_empty());
+        assert!(
+            run(
+                "f6",
+                &["Blue Widget", "Red Chair", "Oak Table", "Desk Lamp"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn checksum_consistency_and_constants() {
+        // Luhn-valid identifiers with random prefixes: a few look like
+        // cards, most do not.
+        let ids: Vec<String> = (0..40)
+            .map(|i| {
+                let partial = format!("{}{:014}", 1 + i % 9, i * 7_919_993);
+                (0..10)
+                    .map(|d| format!("{partial}{d}"))
+                    .find(|n| crate::validate::luhn_valid(n))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert!(run("col_1", &refs).is_empty());
+        // A single system address repeated is not a personal e-mail column.
+        assert!(run("sender", &["support@example.com"; 5]).is_empty());
+        assert!(run("sender", &["noreply@example.com"; 5]).is_empty());
+        // Placeholders do not dilute a sparse column.
+        assert_eq!(
+            run(
+                "c",
+                &["N/A", "jane@example.com", "null", "-", "john@example.org"]
+            ),
+            [(C::Email, 2, 5)]
+        );
     }
 
     #[test]

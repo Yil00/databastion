@@ -321,7 +321,7 @@ fn country_code_len(digits: &str) -> usize {
     }
 }
 
-/// Keeps the layout (`+`, spaces, dots, hyphens), the country code after
+/// Keeps the layout (`+`, spaces, dots, hyphens, slashes, parentheses), the country code after
 /// `+` and the last digits, at most [`MAX_KEPT_RUN`] digits in total
 /// (`+1 *** *** **25`, `+33 * ** ** ** 78`, `+351 *** *** **5`); a national
 /// number keeps its last 2 digits only (`** ** ** ** 78`).
@@ -347,7 +347,7 @@ fn mask_phone(raw: &str) -> String {
                 } else {
                     '*'
                 })
-            } else if matches!(c, '+' | ' ' | '.' | '-') {
+            } else if matches!(c, '+' | ' ' | '.' | '-' | '/' | '(' | ')') {
                 Some(c)
             } else {
                 None
@@ -398,7 +398,10 @@ pub(crate) fn normalize(
             crate::validate::email_valid(&lower).then_some(lower)
         }
         ClassifierId::Iban => {
-            let compact = z(v.chars().filter(|c| !c.is_whitespace()).collect());
+            let compact = z(v
+                .chars()
+                .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '.'))
+                .collect());
             let upper = z(compact.to_ascii_uppercase());
             crate::validate::iban_valid(&upper).then_some(upper)
         }
@@ -411,7 +414,12 @@ pub(crate) fn normalize(
                 .then_some(d)
         }
         ClassifierId::Nir => {
-            let compact = z(detect::compact(v));
+            let compact = z(v.chars().filter(char::is_ascii_alphanumeric).collect());
+            if v.chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || " .-/".contains(c)))
+            {
+                return None;
+            }
             let upper = z(compact.to_ascii_uppercase());
             crate::validate::nir_valid(&upper).then_some(upper)
         }
@@ -436,10 +444,16 @@ fn normalize_phone(v: &str, region: PhoneRegion) -> Option<Zeroizing<String>> {
     let body = v.strip_prefix('+').unwrap_or(v);
     if !body
         .chars()
-        .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '.' | '-'))
+        .all(|c| c.is_ascii_digit() || matches!(c, ' ' | '.' | '-' | '/' | '(' | ')'))
     {
         return None;
     }
+    // An international number's trunk `(0)` is not dialled: `+44 (0)20 …`.
+    let body = if plus {
+        Zeroizing::new(body.replace("(0)", ""))
+    } else {
+        Zeroizing::new(body.to_owned())
+    };
     let digits = Zeroizing::new(
         body.chars()
             .filter(char::is_ascii_digit)
@@ -459,16 +473,11 @@ fn normalize_phone(v: &str, region: PhoneRegion) -> Option<Zeroizing<String>> {
     Some(Zeroizing::new(out))
 }
 
+/// ISO `YYYY-MM-DD` of any date format the detectors accept (an ambiguous
+/// `01/02/1980` is read day first, like the detector).
 fn normalize_date(v: &str) -> Option<String> {
-    if !detect::is_birth_date(v) {
-        return None;
-    }
-    if v.as_bytes().get(2) == Some(&b'/') {
-        // DD/MM/YYYY (ASCII, checked by `is_birth_date`).
-        Some(format!("{}-{}-{}", &v[6..10], &v[3..5], &v[..2]))
-    } else {
-        Some(v[..10].to_owned())
-    }
+    let d = detect::parse_date(v)?;
+    Some(format!("{:04}-{:02}-{:02}", d.year, d.month, d.day))
 }
 
 /// Domain-separation prefix of fingerprints (contract `Fingerprint`).

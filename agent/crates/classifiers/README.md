@@ -11,61 +11,80 @@ Classifier set version `2026.09.1` (`id::CLASSIFIERS_VERSION`). The ids match th
 `ClassifierId` pattern (`^[a-z]+(\.[a-z0-9_]+)+$`) and `dev/ground-truth.json`. An id is never
 renamed: a change of meaning is a new id in a new classifier set version.
 
-| Id | Detection | Needs a column-name hint |
-|----|-----------|--------------------------|
-| `pii.birth_date` | whole value: ISO `YYYY-MM-DD` (optionally at midnight) or `DD/MM/YYYY`, real calendar date, 1900–2030 | yes |
-| `pii.card_number` | token: 13–19 digits with optional space / hyphen separators, Luhn, known issuer prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro) | no |
-| `pii.email` | token: e-mail syntax (Unicode local part, alphabetic TLD of 2+ characters) | no |
-| `pii.iban` | token: `CCkk` + exactly the country's IBAN length, single spaces allowed, ISO 7064 mod 97 | no |
-| `pii.nir` | token: French NIR, 15 characters with optional separators, sex `1`/`2`, plausible month, Corsica `2A`/`2B`, key `97 - n mod 97` | no |
-| `pii.person_name` | whole value: 1–4 capitalized or all-caps words, letters with internal `-` / `'`, lowercase particles | yes |
-| `pii.phone` | token: French national `0X XX XX XX XX` (space, dot or hyphen) or international `+…` with 8–15 digits | no, but raises the threshold without one |
-| `pii.postal_address` | whole value: house number then a word, or a street-type word (FR, EN, DE, NL, ES, IT) | yes |
-| `secret.aws_key` | token: access key id `AKIA` / `ASIA` + 16 characters; with a secret-key hint, a whole 40-character `[A-Za-z0-9/+]` value mixing cases and digits | secret access key only |
-| `secret.password_hash` | whole value: bcrypt, argon2 (PHC), scrypt (PHC, `$7$`), pbkdf2 (PHC / passlib, Django), `crypt(3)` `$5$` / `$6$`, LDAP `{SSHA}`-style schemes | no |
+| Id | Detection | Column name |
+|----|-----------|-------------|
+| `pii.birth_date` | whole value: real calendar date 1900–2030 in ISO (`-`, `/`, `.`), `DD/MM/YYYY`, `MM/DD/YYYY` (day first unless impossible), `DD.MM.YYYY`, `DD-MM-YYYY`, `YYYYMMDD`, textual months EN / FR / DE / ES / IT / NL / PT (`17 mai 1980`, `May 17, 1980`, `17-May-1980`, weekday allowed), optional time and zone; token: a date after a label in text (`born`, `DOB`, `né(e) le`, `date de naissance`, `geboren`…) | optional: without a hint the column needs an age distribution (below) |
+| `pii.card_number` | token: 13–19 digits with optional space / hyphen separators, Luhn, known issuer prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro) | an order / tracking / IMEI / barcode name turns it off |
+| `pii.email` | token: e-mail syntax (Unicode local part, alphabetic TLD of 2+ characters), **personal mailboxes only**: not the user part of a URI (`https://user@host`, `ssh://git@host`), not an scp-like remote (`git@host:org/repo`), not glued to other text, not a message id or machine-generated local part (UUID, hex, many digits), not a system or placeholder mailbox (`noreply`, `mailer-daemon`, `postmaster`, `root`, `user`, `test`…), not a local / file "domain" (`host.local`, `icon@2x.png`); `name@1.2.3` package specs fail the TLD rule | no |
+| `pii.iban` | token: `CCkk` (any case) + exactly the country's IBAN length, single space / hyphen / dot separators, ISO 7064 mod 97 | no |
+| `pii.nir` | token: French NIR, 15 characters with optional separators anywhere (space, dot, hyphen; key separated by space, `-` or `/`), sex `1`/`2`, plausible month, Corsica `2A`/`2B` (any case), key `97 - n mod 97` | no |
+| `pii.person_name` | whole value: 1–5 name words, capitalized, upper or (known names only) lower case, compound (`Jean-Pierre`, `García-López`), elided particles (`O'Connor`, `d'Angelo`), `McDonald`, lowercase particles (`de la`, `van der`), initials, leading titles (`Mr`, `Mme`, `Dr`), suffixes (`Jr.`), `LAST, First`; no digit, no word of an organization, place, product, role or status; evidence from a lexicon of given names and surnames (multi-cultural) and surname endings | optional: without a hint the lexicon must recognize the column |
+| `pii.phone` | token: international `+` / `00` with 8–15 digits (area code in parentheses, trunk `(0)` ignored), North American `(202) 555-0125` / `202-555-0125`, national with a trunk `0` (FR, UK, DE, IT, NL, BE, CH: 9–12 digits with separators, 10–11 compact), Italian mobiles `3xx xxx xxxx`, Spanish mobiles `6xx xx xx xx`; not glued to a longer number, a time or a word; not date-shaped. With a phone hint, also any whole value of 7–15 digits with the usual separators and an optional extension (`x12`, `ext. 12`, `poste 12`) | lowers the threshold |
+| `pii.postal_address` | whole value: a house number before a FR / EN street type (`10 rue …`, `10, rue …`, `221B Baker Street`, `123 main st`), a number-last street type or compound street name then a number (`Via Roma 10`, `Calle Mayor 5`, `C/ Mayor 5`, `ul. Długa 5`, `Musterstraße 12`, `Kerkstraat 12`, `Storgatan 12`), a post office box (`PO Box`, `BP`, `Postfach`, `Apartado`, `Postbus`…), or a street type with a postcode (FR / DE / ES / IT / US 5 digits, ZIP+4, UK, NL, CA, PT, PL, SE, 4-digit with a city); abbreviations (`av.`, `bd`, `St`, `Rd`, `Blvd`); comma, line or LDAP `$` separated. *Weak* evidence: a street type alone, or a house number then a word | optional: without a hint strong addresses are needed |
+| `secret.aws_key` | token: access key id `AKIA` / `ASIA` / `ABIA` / `ACCA` / `A3T…` + 16 characters (not glued to other letters or digits); a 40-character secret after its key id or after its name in text (`aws_secret_access_key = …`, `"SecretAccessKey": "…"`); whole value: 40 characters `[A-Za-z0-9/+]` mixing cases and digits | optional (secret-key names lower the threshold; token / session / digest names raise it) |
+| `secret.password_hash` | token: bcrypt (`$2a/b/x/y$`, Django `bcrypt_sha256$`), argon2 (PHC, Django), scrypt (PHC, `$7$`, Werkzeug), yescrypt `$y$`, sha-crypt `$5$` / `$6$`, md5-crypt `$1$`, `$apr1$`, NetBSD `$sha1$`, phpass `$P$` / `$H$`, Drupal `$S$`, pbkdf2 (PHC / passlib, Django, Werkzeug), Django legacy salted digests, PostgreSQL SCRAM and `md5…`, MySQL `*…` and `$A$`, LDAP `{SSHA}`-style schemes, Atlassian `{PKCS5S2}`; whole value: a raw hex / base64 digest (MD5, SHA-1, SHA-2) only under a password name (`password`, `pwd`, `mdp`, `pw_hash`… or a bare `hash`) | raw digests only |
 
 Tokens never overlap: detectors run from the most to the least specific (AWS key id, password hash,
-e-mail, IBAN, card, NIR, phone), so phone-shaped digit groups inside an IBAN are not phones. All
-regular expressions run on the `regex` crate (linear time).
+AWS secret key in context, e-mail, IBAN, card, NIR, labelled date of birth, phone), so phone-shaped
+digit groups inside an IBAN are not phones. All regular expressions run on the `regex` crate (linear
+time). A pattern that does not compile stops the agent with the pattern name
+(`detect::check_patterns` forces them all; call it at startup) instead of silently disabling a
+detector; the crate declares the `regex` features its patterns need (`unicode-case` for `(?i)`), and
+`tests/regex_features.rs` checks the production feature set without dev-dependency feature
+unification.
 
 In a column named `siret` / `siren` (or `num_siret`…), 14-digit card candidates are dropped: SIRETs
 pass Luhn and some start with a Diners Club prefix (`36`, `38`, `39`). Real 14-digit Diners cards in
-such a column are missed; elsewhere, a Luhn-valid SIRET with those prefixes is reported as a card.
+such a column are missed. Elsewhere, a column of SIRETs is not reported as cards by the checksum
+consistency rule below (most SIRETs are Luhn-valid but not issuer-shaped).
 
 ### Known limits
 
 - **Scan bounds**: only the first 8 KiB of a value are scanned, and at most 64 tokens are kept per
   value. A sensitive value past 8 KiB in a long text, or beyond the 64th token, is not seen; the
   column can still be found through its other rows.
-- **Hint-gated classifiers** (`pii.person_name`, `pii.postal_address`, `pii.birth_date`, AWS secret
-  keys) find nothing in a column whose name gives no hint, and nothing in free text.
+- **Whole-value classifiers** (`pii.person_name`, `pii.postal_address`, `pii.birth_date`, AWS secret
+  keys) decide on the share of matching values; in free text they only see labelled birth dates,
+  AWS secrets next to their name or key id, and strong addresses (a column where at least 3 values
+  and 10 % hold one).
+- **Person names without a hint** rely on the lexicon: a column of rare given names or surnames
+  only (not in the lists, no known surname ending) is missed; brands and places named after people
+  (`Hugo Boss`, `Austin`) can be reported. Names in free text are not detected.
+- **Birth dates without a hint** rely on the age distribution: dates of birth of children (median
+  after 2002) are missed; other old dates spread over decades (publication dates) can be reported.
+  `01/02/1980` is read day first (fingerprints included).
+- **Phones**: compact national numbers without a trunk `0` (`2025550125`, `612345678`) and national
+  formats not listed above are only found under a phone name.
 - **Person names in identifiers**: the name normalizer masks words from a small list of common
   first names (`archive_lucas_martin` -> `*`, `ou=Oliver Martin` -> `ou=*`), but a surname alone
   (`archive_martin`) or a first name missing from the list is not recognized.
-- The recall / precision measured on the dev seed is in-sample: the detectors were written with
-  the seed generator in view.
+- The recall / precision measured on the dev seed and on `tests/synthetic_eval.rs` is in-sample:
+  the detectors were written with them in view.
 
 ### Column-name hints
 
 Names are split into lowercase tokens on separators and camelCase (`accessKeyId` → `access`, `key`,
 `id`), plus the joined form (`num_secu` → `numsecu`). Every segment of a field path counts.
 
-| Classifier | Tokens (FR + EN) |
-|------------|------------------|
-| `pii.email` | `email`, `mail`, `courriel`, `emailaddress`, `adressemail` |
-| `pii.phone` | `phone`, `tel`, `telephone`, `mobile`, `portable`, `gsm`, `fax`, `cell`, `msisdn`, `telephonenumber` |
+| Classifier | Tokens (FR + EN + others) |
+|------------|--------------------------|
+| `pii.email` | `email`, `mail`, `courriel`, `emailaddress`, `adressemail`, `correo`, `epost` |
+| `pii.phone` | `phone`, `tel`, `telephone`, `mobile`, `portable`, `gsm`, `fax`, `cell`, `msisdn`, `telephonenumber`, `telefon`, `telefono`, `handy`, `landline`, `mob`… |
 | `pii.iban` | `iban`, `rib`, `bban` |
-| `pii.card_number` | `card`, `cardnumber`, `pan`, `cc`, `carte`, `cb`, `creditcard` |
-| `pii.nir` | `nir`, `secu`, `numsecu`, `insee`, `ssn`, `securite` |
-| `pii.birth_date` | `dob`, `birth`, `birthdate`, `birthday`, `dateofbirth`, `naissance`, `datenaissance`, `ddn` |
-| `pii.person_name` | `firstname`, `lastname`, `fullname`, `givenname`, `surname`, `prenom`, `cn`, `sn`, `holder`, `titulaire`…; `name` / `nom` alone or with a person qualifier (`first`, `last`, `requester`, `client`, `contact`…) |
-| `pii.postal_address` | `address`, `addr`, `adresse`, `street`, `rue`, `voie`, `postaladdress`, `homeaddress` |
-| `secret.password_hash` | `password`, `passwd`, `pwd`, `pass`, `mdp`, `motdepasse`, `userpassword`, `hash` |
+| `pii.card_number` | `card`, `cardnumber`, `pan`, `cc`, `carte`, `cb`, `creditcard`, `cardno`, `kreditkarte`, `tarjeta` |
+| `pii.nir` | `nir`, `secu`, `numsecu`, `insee`, `ssn`, `securite`, `nss`, `securitesociale` |
+| `pii.birth_date` | `dob`, `birth`, `birthdate`, `birthday`, `dateofbirth`, `naissance`, `datenaissance`, `ddn`, `born`, `bday`, `geburtsdatum`, `nacimiento`, `nascita`, `geboortedatum` |
+| `pii.person_name` | `firstname`, `lastname`, `fullname`, `givenname`, `surname`, `prenom`, `cn`, `sn`, `holder`, `titulaire`, `fname`, `lname`, `vorname`, `nachname`, `apellido`, `cognome`, `voornaam`, `achternaam`, `beneficiary`…; `name` / `nom` / `nombre` / `nome` with a person qualifier (`first`, `last`, `requester`, `client`, `contact`, `author`, `sender`, `recipient`, `guest`, `student`…); a bare `name` / `nom` is a *weak* hint |
+| `pii.postal_address` | `address`, `addr`, `adresse`, `street`, `rue`, `voie`, `postaladdress`, `homeaddress`, `adres`, `direccion`, `indirizzo`, `anschrift`, `strasse`, `calle`, `address1`, `line1`, `domicile`… |
+| `secret.password_hash` | `password`, `passwd`, `pwd`, `pass`, `mdp`, `motdepasse`, `userpassword`, `hash`, `pw`, `passhash`, `hashedpassword`… |
 | `secret.aws_key` | `aws`, `accesskey`, `accesskeyid`, `access` + `key`; secret key: `secret` + `key` / `aws`, `secretaccesskey` |
 
 A last segment containing `id`, `code`, `city`, `country`, `verified`, `opt`, `brand`, `type`,
-`format`, `extension`, `status`… (e.g. `phone_country`, `address.postalCode`) turns the hint off for
-the hint-gated classifiers.
+`format`, `extension`, `status`… (e.g. `phone_country`, `address.postalCode`) turns the hint off.
+Negative names: `order`, `tracking`, `imei`, `invoice`, `serial`, `sku`, `ean`, `barcode`, `awb`,
+`iccid`… (no card hint) turn card numbers off; `token`, `session`, `nonce`, `jwt`, `checksum`,
+`digest`, `hash`, `sha`, `commit`, `uuid`… make whole 40-character values AWS secrets only when 30 %
+hold `/` or `+`.
 
 ## Column API
 
@@ -93,15 +112,23 @@ every column of a table and let the console rebuild partial records. Each column
 distinct masked samples whose values have the smallest
 `HMAC(key, "sample-order" 0x00 column_name 0x00 value)`, which is deterministic for a key but
 independent across columns. Without the agent key, a random key (OS CSPRNG) is drawn for the call.
-Fingerprints are the 50 smallest distinct ones, emitted sorted. Decision rules
-(`ratio = matched / sampled`, empty values skipped):
+Fingerprints are the 50 smallest distinct ones, emitted sorted.
+
+**Decision rules.** Values are detected first; a column name only lowers thresholds. `n` counts the
+informative values (empty values and placeholders such as `N/A`, `null`, `-`, `unknown`,
+`0000-00-00` skipped), `ratio = matched / n`:
 
 | Classifiers | Reported when | Confidence |
 |-------------|---------------|------------|
-| e-mail, IBAN, card, NIR, AWS key id, password hash | `matched >= 1` | `0.6 + 0.35·ratio (+0.05 hint)` |
-| phone | `ratio >= 0.2`, or `matched >= 1` with a hint | `0.4 + 0.4·ratio (+0.2 hint)` |
-| birth date, person name, AWS secret key | hint and `ratio >= 0.8` | `0.3 + 0.5·ratio` (secret key: as validated) |
-| postal address | hint and `ratio >= 0.6` | `0.3 + 0.5·ratio` |
+| IBAN, card, NIR | `matched >= 1` and at least half of the checksum-shaped candidates are valid (a column of order numbers, SIRETs, IMEIs or EAN codes where a few pass Luhn by chance is not reported); card: not under an order / tracking / IMEI / barcode name | `0.6 + 0.35·ratio (+0.05 hint)` |
+| AWS key id or secret in context, password hash token | `matched >= 1` | idem |
+| e-mail | hint, `ratio >= 0.05` or `matched >= 3`; not the same single address repeated (`matched >= 3`) | idem |
+| phone | hint and `matched >= 1`, `ratio >= 0.1`, or `matched >= 10` | `0.4 + 0.4·ratio (+0.2 hint)` |
+| birth date | labelled dates in text: `ratio >= 0.05` or 3 values; hint: dates `>= 0.5`; no hint: dates `>= 0.7`, at least 3, distributed like ages (median year ≤ 2002, 10-year spread between the 10th and 90th percentiles, ≤ 15 % after 2014, none after 2026, not all on the 1st; with more than 20 % times of day, median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
+| person name | hint: name-shaped `>= 0.6` (bare `name`: `>= 0.7` and 25 % with a known name); no hint: name-shaped `>= 0.7`, 50 % with a known given name, surname or surname ending (60 % for single words), 30 % with a listed name, 3 distinct values | idem |
+| postal address | hint: address-like `>= 0.5`; no hint: strong addresses `>= 0.5`, address-like `>= 0.8` with 25 % strong, or at least 3 strong addresses and `>= 0.1` | idem |
+| AWS secret key (whole value) | secret-key hint and `>= 0.5`; no hint: `>= 0.8` and 3 values (30 % with `/` or `+` under a token / digest name) | `0.6 + 0.35·ratio` |
+| password hash (raw digest) | password name and `>= 0.5` | idem |
 
 ## Name normalization (ADR-0009)
 
@@ -133,7 +160,7 @@ no run of more than 4 letters or digits, at least 50 % `*` among letters, digits
 | `pii.email` | `j***@e***.com` (first character of local part and domain if ASCII alphanumeric; TLD if 2–4 ASCII letters, else `***`) |
 | `pii.iban` | `FR** **** **** **** **** ***0 189` (country code + last 4, check digits hidden) |
 | `pii.card_number` | `**** **** **** 1111` (last 4) |
-| `pii.phone` | `+33 * ** ** ** 78`, `+1 *** *** **25`, `+351 *** *** **8` (country code after `+`, then the last digits up to 4 kept in total); national `** ** ** ** 78` (last 2); separators kept |
+| `pii.phone` | `+33 * ** ** ** 78`, `+1 *** *** **25`, `+351 *** *** **8` (country code after `+`, then the last digits up to 4 kept in total); national `** ** ** ** 78` (last 2); separators and parentheses kept (`(***) ***-**25`) |
 | `pii.nir` | `* ** ** ** *** *** **` |
 | `pii.birth_date` | `****-**-**` |
 | `pii.person_name` | `J*** D***` (ASCII initials, at most 4 words) |
@@ -151,8 +178,9 @@ or as an account name, from correlating. The key is the 32-byte `<state_dir>/hma
 enrollment and loaded by the core; `HmacKey` keys the HMAC state once and clones it per value.
 
 Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separators, uppercase; phone
-`+<digits>` when written with `+`, national numbers as their digits (`0X…` → `+33X…` and `00…` →
-`+…` only with `PhoneRegion::Fr`, from the column or the agent configuration); birth date ISO; names
+`+<digits>` when written with `+` (a trunk `(0)` dropped), national numbers as their digits (`0X…` →
+`+33X…` and `00…` → `+…` only with `PhoneRegion::Fr`, from the column or the agent configuration);
+birth date ISO `YYYY-MM-DD` from any accepted format (`01/02/1980` read day first); names
 and addresses NFC-normalized, trimmed, whitespace collapsed, lowercased; keys and hashes trimmed.
 
 `RawSample`, `RawValue` and `HmacKey` have a redacted `Debug` and no `Display`; `RawValue`, `HmacKey`
@@ -168,8 +196,17 @@ time) and the normalized values are zeroized on drop. Production callers must pa
 - `tests/names_props.rs`: name normalizer (ADR-0009), including the Gate property tests: cards,
   phones, IBANs and e-mail addresses split across separators never survive normalization;
 - `tests/ground_truth.rs`: column-level recall / precision against `dev/ground-truth.json`, offline,
-  from the committed seed (`dev/seed/out/`). `cargo test -p databastion-classifiers --test
-  ground_truth -- --nocapture` prints the table (counts only).
+  from the committed seed (`dev/seed/out/`), under the real column names and again under opaque
+  names (`col_17`: values alone must carry the decision). `cargo test -p databastion-classifiers
+  --test ground_truth -- --nocapture` prints the tables (counts only);
+- `tests/synthetic_eval.rs`: ~340 synthetic labeled columns generated in code (deterministic PRNG,
+  fake values): every classifier in many formats and name styles (descriptive, camelCase,
+  PascalCase, UPPER, flat, innocent, opaque, misleading), sparse and mixed columns, free text, and
+  hard negatives (event dates, cities, products, companies, order and tracking numbers, IMEIs,
+  SIRETs, EAN codes, URLs with user info, git remotes, message ids, package specs, system
+  mailboxes, checksums, session tokens…); gate 95 % recall and precision per classifier;
+- `tests/regex_features.rs`: the `regex` features resolved for the production build (without
+  dev-dependencies) cover the detector patterns;
 - `tests/holdout.rs`: the phase 2 gate on the independent held-out corpus (`dev/holdout/`,
   scoring as in its README: Wilson 95 % lower bound, recall ≥ 0.90 and precision ≥ 0.85 per
   classifier). `#[ignore]`d because the corpus is generated, not committed; when run it never
