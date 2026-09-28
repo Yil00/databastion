@@ -1,35 +1,58 @@
-//! PostgreSQL connector for the DataBastion agent.
+//! PostgreSQL connector for the DataBastion agent (P2-B).
 //!
-//! Audit source (docs/08-engine-capabilities.md): pgaudit (Full) or pg_stat_statements / pg_stat_activity (Limited).
+//! - Discovery ([`discover`](Connector::discover)): catalog introspection and
+//!   bounded sampling within the scope of ADR-0012 (obligations 1 to 4 and
+//!   7), classification through `ScanJob::classify`, names through the
+//!   ADR-0009 normalizer; only masked findings reach the sink (I2).
+//! - [`check`](Connector::check): reachability, honest audit level (docs/08:
+//!   pgaudit = Full, `pg_stat_statements` = Limited), over-privilege and
+//!   coverage of the role (ADR-0012 obligation 6).
+//! - Audit (`audit_stream`) is P4-A: not implemented.
 //!
-//! Skeleton status (P0-D): every operation returns a "not implemented"
-//! result; nothing connects to a database yet.
+//! The connector only reads (I4): read-only transactions, `SET LOCAL`
+//! timeouts, statements cancelled on the server when their future is
+//! dropped. It connects only to the declared target (I5), with credentials
+//! from `agent.yaml` references (I3), over rustls TLS.
 
 #![forbid(unsafe_code)]
 
+mod catalog;
+mod check;
+mod conn;
+mod discover;
+mod error;
+mod sql;
+mod tls;
+mod wire;
+
+#[cfg(test)]
+mod it;
+
 use async_trait::async_trait;
+use databastion_core::config::TargetConfig;
 use databastion_core::{
     AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
-    config::TargetConfig,
 };
 
-/// PostgreSQL connector (stub).
-#[derive(Debug, Default)]
+/// PostgreSQL connector. One instance serves every declared PostgreSQL
+/// target.
+#[derive(Default)]
 #[non_exhaustive]
-pub struct PostgresConnector {}
+pub struct PostgresConnector {
+    check_state: check::CheckState,
+}
+
+impl std::fmt::Debug for PostgresConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConnector").finish_non_exhaustive()
+    }
+}
 
 impl PostgresConnector {
-    /// Creates the (stub) connector.
+    /// Creates the connector.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
-    }
-
-    fn not_implemented(&self, operation: &'static str) -> ConnectorError {
-        ConnectorError::NotImplemented {
-            engine: self.engine(),
-            operation,
-        }
+        Self::default()
     }
 }
 
@@ -39,12 +62,12 @@ impl Connector for PostgresConnector {
         Engine::Postgres
     }
 
-    async fn check(&self, _target: &TargetConfig) -> TargetHealth {
-        TargetHealth::not_implemented(self.engine())
+    async fn check(&self, target: &TargetConfig) -> TargetHealth {
+        check::check(&self.check_state, target).await
     }
 
-    async fn discover(&self, _job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("discover"))
+    async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
+        discover::discover(job, sink).await
     }
 
     async fn audit_stream(
@@ -52,51 +75,58 @@ impl Connector for PostgresConnector {
         _cfg: &AuditConfig,
         _sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("audit_stream"))
+        Err(ConnectorError::NotImplemented {
+            engine: self.engine(),
+            operation: "audit_stream",
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databastion_core::AuditLevel;
+    use databastion_core::{AuditLevel, FailureCode};
 
-    #[tokio::test]
-    async fn stub_reports_honest_health() {
-        let connector = PostgresConnector::new();
-        assert_eq!(connector.engine(), Engine::Postgres);
-        let config = databastion_core::AgentConfig::parse(
-            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: \
-             [{id: t, engine: postgres, host: h, account: a, secret: {env: PW}}]}",
-        )
+    fn target(yaml: &str) -> TargetConfig {
+        let config = databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{yaml}]}}"
+        ))
         .unwrap();
-        let health = connector.check(&config.targets[0]).await;
-        assert!(!health.reachable);
-        assert_eq!(health.audit_level, AuditLevel::None);
+        config.targets[0].clone()
     }
 
     #[tokio::test]
-    async fn stub_operations_return_not_implemented() {
+    async fn unreadable_secret_is_reported_without_connecting() {
         let connector = PostgresConnector::new();
-        let (findings, _findings_rx) = FindingSink::channel(1);
-        let (events, _events_rx) = EventSink::channel(1);
-        let discover = connector.discover(&ScanJob::default(), &findings).await;
+        let t = target(
+            "{id: t, engine: postgres, host: 127.0.0.1, port: 9, account: a, \
+             secret: {env: DATABASTION_TEST_UNSET_PG_SECRET}, postgres: {tls: disable}}",
+        );
+        let health = connector.check(&t).await;
+        assert!(!health.reachable);
+        assert_eq!(health.audit_level, AuditLevel::None);
+        assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+    }
+
+    #[tokio::test]
+    async fn default_job_without_target_fails_closed() {
+        let connector = PostgresConnector::new();
+        let (findings, _rx) = FindingSink::channel(1);
+        let r = connector.discover(&ScanJob::default(), &findings).await;
         assert!(matches!(
-            discover,
-            Err(ConnectorError::NotImplemented {
+            r,
+            Err(ConnectorError::Target {
                 engine: Engine::Postgres,
-                operation: "discover"
+                code: FailureCode::Internal,
+                ..
             })
         ));
-        let audit = connector
-            .audit_stream(&AuditConfig::default(), &events)
-            .await;
+        let (events, _rx) = EventSink::channel(1);
         assert!(matches!(
-            audit,
-            Err(ConnectorError::NotImplemented {
-                engine: Engine::Postgres,
-                operation: "audit_stream"
-            })
+            connector
+                .audit_stream(&AuditConfig::default(), &events)
+                .await,
+            Err(ConnectorError::NotImplemented { .. })
         ));
     }
 }
