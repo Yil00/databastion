@@ -14,6 +14,26 @@ type Env = Readonly<Record<string, string | undefined>>;
  */
 export const INSECURE_DEV_VAR = "DATABASTION_ALERTING_INSECURE_DEV";
 
+/**
+ * L5: in production the dev flag alone stops the web and worker processes (see
+ * `alertingFatal`); this second, explicit opt-in lets them start anyway (warned).
+ */
+export const INSECURE_DEV_ACK_VAR = "DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND";
+
+/**
+ * Fatal configuration error (web and worker, `startupFatal`): `DATABASTION_ALERTING_INSECURE_DEV`
+ * set in production without `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1`. `null`: start.
+ */
+export function alertingFatal(env: Env = process.env): string | null {
+  if (env.NODE_ENV !== "production") return null;
+  const set = env[INSECURE_DEV_VAR] !== undefined && env[INSECURE_DEV_VAR] !== "";
+  if (!set || env[INSECURE_DEV_ACK_VAR] === "1") return null;
+  return (
+    `${INSECURE_DEV_VAR} is set in production: refusing to start (it allows http:// webhooks, webhooks to private / loopback addresses and plain-text SMTP). ` +
+    `Unset it, or also set ${INSECURE_DEV_ACK_VAR}=1 to start anyway (not recommended).`
+  );
+}
+
 export function insecureDevAllowed(env: Env = process.env): boolean {
   return env[INSECURE_DEV_VAR] === "1";
 }

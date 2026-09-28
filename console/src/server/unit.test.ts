@@ -202,6 +202,31 @@ describe("startupFatal (missing server key in production)", () => {
   });
 });
 
+describe("startupFatal (alerting dev flag in production, L5)", () => {
+  const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
+  const KEY = { DATABASTION_ENCRYPTION_KEY: "k".repeat(44) };
+
+  it("refuses to start with DATABASTION_ALERTING_INSECURE_DEV in production without the second opt-in", () => {
+    for (const value of ["1", "true", "0"]) {
+      const fatal = startupFatal(env({ NODE_ENV: "production", ...KEY, DATABASTION_ALERTING_INSECURE_DEV: value }));
+      expect(fatal).toContain("refusing to start");
+      expect(fatal).toContain("DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1");
+    }
+    // Only "1" acknowledges.
+    expect(
+      startupFatal(env({ NODE_ENV: "production", ...KEY, DATABASTION_ALERTING_INSECURE_DEV: "1", DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND: "yes" })),
+    ).toContain("refusing to start");
+  });
+
+  it("starts with the opt-in (still warned), outside production, or without the flag", () => {
+    const acked = env({ NODE_ENV: "production", ...KEY, DATABASTION_ALERTING_INSECURE_DEV: "1", DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND: "1" });
+    expect(startupFatal(acked)).toBeNull();
+    expect(startupWarnings(acked).some((w) => w.includes("DATABASTION_ALERTING_INSECURE_DEV=1 in production"))).toBe(true);
+    expect(startupFatal(env({ NODE_ENV: "development", DATABASTION_ALERTING_INSECURE_DEV: "1" }))).toBeNull();
+    expect(startupFatal(env({ NODE_ENV: "production", ...KEY }))).toBeNull();
+  });
+});
+
 describe("login device cookies (P1-D N1)", () => {
   const KEY_A = "device-cookie-test-key-A-0123456789abcdefghijkl";
   const KEY_B = "device-cookie-test-key-B-0123456789abcdefghijkl";
