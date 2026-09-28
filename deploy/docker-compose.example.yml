@@ -46,8 +46,13 @@ services:
       # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
       DATABASTION_TRUST_PROXY: "1"
       # Prometheus scrape token for GET /metrics (ADR-0004); /metrics answers 404 when unset.
-      # /metrics must stay on the internal network: the reverse proxy must NOT publish it.
       DATABASTION_METRICS_TOKEN_FILE: /run/secrets/metrics_token
+      # /metrics on a dedicated listener, never on port 3000 (which then answers 404 there).
+      # 0.0.0.0 inside the container, but the port is NOT published ("ports:" above): a Prometheus
+      # on this compose network scrapes http://console:9464/metrics with
+      # authorization.credentials_file = the metrics_token secret.
+      DATABASTION_METRICS_PORT: "9464"
+      DATABASTION_METRICS_HOST: 0.0.0.0
       TZ: Europe/Paris
     secrets: [db_url, encryption_key, metrics_token]
     user: "10001:10001"

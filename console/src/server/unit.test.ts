@@ -13,6 +13,7 @@ import {
   AGENT_SECRET_FORMAT,
   ENROLLMENT_TOKEN_FORMAT,
   Semaphore,
+  serverSubkey,
 } from "./crypto";
 import { RateLimiter } from "./rate-limit";
 import { clientIp, ipBucket, readJsonBody, xffWarningStats } from "./request";
@@ -117,11 +118,14 @@ describe("Semaphore", () => {
 describe("startupWarnings", () => {
   const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
   it("warns in production without a trusted proxy or with insecure cookies", () => {
-    expect(startupWarnings(env({ NODE_ENV: "production" }))).toHaveLength(1);
-    expect(startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
-    expect(
-      startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1", DATABASTION_INSECURE_COOKIES: "1" })),
-    ).toHaveLength(1);
+    const prod = { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY_FILE: "/run/secrets/encryption_key" };
+    expect(startupWarnings(env(prod))).toHaveLength(1);
+    expect(startupWarnings(env({ ...prod, DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
+    expect(startupWarnings(env({ ...prod, DATABASTION_TRUST_PROXY: "1", DATABASTION_INSECURE_COOKIES: "1" }))).toHaveLength(1);
+    // P1-D I2: no server key, no known-good fingerprints.
+    const noKey = startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }));
+    expect(noKey).toHaveLength(1);
+    expect(noKey[0]).toContain("DATABASTION_ENCRYPTION_KEY");
     expect(startupWarnings(env({ NODE_ENV: "development" }))).toHaveLength(0);
   });
 });
@@ -188,6 +192,35 @@ describe("request helpers", () => {
     } as RequestInit);
     expect(await readJsonBody(req, 10_000)).toEqual({ ok: false, reason: "too_large" });
   });
+
+  it("gives up on a body that is not received within the read deadline (P1-D L1)", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"a":'));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const req = new Request("http://x/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    const start = Date.now();
+    expect(await readJsonBody(req, { maxBytes: 10_000, deadlineMs: 50 })).toEqual({
+      ok: false,
+      reason: "invalid_json",
+      timedOut: true,
+    });
+    expect(Date.now() - start).toBeLessThan(2_000);
+    expect(cancelled).toBe(true);
+    // A body received in time is unaffected by the deadline.
+    const ok = new Request("http://x/", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect(await readJsonBody(ok, { deadlineMs: 1_000 })).toEqual({ ok: true, value: {} });
+  });
 });
 
 describe("audit details", () => {
@@ -195,5 +228,21 @@ describe("audit details", () => {
     expect(() => assertSafeDetails({ agent_secret: "x" })).toThrow();
     expect(() => assertSafeDetails({ password: "x" })).toThrow();
     expect(() => assertSafeDetails({ role: "admin" })).not.toThrow();
+  });
+});
+
+describe("server subkeys (P1-D I2)", () => {
+  const KEY = "hunter2-SECRET-unit-server-key-0123456789abcdef";
+  it("derives independent 256-bit subkeys per domain and key, and fails closed without a key", () => {
+    const a = serverSubkey("agent-known-good.v1", { DATABASTION_ENCRYPTION_KEY: KEY });
+    expect(a).toHaveLength(32);
+    expect(serverSubkey("agent-known-good.v1", { DATABASTION_ENCRYPTION_KEY: KEY })?.equals(a!)).toBe(true);
+    expect(serverSubkey("other.v1", { DATABASTION_ENCRYPTION_KEY: KEY })?.equals(a!)).toBe(false);
+    expect(serverSubkey("agent-known-good.v1", { DATABASTION_ENCRYPTION_KEY: `${KEY}x` })?.equals(a!)).toBe(false);
+    expect(serverSubkey("agent-known-good.v1", {})).toBeNull();
+    expect(serverSubkey("agent-known-good.v1", { DATABASTION_ENCRYPTION_KEY: "short" })).toBeNull();
+    expect(
+      serverSubkey("agent-known-good.v1", { DATABASTION_ENCRYPTION_KEY: KEY, DATABASTION_ENCRYPTION_KEY_FILE: "/nonexistent" }),
+    ).toBeNull();
   });
 });

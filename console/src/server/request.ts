@@ -71,15 +71,35 @@ export const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 export type BodyResult =
   | { ok: true; value: unknown }
-  | { ok: false; reason: "too_large" | "invalid_json" | "unsupported_media_type" };
+  | {
+      ok: false;
+      reason: "too_large" | "invalid_json" | "unsupported_media_type";
+      /** The read deadline expired (reported as `invalid_json`). */
+      timedOut?: true;
+    };
 
 const JSON_CONTENT_TYPE = /^application\/json\s*(;\s*charset\s*=\s*"?utf-8"?\s*)?$/i;
 
+export interface ReadBodyOptions {
+  maxBytes?: number;
+  /**
+   * Wall-clock limit for reading the whole body (P1-D L1): past it, the stream is cancelled and the
+   * body is `invalid_json` (a slow-loris sender never holds the request open indefinitely).
+   * Unset: no deadline (the server timeouts apply).
+   */
+  deadlineMs?: number;
+}
+
+/** Default body read deadline of the agent API bodies read before authentication (`/rotate`). */
+export const BODY_READ_DEADLINE_MS = 10_000;
+
 /**
  * Reads a JSON body with a hard byte cap (the stream is cancelled as soon as the cap is exceeded,
- * whatever `Content-Length` says). Never logs or returns any part of the body on failure.
+ * whatever `Content-Length` says) and an optional read deadline. Never logs or returns any part of
+ * the body on failure. `maxBytes` may be given directly (legacy form) or in the options.
  */
-export async function readJsonBody(req: Request, maxBytes = MAX_BODY_BYTES): Promise<BodyResult> {
+export async function readJsonBody(req: Request, opts: number | ReadBodyOptions = {}): Promise<BodyResult> {
+  const { maxBytes = MAX_BODY_BYTES, deadlineMs } = typeof opts === "number" ? { maxBytes: opts } : opts;
   const contentType = req.headers.get("content-type") ?? "";
   if (!JSON_CONTENT_TYPE.test(contentType.trim())) {
     return { ok: false, reason: "unsupported_media_type" };
@@ -92,15 +112,31 @@ export async function readJsonBody(req: Request, maxBytes = MAX_BODY_BYTES): Pro
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => undefined);
-      return { ok: false, reason: "too_large" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired =
+    deadlineMs === undefined
+      ? null
+      : new Promise<"expired">((resolve) => {
+          timer = setTimeout(() => resolve("expired"), deadlineMs);
+        });
+  try {
+    for (;;) {
+      const next = expired ? await Promise.race([reader.read(), expired]) : await reader.read();
+      if (next === "expired") {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, reason: "invalid_json", timedOut: true };
+      }
+      const { done, value } = next;
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, reason: "too_large" };
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
   let text: string;
   try {

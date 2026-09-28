@@ -6,6 +6,7 @@ import { agents, auditLog, jobs, securityEvents } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import {
   agentArgon2Gate,
+  argon2Stats,
   loginArgon2Gate,
   MAX_CONCURRENT_ROTATE_ARGON2,
   newAgentSecret,
@@ -18,12 +19,22 @@ import {
   rotateStats,
   rotationBlocked,
   staleRetriesPerAgent,
+  staleRotateRetry,
 } from "@/server/rotation";
+import { revokeAgent } from "@/server/agents";
+import { agentHeaders, BASE } from "@/test/helpers";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError } from "@/test/helpers";
 
-import { expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp, TOLERANCE_WINDOW_MS } from "./auth";
-import { handleHeartbeat, handlePollJobs, handleRotate, pollClock } from "./handlers";
+import {
+  expireVerifiedCacheForTests,
+  failuresPerAgent,
+  failuresPerIp,
+  isKnownGood,
+  knownGoodFingerprint,
+  TOLERANCE_WINDOW_MS,
+} from "./auth";
+import { handleHeartbeat, handlePollJobs, handleRotate, pollClock, rotateBodyDeadline } from "./handlers";
 import { jobHub } from "./job-hub";
 
 type Creds = { agentId: string; secret: string };
@@ -59,6 +70,8 @@ async function expectLocked(agentId: string): Promise<void> {
   expect(a?.currentSecretHash).toBeNull();
   expect(a?.pendingSecretHash).toBeNull();
   expect(a?.previousSecretHash).toBeNull();
+  expect(a?.knownGoodFingerprint).toBeNull();
+  expect(a?.knownGoodAt).toBeNull();
   const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, agentId));
   expect(events).toHaveLength(1);
   expect(events[0]?.kind).toBe("agent.rotation_conflict");
@@ -449,6 +462,256 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
       let last = 0;
       for (let i = 0; i < 11; i++) last = (await rotate(s0, { new_secret: s1 })).status;
       expect(last).toBe(429);
+    });
+  });
+
+  describe("P1-D: bounded argon2id cost of previous-secret (S0) checks", () => {
+    it("a stale S0 late retry runs its argon2id work only under the authentication pool slot", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      expireVerifiedCacheForTests();
+      // Shared agent pool saturated: nothing runs (no verification, no lock). Same answer as for any
+      // unrecognized secret, so it does not confirm S0.
+      const held = Array.from({ length: agentArgon2Gate.max }, () => agentArgon2Gate.tryAcquire());
+      try {
+        const started = argon2Stats.started;
+        const busy = await rotate(s0, { new_secret: s1.secret });
+        expect(busy.status).toBe(503);
+        expect(argon2Stats.started).toBe(started);
+        await expectNotLocked(s0.agentId);
+      } finally {
+        held.forEach((r) => r?.());
+      }
+      const started = argon2Stats.started;
+      const rotateOps = rotateStats.argon2Ops;
+      argon2Stats.maxActive = 0;
+      const ok = await rotate(s0, { new_secret: s1.secret });
+      expect(ok.status).toBe(200);
+      expect(((await ok.json()) as { duplicate: boolean }).duplicate).toBe(true);
+      // current (miss) + previous (S0) + the late-retry check, all in authenticateAgent's slot.
+      expect(argon2Stats.started - started).toBe(3);
+      expect(argon2Stats.maxActive).toBe(1);
+      expect(rotateStats.argon2Ops).toBe(rotateOps); // nothing outside the pool of authentication
+      expect(agentArgon2Gate.inUse).toBe(0);
+      await expectNotLocked(s0.agentId);
+    });
+
+    it("S0 inside the window counts as a failed attempt: bounded argon2id work, then 429", async () => {
+      const { s0, s1 } = await rotated();
+      expireVerifiedCacheForTests();
+      const started = argon2Stats.started;
+      const statuses: number[] = [];
+      for (let i = 0; i < 12; i++) statuses.push((await heartbeat(s0)).status);
+      expect(statuses.slice(0, failuresPerAgent.limit)).toEqual(Array(failuresPerAgent.limit).fill(401));
+      expect(statuses.slice(failuresPerAgent.limit)).toEqual([429, 429]);
+      // At most three verifications (current, pending, previous) per counted attempt.
+      expect(argon2Stats.started - started).toBeLessThanOrEqual(3 * failuresPerAgent.limit);
+      await expectNotLocked(s0.agentId);
+      // The current secret was verified before: known good, exempt from the per-agent limit.
+      expect((await heartbeat(s1)).status).toBe(200);
+    });
+
+    it("the persisted known-good fingerprint follows the promotion (S0's one is dropped)", async () => {
+      const s0 = await enroll();
+      expect((await heartbeat(s0)).status).toBe(200);
+      const before = (await row(s0.agentId))?.knownGoodFingerprint;
+      expect(before).toMatch(/^[0-9a-f]{64}$/);
+      const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+      expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      expect((await heartbeat(s1)).status).toBe(200); // promotion by first use
+      const after = await row(s0.agentId);
+      expect(after?.knownGoodFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(after?.knownGoodFingerprint).not.toBe(before);
+    });
+
+    it("a /rotate duplicate with S0 gives its attempt back (inside and after the window)", async () => {
+      const { s0, s1 } = await rotated();
+      for (let i = 0; i < 5; i++) {
+        expireVerifiedCacheForTests();
+        expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      }
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      for (let i = 0; i < 5; i++) expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      // Ten counted attempts would have reached the per-agent limit.
+      expect(failuresPerAgent.check(s0.agentId).limited).toBe(false);
+      await expectNotLocked(s0.agentId);
+    });
+  });
+
+  describe("P1-D follow-up review", () => {
+    /** A `/rotate` whose body never completes; reports whether the handler started reading it. */
+    const hangingRotate = (auth: Creds, extraHeaders: Record<string, string> = {}) => {
+      const state = { pulled: false };
+      const body = new ReadableStream<Uint8Array>({
+        pull() {
+          state.pulled = true;
+          return new Promise(() => undefined);
+        },
+      }, { highWaterMark: 0 });
+      const req = new Request(`${BASE}/rotate`, {
+        method: "POST",
+        headers: { ...agentHeaders(auth), ...extraHeaders },
+        body,
+        duplex: "half",
+      } as RequestInit);
+      return { req, state };
+    };
+    const flood = async (agentId: string) => {
+      const wrong = newAgentSecret();
+      for (let i = 0; i < failuresPerAgent.limit + 2; i++) await heartbeat({ agentId, secret: wrong });
+      expect((await heartbeat({ agentId, secret: wrong })).status).toBe(429);
+    };
+
+    it("L1: cheap rejections happen before the body is read", async () => {
+      const s0 = await enroll();
+      const malformed = hangingRotate({ agentId: s0.agentId, secret: "dbs_short" });
+      expect((await handleRotate(malformed.req)).status).toBe(401);
+      expect(malformed.state.pulled).toBe(false);
+      await flood(s0.agentId);
+      const limited = hangingRotate({ agentId: s0.agentId, secret: newAgentSecret() });
+      expect((await handleRotate(limited.req)).status).toBe(429);
+      expect(limited.state.pulled).toBe(false);
+    });
+
+    it("L1: a body past the read deadline is a 400 before any argon2id work, never a lock", async () => {
+      const { s0 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000); // stale S0: any bad body would lock
+      expireVerifiedCacheForTests();
+      rotateBodyDeadline.ms = 50;
+      try {
+        const started = argon2Stats.started;
+        const slow = hangingRotate(s0);
+        const res = await handleRotate(slow.req);
+        expect(res.status).toBe(400);
+        expect(slow.state.pulled).toBe(true);
+        expect(argon2Stats.started).toBe(started);
+        await expectNotLocked(s0.agentId);
+      } finally {
+        rotateBodyDeadline.ms = 10_000;
+      }
+    });
+
+    it("L-a: timed-out bodies count against the per-IP limit, not the agent's", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      rotateBodyDeadline.ms = 5;
+      try {
+        const s0 = await enroll();
+        const xff = { "X-Forwarded-For": "198.51.100.40" };
+        for (let i = 0; i < failuresPerIp.limit; i++) {
+          expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(400);
+        }
+        // The IP is now limited; another IP, and the agent itself, are not.
+        expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(429);
+        expect((await heartbeat(s0)).status).toBe(200);
+        await expectNotLocked(s0.agentId);
+      } finally {
+        rotateBodyDeadline.ms = 10_000;
+        delete process.env.DATABASTION_TRUST_PROXY;
+      }
+    });
+
+    it("L2: a pending S1 is exempt from a failure flood, before and after its promotion", async () => {
+      const s0 = await enroll();
+      const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+      expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      const pending = await row(s0.agentId);
+      expect(pending?.knownGoodPendingFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(pending?.knownGoodPendingFingerprint).toBe(knownGoodFingerprint(s1.secret, pending?.pendingSecretHash ?? ""));
+      await flood(s0.agentId);
+      expect((await heartbeat(s1)).status).toBe(200); // first use: promotion despite the flood
+      const promoted = await row(s0.agentId);
+      expect(promoted?.pendingSecretHash).toBeNull();
+      expect(promoted?.knownGoodPendingFingerprint).toBeNull();
+      expect(promoted?.knownGoodFingerprint).toBe(pending?.knownGoodPendingFingerprint);
+      expect(promoted?.knownGoodAt).not.toBeNull();
+      await flood(s0.agentId);
+      expireVerifiedCacheForTests();
+      expect((await heartbeat(s1)).status).toBe(200);
+      // S0 is not exempt (its fingerprint was replaced).
+      expect((await heartbeat(s0)).status).toBe(429);
+    });
+
+    it("L2: the pending fingerprint carries over on a promotion at the deadline", async () => {
+      const s0 = await enroll();
+      const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+      expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      const fp = (await row(s0.agentId))?.knownGoodPendingFingerprint;
+      await getDb().update(agents).set({ graceExpiresAt: new Date(Date.now() - 1000) }).where(eq(agents.id, s0.agentId));
+      await flood(s0.agentId); // the lazy promotion runs on one of these requests
+      const a = await row(s0.agentId);
+      expect(a?.pendingSecretHash).toBeNull();
+      expect(a?.knownGoodFingerprint).toBe(fp);
+      expireVerifiedCacheForTests();
+      expect((await heartbeat(s1)).status).toBe(200);
+    });
+
+    it("L2: the pending fingerprint is cleared on lock and on revocation", async () => {
+      const locked = await enroll();
+      expect((await rotate(locked, { new_secret: newAgentSecret() })).status).toBe(200);
+      expect((await rotate(locked, { new_secret: newAgentSecret() })).status).toBe(409);
+      expect((await row(locked.agentId))?.knownGoodPendingFingerprint).toBeNull();
+      const revoked = await enroll();
+      expect((await rotate(revoked, { new_secret: newAgentSecret() })).status).toBe(200);
+      expect((await row(revoked.agentId))?.knownGoodPendingFingerprint).not.toBeNull();
+      await revokeAgent(getDb(), revoked.agentId, { userId: await adminUser(), ip: null });
+      const r = await row(revoked.agentId);
+      expect(r?.knownGoodPendingFingerprint).toBeNull();
+      expect(r?.knownGoodFingerprint).toBeNull();
+    });
+
+    it("I1: a stale S0 without a late-retry check locks when the row is unchanged", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      const a = await row(s0.agentId);
+      const base = { agentId: s0.agentId, matchedHash: a?.previousSecretHash ?? "" };
+      // Row changed since authentication (another current hash): no decision.
+      const changed = await staleRotateRetry(
+        getDb(),
+        { ...base, verifiedCurrentHash: "$argon2id$other", staleDuplicate: true },
+        { new_secret: s1.secret },
+        null,
+      );
+      expect(changed.kind).toBe("unauthorized");
+      await expectNotLocked(s0.agentId);
+      const unchecked = await staleRotateRetry(
+        getDb(),
+        { ...base, verifiedCurrentHash: a?.currentSecretHash ?? null, staleDuplicate: undefined },
+        { new_secret: s1.secret },
+        null,
+      );
+      expect(unchecked.kind).toBe("conflict");
+      await expectLocked(s0.agentId);
+    });
+
+    it("I2: fingerprints are keyed by the server key; without it, or with another key, nothing matches", async () => {
+      const s0 = await enroll();
+      expect((await heartbeat(s0)).status).toBe(200);
+      const a = await row(s0.agentId);
+      const hash = a?.currentSecretHash ?? "";
+      expect(a?.knownGoodFingerprint).toBe(knownGoodFingerprint(s0.secret, hash));
+      expect(isKnownGood(a!, s0.secret, hash)).toBe(true);
+      // Legacy (plain SHA-256) fingerprint written by an earlier version: never matches.
+      const { sha256Hex } = await import("@/server/crypto");
+      const legacy = sha256Hex(`databastion.agent-known-good.v1\0${hash}\0${s0.secret}`);
+      expect(isKnownGood({ knownGoodFingerprint: legacy, knownGoodAt: new Date() }, s0.secret, hash)).toBe(false);
+      const key = process.env.DATABASTION_ENCRYPTION_KEY;
+      try {
+        process.env.DATABASTION_ENCRYPTION_KEY = `${key}-rotated`;
+        expect(isKnownGood(a!, s0.secret, hash)).toBe(false);
+        delete process.env.DATABASTION_ENCRYPTION_KEY;
+        expect(knownGoodFingerprint(s0.secret, hash)).toBeNull();
+        expect(isKnownGood(a!, s0.secret, hash)).toBe(false);
+        // No key: the lock-out exemption is gone (fail closed), authentication still works.
+        await flood(s0.agentId);
+        expireVerifiedCacheForTests();
+        expect((await heartbeat(s0)).status).toBe(429);
+        failuresPerAgent.clear();
+        const other = await enroll();
+        expect((await heartbeat(other)).status).toBe(200);
+        expect((await row(other.agentId))?.knownGoodFingerprint).toBeNull();
+      } finally {
+        process.env.DATABASTION_ENCRYPTION_KEY = key;
+      }
     });
   });
 

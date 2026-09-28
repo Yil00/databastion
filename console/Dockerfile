@@ -1,18 +1,22 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # DataBastion console image: one image, three commands (see docker/entrypoint.sh):
-#   web      Next.js standalone server (UI, user API, agent API, /metrics), port 3000
+#   web      Next.js standalone server (UI, user API, agent API), port 3000; /metrics on the
+#            dedicated listener DATABASTION_METRICS_PORT (e.g. 9464) when set, else on port 3000
 #   worker   pg-boss worker
 #   migrate  applies the versioned SQL migrations (DATABASE_MIGRATION_URL(_FILE)), then exits
 #   bootstrap-admin  creates the first administrator (refused once a user exists)
 # Build context: console/ (the generated protocol types are committed under src/generated/).
 #   docker build -t databastion-console console/
 # Runs as uid/gid 10001 with a read-only root filesystem (only /tmp needs to be writable).
-# Base images are pinned by tag; the release CI pins them by digest.
+# Base images are pinned by tag AND digest (multi-arch index digest, so the pin holds on amd64 and
+# arm64). To update: bump the tag, then take the new index digest, e.g.
+#   docker buildx imagetools inspect node:<tag> --format '{{json .Manifest.Digest}}'
 
 # Node 24 LTS (package.json "engines"); same base for every stage.
+ARG NODE_IMAGE=node:24.15.0-bookworm-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
 
 # ---------------------------------------------------------------- dependencies
-FROM node:24.15.0-bookworm-slim AS deps
+FROM ${NODE_IMAGE} AS deps
 WORKDIR /src
 ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable
@@ -27,7 +31,7 @@ ENV NEXT_TELEMETRY_DISABLED=1 NEXT_OUTPUT_STANDALONE=1 NODE_ENV=production
 RUN pnpm build
 
 # ------------------------------------------------- production deps (worker, migrate)
-FROM node:24.15.0-bookworm-slim AS prod-deps
+FROM ${NODE_IMAGE} AS prod-deps
 WORKDIR /src
 ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable
@@ -36,7 +40,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile --prod
 
 # ---------------------------------------------------------------- runtime
-FROM node:24.15.0-bookworm-slim AS runtime
+FROM ${NODE_IMAGE} AS runtime
 LABEL org.opencontainers.image.title="databastion-console" \
       org.opencontainers.image.source="https://github.com/yil00/databastion" \
       org.opencontainers.image.licenses="Apache-2.0"
@@ -60,7 +64,8 @@ COPY --chown=root:root src /app/console/src
 COPY --chown=root:root --chmod=0755 docker/entrypoint.sh docker/healthcheck.sh /usr/local/bin/
 # Files are owned by root and not writable by the runtime user.
 USER 10001:10001
-EXPOSE 3000
+# 9464: suggested DATABASTION_METRICS_PORT (internal network only, never published).
+EXPOSE 3000 9464
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["web"]

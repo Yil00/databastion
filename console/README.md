@@ -28,14 +28,20 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
 | `DATABASTION_METRICS_TOKEN` / `_FILE` | Bearer token required by `GET /metrics` (at least 32 characters, e.g. `openssl rand -base64 32`). Unset or too short: `/metrics` answers `404`. See "Metrics" |
+| `DATABASTION_METRICS_PORT` | Serve `GET /metrics` on a dedicated listener on this port (e.g. `9464`) instead of the main port, which then answers `404` on `/metrics`. Unset: no dedicated listener, `/metrics` stays on the main port (a startup warning is logged in production when the token is set). Must differ from `PORT`. See "Metrics" |
+| `DATABASTION_METRICS_HOST` | Bind address (IP literal) of that listener: `127.0.0.1` by default; `0.0.0.0` inside a container whose metrics port is not published. Invalid port / host: `/metrics` is disabled everywhere and an error is logged |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
 | `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
-[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) is not
-used yet (see "Data at rest"). The console only knows its own database: it never stores target
+[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
+e.g. `openssl rand -base64 32`) is the console server key of the web process. Today it only keys the
+agent "known good" fingerprints (HKDF-SHA256 subkey, domain `agent-known-good.v1`, see "Data at
+rest"); unset, too short or unreadable: those fingerprints are neither stored nor matched (fail
+closed: agents lose the lock-out exemption, nothing else) and a warning is logged. Changing it
+invalidates the stored fingerprints. The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
 ## Commands
@@ -129,7 +135,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/health` | Liveness: `{"status":"ok"}`, never touches the database |
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
 | `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events` still `501` |
-| `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); internal network only |
+| `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP and per username |
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/auth/session` | Current user + CSRF token |
@@ -192,8 +198,13 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
   holder of `S1` can send it; this check runs only on the `/rotate` path authenticated with `S0`.
   After the window, a `/rotate` with `S0` has exactly two outcomes: that duplicate, or a lock.
   Any invalid body, low-entropy or other secret, unknown `job_id`, or more than 10 late retries in
-  5 min locks the agent; this path never answers `400` / `404` / `429` / `503`, never uses the
-  per-agent rotate bucket and runs at most one argon2id verification outside the rotate pool;
+  5 min locks the agent; once `S0` is recognized, this path never answers `400` / `404` / `429` /
+  `503` and never uses the per-agent rotate bucket. Its only argon2id work (does `new_secret`
+  verify against the current hash?) runs inside the authentication itself, under the pool slot and
+  the counted attempt that verified `S0` (P1-D): the `/rotate` body is read before the argon2id
+  authentication for that, but after its cheap checks (headers, secret format, failure limits),
+  with a 64 KiB cap (`413` after authentication beyond) and a 10 s read deadline (`400` before any
+  argon2id work, never a lock); nothing else about it is answered before authentication;
 - `rotation_conflict` (`409`): `/rotate` with `S0` and any other secret while pending or at any time
   after the promotion, or any other request with `S0` after the window. The agent is locked (every secret hash
   cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
@@ -204,7 +215,9 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
 The previous hash is kept after the 60 s window, until the next promotion replaces it, only to
 detect a later use of `S0`; it never authenticates. A wrong secret therefore costs up to three
 argon2id verifications (current, pending, previous) under a single pool slot and a single
-rate-limit attempt. `/rotate` runs its own argon2id work (hash of `S1`, comparison with the
+rate-limit attempt. A request with `S0` is genuine but never authenticates: its attempt stays
+counted against the per-agent / per-IP failure limits like a wrong secret (P1-D), so repeated uses
+of `S0` cannot cost unbounded argon2id work; only a `/rotate` answered `duplicate` gives it back. `/rotate` runs its own argon2id work (hash of `S1`, comparison with the
 pending / promoted hash) in a dedicated pool of 2 (`503` + `Retry-After` beyond) and is limited
 to 10 calls per agent per 5 min (`429`). Concurrent `/rotate` calls are serialized by conditional
 updates: of two different secrets sent together with `S0`, one is registered and the other one
@@ -222,8 +235,23 @@ longer the current one is closed with `401`.
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
 Prometheus scrapes the console only, never the agents. Protected by
 `Authorization: Bearer <DATABASTION_METRICS_TOKEN>` (constant-time comparison; `401` otherwise,
-`404` when the token is unset). **Internal network only**: do not publish `/metrics` through the
-public reverse proxy (block the path there) and scrape the console directly.
+`404` when the token is unset). **Internal network only**.
+
+Recommended: `DATABASTION_METRICS_PORT` (P1-D). The web process then starts a second, minimal
+`node:http` listener (from `src/instrumentation.ts`, next to the Next.js standalone server) bound to
+`DATABASTION_METRICS_HOST` (`127.0.0.1` by default) that serves only `GET /metrics` (same token,
+same answers; any other path `404`, other methods `405`; 16 connections, 10 s timeouts), and the
+main port answers `404` on `/metrics`. The metrics endpoint is then never reachable through the
+public reverse proxy, whatever its configuration, and nothing depends on client IPs (an IP allowlist
+would rely on `X-Forwarded-For` behind the proxy). A dedicated port was chosen over a custom
+Next.js server because it keeps the generated standalone `server.js` unchanged. In a container,
+set `DATABASTION_METRICS_HOST=0.0.0.0` and do **not** publish the port: Prometheus scrapes it over
+the internal network (see [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml)).
+The listener belongs to the web process only (one per process).
+
+Without `DATABASTION_METRICS_PORT` (default, and the dev setup: `pnpm dev` scraped on port 3000),
+`/metrics` stays on the main port: block the path at the public reverse proxy and scrape the console
+directly.
 
 Frozen names (renaming one is a breaking change; the provisional Grafana dashboard in
 `dev/grafana/` uses the first and the spool one):
@@ -255,10 +283,11 @@ Cardinality caps: 1000 agents (applied in SQL, targets joined to those agents), 
 
 ## Docker image
 [`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,
-`next build` with `NEXT_OUTPUT_STANDALONE=1`, runtime as uid/gid 10001 with root-owned, read-only
+base image and Dockerfile syntax frontend pinned by tag and digest, `next build` with
+`NEXT_OUTPUT_STANDALONE=1`, runtime as uid/gid 10001 with root-owned, read-only
 files: compatible with `read_only: true` (only `/tmp` as tmpfs). Entrypoint commands
 ([docker/entrypoint.sh](docker/entrypoint.sh)): `web` (default, standalone `server.js` on port
-3000), `worker`, `migrate`, `bootstrap-admin`. The worker, the migrator and the bootstrap command run
+3000, plus the metrics listener when `DATABASTION_METRICS_PORT` is set), `worker`, `migrate`, `bootstrap-admin`. The worker, the migrator and the bootstrap command run
 from the TypeScript sources with `tsx` (`node --import tsx`, cache disabled): `tsx` is already the
 production runner of `pnpm worker` / `pnpm db:migrate`, so the image runs exactly the code the tests
 run, with no second bundler configuration to keep in sync; the cost is a larger image (production
@@ -270,14 +299,15 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Data | Storage |
 |------|---------|
 | User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
+| Agent "known good" fingerprints (`agents.known_good_fingerprint`, `known_good_at`, `known_good_pending_fingerprint`) | HMAC-SHA256 (subkey of `DATABASTION_ENCRYPTION_KEY`) over the bound argon2id hash and the 256-bit agent secret; never authenticate, only exempt the last verified secret (24 h, survives restarts) and the pending secret registered by the authenticated agent from the per-agent failure limit; the pending one becomes the current one at promotion; cleared on lock and revocation |
 | Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Masked samples (P2-D), webhook / SMTP settings (later) | AES-256-GCM with `DATABASTION_ENCRYPTION_KEY`, introduced with the first such column |
 
-Rate limiters, the argon2 concurrency cap and the verified-secret cache are in-memory, per
-process: the MVP runs one web process. Several web replicas would need a shared store for the
+Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are in-memory, per
+process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the
 limiters (the secret cache is already safe across processes, as it is bound to the stored hash).
 
 ## Layout
@@ -288,7 +318,8 @@ src/app/                  Next.js App Router (UI + API routes)
 src/app/api/agent/v1/     agent API routes (thin, logic in src/server/agent-api/)
 src/app/api/{auth,agents,enrollment-tokens}/  user API routes (logic in src/server/user-api.ts)
 src/app/(console)/, src/app/login/  UI pages (server components)
-src/app/metrics/          Prometheus endpoint (logic in src/server/metrics.ts)
+src/app/metrics/          Prometheus endpoint on the main port (logic in src/server/metrics.ts;
+                          dedicated listener: src/server/metrics-listener.ts)
 src/components/           UI components (ui/: shadcn-style primitives, console/: pages' parts)
 src/proxy.ts              per-request CSP nonce for UI pages
 docker/                   image entrypoint and healthcheck
