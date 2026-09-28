@@ -133,6 +133,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
+      # Phase 2 exit criterion (ROADMAP P2-F, dev/holdout/README.md): Wilson 95 % lower bound of
+      # recall >= 0.90 and precision >= 0.85 per classifier on the held-out corpus. `--check` first
+      # (labels.json and the pinned corpus SHA-256 up to date), then write the git-ignored
+      # corpus.json; the scorer refuses a corpus whose SHA-256 differs from labels.json. Output is
+      # aggregates plus column ids / tags of the errors, never a value.
+      - name: Holdout classifier gate
+        run: |
+          timeout 120 python3 ../dev/holdout/generate.py --check
+          timeout 120 python3 ../dev/holdout/generate.py > /dev/null
+          cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture
       - name: Minimal build (no connector)
         run: cargo build --no-default-features --locked
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21

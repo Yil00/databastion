@@ -170,3 +170,11 @@ time) and the normalized values are zeroized on drop. Production callers must pa
 - `tests/ground_truth.rs`: column-level recall / precision against `dev/ground-truth.json`, offline,
   from the committed seed (`dev/seed/out/`). `cargo test -p databastion-classifiers --test
   ground_truth -- --nocapture` prints the table (counts only).
+- `tests/holdout.rs`: the phase 2 gate on the independent held-out corpus (`dev/holdout/`,
+  scoring as in its README: Wilson 95 % lower bound, recall ≥ 0.90 and precision ≥ 0.85 per
+  classifier). `#[ignore]`d because the corpus is generated, not committed; when run it never
+  skips. It checks the corpus SHA-256 against `labels.json` first and prints aggregates plus the
+  ids and tags of misclassified columns, never a value:
+  `python3 dev/holdout/generate.py`, then `cargo test -p databastion-classifiers --test holdout
+  -- --ignored --nocapture` (paths overridable with `DATABASTION_HOLDOUT_CORPUS` /
+  `DATABASTION_HOLDOUT_LABELS`). Never tune a classifier against it (independence rule).
