@@ -3,9 +3,10 @@
 //! - Every `valid/<Schema>.<case>.json` must deserialize into `<Schema>`.
 //! - Every `invalid/<Schema>.<case>.json` must be rejected by serde, except
 //!   those in [`NOT_ENFORCED_BY_SERDE`], which rely on a JSON Schema keyword
-//!   the generated types do not express. For those, the console's Ajv
-//!   validation is the enforcement point; agent-side checks of received
-//!   values are a required future step (P1-B, P2). The
+//!   the generated types do not express. For agent -> console bodies, the
+//!   console's Ajv validation is the enforcement point; for console -> agent
+//!   payloads (`JobList`, `HeartbeatResponse`…), the agent's mapping of
+//!   received values is (a required future step: P1-B, P2). The
 //!   allowlist is exact: a fixture listed here that starts failing (or an
 //!   unlisted one that starts passing) fails the test, so it cannot rot.
 
@@ -54,6 +55,24 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
     (
         "JobList.sample-rows-too-large.json",
         "maximum on an integer",
+    ),
+    // Empty scan filters: `Option<Vec<_>>` keeps `[]` distinct from absent
+    // ("all"); see `empty_scan_filters_stay_distinct_from_absent`.
+    (
+        "JobList.scan-empty-classifiers.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-databases.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-include-objects.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-schemas.json",
+        "minItems (Some([]), distinct from absent)",
     ),
     ("JobList.too-many-jobs.json", "maxItems"),
     (
@@ -195,4 +214,56 @@ fn invalid_fixtures_are_rejected_or_allowlisted() {
         accepted, allowlisted,
         "invalid fixtures accepted by serde differ from NOT_ENFORCED_BY_SERDE"
     );
+}
+
+/// Gate for the agent's `discovery.scan` mapping: an empty filter list must
+/// never be read as "absent = all". serde accepts `[]` (it does not enforce
+/// `minItems`), but the generated `Option<Vec<_>>` keeps it distinguishable.
+/// For this console -> agent payload, the agent mapping is the enforcement
+/// point.
+///
+/// TODO(ROADMAP P2-B "Bounded sampling", first scan-job consumer; also P2-C):
+/// when `TryFrom<&DiscoveryScanParams>` for the scanner configuration lands,
+/// add to this test, for each of the 4 fixtures below, the assertion
+/// `assert!(ScanConfig::try_from(&job.params).is_err(), "{file}")`
+/// (empty `databases` / `schemas` / `include_objects` / `classifiers` =>
+/// `Err`, job reported `failed`), and that the valid `JobList` fixtures map
+/// to `Ok`.
+#[test]
+fn empty_scan_filters_stay_distinct_from_absent() {
+    let invalid = fixtures_dir("invalid");
+    type Field = fn(&p::DiscoveryScanParams) -> Option<usize>;
+    let cases: [(&str, Field); 4] = [
+        ("JobList.scan-empty-classifiers.json", |s| {
+            s.classifiers.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-databases.json", |s| {
+            s.databases.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-include-objects.json", |s| {
+            s.include_objects.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-schemas.json", |s| {
+            s.schemas.as_ref().map(Vec::len)
+        }),
+    ];
+    for (file, field) in cases {
+        let json = fs::read_to_string(invalid.join(file)).unwrap();
+        let list: p::JobList = serde_json::from_str(&json).unwrap();
+        let p::Job::DiscoveryScanJob(job) = &list.jobs[0] else {
+            panic!("{file}: not a discovery.scan job");
+        };
+        assert_eq!(
+            field(&job.params),
+            Some(0),
+            "{file}: [] must be Some(empty)"
+        );
+    }
+    // Absent stays `None`.
+    let absent: p::DiscoveryScanParams =
+        serde_json::from_str(r#"{"sample_rows": 200, "max_duration_s": 900}"#).unwrap();
+    assert!(absent.databases.is_none());
+    assert!(absent.schemas.is_none());
+    assert!(absent.include_objects.is_none());
+    assert!(absent.classifiers.is_none());
 }

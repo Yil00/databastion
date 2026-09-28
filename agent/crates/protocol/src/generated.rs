@@ -22,6 +22,13 @@
 // - #/$defs/DiscoveryScanJob/properties/type/const
 //
 // Patterns wrapped as `^[\s\S]*?(?:P)` (search semantics, same language): 25.
+//
+// Optional arrays with `minItems >= 1` generated as `Option<Vec<_>>` (absent != empty;
+// `Some([])` is accepted by serde and must be rejected by the agent-side mapping):
+// - #/$defs/DiscoveryScanParams/properties/classifiers
+// - #/$defs/DiscoveryScanParams/properties/databases
+// - #/$defs/DiscoveryScanParams/properties/include_objects
+// - #/$defs/DiscoveryScanParams/properties/schemas
 
 /**Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
 and no returned value: only who, what object, which action, how many rows, and signals.
@@ -402,7 +409,11 @@ reported when they return at least this many rows.
     ///Polling interval for polled sources (`performance_schema`, `pg_stat_activity`, `cn=accesslog`, profiler).
     #[serde(default = "defaults::default_nzu64::<::std::num::NonZeroU64, 10>")]
     pub poll_interval_s: ::std::num::NonZeroU64,
-    ///Objects classified as sensitive by Discovery, whose accesses are always reported.
+    /**Objects classified as sensitive by Discovery, whose accesses are always reported. Absent or
+empty = no object is flagged sensitive: the settings replace the previous ones as a whole, so
+an empty list legitimately clears them. An empty list narrows reporting to events that carry
+a signal or reach `min_rows`; it can never widen what is reported.
+*/
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub sensitive_objects: ::std::vec::Vec<SensitiveObject>,
 }
@@ -1060,25 +1071,34 @@ a per-statement timeout on every query.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryScanParams {
-    ///Restrict the scan to these classifiers. Absent = all classifiers of the version.
+    /**Restrict the scan to these classifiers. Absent = all classifiers of `classifiers_version`.
+An empty list is rejected (`minItems: 1`): it never means "no classifiers" nor "all".
+*/
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub classifiers: ::std::option::Option<::std::vec::Vec<ClassifierId>>,
-    ///Databases (or LDAP suffixes) to include. Absent = all visible to the account.
-    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
-    pub databases: ::std::vec::Vec<IdentifierPattern>,
-    ///Tables / collections / objectClasses to skip.
+    /**Databases (or LDAP suffixes) to include. Absent = all visible to the account. An empty list is
+rejected (`minItems: 1`) so that a "none selected" bug can never widen a scan to everything.
+*/
+    #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+    pub databases: ::std::option::Option<::std::vec::Vec<IdentifierPattern>>,
+    /**Tables / collections / objectClasses to skip. Absent or empty = nothing skipped (an empty list
+cannot widen the scan beyond the include filters, so it is accepted).
+*/
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub exclude_objects: ::std::vec::Vec<IdentifierPattern>,
-    ///Tables / collections / objectClasses to include. Absent = all.
-    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
-    pub include_objects: ::std::vec::Vec<IdentifierPattern>,
+    /**Tables / collections / objectClasses to include. Absent = all. An empty list is rejected
+(`minItems: 1`).
+*/
+    #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+    pub include_objects: ::std::option::Option<::std::vec::Vec<IdentifierPattern>>,
     ///Wall-clock budget of the whole scan.
     pub max_duration_s: i64,
     ///Maximum rows (documents, entries) sampled per object.
     pub sample_rows: ::std::num::NonZeroU64,
-    ///Schemas to include (PostgreSQL). Absent = all.
-    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
-    pub schemas: ::std::vec::Vec<IdentifierPattern>,
+    /**Schemas to include (PostgreSQL). Absent = all. An empty list is rejected (`minItems: 1`).
+*/
+    #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+    pub schemas: ::std::option::Option<::std::vec::Vec<IdentifierPattern>>,
     ///Timeout applied to each query against the target.
     #[serde(default = "defaults::default_u64::<i64, 30000>")]
     pub statement_timeout_ms: i64,
