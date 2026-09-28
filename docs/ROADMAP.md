@@ -60,8 +60,8 @@ Items prefixed with **Gate** come from a security review: they block the complet
 ## Phase 3 – Policies, incidents, alerting
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P3-A Policy engine | `console-engineer` | [~] Condition → action model · [~] Execution in the worker · [~] Exceptions (in review, `feat/p3-a-policies-incidents`, [ADR-0014](adr/0014-policy-and-incident-model.md)) · [ ] Confirmation, console audit-log entry and a warning on the target when an `audit.configure` change makes `sensitive_objects` empty or removes many objects (protocol contract review, #13; also P4-C) |
-| P3-B Incidents | `console-engineer` | [~] Lifecycle (open, acknowledged, resolved, false positive) · [~] UI (in review, `feat/p3-a-policies-incidents`, [ADR-0014](adr/0014-policy-and-incident-model.md)) |
+| P3-A Policy engine | `console-engineer` | [x] Condition → action model · [x] Execution in the worker · [x] Exceptions (#45, [ADR-0014](adr/0014-policy-and-incident-model.md)) · [ ] Confirmation, console audit-log entry and a warning on the target when an `audit.configure` change makes `sensitive_objects` empty or removes many objects (protocol contract review, #13; also P4-C) |
+| P3-B Incidents | `console-engineer` | [x] Lifecycle (open, acknowledged, resolved, false positive) · [x] UI (#45, [ADR-0014](adr/0014-policy-and-incident-model.md)) |
 | P3-C Alerting | `console-engineer` | [ ] SMTP · [ ] HMAC-signed webhook · [ ] "Silent agent" alert |
 
 ## Phase 4 – SQL Audit

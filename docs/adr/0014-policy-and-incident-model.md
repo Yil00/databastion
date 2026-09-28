@@ -2,7 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-28
-- **Context references**: P3-A and P3-B, branch `feat/p3-a-policies-incidents` (`console/src/lib/policy-model.ts`, `console/src/lib/incident-lifecycle.ts`, `console/src/server/incidents.ts`, `console/src/server/policy-queue.ts`, migrations `0014_p3_policies_incidents.sql` and `0015_incidents_runtime_grants.sql`)
+- **Context references**: P3-A and P3-B, #45 (`console/src/lib/policy-model.ts`, `console/src/lib/incident-lifecycle.ts`, `console/src/server/incidents.ts`, `console/src/server/policy-queue.ts`, migrations `0014_p3_policies_incidents.sql`, `0015_incidents_runtime_grants.sql` and `0016_incidents_update_columns.sql`)
 
 ## Context
 Phase 3 turns findings into incidents. The model must stay valid when phase 4 adds access events as a second source, must not duplicate or lose incidents when jobs are lost, repeated or run concurrently, must agree with the existing false-positive decision on findings (migration 0013), and must hold no sampled value (I2). Several of these choices are hard to change once policies and incidents exist in deployed databases.
