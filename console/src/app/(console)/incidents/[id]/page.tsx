@@ -2,12 +2,14 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { DeliveriesTable } from "@/components/console/deliveries-table";
+import { EventsTable, PrincipalLabel } from "@/components/console/events-table";
 import { FindingsTable } from "@/components/console/findings-table";
 import { IncidentActions } from "@/components/console/incident-actions";
 import { IncidentStatusBadge, SeverityBadge } from "@/components/console/incidents-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
+import { incidentEventCount, incidentEventViews } from "@/server/events";
 import { getFindingView } from "@/server/findings";
 import { getIncident } from "@/server/incidents";
 import { listDeliveries } from "@/server/notifications";
@@ -18,7 +20,7 @@ export const dynamic = "force-dynamic";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Incident detail: lifecycle, policy, and the linked finding. The finding's masked samples are
+ * Incident detail: lifecycle, policy, and the linked finding or access events (P4-C). The finding's masked samples are
  * decrypted server side through the findings view path and rendered into this per-request page
  * only (`Cache-Control: no-store`); the incident itself stores no sampled value.
  */
@@ -29,10 +31,13 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
   const db = getDb();
   const incident = await getIncident(db, id);
   if (!incident) notFound();
-  const [finding, deliveries] = await Promise.all([
+  const [finding, deliveries, events, eventCount] = await Promise.all([
     incident.findingId ? getFindingView(db, incident.findingId) : null,
     listDeliveries(db, { incidentId: incident.id }),
+    incident.access ? incidentEventViews(db, incident.id) : [],
+    incident.access ? incidentEventCount(db, incident.id) : 0,
   ]);
+  const access = incident.access;
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const trail: [string, Date | null, string | null][] = [
@@ -79,13 +84,38 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
             <dd>
               {incident.agentName ?? "?"} / {incident.targetId ?? "?"}
             </dd>
-            <dt className="text-muted-foreground">Classifier</dt>
-            <dd>{incident.classifier ?? ""}</dd>
-            <dt className="text-muted-foreground">Matches</dt>
-            <dd>
-              {incident.matchCount} scan{incident.matchCount > 1 ? "s" : ""}
-              {incident.findingMatched !== null ? `, ${incident.findingMatched} values matched at the last one` : ""}
-            </dd>
+            {access ? (
+              <>
+                <dt className="text-muted-foreground">Principal</dt>
+                <dd className="break-all">
+                  <PrincipalLabel principal={access.principal} fingerprinted={access.principal.startsWith("hmac-sha256:")} />
+                </dd>
+                <dt className="text-muted-foreground">Database</dt>
+                <dd>
+                  {access.database ?? "none"}{" "}
+                  <span className="text-muted-foreground">
+                    hour starting {access.bucket?.toISOString().slice(0, 13).replace("T", " ")}:00 UTC
+                  </span>
+                </dd>
+                <dt className="text-muted-foreground">Matches</dt>
+                <dd>
+                  {incident.matchCount} event{incident.matchCount > 1 ? "s" : ""}, {Math.round(access.rows ?? 0)} rows, highest score{" "}
+                  {access.score ?? 0}
+                </dd>
+                <dt className="text-muted-foreground">Signals</dt>
+                <dd>{access.signals.length > 0 ? access.signals.join(", ") : "none"}</dd>
+              </>
+            ) : (
+              <>
+                <dt className="text-muted-foreground">Classifier</dt>
+                <dd>{incident.classifier ?? ""}</dd>
+                <dt className="text-muted-foreground">Matches</dt>
+                <dd>
+                  {incident.matchCount} scan{incident.matchCount > 1 ? "s" : ""}
+                  {incident.findingMatched !== null ? `, ${incident.findingMatched} values matched at the last one` : ""}
+                </dd>
+              </>
+            )}
             <dt className="text-muted-foreground">Notify</dt>
             <dd>{incident.notifyChannels.length > 0 ? incident.notifyChannels.join(", ") : "none"}</dd>
             {trail
@@ -111,18 +141,37 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
           <DeliveriesTable deliveries={deliveries} now={now} />
         </CardContent>
       </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>Linked finding</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {finding ? (
-            <FindingsTable findings={[finding]} csrfToken={session.csrfToken} now={now} canMark={false} />
-          ) : (
-            <p className="text-sm text-muted-foreground">The finding is no longer available (agent or target removed).</p>
-          )}
-        </CardContent>
-      </Card>
+      {access ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Access events</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2">
+            {eventCount > events.length && (
+              <p className="text-sm text-muted-foreground">
+                Showing the latest {events.length} of {eventCount} events (older ones may have been purged by the retention).
+              </p>
+            )}
+            {eventCount === 0 && (
+              <p className="text-sm text-muted-foreground">The events of this incident are past the retention and were purged.</p>
+            )}
+            <EventsTable events={events} now={now} />
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle>Linked finding</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {finding ? (
+              <FindingsTable findings={[finding]} csrfToken={session.csrfToken} now={now} canMark={false} />
+            ) : (
+              <p className="text-sm text-muted-foreground">The finding is no longer available (agent or target removed).</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

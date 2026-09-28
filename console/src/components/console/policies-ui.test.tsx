@@ -160,6 +160,7 @@ describe("policies view", () => {
       name: "Emails",
       description: "d",
       enabled: true,
+      source: "finding",
       conditions: p.conditions,
       actions: p.actions,
     });
@@ -170,6 +171,7 @@ describe("policies view", () => {
       name: "x",
       description: null,
       enabled: true,
+      source: "finding",
       conditions: {},
       actions: [{ type: "create_incident", severity: "low" }],
     });

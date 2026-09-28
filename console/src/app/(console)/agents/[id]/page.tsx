@@ -9,7 +9,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { getDb } from "@/db/client";
 import { displayStatus, formatAge } from "@/lib/agent-status";
+import { auditWarningText } from "@/lib/audit-warning";
+import { eventsHref } from "@/lib/events-filter";
 import { getAgentDetail } from "@/server/agents";
+import { auditSummaries } from "@/server/audit-config";
 import { rotationBlocked } from "@/server/rotation";
 import { latestScans, scanStatusLabel } from "@/server/scans";
 import { requestTime, requirePageSession } from "@/server/ui-session";
@@ -25,7 +28,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
   if (!UUID.test(id)) notFound();
   const agent = await getAgentDetail(getDb(), id);
   if (!agent) notFound();
-  const scans = await latestScans(getDb(), id);
+  const [scans, audits] = await Promise.all([latestScans(getDb(), id), auditSummaries(getDb(), id)]);
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const status = displayStatus(agent, now);
@@ -94,6 +97,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                   <TableHead>Last error</TableHead>
                   <TableHead>Reported</TableHead>
                   <TableHead>Last scan</TableHead>
+                  <TableHead>Audit settings</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
@@ -118,10 +122,31 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                         return `${scanStatusLabel(scan, agent.classifiersVersion)}, ${formatAge(scan.createdAt, now)}`;
                       })()}
                     </TableCell>
+                    <TableCell className="max-w-56 whitespace-normal">
+                      {(() => {
+                        const a = audits.get(t.targetId);
+                        const label = !a ? "not configured" : a.enabled ? `enabled, ${a.objects} sensitive objects` : "disabled";
+                        return (
+                          <>
+                            <Link className="hover:underline" prefetch={false} href={`/agents/${agent.id}/targets/${t.targetId}/audit`}>
+                              {label}
+                            </Link>
+                            {a?.warning && (
+                              <p role="alert" className="text-xs text-destructive">
+                                {auditWarningText(a.warning, a.warningRemoved)}
+                              </p>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </TableCell>
                     <TableCell>
                       <div className="flex items-start gap-2">
                         <Link className="text-sm hover:underline" prefetch={false} href={findingsHref({ agent: agent.id, target: t.targetId })}>
                           Findings
+                        </Link>
+                        <Link className="text-sm hover:underline" prefetch={false} href={eventsHref({ agent: agent.id, target: t.targetId })}>
+                          Events
                         </Link>
                         {isAdmin && active && t.present && (
                           <ScanDialog

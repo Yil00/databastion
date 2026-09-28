@@ -2,6 +2,7 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, auditConfigs, findings, jobs } from "@/db/schema";
+import type { AuditWarning } from "@/lib/audit-warning";
 import { objectSensitivity } from "@/lib/event-model";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
@@ -40,7 +41,7 @@ export const AUDIT_DEFAULTS = { aggregation_window_s: 60, poll_interval_s: 10 } 
 
 export type AuditConfigureParams = Schemas["AuditConfigureParams"];
 export type SensitiveObject = Schemas["SensitiveObject"];
-export type AuditWarning = "disabled" | "emptied" | "shrunk";
+export type { AuditWarning } from "@/lib/audit-warning";
 
 export interface AuditConfigInput {
   enabled: boolean;
