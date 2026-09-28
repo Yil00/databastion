@@ -25,10 +25,13 @@ PSQL='PGPASSWORD="$DATABASTION_DB_PASSWORD" psql -h 127.0.0.1 -U databastion -d 
 check "read-only account can read" ex postgres "$PSQL -c 'SELECT count(*) FROM crm.customers' | grep -Eq '^[1-9]'"
 check "read-only account cannot write" must_fail ex postgres "$PSQL -c 'DELETE FROM billing.invoices WHERE id = -1'"
 # ADR-0012 minimal variant: no pg_read_all_data, so the credential-bearing catalogs are denied.
-check "read-only account cannot SELECT pg_authid" must_fail ex postgres \
-  "$PSQL -c 'SELECT count(*) FROM pg_catalog.pg_authid'"
-check "read-only account cannot read pg_user_mapping" must_fail ex postgres \
-  "$PSQL -c 'SELECT count(*) FROM pg_catalog.pg_user_mapping'"
+# Asserted as privileges (not "the query failed"), so a connection error cannot pass for a denial.
+check "read-only account cannot read pg_authid / pg_user_mapping" ex postgres \
+  "$PSQL -c \"SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')
+     OR has_table_privilege('pg_catalog.pg_user_mapping', 'SELECT')\" | grep -qx f"
+check "read-only account attributes (no superuser / createdb / createrole / replication / bypassrls, limit 4)" \
+  ex postgres "$PSQL -c \"SELECT concat_ws(',', rolsuper, rolcreatedb, rolcreaterole, rolreplication,
+     rolbypassrls, rolconnlimit) FROM pg_roles WHERE rolname = current_user\" | grep -qx 'f,f,f,f,f,4'"
 check "read-only account role defaults (read-only, timeouts)" ex postgres \
   "$PSQL -c \"SELECT current_setting('default_transaction_read_only') = 'on'
      AND current_setting('statement_timeout')::interval = '30s'

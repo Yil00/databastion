@@ -26,7 +26,11 @@ set -euo pipefail
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   -v dbname="$POSTGRES_DB" -v owner="$POSTGRES_USER" <<'EOSQL'
+-- Test-only deviation from ADR-0012 (psql's password meta-command is interactive): the role password is set with a
+-- PASSWORD literal. It is not recorded: track_utility is off for this session, pgaudit and
+-- log_statement do not log ROLE statements here, and a failing statement is not logged either.
 SET pg_stat_statements.track_utility = off;
+SET log_min_error_statement = panic;
 CREATE EXTENSION IF NOT EXISTS pgaudit;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 

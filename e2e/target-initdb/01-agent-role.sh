@@ -20,6 +20,10 @@
 # environment, nor interpolated by the shell (quoted heredoc).
 set -eu
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+-- Test-only deviation from ADR-0012 (psql's password meta-command is interactive): the role
+-- password is set with a PASSWORD literal. It is not recorded: pg_stat_statements is not loaded
+-- here, log_statement does not log ROLE statements, and a failing statement is not logged either.
+SET log_min_error_statement = panic;
 \set agent_password `cat /run/secrets/target_agent_password`
 CREATE ROLE databastion_agent LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   CONNECTION LIMIT 4 PASSWORD :'agent_password';
