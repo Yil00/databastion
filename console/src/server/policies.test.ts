@@ -1,8 +1,12 @@
 import { and, eq, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Client, Pool } from "pg";
 import { PgBoss } from "pg-boss";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb } from "@/db/client";
+import * as schema from "@/db/schema";
+import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { auditLog, findings, incidents, policies, policyExceptions, users } from "@/db/schema";
 import { logger } from "@/lib/logger";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
@@ -13,7 +17,7 @@ import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 import { pgBossOptions, registerPolicyQueue } from "@/worker/queues";
 
-import { dedupKey, drainPolicyWork, getIncident, listIncidents } from "./incidents";
+import { dedupKey, drainPolicyWork, getIncident, listIncidents, reopensResolved, transitionIncident } from "./incidents";
 import { POLICY_QUEUE, setPolicyJobSender } from "./policy-queue";
 import {
   handleCreateException,
@@ -493,16 +497,101 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect(failures[0]?.details).toMatchObject({ from: "resolved", to: "acknowledged", reason: "invalid_transition" });
     });
 
-    it("a resolved incident stays closed until the finding grows or is reclassified", async () => {
+    it("M1: resolved = remediated; a later scan that still sees the finding opens a new incident", async () => {
       const { auth, id } = await openIncident();
-      expect((await transition(id, "resolved")).status).toBe(204);
-      await scanWith(auth, [finding()]);
+      expect((await transition(id, "resolved", analyst)).status).toBe(204);
+      // No rescan: re-evaluations (retries, a full pass after a policy edit) open nothing.
+      await drainPolicyWork(getDb());
+      await getDb().update(policies).set({ changedAt: sql`now()` });
       await drainPolicyWork(getDb());
       expect(await incidentsOf(auth.agentId)).toHaveLength(1);
-      await scanWith(auth, [finding({ matched: 180 })]);
+      // A rescan with identical data still sees the finding: a new incident.
+      await scanWith(auth, [finding()]);
+      await drainPolicyWork(getDb());
       await drainPolicyWork(getDb());
       const rows = await incidentsOf(auth.agentId);
       expect(rows.map((r) => r.status)).toEqual(["resolved", "open"]);
+      expect(rows[1]?.matchCount).toBe(1);
+    });
+
+    it("M1: an admin false positive stays silent across identical rescans", async () => {
+      const { auth, id } = await openIncident();
+      expect((await transition(id, "false_positive")).status).toBe(204);
+      await scanWith(auth, [finding()]);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(auth.agentId)).map((r) => r.status)).toEqual(["false_positive"]);
+    });
+
+    it("M1: reopensResolved keeps the growth / reclassification triggers", () => {
+      const t = new Date("2026-09-28T12:00:00Z");
+      const inc = { resolvedAt: t, findingMatched: 150, findingClassifiersVersion: "2026.09.1" };
+      const f = { lastSeenAt: new Date(t.getTime() - 1000), matched: 150, classifiersVersion: "2026.09.1" };
+      expect(reopensResolved(inc, f)).toBe(false);
+      expect(reopensResolved(inc, { ...f, lastSeenAt: new Date(t.getTime() + 1) })).toBe(true);
+      expect(reopensResolved(inc, { ...f, matched: 151 })).toBe(true);
+      expect(reopensResolved(inc, { ...f, classifiersVersion: "2099.01.1" })).toBe(true);
+    });
+
+    it("L3: an incident resolved while the engine re-matches it falls through to the resolved rules", async () => {
+      const { auth, id } = await openIncident();
+      await scanWith(auth, [finding()]);
+      const c = new Client({ connectionString: process.env.DATABASE_URL });
+      await c.connect();
+      try {
+        await c.query("begin");
+        // Resolved before the rescan (so the rescan reopens it), row lock held until commit.
+        await c.query(
+          "update incidents set status = 'resolved', resolved_at = now() - interval '1 hour' where id = $1",
+          [id],
+        );
+        const drain = drainPolicyWork(getDb());
+        await new Promise((r) => setTimeout(r, 300));
+        await c.query("commit");
+        await drain;
+      } finally {
+        await c.end();
+      }
+      const rows = await incidentsOf(auth.agentId);
+      expect(rows.map((r) => r.status)).toEqual(["resolved", "open"]);
+    });
+
+    it("L1: a false-positive transition and the engine on the same finding do not deadlock", async () => {
+      for (let i = 0; i < 3; i++) {
+        await getDb().delete(policies);
+        const { auth, id } = await openIncident();
+        await scanWith(auth, [finding()]);
+        const [t] = await Promise.all([transition(id, "false_positive"), drainPolicyWork(getDb())]);
+        expect(t.status).toBe(204);
+        await drainPolicyWork(getDb());
+        expect((await incidentsOf(auth.agentId)).map((r) => r.status)).toEqual(["false_positive"]);
+      }
+    });
+
+    it("L4: an incomplete full pass does not hold back the pending findings", async () => {
+      const auth = await agentWithTargets();
+      const emailPolicy = await newPolicy();
+      await newPolicy({ ...EMAIL_POLICY, name: "Phones", conditions: { classifiers: ["pii.phone"], min_matched: 45 } });
+      await scanWith(auth, [finding(), PHONE]);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(auth.agentId)).map((r) => r.classifier)).toEqual(["pii.email"]);
+      // The phone finding becomes pending and matching; the e-mail policy needs a full pass.
+      await scanWith(auth, [{ ...PHONE, matched: 50 }]);
+      await getDb().update(policies).set({ changedAt: sql`now()` }).where(eq(policies.id, emailPolicy));
+      const email = await findingId(auth.agentId);
+      const c = new Client({ connectionString: process.env.DATABASE_URL });
+      await c.connect();
+      try {
+        await c.query("begin");
+        await c.query("select 1 from findings where id = $1 for update", [email]);
+        const stats = await drainPolicyWork(getDb());
+        expect(stats.more).toBe(true);
+        await c.query("commit");
+      } finally {
+        await c.end();
+      }
+      expect((await incidentsOf(auth.agentId)).map((r) => r.classifier).sort()).toEqual(["pii.email", "pii.phone"]);
+      const [p] = await getDb().select().from(policies).where(eq(policies.id, emailPolicy));
+      expect(p !== undefined && (p.evaluatedAt === null || p.evaluatedAt < p.changedAt)).toBe(true);
     });
 
     it("false positive: admin only; marks the finding and closes its incidents; unmarking re-evaluates", async () => {
@@ -585,13 +674,55 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect(dump).not.toContain("e******");
     });
 
-    it("the runtime role cannot delete or truncate incidents (migration 0015)", async () => {
+    it("the runtime role cannot delete incidents nor rewrite their snapshot (migrations 0015, 0016)", async () => {
       const res = await getDb().execute(sql`
         select has_table_privilege('databastion_app', 'public.incidents', 'DELETE') as del,
                has_table_privilege('databastion_app', 'public.incidents', 'TRUNCATE') as trunc,
                has_table_privilege('databastion_app', 'public.incidents', 'UPDATE') as upd,
+               has_column_privilege('databastion_app', 'public.incidents', 'status', 'UPDATE') as status_upd,
+               has_column_privilege('databastion_app', 'public.incidents', 'match_count', 'UPDATE') as count_upd,
+               has_column_privilege('databastion_app', 'public.incidents', 'severity', 'UPDATE') as sev_upd,
+               has_column_privilege('databastion_app', 'public.incidents', 'dedup_key', 'UPDATE') as key_upd,
+               has_column_privilege('databastion_app', 'public.incidents', 'policy_name', 'UPDATE') as name_upd,
                has_table_privilege('databastion_app', 'public.policies', 'DELETE') as pdel`);
-      expect(res.rows[0]).toEqual({ del: false, trunc: false, upd: true, pdel: true });
+      expect(res.rows[0]).toEqual({
+        del: false,
+        trunc: false,
+        upd: false,
+        status_upd: true,
+        count_upd: true,
+        sev_upd: false,
+        key_upd: false,
+        name_upd: false,
+        pdel: true,
+      });
+    });
+
+    it("the whole lifecycle and the engine work as the runtime role; the role check stays quiet", async () => {
+      const { url } = await createRuntimeRole();
+      const auth = await agentWithTargets();
+      await newPolicy();
+      await scanWith(auth, [finding()]);
+      const pool = new Pool({ connectionString: url, max: 2 });
+      try {
+        const db = drizzle(pool, { schema });
+        await drainPolicyWork(db);
+        const [row] = await incidentsOf(auth.agentId);
+        const actor = { userId: analystId, ip: null };
+        expect(await transitionIncident(db, String(row?.id), "acknowledged", actor)).toEqual({ outcome: "ok", from: "open" });
+        await scanWith(auth, [finding()]);
+        await drainPolicyWork(db);
+        expect((await incidentsOf(auth.agentId))[0]?.matchCount).toBe(2);
+        expect(await transitionIncident(db, String(row?.id), "false_positive", actor)).toEqual({
+          outcome: "ok",
+          from: "acknowledged",
+        });
+        await expect(pool.query("update incidents set severity = 'low'")).rejects.toThrow(/permission denied/);
+        await expect(pool.query("delete from incidents")).rejects.toThrow(/permission denied/);
+        expect(await runtimeRoleWarnings(pool)).toEqual([]);
+      } finally {
+        await pool.end();
+      }
     });
   });
 });

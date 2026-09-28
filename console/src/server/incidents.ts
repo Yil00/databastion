@@ -130,6 +130,25 @@ type FindingRow = FindingFacts & {
   falsePositiveAt: Date | null;
 };
 
+/**
+ * M1: `resolved` means remediated. A resolved incident is followed by a new one when a scan that
+ * ran after the resolution still sees the finding (`last_seen_at` of the finding, set by the
+ * database clock at ingestion, later than `resolved_at`, same clock), or when the finding matches
+ * more values or is classified by another classifier set (the false-positive reset rule). Durable
+ * suppression is an administrator decision: a false positive or an exception.
+ */
+export function reopensResolved(
+  incident: { resolvedAt: Date | null; findingMatched: number | null; findingClassifiersVersion: string | null },
+  f: { lastSeenAt: Date; matched: number; classifiersVersion: string },
+): boolean {
+  if (incident.resolvedAt === null || f.lastSeenAt.getTime() > incident.resolvedAt.getTime()) return true;
+  return fpResetNeeded(
+    { falsePositiveMatched: incident.findingMatched, falsePositiveClassifiersVersion: incident.findingClassifiersVersion },
+    f.matched,
+    f.classifiersVersion,
+  );
+}
+
 export const dedupKey = (policyId: string, findingId: string) => `policy:${policyId}|finding:${findingId}`;
 
 type ApplyResult = "created" | "rematched" | "unchanged" | "suppressed" | "excepted" | "no_match";
@@ -145,18 +164,22 @@ async function applyPolicy(
   if (!findingMatches(policy.conditions, f)) return "no_match";
   if (exceptions.some((e) => exceptionCovers(e, policy.id, f, now))) return "excepted";
   const key = dedupKey(policy.id, f.id);
-  const [latest] = await tx
-    .select({
-      id: incidents.id,
-      status: incidents.status,
-      findingMatched: incidents.findingMatched,
-      findingClassifiersVersion: incidents.findingClassifiersVersion,
-      lastFindingSeenAt: incidents.lastFindingSeenAt,
-    })
-    .from(incidents)
-    .where(eq(incidents.dedupKey, key))
-    .orderBy(desc(incidents.createdAt), desc(incidents.id))
-    .limit(1);
+  const readLatest = async () =>
+    (
+      await tx
+        .select({
+          id: incidents.id,
+          status: incidents.status,
+          findingMatched: incidents.findingMatched,
+          findingClassifiersVersion: incidents.findingClassifiersVersion,
+          resolvedAt: incidents.resolvedAt,
+        })
+        .from(incidents)
+        .where(eq(incidents.dedupKey, key))
+        .orderBy(desc(incidents.createdAt), desc(incidents.id))
+        .limit(1)
+    )[0];
+  let latest = await readLatest();
   if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) {
     // One bump per finding revision: re-evaluating the same revision changes nothing.
     const updated = await tx
@@ -176,20 +199,13 @@ async function applyPolicy(
         ),
       )
       .returning({ id: incidents.id });
-    return updated.length > 0 ? "rematched" : "unchanged";
+    if (updated.length > 0) return "rematched";
+    // L3: nothing updated. Either this revision was already counted, or the incident was closed
+    // concurrently (e.g. resolved): re-read, and apply the closed-incident rules in that case.
+    latest = await readLatest();
+    if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) return "unchanged";
   }
-  if (
-    latest?.status === "resolved" &&
-    !fpResetNeeded(
-      { falsePositiveMatched: latest.findingMatched, falsePositiveClassifiersVersion: latest.findingClassifiersVersion },
-      f.matched,
-      f.classifiersVersion,
-    )
-  ) {
-    // Same rule as the false-positive reset: a resolved incident stays closed until the finding
-    // matches more values or is classified by another classifier set.
-    return "suppressed";
-  }
+  if (latest?.status === "resolved" && !reopensResolved(latest, f)) return "suppressed";
   const inserted = await tx
     .insert(incidents)
     .values({
@@ -273,10 +289,9 @@ export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } 
     }
     const done = await fullPass(db, id, deadline, count);
     stats.policyPasses += 1;
-    if (!done) {
-      stats.more = true;
-      return stats;
-    }
+    // L4: an incomplete pass (rows locked by a writer, time budget) leaves the policy pending, but
+    // never holds back the pending findings below.
+    if (!done) stats.more = true;
   }
 
   // 2. Pending findings, against every enabled policy.
@@ -314,7 +329,7 @@ export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } 
         .select({ n: sql<number>`count(*)::int` })
         .from(findings)
         .where(sql`${findings.policyEvaluatedAt} is distinct from ${findings.lastSeenAt}`);
-      stats.more = (left?.n ?? 0) > 0;
+      stats.more = stats.more || (left?.n ?? 0) > 0;
       return stats;
     }
   }
@@ -394,6 +409,12 @@ export async function transitionIncident(
   actor: { userId: string; ip: string | null },
 ): Promise<TransitionOutcome> {
   return db.transaction(async (tx) => {
+    // L1: same lock order as the policy engine and the findings writers: the finding first, then
+    // the incident. `finding_id` only ever changes to null (finding deleted), which is re-checked.
+    const [link] = await tx.select({ findingId: incidents.findingId }).from(incidents).where(eq(incidents.id, incidentId));
+    if (link?.findingId) {
+      await tx.select({ id: findings.id }).from(findings).where(eq(findings.id, link.findingId)).for("update");
+    }
     const [current] = await tx
       .select({ status: incidents.status, findingId: incidents.findingId })
       .from(incidents)

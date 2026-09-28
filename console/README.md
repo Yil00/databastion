@@ -88,8 +88,10 @@ and migrations must never run code planted by the console. Production uses three
 
 Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql`,
 `0010_security_events_no_delete.sql`, `0012_findings_runtime_grants.sql` (`findings_batches`:
-`SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`) and `0015_incidents_runtime_grants.sql`
-(`incidents`: no `DELETE`, `TRUNCATE`) (custom, every name schema-qualified). Migration
+`SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`), `0015_incidents_runtime_grants.sql`
+(`incidents`: no `DELETE`, `TRUNCATE`) and `0016_incidents_update_columns.sql` (`incidents`:
+`UPDATE` only on the lifecycle columns and the engine's re-match counters, never the policy
+snapshot, severity, dedup key or subject) (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
@@ -101,7 +103,7 @@ first database initialization, reading the passwords from the Docker secret file
 (never on a command line). The worker runs pg-boss with `schema: 'pgboss'`, `createSchema: false`.
 
 At startup, the web and worker processes log a warning if their database role is a superuser or
-owns `audit_log`.
+owns `audit_log`, or if it can delete incidents or rewrite their snapshot columns.
 
 Rule: the owner role must never run SQL against objects inside schema `pgboss` (DML, DDL, manual
 maintenance). pg-boss creates them as the runtime role, so a trigger or function planted there by
@@ -395,7 +397,7 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | HMAC fingerprints (`findings.fingerprints`) | as sent by the agent (keyed by its local key, which never leaves it) |
 | Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch in canonical JSON (keys sorted recursively), job, item count: idempotency only, never the body. Append-only for the runtime role (migration `0012`: no `UPDATE`, `DELETE`, `TRUNCATE`); `findings` rows cannot be deleted by it either |
 | Policies, exceptions (`policies`, `policy_exceptions`) | plain columns: admin-typed name, description, reason; condition and action documents holding only identifiers, globs on normalized names, thresholds, severities and channel references; never a sampled value |
-| Incidents (`incidents`) | plain columns: policy snapshot (id, name, revision), severity, status and who / when of each transition, finding id, agent, target, classifier, `matched` and `classifiers_version` snapshots, `dedup_key`; no sampled value (the samples stay encrypted on the finding). Never deleted by the runtime role (migration `0015`) |
+| Incidents (`incidents`) | plain columns: policy snapshot (id, name, revision), severity, status and who / when of each transition, finding id, agent, target, classifier, `matched` and `classifiers_version` snapshots, `dedup_key`; no sampled value (the samples stay encrypted on the finding). Never deleted by the runtime role, which may only update the lifecycle and re-match columns (migrations `0015`, `0016`) |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
@@ -422,7 +424,10 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   and copied to each incident (`notify_channels`); delivery comes with P3-C.
 - **Exceptions**: scoped to one policy or to all, by agent, target, classifier (id or family) and / or
   location globs (at least one), with a mandatory reason and an optional expiry. A covered finding
-  opens no incident; expired exceptions are listed as expired and ignored.
+  opens no incident; expired exceptions are listed as expired and ignored. An exception without a
+  policy is global: scoped to a classifier family (e.g. `pii.*`) alone, it silences that family for
+  every policy and every target. Only administrators create one, and it is audited
+  (`policy_exception.create`).
 - **Execution** (worker, pg-boss queue `policies.evaluate`, `stately`, no payload): the web process
   sends a wake-up after the commit of an accepted findings batch and after a policy or exception
   change; the worker also schedules it every minute. The work itself is recorded in the tables, so a
@@ -432,17 +437,21 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   `evaluated_at` is older than `changed_at` (creation, edit of conditions / actions / enablement,
   deletion of one of its exceptions) or than the expiry of one of its exceptions. Findings are
   processed in chunks of 200 per transaction, row-locked (`SKIP LOCKED`: rows held by an ingestion
-  are left pending), so an evaluation never races an ingestion or a false-positive marking. A job
+  are left pending), so an evaluation never races an ingestion or a false-positive marking. An
+  incomplete full pass leaves its policy pending without holding back the pending findings. A job
   runs for at most 50 s and re-queues itself when work remains.
 - **Dedup**: `dedup_key = policy:<id>|finding:<id>`; a partial unique index allows one open or
   acknowledged incident per key. A later scan of the same finding increments `match_count` once per
-  finding revision. After `resolved`, a new incident opens only when the finding matches more values
-  or is reclassified by another classifier set (the rule that also resets a false positive). A
-  false-positive finding never opens an incident. Incident creation is audited `incident.create`
-  (system actor).
+  finding revision. **`resolved` means remediated**: when a scan that ran after the resolution still
+  sees the finding (its `last_seen_at` is later than `resolved_at`, both from the database clock), or
+  when the finding matches more values or is reclassified by another classifier set, a new incident
+  opens; re-evaluations without a new scan open nothing. Durable suppression is an administrator
+  decision only: a false positive (a false-positive finding never opens an incident) or an
+  exception. Incident creation is audited `incident.create` (system actor).
 - **Lifecycle**: `open` -> `acknowledged` -> `resolved`, `open` -> `resolved`, `open` /
   `acknowledged` -> `false_positive`; `resolved` and `false_positive` are final. Checked server side
-  under a row lock. `false_positive` is the finding's false-positive decision (admin only, as on
+  under row locks taken in the same order as the policy engine and the findings writers (the finding,
+  then the incident). `false_positive` is the finding's false-positive decision (admin only, as on
   `/findings`): it marks the finding (with its `matched` / `classifiers_version` snapshot) and closes
   every active incident of it.
 - The `audit.configure` confirmation of P3-A (warning when a change empties `sensitive_objects`)
