@@ -1,0 +1,10 @@
+# Build context of agent/Dockerfile: sources, manifests and Cargo.lock only.
+target/
+**/target/
+.git
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+Dockerfile
+.dockerignore

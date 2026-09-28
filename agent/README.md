@@ -223,6 +223,18 @@ cargo run -- run --config /etc/databastion/agent.yaml
 `agent.example.yaml` documents every configuration key. Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`
 (e.g. `DATABASTION_LOG=debug`), default `info`.
 
+## Docker image
+[`Dockerfile`](Dockerfile) (build context `agent/`): `rust:1.94.1-bookworm` builder
+(`cargo build --release --locked`, default features: every connector) and a
+`gcr.io/distroless/cc-debian12` runtime (glibc + libgcc only, no shell, no package manager;
+`static` would need a musl build). Base images are pinned by tag and digest. Runs as uid/gid
+10001; the binary is root-owned. Mounts: `/etc/databastion/agent.yaml` (read-only),
+`/var/lib/databastion` (state volume, `0700`, owned by 10001: an empty named volume inherits
+it), and the secret files referenced by `agent.yaml` (read-only, `0600`, owned by 10001).
+Nothing secret is baked in. No `HEALTHCHECK`: the agent has no listener (I1); its health is
+the console's `databastion_agent_up`. Compatible with `read_only: true` and `cap_drop: ALL`.
+The end-to-end harness in [`e2e/`](../e2e/README.md) builds and runs it.
+
 ## Rules
 See [AGENTS.md](../AGENTS.md): `#![forbid(unsafe_code)]` in every crate,
 rustls only, no `println!` (enforced by clippy `print_stdout` /
