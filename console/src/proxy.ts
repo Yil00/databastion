@@ -14,6 +14,8 @@ export function proxy(request: NextRequest): NextResponse {
   requestHeaders.set("Content-Security-Policy", csp);
   const response = NextResponse.next({ request: { headers: requestHeaders } });
   response.headers.set("Content-Security-Policy", csp);
+  // UI pages are per-user and some carry decrypted masked samples (findings view): never cached.
+  response.headers.set("Cache-Control", "no-store");
   return response;
 }
 

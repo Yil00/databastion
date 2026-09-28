@@ -259,16 +259,66 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     });
   });
 
-  it("40 concurrent wrong logins: at most the per-user limit reaches argon2id (H1)", async () => {
-    const before = argon2Stats.started;
-    const results = await Promise.all(
-      Array.from({ length: 40 }, () =>
-        handleLogin(userReq("POST", "/api/auth/login", { body: { username: "admin", password: "wrong wrong wrong" } })),
-      ),
-    );
-    expect(argon2Stats.started - before).toBeLessThanOrEqual(loginFailuresPerUser.limit);
-    expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(loginFailuresPerUser.limit);
-    expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+  /**
+   * H1: attempts are reserved before argon2id, so a burst cannot exceed the failure limits.
+   * Self-contained: its own user (not the admin of an earlier test) and a warm dummy hash, so no
+   * lazily-initialized argon2 work is counted.
+   */
+  async function burstUser(name: string): Promise<void> {
+    await getDb()
+      .insert(users)
+      .values({ username: name, passwordHash: await argon2Hash(PASSWORD) })
+      .onConflictDoNothing();
+    await argon2VerifyDummy("warm-up");
+  }
+
+  it("40 concurrent wrong logins from a known IP: at most the per-(user, IP) limit reaches argon2id (H1)", async () => {
+    await burstUser("burst-known");
+    process.env.DATABASTION_TRUST_PROXY = "1";
+    try {
+      const before = argon2Stats.started;
+      const results = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          handleLogin(
+            userReq("POST", "/api/auth/login", {
+              body: { username: "burst-known", password: "wrong wrong wrong" },
+              headers: { "X-Forwarded-For": "198.51.100.40" },
+            }),
+          ),
+        ),
+      );
+      const verified = argon2Stats.started - before;
+      const failed = results.filter((r) => r.status === 401).length;
+      // Every argon2id run is a counted failure; no other argon2 work happened.
+      expect(verified).toBe(failed);
+      expect(failed).toBeLessThanOrEqual(loginFailuresPerUser.limit);
+      expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+    } finally {
+      delete process.env.DATABASTION_TRUST_PROXY;
+    }
+  });
+
+  it("40 concurrent wrong logins, unknown IP: the limit plus the single degraded slot reach argon2id (H1, N2)", async () => {
+    await burstUser("burst-unknown");
+    loginSlowdown.ms = 100;
+    try {
+      const before = argon2Stats.started;
+      const results = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          handleLogin(userReq("POST", "/api/auth/login", { body: { username: "burst-unknown", password: "wrong wrong wrong" } })),
+        ),
+      );
+      const verified = argon2Stats.started - before;
+      const failed = results.filter((r) => r.status === 401).length;
+      expect(verified).toBe(failed);
+      // N2: with an unknown IP the per-username counter never answers 429; beyond it the username
+      // degrades to ONE slowed-down attempt in flight, the others get 503. In a burst that is at
+      // most one attempt more than the limit (all others arrive while the slot is held).
+      expect(failed).toBeLessThanOrEqual(loginFailuresPerUser.limit + 1);
+      expect(results.every((r) => [401, 503].includes(r.status))).toBe(true);
+    } finally {
+      loginSlowdown.ms = 2000;
+    }
   });
 
   it("caps concurrent argon2id verifications for logins (H1)", async () => {
