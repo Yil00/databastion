@@ -124,6 +124,9 @@ export function channelErrorMessage(status: number, body: unknown): string {
   if (status === 400 && typeof b.field === "string" && Object.hasOwn(CHANNEL_FIELD_ERRORS, b.field)) {
     return CHANNEL_FIELD_ERRORS[b.field] as string;
   }
+  if (status === 400 && b.error === "password_required") {
+    return "Changing the SMTP host, port, TLS mode or user requires entering the password again (or removing it).";
+  }
   if (status === 409 && b.error === "slug_taken") return "A channel with this name already exists.";
   if (status === 409 && b.error === "encryption_key_unavailable") {
     return "The console server key (DATABASTION_ENCRYPTION_KEY) is not configured: secrets cannot be stored.";

@@ -632,8 +632,9 @@ const CHANNEL_ERRORS = {
   key_unavailable: [409, "encryption_key_unavailable"],
 } as const;
 
-function channelError(outcome: keyof typeof CHANNEL_ERRORS | "invalid_password"): Response {
+function channelError(outcome: keyof typeof CHANNEL_ERRORS | "invalid_password" | "password_required"): Response {
   if (outcome === "invalid_password") return json({ error: "invalid_channel", field: "password" }, 400);
+  if (outcome === "password_required") return error(400, "password_required");
   const [status, code] = CHANNEL_ERRORS[outcome];
   return error(status, code);
 }

@@ -260,7 +260,24 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
         error: "invalid_channel",
         field: "password",
       });
+      // M1: the stored password never follows the channel to another relay without being re-entered.
+      const moved = { host: "attacker.example.net", port: 587, tls: "starttls", from: "dlp@example.com", recipients: ["soc@example.com"], username: "dlp" };
+      for (const config of [
+        moved,
+        { ...moved, host: "smtp.example.com", port: 2525 },
+        { ...moved, host: "smtp.example.com", tls: "implicit" },
+        { ...moved, host: "smtp.example.com", username: "other" },
+      ]) {
+        const r = await updateChannel(mailId, { config });
+        expect(r.status).toBe(400);
+        expect(await r.json()).toEqual({ error: "password_required" });
+      }
+      // Same relay (recipients changed): the password is kept.
+      expect((await updateChannel(mailId, { config: { ...moved, host: "smtp.example.com", recipients: ["x@example.com"] } })).status).toBe(204);
+      expect((await updateChannel(mailId, { config: moved, password: "new-relay-password" })).status).toBe(204);
       expect((await updateChannel(mailId, { password: null })).status).toBe(204);
+      // Without a stored password, moving is free.
+      expect((await updateChannel(mailId, { config: { ...moved, host: "relay2.example.net" } })).status).toBe(204);
       expect((await createChannel({ slug: "soc-hook", type: "webhook", config: { url: "https://h.example.com/x" } })).status).toBe(409);
       expect(await (await createChannel({ slug: "x", type: "webhook", config: { url: "https://169.254.169.254/" } })).json()).toEqual({
         error: "invalid_channel",

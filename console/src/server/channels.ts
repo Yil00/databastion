@@ -269,7 +269,8 @@ export type ChannelWriteOutcome =
   | { outcome: "slug_taken" }
   | { outcome: "not_found" }
   | { outcome: "key_unavailable" }
-  | { outcome: "invalid_password" };
+  | { outcome: "invalid_password" }
+  | { outcome: "password_required" };
 
 /**
  * Creates a channel. A webhook gets a signing secret generated here, returned once to the caller.
@@ -364,6 +365,15 @@ export async function updateChannel(db: Database, id: string, input: ChannelUpda
         if (typeof input.password === "string") return { outcome: "invalid_password" as const };
         if (row.secret !== null) secretChanged = true;
         set.secret = null;
+      } else if (
+        // M1: the stored password is bound to the relay it was entered for. Moving the channel to
+        // another host, port, TLS mode or user without re-entering it could send it to a server
+        // of the editor's choice (e.g. with "Test"): a new password (or its removal) is required.
+        row.secret !== null &&
+        input.password === undefined &&
+        (next.host !== current.host || next.port !== current.port || next.tls !== current.tls || next.username !== current.username)
+      ) {
+        return { outcome: "password_required" as const };
       } else if (input.password !== undefined) {
         if (input.password === null) {
           set.secret = null;
