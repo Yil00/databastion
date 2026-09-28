@@ -16,7 +16,7 @@ import {
 import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
 import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
-import { authenticateAgent, authPrecheck, type AuthOptions, type AuthResult } from "./auth";
+import { authenticateAgent, authPrecheck, countTimedOutBody, type AuthOptions, type AuthResult } from "./auth";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -213,8 +213,12 @@ export function handleRotate(req: Request): Promise<Response> {
     if (!pre.ok) return pre.response;
     const raw = await readJsonBody(req, { maxBytes: MAX_ROTATE_BODY_BYTES, deadlineMs: rotateBodyDeadline.ms });
     // A body not received within the deadline is answered before any argon2id work: no pool slot,
-    // no counted attempt, and never a lock (a slow network is not a rotation conflict).
-    if (!raw.ok && raw.timedOut) return invalidRequest();
+    // no per-agent attempt, and never a lock (a slow network is not a rotation conflict). It counts
+    // against the per-IP failure limit so trickled bodies cannot hold handlers without a cost.
+    if (!raw.ok && raw.timedOut) {
+      countTimedOutBody(pre.ipKey);
+      return invalidRequest();
+    }
     const auth = await preamble(req, { allowPrevious: true, staleCandidate: rotateCandidate(raw) });
     if (!auth.ok) return auth.response;
     if (auth.via === "previous" && auth.stale) {

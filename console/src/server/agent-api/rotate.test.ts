@@ -540,7 +540,7 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
 
   describe("P1-D follow-up review", () => {
     /** A `/rotate` whose body never completes; reports whether the handler started reading it. */
-    const hangingRotate = (auth: Creds) => {
+    const hangingRotate = (auth: Creds, extraHeaders: Record<string, string> = {}) => {
       const state = { pulled: false };
       const body = new ReadableStream<Uint8Array>({
         pull() {
@@ -550,7 +550,7 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
       }, { highWaterMark: 0 });
       const req = new Request(`${BASE}/rotate`, {
         method: "POST",
-        headers: agentHeaders(auth),
+        headers: { ...agentHeaders(auth), ...extraHeaders },
         body,
         duplex: "half",
       } as RequestInit);
@@ -588,6 +588,25 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
         await expectNotLocked(s0.agentId);
       } finally {
         rotateBodyDeadline.ms = 10_000;
+      }
+    });
+
+    it("L-a: timed-out bodies count against the per-IP limit, not the agent's", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      rotateBodyDeadline.ms = 5;
+      try {
+        const s0 = await enroll();
+        const xff = { "X-Forwarded-For": "198.51.100.40" };
+        for (let i = 0; i < failuresPerIp.limit; i++) {
+          expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(400);
+        }
+        // The IP is now limited; another IP, and the agent itself, are not.
+        expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(429);
+        expect((await heartbeat(s0)).status).toBe(200);
+        await expectNotLocked(s0.agentId);
+      } finally {
+        rotateBodyDeadline.ms = 10_000;
+        delete process.env.DATABASTION_TRUST_PROXY;
       }
     });
 

@@ -329,6 +329,14 @@ export type Precheck =
   | { ok: false; response: Response };
 
 /**
+ * Counts a `/rotate` body that missed its read deadline against the per-IP failure limit only (never
+ * per agent: a trickled body proves nothing about the agent, and must not eat its budget).
+ */
+export function countTimedOutBody(ipKey: string | null): void {
+  if (ipKey) failuresPerIp.hit(ipKey);
+}
+
+/**
  * The cheap part of agent authentication (P1-D L1), run before anything expensive (argon2id, and
  * for `/rotate` reading the body): header parsing, secret format, and the per-IP / per-agent failure
  * limits. A secret that is known good (current or pending, L2) is not held by the per-agent limit:
