@@ -23,6 +23,7 @@ import {
 } from "@/server/rotation";
 import { revokeAgent } from "@/server/agents";
 import { agentHeaders, BASE } from "@/test/helpers";
+import { ipBucket } from "@/server/request";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError } from "@/test/helpers";
 
@@ -30,6 +31,7 @@ import {
   expireVerifiedCacheForTests,
   failuresPerAgent,
   failuresPerIp,
+  cheapFailuresPerIp,
   isKnownGood,
   knownGoodFingerprint,
   TOLERANCE_WINDOW_MS,
@@ -112,6 +114,7 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
   beforeEach(() => {
     failuresPerAgent.clear();
     failuresPerIp.clear();
+    cheapFailuresPerIp.clear();
     rotatePerAgent.clear();
     staleRetriesPerAgent.clear();
   });
@@ -591,15 +594,19 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
       }
     });
 
-    it("L-a: timed-out bodies count against the per-IP limit, not the agent's", async () => {
+    it("L-a: timed-out bodies count against the cheap per-IP limit (M1), not the agent's", async () => {
       process.env.DATABASTION_TRUST_PROXY = "1";
       rotateBodyDeadline.ms = 5;
       try {
         const s0 = await enroll();
         const xff = { "X-Forwarded-For": "198.51.100.40" };
-        for (let i = 0; i < failuresPerIp.limit; i++) {
+        // Earlier cheap failures from this IP (the limit is high: fill it directly), then real ones.
+        for (let i = 0; i < cheapFailuresPerIp.limit - 5; i++) cheapFailuresPerIp.hit(ipBucket("198.51.100.40"));
+        for (let i = 0; i < 5; i++) {
           expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(400);
         }
+        // No argon2id ran: the argon2id-backed per-IP counter is untouched.
+        expect(failuresPerIp.check(ipBucket("198.51.100.40")).limited).toBe(false);
         // The IP is now limited; another IP, and the agent itself, are not.
         expect((await handleRotate(hangingRotate(s0, xff).req)).status).toBe(429);
         expect((await heartbeat(s0)).status).toBe(200);

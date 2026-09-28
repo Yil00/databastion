@@ -47,9 +47,10 @@ function warnBadForwardedFor(): void {
 
 /**
  * Rate-limit bucket of an IP: IPv6 addresses are aggregated by /64 (one host usually owns a whole
- * /64), IPv4-mapped IPv6 addresses are reduced to their IPv4 address.
+ * /64), or by /56 (`v6Prefix = 56`: logins, P1-D N1, where a customer allocation often is a /56),
+ * IPv4-mapped IPv6 addresses are reduced to their IPv4 address.
  */
-export function ipBucket(ip: string): string {
+export function ipBucket(ip: string, v6Prefix: 56 | 64 = 64): string {
   if (isIP(ip) !== 6) return ip;
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
   if (mapped?.[1]) return mapped[1];
@@ -64,7 +65,9 @@ export function ipBucket(ip: string): string {
   if (headGroups.at(-1)?.includes(".")) headGroups = [...headGroups.slice(0, -1), "0", "0"];
   const missing = 8 - headGroups.length - tailGroups.length;
   const groups = [...headGroups, ...Array<string>(Math.max(0, missing)).fill("0"), ...tailGroups];
-  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+  const prefix = groups.slice(0, 4).map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : 0));
+  if (v6Prefix === 56) prefix[3] = (prefix[3] ?? 0) & 0xff00;
+  return `${prefix.map((g) => g.toString(16)).join(":")}::/${v6Prefix}`;
 }
 
 export const MAX_BODY_BYTES = 4 * 1024 * 1024;

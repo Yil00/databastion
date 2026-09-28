@@ -7,14 +7,15 @@ import type { Schemas } from "@/lib/protocol/validate";
 import { writeAudit } from "./audit";
 import { purgeSecretCache } from "./agent-api/auth";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
-import { argon2Hash, newAgentSecret, sha256Hex } from "./crypto";
+import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
 
 /**
  * Consumes an enrollment token and creates the agent.
  * 1. The token is looked up by hash (cheap, not consuming): an unknown, expired, revoked or
  *    consumed token is rejected before any argon2id work (M4).
- * 2. Only then is the new secret generated and hashed.
+ * 2. Only then is the new secret generated and hashed, inside the bounded enroll pool
+ *    (`enrollArgon2Gate`, L4): `busy` when it is full (the token is not consumed).
  * 3. The conditional UPDATE (unused, unrevoked, unexpired -> used) keeps single use atomic under
  *    concurrency; the agent insert happens in the same transaction.
  * Returns null when the token is not usable. Failures are audited without any token material.
@@ -23,7 +24,7 @@ export async function enrollAgent(
   db: Database,
   req: Schemas["EnrollRequest"],
   ip: string | null,
-): Promise<{ agentId: string; secret: string } | null> {
+): Promise<{ agentId: string; secret: string } | "busy" | null> {
   const tokenHash = sha256Hex(req.token);
   const usable = and(
     eq(enrollmentTokens.tokenHash, tokenHash),
@@ -40,8 +41,15 @@ export async function enrollAgent(
     await auditEnrollFailure(db, ip);
     return null;
   }
+  const release = enrollArgon2Gate.tryAcquire();
+  if (!release) return "busy";
   const secret = newAgentSecret();
-  const secretHash = await argon2Hash(secret);
+  let secretHash: string;
+  try {
+    secretHash = await argon2Hash(secret);
+  } finally {
+    release();
+  }
   const result = await db.transaction(async (tx) => {
     const [token] = await tx
       .update(enrollmentTokens)

@@ -24,6 +24,22 @@ echo "# PostgreSQL + pgaudit"
 PSQL='PGPASSWORD="$DATABASTION_DB_PASSWORD" psql -h 127.0.0.1 -U databastion -d shop -v ON_ERROR_STOP=1 -Atq'
 check "read-only account can read" ex postgres "$PSQL -c 'SELECT count(*) FROM crm.customers' | grep -Eq '^[1-9]'"
 check "read-only account cannot write" must_fail ex postgres "$PSQL -c 'DELETE FROM billing.invoices WHERE id = -1'"
+# ADR-0012 minimal variant: no pg_read_all_data, so the credential-bearing catalogs are denied.
+# Asserted as privileges (not "the query failed"), so a connection error cannot pass for a denial.
+check "read-only account cannot read pg_authid / pg_user_mapping" ex postgres \
+  "$PSQL -c \"SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')
+     OR has_table_privilege('pg_catalog.pg_user_mapping', 'SELECT')\" | grep -qx f"
+check "read-only account attributes (no superuser / createdb / createrole / replication / bypassrls, limit 4)" \
+  ex postgres "$PSQL -c \"SELECT concat_ws(',', rolsuper, rolcreatedb, rolcreaterole, rolreplication,
+     rolbypassrls, rolconnlimit) FROM pg_roles WHERE rolname = current_user\" | grep -qx 'f,f,f,f,f,4'"
+check "read-only account role defaults (read-only, timeouts)" ex postgres \
+  "$PSQL -c \"SELECT current_setting('default_transaction_read_only') = 'on'
+     AND current_setting('statement_timeout')::interval = '30s'
+     AND current_setting('lock_timeout')::interval = '2s'
+     AND current_setting('idle_in_transaction_session_timeout')::interval = '60s'\" | grep -qx t"
+check "read-only account is a member of pg_read_all_stats only" ex postgres \
+  "$PSQL -c \"SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
+     JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = 'databastion'::regrole\" | grep -qx pg_read_all_stats"
 check "pgaudit SESSION log line after a SELECT" retry 15 ex postgres \
   "grep 'AUDIT: SESSION' /var/log/databastion/postgresql.json | grep -q 'crm.customers'"
 check "pgaudit OBJECT log line (databastion_auditor)" retry 15 ex postgres \

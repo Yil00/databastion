@@ -15,7 +15,7 @@ import {
 } from "@/server/crypto";
 import { errorSummary, logger } from "@/lib/logger";
 import { writeAudit } from "@/server/audit";
-import { RateLimiter } from "@/server/rate-limit";
+import { RateLimiter, type RateLimitDecision } from "@/server/rate-limit";
 import { clientIp, ipBucket } from "@/server/request";
 
 import { rateLimited, unauthorized, unavailable } from "./errors";
@@ -27,15 +27,21 @@ import { jobHub, REVOKED_CHANNEL } from "./job-hub";
  *   verification. Each attempt is counted (reserved) synchronously before the verification and
  *   refunded on success, so concurrent requests cannot overrun the limit.
  * - The per-agent limit is keyed by (agent id, source IP) when the IP is known, so an attacker
- *   elsewhere cannot lock a legitimate agent out. The per-IP limit only applies when the IP is known
+ *   elsewhere cannot lock a legitimate agent out. The per-IP limits only apply when the IP is known
  *   (no shared global bucket).
+ * - Per IP (P1-D M1): only argon2id-backed failures count toward `failuresPerIp`; cheap failures
+ *   (bad headers or secret format, unknown or inactive agent, trickled `/rotate` body) count toward
+ *   the higher `cheapFailuresPerIp`, which only gates reaching the argon2id path. Neither limit
+ *   holds a secret that is in the verified cache or known good (current or pending): agents behind
+ *   a shared (NAT / proxy) IP cannot be blocked by junk requests from that IP.
  * - argon2id verifications run under a process-wide concurrency cap (`argon2Gate`, 503 beyond).
  * - Verified secrets are cached for less than 30 s. A cache entry is bound to the stored hash it
  *   was verified against, and the agent row is read on every request, so a revocation, a lock or a
  *   rotation (from any console process) makes the secret unusable immediately; the cache is also
  *   purged explicitly on revocation.
- * - A longer-lived "last verified secret" fingerprint (SHA-256, bound to the stored hash) is used
- *   ONLY to exempt the legitimate secret from the per-agent failure limit, never to authenticate:
+ * - A longer-lived "last verified secret" fingerprint (bound to the stored hash) is used ONLY to
+ *   exempt the legitimate secret from the failure limits (per agent and, M1, per IP), never to
+ *   authenticate:
  *   the secret still goes through the cache or a full argon2id verification. It is persisted in the
  *   agent row (P1-D), so a console restart does not expose the agent to a lock-out flood.
  */
@@ -48,7 +54,13 @@ const BEARER = /^Bearer ([^\s]+)$/;
 export const CACHE_TTL_MS = 25_000;
 export const KNOWN_GOOD_TTL_MS = 24 * 60 * 60 * 1000;
 export const failuresPerAgent = new RateLimiter(10, 5 * 60_000);
+/** argon2id-backed failed authentications per source IP (P1-D M1: nothing else counts here). */
 export const failuresPerIp = new RateLimiter(50, 5 * 60_000);
+/**
+ * Cheap failures per source IP (no argon2id: bad headers or format, unknown or inactive agent,
+ * trickled `/rotate` body). Higher, and only gates reaching the argon2id path (P1-D M1).
+ */
+export const cheapFailuresPerIp = new RateLimiter(500, 5 * 60_000);
 
 interface CacheEntry {
   secretSha256: string;
@@ -60,6 +72,17 @@ const MAX_CACHE_ENTRIES = 50_000;
 class BoundCache {
   private readonly entries = new Map<string, CacheEntry>();
   constructor(private readonly ttlMs: number) {}
+
+  /**
+   * Whether `secret` was verified for `agentId` less than the TTL ago, whatever the stored hash
+   * (P1-D M1). Never authenticates: only used by `authPrecheck` to skip the failure limits before
+   * the agent row is read; `matches` (hash-bound) still runs afterwards.
+   */
+  holds(agentId: string, secret: string): boolean {
+    const entry = this.entries.get(agentId);
+    if (!entry || entry.expiresAt <= Date.now()) return false;
+    return safeEqual(entry.secretSha256, sha256Hex(secret));
+  }
 
   matches(agentId: string, secret: string, storedHash: string): boolean {
     const entry = this.entries.get(agentId);
@@ -99,11 +122,13 @@ export function expireVerifiedCacheForTests(): void {
 
 export function purgeSecretCache(agentId?: string): void {
   verified.delete(agentId);
+  if (agentId === undefined) knownGoodHints.clear();
+  else knownGoodHints.delete(agentId);
 }
 
 /**
  * "Known good" fingerprint (persisted in `agents.known_good_fingerprint`, P1-D). Never
- * authenticates: it only exempts the last verified secret from the per-agent failure limit (and
+ * authenticates: it only exempts the last verified secret from the failure limits (and
  * routes it to the reserved argon2id pool). Stored at rest, so it is:
  * - an HMAC-SHA256 keyed by a subkey of the console server key (`DATABASTION_ENCRYPTION_KEY`,
  *   HKDF domain `agent-known-good.v1`): a database dump alone cannot be used to test secrets;
@@ -160,9 +185,10 @@ async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: str
     safeEqual(row.knownGoodFingerprint, fingerprint);
   if (fresh) return;
   try {
-    await getDb()
+    const knownGoodAt = new Date();
+    const updated = await getDb()
       .update(agents)
-      .set({ knownGoodFingerprint: fingerprint, knownGoodAt: new Date() })
+      .set({ knownGoodFingerprint: fingerprint, knownGoodAt })
       .where(
         and(
           eq(agents.id, row.id),
@@ -170,7 +196,10 @@ async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: str
           isNull(agents.revokedAt),
           isNull(agents.lockedAt),
         ),
-      );
+      )
+      .returning({ id: agents.id });
+    // N4: the in-memory hint follows the row at once (the next request may be a flood's victim).
+    if (updated.length > 0) rememberHint({ ...row, knownGoodFingerprint: fingerprint, knownGoodAt }, row.id);
   } catch (err) {
     // Best effort: the request is authenticated; only the lock-out exemption is not refreshed.
     logger.warn({ error: errorSummary(err), agentId: row.id }, "known-good fingerprint not persisted");
@@ -236,8 +265,47 @@ export interface AuthOptions {
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
 
-const loadAgent = async (agentId: string) =>
-  (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+/**
+ * In-memory copy of the known-good fields of recently read agent rows (P1-D N4). Only a HINT used by
+ * `authPrecheck` to exempt a known-good secret from the failure limits without a database read (the
+ * row is read on every request anyway, so it stays fresh); it never authenticates, and
+ * `authenticateAgent` re-checks everything on the fresh row. Bounded like the verified cache.
+ */
+type KnownGoodHint = Pick<
+  AgentRow,
+  "knownGoodFingerprint" | "knownGoodAt" | "knownGoodPendingFingerprint" | "pendingSecretHash"
+> & { currentSecretHash: string };
+const knownGoodHints = new Map<string, KnownGoodHint>();
+
+function rememberHint(agent: AgentRow | undefined, agentId: string): void {
+  knownGoodHints.delete(agentId);
+  if (!active(agent) || (agent.knownGoodFingerprint === null && agent.knownGoodPendingFingerprint === null)) return;
+  if (knownGoodHints.size >= MAX_CACHE_ENTRIES) {
+    const oldest = knownGoodHints.keys().next();
+    if (!oldest.done) knownGoodHints.delete(oldest.value);
+  }
+  knownGoodHints.set(agentId, {
+    knownGoodFingerprint: agent.knownGoodFingerprint,
+    knownGoodAt: agent.knownGoodAt,
+    knownGoodPendingFingerprint: agent.knownGoodPendingFingerprint,
+    pendingSecretHash: agent.pendingSecretHash,
+    currentSecretHash: agent.currentSecretHash,
+  });
+}
+
+/** Test hook: simulates a restarted process (no known-good hints in memory). */
+export function clearKnownGoodHintsForTests(): void {
+  knownGoodHints.clear();
+}
+
+/** Database reads made only to decide a failure-limit exemption (test / metrics counter, N4). */
+export const exemptionLookupStats = { lookups: 0 };
+
+const loadAgent = async (agentId: string) => {
+  const agent = (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+  rememberHint(agent, agentId);
+  return agent;
+};
 
 const active = (a: AgentRow | undefined): a is AgentRow & { currentSecretHash: string } =>
   !!a && !!a.currentSecretHash && a.revokedAt === null && a.lockedAt === null;
@@ -306,21 +374,34 @@ interface Limits {
   ipKey: string | null;
 }
 
-function limitedResponse(ipKey: string | null, agent?: string): Response | null {
+const retryAfter = (...decisions: (RateLimitDecision | undefined)[]) =>
+  Math.max(1, ...decisions.map((d) => (d?.limited ? d.retryAfterS : 1)));
+
+/**
+ * The limits that gate the argon2id path for a non-exempt secret: argon2id-backed failures per IP,
+ * cheap failures per IP (M1), argon2id-backed failures per (agent, IP). `null` when none is reached.
+ */
+function argon2PathLimited(ipKey: string | null, key: string | null): Response | null {
   const byIp = ipKey ? failuresPerIp.check(ipKey) : undefined;
-  const byAgent = agent ? failuresPerAgent.check(agent) : undefined;
-  if (byIp?.limited || byAgent?.limited) {
-    return rateLimited(Math.max(byIp?.retryAfterS ?? 1, byAgent?.retryAfterS ?? 1));
+  const cheapByIp = ipKey ? cheapFailuresPerIp.check(ipKey) : undefined;
+  const byAgent = key ? failuresPerAgent.check(key) : undefined;
+  if (byIp?.limited || cheapByIp?.limited || byAgent?.limited) {
+    return rateLimited(retryAfter(byIp, cheapByIp, byAgent));
   }
   return null;
 }
 
-/** Cheap failure (no argon2): counted after the fact. */
-function cheapFailure({ ipKey }: Limits, key?: string): { ok: false; response: Response } {
-  const blocked = limitedResponse(ipKey, key);
-  if (blocked) return { ok: false, response: blocked };
-  if (key) failuresPerAgent.hit(key);
-  if (ipKey) failuresPerIp.hit(ipKey);
+/**
+ * Cheap failure (no argon2id): counted after the fact against the cheap per-IP counter only (M1):
+ * neither `failuresPerIp` nor the per-(agent, IP) limit, so junk requests that need no secret cannot
+ * block an agent (not even one not yet known good) behind the same source IP.
+ */
+function cheapFailure({ ipKey }: Limits): { ok: false; response: Response } {
+  if (ipKey) {
+    const cheapByIp = cheapFailuresPerIp.check(ipKey);
+    if (cheapByIp.limited) return { ok: false, response: rateLimited(cheapByIp.retryAfterS) };
+    cheapFailuresPerIp.hit(ipKey);
+  }
   return { ok: false, response: unauthorized() };
 }
 
@@ -329,18 +410,43 @@ export type Precheck =
   | { ok: false; response: Response };
 
 /**
- * Counts a `/rotate` body that missed its read deadline against the per-IP failure limit only (never
- * per agent: a trickled body proves nothing about the agent, and must not eat its budget).
+ * Counts a `/rotate` body that missed its read deadline against the cheap per-IP counter only (never
+ * per agent: a trickled body proves nothing about the agent, and must not eat its budget; and no
+ * argon2id ran, so not `failuresPerIp` either, M1).
  */
 export function countTimedOutBody(ipKey: string | null): void {
-  if (ipKey) failuresPerIp.hit(ipKey);
+  if (ipKey) cheapFailuresPerIp.hit(ipKey);
+}
+
+const knownGoodFor = (row: KnownGoodHint, secret: string) =>
+  isKnownGood(row, secret, row.currentSecretHash) || isKnownGoodPending(row, secret);
+
+/**
+ * Whether the presented secret is exempt from the failure limits (M1, L2), checked in this order:
+ * verified less than 25 s ago (cache), known good per the in-memory hint (no database read), then
+ * known good per the agent row. N4: that database read is skipped when the source IP is over the
+ * cheap per-IP limit, and a read that does not end in an exemption is charged to it, so it cannot
+ * be used for uncounted database reads. Never authenticates: `authenticateAgent` still runs the
+ * hash-bound cache or a full verification.
+ */
+async function exemptFromLimits(agentId: string, secret: string, ipKey: string | null): Promise<boolean> {
+  if (verified.holds(agentId, secret)) return true;
+  const hint = knownGoodHints.get(agentId);
+  if (hint && knownGoodFor(hint, secret)) return true;
+  if (ipKey && cheapFailuresPerIp.check(ipKey).limited) return false;
+  exemptionLookupStats.lookups++;
+  const agent = await loadAgent(agentId);
+  const exempt = active(agent) && knownGoodFor(agent, secret);
+  if (!exempt && ipKey) cheapFailuresPerIp.hit(ipKey);
+  return exempt;
 }
 
 /**
  * The cheap part of agent authentication (P1-D L1), run before anything expensive (argon2id, and
  * for `/rotate` reading the body): header parsing, secret format, and the per-IP / per-agent failure
- * limits. A secret that is known good (current or pending, L2) is not held by the per-agent limit:
- * the agent row is only read in that case (limit reached), to check the fingerprint.
+ * limits. A secret that is in the verified cache or known good (current or pending, L2) is held by
+ * none of them (M1): the agent row is only read in that case (a limit reached), to check the
+ * fingerprint.
  */
 export async function authPrecheck(req: Request): Promise<Precheck> {
   const ip = clientIp(req);
@@ -350,16 +456,9 @@ export async function authPrecheck(req: Request): Promise<Precheck> {
   const secret = BEARER.exec(req.headers.get("authorization") ?? "")?.[1];
   if (agentId === null || secret === undefined) return cheapFailure(limits);
   const key = agentKey(agentId, limits.ipKey);
-  if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(limits, key);
-  const byIp = limitedResponse(limits.ipKey);
-  if (byIp) return { ok: false, response: byIp };
-  const byAgent = limitedResponse(null, key);
-  if (byAgent) {
-    const agent = await loadAgent(agentId);
-    const exempt =
-      active(agent) && (isKnownGood(agent, secret, agent.currentSecretHash) || isKnownGoodPending(agent, secret));
-    if (!exempt) return { ok: false, response: byAgent };
-  }
+  if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(limits);
+  const limited = argon2PathLimited(limits.ipKey, key);
+  if (limited && !(await exemptFromLimits(agentId, secret, limits.ipKey))) return { ok: false, response: limited };
   return { ok: true, agentId, secret, ipKey: limits.ipKey, key };
 }
 
@@ -371,12 +470,12 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   const denied = (): AuthResult => ({ ok: false, response: unauthorized() });
 
   let agent = await loadAgent(agentId);
-  if (!active(agent)) return cheapFailure(limits, key);
+  if (!active(agent)) return cheapFailure(limits);
   // Grace deadline reached without any use of S1: promotion at the deadline (ADR-0008).
   if (agent.pendingSecretHash && agent.graceExpiresAt && agent.graceExpiresAt.getTime() <= Date.now()) {
     await promotePending(agentId, agent.currentSecretHash, agent.pendingSecretHash, agent.graceExpiresAt, "grace_expired");
     agent = await loadAgent(agentId);
-    if (!active(agent)) return cheapFailure(limits, key);
+    if (!active(agent)) return cheapFailure(limits);
   }
   const storedHash = agent.currentSecretHash;
   if (verified.matches(agentId, secret, storedHash)) {
@@ -391,12 +490,18 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
       ? ["pending", agent.pendingSecretHash]
       : null;
   const exempt = exemptSlot !== null;
-  const refundIp = ipKey ? failuresPerIp.reserve(ipKey) : () => undefined;
+  // M1: a known-good secret is held by no failure limit (it only uses the reserved pool). Any other
+  // secret reaches argon2id only below the cheap per-IP limit, and its attempt is reserved against
+  // the argon2id-backed per-IP and per-(agent, IP) limits.
+  if (!exempt && ipKey && cheapFailuresPerIp.check(ipKey).limited) {
+    return { ok: false, response: argon2PathLimited(ipKey, key) ?? rateLimited(1) };
+  }
+  const refundIp = exempt || !ipKey ? () => undefined : failuresPerIp.reserve(ipKey);
   const refundAgent = exempt ? () => undefined : failuresPerAgent.reserve(key);
   if (!refundIp || !refundAgent) {
     refundIp?.();
     refundAgent?.();
-    return { ok: false, response: limitedResponse(ipKey, exempt ? undefined : key) ?? rateLimited(1) };
+    return { ok: false, response: argon2PathLimited(ipKey, key) ?? rateLimited(1) };
   }
   // N1: the legitimate secret uses a reserved pool that floods of wrong secrets cannot fill.
   // L1: in the shared pool, at most one verification in flight per agent id (fair allocation).

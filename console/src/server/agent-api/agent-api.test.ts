@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { Client } from "pg";
 import { PgBoss } from "pg-boss";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
@@ -12,6 +12,8 @@ import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
+  enrollArgon2Gate,
+  MAX_CONCURRENT_ENROLL_ARGON2,
   loginArgon2Gate,
   MAX_CONCURRENT_UNAUTHENTICATED_ARGON2,
   sha256Hex,
@@ -30,7 +32,16 @@ import {
   newToken,
 } from "@/test/helpers";
 
-import { expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp } from "./auth";
+import { ipBucket } from "@/server/request";
+
+import {
+  cheapFailuresPerIp,
+  clearKnownGoodHintsForTests,
+  exemptionLookupStats,
+  expireVerifiedCacheForTests,
+  failuresPerAgent,
+  failuresPerIp,
+} from "./auth";
 import {
   enrollPerIp,
   handleEnroll,
@@ -69,6 +80,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     enrollFailureAuditBudget.clear();
     failuresPerAgent.clear();
     failuresPerIp.clear();
+    cheapFailuresPerIp.clear();
     enrollPerIp.clear();
     pollClock.msPerSecond = 1000;
   });
@@ -141,7 +153,12 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         Array.from({ length: 5 }, () => handleEnroll(agentRequest("POST", "/enroll", { body }))),
       );
       expect(results.filter((r) => r.status === 200)).toHaveLength(1);
-      expect(results.filter((r) => r.status === 401)).toHaveLength(4);
+      // The others lost the race (401) or found the bounded enroll pool full (503, L4).
+      expect(results.every((r) => [200, 401, 503].includes(r.status))).toBe(true);
+      const created = await getDb().select().from(agents).where(eq(agents.hostname, "h2"));
+      expect(created).toHaveLength(1);
+      // Retried after the pool freed up: the token is consumed.
+      expect((await handleEnroll(agentRequest("POST", "/enroll", { body }))).status).toBe(401);
     });
 
     it.each(fixtures("valid", "EnrollRequest"))("valid fixture %s passes validation", async (_f, body) => {
@@ -191,6 +208,48 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(failures.length).toBeGreaterThan(0);
       expect(JSON.stringify(failures)).not.toContain(token);
       expect(JSON.stringify(failures)).not.toContain(sha256Hex(token));
+    });
+  });
+
+  describe("POST /enroll argon2id pool (P1-D L4)", () => {
+    it("answers 503 + Retry-After when the enroll pool is full, without consuming the token", async () => {
+      const token = await newToken();
+      const body = { token, hostname: "l4", agent_version: "0.1.0", connectors: [] };
+      const held = Array.from({ length: MAX_CONCURRENT_ENROLL_ARGON2 }, () => enrollArgon2Gate.tryAcquire());
+      expect(held.every((r) => r !== null)).toBe(true);
+      const before = argon2Stats.started;
+      try {
+        const busy = await handleEnroll(agentRequest("POST", "/enroll", { body }));
+        expect(busy.status).toBe(503);
+        expect(Number(busy.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+        await expectConformingError(busy, body);
+        expect(argon2Stats.started).toBe(before);
+        const [tok] = await getDb()
+          .select()
+          .from(enrollmentTokens)
+          .where(eq(enrollmentTokens.tokenHash, sha256Hex(token)));
+        expect(tok?.consumedAt).toBeNull();
+      } finally {
+        for (const release of held) release?.();
+      }
+      // Once a slot is free, the same token enrolls.
+      expect((await handleEnroll(agentRequest("POST", "/enroll", { body }))).status).toBe(200);
+      expect(enrollArgon2Gate.inUse).toBe(0);
+    });
+
+    it("never runs more than the pool size of enroll hashes at once", async () => {
+      const tokens = await Promise.all(Array.from({ length: 6 }, () => newToken()));
+      argon2Stats.maxActive = 0;
+      const results = await Promise.all(
+        tokens.map((token, i) =>
+          handleEnroll(
+            agentRequest("POST", "/enroll", { body: { token, hostname: `l4-${i}`, agent_version: "0.1.0", connectors: [] } }),
+          ),
+        ),
+      );
+      expect(results.every((r) => [200, 503].includes(r.status))).toBe(true);
+      expect(results.filter((r) => r.status === 200).length).toBeGreaterThanOrEqual(1);
+      expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_ENROLL_ARGON2);
     });
   });
 
@@ -375,6 +434,117 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(legit.status).toBe(200);
       // Exempt from the limit, but still fully verified.
       expect(argon2Stats.started).toBe(before + 1);
+    });
+  });
+
+  describe("P1-D M1: agents behind a shared source IP", () => {
+    const IP = "198.51.100.77";
+    const XFF = { "X-Forwarded-For": IP };
+    const hb = (auth?: { agentId: string; secret: string }, headers: Record<string, string> = XFF) =>
+      handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT, headers }));
+    beforeEach(() => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+    });
+    afterEach(() => {
+      delete process.env.DATABASTION_TRUST_PROXY;
+    });
+
+    it("50 cheap failures from an IP (no secret needed) block no agent behind it", async () => {
+      const known = await enroll("m1-known");
+      expect((await hb(known)).status).toBe(200);
+      const fresh = await enroll("m1-fresh");
+      const before = argon2Stats.started;
+      for (let i = 0; i < 50; i++) {
+        const junk =
+          i % 3 === 0
+            ? hb() // no agent id / secret headers
+            : i % 3 === 1
+              ? hb({ agentId: known.agentId, secret: "dbs_short" }) // malformed secret
+              : hb({ agentId: randomUUID(), secret: fresh.secret }); // unknown agent
+        expect((await junk).status).toBe(401);
+      }
+      expect(argon2Stats.started).toBe(before);
+      expect(failuresPerIp.check(ipBucket(IP)).limited).toBe(false);
+      expireVerifiedCacheForTests();
+      expect((await hb(known)).status).toBe(200);
+      // A never-verified agent still reaches argon2id: cheap failures only gate at a much higher count.
+      expect((await hb(fresh)).status).toBe(200);
+    });
+
+    it("with both per-IP limits reached, known-good and cached secrets get 200, others 429", async () => {
+      const known = await enroll("m1-kg");
+      expect((await hb(known)).status).toBe(200);
+      const cached = await enroll("m1-cached");
+      expect((await hb(cached)).status).toBe(200);
+      // Only the short verified cache exempts this one.
+      await getDb()
+        .update(agents)
+        .set({ knownGoodFingerprint: null, knownGoodAt: null })
+        .where(eq(agents.id, cached.agentId));
+      const stranger = await enroll("m1-stranger");
+      const key = ipBucket(IP);
+      for (let i = 0; i < failuresPerIp.limit; i++) failuresPerIp.hit(key);
+      for (let i = 0; i < cheapFailuresPerIp.limit; i++) cheapFailuresPerIp.hit(key);
+
+      const before = argon2Stats.started;
+      expect((await hb({ agentId: known.agentId, secret: stranger.secret })).status).toBe(429);
+      expect((await hb(stranger)).status).toBe(429);
+      expect(argon2Stats.started).toBe(before);
+      // Cached: no argon2id at all.
+      expect((await hb(cached)).status).toBe(200);
+      expect(argon2Stats.started).toBe(before);
+      // Known good (cache expired): exempt, still fully verified, in the reserved pool.
+      expireVerifiedCacheForTests();
+      expect((await hb(known)).status).toBe(200);
+      expect(argon2Stats.started).toBe(before + 1);
+      // The exemption does not change the limits of the IP.
+      expect(failuresPerIp.check(key).limited).toBe(true);
+    });
+
+    it("N4: exemption lookups are counted, and skipped once the IP is over the cheap limit", async () => {
+      const known = await enroll("n4-known");
+      expect((await hb(known)).status).toBe(200);
+      const key = ipBucket(IP);
+      for (let i = 0; i < failuresPerIp.limit; i++) failuresPerIp.hit(key);
+      for (let i = 0; i < cheapFailuresPerIp.limit - 1; i++) cheapFailuresPerIp.hit(key);
+      const junk = { agentId: randomUUID(), secret: known.secret };
+      // Limited, no cache, no hint: one row read, charged to the cheap per-IP counter.
+      let lookups = exemptionLookupStats.lookups;
+      expect((await hb(junk)).status).toBe(429);
+      expect(exemptionLookupStats.lookups).toBe(lookups + 1);
+      expect(cheapFailuresPerIp.check(key).limited).toBe(true);
+      // Over the cheap limit: no row read at all.
+      lookups = exemptionLookupStats.lookups;
+      for (let i = 0; i < 5; i++) expect((await hb(junk)).status).toBe(429);
+      expect(exemptionLookupStats.lookups).toBe(lookups);
+      // The known-good agent still passes: the in-memory hint needs no row read (M1 preserved).
+      expireVerifiedCacheForTests();
+      expect((await hb(known)).status).toBe(200);
+      expect(exemptionLookupStats.lookups).toBe(lookups);
+      // Documented limit: right after a restart (no hint yet) and while the IP is over the cheap
+      // limit, the known-good agent waits for the window like the others.
+      expireVerifiedCacheForTests();
+      clearKnownGoodHintsForTests();
+      expect((await hb(known)).status).toBe(429);
+      // Below the cheap limit, the row read restores the exemption.
+      cheapFailuresPerIp.clear();
+      expect((await hb(known)).status).toBe(200);
+      expect(exemptionLookupStats.lookups).toBe(lookups + 1);
+    });
+
+    it("only argon2id-backed failures count toward the per-IP failure limit", async () => {
+      const target = await enroll("m1-count");
+      const wrong = (await enroll("m1-count-wrong")).secret;
+      expect((await hb({ agentId: target.agentId, secret: wrong })).status).toBe(401);
+      expect((await hb({ agentId: randomUUID(), secret: wrong })).status).toBe(401);
+      const key = ipBucket(IP);
+      // Exactly one argon2id-backed failure was counted (the unknown agent was a cheap failure):
+      // limit - 2 more leave the IP below the limit, one more reaches it.
+      for (let i = 0; i < failuresPerIp.limit - 2; i++) failuresPerIp.hit(key);
+      expect(failuresPerIp.check(key).limited).toBe(false);
+      failuresPerIp.hit(key);
+      expect(failuresPerIp.check(key).limited).toBe(true);
+      expect(cheapFailuresPerIp.check(key).limited).toBe(false);
     });
   });
 
