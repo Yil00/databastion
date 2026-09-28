@@ -15,6 +15,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0009](0009-name-normalization-and-item-sanitization.md) | Name normalization and per-item sanitization before the uplink | Accepted |
 | [0010](0010-rotation-conflict-window.md) | Rotation conflict window and "just promoted" definition (refines 0008) | Accepted |
 | [0011](0011-late-rotation-retry.md) | Late rotation retry with the previous secret (refines 0010) | Accepted |
-| [0012](0012-postgresql-agent-grants.md) | Grant set of the agent's PostgreSQL role (Discovery, Audit) | Proposed |
+| [0012](0012-postgresql-agent-grants.md) | Grant set of the agent's PostgreSQL role (Discovery, Audit) | Accepted |
 
 Template: copy [template.md](template.md).
