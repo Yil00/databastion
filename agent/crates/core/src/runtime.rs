@@ -12,7 +12,7 @@ use databastion_protocol::{
     AgentVersion, Connector as ProtoConnector, ConnectorList, Count, EnrollRequest,
     EnrollRequestArch, EnrollRequestOs, EnrollResponse, EnrollmentToken, FailureCode,
     HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate, MetricsMap,
-    MetricsMapKey, SpoolStatus, TargetId, TargetStatus, Timestamp, Uuid,
+    MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
 };
 use reqwest::{Method, StatusCode};
 use tokio::sync::watch;
@@ -21,11 +21,13 @@ use zeroize::Zeroizing;
 use crate::backoff;
 use crate::config::{AgentConfig, ConfigError, TargetEngine};
 use crate::connector::Connector;
+use crate::detect;
 use crate::engine::{AuditLevel, Engine};
 use crate::identity::{Identity, IdentityError, StateDir};
 use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
 use crate::session::{CallError, RotateOutcome, Session};
-use crate::uplink::{self, Auth, Uplink, UplinkError};
+use crate::spool::Spool;
+use crate::uplink::{self, Auth, ResultBatch, Uplink, UplinkError};
 
 /// Errors returned to the binary. Messages never contain a secret or a
 /// configuration value.
@@ -254,6 +256,10 @@ struct Counters {
     jobs_failed: AtomicU64,
     jobs_unparseable: AtomicU64,
     jobs_deferred: AtomicU64,
+    batches_sent: AtomicU64,
+    batches_duplicate: AtomicU64,
+    batches_rejected: AtomicU64,
+    batch_conflicts: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, n: u64) {
@@ -269,6 +275,23 @@ struct Runtime {
     counters: Counters,
     ledger: Mutex<Ledger>,
     state: watch::Sender<RunState>,
+    spool: Mutex<Spool>,
+    /// Host root for local detection (`/`; a fixture tree in tests).
+    host_root: PathBuf,
+}
+
+/// A spool write failed (logged by kind only).
+struct SpoolIo;
+
+/// Result of one spool flush step.
+#[derive(Debug, PartialEq, Eq)]
+enum Flush {
+    /// Nothing to send.
+    Idle,
+    /// A batch was sent, dropped or replaced; continue.
+    Progress,
+    /// Retry the same batch later.
+    Retry(Duration),
 }
 
 /// Runs the agent until `shutdown` becomes `true`.
@@ -298,6 +321,13 @@ impl Runtime {
         state.load_hmac_key()?;
         let uplink = Uplink::new(&config)?;
         tracing::info!(agent_id = %identity.agent_id, "identity loaded");
+        let spool = Spool::open(&config.state_dir, &config.spool).map_err(|e| {
+            AgentError::Identity(IdentityError::Io {
+                path: config.state_dir.join("spool"),
+                kind: e.kind(),
+                detail: "",
+            })
+        })?;
         Ok(Self {
             config_path: config_path.to_owned(),
             config: RwLock::new(config),
@@ -307,15 +337,19 @@ impl Runtime {
             counters: Counters::default(),
             ledger: Mutex::new(Ledger::default()),
             state: watch::channel(RunState::Active).0,
+            spool: Mutex::new(spool),
+            host_root: PathBuf::from("/"),
         })
     }
 
     async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let heartbeat = self.heartbeat_loop(shutdown.clone());
-        let jobs = self.jobs_loop(shutdown);
+        let jobs = self.jobs_loop(shutdown.clone());
+        let spool = self.spool_loop(shutdown);
         tokio::select! {
             r = heartbeat => r,
             r = jobs => r,
+            r = spool => r,
         }
     }
 
@@ -378,6 +412,10 @@ impl Runtime {
             ("jobs_failed_total", &c.jobs_failed),
             ("jobs_unparseable_total", &c.jobs_unparseable),
             ("jobs_deferred_total", &c.jobs_deferred),
+            ("batches_sent_total", &c.batches_sent),
+            ("batches_duplicate_total", &c.batches_duplicate),
+            ("batches_rejected_total", &c.batches_rejected),
+            ("batch_conflicts_total", &c.batch_conflicts),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -391,23 +429,21 @@ impl Runtime {
         let config = self.config();
         let engines: Vec<Engine> = self.connectors.iter().map(|c| c.engine()).collect();
         let uptime = i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let spool = self.lock_spool().status();
         Ok(HeartbeatRequest {
             agent_version: agent_version()?,
             classifiers_version: None,
             connectors: connector_list(&engines),
-            // Local engine detection (ADR-0006) is a separate P1-B item.
-            detected_targets: Vec::new(),
+            detected_targets: detect::detect(
+                &detect::HostView {
+                    root: &self.host_root,
+                    is_socket: detect::is_unix_socket,
+                },
+                &config.targets,
+            ),
             metrics: Some(self.metrics()),
             running_jobs: None,
-            // Placeholder until the bounded disk spool exists.
-            spool: SpoolStatus {
-                batches: Count(0),
-                bytes: Count(0),
-                dropped_batches: None,
-                dropped_items: None,
-                max_bytes: Count(0),
-                oldest_age_s: None,
-            },
+            spool,
             targets: self.target_statuses(&config).await,
             ts: now(),
             uptime_s: Count(uptime),
@@ -537,6 +573,176 @@ impl Runtime {
             other => {
                 tracing::warn!(what, error = %other, "request failed");
                 Ok(normal)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- spool
+
+    fn lock_spool(&self) -> std::sync::MutexGuard<'_, Spool> {
+        self.spool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Converts masked findings of a job (the single conversion in
+    /// `uplink::to_batches`) and spools them. Wired to connectors in P2.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "connectors produce findings in P2")
+    )]
+    pub(crate) fn spool_findings(
+        &self,
+        job_id: Uuid,
+        target_id: &TargetId,
+        engine: databastion_protocol::Engine,
+        classifiers_version: &databastion_protocol::ClassifiersVersion,
+        findings: &[databastion_classifiers::masking::MaskedFinding],
+    ) -> std::io::Result<()> {
+        let built = uplink::to_batches(uplink::MaskedResults::Findings {
+            job_id,
+            classifiers_version,
+            target_id,
+            engine,
+            findings,
+        });
+        let mut spool = self.lock_spool();
+        spool.counters.dropped_items += built.dropped_items;
+        if built.dropped_items > 0 {
+            tracing::warn!(
+                items = built.dropped_items,
+                "invalid findings dropped before spooling"
+            );
+        }
+        for batch in &built.batches {
+            spool.push(batch)?;
+        }
+        Ok(())
+    }
+
+    async fn spool_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        let mut state = self.state.subscribe();
+        let mut failures: u32 = 0;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            if *state.borrow_and_update() != RunState::Active {
+                tokio::select! {
+                    _ = state.changed() => continue,
+                    _ = shutdown.changed() => continue,
+                }
+            }
+            let delay = match self.flush_once().await? {
+                Flush::Progress => {
+                    failures = 0;
+                    continue;
+                }
+                Flush::Idle => Duration::from_secs(2),
+                Flush::Retry(d) => {
+                    failures = failures.saturating_add(1);
+                    d
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                _ = shutdown.changed() => {}
+            }
+        }
+    }
+
+    /// Sends the batch at the head of the spool and applies the outcome
+    /// (docs/09 error table).
+    async fn flush_once(&self) -> Result<Flush, AgentError> {
+        let front = self.lock_spool().front();
+        let Some((key, batch)) = front else {
+            return Ok(Flush::Idle);
+        };
+        let Some(body) = batch.to_bytes() else {
+            self.lock_spool().drop_batch(&key);
+            return Ok(Flush::Progress);
+        };
+        let result = self
+            .session
+            .call(
+                Method::POST,
+                batch.path(),
+                &[],
+                Some(&body),
+                uplink::REQUEST_TIMEOUT,
+            )
+            .await;
+        let io = |e: std::io::Error| {
+            tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+            SpoolIo
+        };
+        match result {
+            Ok(reply) => {
+                match serde_json::from_slice::<databastion_protocol::BatchAck>(&reply.body) {
+                    Ok(ack) if ack.batch_id == batch.batch_id() => {
+                        if ack.duplicate {
+                            bump(&self.counters.batches_duplicate, 1);
+                            tracing::info!(batch_id = %ack.batch_id, "batch already received (duplicate)");
+                        }
+                    }
+                    _ => tracing::warn!("batch accepted with an unexpected acknowledgement"),
+                }
+                bump(&self.counters.batches_sent, 1);
+                self.lock_spool().remove(&key);
+                Ok(Flush::Progress)
+            }
+            Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
+                let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    items = dropped,
+                    "console rejected batch items; resending the rest"
+                );
+                let rest: Vec<ResultBatch> = batch.without(&items).into_iter().collect();
+                let left_out = u64::try_from(batch.len()).unwrap_or(u64::MAX)
+                    - u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>()).unwrap_or(0);
+                if self
+                    .lock_spool()
+                    .replace(&key, &rest, left_out)
+                    .map_err(io)
+                    .is_err()
+                {
+                    return Ok(Flush::Retry(Duration::from_secs(30)));
+                }
+                Ok(Flush::Progress)
+            }
+            Err(CallError::Uplink(UplinkError::Rejected { status: 413, .. })) => {
+                let mut spool = self.lock_spool();
+                match batch.halves() {
+                    Some((a, b)) => {
+                        if spool.replace(&key, &[a, b], 0).map_err(io).is_err() {
+                            return Ok(Flush::Retry(Duration::from_secs(30)));
+                        }
+                    }
+                    None => {
+                        tracing::warn!("single-item batch too large; dropped");
+                        spool.drop_batch(&key);
+                    }
+                }
+                Ok(Flush::Progress)
+            }
+            Err(CallError::Uplink(UplinkError::Rejected { status, code })) => {
+                if code == Some(databastion_protocol::ErrorCode::BatchConflict) {
+                    bump(&self.counters.batch_conflicts, 1);
+                    tracing::warn!(
+                        batch_id = %batch.batch_id(),
+                        "batch_conflict: the console holds different content for this batch_id; dropped"
+                    );
+                } else {
+                    bump(&self.counters.batches_rejected, 1);
+                    tracing::warn!(status, "batch rejected (not retryable); dropped");
+                }
+                self.lock_spool().drop_batch(&key);
+                Ok(Flush::Progress)
+            }
+            Err(e) => {
+                let normal = Duration::from_secs(30);
+                let delay = self.on_call_error("spool", &e, 1, normal)?;
+                Ok(Flush::Retry(delay))
             }
         }
     }

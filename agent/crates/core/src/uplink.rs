@@ -12,18 +12,25 @@
 //! - Request and response bodies are never logged. Error bodies are parsed
 //!   with the generated `Error` type and only their closed `code` and the
 //!   `pointer` / `keyword` of `details` are logged.
-//! - Findings and events are only accepted as masked types (I2, ADR-0003);
-//!   their batching lands with the spool (P2).
+//! - Findings and events are only accepted as masked types (I2, ADR-0003):
+//!   [`to_batches`] is the single conversion from `MaskedFinding` /
+//!   `MaskedEvent` to `FindingsBatch` / `EventsBatch`, with per-item
+//!   sanitization (ADR-0009) and the 1 MiB / `maxItems` caps.
 
 use std::time::Duration;
 
 use databastion_classifiers::masking::{MaskedEvent, MaskedFinding};
-use databastion_protocol::{AgentSecret, BatchAck, ErrorCode, Uuid};
+use databastion_protocol::{
+    AccessEvent, AgentSecret, ClassifierId as ProtoClassifierId, ClassifiersVersion, Count, Engine,
+    ErrorCode, EventsBatch, Finding, FindingsBatch, Identifier, Location,
+    MaskedSample as ProtoMaskedSample, TargetId, Uuid, UuidV7, new_batch_id,
+};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
 
 use crate::backoff;
 use crate::config::AgentConfig;
+use crate::sanitize;
 
 /// Protocol major version spoken by this agent.
 pub(crate) const PROTOCOL_VERSION: &str = "1";
@@ -40,9 +47,6 @@ pub(crate) fn user_agent() -> String {
 /// Uplink errors. They carry no request or response body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum UplinkError {
-    /// Not implemented yet (findings / events batches, P2).
-    #[error("uplink operation is not implemented yet")]
-    NotImplemented,
     /// Client construction failed (TLS / CA file).
     #[error("uplink setup failed: {0}")]
     Setup(&'static str),
@@ -70,6 +74,10 @@ pub(crate) enum UplinkError {
         status: u16,
         code: Option<ErrorCode>,
     },
+    /// `400` / `404` on `/findings` or `/events` whose `details` all point at
+    /// items: the (deduplicated, sorted) indices of the rejected items.
+    #[error("batch items rejected ({status}, {} items)", items.len())]
+    ItemsRejected { status: u16, items: Vec<usize> },
     /// Unexpected status or undecodable body.
     #[error("unexpected response ({status})")]
     UnexpectedResponse { status: u16 },
@@ -220,22 +228,6 @@ impl Uplink {
         }
         Err(classify(path, status, retry_after, &body))
     }
-
-    /// Sends a batch of masked findings (P2: spool and batching).
-    pub(crate) async fn send_findings(
-        &self,
-        _batch: &[MaskedFinding],
-    ) -> Result<BatchAck, UplinkError> {
-        Err(UplinkError::NotImplemented)
-    }
-
-    /// Sends a batch of masked access events (P4: spool and batching).
-    pub(crate) async fn send_events(
-        &self,
-        _batch: &[MaskedEvent],
-    ) -> Result<BatchAck, UplinkError> {
-        Err(UplinkError::NotImplemented)
-    }
 }
 
 fn transport(e: &reqwest::Error) -> UplinkError {
@@ -261,6 +253,29 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, Uplink
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Indices of the items designated by every `details[].pointer`, when all
+/// of them point inside `/findings/<i>` or `/events/<i>` (docs/09). `None`
+/// if any pointer targets the envelope, or if there is no detail.
+fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<usize>> {
+    let prefix = match path {
+        "/findings" => "/findings/",
+        "/events" => "/events/",
+        _ => return None,
+    };
+    if error.details.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(error.details.len());
+    for d in &error.details {
+        let rest = d.pointer.as_str().strip_prefix(prefix)?;
+        let index = rest.split('/').next()?;
+        items.push(index.parse::<usize>().ok()?);
+    }
+    items.sort_unstable();
+    items.dedup();
+    Some(items)
 }
 
 /// Maps a non-2xx response. Logs only the closed error code and the
@@ -305,9 +320,290 @@ fn classify(
             retry_after,
         },
         500..=599 => UplinkError::Server { status },
+        400 | 404 => match error.as_ref().and_then(|e| item_pointers(path, e)) {
+            Some(items) => UplinkError::ItemsRejected { status, items },
+            None => UplinkError::Rejected { status, code },
+        },
         400..=499 => UplinkError::Rejected { status, code },
         _ => UplinkError::UnexpectedResponse { status },
     }
+}
+
+// ------------------------------------------------------------- result batches
+
+/// Contract `x-databastion-max-bytes` of `FindingsBatch` / `EventsBatch`.
+pub(crate) const MAX_BATCH_BYTES: usize = 1024 * 1024;
+/// Contract `maxItems` of `FindingsBatch.findings`.
+pub(crate) const MAX_FINDINGS_PER_BATCH: usize = 200;
+/// Contract `maxItems` of `EventsBatch.events`.
+pub(crate) const MAX_EVENTS_PER_BATCH: usize = 500;
+
+/// A findings or events batch, as spooled and sent. Built only by
+/// [`to_batches`] (from masked types) or by splitting such a batch.
+#[derive(Debug, Clone)]
+pub(crate) enum ResultBatch {
+    /// `POST /findings`.
+    Findings(FindingsBatch),
+    /// `POST /events`.
+    Events(EventsBatch),
+}
+
+impl ResultBatch {
+    /// Parses a spooled body of the given kind.
+    pub(crate) fn parse(findings: bool, bytes: &[u8]) -> Option<Self> {
+        if findings {
+            serde_json::from_slice(bytes).ok().map(Self::Findings)
+        } else {
+            serde_json::from_slice(bytes).ok().map(Self::Events)
+        }
+    }
+
+    /// Whether this is a findings batch.
+    pub(crate) fn is_findings(&self) -> bool {
+        matches!(self, Self::Findings(_))
+    }
+
+    /// API path.
+    pub(crate) fn path(&self) -> &'static str {
+        if self.is_findings() {
+            "/findings"
+        } else {
+            "/events"
+        }
+    }
+
+    /// Idempotency key.
+    pub(crate) fn batch_id(&self) -> UuidV7 {
+        match self {
+            Self::Findings(b) => b.batch_id,
+            Self::Events(b) => b.batch_id,
+        }
+    }
+
+    /// Number of items.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Findings(b) => b.findings.len(),
+            Self::Events(b) => b.events.len(),
+        }
+    }
+
+    /// Serialized body.
+    pub(crate) fn to_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Findings(b) => serde_json::to_vec(b).ok(),
+            Self::Events(b) => serde_json::to_vec(b).ok(),
+        }
+    }
+
+    /// The same batch without the items at `drop`, under a **new**
+    /// `batch_id`; `None` if nothing is left.
+    pub(crate) fn without(&self, drop: &[usize]) -> Option<Self> {
+        fn keep<T: Clone>(items: &[T], drop: &[usize]) -> Vec<T> {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| drop.binary_search(i).is_err())
+                .map(|(_, x)| x.clone())
+                .collect()
+        }
+        let out = match self {
+            Self::Findings(b) => Self::Findings(FindingsBatch {
+                batch_id: new_batch_id(),
+                findings: keep(&b.findings, drop),
+                ..b.clone()
+            }),
+            Self::Events(b) => Self::Events(EventsBatch {
+                batch_id: new_batch_id(),
+                events: keep(&b.events, drop),
+            }),
+        };
+        (out.len() > 0).then_some(out)
+    }
+
+    /// Two halves, each under a new `batch_id` (`413`); `None` for a single
+    /// item.
+    pub(crate) fn halves(&self) -> Option<(Self, Self)> {
+        let n = self.len();
+        if n < 2 {
+            return None;
+        }
+        let first: Vec<usize> = (0..n / 2).collect();
+        let second: Vec<usize> = (n / 2..n).collect();
+        Some((self.without(&second)?, self.without(&first)?))
+    }
+}
+
+/// Batches built from masked results, and the items dropped on the way.
+#[derive(Debug, Default)]
+pub(crate) struct Built {
+    pub(crate) batches: Vec<ResultBatch>,
+    pub(crate) dropped_items: u64,
+}
+
+/// Masked results handed to [`to_batches`].
+pub(crate) enum MaskedResults<'a> {
+    /// Findings of one `discovery.scan` job on one target.
+    Findings {
+        job_id: Uuid,
+        classifiers_version: &'a ClassifiersVersion,
+        target_id: &'a TargetId,
+        engine: Engine,
+        findings: &'a [MaskedFinding],
+    },
+    /// Access events (P4: `MaskedEvent` carries no content yet).
+    #[cfg_attr(not(test), allow(dead_code, reason = "event producers land in P4"))]
+    Events(&'a [MaskedEvent]),
+}
+
+/// **The** conversion from masked types to protocol batches (I2, I6,
+/// ADR-0009): each item is converted, validated and sanitized
+/// (`sanitize`), invalid items are dropped and counted, and the rest is
+/// packed into batches of at most `maxItems` items and 1 MiB serialized,
+/// each with a fresh UUIDv7 `batch_id`.
+pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
+    match results {
+        MaskedResults::Findings {
+            job_id,
+            classifiers_version,
+            target_id,
+            engine,
+            findings,
+        } => {
+            let mut dropped = 0u64;
+            let items: Vec<Finding> = findings
+                .iter()
+                .filter_map(|f| {
+                    let item = finding_item(target_id, engine, f)
+                        .and_then(|mut i| sanitize::check_finding(&mut i).then_some(i));
+                    if item.is_none() {
+                        dropped += 1;
+                    }
+                    item
+                })
+                .collect();
+            let mut built = pack_findings(job_id, classifiers_version, items);
+            built.dropped_items += dropped;
+            built
+        }
+        MaskedResults::Events(events) => {
+            // P4: event masking produces no content yet; nothing to send.
+            Built {
+                batches: Vec::new(),
+                dropped_items: u64::try_from(events.len()).unwrap_or(u64::MAX),
+            }
+        }
+    }
+}
+
+fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Option<Finding> {
+    let loc = f.location()?;
+    let id =
+        |n: &databastion_classifiers::names::NormalizedName| Identifier::try_from(n.as_str()).ok();
+    let masked_samples = f
+        .masked_samples()
+        .iter()
+        .filter_map(|s| ProtoMaskedSample::try_from(s.as_str()).ok())
+        .collect();
+    Some(Finding {
+        classifier: ProtoClassifierId::try_from(f.classifier().as_str()).ok()?,
+        confidence: f.confidence(),
+        estimated_rows: f
+            .estimated_rows()
+            .and_then(|r| i64::try_from(r).ok())
+            .map(Count),
+        fingerprints: None,
+        location: Location {
+            database: id(&loc.database)?,
+            engine,
+            field: id(&loc.field)?,
+            object: id(&loc.object)?,
+            schema: match &loc.schema {
+                Some(s) => Some(id(s)?),
+                None => None,
+            },
+        },
+        masked_samples,
+        matched: i64::from(f.matched()),
+        sampled: std::num::NonZeroU64::new(u64::from(f.sampled()))?,
+        target_id: target_id.clone(),
+    })
+}
+
+/// Packs sanitized findings under the item and byte caps.
+fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>) -> Built {
+    let make = |findings: Vec<Finding>| FindingsBatch {
+        batch_id: new_batch_id(),
+        classifiers_version: version.clone(),
+        findings,
+        job_id,
+    };
+    let mut built = Built::default();
+    let envelope = serde_json::to_vec(&make(Vec::new())).map_or(MAX_BATCH_BYTES, |v| v.len());
+    let mut current: Vec<Finding> = Vec::new();
+    let mut size = envelope;
+    for item in items {
+        let Ok(len) = serde_json::to_vec(&item).map(|v| v.len() + 1) else {
+            built.dropped_items += 1;
+            continue;
+        };
+        if envelope + len > MAX_BATCH_BYTES {
+            built.dropped_items += 1;
+            continue;
+        }
+        if current.len() == MAX_FINDINGS_PER_BATCH || size + len > MAX_BATCH_BYTES {
+            built
+                .batches
+                .push(ResultBatch::Findings(make(std::mem::take(&mut current))));
+            size = envelope;
+        }
+        size += len;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        built.batches.push(ResultBatch::Findings(make(current)));
+    }
+    built
+}
+
+/// Packs sanitized events under the item and byte caps (used once event
+/// masking produces content, P4; tested now).
+#[cfg_attr(not(test), allow(dead_code, reason = "event masking lands in P4"))]
+pub(crate) fn pack_events(items: Vec<AccessEvent>) -> Built {
+    let make = |events: Vec<AccessEvent>| EventsBatch {
+        batch_id: new_batch_id(),
+        events,
+    };
+    let mut built = Built::default();
+    let envelope = serde_json::to_vec(&make(Vec::new())).map_or(MAX_BATCH_BYTES, |v| v.len());
+    let mut current: Vec<AccessEvent> = Vec::new();
+    let mut size = envelope;
+    for mut item in items {
+        if !sanitize::check_event(&mut item) {
+            built.dropped_items += 1;
+            continue;
+        }
+        let Ok(len) = serde_json::to_vec(&item).map(|v| v.len() + 1) else {
+            built.dropped_items += 1;
+            continue;
+        };
+        if envelope + len > MAX_BATCH_BYTES {
+            built.dropped_items += 1;
+            continue;
+        }
+        if current.len() == MAX_EVENTS_PER_BATCH || size + len > MAX_BATCH_BYTES {
+            built
+                .batches
+                .push(ResultBatch::Events(make(std::mem::take(&mut current))));
+            size = envelope;
+        }
+        size += len;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        built.batches.push(ResultBatch::Events(make(current)));
+    }
+    built
 }
 
 #[cfg(test)]

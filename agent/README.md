@@ -46,6 +46,56 @@ binary: `cargo build --no-default-features --features postgres`.
 - Raw values are wrapped in `RawSample`: redacted `Debug`, no `Display`, no
   serialization, and `expose()` is crate-private to `classifiers`.
 
+### Results path: normalization, sanitization, spool (ADR-0009)
+- Names: `classifiers::names` is the only producer of `NormalizedName`
+  (array indices → `[]`, value-like segments such as long digit runs, UUIDs,
+  e-mail addresses → `*`, LDAP entry DN → parent container, attribute types
+  lowercased, anything non-conforming → `*`). A `FindingLocation` is built
+  only from `NormalizedName`s. Property tests
+  (`crates/classifiers/tests/names_props.rs`, deterministic generator, no
+  extra dependency) check every output against the generated `Identifier`
+  type and its `not` rule. Skeleton: classifier matches on segments are
+  added by P2-A.
+- Conversion: `uplink::to_batches` is the single conversion from
+  `MaskedFinding` / `MaskedEvent` to `FindingsBatch` / `EventsBatch`. Each
+  item goes through `sanitize` (the `NOT_ENFORCED_BY_SERDE` keywords for sent
+  types: `not` → `*`, `confidence` / `sampled` / `matched` ranges and
+  `matched <= sampled`, `maxItems` / `uniqueItems` of samples, fingerprints,
+  objects and signals, the `read` / `write` object requirement, `Count`
+  ranges); an item still invalid is dropped and counted. Batches hold at most
+  200 findings / 500 events and 1 MiB serialized, each with a fresh UUIDv7.
+- Account names: control / format characters stripped, truncated on a
+  character boundary; a non-conforming name goes to `db_user_fingerprint`.
+  **Stub**: HMAC fingerprints are not wired yet (P2-A), so such an event is
+  dropped and counted instead. `MaskedEvent` has no content yet (P4): no
+  event reaches the spool today.
+- Spool: `<state_dir>/spool/`, one `0600` file per batch written with
+  tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
+  removed at startup, unreadable files are moved to `spool/quarantine/` (32
+  kept) and counted (`quarantined`), never crash the agent and are never
+  logged. Bounded by `spool.max_bytes` (default 256 MiB) and
+  `spool.max_batches` (default 10000): oldest dropped first. FIFO send:
+  `2xx` (including `duplicate: true`) removes the batch; `400` / `404` whose
+  pointers all designate items → those items dropped, the rest resent under
+  a new `batch_id` at the same queue position; `413` → two halves with new
+  ids (a single item is dropped); `409 batch_conflict` → dropped, counted
+  (`batch_conflicts_total`), warned, never resent; other `4xx` → dropped;
+  network / `5xx` / `429` → kept and retried with backoff; `401` / `426` →
+  kept (spooling continues within bounds). Real stats go into the heartbeat
+  `spool` section.
+
+### Local engine detection (ADR-0006, I5)
+`detect` looks at the agent host only, read-only, with no network I/O: a
+fixed list of Unix socket paths under `/run`, `/var/run`, `/tmp`,
+`/var/lib/mysql` (`lstat`, never connect); `LISTEN` entries of
+`/proc/net/tcp{,6}` for ports 5432 / 3306 / 27017 / 389 / 636 (the address is
+never reported); `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`,
+`mongod`, `slapd` (never the command line). Declared targets are excluded
+(same socket; loopback host with the same port; a local target of the same
+engine family hides the process entry). At most 16 entries, reported as
+`detected_targets` in each heartbeat. The host root is injectable; tests use
+fixture trees.
+
 ### Guards
 `crates/agent/tests/architecture.rs` checks that connectors do not depend on
 an HTTP client or `socket2` (including `[dependencies.x]` tables and

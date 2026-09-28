@@ -28,6 +28,13 @@ limits:
   statement_timeout_ms: 30000  # 100..=600000, never 0
   max_scan_duration_s: 3600    # 60..=86400
 
+# Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,
+# files 0600). When full, the oldest batches are dropped first and counted
+# (heartbeat spool.dropped_batches / dropped_items).
+spool:
+  max_bytes: 268435456         # 256 MiB; 2097152..=68719476736
+  max_batches: 10000           # 1..=1000000
+
 targets:
   - id: pg-main                # slug reported to the console (no host name)
     engine: postgres           # postgres | mysql | mariadb | mongodb | openldap

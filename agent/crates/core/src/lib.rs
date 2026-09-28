@@ -10,7 +10,9 @@
 //!   binary gets.
 //! - crate-private: `uplink` (HTTPS client, rustls, TLS 1.3), `session`
 //!   (authentication, `401` handling, secret rotation), `identity` (`0600`
-//!   state files), `jobs` (per-job parsing, dedup), `backoff`.
+//!   state files), `jobs` (per-job parsing, dedup), `backoff`, `sanitize`
+//!   (per-item validation, ADR-0009), `spool` (bounded disk spool),
+//!   `detect` (local engine detection, ADR-0006).
 //!
 //! The uplink only accepts masked types for findings and events (I2,
 //! ADR-0003). It is not exported: connectors depend on this crate but can
@@ -27,17 +29,16 @@
 mod backoff;
 pub mod config;
 pub mod connector;
+mod detect;
 pub mod engine;
 mod fsutil;
 pub mod identity;
 mod jobs;
 pub mod runtime;
+mod sanitize;
 mod session;
 pub mod sink;
-#[allow(
-    dead_code,
-    reason = "send_findings / send_events are wired with the spool (P2)"
-)]
+mod spool;
 mod uplink;
 
 pub use config::AgentConfig;

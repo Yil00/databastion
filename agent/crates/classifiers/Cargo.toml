@@ -10,5 +10,10 @@ publish.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+# Property tests check normalized names against the generated contract
+# `Identifier` type (test only; the library does not depend on it).
+databastion-protocol.workspace = true
+
 [lints]
 workspace = true

@@ -987,3 +987,170 @@ async fn immediate_204_does_not_hot_loop() {
         .count();
     assert!((1..=3).contains(&polls), "{polls} polls in 1.5 s");
 }
+
+// ---------------------------------------------------------------- spool
+
+/// Scripted `/findings` responses, in order; then plain acks.
+enum Step {
+    Ack(bool),
+    Items(&'static [&'static str]),
+    TooLarge,
+    Conflict,
+}
+
+struct Script(std::sync::Mutex<std::collections::VecDeque<Step>>);
+
+impl wiremock::Respond for Script {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let ack = |dup: bool| {
+            ResponseTemplate::new(202)
+                .set_body_json(serde_json::json!({"batch_id": body["batch_id"], "duplicate": dup}))
+        };
+        match self.0.lock().unwrap().pop_front() {
+            None | Some(Step::Ack(false)) => ack(false),
+            Some(Step::Ack(true)) => ack(true),
+            Some(Step::Items(pointers)) => {
+                let details: Vec<_> = pointers
+                    .iter()
+                    .map(|p| serde_json::json!({"pointer": p, "keyword": "maximum"}))
+                    .collect();
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "code": "invalid_request", "message": "Invalid.", "details": details
+                }))
+            }
+            Some(Step::TooLarge) => error_body(413, "payload_too_large"),
+            Some(Step::Conflict) => error_body(409, "batch_conflict"),
+        }
+    }
+}
+
+async fn spooled_runtime(server: &MockServer, steps: Vec<Step>, findings: usize) -> (Env, Runtime) {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(findings, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    (env, rt)
+}
+
+async fn sent_batches(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/findings"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+async fn drain(rt: &Runtime) {
+    for _ in 0..20 {
+        if rt.flush_once().await.unwrap() == Flush::Idle {
+            return;
+        }
+    }
+    panic!("spool not drained");
+}
+
+#[tokio::test]
+async fn items_rejected_by_pointer_are_dropped_and_rest_resent_under_new_id() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(
+        &server,
+        vec![Step::Items(&["/findings/1/confidence", "/findings/3"])],
+        10,
+    )
+    .await;
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 8);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    assert_eq!(status.dropped_batches.unwrap().0, 0);
+    assert_eq!(status.batches.0, 0);
+}
+
+#[tokio::test]
+async fn envelope_pointer_drops_the_whole_batch() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/job_id"])], 4).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_batches.unwrap().0, 1);
+    assert_eq!(status.dropped_items.unwrap().0, 4);
+}
+
+#[tokio::test]
+async fn payload_too_large_splits_in_halves_with_new_ids() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::TooLarge, Step::Ack(true)], 9).await;
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    let sizes: Vec<_> = sent
+        .iter()
+        .map(|b| b["findings"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [9, 4, 5]);
+    let ids: std::collections::HashSet<_> =
+        sent.iter().map(|b| b["batch_id"].to_string()).collect();
+    assert_eq!(ids.len(), 3);
+    let m = rt.metrics().0;
+    let get = |k: &str| m[&MetricsMapKey::try_from(k).unwrap()];
+    assert!((get("batches_duplicate_total") - 1.0).abs() < f64::EPSILON);
+    assert!((get("batches_sent_total") - 2.0).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn batch_conflict_is_dropped_never_resent() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Conflict], 3).await;
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    let m = rt.metrics().0;
+    assert!(
+        (m[&MetricsMapKey::try_from("batch_conflicts_total").unwrap()] - 1.0).abs() < f64::EPSILON
+    );
+    assert_eq!(rt.lock_spool().status().dropped_batches.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn server_errors_keep_the_batch_for_retry() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let found = crate::spool::tests::masked(2, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+    assert!(matches!(rt.flush_once().await.unwrap(), Flush::Retry(_)));
+    let hb = rt.build_heartbeat().await.unwrap();
+    assert_eq!(hb.spool.batches.0, 1);
+    assert!(hb.spool.bytes.0 > 0);
+    assert!(hb.spool.max_bytes.0 > 0);
+}
