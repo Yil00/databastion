@@ -1,0 +1,31 @@
+{
+  "batch_id": "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f",
+  "events": [
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:02:11Z",
+      "principal": {
+        "db_user": "backup",
+        "client_addr": "192.0.2.14",
+        "application": "pg_dump",
+        "db_user_fingerprint": "hmac-sha256:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "clients"
+        }
+      ],
+      "rows": 1250000,
+      "signals": [
+        "signature.pg_dump",
+        "shape.full_table_copy",
+        "volume.above_baseline"
+      ],
+      "source": "pgaudit",
+      "aggregated_count": 1
+    }
+  ]
+}

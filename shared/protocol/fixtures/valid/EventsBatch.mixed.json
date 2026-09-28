@@ -81,6 +81,19 @@
       ],
       "source": "mongodb_log",
       "aggregated_count": 1
+    },
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:06:00Z",
+      "ts_last": "2026-09-28T14:06:40Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "client_addr": "198.51.100.99"
+      },
+      "action": "auth_failure",
+      "objects": [],
+      "source": "pgaudit",
+      "aggregated_count": 12
     }
   ]
 }

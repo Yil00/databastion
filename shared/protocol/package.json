@@ -7,8 +7,10 @@
   "type": "module",
   "scripts": {
     "lint": "npx --yes @redocly/cli@2.54.3 lint --config redocly.yaml openapi.yaml",
+    "test:schema-lint": "node --test scripts/schema-lint.test.mjs",
     "validate": "node scripts/validate-fixtures.mjs",
-    "test": "npm run lint && npm run validate"
+    "test": "npm run test:schema-lint && npm run validate",
+    "check": "npm run lint && npm test"
   },
   "devDependencies": {
     "ajv": "8.20.0",

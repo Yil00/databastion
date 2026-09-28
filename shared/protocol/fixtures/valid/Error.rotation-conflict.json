@@ -1,0 +1,4 @@
+{
+  "code": "rotation_conflict",
+  "message": "Secret rotation conflict. The agent has been locked; re-enrollment is required."
+}

@@ -9,7 +9,7 @@
         "engine": "mongodb",
         "database": "app",
         "object": "users",
-        "field": "profile.contact.email"
+        "field": "orders[].contacts.*.email"
       },
       "classifier": "pii.email",
       "confidence": 0.88,

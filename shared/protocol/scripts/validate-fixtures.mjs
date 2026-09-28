@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Validates the protocol contract and its fixtures.
 //
-// 1. Bounds lint: every object schema of openapi.yaml is closed (`additionalProperties: false`,
-//    invariant I2), every string / array / number is bounded. The only allowed open object is a
-//    numeric map explicitly marked `x-databastion-numeric-map: true`.
+// 1. Bounds lint (scripts/schema-lint.mjs): every object schema of openapi.yaml is closed
+//    (`additionalProperties: false`, invariant I2), every string / array / number is bounded, no
+//    `true` / `{}` schema. The only allowed open object is a numeric map marked
+//    `x-databastion-numeric-map: true`.
 // 2. Every fixture in fixtures/valid/ validates against its schema; every fixture in
 //    fixtures/invalid/ is rejected, with the JSON Schema keyword listed in
 //    fixtures/invalid-expectations.json (so that it fails for the intended reason).
@@ -18,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { parse } from "yaml";
+import { MAP_MARK, lintDocument } from "./schema-lint.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const doc = parse(readFileSync(join(root, "openapi.yaml"), "utf8"));
@@ -26,64 +28,7 @@ const problems = [];
 const fail = (msg) => problems.push(msg);
 
 // ---------------------------------------------------------------- 1. bounds lint
-const MAP_MARK = "x-databastion-numeric-map";
-// `fragment`: subschema of if / then / else / not, which only adds conditions to its parent
-// (closure and explicit type are checked on the parent, not on the fragment).
-function lintSchema(node, path, fragment = false) {
-  if (node === null || typeof node !== "object" || Array.isArray(node)) return;
-  const onlyRef = node.$ref !== undefined;
-  const isEnum = node.enum !== undefined || node.const !== undefined;
-  const type = node.type;
-
-  if (!onlyRef && !fragment && (type === "object" || node.properties !== undefined)) {
-    if (node[MAP_MARK] === true) {
-      const ap = node.additionalProperties;
-      const numeric = ap && typeof ap === "object" && (ap.type === "number" || ap.type === "integer");
-      if (!numeric || node.propertyNames?.pattern === undefined || node.maxProperties === undefined) {
-        fail(`${path}: numeric map needs numeric additionalProperties, propertyNames.pattern and maxProperties`);
-      }
-    } else if (node.additionalProperties !== false) {
-      fail(`${path}: object schema without "additionalProperties: false" (invariant I2)`);
-    }
-  }
-  // A format (uuid, date-time) alone does not bound a string for every validator: maxLength is required.
-  if (type === "string" && !isEnum && node.maxLength === undefined) {
-    fail(`${path}: unbounded string (maxLength, enum or const required)`);
-  }
-  if (type === "array" && node.maxItems === undefined) {
-    fail(`${path}: unbounded array (maxItems required)`);
-  }
-  if ((type === "integer" || type === "number") && !isEnum && (node.minimum === undefined || node.maximum === undefined)) {
-    fail(`${path}: unbounded number (minimum and maximum required)`);
-  }
-  if (type === undefined && !fragment && !onlyRef && !node.oneOf && !node.anyOf && !node.allOf && Object.keys(node).some((k) => ["properties", "items", "pattern"].includes(k))) {
-    fail(`${path}: schema with constraints but no explicit type`);
-  }
-
-  for (const [key, value] of Object.entries(node)) {
-    if (key === "properties" || key === "patternProperties" || key === "$defs") {
-      for (const [name, sub] of Object.entries(value)) lintSchema(sub, `${path}/${key}/${name}`);
-    } else if (["items", "additionalProperties", "propertyNames", "contains"].includes(key)) {
-      lintSchema(value, `${path}/${key}`);
-    } else if (["not", "if", "then", "else"].includes(key)) {
-      lintSchema(value, `${path}/${key}`, true);
-    } else if (["oneOf", "anyOf", "allOf", "prefixItems"].includes(key)) {
-      value.forEach((sub, i) => lintSchema(sub, `${path}/${key}/${i}`));
-    }
-  }
-}
-
-for (const [name, schema] of Object.entries(schemas)) lintSchema(schema, `#/components/schemas/${name}`);
-for (const [name, param] of Object.entries(doc.components.parameters ?? {})) {
-  lintSchema(param.schema, `#/components/parameters/${name}/schema`);
-}
-for (const [p, item] of Object.entries(doc.paths)) {
-  for (const [method, op] of Object.entries(item)) {
-    (op.parameters ?? []).forEach((param, i) => {
-      if (param.schema) lintSchema(param.schema, `#/paths/${p}/${method}/parameters/${i}/schema`);
-    });
-  }
-}
+for (const problem of lintDocument(doc)) fail(problem);
 
 // ------------------------------------------------ 2. build a JSON Schema 2020-12 document
 // OpenAPI 3.1 schemas are JSON Schema 2020-12: move components.schemas to $defs and rewrite refs.
@@ -101,10 +46,11 @@ const rewrite = (value) => {
 };
 const jsonSchema = { $id: ROOT_ID, $defs: rewrite(schemas) };
 
-const ajv = new Ajv2020({ strict: true, allErrors: true });
+// strictRequired off: `oneOf: [{required: [a]}, {required: [b]}]` (exactly one of) is intended.
+const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true });
 addFormats(ajv);
 // OpenAPI annotations, not validation keywords. `oneOf` + `const` on `type` does the validation.
-ajv.addVocabulary(["discriminator", MAP_MARK]);
+ajv.addVocabulary(["discriminator", MAP_MARK, "x-databastion-normalized-name", "x-databastion-max-bytes"]);
 ajv.addSchema(jsonSchema);
 
 const validatorFor = (name) => {
@@ -140,6 +86,10 @@ for (const kind of ["valid", "invalid"]) {
     }
     covered[kind].add(m[1]);
     checked++;
+    const maxBytes = schemas[m[1]]["x-databastion-max-bytes"];
+    if (kind === "valid" && maxBytes !== undefined && Buffer.byteLength(JSON.stringify(data)) > maxBytes) {
+      fail(`fixtures/valid/${file}: larger than x-databastion-max-bytes (${maxBytes})`);
+    }
     const ok = validate(data);
     const errors = validate.errors ?? [];
     if (kind === "valid" && !ok) {
