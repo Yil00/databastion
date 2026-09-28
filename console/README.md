@@ -7,8 +7,9 @@ database (also used as the job queue: no Redis). See
 [docs/02-architecture.md](../docs/02-architecture.md) and
 [docs/03-tech-stack.md](../docs/03-tech-stack.md).
 
-> Status: phase 0 skeleton (ROADMAP P0-D). No business feature and no agent
-> endpoint yet.
+> Status: phase 1 backend (ROADMAP P1-A part 1): database schema, local auth, console audit
+> log, enrollment tokens, agent API `/enroll`, `/heartbeat`, `/jobs` (long-poll),
+> `/jobs/{job_id}/status`. No UI page yet.
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -21,10 +22,16 @@ database (also used as the job queue: no Redis). See
 | `DATABASE_URL` / `DATABASE_URL_FILE` | Internal PostgreSQL connection string, directly or via a file (Docker secret). Setting both is an error. |
 | `LOG_LEVEL` | pino level (`info` by default) |
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
+| `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin |
+| `DATABASTION_TRUST_PROXY=1` | Use the last `X-Forwarded-For` entry as the client IP for rate limiting. Set it only behind a reverse proxy that appends it; unset: all clients share one rate-limit bucket |
+| `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only) |
+| `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
+| `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
+| `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
 
-`DATABASTION_ENCRYPTION_KEY(_FILE)` and `DATABASTION_PUBLIC_URL` from
-[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) are not
-used yet. The console only knows its own database: it never stores target
+`DATABASTION_ENCRYPTION_KEY(_FILE)` from
+[deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) is not
+used yet (see "Data at rest"). The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
 ## Commands
@@ -41,6 +48,23 @@ database credentials (invariant I3).
 | `pnpm protocol:generate` | Regenerate `src/generated/protocol/` from `shared/protocol/openapi.yaml` (checked by `pnpm test`) |
 | `pnpm db:generate --name <slug>` | Generate a versioned SQL migration in `drizzle/` from `src/db/schema.ts` |
 | `pnpm db:migrate` | Apply pending migrations to `DATABASE_URL(_FILE)` |
+| `pnpm admin:bootstrap` | Create the first administrator (refused if any user exists) |
+
+`pnpm test` starts a throwaway PostgreSQL cluster on `127.0.0.1` (random port, temporary
+directory, deleted afterwards; run as the `postgres` system user when the tests run as root) for
+the database tests. Without `TEST_DATABASE_URL` or PostgreSQL binaries, those tests are skipped
+with a message and the unit tests still run.
+
+## First administrator
+There is no default account and no default password. After `pnpm db:migrate`:
+
+```sh
+DATABASTION_BOOTSTRAP_ADMIN_USERNAME=admin \
+DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/admin_password \
+pnpm admin:bootstrap
+```
+
+The command refuses to run once a user exists, and writes `user.bootstrap` to the audit log.
 
 The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 `pnpm build` with Node 24.
@@ -50,14 +74,44 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 |-------|---------|
 | `GET /api/health` | Liveness: `{"status":"ok"}`, never touches the database |
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
-| `/api/agent/v1/*` | Agent API placeholder, `501 not_implemented` (see [its README](src/app/api/agent/v1/README.md)) |
+| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events`, `/rotate` still `501` |
+| `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP and per username |
+| `POST /api/auth/logout` | Ends the session |
+| `GET /api/auth/session` | Current user + CSRF token |
+| `GET` / `POST /api/enrollment-tokens` | List / create (admin). The `dbe_…` token is returned once, only its SHA-256 is stored; valid 24 h |
+| `DELETE /api/enrollment-tokens/{id}` | Revoke an unused token (admin) |
+| `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
+| `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
+
+User sessions: 256-bit cookie (`HttpOnly`, `SameSite=Strict`, `Secure` + `__Host-` prefix in
+production), only its SHA-256 stored, 12 h absolute / 2 h idle. State-changing user routes require
+a same-origin request and the `X-CSRF-Token` header (HMAC of the session token, returned by login
+and `/api/auth/session`). Every user action (login, logout, token creation / revocation, agent
+revocation) and every enrollment is written to the `audit_log` table (append-only, no secrets).
+
+## Data at rest
+| Data | Storage |
+|------|---------|
+| User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
+| Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
+| Database credentials, connection strings | never received nor stored (invariant I3) |
+| Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
+| Masked samples (P2-D), webhook / SMTP settings (later) | AES-256-GCM with `DATABASTION_ENCRYPTION_KEY`, introduced with the first such column |
+
+Rate limiters and the verified-secret cache are in-memory, per process: the MVP runs one web
+process. Several web replicas would need a shared store for the limiters (the secret cache is
+already safe across processes, as it is bound to the stored hash).
 
 ## Layout
 ```
 drizzle/                  versioned SQL migrations (generated, never edited by hand)
 scripts/protocol/         protocol code generator (`pnpm protocol:generate`)
 src/app/                  Next.js App Router (UI + API routes)
-src/app/api/agent/v1/     agent API (placeholder)
+src/app/api/agent/v1/     agent API routes (thin, logic in src/server/agent-api/)
+src/app/api/{auth,agents,enrollment-tokens}/  user API routes (logic in src/server/user-api.ts)
+src/cli/                  admin bootstrap command
+src/server/               auth, audit log, enrollment, agents, jobs, rate limiting
+src/test/                 test harness (throwaway PostgreSQL cluster, fixture helpers)
 src/config/               configuration loading (NAME / NAME_FILE)
 src/db/                   Drizzle schema, client, migrator
 src/generated/protocol/   types + JSON Schema bundle generated from shared/protocol/ (never edited)

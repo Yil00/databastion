@@ -15,6 +15,11 @@ describe("errorSummary", () => {
     });
   });
 
+  it("drops the bound parameters of drizzle query errors", () => {
+    const err = new Error("Failed query: insert into agents values ($1)\nparams: dbs_x,secret");
+    expect(errorSummary(err).message).toBe("Failed query: insert into agents values ($1) [params redacted]");
+  });
+
   it("stringifies non-Error values", () => {
     expect(errorSummary("oops")).toEqual({ message: "oops" });
   });
