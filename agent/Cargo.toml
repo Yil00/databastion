@@ -40,6 +40,9 @@ async-trait = "0.1"
 # RustCrypto HMAC-SHA256 for value fingerprints (classifiers::masking).
 hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# MySQL connector (P2-C): SHA-1 scramble of mysql_native_password only (a
+# protocol requirement, not used for any other purpose).
+sha1 = { version = "0.11", default-features = false }
 # NFC normalization of names and addresses before fingerprinting.
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 # Linear-time regex engine (no backtracking, no ReDoS) for the classifiers.
@@ -63,6 +66,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1.12", default-features = false, features = ["std"] }
 rustls-native-certs = "0.8"
 futures-util = { version = "0.3", default-features = false }
+# The MySQL / MariaDB connector (P2-C) has no driver crate: it speaks the
+# client protocol itself (crates/connector-mysql/src/proto.rs) over tokio and
+# the TLS crates above.
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

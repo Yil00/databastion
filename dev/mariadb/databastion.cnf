@@ -14,3 +14,8 @@ server_audit_excl_users = healthcheck
 performance_schema = ON
 performance-schema-consumer-events-statements-history = ON
 performance-schema-consumer-events-statements-history-long = ON
+# DEV-ONLY TLS material created by initdb/30-tls.sh (throwaway CA, certificate for 127.0.0.1 /
+# localhost / mariadb), so that the agent can use its default `tls: verify_full` with a pinned CA.
+ssl_ca = /var/lib/mysql/databastion-tls/ca.pem
+ssl_cert = /var/lib/mysql/databastion-tls/server-cert.pem
+ssl_key = /var/lib/mysql/databastion-tls/server-key.pem

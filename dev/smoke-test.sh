@@ -51,6 +51,10 @@ echo "# MariaDB + server_audit"
 MARIADB='MYSQL_PWD="$DATABASTION_DB_PASSWORD" mariadb -h 127.0.0.1 -u databastion -N'
 check "read-only account can read" ex mariadb "$MARIADB -e 'SELECT COUNT(*) FROM support.tickets' | grep -Eq '^[1-9]'"
 check "read-only account cannot write" must_fail ex mariadb "$MARIADB -e 'DELETE FROM support.tickets WHERE id = -1'"
+# ADR-0018 minimal variant: grants on the application database only, TLS required.
+check "agent account has no global privilege (mysql.global_priv not readable)" \
+  must_fail ex mariadb "$MARIADB -e 'SELECT COUNT(*) FROM mysql.global_priv'"
+check "agent account needs TLS" must_fail ex mariadb "$MARIADB --skip-ssl -e 'SELECT 1'"
 check "server_audit log records the query" retry 15 ex mariadb \
   "grep databastion /var/log/databastion/server_audit.log | grep -q tickets"
 check "audit log non-empty on the host" test -s .state/logs/mariadb/server_audit.log
@@ -59,8 +63,14 @@ echo "# MySQL + performance_schema"
 MYSQL='MYSQL_PWD="$DATABASTION_DB_PASSWORD" mysql -h 127.0.0.1 -u databastion -N'
 check "read-only account can read" ex mysql "$MYSQL -e 'SELECT COUNT(*) FROM hr.employees' | grep -Eq '^[1-9]'"
 check "read-only account cannot write" must_fail ex mysql "$MYSQL -e 'DELETE FROM hr.employees WHERE id = -1'"
+check "agent account has no global privilege (mysql.user not readable)" \
+  must_fail ex mysql "$MYSQL -e 'SELECT COUNT(*) FROM mysql.user'"
+check "agent account needs TLS" must_fail ex mysql "$MYSQL --ssl-mode=DISABLED -e 'SELECT 1'"
+# ADR-0018 minimal variant: the agent account has no performance_schema grant before Audit (P4-B);
+# the audit source itself is checked as root.
+MYSQL_ROOT='MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h 127.0.0.1 -u root -N'
 check "events_statements_history_long records the query" ex mysql \
-  "$MYSQL -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE SQL_TEXT LIKE '%hr.employees%'\" | grep -Eq '^[1-9]'"
+  "$MYSQL_ROOT -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE SQL_TEXT LIKE '%hr.employees%'\" | grep -Eq '^[1-9]'"
 
 echo "# MongoDB (Community: profiler + JSON logs)"
 MONGO='mongosh --quiet --norc "mongodb://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"'

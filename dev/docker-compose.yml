@@ -82,6 +82,7 @@ services:
       - ./mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
       - ./seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+      - ./mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
     healthcheck:
       # --connect fails while the entrypoint's temporary (--skip-networking) server is seeding.
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
@@ -99,6 +100,7 @@ services:
       - ./mysql/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
       - ./seed/out/mysql.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./mysql/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+      - ./mysql/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
     healthcheck:
       # TCP: the temporary server used during initialization runs with --skip-networking.
       test: ["CMD-SHELL", "MYSQL_PWD=\"$$DATABASTION_DB_PASSWORD\" mysql -h 127.0.0.1 -u databastion -N -e 'SELECT 1 FROM hr.employees LIMIT 1'"]
