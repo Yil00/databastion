@@ -95,6 +95,13 @@ const ALPHABET: &[&str] = &[
     "五",
     "九",
     "六一二三四五六七八",
+    // Review of the follow-ups, L3: CJK financial numerals.
+    "壹",
+    "陆",
+    "貳",
+    "两",
+    "拾",
+    "陆壹贰叁肆伍陆柒捌",
 ];
 
 fn random_input(rng: &mut Rng) -> String {
@@ -342,8 +349,32 @@ mod gate {
         "[bcdfghjklmnpqrstvwxz]{4,8}"
     }
 
+    /// A number of 9 to 12 CJK numerals (ideographic and financial forms).
+    fn cjk_number() -> impl Strategy<Value = String> {
+        const NUMERALS: &[char] = &[
+            '零', '〇', '一', '二', '三', '四', '五', '六', '七', '八', '九', '壹', '贰', '叁',
+            '肆', '伍', '陆', '柒', '捌', '玖', '貳', '參', '陸', '两', '兩', '拾',
+        ];
+        proptest::collection::vec(0..NUMERALS.len(), 9..=12)
+            .prop_map(|v| v.into_iter().map(|i| NUMERALS[i]).collect())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn cjk_numbers_never_survive(input in embed(cjk_number().prop_flat_map(split))) {
+            use databastion_classifiers::names::is_numeric_like;
+            for out in [
+                normalize_path(&input),
+                normalize_field_path(&keys(&input)),
+            ] {
+                let out = out.as_str();
+                assert_contract(&input, out);
+                let kept = out.chars().filter(|c| is_numeric_like(*c)).count();
+                prop_assert!(kept <= 8, "{input:?} -> {out:?} keeps {kept} numerals");
+            }
+        }
 
         #[test]
         fn split_numbers_never_survive(input in embed(compact_value().prop_flat_map(split))) {

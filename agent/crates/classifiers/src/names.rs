@@ -44,8 +44,8 @@
 //! - anything that still does not conform becomes `*`, and so does a name
 //!   with a run of more than [`MAX_INDEX_DIGITS`] or more than
 //!   [`MAX_TOTAL_DIGITS`] numeric characters in total, in any script
-//!   (CJK ideographic digits `零〇一二三四五六七八九` included, see
-//!   [`is_numeric_like`]);
+//!   (CJK ideographic digits `零〇一二三四五六七八九` and financial
+//!   numerals `壹贰叁肆伍陆柒捌玖` included, see [`is_numeric_like`]);
 //! - an LDAP DN value that is empty or BER-encoded (`#…`) becomes `*`.
 //!
 //! Known gap: a surname alone, or a first name missing from the list, is
@@ -200,17 +200,20 @@ pub fn conforms(name: &str) -> bool {
     })
 }
 
-/// CJK ideographic digits that `char::is_numeric` does not report (they are
-/// letters, `Lo`, in Unicode; `〇` is already numeric).
-const CJK_DIGITS: [char; 11] = [
-    '零', '〇', '一', '二', '三', '四', '五', '六', '七', '八', '九',
+/// CJK numerals that `char::is_numeric` does not report (they are letters,
+/// `Lo`, in Unicode; `〇` is already numeric): the ideographic digits
+/// `零〇一二三四五六七八九`, the financial forms `壹贰叁肆伍陆柒捌玖`
+/// (and the traditional `貳參陸`), `两` / `兩` (two) and `拾` (ten). Hangul
+/// numerals are left out on purpose: they are ordinary syllables.
+const CJK_DIGITS: [char; 26] = [
+    '零', '〇', '一', '二', '三', '四', '五', '六', '七', '八', '九', '壹', '贰', '叁', '肆', '伍',
+    '陆', '柒', '捌', '玖', '貳', '參', '陸', '两', '兩', '拾',
 ];
 
 /// Whether `c` counts as a digit for the digit bounds: a numeric character
 /// in any script (`char::is_numeric`: ASCII, fullwidth, Arabic-Indic,
-/// mathematical digits…) or a CJK ideographic digit
-/// (`零〇一二三四五六七八九`), so a number written with them is bounded
-/// like any other.
+/// mathematical digits…) or a CJK numeral ([`CJK_DIGITS`]), so a number
+/// written with them is bounded like any other.
 #[must_use]
 pub fn is_numeric_like(c: char) -> bool {
     c.is_numeric() || CJK_DIGITS.contains(&c)
@@ -1139,8 +1142,10 @@ mod tests {
 
     #[test]
     fn cjk_ideographic_digits_are_counted() {
-        // Re-review L4: `零〇一二三四五六七八九` count as digits.
-        for c in "零〇一二三四五六七八九".chars() {
+        // Re-review L4: `零〇一二三四五六七八九` count as digits, and so do
+        // the financial forms (review of the follow-ups, L3).
+        for c in "零〇一二三四五六七八九壹贰叁肆伍陆柒捌玖貳參陸两兩拾".chars()
+        {
             assert!(is_numeric_like(c), "{c}");
         }
         assert!(!is_numeric_like('日') && !is_numeric_like('a'));
@@ -1163,6 +1168,24 @@ mod tests {
             "*"
         );
         assert_eq!(normalize_ldap_dn("ou=一二三四,dc=五六七八九").as_str(), "*");
+        for raw in [
+            "tel_陆壹贰叁肆伍陆柒捌",
+            "acct.壹貳參肆伍陸柒捌玖",
+            "a.x两拾壹贰叁肆.y伍陆柒捌",
+        ] {
+            let out = normalize_path(raw);
+            assert!(
+                !out.as_str().chars().any(is_numeric_like),
+                "{raw} -> {out:?}"
+            );
+        }
+        assert_eq!(normalize_path("tel_陆壹贰叁肆伍陆柒捌").as_str(), "*");
+        // Hangul numerals are not counted (ordinary syllables).
+        assert!(!is_numeric_like('일') && !is_numeric_like('삼'));
+        assert_eq!(
+            normalize_path("일이삼사오육칠팔").as_str(),
+            "일이삼사오육칠팔"
+        );
         // A few ideographic digits in an ordinary name are kept.
         assert_eq!(normalize_path("第一名").as_str(), "第一名");
         assert_eq!(normalize_path("sales.一月").as_str(), "sales.一月");
