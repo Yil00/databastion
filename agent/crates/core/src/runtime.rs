@@ -1481,10 +1481,14 @@ impl Runtime {
                 Take::Kept
             }
         };
+        // Set once the connector has returned: a chunk held for a parked
+        // `/findings` stops waiting then (the drain below spools it).
+        let (done_tx, done_rx) = watch::channel(false);
         let outcome = {
             let run = async {
                 let r = connector.discover(&scan, &sink).await;
                 drop(sink);
+                let _ = done_tx.send(true);
                 r
             };
             // Resolves when the channel closes (`false`), or at the cap
@@ -1496,9 +1500,14 @@ impl Runtime {
                         Take::Full => {
                             // No new batch for a parked `/findings`: hold
                             // the chunk (the connector blocks on the full
-                            // channel) until the park ends.
-                            self.findings_unparked().await;
-                            flush();
+                            // channel) until the park ends, or until the
+                            // connector has returned (its result is then
+                            // known; the drain below spools the rest).
+                            let mut done = done_rx.clone();
+                            tokio::select! {
+                                () = self.findings_unparked() => flush(),
+                                _ = done.wait_for(|d| *d) => return false,
+                            }
                         }
                         Take::Kept => {}
                     }

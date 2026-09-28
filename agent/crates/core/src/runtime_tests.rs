@@ -2587,3 +2587,34 @@ async fn running_scan_holds_its_findings_while_findings_are_parked() {
     drain(&rt).await;
     assert_eq!(sent_findings(&sent_batches(&server).await), 700);
 }
+
+#[tokio::test]
+async fn completed_scan_is_not_held_by_a_park_until_its_deadline() {
+    // Window 10 s, received 9 s ago: 1 s left. `/findings` parked for an
+    // hour; the connector fills a chunk, then returns.
+    let (server, rt, _env) = queued_scan_runtime(
+        Box::new(Flood(Some(FINDINGS_CHUNK + 20))),
+        Duration::from_secs(9),
+    )
+    .await;
+    rt.lock_parked().findings.until = Some(Instant::now() + Duration::from_secs(3600));
+    let started = Instant::now();
+    run_queued_scans(&rt).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
+    assert_eq!(update["status"], "succeeded", "{got:?}");
+    // Every finding was spooled (parked, kept), none lost.
+    assert_eq!(rt.counters.findings_lost.load(Ordering::Relaxed), 0);
+    assert_eq!(sent_batches(&server).await.len(), 0);
+    rt.lock_parked().findings.until = None;
+    drain(&rt).await;
+    assert_eq!(
+        sent_findings(&sent_batches(&server).await),
+        FINDINGS_CHUNK + 20
+    );
+}
