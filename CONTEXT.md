@@ -8,8 +8,8 @@ DataBastion is an open-source DLP (Apache 2.0) that finds sensitive data in Post
 ## Where the project stands
 - **Current phase**: 0 – Foundations (see [docs/ROADMAP.md](docs/ROADMAP.md))
 - Skeletons only (P0-D): `console/` (Next.js + Drizzle + pg-boss, health endpoints, agent API placeholder answering `501`) and `agent/` (Cargo workspace that compiles; connectors are stubs). No enrollment, uplink, Discovery or Audit logic yet.
-- Protocol v1 contract merged (P0-B): `shared/protocol/openapi.yaml` + fixtures is the source of truth ([docs/09-agent-protocol.md](docs/09-agent-protocol.md) is an overview). Neither side implements it yet; TS and Rust type generation is in progress.
-- To do: dev environment `dev/` (P0-C).
+- Protocol v1 contract merged (P0-B): `shared/protocol/openapi.yaml` + fixtures is the source of truth ([docs/09-agent-protocol.md](docs/09-agent-protocol.md) is an overview). Types are generated on both sides (console: openapi-typescript + Ajv runtime validator; agent: typify), with drift tests. The console agent API still answers `501` and the agent uplink is a stub: the contract is not exercised end to end yet.
+- Remaining in phase 0: dev environment `dev/` (P0-C).
 
 ## Invariants (non-negotiable)
 | # | Invariant | Source |
