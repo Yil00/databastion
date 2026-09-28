@@ -1309,3 +1309,47 @@ async fn probe_refused_falls_back_to_rotate_with_s0() {
     );
     assert!(env.state.load_identity().unwrap().pending.is_some());
 }
+
+#[tokio::test]
+async fn probe_success_with_unparseable_body_does_not_promote() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let before = env.state.load_identity().unwrap();
+    let s1 = before.pending.as_ref().unwrap().expose().to_owned();
+    // A 2xx that is not a HeartbeatResponse (e.g. a proxy page) proves
+    // nothing about S1.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy login</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(rotate_response(true))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = session.rotate_probed(None, Some(b"{}")).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CallError::Uplink(UplinkError::UnexpectedResponse { status: 200 })
+        ),
+        "{err:?}"
+    );
+    let stored = env.state.load_identity().unwrap();
+    assert_eq!(stored.secret.expose(), S0);
+    assert_eq!(stored.pending.unwrap().expose(), s1);
+    assert_eq!(session.snapshot().secret.expose(), S0);
+}
+

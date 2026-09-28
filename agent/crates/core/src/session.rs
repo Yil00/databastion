@@ -18,7 +18,9 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, RotateResponse, Uuid};
+use databastion_protocol::{
+    AgentSecret, ErrorCode, HeartbeatResponse, RotateRequest, RotateResponse, Uuid,
+};
 use reqwest::Method;
 use zeroize::Zeroizing;
 
@@ -393,8 +395,11 @@ impl Session {
 }
 
 impl Session {
-    /// Sends `POST /heartbeat` with `S1` only. `true`: accepted, `S1`
-    /// promoted. `false`: `401` (not registered yet).
+    /// Sends `POST /heartbeat` with `S1` only. `true`: accepted with a
+    /// contract `HeartbeatResponse`, `S1` promoted. `false`: `401` (not
+    /// registered yet). A success status whose body is not a
+    /// `HeartbeatResponse` (e.g. a proxy page) is an error: nothing is
+    /// promoted and no `/rotate` is sent in this attempt.
     async fn probe_pending(&self, s1: &AgentSecret, body: &[u8]) -> Result<bool, CallError> {
         let agent_id = self.lock().identity.agent_id;
         let auth = Auth::Agent {
@@ -413,7 +418,14 @@ impl Session {
             )
             .await
         {
-            Ok(_) => {
+            Ok(reply) => {
+                // Parse before promoting: only a contract answer proves the
+                // console accepted S1.
+                serde_json::from_slice::<HeartbeatResponse>(&reply.body).map_err(|_| {
+                    UplinkError::UnexpectedResponse {
+                        status: reply.status.as_u16(),
+                    }
+                })?;
                 self.promote(s1)?;
                 tracing::info!("pending secret already registered; promoted without /rotate");
                 Ok(true)
