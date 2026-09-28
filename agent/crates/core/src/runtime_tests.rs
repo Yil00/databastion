@@ -11,6 +11,7 @@ use wiremock::matchers::{body_partial_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::*;
+use crate::engine::TargetHealth;
 use crate::fsutil::test_dir::TempDir;
 use crate::session::RotateOutcome;
 
@@ -1712,4 +1713,72 @@ async fn contract_answer_to_s1_promotes() {
     let stored = env.state.load_identity().unwrap();
     assert!(stored.pending.is_none());
     assert_ne!(stored.secret.expose(), S0);
+}
+
+// ---------------------------------------------------------- target health
+
+struct Health(TargetHealth);
+
+#[async_trait::async_trait]
+impl Connector for Health {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self) -> TargetHealth {
+        self.0.clone()
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn connector_failure_code_is_reported_as_last_error() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let unreachable = TargetHealth {
+        reachable: false,
+        audit_level: AuditLevel::None,
+        failure: Some(FailureCode::TargetUnreachable),
+        detail: None,
+    };
+    let healthy = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+    };
+    for (health, expected) in [
+        (
+            TargetHealth::not_implemented(Engine::Postgres),
+            Some(FailureCode::Unsupported),
+        ),
+        (unreachable, Some(FailureCode::TargetUnreachable)),
+        (healthy, None),
+    ] {
+        let rt = Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(Health(health.clone()))],
+        )
+        .unwrap();
+        let statuses = rt.target_statuses(&env.config).await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].last_error, expected);
+        assert_eq!(statuses[0].reachable, health.reachable);
+    }
 }
