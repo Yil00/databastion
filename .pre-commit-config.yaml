@@ -1,0 +1,13 @@
+# Hooks locaux : `pipx install pre-commit` puis
+# `pre-commit install --hook-type pre-commit --hook-type commit-msg`
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, perf, security, revert, docs, refactor, test, ci, chore, build, release]

@@ -1,0 +1,19 @@
+{
+  "name": "databastion",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Outillage de release du dépôt DataBastion (la console a son propre package.json dans console/).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "release": "release-it",
+    "release:dry": "release-it --dry-run --ci",
+    "bump": "node scripts/bump-version.mjs"
+  },
+  "devDependencies": {
+    "@release-it/conventional-changelog": "12.0.2",
+    "release-it": "21.1.0"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  }
+}

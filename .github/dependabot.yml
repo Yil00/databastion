@@ -1,0 +1,24 @@
+# Les écosystèmes console (npm/pnpm) et agent (cargo) seront ajoutés quand ces dossiers existeront.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      release-tooling:
+        patterns: ["*"]

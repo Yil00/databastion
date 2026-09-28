@@ -1,0 +1,33 @@
+# OS / éditeurs
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Archives locales
+*.zip
+
+# Secrets — ne jamais committer
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+# Rust
+target/
+
+# État local de l'agent en dev
+dev/.state/
+
+# Claude Code — fichiers personnels
+CLAUDE.local.md
+.claude/settings.local.json

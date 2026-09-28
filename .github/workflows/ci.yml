@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Les composants n'existent pas encore tous : chaque job ne tourne que si son composant est présent.
+  detect:
+    name: Détection des composants
+    runs-on: ubuntu-latest
+    outputs:
+      console: ${{ steps.detect.outputs.console }}
+      agent: ${{ steps.detect.outputs.agent }}
+      protocol: ${{ steps.detect.outputs.protocol }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: detect
+        run: |
+          has() { [ -f "$1" ] && echo true || echo false; }
+          {
+            echo "console=$(has console/package.json)"
+            echo "agent=$(has agent/Cargo.toml)"
+            echo "protocol=$(has shared/protocol/openapi.yaml)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Liens Markdown internes
+        run: python3 scripts/check-md-links.py
+
+  secrets:
+    name: Recherche de secrets (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Installer gitleaks (somme de contrôle vérifiée)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/$archive"
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${archive}\$" | sha256sum -c -
+          tar -xzf "$archive" gitleaks
+      - name: Analyse de l'historique
+        run: ./gitleaks git --redact --verbose --exit-code 1 .
+
+  console:
+    name: Console
+    needs: detect
+    if: needs.detect.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: console/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+
+  agent:
+    name: Agent
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features --locked
+
+  protocol:
+    name: Protocole
+    needs: detect
+    if: needs.detect.outputs.protocol == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
+
+  # Point de contrôle unique exigé par la protection des branches.
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [detect, docs, secrets, console, agent, protocol]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tous les jobs sont verts ou ignorés
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "résultats : $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) exit 1 ;; esac
+          done
