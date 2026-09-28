@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent",
+    "crates/core",
+    "crates/classifiers",
+    "crates/connector-postgres",
+    "crates/connector-mysql",
+    "crates/connector-mongodb",
+    "crates/connector-openldap",
+]
+
+# `version` is rewritten by scripts/bump-version.mjs: keep it the first
+# `version` key of this section.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Yil00/databastion"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+databastion-core = { path = "crates/core" }
+databastion-classifiers = { path = "crates/classifiers" }
+databastion-connector-postgres = { path = "crates/connector-postgres" }
+databastion-connector-mysql = { path = "crates/connector-mysql" }
+databastion-connector-mongodb = { path = "crates/connector-mongodb" }
+databastion-connector-openldap = { path = "crates/connector-openldap" }
+
+# Third-party crates: default features off, opt in explicitly.
+# TLS policy: rustls only. openssl / native-tls are forbidden (see
+# crates/agent/tests/architecture.rs).
+async-trait = "0.1"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "json", "env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# No panics in agent code paths: stubs return errors instead.
+todo = "warn"
+unimplemented = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+# No println!/eprintln!: structured `tracing` logs only (AGENTS.md).
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
