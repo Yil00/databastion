@@ -6,7 +6,13 @@ import { validateSchema } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
-import { lockAgentForConflict, rotatePerAgent, rotateSecret } from "@/server/rotation";
+import {
+  lockAgentForConflict,
+  rotatePerAgent,
+  rotateSecret,
+  staleRotateRetry,
+  type RotateOutcome,
+} from "@/server/rotation";
 import { clientIp, ipBucket } from "@/server/request";
 
 import { authenticateAgent, type AgentRow, type AuthOptions, type SecretSlot } from "./auth";
@@ -53,7 +59,7 @@ export function handleEnroll(req: Request): Promise<Response> {
 }
 
 type Preamble =
-  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string }
+  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
   | { ok: false; response: Response };
 
 async function preamble(req: Request, opts: AuthOptions = {}): Promise<Preamble> {
@@ -179,6 +185,17 @@ export function handleRotate(req: Request): Promise<Response> {
   return guarded("rotate", async () => {
     const auth = await preamble(req, { allowPrevious: true });
     if (!auth.ok) return auth.response;
+    if (auth.via === "previous" && auth.stale) {
+      // N1: stale S0. Handled before any other check: duplicate or lock, never another answer.
+      const body = await readValidBody(req, "RotateRequest");
+      const outcome = await staleRotateRetry(
+        getDb(),
+        { agentId: auth.agent.id, matchedHash: auth.matchedHash },
+        body.ok ? body.value : null,
+        clientIp(req),
+      );
+      return rotateResponse(outcome);
+    }
     const limit = rotatePerAgent.hit(auth.agent.id);
     if (limit.limited) return rateLimited(limit.retryAfterS);
     const body = await readValidBody(req, "RotateRequest");
@@ -196,25 +213,29 @@ export function handleRotate(req: Request): Promise<Response> {
       body.value,
       clientIp(req),
     );
-    switch (outcome.kind) {
-      case "registered":
-      case "duplicate":
-        return conformingJson("RotateResponse", {
-          grace_expires_at: outcome.graceExpiresAt.toISOString(),
-          duplicate: outcome.kind === "duplicate",
-        });
-      case "invalid_secret":
-        return agentError(400, "invalid_secret");
-      case "not_found":
-        return agentError(404, "not_found");
-      case "conflict":
-        return agentError(409, "rotation_conflict");
-      case "busy":
-        return unavailable();
-      case "unauthorized":
-        return unauthorized();
-    }
+    return rotateResponse(outcome);
   });
+}
+
+function rotateResponse(outcome: RotateOutcome): Response {
+  switch (outcome.kind) {
+    case "registered":
+    case "duplicate":
+      return conformingJson("RotateResponse", {
+        grace_expires_at: outcome.graceExpiresAt.toISOString(),
+        duplicate: outcome.kind === "duplicate",
+      });
+    case "invalid_secret":
+      return agentError(400, "invalid_secret");
+    case "not_found":
+      return agentError(404, "not_found");
+    case "conflict":
+      return agentError(409, "rotation_conflict");
+    case "busy":
+      return unavailable();
+    case "unauthorized":
+      return unauthorized();
+  }
 }
 
 async function errorDetails(res: Response): Promise<{ pointer: string }[]> {

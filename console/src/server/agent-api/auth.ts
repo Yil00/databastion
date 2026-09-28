@@ -154,7 +154,7 @@ export async function promotePending(
   promotedAt: Date | "now",
   trigger: "first_use" | "grace_expired",
 ): Promise<void> {
-  await getDb().transaction(async (tx) => {
+  const promoted = await getDb().transaction(async (tx) => {
     const rows = await tx
       .update(agents)
       .set({
@@ -176,7 +176,7 @@ export async function promotePending(
         ),
       )
       .returning({ id: agents.id });
-    if (rows.length === 0) return;
+    if (rows.length === 0) return false;
     await writeAudit(tx, {
       actorType: trigger === "first_use" ? "agent" : "system",
       actorId: trigger === "first_use" ? agentId : null,
@@ -185,9 +185,12 @@ export async function promotePending(
       targetId: agentId,
       details: { trigger },
     });
+    return true;
   });
   // The cache entries are bound to the old current hash: they are dead already; purge anyway.
   purgeSecretCache(agentId);
+  // Only the request that actually promoted wakes the polls (a lost race changes nothing).
+  if (!promoted) return;
   // L2: wake held long-polls here and in every console process; each one re-checks that the secret
   // it was opened with is still the current one (polls opened with S0 are closed).
   jobHub.closeAgent(agentId);

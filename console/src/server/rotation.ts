@@ -292,3 +292,46 @@ export function rotationBlocked(
   }
   return row.promotedAt !== null && now - row.promotedAt.getTime() < TOLERANCE_WINDOW_MS;
 }
+
+/**
+ * Late retries with a stale `S0` (after the 60 s window) on `/rotate` (ADR-0011, review N1). The
+ * ONLY non-locking outcome is `duplicate`: a valid body whose `new_secret` verifies against the
+ * current (promoted `S1`) hash. Everything else (invalid body, low-entropy secret, unknown
+ * `job_id`, another secret, too many retries) locks the agent. This path uses its own small bucket
+ * (never `rotatePerAgent`, so it cannot drain the legitimate agent's rotations) and at most one
+ * argon2id verification per request, outside the rotate pool (a busy pool must neither confirm `S0`
+ * with a `503` nor lock a legitimate late retry).
+ */
+export const staleRetriesPerAgent = new RateLimiter(10, 5 * 60_000);
+
+export async function staleRotateRetry(
+  db: Database,
+  auth: { agentId: string; matchedHash: string },
+  body: Schemas["RotateRequest"] | null,
+  ip: string | null,
+): Promise<RotateOutcome> {
+  const conflict = async (): Promise<RotateOutcome> => {
+    await lockAgentForConflict(db, auth.agentId, "stale_secret", ip);
+    return { kind: "conflict" };
+  };
+  if (body === null || isLowEntropySecret(body.new_secret)) return conflict();
+  if (staleRetriesPerAgent.check(auth.agentId).limited) return conflict();
+  staleRetriesPerAgent.hit(auth.agentId);
+  if (body.job_id !== undefined) {
+    const [job] = await db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(eq(jobs.id, body.job_id), eq(jobs.agentId, auth.agentId), eq(jobs.type, "agent.rotate_secret")))
+      .limit(1);
+    if (!job) return conflict();
+  }
+  const [row] = await db.select().from(agents).where(eq(agents.id, auth.agentId)).limit(1);
+  if (!row || !row.currentSecretHash || row.revokedAt || row.lockedAt) return { kind: "unauthorized" };
+  // S0 replaced by a newer promotion meanwhile: it is now an unknown secret, like any other.
+  if (row.previousSecretHash !== auth.matchedHash) return { kind: "unauthorized" };
+  rotateStats.argon2Ops++;
+  if (await argon2Verify(row.currentSecretHash, body.new_secret)) {
+    return { kind: "duplicate", graceExpiresAt: row.promotedGraceExpiresAt ?? row.promotedAt ?? new Date() };
+  }
+  return conflict();
+}

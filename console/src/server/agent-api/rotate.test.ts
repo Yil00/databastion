@@ -12,7 +12,13 @@ import {
   rotateArgon2Gate,
 } from "@/server/crypto";
 import { claimJobs } from "@/server/jobs";
-import { requestSecretRotation, rotatePerAgent, rotateStats, rotationBlocked } from "@/server/rotation";
+import {
+  requestSecretRotation,
+  rotatePerAgent,
+  rotateStats,
+  rotationBlocked,
+  staleRetriesPerAgent,
+} from "@/server/rotation";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError } from "@/test/helpers";
 
@@ -94,6 +100,7 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
     failuresPerAgent.clear();
     failuresPerIp.clear();
     rotatePerAgent.clear();
+    staleRetriesPerAgent.clear();
   });
 
   it("registers the new secret as a pending argon2id hash, 300 s grace, no-store, audited", async () => {
@@ -245,6 +252,64 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
     expect(first.grace_expires_at).not.toBe(body.grace_expires_at); // test moved the deadline
     await expectNotLocked(s0.agentId);
     expect((await heartbeat({ agentId: s0.agentId, secret: s1 })).status).toBe(200);
+  });
+
+  describe("N1: stale S0 on /rotate is a duplicate or a lock, never anything else", () => {
+    const staleCases: [string, (s1: string) => { body?: unknown; raw?: string }][] = [
+      ["empty body", () => ({ body: {} })],
+      ["extra field", (s1) => ({ body: { new_secret: s1, other: 1 } })],
+      ["invalid JSON", () => ({ raw: "{" })],
+      ["malformed secret", () => ({ body: { new_secret: "dbs_short" } })],
+      ["low-entropy secret", () => ({ body: { new_secret: `dbs_${"A".repeat(43)}` } })],
+      ["unknown job_id", (s1) => ({ body: { new_secret: s1, job_id: "01890a5d-ac96-774b-bcce-b302099a8057" } })],
+      ["another secret", () => ({ body: { new_secret: newAgentSecret() } })],
+    ];
+    it.each(staleCases)("%s -> 409 + lock + security event", async (_name, make) => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      const res = await handleRotate(agentRequest("POST", "/rotate", { auth: s0, ...make(s1.secret) }));
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { code: string }).code).toBe("rotation_conflict");
+      await expectLocked(s0.agentId);
+    });
+
+    it("11 stale requests in a row: the first locks, the rotate bucket is untouched", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i++) statuses.push((await rotate(s0, {})).status);
+      expect(statuses[0]).toBe(409);
+      // Once locked, S0 is an unknown secret: 401, then the ordinary auth failure limit (429).
+      expect(statuses.slice(1).every((st) => st === 401 || st === 429)).toBe(true);
+      expect(rotatePerAgent.check(s0.agentId).limited).toBe(false);
+      await expectLocked(s0.agentId);
+      expect([401, 429]).toContain((await heartbeat(s1)).status);
+    });
+
+    it("a stale S0 is not blocked by a saturated rotate pool: legit retry duplicate, bad one locks", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      const held = Array.from({ length: MAX_CONCURRENT_ROTATE_ARGON2 }, () => rotateArgon2Gate.tryAcquire());
+      try {
+        const ok = await rotate(s0, { new_secret: s1.secret });
+        expect(ok.status).toBe(200);
+        expect(((await ok.json()) as { duplicate: boolean }).duplicate).toBe(true);
+        await expectNotLocked(s0.agentId);
+        expect((await rotate(s0, { new_secret: newAgentSecret() })).status).toBe(409);
+        await expectLocked(s0.agentId);
+      } finally {
+        held.forEach((r) => r?.());
+      }
+    });
+
+    it("more than 10 late duplicates in 5 min lock the agent", async () => {
+      const { s0, s1 } = await rotated();
+      await shiftPromotion(s0.agentId, TOLERANCE_WINDOW_MS + 1000);
+      for (let i = 0; i < 10; i++) expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      await expectNotLocked(s0.agentId);
+      expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(409);
+      await expectLocked(s0.agentId);
+    });
   });
 
   it("L4: a late S0 + S1 duplicate keeps S1's deadline even after S1 -> S2 started", async () => {

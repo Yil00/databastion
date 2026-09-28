@@ -189,7 +189,11 @@ as refined by ADR-0010 (`S0` previous secret, `S1` new one):
 - `/rotate` with `S0` and the promoted `S1` (it verifies against the current hash) is a late retry
   at **any** time (ADR-0011, refining ADR-0010): `200 duplicate: true` with that rotation's deadline
   (`promoted_grace_expires_at`, kept even when a newer rotation has started), never a lock. Only the
-  holder of `S1` can send it; this check runs only on the `/rotate` path authenticated with `S0`;
+  holder of `S1` can send it; this check runs only on the `/rotate` path authenticated with `S0`.
+  After the window, a `/rotate` with `S0` has exactly two outcomes: that duplicate, or a lock.
+  Any invalid body, low-entropy or other secret, unknown `job_id`, or more than 10 late retries in
+  5 min locks the agent; this path never answers `400` / `404` / `429` / `503`, never uses the
+  per-agent rotate bucket and runs at most one argon2id verification outside the rotate pool;
 - `rotation_conflict` (`409`): `/rotate` with `S0` and any other secret while pending or at any time
   after the promotion, or any other request with `S0` after the window. The agent is locked (every secret hash
   cleared, held long-polls closed, open jobs cancelled), `agent.rotation_conflict` is written to the
