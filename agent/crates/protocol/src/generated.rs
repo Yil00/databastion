@@ -1007,12 +1007,19 @@ impl ::std::convert::TryFrom<::std::string::String> for DetectedTargetProcess {
         value.parse()
     }
 }
-///`DiscoveryScanJob`
+/**A Discovery scan of one target. The console issues it only with the `classifiers_version` of
+the agent's latest heartbeat, registered in `classifiers.json`. The agent refuses a job whose
+`classifiers_version` is not its compiled one (or whose `params.classifiers` holds ids unknown
+to that set) **before touching the target**, reporting `failed` with `unsupported`. Findings
+of the job: see "Console-side checks" in the description of this contract.
+*/
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryScanJob {
-    /**Classifier set the scan must use; always a version of the classifier registry
-(`classifiers.json`). Findings batches of this job must carry the same version.
+    /**Classifier set the scan must use: the version from the agent's latest heartbeat, always
+registered in `classifiers.json`. Findings batches of this job must carry the same
+version. An agent whose compiled classifier set version differs refuses the job before
+touching the target and reports `failed` / `unsupported`.
 */
     pub classifiers_version: ClassifiersVersion,
     pub created_at: Timestamp,

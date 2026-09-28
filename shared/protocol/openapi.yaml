@@ -64,10 +64,14 @@ info:
       single item still rejected with `413` is dropped.
     - Other `400`, `404`, `409`: not retryable. The agent drops the request and increments a metric.
       It logs the error `code`, `pointer` and `keyword`, never the payload.
-    - Network errors and `5xx`: retry with backoff; batches are idempotent thanks to `batch_id`.
-      `501` (endpoint not implemented by this console, see `NotImplemented`) is a `5xx` like any
-      other: the agent keeps the batch spooled within its bounds and retries, honoring `Retry-After`
-      when present.
+    - Network errors and `5xx` other than `501`: retry with backoff; batches are idempotent thanks to
+      `batch_id`.
+    - `501` (endpoint not implemented by this console, see `NotImplemented`) is **per endpoint** and
+      must not block any other endpoint. The agent **parks** that endpoint until `Retry-After` (or,
+      without it, its own backoff) has elapsed: it keeps separate per-endpoint upload queues, or skips
+      the parked endpoint's batches, so that e.g. findings keep flowing while `POST /events` answers
+      `501`; it keeps the parked batches spooled within its bounds (never dropped because of a
+      `501`) and stops producing new batches for the parked endpoint while it is parked.
     - `Error.code` is a closed enum that agents decode strictly: adding a value is an
       **incompatible** change (new ADR and protocol version). New situations reuse an existing code
       and are told apart by status, `details[].pointer` and `details[].keyword`.
@@ -86,9 +90,13 @@ info:
     a canonical serialization of the validated body (object keys sorted recursively, no insignificant
     whitespace, numbers compared by value, so `0.5` and `0.50` are equal). Object key order and
     formatting may therefore change between two sends (e.g. a batch re-serialized from the spool by a
-    newer agent build); array order and every value are significant. The duplicate check runs before
-    every other console-side check, so a replay of an accepted batch is acknowledged even after its
-    job stopped accepting findings.
+    newer agent build); array order and every value are significant.
+
+    Order: the duplicate check runs **after** authentication, the protocol and size checks (`413`,
+    `maxBytes`) and schema validation, since the hash is computed over the validated body; and
+    **before** every other console-side check, so a replay of an accepted batch is acknowledged even
+    after its job stopped accepting findings. Only accepted batches are recorded: a rejected batch
+    (any `4xx`) leaves no (`agent_id`, `batch_id`) record, so it can never cause a `batch_conflict`.
 
     ## Console-side checks not expressible in this schema
     The console enforces, in addition to schema validation, the checks below. Each rejection carries
@@ -130,9 +138,22 @@ info:
          job's `params.classifiers` when present (`/findings/<i>/classifier`, `enum`).
     4. **Per-job cap.** At most **50 000** findings (`MAX_FINDINGS_PER_JOB`) are accepted per job,
        over all its batches. A batch that would exceed it is rejected as a whole (`400`, pointer
-       `/findings`, keyword `maxItems`). The agent counts the findings it emits per job and stops
-       emitting past that bound (it ends the job as `failed` / `resource_limit`, so the truncation is
-       visible), so a conforming agent never hits it.
+       `/findings`, keyword `maxItems`). The console enforces the cap **atomically**: the batches of
+       one agent are ingested serialized (one at a time per agent, count check and insert in the same
+       transaction), so concurrent batches can never jointly exceed it. The agent counts the findings
+       it emits per job and stops emitting once it reaches the bound; it then ends the job as `failed`
+       with `resource_limit` (the scan was truncated by a limit; the findings already accepted are
+       kept), so a conforming agent never hits the `400`.
+
+    `discovery.scan` jobs and `classifiers_version`:
+    - the console issues a `discovery.scan` job only with the `classifiers_version` reported in the
+      agent's **latest heartbeat**, and only if that version is registered in `classifiers.json`
+      (with `params.classifiers` ids of that version); otherwise it does not issue the job;
+    - the agent refuses a job whose `classifiers_version` is not its compiled classifier set version,
+      **before touching the target** (no connection, no query), and reports it `failed` with
+      `unsupported`: the agent build cannot run that classifier set (a capability mismatch, as for
+      a stub connector), whereas `invalid_params` would blame parameters that are well-formed and
+      valid for another agent build. The same applies to `params.classifiers` ids unknown to its set.
 
     **Classifier registry** (`classifiers.json`, next to this file, schema `classifiers.schema.json`):
     the valid classifier ids of each classifier set version. A published version is never modified;
@@ -403,7 +424,8 @@ paths:
         `target_id` does not belong to this agent (`details[].pointer` designates the items).
 
         A console that does not implement Audit yet (before phase 4) answers `501`
-        (`NotImplemented`) without reading the body.
+        (`NotImplemented`) without reading the body. The agent then parks `POST /events` only;
+        `POST /findings` and every other endpoint keep working (see `NotImplemented`).
       tags: [results]
       parameters:
         - $ref: "#/components/parameters/AgentId"
@@ -701,9 +723,11 @@ components:
         `POST /events` before Audit, phase 4). The body is not read. `code` is `unavailable`: there is
         no dedicated `not_implemented` code because `Error.code` is a closed enum decoded strictly by
         v1 agents, and a new value would make a deployed agent fail to decode the whole error body.
-        The console may send `Retry-After` (typically 3600 s). The agent treats it like any `5xx`:
-        it keeps the batch spooled within its bounds and retries with backoff, honoring `Retry-After`
-        when present; it never drops the batch because of a `501`.
+        The console may send `Retry-After` (typically 3600 s). A `501` concerns **that endpoint
+        only** and must not block any other: the agent parks the endpoint until `Retry-After` (or its
+        own backoff) has elapsed, with per-endpoint queues or by skipping the parked endpoint's
+        batches, keeps its spooled batches within its bounds (never dropped because of a `501`), and
+        stops producing new batches for it while it is parked.
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
@@ -1300,6 +1324,12 @@ components:
           agent.config.reload: "#/components/schemas/AgentConfigReloadJob"
           agent.rotate_secret: "#/components/schemas/AgentRotateSecretJob"
     DiscoveryScanJob:
+      description: |
+        A Discovery scan of one target. The console issues it only with the `classifiers_version` of
+        the agent's latest heartbeat, registered in `classifiers.json`. The agent refuses a job whose
+        `classifiers_version` is not its compiled one (or whose `params.classifiers` holds ids unknown
+        to that set) **before touching the target**, reporting `failed` with `unsupported`. Findings
+        of the job: see "Console-side checks" in the description of this contract.
       type: object
       additionalProperties: false
       required: [job_id, type, created_at, target_id, classifiers_version, params]
@@ -1318,8 +1348,10 @@ components:
           $ref: "#/components/schemas/TargetId"
         classifiers_version:
           description: |
-            Classifier set the scan must use; always a version of the classifier registry
-            (`classifiers.json`). Findings batches of this job must carry the same version.
+            Classifier set the scan must use: the version from the agent's latest heartbeat, always
+            registered in `classifiers.json`. Findings batches of this job must carry the same
+            version. An agent whose compiled classifier set version differs refuses the job before
+            touching the target and reports `failed` / `unsupported`.
           $ref: "#/components/schemas/ClassifiersVersion"
         params:
           $ref: "#/components/schemas/DiscoveryScanParams"

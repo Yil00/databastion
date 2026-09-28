@@ -156,7 +156,8 @@ export interface paths {
          *     `target_id` does not belong to this agent (`details[].pointer` designates the items).
          *
          *     A console that does not implement Audit yet (before phase 4) answers `501`
-         *     (`NotImplemented`) without reading the body.
+         *     (`NotImplemented`) without reading the body. The agent then parks `POST /events` only;
+         *     `POST /findings` and every other endpoint keep working (see `NotImplemented`).
          */
         post: operations["submitEvents"];
         delete?: never;
@@ -590,6 +591,13 @@ export interface components {
          *     string or configuration content: targets and credentials live in the agent's local `agent.yaml`.
          */
         Job: components["schemas"]["DiscoveryScanJob"] | components["schemas"]["AuditConfigureJob"] | components["schemas"]["AgentConfigReloadJob"] | components["schemas"]["AgentRotateSecretJob"];
+        /**
+         * @description A Discovery scan of one target. The console issues it only with the `classifiers_version` of
+         *     the agent's latest heartbeat, registered in `classifiers.json`. The agent refuses a job whose
+         *     `classifiers_version` is not its compiled one (or whose `params.classifiers` holds ids unknown
+         *     to that set) **before touching the target**, reporting `failed` with `unsupported`. Findings
+         *     of the job: see "Console-side checks" in the description of this contract.
+         */
         DiscoveryScanJob: {
             job_id: components["schemas"]["Uuid"];
             /**
@@ -602,8 +610,10 @@ export interface components {
             expires_at?: components["schemas"]["Timestamp"];
             target_id: components["schemas"]["TargetId"];
             /**
-             * @description Classifier set the scan must use; always a version of the classifier registry
-             *     (`classifiers.json`). Findings batches of this job must carry the same version.
+             * @description Classifier set the scan must use: the version from the agent's latest heartbeat, always
+             *     registered in `classifiers.json`. Findings batches of this job must carry the same
+             *     version. An agent whose compiled classifier set version differs refuses the job before
+             *     touching the target and reports `failed` / `unsupported`.
              */
             classifiers_version: components["schemas"]["ClassifiersVersion"];
             params: components["schemas"]["DiscoveryScanParams"];
@@ -970,9 +980,11 @@ export interface components {
          *     `POST /events` before Audit, phase 4). The body is not read. `code` is `unavailable`: there is
          *     no dedicated `not_implemented` code because `Error.code` is a closed enum decoded strictly by
          *     v1 agents, and a new value would make a deployed agent fail to decode the whole error body.
-         *     The console may send `Retry-After` (typically 3600 s). The agent treats it like any `5xx`:
-         *     it keeps the batch spooled within its bounds and retries with backoff, honoring `Retry-After`
-         *     when present; it never drops the batch because of a `501`.
+         *     The console may send `Retry-After` (typically 3600 s). A `501` concerns **that endpoint
+         *     only** and must not block any other: the agent parks the endpoint until `Retry-After` (or its
+         *     own backoff) has elapsed, with per-endpoint queues or by skipping the parked endpoint's
+         *     batches, keeps its spooled batches within its bounds (never dropped because of a `501`), and
+         *     stops producing new batches for it while it is parked.
          */
         NotImplemented: {
             headers: {

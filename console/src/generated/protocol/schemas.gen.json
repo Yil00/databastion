@@ -672,6 +672,7 @@
       }
     },
     "DiscoveryScanJob": {
+      "description": "A Discovery scan of one target. The console issues it only with the `classifiers_version` of\nthe agent's latest heartbeat, registered in `classifiers.json`. The agent refuses a job whose\n`classifiers_version` is not its compiled one (or whose `params.classifiers` holds ids unknown\nto that set) **before touching the target**, reporting `failed` with `unsupported`. Findings\nof the job: see \"Console-side checks\" in the description of this contract.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -701,7 +702,7 @@
           "$ref": "#/$defs/TargetId"
         },
         "classifiers_version": {
-          "description": "Classifier set the scan must use; always a version of the classifier registry\n(`classifiers.json`). Findings batches of this job must carry the same version.\n",
+          "description": "Classifier set the scan must use: the version from the agent's latest heartbeat, always\nregistered in `classifiers.json`. Findings batches of this job must carry the same\nversion. An agent whose compiled classifier set version differs refuses the job before\ntouching the target and reports `failed` / `unsupported`.\n",
           "$ref": "#/$defs/ClassifiersVersion"
         },
         "params": {
