@@ -1,0 +1,4 @@
+{
+  "code": "batch_conflict",
+  "message": "This batch identifier was already received with a different content."
+}

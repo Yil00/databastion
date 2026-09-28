@@ -1,0 +1,6 @@
+{
+  "agent_id": "0192A1B2-C3D4-7E5F-8A6B-7C8D9E0F1A2B",
+  "agent_secret": "dbs_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE0",
+  "console_min_protocol": 1,
+  "heartbeat_interval_s": 30
+}

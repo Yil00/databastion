@@ -1,0 +1,8 @@
+{
+  "token": "dbe_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE0",
+  "hostname": "db-host-1.example.com",
+  "agent_version": "0.1.0",
+  "connectors": [
+    "oracle"
+  ]
+}

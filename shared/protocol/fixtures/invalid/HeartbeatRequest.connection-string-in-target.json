@@ -1,0 +1,104 @@
+{
+  "ts": "2026-09-28T14:02:00Z",
+  "agent_version": "0.1.0",
+  "uptime_s": 86400,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap"
+  ],
+  "targets": [
+    {
+      "target_id": "pg-prod-1",
+      "engine": "postgres",
+      "edition": "community",
+      "server_version": "16.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "pgaudit",
+      "metrics": {
+        "discovery_objects_scanned_total": 412,
+        "audit_events_read_total": 18234,
+        "audit_lag_seconds": 1.5
+      },
+      "dsn": "postgresql://192.0.2.10:5432/crm"
+    },
+    {
+      "target_id": "pg-legacy",
+      "engine": "postgres",
+      "server_version": "14.13",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "pg_stat_statements"
+    },
+    {
+      "target_id": "mysql-crm",
+      "engine": "mysql",
+      "edition": "community",
+      "server_version": "8.4.2",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "performance_schema"
+    },
+    {
+      "target_id": "mongo-app",
+      "engine": "mongodb",
+      "edition": "community",
+      "server_version": "7.0.12",
+      "reachable": false,
+      "audit_level": "limited",
+      "audit_source": "mongodb_profiler",
+      "last_error": "authentication_failed"
+    },
+    {
+      "target_id": "ldap-main",
+      "engine": "openldap",
+      "server_version": "2.6.8",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "openldap_accesslog"
+    },
+    {
+      "target_id": "mariadb-hr",
+      "engine": "mariadb",
+      "server_version": "11.4.3",
+      "reachable": true,
+      "audit_level": "none"
+    }
+  ],
+  "detected_targets": [
+    {
+      "engine": "postgres",
+      "unix_socket": "/var/run/postgresql/.s.PGSQL.5433",
+      "port": 5433,
+      "process": "postgres"
+    },
+    {
+      "engine": "mariadb",
+      "unix_socket": "/run/mysqld/mysqld.sock",
+      "process": "mariadbd"
+    },
+    {
+      "engine": "mongodb",
+      "port": 27018
+    }
+  ],
+  "running_jobs": [
+    "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a"
+  ],
+  "spool": {
+    "bytes": 524288,
+    "max_bytes": 104857600,
+    "batches": 3,
+    "oldest_age_s": 95,
+    "dropped_batches": 0
+  },
+  "metrics": {
+    "uplink_requests_total": 10234,
+    "uplink_errors_total": 3,
+    "heartbeat_duration_seconds": 0.042,
+    "process_resident_memory_bytes": 31457280
+  }
+}
