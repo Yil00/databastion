@@ -27,6 +27,17 @@ export const logger = pino({
       "*.secret",
       "token",
       "*.token",
+      "agent_secret",
+      "*.agent_secret",
+      "new_secret",
+      "*.new_secret",
+      "cookie",
+      "*.cookie",
+      "headers.cookie",
+      "req.headers.cookie",
+      // Request bodies are never logged; these paths are a safety net for /enroll and /rotate.
+      "body",
+      "*.body",
     ],
     censor: "[REDACTED]",
   },
@@ -42,6 +53,16 @@ export function errorSummary(err: unknown): { message: string; cause?: string } 
   if (!(err instanceof Error)) {
     return { message: String(err) };
   }
-  const cause = err.cause instanceof Error ? err.cause.message : undefined;
-  return cause === undefined ? { message: err.message } : { message: err.message, cause };
+  const message = withoutParams(err.message);
+  const cause = err.cause instanceof Error ? withoutParams(err.cause.message) : undefined;
+  return cause === undefined ? { message } : { message, cause };
+}
+
+/**
+ * Drizzle's query errors end with `\nparams: <bound values>`: bound values (hashes, agent data)
+ * are never logged.
+ */
+function withoutParams(message: string): string {
+  const i = message.indexOf("\nparams:");
+  return i === -1 ? message : `${message.slice(0, i)} [params redacted]`;
 }
