@@ -1,0 +1,14 @@
+{
+  "2026.09.1": [
+    "pii.birth_date",
+    "pii.card_number",
+    "pii.email",
+    "pii.iban",
+    "pii.nir",
+    "pii.person_name",
+    "pii.phone",
+    "pii.postal_address",
+    "secret.aws_key",
+    "secret.password_hash"
+  ]
+}
