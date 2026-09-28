@@ -1,18 +1,30 @@
 import { isIP } from "node:net";
 
 /**
- * Source IP used for rate limiting. Route handlers do not see the socket address, so the console
- * relies on its reverse proxy: with `DATABASTION_TRUST_PROXY=1`, the last `X-Forwarded-For` entry
- * (the one appended by the proxy) is used. Without it, every request shares the `direct` bucket
- * (spoofable headers are never trusted by default).
+ * Number of trusted reverse proxies in front of the console:
+ * `DATABASTION_TRUSTED_PROXY_HOPS=N` (1..10), or `DATABASTION_TRUST_PROXY=1` (same as 1 hop).
+ * 0 means no trusted proxy: `X-Forwarded-For` is ignored.
  */
-export function clientIp(req: Request, env: NodeJS.ProcessEnv = process.env): string {
-  if (env.DATABASTION_TRUST_PROXY === "1") {
-    const xff = req.headers.get("x-forwarded-for");
-    const last = xff?.split(",").at(-1)?.trim();
-    if (last && isIP(last)) return last;
-  }
-  return "direct";
+export function trustedProxyHops(env: NodeJS.ProcessEnv = process.env): number {
+  const hops = env.DATABASTION_TRUSTED_PROXY_HOPS;
+  if (hops !== undefined && /^(10|[1-9])$/.test(hops)) return Number(hops);
+  return env.DATABASTION_TRUST_PROXY === "1" ? 1 : 0;
+}
+
+/**
+ * Source IP used for rate limiting, or `null` when unknown. Route handlers do not see the socket
+ * address, so the console relies on its reverse proxies: with N trusted hops, the N-th
+ * `X-Forwarded-For` entry from the right is the address seen by the outermost trusted proxy
+ * (entries further left are client-controlled). Without a trusted proxy, the IP is unknown and
+ * per-IP limits are NOT applied (a shared bucket would let anyone lock everyone out): per-user /
+ * per-agent limits and the argon2 concurrency cap still apply.
+ */
+export function clientIp(req: Request, env: NodeJS.ProcessEnv = process.env): string | null {
+  const hops = trustedProxyHops(env);
+  if (hops === 0) return null;
+  const entries = (req.headers.get("x-forwarded-for") ?? "").split(",").map((e) => e.trim());
+  const entry = entries.length >= hops ? entries[entries.length - hops] : undefined;
+  return entry && isIP(entry) ? entry : null;
 }
 
 export const MAX_BODY_BYTES = 4 * 1024 * 1024;

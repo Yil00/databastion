@@ -46,22 +46,42 @@ export const logger = pino({
 export type Logger = typeof logger;
 
 /**
- * Reduces an unknown error to its message (and its cause's message, e.g. the
- * pg error wrapped by drizzle), for logging without stack or bound values.
+ * Reduces an unknown error for logging, without stack or bound values.
+ * - PostgreSQL errors (the error itself or its cause, e.g. wrapped by drizzle) are reduced to the
+ *   SQLSTATE `code` and the constraint name: pg message texts can quote values (L8).
+ * - Other errors keep their message, minus drizzle's `\nparams: <bound values>` suffix.
  */
-export function errorSummary(err: unknown): { message: string; cause?: string } {
+export function errorSummary(err: unknown): {
+  message: string;
+  cause?: string;
+  code?: string;
+  constraint?: string;
+} {
   if (!(err instanceof Error)) {
     return { message: String(err) };
+  }
+  const pg = pgError(err) ?? pgError(err.cause);
+  if (pg) {
+    return pg.constraint
+      ? { message: "database error", code: pg.code, constraint: pg.constraint }
+      : { message: "database error", code: pg.code };
   }
   const message = withoutParams(err.message);
   const cause = err.cause instanceof Error ? withoutParams(err.cause.message) : undefined;
   return cause === undefined ? { message } : { message, cause };
 }
 
-/**
- * Drizzle's query errors end with `\nparams: <bound values>`: bound values (hashes, agent data)
- * are never logged.
- */
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+
+function pgError(e: unknown): { code: string; constraint?: string } | undefined {
+  if (!(e instanceof Error)) return undefined;
+  const { code, constraint } = e as Error & { code?: unknown; constraint?: unknown };
+  if (typeof code !== "string" || !SQLSTATE.test(code)) return undefined;
+  return typeof constraint === "string" && /^[A-Za-z0-9_]{1,63}$/.test(constraint)
+    ? { code, constraint }
+    : { code };
+}
+
 function withoutParams(message: string): string {
   const i = message.indexOf("\nparams:");
   return i === -1 ? message : `${message.slice(0, i)} [params redacted]`;

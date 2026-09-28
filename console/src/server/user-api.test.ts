@@ -2,7 +2,8 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { agents, auditLog, users } from "@/db/schema";
+import { agents, auditLog, sessions, users } from "@/db/schema";
+import { argon2Stats, argon2VerifyDummy, MAX_CONCURRENT_UNAUTHENTICATED_ARGON2 } from "@/server/crypto";
 import { bootstrapAdmin, BootstrapError } from "@/server/auth/users";
 import { handleEnroll } from "@/server/agent-api/handlers";
 import { hasDb, setupTestDatabase } from "@/test/db";
@@ -91,6 +92,63 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     for (let i = 0; i < 6; i++) statuses.push((await login("admin", "not the password")).res.status);
     expect(statuses.slice(0, 5)).toEqual([401, 401, 401, 401, 401]);
     expect(statuses[5]).toBe(429);
+  });
+
+  it("40 concurrent wrong logins: at most the per-user limit reaches argon2id (H1)", async () => {
+    const before = argon2Stats.started;
+    const results = await Promise.all(
+      Array.from({ length: 40 }, () =>
+        handleLogin(userReq("POST", "/api/auth/login", { body: { username: "admin", password: "wrong wrong wrong" } })),
+      ),
+    );
+    expect(argon2Stats.started - before).toBeLessThanOrEqual(loginFailuresPerUser.limit);
+    expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(loginFailuresPerUser.limit);
+    expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+  });
+
+  it("caps concurrent argon2id verifications for logins (H1)", async () => {
+    await argon2VerifyDummy("warm-up");
+    argon2Stats.maxActive = 0;
+    const results = await Promise.all(
+      Array.from({ length: 40 }, (_, i) =>
+        handleLogin(userReq("POST", "/api/auth/login", { body: { username: `nobody${i}`, password: "wrong wrong" } })),
+      ),
+    );
+    expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
+    expect(results.every((r) => [401, 503].includes(r.status))).toBe(true);
+  });
+
+  it("applies no shared per-IP bucket when the client IP is unknown (H2)", async () => {
+    // 25 failures on distinct usernames exceed the per-IP limit (20) but no IP is known.
+    for (let i = 0; i < 25; i++) {
+      await handleLogin(userReq("POST", "/api/auth/login", { body: { username: `ghost${i}`, password: "nope nope" } }));
+    }
+    expect((await login()).res.status).toBe(200);
+  });
+
+  it("audits authorization failures of authenticated users (L3)", async () => {
+    const s = await login();
+    const before = await auditCount("user.access_denied", "failure");
+    await handleCreateToken(userReq("POST", "/api/enrollment-tokens", { cookie: s.cookie, body: {} }));
+    expect(await auditCount("user.access_denied", "failure")).toBe(before + 1);
+  });
+
+  it("ends the previous session of the browser on login and purges stale sessions (L4)", async () => {
+    const first = await login();
+    await getDb()
+      .insert(sessions)
+      .values({ tokenHash: "f".repeat(64), userId: (await getDb().select().from(users))[0]!.id, expiresAt: new Date(Date.now() - 1000) });
+    const res = await handleLogin(
+      new Request(`${ORIGIN}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: ORIGIN, Cookie: first.cookie },
+        body: JSON.stringify({ username: "admin", password: PASSWORD }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await handleSession(userReq("GET", "/api/auth/session", { cookie: first.cookie }))).status).toBe(401);
+    const stale = await getDb().select().from(sessions).where(eq(sessions.tokenHash, "f".repeat(64)));
+    expect(stale).toHaveLength(0);
   });
 
   it("rejects cross-origin login and state changes without CSRF token", async () => {

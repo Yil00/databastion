@@ -21,14 +21,21 @@ response is `Cache-Control: no-store`. Outgoing bodies (`EnrollResponse`, `Heart
 `JobList`) are validated against the contract before being sent; each job is validated
 individually and a non-conforming job is marked `failed` and never served.
 
-Authentication: failed attempts are rate limited per agent id (10 / 5 min) and per source IP
-(50 / 5 min) before any argon2id verification. Verified secrets are cached 25 s, bound to the
-stored hash and purged on revocation; the agent row is read on every request, so a revocation from
-any console process is effective immediately.
+Authentication: every attempt that needs an argon2id verification is counted before it runs
+(refunded on success), per (agent id, source IP) (10 / 5 min) and per source IP (50 / 5 min); the
+per-IP limit only applies when the IP is known (trusted proxy), and the per-agent key falls back to
+the agent id alone otherwise. At most 8 argon2id verifications run at once per process (`503` +
+`Retry-After` beyond). Verified secrets are cached 25 s, bound to the stored hash and purged on
+revocation; the agent row is read on every request, so a revocation from any console process is
+effective immediately. A 24 h "known good" fingerprint of the last verified secret only exempts it
+from the per-agent failure limit (an attacker cannot lock the agent out); it never authenticates.
 
 Long-poll: one `LISTEN` connection per process (`databastion_jobs`, `databastion_agent_revoked`),
-no database connection held while waiting, 5 s fallback re-check, at most 2 held polls per agent
-(`429` beyond). Revocation closes held polls with `401`.
+no database connection held while waiting. While the listener is up, a held poll re-reads only the
+agent's revocation state every 30 s and claims jobs on a job wake-up; when it is down, it claims
+every 5 s. Held-poll slots are reserved before any await: at most 2 per agent (`429`) and 2000 per
+process (`503`). Revocation closes held polls with `401`. A job delivered 5 times without any
+status is marked `failed` (`timeout`).
 
 Rules for the endpoints to come (see [docs/09-agent-protocol.md](../../../../../../docs/09-agent-protocol.md)):
 

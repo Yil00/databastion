@@ -9,6 +9,8 @@ import {
   deleteSession,
   isSameOrigin,
   loadSession,
+  purgeStaleSessions,
+  readSessionToken,
   SESSION_TTL_MS,
   sessionCookie,
   validCsrf,
@@ -20,6 +22,7 @@ import {
   listEnrollmentTokens,
   revokeEnrollmentToken,
 } from "@/server/enrollment";
+import { argon2Gate, sha256Hex } from "@/server/crypto";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, readJsonBody } from "@/server/request";
 
@@ -47,22 +50,36 @@ async function guardedUser(route: string, fn: () => Promise<Response>): Promise<
   }
 }
 
-type Guard = { ok: true; session: Session; ip: string } | { ok: false; response: Response };
+type Guard = { ok: true; session: Session; ip: string | null } | { ok: false; response: Response };
 
 async function requireUser(
   req: Request,
-  opts: { admin?: boolean; stateChanging?: boolean },
+  opts: { admin?: boolean; stateChanging?: boolean; route: string },
 ): Promise<Guard> {
-  if (opts.stateChanging && !isSameOrigin(req)) return { ok: false, response: error(403, "forbidden") };
+  const ip = clientIp(req);
+  const crossOrigin = opts.stateChanging && !isSameOrigin(req);
   const session = await loadSession(getDb(), req);
+  let reason: string | null = null;
+  if (crossOrigin) reason = "cross_origin";
+  else if (!session) return { ok: false, response: error(401, "unauthorized") };
+  else if (opts.stateChanging && !validCsrf(req, session)) reason = "csrf";
+  else if (opts.admin && session.user.role !== "admin") reason = "role";
+  if (reason !== null) {
+    // Authorization failures of authenticated users are audited (L3).
+    if (session) {
+      await writeAudit(getDb(), {
+        actorType: "user",
+        actorId: session.user.id,
+        action: "user.access_denied",
+        outcome: "failure",
+        sourceIp: ip,
+        details: { route: opts.route, reason },
+      });
+    }
+    return { ok: false, response: error(403, reason === "csrf" ? "csrf" : "forbidden") };
+  }
   if (!session) return { ok: false, response: error(401, "unauthorized") };
-  if (opts.stateChanging && !validCsrf(req, session)) {
-    return { ok: false, response: error(403, "csrf") };
-  }
-  if (opts.admin && session.user.role !== "admin") {
-    return { ok: false, response: error(403, "forbidden") };
-  }
-  return { ok: true, session, ip: clientIp(req) };
+  return { ok: true, session, ip };
 }
 
 /** Failed logins: per source IP and per username, checked before argon2id. */
@@ -97,17 +114,33 @@ export function handleLogin(req: Request): Promise<Response> {
     }
     const ip = clientIp(req);
     const userKey = v.username.trim().toLowerCase();
-    const byIp = loginFailuresPerIp.check(ip);
-    const byUser = loginFailuresPerUser.check(userKey);
-    if (byIp.limited || byUser.limited) {
-      const retry = Math.max(byIp.retryAfterS, byUser.retryAfterS);
+    // H1: attempts are reserved synchronously before argon2id and refunded on success, so
+    // concurrent requests cannot overrun the limits. H2: no per-IP limit when the IP is unknown.
+    const refundIp = ip ? loginFailuresPerIp.reserve(ip) : () => undefined;
+    const refundUser = loginFailuresPerUser.reserve(userKey);
+    if (!refundIp || !refundUser) {
+      refundIp?.();
+      refundUser?.();
+      const retry = Math.max(
+        ip ? loginFailuresPerIp.check(ip).retryAfterS : 1,
+        loginFailuresPerUser.check(userKey).retryAfterS,
+      );
       return error(429, "rate_limited", { "Retry-After": String(retry) });
     }
+    const release = argon2Gate.tryAcquire();
+    if (!release) {
+      refundIp();
+      refundUser();
+      return error(503, "busy", { "Retry-After": "1" });
+    }
     const db = getDb();
-    const result = await verifyCredentials(db, v.username, v.password);
+    let result: Awaited<ReturnType<typeof verifyCredentials>>;
+    try {
+      result = await verifyCredentials(db, v.username, v.password);
+    } finally {
+      release();
+    }
     if (!result.ok) {
-      loginFailuresPerIp.hit(ip);
-      loginFailuresPerUser.hit(userKey);
       // The attempted username is not recorded for unknown users (it may be a mistyped password).
       await writeAudit(db, {
         actorType: "user",
@@ -118,6 +151,12 @@ export function handleLogin(req: Request): Promise<Response> {
       });
       return error(401, "invalid_credentials");
     }
+    refundIp();
+    refundUser();
+    // L4: drop the session this browser already had, and expired / idle sessions.
+    const previous = readSessionToken(req);
+    if (previous) await deleteSession(db, sha256Hex(previous));
+    await purgeStaleSessions(db);
     const session = await createSession(db, result.user.id);
     await writeAudit(db, {
       actorType: "user",
@@ -133,7 +172,7 @@ export function handleLogin(req: Request): Promise<Response> {
 
 export function handleLogout(req: Request): Promise<Response> {
   return guardedUser("logout", async () => {
-    const g = await requireUser(req, { stateChanging: true });
+    const g = await requireUser(req, { stateChanging: true, route: "logout" });
     if (!g.ok) return g.response;
     await deleteSession(getDb(), g.session.tokenHash);
     await writeAudit(getDb(), {
@@ -151,7 +190,7 @@ export function handleLogout(req: Request): Promise<Response> {
 
 export function handleSession(req: Request): Promise<Response> {
   return guardedUser("session", async () => {
-    const g = await requireUser(req, {});
+    const g = await requireUser(req, { route: "session" });
     if (!g.ok) return g.response;
     return json({ user: g.session.user, csrf_token: csrfTokenFor(g.session.token) });
   });
@@ -162,7 +201,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function handleCreateToken(req: Request): Promise<Response> {
   return guardedUser("enrollment_token.create", async () => {
-    const g = await requireUser(req, { admin: true, stateChanging: true });
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "enrollment_token.create" });
     if (!g.ok) return g.response;
     const body = await readJsonBody(req, MAX_USER_BODY);
     if (!body.ok || !isPlainObject(body.value) || !onlyKeys(body.value, ["label"])) {
@@ -187,7 +226,7 @@ export function handleCreateToken(req: Request): Promise<Response> {
 
 export function handleListTokens(req: Request): Promise<Response> {
   return guardedUser("enrollment_token.list", async () => {
-    const g = await requireUser(req, { admin: true });
+    const g = await requireUser(req, { admin: true, route: "enrollment_token.list" });
     if (!g.ok) return g.response;
     return json({ tokens: await listEnrollmentTokens(getDb()) });
   });
@@ -195,7 +234,7 @@ export function handleListTokens(req: Request): Promise<Response> {
 
 export function handleRevokeToken(req: Request, id: string): Promise<Response> {
   return guardedUser("enrollment_token.revoke", async () => {
-    const g = await requireUser(req, { admin: true, stateChanging: true });
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "enrollment_token.revoke" });
     if (!g.ok) return g.response;
     if (!UUID.test(id)) return error(404, "not_found");
     const ok = await revokeEnrollmentToken(getDb(), { userId: g.session.user.id, ip: g.ip }, id);
@@ -205,7 +244,7 @@ export function handleRevokeToken(req: Request, id: string): Promise<Response> {
 
 export function handleListAgents(req: Request): Promise<Response> {
   return guardedUser("agent.list", async () => {
-    const g = await requireUser(req, {});
+    const g = await requireUser(req, { route: "agent.list" });
     if (!g.ok) return g.response;
     return json({ agents: await listAgents(getDb()) });
   });
@@ -213,7 +252,7 @@ export function handleListAgents(req: Request): Promise<Response> {
 
 export function handleRevokeAgent(req: Request, id: string): Promise<Response> {
   return guardedUser("agent.revoke", async () => {
-    const g = await requireUser(req, { admin: true, stateChanging: true });
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "agent.revoke" });
     if (!g.ok) return g.response;
     if (!UUID.test(id)) return error(404, "not_found");
     const ok = await revokeAgent(getDb(), id, { userId: g.session.user.id, ip: g.ip });

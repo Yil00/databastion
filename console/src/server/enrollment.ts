@@ -10,7 +10,7 @@ export const ENROLLMENT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface Actor {
   userId: string;
-  ip: string;
+  ip: string | null;
 }
 
 /** Creates a single-use token. The clear token is returned ONCE; only its SHA-256 is stored. */

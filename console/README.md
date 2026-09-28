@@ -23,8 +23,9 @@ database (also used as the job queue: no Redis). See
 | `LOG_LEVEL` | pino level (`info` by default) |
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin |
-| `DATABASTION_TRUST_PROXY=1` | Use the last `X-Forwarded-For` entry as the client IP for rate limiting. Set it only behind a reverse proxy that appends it; unset: all clients share one rate-limit bucket |
-| `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only) |
+| `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
+| `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY` |
+| `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
 | `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
@@ -47,6 +48,7 @@ database credentials (invariant I3).
 | `pnpm test` | Unit tests (vitest) |
 | `pnpm protocol:generate` | Regenerate `src/generated/protocol/` from `shared/protocol/openapi.yaml` (checked by `pnpm test`) |
 | `pnpm db:generate --name <slug>` | Generate a versioned SQL migration in `drizzle/` from `src/db/schema.ts` |
+| `pnpm db:generate --custom --name <slug>` | Empty versioned migration for SQL drizzle-kit cannot express (triggers); used only for `0002_audit_log_append_only.sql` |
 | `pnpm db:migrate` | Apply pending migrations to `DATABASE_URL(_FILE)` |
 | `pnpm admin:bootstrap` | Create the first administrator (refused if any user exists) |
 
@@ -87,7 +89,15 @@ User sessions: 256-bit cookie (`HttpOnly`, `SameSite=Strict`, `Secure` + `__Host
 production), only its SHA-256 stored, 12 h absolute / 2 h idle. State-changing user routes require
 a same-origin request and the `X-CSRF-Token` header (HMAC of the session token, returned by login
 and `/api/auth/session`). Every user action (login, logout, token creation / revocation, agent
-revocation) and every enrollment is written to the `audit_log` table (append-only, no secrets).
+revocation, authorization failures) and every enrollment, successful or not, is written to the
+`audit_log` table. It holds no secrets and is append-only at the database level: a trigger rejects
+any `UPDATE`, `DELETE` or `TRUNCATE`. Expired and idle sessions are deleted at each login, and
+logging in again from the same browser ends its previous session.
+
+Brute-force protection: every login or agent-authentication attempt that needs an argon2id
+verification is counted before it runs (and refunded on success), so concurrent requests cannot
+exceed the limits, and at most 8 such verifications run at once per process (`503` +
+`Retry-After` beyond).
 
 ## Data at rest
 | Data | Storage |
@@ -98,9 +108,9 @@ revocation) and every enrollment is written to the `audit_log` table (append-onl
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Masked samples (P2-D), webhook / SMTP settings (later) | AES-256-GCM with `DATABASTION_ENCRYPTION_KEY`, introduced with the first such column |
 
-Rate limiters and the verified-secret cache are in-memory, per process: the MVP runs one web
-process. Several web replicas would need a shared store for the limiters (the secret cache is
-already safe across processes, as it is bound to the stored hash).
+Rate limiters, the argon2 concurrency cap and the verified-secret cache are in-memory, per
+process: the MVP runs one web process. Several web replicas would need a shared store for the
+limiters (the secret cache is already safe across processes, as it is bound to the stored hash).
 
 ## Layout
 ```

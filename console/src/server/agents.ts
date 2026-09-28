@@ -8,32 +8,45 @@ import { writeAudit } from "./audit";
 import { purgeSecretCache } from "./agent-api/auth";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, newAgentSecret, sha256Hex } from "./crypto";
+import { RateLimiter } from "./rate-limit";
 
 /**
- * Consumes an enrollment token and creates the agent, atomically: the conditional UPDATE only
- * matches an unused, unrevoked, unexpired token, so two concurrent enrollments with the same token
- * cannot both succeed; the agent insert happens in the same transaction.
- * Returns null when the token is unknown, expired, revoked or already consumed.
+ * Consumes an enrollment token and creates the agent.
+ * 1. The token is looked up by hash (cheap, not consuming): an unknown, expired, revoked or
+ *    consumed token is rejected before any argon2id work (M4).
+ * 2. Only then is the new secret generated and hashed.
+ * 3. The conditional UPDATE (unused, unrevoked, unexpired -> used) keeps single use atomic under
+ *    concurrency; the agent insert happens in the same transaction.
+ * Returns null when the token is not usable. Failures are audited without any token material.
  */
 export async function enrollAgent(
   db: Database,
   req: Schemas["EnrollRequest"],
-  ip: string,
+  ip: string | null,
 ): Promise<{ agentId: string; secret: string } | null> {
+  const tokenHash = sha256Hex(req.token);
+  const usable = and(
+    eq(enrollmentTokens.tokenHash, tokenHash),
+    isNull(enrollmentTokens.consumedAt),
+    isNull(enrollmentTokens.revokedAt),
+    sql`${enrollmentTokens.expiresAt} > now()`,
+  );
+  const [candidate] = await db
+    .select({ id: enrollmentTokens.id })
+    .from(enrollmentTokens)
+    .where(usable)
+    .limit(1);
+  if (!candidate) {
+    await auditEnrollFailure(db, ip);
+    return null;
+  }
   const secret = newAgentSecret();
   const secretHash = await argon2Hash(secret);
-  return db.transaction(async (tx) => {
+  const result = await db.transaction(async (tx) => {
     const [token] = await tx
       .update(enrollmentTokens)
       .set({ consumedAt: sql`now()` })
-      .where(
-        and(
-          eq(enrollmentTokens.tokenHash, sha256Hex(req.token)),
-          isNull(enrollmentTokens.consumedAt),
-          isNull(enrollmentTokens.revokedAt),
-          sql`${enrollmentTokens.expiresAt} > now()`,
-        ),
-      )
+      .where(usable)
       .returning({ id: enrollmentTokens.id, createdBy: enrollmentTokens.createdBy });
     if (!token) return null;
     const [agent] = await tx
@@ -63,6 +76,29 @@ export async function enrollAgent(
       details: { enrollment_ref: token.id, issued_by: token.createdBy },
     });
     return { agentId: agent.id, secret };
+  });
+  if (!result) await auditEnrollFailure(db, ip);
+  return result;
+}
+
+/**
+ * Failed enrollments are audited (L3) within a process-wide budget, so that an unauthenticated
+ * flood cannot turn into unbounded audit-log writes. Beyond the budget they are only counted.
+ */
+export const enrollFailureAuditBudget = new RateLimiter(60, 60_000);
+export const enrollFailureStats = { unaudited: 0 };
+
+async function auditEnrollFailure(db: Database, ip: string | null): Promise<void> {
+  if (enrollFailureAuditBudget.hit("global").limited) {
+    enrollFailureStats.unaudited++;
+    return;
+  }
+  await writeAudit(db, {
+    actorType: "agent",
+    action: "agent.enroll",
+    outcome: "failure",
+    sourceIp: ip,
+    details: { reason: "token_not_usable" },
   });
 }
 
@@ -129,7 +165,7 @@ export async function recordHeartbeat(
 export async function revokeAgent(
   db: Database,
   agentId: string,
-  actor: { userId: string; ip: string },
+  actor: { userId: string; ip: string | null },
 ): Promise<boolean> {
   const done = await db.transaction(async (tx) => {
     const rows = await tx
@@ -163,6 +199,19 @@ export async function revokeAgent(
   });
   purgeSecretCache(agentId);
   jobHub.closeAgent(agentId);
+  if (!done) {
+    // Unknown or already revoked agent (L3).
+    await writeAudit(db, {
+      actorType: "user",
+      actorId: actor.userId,
+      action: "agent.revoke",
+      outcome: "failure",
+      targetType: "agent",
+      targetId: agentId,
+      sourceIp: actor.ip,
+      details: { reason: "not_found_or_already_revoked" },
+    });
+  }
   return done;
 }
 

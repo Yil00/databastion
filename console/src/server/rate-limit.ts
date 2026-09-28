@@ -59,6 +59,24 @@ export class RateLimiter {
     return this.decision(w);
   }
 
+  /**
+   * Counts an attempt BEFORE the expensive work, synchronously (no await between the check and
+   * the increment, so concurrent requests cannot all pass the check). Returns null when the key is
+   * already at its limit, else a `refund` to call if the attempt turns out to be successful.
+   */
+  reserve(key: string): (() => void) | null {
+    if (this.check(key).limited) return null;
+    this.hit(key);
+    const w = this.windows.get(key);
+    let refunded = false;
+    return () => {
+      if (!refunded && w && this.windows.get(key) === w && w.count > 0) {
+        refunded = true;
+        w.count--;
+      }
+    };
+  }
+
   reset(key: string): void {
     this.windows.delete(key);
   }

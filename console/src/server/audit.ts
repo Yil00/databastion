@@ -17,7 +17,8 @@ export type AuditAction =
   | "enrollment_token.create"
   | "enrollment_token.revoke"
   | "agent.enroll"
-  | "agent.revoke";
+  | "agent.revoke"
+  | "user.access_denied";
 
 export interface AuditEntry {
   actorType: AuditActorType;

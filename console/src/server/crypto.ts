@@ -19,18 +19,62 @@ const ARGON2_OPTIONS = {
   parallelism: 1,
 } as const;
 
+/** Counters for tests and metrics: argon2 operations started, running, and peak concurrency. */
+export const argon2Stats = { started: 0, active: 0, maxActive: 0 };
+
+async function tracked<T>(op: () => Promise<T>): Promise<T> {
+  argon2Stats.started++;
+  argon2Stats.active++;
+  argon2Stats.maxActive = Math.max(argon2Stats.maxActive, argon2Stats.active);
+  try {
+    return await op();
+  } finally {
+    argon2Stats.active--;
+  }
+}
+
 export function argon2Hash(secret: string): Promise<string> {
-  return hash(secret, ARGON2_OPTIONS);
+  return tracked(() => hash(secret, ARGON2_OPTIONS));
 }
 
 /** Never throws on a malformed stored hash: returns false. */
 export async function argon2Verify(storedHash: string, secret: string): Promise<boolean> {
   try {
-    return await verify(storedHash, secret);
+    return await tracked(() => verify(storedHash, secret));
   } catch {
     return false;
   }
 }
+
+/**
+ * Process-wide cap on argon2id operations run on unauthenticated input (login, agent auth).
+ * Non-blocking: when every slot is taken the caller answers 503 with `Retry-After` instead of
+ * queueing, so the hash cost cannot be turned into a CPU / memory denial of service.
+ */
+export class Semaphore {
+  private active = 0;
+  constructor(readonly max: number) {}
+
+  /** Synchronous: returns a release function, or null when saturated. */
+  tryAcquire(): (() => void) | null {
+    if (this.active >= this.max) return null;
+    this.active++;
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        this.active--;
+      }
+    };
+  }
+
+  get inUse(): number {
+    return this.active;
+  }
+}
+
+export const MAX_CONCURRENT_UNAUTHENTICATED_ARGON2 = 8;
+export const argon2Gate = new Semaphore(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
 
 let dummyHash: Promise<string> | undefined;
 

@@ -1,12 +1,12 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
-import { revokeAgent } from "@/server/agents";
-import { sha256Hex } from "@/server/crypto";
-import { enqueueJob } from "@/server/jobs";
+import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
+import { argon2Stats, MAX_CONCURRENT_UNAUTHENTICATED_ARGON2, sha256Hex } from "@/server/crypto";
+import { enqueueJob, MAX_JOB_ATTEMPTS } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import {
   adminUser,
@@ -17,7 +17,7 @@ import {
   newToken,
 } from "@/test/helpers";
 
-import { failuresPerAgent, failuresPerIp } from "./auth";
+import { expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp } from "./auth";
 import {
   enrollPerIp,
   handleEnroll,
@@ -52,6 +52,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     await teardown?.();
   });
   beforeEach(() => {
+    enrollFailureAuditBudget.clear();
     failuresPerAgent.clear();
     failuresPerIp.clear();
     enrollPerIp.clear();
@@ -143,13 +144,39 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(Array.isArray(err.details)).toBe(true);
     });
 
-    it("rate limits per source IP", async () => {
-      const body = { token: `dbe_${"A".repeat(43)}`, hostname: "h", agent_version: "0.1.0", connectors: [] };
-      let last = 0;
-      for (let i = 0; i < 21; i++) {
-        last = (await handleEnroll(agentRequest("POST", "/enroll", { body }))).status;
+    it("rate limits per source IP when the IP is known (trusted proxy)", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      try {
+        const body = { token: `dbe_${"A".repeat(43)}`, hostname: "h", agent_version: "0.1.0", connectors: [] };
+        const headers = { "X-Forwarded-For": "198.51.100.20" };
+        let last = 0;
+        for (let i = 0; i < 21; i++) {
+          last = (await handleEnroll(agentRequest("POST", "/enroll", { body, headers }))).status;
+        }
+        expect(last).toBe(429);
+        // Another client IP is not affected.
+        const other = await handleEnroll(
+          agentRequest("POST", "/enroll", { body, headers: { "X-Forwarded-For": "198.51.100.21" } }),
+        );
+        expect(other.status).toBe(401);
+      } finally {
+        delete process.env.DATABASTION_TRUST_PROXY;
       }
-      expect(last).toBe(429);
+    });
+
+    it("runs no argon2id for an unusable token and audits the failure without token material (M4, L3)", async () => {
+      const token = `dbe_${"B".repeat(43)}`;
+      const before = argon2Stats.started;
+      const res = await handleEnroll(
+        agentRequest("POST", "/enroll", { body: { token, hostname: "h", agent_version: "0.1.0", connectors: [] } }),
+      );
+      expect(res.status).toBe(401);
+      expect(argon2Stats.started).toBe(before);
+      const rows = await getDb().select().from(auditLog).where(eq(auditLog.action, "agent.enroll"));
+      const failures = rows.filter((r) => r.outcome === "failure");
+      expect(failures.length).toBeGreaterThan(0);
+      expect(JSON.stringify(failures)).not.toContain(token);
+      expect(JSON.stringify(failures)).not.toContain(sha256Hex(token));
     });
   });
 
@@ -253,6 +280,90 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     });
   });
 
+  describe("brute-force protections (security review H1, M1)", () => {
+    it("40 concurrent wrong secrets: at most the per-agent limit reaches argon2id", async () => {
+      const auth = await enroll();
+      const wrong = (await enroll("other-bf")).secret;
+      const before = argon2Stats.started;
+      const results = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          handleHeartbeat(
+            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+          ),
+        ),
+      );
+      expect(argon2Stats.started - before).toBeLessThanOrEqual(failuresPerAgent.limit);
+      expect(results.every((r) => [401, 429, 503].includes(r.status))).toBe(true);
+      expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(failuresPerAgent.limit);
+    });
+
+    it("caps concurrent argon2id verifications process-wide", async () => {
+      const ids = await Promise.all(Array.from({ length: 12 }, (_, i) => enroll(`conc-${i}`)));
+      const wrong = (await enroll("conc-wrong")).secret;
+      argon2Stats.maxActive = 0;
+      const results = await Promise.all(
+        ids.flatMap((a) =>
+          Array.from({ length: 3 }, () =>
+            handleHeartbeat(
+              agentRequest("POST", "/heartbeat", { auth: { agentId: a.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+            ),
+          ),
+        ),
+      );
+      expect(argon2Stats.maxActive).toBeLessThanOrEqual(MAX_CONCURRENT_UNAUTHENTICATED_ARGON2);
+      const busy = results.filter((r) => r.status === 503);
+      for (const r of busy) expect(Number(r.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    });
+
+    it("an attacker from another IP cannot lock a legitimate agent out", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      try {
+        const auth = await enroll();
+        const wrong = (await enroll("other-m1")).secret;
+        for (let i = 0; i < 12; i++) {
+          await handleHeartbeat(
+            agentRequest("POST", "/heartbeat", {
+              auth: { agentId: auth.agentId, secret: wrong },
+              body: MINIMAL_HEARTBEAT,
+              headers: { "X-Forwarded-For": "203.0.113.66" },
+            }),
+          );
+        }
+        const legit = await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", {
+            auth,
+            body: MINIMAL_HEARTBEAT,
+            headers: { "X-Forwarded-For": "192.0.2.10" },
+          }),
+        );
+        expect(legit.status).toBe(200);
+      } finally {
+        delete process.env.DATABASTION_TRUST_PROXY;
+      }
+    });
+
+    it("with an unknown IP, a known-good secret is exempt from the per-agent limit (never authenticates)", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const wrong = (await enroll("other-m1b")).secret;
+      for (let i = 0; i < 12; i++) {
+        await handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+      }
+      const blocked = await handleHeartbeat(
+        agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+      );
+      expect(blocked.status).toBe(429);
+      expireVerifiedCacheForTests();
+      const before = argon2Stats.started;
+      const legit = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+      expect(legit.status).toBe(200);
+      // Exempt from the limit, but still fully verified.
+      expect(argon2Stats.started).toBe(before + 1);
+    });
+  });
+
   describe("POST /heartbeat", () => {
     it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
@@ -345,6 +456,30 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(row?.status).toBe("failed");
     });
 
+    it("caps held polls per agent, reserving slots before any await (M2)", async () => {
+      const auth = await enroll();
+      pollClock.msPerSecond = 100;
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => handlePollJobs(agentRequest("GET", "/jobs?wait=2", { auth }))),
+      );
+      const statuses = results.map((r) => r.status).sort();
+      expect(statuses).toEqual([204, 204, 429, 429, 429]);
+      expect(jobHub.heldPolls(auth.agentId)).toBe(0);
+    });
+
+    it("gives up a job delivered MAX_JOB_ATTEMPTS times without status (L7)", async () => {
+      const auth = await enroll();
+      const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "agent.config.reload", params: {} });
+      await getDb()
+        .update(jobs)
+        .set({ status: "delivered", attempts: MAX_JOB_ATTEMPTS, leaseUntil: new Date(Date.now() - 1000) })
+        .where(eq(jobs.id, id));
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+      const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+      expect(row?.status).toBe("failed");
+      expect(row?.error).toEqual({ code: "timeout" });
+    });
+
     it("does not deliver expired jobs", async () => {
       const auth = await enroll();
       const id = await enqueueJob(getDb(), {
@@ -392,6 +527,29 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         .set({ revokedAt: new Date(), currentSecretHash: null, status: "revoked" })
         .where(eq(agents.id, auth.agentId));
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(401);
+    });
+  });
+
+  describe("audit log", () => {
+    it("is append-only at the database level (M5)", async () => {
+      await adminUser();
+      await expect(getDb().execute(sql`update audit_log set action = 'x'`)).rejects.toThrow();
+      await expect(getDb().execute(sql`delete from audit_log`)).rejects.toThrow();
+      await expect(getDb().execute(sql`truncate audit_log`)).rejects.toThrow();
+      const [n] = (await getDb().execute(sql`select count(*)::int as n from audit_log`)).rows;
+      expect(Number(n?.n)).toBeGreaterThan(0);
+    });
+
+    it("audits a revoke of an unknown or already revoked agent (L3)", async () => {
+      const userId = await adminUser();
+      const auth = await enroll();
+      expect(await revokeAgent(getDb(), auth.agentId, { userId, ip: null })).toBe(true);
+      expect(await revokeAgent(getDb(), auth.agentId, { userId, ip: null })).toBe(false);
+      const rows = await getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.targetId, auth.agentId), eq(auditLog.action, "agent.revoke")));
+      expect(rows.map((r) => r.outcome).sort()).toEqual(["failure", "success"]);
     });
   });
 

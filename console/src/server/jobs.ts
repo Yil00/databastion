@@ -10,6 +10,8 @@ import { JOBS_CHANNEL } from "./agent-api/job-hub";
 /** A delivered job with no status is delivered again after this lease (contract: 120 s). */
 export const JOB_LEASE_S = 120;
 export const MAX_JOBS_PER_POLL = 16;
+/** Deliveries without any status before a job is given up (`failed`, `timeout`). */
+export const MAX_JOB_ATTEMPTS = 5;
 
 export type JobType = Schemas["Job"]["type"];
 
@@ -80,6 +82,12 @@ export async function claimJobs(db: Database, agentId: string): Promise<Schemas[
     update jobs set status = 'expired', finished_at = now()
     where agent_id = ${agentId} and status in ('pending', 'delivered')
       and expires_at is not null and expires_at <= now()`);
+  // L7: a job delivered MAX_JOB_ATTEMPTS times without any status is not redelivered forever.
+  await db.execute(sql`
+    update jobs set status = 'failed', error = '{"code":"timeout"}'::jsonb, finished_at = now(),
+      lease_until = null
+    where agent_id = ${agentId} and status = 'delivered' and lease_until < now()
+      and attempts >= ${MAX_JOB_ATTEMPTS}`);
   const result = await db.execute<ClaimedRow>(sql`
     update jobs set
       status = 'delivered',

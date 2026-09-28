@@ -20,6 +20,17 @@ describe("errorSummary", () => {
     expect(errorSummary(err).message).toBe("Failed query: insert into agents values ($1) [params redacted]");
   });
 
+  it("reduces PostgreSQL errors to SQLSTATE and constraint (no message text)", () => {
+    const pgErr = Object.assign(new Error('duplicate key value (username)=(jane@example.com)'), {
+      code: "23505",
+      constraint: "users_username_key",
+    });
+    const wrapped = new Error("Failed query: insert ...\nparams: jane@example.com", { cause: pgErr });
+    const summary = errorSummary(wrapped);
+    expect(summary).toEqual({ message: "database error", code: "23505", constraint: "users_username_key" });
+    expect(JSON.stringify(summary)).not.toContain("jane");
+  });
+
   it("stringifies non-Error values", () => {
     expect(errorSummary("oops")).toEqual({ message: "oops" });
   });

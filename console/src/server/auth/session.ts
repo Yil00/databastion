@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, lte, or, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { sessions, users } from "@/db/schema";
@@ -108,6 +108,22 @@ export async function loadSession(db: Database, req: Request): Promise<Session |
 
 export async function deleteSession(db: Database, tokenHash: string): Promise<void> {
   await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash));
+}
+
+/** Deletes expired and idle sessions (run on every login). */
+export async function purgeStaleSessions(db: Database): Promise<number> {
+  const idleLimit = new Date(Date.now() - SESSION_IDLE_MS);
+  const rows = await db
+    .delete(sessions)
+    .where(or(lte(sessions.expiresAt, sql`now()`), lte(sessions.lastSeenAt, idleLimit)))
+    .returning({ h: sessions.tokenHash });
+  return rows.length;
+}
+
+/** Ends every session of a user (password change, account disabled, suspected compromise). */
+export async function revokeAllSessions(db: Database, userId: string): Promise<number> {
+  const rows = await db.delete(sessions).where(eq(sessions.userId, userId)).returning({ h: sessions.tokenHash });
+  return rows.length;
 }
 
 /**
