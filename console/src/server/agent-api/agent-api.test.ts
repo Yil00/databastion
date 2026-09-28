@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { Client } from "pg";
 import { PgBoss } from "pg-boss";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
@@ -375,6 +375,77 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(legit.status).toBe(200);
       // Exempt from the limit, but still fully verified.
       expect(argon2Stats.started).toBe(before + 1);
+    });
+  });
+
+  describe("P1-D: persisted known-good fingerprint", () => {
+    const wrongHeartbeat = (h: typeof handleHeartbeat, agentId: string, wrong: string) =>
+      h(agentRequest("POST", "/heartbeat", { auth: { agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }));
+    const knownGoodRow = async (agentId: string) =>
+      (
+        await getDb()
+          .select({ fp: agents.knownGoodFingerprint, at: agents.knownGoodAt })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+      )[0];
+
+    it("stores a hash-bound fingerprint, never the secret nor its plain SHA-256", async () => {
+      const auth = await enroll("kg-store");
+      expect((await knownGoodRow(auth.agentId))?.fp).toBeNull();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const [row] = await getDb().select().from(agents).where(eq(agents.id, auth.agentId));
+      expect(row?.knownGoodFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(row?.knownGoodFingerprint).not.toBe(sha256Hex(auth.secret));
+      expect(row?.knownGoodAt).not.toBeNull();
+      expect(JSON.stringify(row)).not.toContain(auth.secret);
+      expect(JSON.stringify(row)).not.toContain(sha256Hex(auth.secret));
+    });
+
+    it("survives a console restart: fresh process state, the agent is still exempt from the lock-out", async () => {
+      const auth = await enroll("kg-restart");
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const wrong = (await enroll("kg-restart-other")).secret;
+      // New module instances: empty verified cache, limiters and pools, like a restarted process.
+      vi.resetModules();
+      const fresh = await import("./handlers");
+      const freshDb = await import("@/db/client");
+      try {
+        for (let i = 0; i < 12; i++) await wrongHeartbeat(fresh.handleHeartbeat, auth.agentId, wrong);
+        expect((await wrongHeartbeat(fresh.handleHeartbeat, auth.agentId, wrong)).status).toBe(429);
+        const legit = await fresh.handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }));
+        expect(legit.status).toBe(200);
+      } finally {
+        await freshDb.closeDb();
+      }
+    });
+
+    it("an expired fingerprint (24 h) or one bound to another hash exempts nothing", async () => {
+      const auth = await enroll("kg-expired");
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      const wrong = (await enroll("kg-expired-other")).secret;
+      await getDb()
+        .update(agents)
+        .set({ knownGoodAt: new Date(Date.now() - 24 * 3600_000 - 1000) })
+        .where(eq(agents.id, auth.agentId));
+      expireVerifiedCacheForTests();
+      for (let i = 0; i < 12; i++) await wrongHeartbeat(handleHeartbeat, auth.agentId, wrong);
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(429);
+      // A fingerprint of the right secret over another stored hash does not match either.
+      const other = await enroll("kg-other-hash");
+      const [otherRow] = await getDb().select().from(agents).where(eq(agents.id, other.agentId));
+      const { knownGoodFingerprint, isKnownGood } = await import("./auth");
+      const row = { knownGoodFingerprint: knownGoodFingerprint(other.secret, "$argon2id$other"), knownGoodAt: new Date() };
+      expect(isKnownGood(row, other.secret, otherRow?.currentSecretHash ?? "")).toBe(false);
+      expect(isKnownGood(row, other.secret, "$argon2id$other")).toBe(true);
+    });
+
+    it("is cleared on revocation", async () => {
+      const auth = await enroll("kg-revoke");
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: MINIMAL_HEARTBEAT }))).status).toBe(200);
+      expect((await knownGoodRow(auth.agentId))?.fp).not.toBeNull();
+      const [admin] = await getDb().execute<{ id: string }>(sql`select id from users limit 1`).then((r) => r.rows);
+      await revokeAgent(getDb(), auth.agentId, { userId: admin?.id ?? "", ip: null });
+      expect(await knownGoodRow(auth.agentId)).toEqual({ fp: null, at: null });
     });
   });
 

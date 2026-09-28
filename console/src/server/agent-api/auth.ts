@@ -9,8 +9,11 @@ import {
   argon2Verify,
   isLowEntropySecret,
   safeEqual,
+  hmacSha256Hex,
+  serverSubkey,
   sha256Hex,
 } from "@/server/crypto";
+import { errorSummary, logger } from "@/lib/logger";
 import { writeAudit } from "@/server/audit";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket } from "@/server/request";
@@ -33,7 +36,8 @@ import { jobHub, REVOKED_CHANNEL } from "./job-hub";
  *   purged explicitly on revocation.
  * - A longer-lived "last verified secret" fingerprint (SHA-256, bound to the stored hash) is used
  *   ONLY to exempt the legitimate secret from the per-agent failure limit, never to authenticate:
- *   the secret still goes through the cache or a full argon2id verification.
+ *   the secret still goes through the cache or a full argon2id verification. It is persisted in the
+ *   agent row (P1-D), so a console restart does not expose the agent to a lock-out flood.
  */
 
 export type AgentRow = typeof agents.$inferSelect;
@@ -87,17 +91,90 @@ class BoundCache {
 
 /** Authenticates (< 30 s). */
 const verified = new BoundCache(CACHE_TTL_MS);
-/** Never authenticates: only exempts the legitimate secret from the per-agent failure limit. */
-const knownGood = new BoundCache(KNOWN_GOOD_TTL_MS);
 
-/** Test hook: simulates the expiry of the short verified-secret cache (the known-good set stays). */
+/** Test hook: simulates the expiry of the short verified-secret cache (known-good fingerprints stay). */
 export function expireVerifiedCacheForTests(): void {
   verified.delete();
 }
 
 export function purgeSecretCache(agentId?: string): void {
   verified.delete(agentId);
-  knownGood.delete(agentId);
+}
+
+/**
+ * "Known good" fingerprint (persisted in `agents.known_good_fingerprint`, P1-D). Never
+ * authenticates: it only exempts the last verified secret from the per-agent failure limit (and
+ * routes it to the reserved argon2id pool). Stored at rest, so it is:
+ * - an HMAC-SHA256 keyed by a subkey of the console server key (`DATABASTION_ENCRYPTION_KEY`,
+ *   HKDF domain `agent-known-good.v1`): a database dump alone cannot be used to test secrets;
+ * - bound to the stored argon2id hash (a promotion, a lock or a revocation invalidates it);
+ * - computed over a 256-bit CSPRNG secret (`AgentSecret`, low-entropy values rejected).
+ * `null` when the server key is unavailable: nothing is stored and nothing matches (fail closed;
+ * the agent then only loses the lock-out exemption). A changed key, or a fingerprint written by an
+ * earlier version (plain SHA-256), never matches either.
+ */
+export const KNOWN_GOOD_DOMAIN = "agent-known-good.v1";
+
+export function knownGoodFingerprint(secret: string, storedHash: string): string | null {
+  const key = serverSubkey(KNOWN_GOOD_DOMAIN);
+  return key ? hmacSha256Hex(key, `${storedHash}\0${secret}`) : null;
+}
+
+function fingerprintMatches(stored: string | null, secret: string, storedHash: string): boolean {
+  if (stored === null) return false;
+  const expected = knownGoodFingerprint(secret, storedHash);
+  return expected !== null && safeEqual(stored, expected);
+}
+
+/** Refresh the persisted confirmation time at most this often (one write per agent per hour). */
+export const KNOWN_GOOD_REFRESH_MS = 60 * 60 * 1000;
+
+export function isKnownGood(
+  row: Pick<AgentRow, "knownGoodFingerprint" | "knownGoodAt">,
+  secret: string,
+  storedHash: string,
+  now = Date.now(),
+): boolean {
+  if (row.knownGoodFingerprint === null || row.knownGoodAt === null) return false;
+  if (now - row.knownGoodAt.getTime() >= KNOWN_GOOD_TTL_MS) return false;
+  return fingerprintMatches(row.knownGoodFingerprint, secret, storedHash);
+}
+
+/** The pending secret `S1`, registered by the agent authenticated with its current secret (L2). */
+export function isKnownGoodPending(
+  row: Pick<AgentRow, "knownGoodPendingFingerprint" | "pendingSecretHash">,
+  secret: string,
+): boolean {
+  if (row.pendingSecretHash === null) return false;
+  return fingerprintMatches(row.knownGoodPendingFingerprint, secret, row.pendingSecretHash);
+}
+
+/** Persists the fingerprint after a full verification (conditional on the hash still current). */
+async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: string): Promise<void> {
+  const fingerprint = knownGoodFingerprint(secret, matchedHash);
+  if (fingerprint === null) return;
+  const fresh =
+    row.knownGoodFingerprint !== null &&
+    row.knownGoodAt !== null &&
+    Date.now() - row.knownGoodAt.getTime() < KNOWN_GOOD_REFRESH_MS &&
+    safeEqual(row.knownGoodFingerprint, fingerprint);
+  if (fresh) return;
+  try {
+    await getDb()
+      .update(agents)
+      .set({ knownGoodFingerprint: fingerprint, knownGoodAt: new Date() })
+      .where(
+        and(
+          eq(agents.id, row.id),
+          eq(agents.currentSecretHash, matchedHash),
+          isNull(agents.revokedAt),
+          isNull(agents.lockedAt),
+        ),
+      );
+  } catch (err) {
+    // Best effort: the request is authenticated; only the lock-out exemption is not refreshed.
+    logger.warn({ error: errorSummary(err), agentId: row.id }, "known-good fingerprint not persisted");
+  }
 }
 
 /** Agent ids with an unrecognized-secret verification in flight (bounded by the pool size). */
@@ -123,7 +200,24 @@ export const TOLERANCE_WINDOW_MS = 60_000;
 export type SecretSlot = "current" | "pending" | "previous";
 
 export type AuthResult =
-  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
+  | {
+      ok: true;
+      agent: AgentRow;
+      via: SecretSlot;
+      matchedHash: string;
+      stale?: boolean;
+      /**
+       * `S0` after the window on `/rotate` only: whether `staleCandidate` verified against the current
+       * hash (`agent.currentSecretHash`), computed under the same pool slot as `S0` itself.
+       * `undefined` when no well-formed candidate was given.
+       */
+      staleDuplicate?: boolean;
+      /**
+       * `via: "previous"` only: the failed-attempt reservations taken for this request are kept
+       * (a use of `S0` is counted like a failed attempt); `/rotate` gives them back on a duplicate.
+       */
+      refundAttempt?: () => void;
+    }
   | { ok: false; response: Response; staleSecret?: undefined }
   /** `S0` used after the tolerance window: the caller locks the agent (`rotation_conflict`). */
   | { ok: false; staleSecret: true; agentId: string; response?: undefined };
@@ -131,6 +225,13 @@ export type AuthResult =
 export interface AuthOptions {
   /** `/rotate` only: accept `S0` inside the tolerance window (the handler decides duplicate / conflict). */
   allowPrevious?: boolean;
+  /**
+   * `/rotate` only (with `allowPrevious`): the `new_secret` of the request body, read before
+   * authentication. When the presented secret is a stale `S0`, it is verified against the current
+   * hash under the SAME argon2id pool slot and the same counted attempt as `S0` (P1-D): the late
+   * retry check costs no verification outside the bounded pools.
+   */
+  staleCandidate?: string;
 }
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
@@ -161,6 +262,10 @@ export async function promotePending(
         currentSecretHash: pendingHash,
         previousSecretHash: currentHash,
         pendingSecretHash: null,
+        // L2: S1's fingerprint (bound to the pending hash, now the current one) carries over.
+        knownGoodFingerprint: sql`${agents.knownGoodPendingFingerprint}`,
+        knownGoodAt: sql`case when ${agents.knownGoodPendingFingerprint} is null then null else ${new Date().toISOString()}::timestamptz end`,
+        knownGoodPendingFingerprint: null,
         // L1: every rotation instant uses the console (Node) clock, like the window checks.
         promotedAt: promotedAt === "now" ? new Date() : promotedAt,
         // L4: the deadline of this rotation, answered to late S0 + S1 retries (ADR-0011).
@@ -197,43 +302,81 @@ export async function promotePending(
   await getDb().execute(sql`select pg_notify(${REVOKED_CHANNEL}, ${agentId})`);
 }
 
-export async function authenticateAgent(req: Request, opts: AuthOptions = {}): Promise<AuthResult> {
+interface Limits {
+  ipKey: string | null;
+}
+
+function limitedResponse(ipKey: string | null, agent?: string): Response | null {
+  const byIp = ipKey ? failuresPerIp.check(ipKey) : undefined;
+  const byAgent = agent ? failuresPerAgent.check(agent) : undefined;
+  if (byIp?.limited || byAgent?.limited) {
+    return rateLimited(Math.max(byIp?.retryAfterS ?? 1, byAgent?.retryAfterS ?? 1));
+  }
+  return null;
+}
+
+/** Cheap failure (no argon2): counted after the fact. */
+function cheapFailure({ ipKey }: Limits, key?: string): { ok: false; response: Response } {
+  const blocked = limitedResponse(ipKey, key);
+  if (blocked) return { ok: false, response: blocked };
+  if (key) failuresPerAgent.hit(key);
+  if (ipKey) failuresPerIp.hit(ipKey);
+  return { ok: false, response: unauthorized() };
+}
+
+export type Precheck =
+  | { ok: true; agentId: string; secret: string; ipKey: string | null; key: string }
+  | { ok: false; response: Response };
+
+/**
+ * Counts a `/rotate` body that missed its read deadline against the per-IP failure limit only (never
+ * per agent: a trickled body proves nothing about the agent, and must not eat its budget).
+ */
+export function countTimedOutBody(ipKey: string | null): void {
+  if (ipKey) failuresPerIp.hit(ipKey);
+}
+
+/**
+ * The cheap part of agent authentication (P1-D L1), run before anything expensive (argon2id, and
+ * for `/rotate` reading the body): header parsing, secret format, and the per-IP / per-agent failure
+ * limits. A secret that is known good (current or pending, L2) is not held by the per-agent limit:
+ * the agent row is only read in that case (limit reached), to check the fingerprint.
+ */
+export async function authPrecheck(req: Request): Promise<Precheck> {
   const ip = clientIp(req);
-  const ipKey = ip ? ipBucket(ip) : null;
+  const limits: Limits = { ipKey: ip ? ipBucket(ip) : null };
   const headerId = req.headers.get("x-databastion-agent-id");
   const agentId = headerId !== null && UUID.test(headerId) ? headerId : null;
   const secret = BEARER.exec(req.headers.get("authorization") ?? "")?.[1];
+  if (agentId === null || secret === undefined) return cheapFailure(limits);
+  const key = agentKey(agentId, limits.ipKey);
+  if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(limits, key);
+  const byIp = limitedResponse(limits.ipKey);
+  if (byIp) return { ok: false, response: byIp };
+  const byAgent = limitedResponse(null, key);
+  if (byAgent) {
+    const agent = await loadAgent(agentId);
+    const exempt =
+      active(agent) && (isKnownGood(agent, secret, agent.currentSecretHash) || isKnownGoodPending(agent, secret));
+    if (!exempt) return { ok: false, response: byAgent };
+  }
+  return { ok: true, agentId, secret, ipKey: limits.ipKey, key };
+}
 
+export async function authenticateAgent(req: Request, opts: AuthOptions = {}): Promise<AuthResult> {
+  const pre = await authPrecheck(req);
+  if (!pre.ok) return pre;
+  const { agentId, secret, ipKey, key } = pre;
+  const limits: Limits = { ipKey };
   const denied = (): AuthResult => ({ ok: false, response: unauthorized() });
-  const limitedResponse = (keys: { agent?: string }): AuthResult | null => {
-    const byIp = ipKey ? failuresPerIp.check(ipKey) : undefined;
-    const byAgent = keys.agent ? failuresPerAgent.check(keys.agent) : undefined;
-    if (byIp?.limited || byAgent?.limited) {
-      const retry = Math.max(byIp?.retryAfterS ?? 1, byAgent?.retryAfterS ?? 1);
-      return { ok: false, response: rateLimited(retry) };
-    }
-    return null;
-  };
-  /** Cheap failure (no argon2): counted after the fact. */
-  const cheapFailure = (key?: string): AuthResult => {
-    const blocked = limitedResponse({ agent: key });
-    if (blocked) return blocked;
-    if (key) failuresPerAgent.hit(key);
-    if (ipKey) failuresPerIp.hit(ipKey);
-    return denied();
-  };
-
-  if (agentId === null || secret === undefined) return cheapFailure();
-  const key = agentKey(agentId, ipKey);
-  if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(key);
 
   let agent = await loadAgent(agentId);
-  if (!active(agent)) return cheapFailure(key);
+  if (!active(agent)) return cheapFailure(limits, key);
   // Grace deadline reached without any use of S1: promotion at the deadline (ADR-0008).
   if (agent.pendingSecretHash && agent.graceExpiresAt && agent.graceExpiresAt.getTime() <= Date.now()) {
     await promotePending(agentId, agent.currentSecretHash, agent.pendingSecretHash, agent.graceExpiresAt, "grace_expired");
     agent = await loadAgent(agentId);
-    if (!active(agent)) return cheapFailure(key);
+    if (!active(agent)) return cheapFailure(limits, key);
   }
   const storedHash = agent.currentSecretHash;
   if (verified.matches(agentId, secret, storedHash)) {
@@ -241,13 +384,19 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   }
 
   // Expensive path. Everything up to argon2Verify is synchronous: reservations cannot race.
-  const exempt = knownGood.matches(agentId, secret, storedHash);
+  // L2: the current secret, or the pending S1 registered by this agent, can be known good.
+  const exemptSlot: [SecretSlot, string] | null = isKnownGood(agent, secret, storedHash)
+    ? ["current", storedHash]
+    : agent.pendingSecretHash && isKnownGoodPending(agent, secret)
+      ? ["pending", agent.pendingSecretHash]
+      : null;
+  const exempt = exemptSlot !== null;
   const refundIp = ipKey ? failuresPerIp.reserve(ipKey) : () => undefined;
   const refundAgent = exempt ? () => undefined : failuresPerAgent.reserve(key);
   if (!refundIp || !refundAgent) {
     refundIp?.();
     refundAgent?.();
-    return limitedResponse({ agent: exempt ? undefined : key }) ?? { ok: false, response: rateLimited(1) };
+    return { ok: false, response: limitedResponse(ipKey, exempt ? undefined : key) ?? rateLimited(1) };
   }
   // N1: the legitimate secret uses a reserved pool that floods of wrong secrets cannot fill.
   // L1: in the shared pool, at most one verification in flight per agent id (fair allocation).
@@ -267,16 +416,26 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
     return { ok: false, response: unavailable() };
   }
   // Candidates, in order, under the same pool slot (one attempt for the rate limits). A known-good
-  // secret is the current one by construction: nothing else to try.
-  const candidates: [SecretSlot, string][] = [["current", storedHash]];
+  // secret is only tried against the slot its fingerprint is bound to.
+  const candidates: [SecretSlot, string][] = exemptSlot ? [exemptSlot] : [["current", storedHash]];
   if (!exempt && agent.pendingSecretHash) candidates.push(["pending", agent.pendingSecretHash]);
   if (!exempt && agent.previousSecretHash) candidates.push(["previous", agent.previousSecretHash]);
   let match: [SecretSlot, string] | undefined;
+  let stale = false;
+  let staleDuplicate: boolean | undefined;
   try {
     for (const candidate of candidates) {
       if (await argon2Verify(candidate[1], secret)) {
         match = candidate;
         break;
+      }
+    }
+    if (match?.[0] === "previous") {
+      stale = Date.now() - (agent.promotedAt?.getTime() ?? 0) >= TOLERANCE_WINDOW_MS;
+      // P1-D: the late-retry check of a stale S0 on `/rotate` (ADR-0011) runs here, under the slot
+      // already held: at most one more verification, never outside the bounded pools, never a 503.
+      if (stale && opts.allowPrevious && opts.staleCandidate !== undefined) {
+        staleDuplicate = await argon2Verify(storedHash, opts.staleCandidate);
       }
     }
   } finally {
@@ -286,13 +445,17 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   const [slot, matchedHash] = match;
 
   if (slot === "previous") {
-    // Not a guessing attempt: the secret is genuine (old). Never counted against the limits.
-    refundIp();
-    refundAgent();
-    const promotedAt = agent.promotedAt?.getTime() ?? 0;
-    const stale = Date.now() - promotedAt >= TOLERANCE_WINDOW_MS;
+    // P1-D: the secret is genuine (old) but never authenticates. The attempt stays counted against
+    // the per-agent / per-IP limits, so repeated uses of S0 (each one up to three argon2id
+    // verifications) are bounded like wrong secrets; `/rotate` refunds it on a duplicate only.
+    const refundAttempt = () => {
+      refundIp();
+      refundAgent();
+    };
     // `/rotate` decides itself (ADR-0011): S0 + the promoted S1 is a harmless retry at any time.
-    if (opts.allowPrevious) return { ok: true, agent, via: "previous", matchedHash, stale };
+    if (opts.allowPrevious) {
+      return { ok: true, agent, via: "previous", matchedHash, stale, staleDuplicate, refundAttempt };
+    }
     if (stale) return { ok: false, staleSecret: true, agentId };
     return denied();
   }
@@ -306,6 +469,6 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   refundIp();
   refundAgent();
   verified.remember(agentId, secret, matchedHash);
-  knownGood.remember(agentId, secret, matchedHash);
+  await rememberKnownGood(fresh, secret, matchedHash);
   return { ok: true, agent: fresh, via: slot, matchedHash };
 }

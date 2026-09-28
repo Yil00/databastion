@@ -2,9 +2,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { sql } from "drizzle-orm";
 
-import { readEnvOrFile, type Env } from "@/config/env";
-import type { Database } from "@/db/client";
-import { logger } from "@/lib/logger";
+import { isIP } from "node:net";
+
+import { ConfigError, readEnvOrFile, type Env } from "@/config/env";
+import { getDb, type Database } from "@/db/client";
+import { errorSummary, logger } from "@/lib/logger";
 
 import { argon2Stats } from "./crypto";
 
@@ -257,4 +259,83 @@ export function checkMetricsAuth(req: Request, env: Env = process.env): MetricsA
   const a = createHash("sha256").update(presented).digest();
   const b = createHash("sha256").update(expected).digest();
   return timingSafeEqual(a, b) && presented.length > 0 ? "ok" : "unauthorized";
+}
+
+// ------------------------------------------------------------------------ serving
+
+const NO_STORE = { "Cache-Control": "no-store" } as const;
+
+/**
+ * The `/metrics` answer, shared by the dedicated metrics listener and the main-port route:
+ * `404` when disabled (token unset, too short or misconfigured), `401` without the exact bearer
+ * token, `503` when collection fails (cause only logged).
+ */
+export async function serveMetrics(req: Request, env: Env = process.env): Promise<Response> {
+  let auth: MetricsAuth;
+  try {
+    auth = checkMetricsAuth(req, env);
+  } catch (err) {
+    logger.error({ error: errorSummary(err) }, "metrics token configuration error");
+    return new Response("not found\n", { status: 404, headers: NO_STORE });
+  }
+  if (auth === "disabled") return new Response("not found\n", { status: 404, headers: NO_STORE });
+  if (auth === "unauthorized") {
+    return new Response("unauthorized\n", {
+      status: 401,
+      headers: { ...NO_STORE, "WWW-Authenticate": 'Bearer realm="databastion-metrics"' },
+    });
+  }
+  try {
+    return new Response(await collectMetrics(getDb()), {
+      status: 200,
+      headers: { ...NO_STORE, "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+    });
+  } catch (err) {
+    logger.error({ error: errorSummary(err) }, "metrics collection failed");
+    return new Response("unavailable\n", { status: 503, headers: NO_STORE });
+  }
+}
+
+// ------------------------------------------------------------------------ dedicated listener
+
+export interface MetricsListenerConfig {
+  host: string;
+  port: number;
+}
+
+export const DEFAULT_METRICS_HOST = "127.0.0.1";
+
+/**
+ * `DATABASTION_METRICS_PORT` (1..65535): serve `/metrics` on a dedicated listener of the web
+ * process, bound to `DATABASTION_METRICS_HOST` (an IP literal, `127.0.0.1` by default; `0.0.0.0`
+ * inside a container whose port is not published). The main port then answers `404` on
+ * `/metrics`. Unset: no dedicated listener, `/metrics` stays on the main port (compatibility).
+ * Invalid values throw a `ConfigError` (never containing a secret).
+ */
+export function metricsListenerConfig(env: Env = process.env): MetricsListenerConfig | null {
+  const rawPort = env.DATABASTION_METRICS_PORT?.trim() ?? "";
+  const rawHost = env.DATABASTION_METRICS_HOST?.trim() ?? "";
+  if (rawPort === "") {
+    if (rawHost !== "") throw new ConfigError("DATABASTION_METRICS_HOST is set without DATABASTION_METRICS_PORT.");
+    return null;
+  }
+  if (!/^[0-9]{1,5}$/.test(rawPort) || Number(rawPort) < 1 || Number(rawPort) > 65535) {
+    throw new ConfigError("DATABASTION_METRICS_PORT must be an integer between 1 and 65535.");
+  }
+  const host = rawHost === "" ? DEFAULT_METRICS_HOST : rawHost;
+  if (isIP(host) === 0) throw new ConfigError("DATABASTION_METRICS_HOST must be an IP address.");
+  const mainPort = env.PORT?.trim() ?? "3000";
+  if (rawPort === mainPort) {
+    throw new ConfigError("DATABASTION_METRICS_PORT must differ from the main port (PORT).");
+  }
+  return { host, port: Number(rawPort) };
+}
+
+/** Main-port `/metrics`: disabled when a dedicated listener is configured (or misconfigured). */
+export function metricsOnMainPort(env: Env = process.env): boolean {
+  try {
+    return metricsListenerConfig(env) === null;
+  } catch {
+    return false;
+  }
 }
