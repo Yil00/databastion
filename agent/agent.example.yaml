@@ -22,11 +22,16 @@ console:
 # Identity (0600), pending rotation secret, local HMAC key and spool.
 state_dir: /var/lib/databastion
 
-# Local hard limits (I4). Console job parameters are clamped to them.
+# Local hard limits (I4). Console job parameters are first checked against
+# the protocol ranges (an out-of-range or empty filter list fails the job
+# with invalid_params), then clamped to these values. A statement timeout of
+# 0 (unlimited on PostgreSQL / MySQL) is never sent: it becomes
+# statement_timeout_ms.
 limits:
-  max_sample_rows: 1000        # 1..=10000
-  statement_timeout_ms: 30000  # 100..=600000, never 0
-  max_scan_duration_s: 3600    # 60..=86400
+  max_sample_rows: 1000        # 1..=10000; rows sampled per object
+  statement_timeout_ms: 30000  # 100..=600000, never 0; cap of every query
+  max_scan_duration_s: 3600    # 60..=86400; cap of a whole scan
+  min_audit_poll_interval_s: 5 # 1..=3600; floor of audit polling
 
 # Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,
 # files 0600). When full, the oldest batches are dropped first and counted
@@ -43,6 +48,10 @@ targets:
     account: databastion       # dedicated read-only account (docs/05-security.md)
     secret:
       env: DATABASTION_PG_MAIN_PASSWORD
+    # Optional: region of national phone numbers written without `+`, so
+    # that `06 12 34 56 78` and `+33 6 12 34 56 78` get the same fingerprint.
+    # `fr` only for now; absent = unknown (digits fingerprinted as is).
+    phone_region: fr
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

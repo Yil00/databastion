@@ -2,6 +2,9 @@
 //!
 //! - [`engine`]: engines, audit levels and target health.
 //! - [`connector`]: the [`Connector`] trait every connector implements.
+//! - [`job`]: job parameters handed to connectors ([`ScanJob`],
+//!   [`AuditConfig`]), only built through the contract `TryFrom` gates and
+//!   the `agent.yaml` clamp.
 //! - [`sink`]: channels through which connectors hand results to the core.
 //!   They only carry masked types from `databastion_classifiers::masking`.
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
@@ -33,6 +36,7 @@ mod detect;
 pub mod engine;
 mod fsutil;
 pub mod identity;
+pub mod job;
 mod jobs;
 pub mod runtime;
 mod sanitize;
@@ -42,7 +46,8 @@ mod spool;
 mod uplink;
 
 pub use config::AgentConfig;
-pub use connector::{AuditConfig, Connector, ConnectorError, ScanJob};
+pub use connector::{Connector, ConnectorError};
 pub use engine::{AuditLevel, Engine, FailureCode, TargetHealth};
+pub use job::{AuditConfig, AuditParams, ParamsError, ScanJob, ScanParams};
 pub use runtime::{AgentError, EnrollOptions, enroll, run};
 pub use sink::{EventSink, FindingSink};

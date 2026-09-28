@@ -412,7 +412,7 @@ pub fn is_aws_secret_key(value: &str) -> bool {
 
 /// Whether a string (typically a name segment) contains a value recognized
 /// by a token detector. Building block for the classifier-based name
-/// normalization of ADR-0009 (wired in the core, P2-A part 2).
+/// normalization of ADR-0009 (`crate::names` locates matches in whole names).
 #[must_use]
 pub fn contains_value(s: &str) -> bool {
     !scan_tokens(s, &|_| true).is_empty()

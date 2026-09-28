@@ -3,25 +3,8 @@
 use async_trait::async_trait;
 
 use crate::engine::{Engine, TargetHealth};
+pub use crate::job::{AuditConfig, ScanJob};
 use crate::sink::{EventSink, FindingSink, SinkClosed};
-
-/// Parameters of a `discovery.scan` job.
-///
-/// Placeholder: the core will map the generated
-/// `databastion_protocol::DiscoveryScanParams` into it; connectors never see
-/// the generated type. Protocol fields are not hand-written here (I6).
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct ScanJob {}
-
-/// Audit configuration of a target (`audit.configure` job).
-///
-/// Placeholder: the core will map the generated
-/// `databastion_protocol::AuditConfigureParams` into it; connectors never see
-/// the generated type.
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct AuditConfig {}
 
 /// Errors returned by connectors.
 ///
@@ -61,7 +44,17 @@ pub trait Connector: Send + Sync {
     /// such.
     async fn check(&self) -> TargetHealth;
 
-    /// Runs a Discovery scan and pushes masked findings into `sink`.
+    /// Runs a Discovery scan on `job.target()` and pushes masked findings
+    /// into `sink`.
+    ///
+    /// Every bound comes from `job`, already checked against the contract
+    /// and clamped to `agent.yaml` (I4): sample at most `job.sample_rows()`
+    /// rows per object, set `job.statement_timeout_ms()` on every statement
+    /// (never `0`), and skip objects out of `job.includes_*`. Classify each
+    /// column with `job.classify(raw_column_name, &values)`, normalize names
+    /// with `databastion_classifiers::names` (`normalize_field_path` for
+    /// document keys), and submit `ColumnFinding::into_finding(location)`.
+    /// The core stops the scan after `job.max_duration()`.
     async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError>;
 
     /// Streams normalized access events into `sink` until stopped.
