@@ -2,6 +2,9 @@ import { getDb } from "@/db/client";
 import { errorSummary, logger } from "@/lib/logger";
 import { listAgents, revokeAgent } from "@/server/agents";
 import { requestSecretRotation } from "@/server/rotation";
+import { setFalsePositive } from "@/server/findings";
+import { buildScanParams, requestScan } from "@/server/scans";
+import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
 import {
   clearSessionCookie,
@@ -369,5 +372,60 @@ export function handleRotateAgent(req: Request, id: string): Promise<Response> {
     // ADR-0010: never while a secret is pending or within 60 s of a promotion.
     if (r.outcome === "busy") return error(409, "rotation_in_progress");
     return json({ job_id: r.jobId }, 202);
+  });
+}
+
+const SCAN_ERRORS = {
+  not_found: [404, "not_found"],
+  not_ready: [409, "agent_not_ready"],
+  busy: [409, "scan_in_progress"],
+} as const;
+
+/**
+ * Launches a Discovery scan of one target (admin, CSRF): body = contract `DiscoveryScanParams`
+ * (all optional; defaults for `sample_rows`, `max_duration_s`, `statement_timeout_ms`), unknown
+ * keys, out-of-range values and empty include filters rejected. `202 {job_id}`; audited.
+ */
+export function handleRequestScan(req: Request, agentId: string, targetId: string): Promise<Response> {
+  return guardedUser("discovery.scan_request", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "discovery.scan_request" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(agentId) || !validateSchema("TargetId", targetId).ok) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const params = buildScanParams(body.value);
+    if (!params.ok) return error(400, "invalid_params");
+    const r = await requestScan(getDb(), agentId, targetId, params.params, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome !== "queued") {
+      const [status, code] = SCAN_ERRORS[r.outcome];
+      return error(status, code);
+    }
+    return json({ job_id: r.jobId }, 202);
+  });
+}
+
+/**
+ * Marks (`{"false_positive": true}`) or unmarks a finding as a false positive (admin, CSRF; M2: it
+ * hides a finding from everyone). Audited. False positives are hidden from the view by default.
+ */
+export function handleFalsePositive(req: Request, findingId: string): Promise<Response> {
+  return guardedUser("finding.false_positive", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "finding.false_positive" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(findingId)) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (
+      !body.ok ||
+      !isPlainObject(body.value) ||
+      !onlyKeys(body.value, ["false_positive"]) ||
+      typeof body.value.false_positive !== "boolean"
+    ) {
+      return error(400, "invalid_request");
+    }
+    const ok = await setFalsePositive(getDb(), findingId, body.value.false_positive, {
+      userId: g.session.user.id,
+      ip: g.ip,
+    });
+    return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
   });
 }

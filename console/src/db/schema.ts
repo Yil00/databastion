@@ -1,7 +1,11 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
+  customType,
+  doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -25,8 +29,8 @@ import {
  * - no column holds a database credential or connection string (invariant I3);
  * - agent-provided strings stored here (hostname, target ids, versions) are bounded by the protocol
  *   schema and are escaped on display;
- * - AES-256-GCM encryption at rest (`DATABASTION_ENCRYPTION_KEY`) comes with the first column that
- *   needs it: masked samples (P2-D), then webhook / SMTP settings.
+ * - AES-256-GCM encryption at rest (`DATABASTION_ENCRYPTION_KEY`, HKDF subkey per domain):
+ *   `findings.masked_samples` (P2-D, domain `masked-samples.v1`), later webhook / SMTP settings.
  */
 
 const tsz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
@@ -274,4 +278,99 @@ export const securityEvents = pgTable(
     acknowledgedBy: uuid("acknowledged_by").references(() => users.id, { onDelete: "set null" }),
   },
   (t) => [index("security_events_at_idx").on(t.at), index("security_events_agent_idx").on(t.agentId)],
+);
+
+// ------------------------------------------------------------------------- findings
+
+/** Raw bytes (`bytea`): used for AES-256-GCM ciphertexts only. */
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return "bytea";
+  },
+});
+
+/**
+ * Findings batches received from agents (`POST /findings`), for idempotency on
+ * (`agent_id`, `batch_id`): `body_sha256` is the SHA-256 of the validated batch serialized as JSON.
+ * Same pair + same hash: `202 duplicate: true`; same pair + another hash: `409 batch_conflict`.
+ * Only accepted batches are recorded; the body itself is never stored here.
+ */
+export const findingsBatches = pgTable(
+  "findings_batches",
+  {
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    batchId: uuid("batch_id").notNull(),
+    bodySha256: text("body_sha256").notNull(),
+    jobId: uuid("job_id").references(() => jobs.id, { onDelete: "set null" }),
+    findingsCount: integer("findings_count").notNull(),
+    receivedAt: tsz("received_at").notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.batchId] }),
+    index("findings_batches_job_idx").on(t.jobId),
+    check("findings_batches_sha256_format", sql`${t.bodySha256} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+/**
+ * Discovery findings: one row per (agent, target, location, classifier), updated by later scans.
+ * `location_key` is the SHA-256 of that key (see `findingLocationKey`), unique per agent.
+ * Names are normalized by the agent (ADR-0009) and escaped on display.
+ * - `masked_samples`: AES-256-GCM ciphertext (subkey `masked-samples.v1` of
+ *   `DATABASTION_ENCRYPTION_KEY`, random 96-bit nonce, AAD bound to the finding id) of the JSON
+ *   array of masked samples; NULL when the batch carried none or when the server key is unavailable
+ *   (fail closed: the finding is stored, its samples are not).
+ * - `fingerprints`: `hmac-sha256:` values as sent (keyed by the agent-local key, never leaves it).
+ * - False positives are an admin decision on the location + classifier: kept across rescans unless
+ *   `matched` rises above its value at marking time or the classifier set changes.
+ */
+export const findings = pgTable(
+  "findings",
+  {
+    id: uuid("id").primaryKey(),
+    agentId: uuid("agent_id").notNull(),
+    targetId: text("target_id").notNull(),
+    locationKey: text("location_key").notNull(),
+    engine: text("engine").notNull(),
+    databaseName: text("database_name").notNull(),
+    schemaName: text("schema_name"),
+    objectName: text("object_name").notNull(),
+    fieldName: text("field_name").notNull(),
+    classifier: text("classifier").notNull(),
+    classifiersVersion: text("classifiers_version").notNull(),
+    confidence: doublePrecision("confidence").notNull(),
+    sampled: integer("sampled").notNull(),
+    matched: integer("matched").notNull(),
+    estimatedRows: bigint("estimated_rows", { mode: "number" }),
+    maskedSamples: bytea("masked_samples"),
+    fingerprints: jsonb("fingerprints").$type<string[]>().notNull().default([]),
+    firstJobId: uuid("first_job_id").references(() => jobs.id, { onDelete: "set null" }),
+    lastJobId: uuid("last_job_id").references(() => jobs.id, { onDelete: "set null" }),
+    lastBatchId: uuid("last_batch_id").notNull(),
+    firstSeenAt: tsz("first_seen_at").notNull().defaultNow(),
+    lastSeenAt: tsz("last_seen_at").notNull().defaultNow(),
+    falsePositiveAt: tsz("false_positive_at"),
+    falsePositiveBy: uuid("false_positive_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * `matched` and `classifiers_version` when the false positive was marked: a later scan that
+     * matches more values or runs another classifier set resets the mark (audited).
+     */
+    falsePositiveMatched: integer("false_positive_matched"),
+    falsePositiveClassifiersVersion: text("false_positive_classifiers_version"),
+  },
+  (t) => [
+    foreignKey({
+      name: "findings_agent_target_fk",
+      columns: [t.agentId, t.targetId],
+      foreignColumns: [agentTargets.agentId, agentTargets.targetId],
+    }).onDelete("cascade"),
+    uniqueIndex("findings_location_key").on(t.agentId, t.locationKey),
+    index("findings_target_classifier_idx").on(t.agentId, t.targetId, t.classifier),
+    index("findings_classifier_idx").on(t.classifier),
+    check("findings_confidence_range", sql`${t.confidence} >= 0 and ${t.confidence} <= 1`),
+    check("findings_counts", sql`${t.matched} >= 0 and ${t.matched} <= ${t.sampled} and ${t.sampled} <= 10000`),
+    check("findings_location_key_format", sql`${t.locationKey} ~ '^[0-9a-f]{64}$'`),
+  ],
 );

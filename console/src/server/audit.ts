@@ -22,6 +22,13 @@ export type AuditAction =
   | "agent.rotate"
   | "agent.secret_promote"
   | "agent.rotation_conflict"
+  | "agent.batch_rejected"
+  | "agent.batch_conflict"
+  | "agent.foreign_target"
+  | "discovery.scan_request"
+  | "finding.false_positive"
+  | "finding.false_positive_reset"
+  | "job.timeout"
   | "user.access_denied";
 
 export interface AuditEntry {
