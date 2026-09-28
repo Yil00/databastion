@@ -1,35 +1,67 @@
-//! MySQL / MariaDB connector for the DataBastion agent.
+//! MySQL / MariaDB connector for the DataBastion agent (P2-C).
 //!
-//! Audit source (docs/08-engine-capabilities.md): MariaDB server_audit / Percona audit_log (Full) or performance_schema (Partial, MySQL Community).
+//! - Discovery ([`discover`](Connector::discover)): `information_schema`
+//!   introspection and bounded sampling of local base tables (never views,
+//!   remote-access engines such as `FEDERATED`, nor virtual generated
+//!   columns), classification through `ScanJob::classify`, names through
+//!   the ADR-0009 normalizer; only masked findings reach the sink (I2).
+//! - [`check`](Connector::check): reachability, honest audit level (docs/08:
+//!   `performance_schema` history = Partial; audit plugins are reported but
+//!   Full needs the audit log file, P4-A), over-privilege and coverage.
+//! - Audit (`audit_stream`) is P4-A: not implemented.
 //!
-//! Skeleton status (P0-D): every operation returns a "not implemented"
-//! result; nothing connects to a database yet.
+//! The connector only reads (I4): read-only transactions and session
+//! default, statement timeouts on every query (`max_execution_time` /
+//! `max_statement_time`, never `0`), statements killed on the server
+//! (`KILL QUERY`) when their future is dropped. It connects only to the
+//! declared target (I5), with credentials from `agent.yaml` references
+//! (I3), over rustls TLS, through its own implementation of the client
+//! protocol (`proto`, `auth`): no local-file capability, no cleartext
+//! password plugin, no RSA key retrieval.
 
 #![forbid(unsafe_code)]
 
+mod auth;
+mod catalog;
+mod check;
+mod conn;
+mod discover;
+mod error;
+mod net;
+mod proto;
+mod sql;
+mod tls;
+
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+mod it;
+
 use async_trait::async_trait;
+use databastion_core::config::TargetConfig;
 use databastion_core::{
     AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
-    config::TargetConfig,
 };
 
-/// MySQL / MariaDB connector (stub).
-#[derive(Debug, Default)]
+/// MySQL / MariaDB connector. One instance serves every declared MySQL and
+/// MariaDB target.
+#[derive(Default)]
 #[non_exhaustive]
-pub struct MysqlConnector {}
+pub struct MysqlConnector {
+    check_state: check::CheckState,
+}
+
+impl std::fmt::Debug for MysqlConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MysqlConnector").finish_non_exhaustive()
+    }
+}
 
 impl MysqlConnector {
-    /// Creates the (stub) connector.
+    /// Creates the connector.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
-    }
-
-    fn not_implemented(&self, operation: &'static str) -> ConnectorError {
-        ConnectorError::NotImplemented {
-            engine: self.engine(),
-            operation,
-        }
+        Self::default()
     }
 }
 
@@ -39,12 +71,12 @@ impl Connector for MysqlConnector {
         Engine::Mysql
     }
 
-    async fn check(&self, _target: &TargetConfig) -> TargetHealth {
-        TargetHealth::not_implemented(self.engine())
+    async fn check(&self, target: &TargetConfig) -> TargetHealth {
+        check::check(&self.check_state, target).await
     }
 
-    async fn discover(&self, _job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("discover"))
+    async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
+        discover::discover(job, sink).await
     }
 
     async fn audit_stream(
@@ -52,51 +84,59 @@ impl Connector for MysqlConnector {
         _cfg: &AuditConfig,
         _sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("audit_stream"))
+        Err(ConnectorError::NotImplemented {
+            engine: self.engine(),
+            operation: "audit_stream",
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databastion_core::AuditLevel;
+    use databastion_core::{AuditLevel, FailureCode};
 
-    #[tokio::test]
-    async fn stub_reports_honest_health() {
-        let connector = MysqlConnector::new();
-        assert_eq!(connector.engine(), Engine::Mysql);
-        let config = databastion_core::AgentConfig::parse(
-            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: \
-             [{id: t, engine: mysql, host: h, account: a, secret: {env: PW}}]}",
-        )
+    fn target(yaml: &str) -> TargetConfig {
+        let config = databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{yaml}]}}"
+        ))
         .unwrap();
-        let health = connector.check(&config.targets[0]).await;
-        assert!(!health.reachable);
-        assert_eq!(health.audit_level, AuditLevel::None);
+        config.targets[0].clone()
     }
 
     #[tokio::test]
-    async fn stub_operations_return_not_implemented() {
+    async fn unreadable_secret_is_reported_without_connecting() {
         let connector = MysqlConnector::new();
-        let (findings, _findings_rx) = FindingSink::channel(1);
-        let (events, _events_rx) = EventSink::channel(1);
-        let discover = connector.discover(&ScanJob::default(), &findings).await;
+        let t = target(
+            "{id: t, engine: mysql, host: 127.0.0.1, port: 9, account: a, \
+             secret: {env: DATABASTION_TEST_UNSET_MY_SECRET}, mysql: {tls: disable}}",
+        );
+        let health = connector.check(&t).await;
+        assert!(!health.reachable);
+        assert_eq!(health.audit_level, AuditLevel::None);
+        assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+    }
+
+    #[tokio::test]
+    async fn default_job_without_target_fails_closed() {
+        let connector = MysqlConnector::new();
+        assert_eq!(connector.engine(), Engine::Mysql);
+        let (findings, _rx) = FindingSink::channel(1);
+        let r = connector.discover(&ScanJob::default(), &findings).await;
         assert!(matches!(
-            discover,
-            Err(ConnectorError::NotImplemented {
+            r,
+            Err(ConnectorError::Target {
                 engine: Engine::Mysql,
-                operation: "discover"
+                code: FailureCode::Internal,
+                ..
             })
         ));
-        let audit = connector
-            .audit_stream(&AuditConfig::default(), &events)
-            .await;
+        let (events, _rx) = EventSink::channel(1);
         assert!(matches!(
-            audit,
-            Err(ConnectorError::NotImplemented {
-                engine: Engine::Mysql,
-                operation: "audit_stream"
-            })
+            connector
+                .audit_stream(&AuditConfig::default(), &events)
+                .await,
+            Err(ConnectorError::NotImplemented { .. })
         ));
     }
 }

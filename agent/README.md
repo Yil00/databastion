@@ -17,7 +17,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, `agent.yaml`, enrollment, runtime (heartbeat / jobs), crate-private HTTPS uplink and session |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B); Audit is P4-A |
-| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector (stub) |
+| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C); Audit is P4-A |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
@@ -233,7 +233,64 @@ cargo test -p databastion-connector-postgres -- --nocapture
 ../dev/postgres/local-cluster.sh stop
 ```
 
-### Future database drivers (mysql, mongodb, ldap3)
+### MySQL / MariaDB connector
+No driver crate: the connector speaks the text client protocol itself
+(`crates/connector-mysql/src/proto.rs`, `auth.rs`, `conn.rs`) over tokio and the same
+rustls crates (`ring` provider). The available pure-Rust drivers (mysql_async) cannot refuse
+the RSA public-key retrieval of `caching_sha2_password` nor choose the capability flags, and pull
+the `rsa` crate (RUSTSEC-2023-0071, no fix). Owning the protocol lets the connector:
+
+- never set `CLIENT_LOCAL_FILES` (and refuse a `LOCAL INFILE` request anyway),
+  `CLIENT_MULTI_STATEMENTS` or compression; keep only the error number and SQLSTATE of an
+  error packet (the message is never stored); read rows one packet at a time (zeroized buffers);
+- authenticate by transport: `caching_sha2_password` (scramble) everywhere, its full
+  authentication (the password itself) only over TLS or a Unix socket, never through RSA key
+  retrieval; `mysql_native_password` over TLS, a Unix socket or a loopback literal, never on a
+  network without TLS; every other plugin (`mysql_clear_password`, PAM `dialog`,
+  `sha256_password`, `client_ed25519`, GSSAPI) refused before any password-derived byte;
+- TLS: `verify_full` (default) against a pinned CA or the system store, host name or IP SAN
+  checked; the server must offer TLS; `disable` only on a Unix socket or loopback literal;
+  `disable_insecure`, an explicit and warned opt-in, on a network.
+
+Behavior:
+
+- sessions verified after setup: `sql_mode` pinned (`NO_BACKSLASH_ESCAPES`, never
+  `ANSI_QUOTES`), utf8mb4, `SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY`,
+  `wait_timeout` 60 s (idle sessions are replaced after 45 s), `net_read_timeout` /
+  `net_write_timeout` 30 s, `lock_wait_timeout` / `innodb_lock_wait_timeout` 2 s, MariaDB
+  `idle_(readonly_)transaction_timeout` 10 s, and the statement timeout (`max_execution_time`
+  on MySQL, `max_statement_time` on MariaDB; clamped job parameter, never `0`), also set per
+  sampling statement (optimizer hint / `SET STATEMENT … FOR`); a server connection id that
+  differs from the handshake (a proxy) is refused, since `KILL QUERY` could not reach it;
+- every unit of work in `START TRANSACTION READ ONLY` (the OK status must show a read-only
+  transaction), committed before `FindingSink::submit().await`; a statement whose future is
+  dropped is killed from a separate connection (`KILL QUERY <id>`); a sample stopped at its
+  byte budget (32 MiB per table, checked per row) is killed, not drained, and the next table
+  uses a new session;
+- scope: base tables of local engines (InnoDB, MyISAM, Aria, MEMORY, ARCHIVE, RocksDB,
+  TokuDB) outside `mysql`, `sys`, `information_schema`, `performance_schema`; never views
+  (definer code), `FEDERATED` / `CONNECT` / `SPIDER` / `S3` / `SPHINX` / NDB tables (I5),
+  merge tables or other engines; never virtual generated columns; a partitioned table is one
+  table. The introspection reads no statistics column (`TABLE_ROWS` opens the handler, and a
+  `FEDERATED` handler connects to its remote server): row estimates are read per sampled table,
+  filtered on local engines, which also re-checks the engine in the sampling transaction;
+- sampling: `LIMIT sample_rows` (no `ORDER BY RAND()`: a full scan and sort), text columns as
+  `LEFT(col, 4096)`, values cut to 4096 bytes in Rust; character, JSON, `int` / `bigint` /
+  `decimal` and `date` columns only;
+- `check()`: reachability; audit level Partial with the `events_statements_history_long`
+  consumer readable, Limited with the per-thread consumers only, Full never before the audit
+  log path exists (P4-A; an active `server_audit` / `audit_log` is noted); over-privilege
+  (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`, `WITH GRANT
+  OPTION`, `SELECT` on `mysql` / `sys`, roles), `init_connect`, and coverage (views, engines).
+
+Target settings: the `mysql` block of a target in `agent.example.yaml`. Integration tests
+(`src/it.rs`) run against the dev environment (`make dev`, see
+[dev/README.md](../dev/README.md#connector-integration-tests)) when `DATABASTION_TEST_MYSQL_URL` /
+`DATABASTION_TEST_MARIADB_URL` (and the `_ADMIN_URL` / `_CA_FILE` variables for the probes) are
+set, and are skipped otherwise; protocol refusals are also tested against a scripted server over
+an in-memory stream (`src/fake.rs`).
+
+### Future database drivers (mongodb, ldap3)
 Add them with `default-features = false` and rustls-only TLS features, and
 re-check `Cargo.lock` for OpenSSL. Every query gets a timeout and bounded
 sampling (I4). Driver errors can echo query text or values: map them to

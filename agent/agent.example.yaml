@@ -63,6 +63,23 @@ targets:
       # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
       # the membership as an expected warning instead of over-privilege.
       extended_grants: false
+  - id: mariadb-support
+    engine: mariadb            # or mysql: same connector, flavor detected at connection
+    host: db2.internal         # or `socket: /run/mysqld/mysqld.sock` (with tls: disable)
+    port: 3306
+    account: databastion       # SELECT-only account (docs/05-security.md)
+    secret:
+      file: /etc/databastion/secrets/mariadb-support   # 0600, owned by the agent user
+    # MySQL / MariaDB settings (optional block).
+    mysql:
+      # verify_full (default; rustls, certificate + host name). Self-signed
+      #   server certificates need their CA pinned with ca_file, and must name
+      #   the host.
+      # disable: Unix socket or loopback IP literal only (required for a socket)
+      # disable_insecure: no TLS on a network, explicit opt-in (warned); only
+      #   the caching_sha2_password fast path is accepted
+      tls: verify_full
+      # ca_file: /etc/databastion/mariadb-ca.pem   # only trusted root for this target
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

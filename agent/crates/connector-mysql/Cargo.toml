@@ -13,10 +13,27 @@ publish.workspace = true
 # no access to the uplink (checked by crates/agent/tests/architecture.rs).
 [dependencies]
 databastion-core.workspace = true
+databastion-classifiers.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Client protocol implemented in `proto` / `auth` (no driver crate: the
+# connector must control capability flags and authentication exchanges).
+# TLS: rustls only, `ring` provider, system roots or a pinned CA file.
+# Scrambles: SHA-1 (mysql_native_password), SHA-256 (caching_sha2_password).
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+serde_json = "1"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
