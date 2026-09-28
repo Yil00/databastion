@@ -7,6 +7,11 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🐛 Agent classifiers
+- Value-based column classification: birth dates, person names and postal addresses are detected without a column-name hint (age distribution, name lexicon, address structure); broader phone, IBAN, NIR, AWS key and password-hash formats; card and e-mail precision rules (checksum consistency, personal mailboxes only)
+- Values are put in Unicode NFC before detection and fingerprinting: fingerprints of decomposed (NFD) non-ASCII values, e.g. accented e-mail addresses, change to those of their composed form
+- The `regex` `unicode-case` feature is declared by the classifiers crate (case-insensitive patterns failed in the production build) and every pattern is compiled at agent startup
+
 ### 📝 Documentation
 - MVP framing: vision, architecture, stack, scope, security
 - Architecture decisions ADR-0001 to ADR-0006
