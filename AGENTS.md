@@ -65,6 +65,14 @@ An agent does **not** modify files belonging to another owner, unless the task e
   4. Files from other owners that should be modified
 - The `docs-keeper` updates `docs/ROADMAP.md` and `CONTEXT.md` (current phase) after each merge.
 
+## Long-running tasks
+- Every task has a time budget, set by whoever launches it. When it runs out: stop, commit what is consistent, and report what is left.
+- Wrap potentially long commands in `timeout` (e.g. `timeout 300 cargo test`).
+- No watch modes (`vitest` without `run`, `cargo watch`, `next dev` left running).
+- Stop any server or container started for a test before ending the task.
+- If a command keeps failing, report the partial result instead of retrying in a loop.
+- Every CI job sets `timeout-minutes`.
+
 ## Definition of Done
 - [ ] Lint + tests green for the affected component
 - [ ] Invariants I1–I7 respected (state it explicitly in the PR if the task touches the network, data or the protocol)
