@@ -78,6 +78,13 @@
       "when": 1790615607485,
       "tag": "0010_security_events_no_delete",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790617189173,
+      "tag": "0011_p2d_findings",
+      "breakpoints": true
     }
   ]
 }

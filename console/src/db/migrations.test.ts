@@ -87,6 +87,48 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
+  describe("0011: findings tables", () => {
+    it("the runtime role can read and write findings and batches; locations are unique per agent", async () => {
+      const { url } = await createRuntimeRole();
+      await withClient(url, async (c) => {
+        const agent = await c.query<{ id: string }>(
+          "insert into agents (name, hostname, version) values ('h', 'h', '0.1.0') returning id",
+        );
+        const agentId = agent.rows[0]?.id;
+        await c.query(
+          "insert into agent_targets (agent_id, target_id, engine, reachable, audit_level) values ($1, 'pg', 'postgres', true, 'none')",
+          [agentId],
+        );
+        const insert = (id: string) =>
+          c.query(
+            `insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+               field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id)
+             values ($1, $2, 'pg', $3, 'postgres', 'crm', 'clients', 'email', 'pii.email', '2026.09.1', 0.5, 10, 5, $1)`,
+            [id, agentId, "a".repeat(64)],
+          );
+        await insert("01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f");
+        await expect(insert("01920f60-3c1a-7b2e-9f00-5a1b2c3d4e60")).rejects.toThrow(/findings_location_key/);
+        await c.query(
+          "insert into findings_batches (agent_id, batch_id, body_sha256, findings_count) values ($1, $2, $3, 1)",
+          [agentId, "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e5f", "b".repeat(64)],
+        );
+        // A finding must reference a target reported by its agent.
+        await expect(
+          c.query(
+            `insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+               field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id)
+             values ($1, $2, 'other', $3, 'postgres', 'crm', 'clients', 'email', 'pii.email', '2026.09.1', 0.5, 10, 5, $1)`,
+            ["01920f60-3c1a-7b2e-9f00-5a1b2c3d4e61", agentId, "c".repeat(64)],
+          ),
+        ).rejects.toThrow(/findings_agent_target_fk/);
+        await c.query("update findings set false_positive_at = now()");
+        await c.query("delete from agents where id = $1", [agentId]);
+        const left = await c.query("select count(*)::int as n from findings");
+        expect((left.rows[0] as { n: number }).n).toBe(0);
+      });
+    });
+  });
+
   describe("0009: refuses to run when pgboss is owned by another role", () => {
     const guardSql = readFileSync(path.join(MIGRATIONS_FOLDER, "0009_pgboss_owner_guard.sql"), "utf8");
 
