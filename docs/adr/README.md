@@ -18,5 +18,6 @@ Every structural decision is recorded here. **An agent (human or AI) does not ch
 | [0012](0012-postgresql-agent-grants.md) | Grant set of the agent's PostgreSQL role (Discovery, Audit) | Accepted |
 | [0013](0013-frozen-error-codes.md) | Error codes are frozen within a protocol major version | Accepted |
 | [0014](0014-policy-and-incident-model.md) | Policy and incident model: per-source conditions, durable work markers, dedup (resolved means remediated) and false-positive alignment | Accepted |
+| [0015](0015-postgresql-connector-decisions.md) | PostgreSQL connector: TLS policy, authentication refusals, RLS policy allow-list, audit level before P4-A, partition and byte bounds (refines 0012) | Accepted |
 
 Template: copy [template.md](template.md).
