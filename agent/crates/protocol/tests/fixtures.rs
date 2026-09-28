@@ -4,7 +4,8 @@
 //! - Every `invalid/<Schema>.<case>.json` must be rejected by serde, except
 //!   those in [`NOT_ENFORCED_BY_SERDE`], which rely on a JSON Schema keyword
 //!   the generated types do not express. For those, the console's Ajv
-//!   validation and the agent's sanitizer are the enforcement points. The
+//!   validation is the enforcement point; agent-side checks of received
+//!   values are a required future step (P1-B, P2). The
 //!   allowlist is exact: a fixture listed here that starts failing (or an
 //!   unlisted one that starts passing) fails the test, so it cannot rot.
 
@@ -18,18 +19,10 @@ use databastion_protocol as p;
 /// Invalid fixtures that serde accepts, with the keyword it does not enforce.
 const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
     (
-        "EnrollResponse.uppercase-agent-id.json",
-        "pattern: `Uuid` is mapped to uuid::Uuid, which accepts uppercase",
-    ),
-    (
         "EventsBatch.read-without-objects.json",
         "minItems (via if/then, removed before generation)",
     ),
     ("EventsBatch.too-many-events.json", "maxItems"),
-    (
-        "FindingsBatch.batch-id-not-uuidv7.json",
-        "pattern: `UuidV7` is mapped to uuid::Uuid, any version accepted",
-    ),
     (
         "FindingsBatch.card-number-as-table.json",
         "not (Identifier)",
@@ -128,6 +121,46 @@ fn check(schema: &str, json: &str) -> Result<(), String> {
         RotateRequest,
         RotateResponse,
     )
+}
+
+/// `Debug` of every structure carrying a credential must not print it.
+#[test]
+fn debug_never_prints_credentials() {
+    let valid = fixtures_dir("valid");
+    type Render = fn(&str) -> String;
+    let cases: [(&str, Render); 5] = [
+        ("EnrollRequest.full.json", |j| {
+            format!("{:?}", serde_json::from_str::<p::EnrollRequest>(j).unwrap())
+        }),
+        ("EnrollRequest.minimal.json", |j| {
+            format!("{:?}", serde_json::from_str::<p::EnrollRequest>(j).unwrap())
+        }),
+        ("EnrollResponse.default.json", |j| {
+            format!(
+                "{:?}",
+                serde_json::from_str::<p::EnrollResponse>(j).unwrap()
+            )
+        }),
+        ("RotateRequest.agent-initiated.json", |j| {
+            format!("{:?}", serde_json::from_str::<p::RotateRequest>(j).unwrap())
+        }),
+        ("RotateRequest.from-job.json", |j| {
+            format!("{:?}", serde_json::from_str::<p::RotateRequest>(j).unwrap())
+        }),
+    ];
+    for (file, debug) in cases {
+        let json = fs::read_to_string(valid.join(file)).unwrap();
+        let rendered = debug(&json);
+        assert!(rendered.contains("[REDACTED]"), "{file}: {rendered}");
+        for prefix in ["dbs_", "dbe_"] {
+            assert!(
+                !rendered.contains(prefix),
+                "{file} leaks a credential in Debug"
+            );
+        }
+        // The fixture really carries a credential.
+        assert!(json.contains("dbs_") || json.contains("dbe_"), "{file}");
+    }
 }
 
 #[test]

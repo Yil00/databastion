@@ -22,19 +22,31 @@
 //!   (`additionalProperties: false` in the schema). Structs that carry data
 //!   do not derive `Default`.
 //!
+//! - `AgentSecret` and `EnrollmentToken` are hand-written wrappers
+//!   ([`secret`]): redacted `Debug`, no `Display` / `Hash` / `Ord`, zeroized
+//!   on drop, validated on construction and deserialization. `Uuid` and
+//!   `UuidV7` are hand-written too ([`ids`]): canonical lowercase, version 7
+//!   checked; [`new_batch_id`] creates batch identifiers.
+//!
 //! # What serde does not enforce
 //! The generated types enforce types, `required`, closed objects, enums,
-//! string `minLength` / `maxLength` and `pattern` (through `regress`, with
-//! ECMAScript semantics), and the bounds typify maps to Rust integer types.
-//! They do **not** enforce, among others: `if` / `then` / `else` (removed
-//! before generation, listed in the header of `generated.rs`), `not`,
-//! numeric `minimum` / `maximum` in general, `minItems` / `maxItems`,
-//! `uniqueItems`, `maxProperties`, the lowercase / version pattern of
-//! `Uuid` / `UuidV7` (mapped to [`uuid::Uuid`]) and `maxLength` of
-//! `Timestamp` (mapped to `chrono`). The console's Ajv validation (strict,
-//! unknown fields rejected) and the agent's own sanitizer before spooling
-//! remain the enforcement points; `tests/fixtures.rs` lists every invalid
-//! fixture that still deserializes, and why.
+//! `const`, string `minLength` / `maxLength` and `pattern` (through
+//! `regress`, ECMAScript semantics with the `u` flag), and the bounds typify
+//! maps to Rust integer types. They do **not** enforce: `if` / `then` /
+//! `else` (removed before generation, listed in the header of
+//! `generated.rs`), `not`, numeric `minimum` / `maximum` in general,
+//! `minItems` / `maxItems`, `uniqueItems`, `minProperties` /
+//! `maxProperties`, and `maxLength` of `Timestamp` (mapped to `chrono`).
+//! `tests/fixtures.rs` lists every invalid fixture that still deserializes,
+//! and why.
+//!
+//! On the console side, Ajv enforces all of them. **On the agent side, no
+//! sanitizer exists yet**: checking what the agent receives against the
+//! contract ranges is a required future step, not a current guarantee
+//! (heartbeat and job bounds in the P1-B scheduler; scan and audit
+//! parameters mapped into `ScanJob` / `AuditConfig` through a `TryFrom`
+//! that applies the contract ranges in P2). Payloads the agent sends are
+//! built from masked types only.
 //!
 //! Optional arrays are generated as `Vec` with `#[serde(default)]`: an
 //! absent array and an empty array are the same value on the agent side.
@@ -62,3 +74,8 @@
 pub mod generated;
 
 pub use generated::*;
+pub use ids::{InvalidUuid, Uuid, UuidV7, new_batch_id};
+pub use secret::{AgentSecret, EnrollmentToken, InvalidCredential};
+
+pub mod ids;
+pub mod secret;

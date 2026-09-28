@@ -75,9 +75,16 @@ written by hand (I6): `crates/protocol/src/generated.rs` is produced by
 `databastion-protocol-codegen` (typify) and committed. Its header lists the
 schema rewrites applied before generation and the keywords that serde does
 not enforce (`if` / `then` / `else`, `not`, numeric bounds, `minItems` /
-`maxItems`…); for those, the console's Ajv validation and the agent's
-sanitizer before spooling are the enforcement points
+`maxItems`…). The console's Ajv validation enforces them; checking received
+values on the agent side is a required future step (P1-B heartbeat
+scheduler, P2 scan / audit parameter mapping), not an existing guarantee
 (`crates/protocol/tests/fixtures.rs` lists the affected invalid fixtures).
+`AgentSecret` / `EnrollmentToken` are hand-written wrappers (redacted
+`Debug`, zeroized on drop), as are `Uuid` / `UuidV7` (canonical, version
+checked).
+
+The generator (developer tool only, never linked into the binary) parses
+YAML with `serde_yaml_ng`, a maintained fork of the deprecated `serde_yaml`.
 Only the crate-private uplink uses these types; connectors may not depend on
 `databastion-protocol` (architecture test). `ScanJob` and `AuditConfig`
 remain opaque placeholders that the core will map from the generated job

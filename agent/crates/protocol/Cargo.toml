@@ -13,7 +13,9 @@ publish.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 regress = "0.12"
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
-uuid = { version = "1", default-features = false, features = ["std", "serde"] }
+uuid = { version = "1", default-features = false, features = ["std", "serde", "v7"] }
+# Credentials are zeroized on drop (src/secret.rs).
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 databastion-protocol-codegen.workspace = true

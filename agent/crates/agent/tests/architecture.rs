@@ -12,10 +12,12 @@
 //! author. The type boundary in `classifiers::masking` and code review remain
 //! the primary controls; cargo-deny is planned in CI.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const CONNECTORS: [&str; 4] = [
     "connector-postgres",
@@ -257,4 +259,71 @@ fn no_listening_socket_in_agent_code() {
             );
         }
     }
+}
+
+/// Runs `cargo metadata --locked` with a 120 s timeout. Not `--offline`:
+/// the full resolve covers every platform, so it may need crates (e.g.
+/// Windows / UEFI targets of `getrandom`) that a host build never fetched.
+fn cargo_metadata() -> serde_json::Value {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let out_path = std::env::temp_dir().join(format!(
+        "databastion-arch-metadata-{}.json",
+        std::process::id()
+    ));
+    let out_file = fs::File::create(&out_path).unwrap();
+    let mut child = Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .current_dir(workspace_root())
+        .stdout(out_file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("cargo metadata timed out");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "cargo metadata failed");
+    let text = fs::read_to_string(&out_path).unwrap();
+    fs::remove_file(&out_path).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// In the resolved graph, the only crate with a normal (non-dev, non-build)
+/// dependency on `databastion-protocol` is `databastion-core`, whose
+/// crate-private uplink is the only user of the generated types. Complements
+/// the manifest text guard above.
+#[test]
+fn only_core_depends_on_protocol_types() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"].as_array().unwrap();
+    let name_of = |id: &str| {
+        packages
+            .iter()
+            .find(|p| p["id"] == id)
+            .and_then(|p| p["name"].as_str())
+            .unwrap()
+            .to_owned()
+    };
+    let mut dependents = Vec::new();
+    for node in metadata["resolve"]["nodes"].as_array().unwrap() {
+        for dep in node["deps"].as_array().unwrap() {
+            let is_protocol = name_of(dep["pkg"].as_str().unwrap()) == "databastion-protocol";
+            let normal = dep["dep_kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k["kind"].is_null());
+            if is_protocol && normal {
+                dependents.push(name_of(node["id"].as_str().unwrap()));
+            }
+        }
+    }
+    assert_eq!(dependents, ["databastion-core"]);
 }

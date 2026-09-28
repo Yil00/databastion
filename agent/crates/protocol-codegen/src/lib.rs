@@ -47,7 +47,7 @@ pub enum CodegenError {
     },
     /// The OpenAPI document is not valid YAML.
     #[error("invalid YAML: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
     /// The schemas could not be converted into a JSON Schema document.
     #[error("invalid JSON Schema: {0}")]
     Json(#[from] serde_json::Error),
@@ -80,7 +80,7 @@ pub fn default_output_path() -> PathBuf {
 /// # Errors
 /// If the YAML is invalid or has no `components/schemas` mapping.
 pub fn json_schema_from_openapi(openapi_yaml: &str) -> Result<Value, CodegenError> {
-    let doc: Value = serde_yaml::from_str(openapi_yaml)?;
+    let doc: Value = serde_yaml_ng::from_str(openapi_yaml)?;
     let mut schemas = doc
         .get("components")
         .and_then(|c| c.get("schemas"))
@@ -89,7 +89,7 @@ pub fn json_schema_from_openapi(openapi_yaml: &str) -> Result<Value, CodegenErro
     if !schemas.is_object() {
         return Err(CodegenError::NoSchemas);
     }
-    rewrite_refs(&mut schemas);
+    walk_defs(&mut schemas, "#/$defs", &mut rewrite_ref);
     Ok(wrap(schemas))
 }
 
@@ -103,92 +103,21 @@ fn wrap(schemas: Value) -> Value {
     Value::Object(root)
 }
 
+/// Schemas replaced by hand-written types of `databastion-protocol`:
+/// credentials (redacted `Debug`, zeroized, `src/secret.rs`) and UUIDs
+/// (canonical lowercase, version 7 checked, `src/ids.rs`).
+pub const REPLACEMENTS: [(&str, &str); 4] = [
+    ("AgentSecret", "crate::secret::AgentSecret"),
+    ("EnrollmentToken", "crate::secret::EnrollmentToken"),
+    ("Uuid", "crate::ids::Uuid"),
+    ("UuidV7", "crate::ids::UuidV7"),
+];
+
 /// Keywords typify cannot express (it panics on them). They are removed
 /// before generation and listed in the generated file header. Their rules
-/// are enforced by the console's Ajv validation and by the agent's own
-/// sanitizer before spooling, not by serde.
+/// are enforced by the console's Ajv validation, not by serde; agent-side
+/// checks of received values are a required future step (P1-B, P2).
 const UNSUPPORTED_KEYWORDS: [&str; 3] = ["if", "then", "else"];
-
-/// Anchors unanchored `pattern`s: `P` becomes `^[\s\S]*?(?:P)`.
-///
-/// JSON Schema patterns are unanchored searches. typify merges the patterns
-/// of an `allOf` into lookaheads (`(?=A)(?=B)`) evaluated at the first
-/// position where `A` matches, so an unanchored `B` (e.g. `MaskedSample`'s
-/// "contains a `*`" rule) would only be tested at that position. The
-/// rewritten pattern matches exactly the same strings on its own, and stays
-/// correct once merged.
-fn anchor_patterns(value: &mut Value, pointer: &str, rewritten: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                let child_pointer = format!("{pointer}/{key}");
-                match child {
-                    Value::String(pattern) if key == "pattern" && !pattern.starts_with('^') => {
-                        *pattern = format!("^[\\s\\S]*?(?:{pattern})");
-                        rewritten.push(child_pointer);
-                    }
-                    _ => anchor_patterns(child, &child_pointer, rewritten),
-                }
-            }
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter_mut().enumerate() {
-                anchor_patterns(child, &format!("{pointer}/{i}"), rewritten);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Rewrites `const: X` as `enum: [X]` (same meaning in JSON Schema).
-///
-/// typify ignores `const` on a string property (it generates a free
-/// `String`), so the `type` discriminator of each `Job` variant would accept
-/// any value, e.g. `shell.exec`. A one-value `enum` becomes a one-variant
-/// Rust enum, which serde enforces.
-fn const_to_enum(value: &mut Value, pointer: &str, rewritten: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if !map.contains_key("enum") {
-                if let Some(constant) = map.remove("const") {
-                    map.insert("enum".to_owned(), Value::Array(vec![constant]));
-                    rewritten.push(format!("{pointer}/const"));
-                }
-            }
-            for (key, child) in map.iter_mut() {
-                const_to_enum(child, &format!("{pointer}/{key}"), rewritten);
-            }
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter_mut().enumerate() {
-                const_to_enum(child, &format!("{pointer}/{i}"), rewritten);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collects the JSON pointers of `not` keywords: typify ignores them on
-/// string schemas, so they are reported in the generated file header.
-fn collect_not(value: &Value, pointer: &str, found: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let child_pointer = format!("{pointer}/{key}");
-                if key == "not" {
-                    found.push(child_pointer.clone());
-                }
-                collect_not(child, &child_pointer, found);
-            }
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter().enumerate() {
-                collect_not(child, &format!("{pointer}/{i}"), found);
-            }
-        }
-        _ => {}
-    }
-}
 
 /// Compiles every schema pattern with the ECMAScript `u` flag.
 ///
@@ -248,48 +177,160 @@ fn strip_default_derives(file: &mut syn::File) {
     }
 }
 
-/// Removes [`UNSUPPORTED_KEYWORDS`] from every schema object and returns the
-/// JSON pointers (under `$defs`) of the removed keywords, sorted.
-fn strip_unsupported(value: &mut Value, pointer: &str, removed: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for keyword in UNSUPPORTED_KEYWORDS {
-                if map.remove(keyword).is_some() {
-                    removed.push(format!("{pointer}/{keyword}"));
+/// Keywords whose value is a map of subschemas (property names as keys).
+const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+/// Keywords whose value is a single subschema.
+const SCHEMA_KEYWORDS: [&str; 11] = [
+    "items",
+    "additionalItems",
+    "additionalProperties",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+/// Keywords whose value is an array of subschemas.
+const SCHEMA_ARRAY_KEYWORDS: [&str; 4] = ["allOf", "anyOf", "oneOf", "prefixItems"];
+
+/// Calls `visit` on every schema object reachable from `schema`, following
+/// only subschema keywords. Property names under `properties`, and the
+/// values of `enum`, `const`, `default`, `examples` or `description`, are
+/// never visited, so a property called `pattern` or an example containing
+/// `const` is not rewritten. `visit` runs before the children are walked.
+fn walk_schema(
+    schema: &mut Value,
+    pointer: &str,
+    visit: &mut dyn FnMut(&mut Map<String, Value>, &str),
+) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+    visit(map, pointer);
+    for (key, child) in map.iter_mut() {
+        let child_pointer = format!("{pointer}/{key}");
+        let key = key.as_str();
+        if SCHEMA_MAP_KEYWORDS.contains(&key) {
+            if let Value::Object(entries) = child {
+                for (name, sub) in entries.iter_mut() {
+                    walk_schema(sub, &format!("{child_pointer}/{name}"), visit);
                 }
             }
-            for (key, child) in map.iter_mut() {
-                strip_unsupported(child, &format!("{pointer}/{key}"), removed);
+        } else if SCHEMA_KEYWORDS.contains(&key) {
+            match child {
+                // `items` in array form (draft 2019 and older).
+                Value::Array(items) => {
+                    for (i, sub) in items.iter_mut().enumerate() {
+                        walk_schema(sub, &format!("{child_pointer}/{i}"), visit);
+                    }
+                }
+                sub => walk_schema(sub, &child_pointer, visit),
+            }
+        } else if SCHEMA_ARRAY_KEYWORDS.contains(&key) {
+            if let Value::Array(items) = child {
+                for (i, sub) in items.iter_mut().enumerate() {
+                    walk_schema(sub, &format!("{child_pointer}/{i}"), visit);
+                }
             }
         }
-        Value::Array(items) => {
-            for (i, child) in items.iter_mut().enumerate() {
-                strip_unsupported(child, &format!("{pointer}/{i}"), removed);
-            }
-        }
-        _ => {}
     }
 }
 
-/// Rewrites every `$ref: "#/components/schemas/X"` to `#/$defs/X`.
-fn rewrite_refs(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                if key == "$ref" {
-                    if let Value::String(target) = child {
-                        if let Some(name) = target.strip_prefix(OPENAPI_REF_PREFIX) {
-                            *target = format!("{DEFS_REF_PREFIX}{name}");
-                        }
-                    }
-                } else {
-                    rewrite_refs(child);
-                }
-            }
+/// Walks every schema under a map of named schemas (`$defs`).
+fn walk_defs(
+    defs: &mut Value,
+    pointer: &str,
+    visit: &mut dyn FnMut(&mut Map<String, Value>, &str),
+) {
+    if let Value::Object(entries) = defs {
+        for (name, schema) in entries.iter_mut() {
+            walk_schema(schema, &format!("{pointer}/{name}"), visit);
         }
-        Value::Array(items) => items.iter_mut().for_each(rewrite_refs),
-        _ => {}
     }
+}
+
+/// Removes [`UNSUPPORTED_KEYWORDS`] from a schema object.
+fn strip_unsupported(map: &mut Map<String, Value>, pointer: &str, removed: &mut Vec<String>) {
+    for keyword in UNSUPPORTED_KEYWORDS {
+        if map.remove(keyword).is_some() {
+            removed.push(format!("{pointer}/{keyword}"));
+        }
+    }
+}
+
+/// Gives every `pattern` explicit search semantics: `P` becomes
+/// `^[\s\S]*?(?:P)`.
+///
+/// JSON Schema patterns are unanchored searches. typify merges the patterns
+/// of an `allOf` into lookaheads (`(?=A)(?=B)`) evaluated at the first
+/// position where `A` matches, so an unanchored `B` (e.g. `MaskedSample`'s
+/// "contains a `*`" rule) would only be tested at that position. Detecting
+/// anchoring syntactically is error-prone (`^a|b` is not anchored), so every
+/// pattern is wrapped: the wrapped pattern matches exactly the same strings
+/// (without the `m` flag, `^` only matches at the start of the input), and
+/// stays correct once merged.
+fn wrap_pattern(map: &mut Map<String, Value>, pointer: &str, rewritten: &mut Vec<String>) {
+    if let Some(Value::String(pattern)) = map.get_mut("pattern") {
+        *pattern = format!("^[\\s\\S]*?(?:{pattern})");
+        rewritten.push(format!("{pointer}/pattern"));
+    }
+}
+
+/// Rewrites `const: X` as `enum: [X]` (same meaning in JSON Schema).
+///
+/// typify ignores `const` on a string property (it generates a free
+/// `String`), so the `type` discriminator of each `Job` variant would accept
+/// any value, e.g. `shell.exec`. A one-value `enum` becomes a one-variant
+/// Rust enum, which serde enforces.
+fn const_to_enum(map: &mut Map<String, Value>, pointer: &str, rewritten: &mut Vec<String>) {
+    if !map.contains_key("enum") {
+        if let Some(constant) = map.remove("const") {
+            map.insert("enum".to_owned(), Value::Array(vec![constant]));
+            rewritten.push(format!("{pointer}/const"));
+        }
+    }
+}
+
+/// Records `not` keywords: typify ignores them on string schemas, so they
+/// are reported in the generated file header.
+fn collect_not(map: &mut Map<String, Value>, pointer: &str, found: &mut Vec<String>) {
+    if map.contains_key("not") {
+        found.push(format!("{pointer}/not"));
+    }
+}
+
+/// Rewrites `$ref: "#/components/schemas/X"` to `#/$defs/X`.
+fn rewrite_ref(map: &mut Map<String, Value>, _pointer: &str) {
+    if let Some(Value::String(target)) = map.get_mut("$ref") {
+        if let Some(name) = target.strip_prefix(OPENAPI_REF_PREFIX) {
+            *target = format!("{DEFS_REF_PREFIX}{name}");
+        }
+    }
+}
+
+/// Runs `pass` on every schema under `$defs` and returns the sorted
+/// pointers it reports.
+fn run_pass(
+    schema: &mut Value,
+    pass: fn(&mut Map<String, Value>, &str, &mut Vec<String>),
+) -> Vec<String> {
+    let mut found = Vec::new();
+    if let Some(defs) = schema.get_mut("$defs") {
+        walk_defs(defs, "#/$defs", &mut |map, pointer| {
+            pass(map, pointer, &mut found);
+        });
+    }
+    found.sort();
+    found
 }
 
 /// Generates the Rust source of `databastion-protocol`'s `generated` module.
@@ -298,29 +339,16 @@ fn rewrite_refs(value: &mut Value) {
 /// If the document cannot be parsed or typify rejects a schema.
 pub fn generate(openapi_yaml: &str) -> Result<String, CodegenError> {
     let mut schema = json_schema_from_openapi(openapi_yaml)?;
-    let mut removed = Vec::new();
-    if let Some(defs) = schema.get_mut("$defs") {
-        strip_unsupported(defs, "#/$defs", &mut removed);
-    }
-    removed.sort();
-    let mut anchored = Vec::new();
-    if let Some(defs) = schema.get_mut("$defs") {
-        anchor_patterns(defs, "#/$defs", &mut anchored);
-    }
-    anchored.sort();
-    let mut constants = Vec::new();
-    if let Some(defs) = schema.get_mut("$defs") {
-        const_to_enum(defs, "#/$defs", &mut constants);
-    }
-    constants.sort();
-    let mut negations = Vec::new();
-    if let Some(defs) = schema.get("$defs") {
-        collect_not(defs, "#/$defs", &mut negations);
-    }
-    negations.sort();
+    let removed = run_pass(&mut schema, strip_unsupported);
+    let negations = run_pass(&mut schema, collect_not);
+    let constants = run_pass(&mut schema, const_to_enum);
+    let wrapped = run_pass(&mut schema, wrap_pattern);
     let root: schemars::schema::RootSchema = serde_json::from_value(schema)?;
     let mut settings = typify::TypeSpaceSettings::default();
     settings.with_struct_builder(false);
+    for (schema, rust_type) in REPLACEMENTS {
+        settings.with_replacement(schema, rust_type, std::iter::empty());
+    }
     let mut space = typify::TypeSpace::new(&settings);
     space.add_root_schema(root)?;
     let mut file: syn::File = syn::parse2(space.to_stream())?;
@@ -329,17 +357,15 @@ pub fn generate(openapi_yaml: &str) -> Result<String, CodegenError> {
     syn::visit_mut::VisitMut::visit_file_mut(&mut unicode, &mut file);
     let mut out = String::from(HEADER);
     out.push_str(
-        "//\n// Keywords not expressible by typify, removed before generation and enforced\n\
-         // by the console's Ajv validation and the agent's sanitizer instead:\n",
+        "//\n// Keywords not expressible by typify, removed before generation. Enforced by\n\
+         // the console's Ajv validation; agent-side checks are a future step (P1-B, P2):\n",
     );
     for pointer in &removed {
         out.push_str("// - ");
         out.push_str(pointer);
         out.push('\n');
     }
-    out.push_str(
-        "//\n// `not` keywords (not enforced by the generated types; same enforcement points):\n",
-    );
+    out.push_str("//\n// `not` keywords (not enforced by the generated types; same as above):\n");
     for pointer in &negations {
         out.push_str("// - ");
         out.push_str(pointer);
@@ -355,12 +381,10 @@ pub fn generate(openapi_yaml: &str) -> Result<String, CodegenError> {
         out.push_str(pointer);
         out.push('\n');
     }
-    out.push_str("//\n// Unanchored patterns rewritten as `^[\\s\\S]*?(?:P)` (same language):\n");
-    for pointer in &anchored {
-        out.push_str("// - ");
-        out.push_str(pointer);
-        out.push('\n');
-    }
+    out.push_str(&format!(
+        "//\n// Patterns wrapped as `^[\\s\\S]*?(?:P)` (search semantics, same language): {}.\n",
+        wrapped.len()
+    ));
     out.push('\n');
     out.push_str(&prettyplease::unparse(&file));
     Ok(out)
@@ -408,14 +432,16 @@ components:
         ));
     }
 
+    fn defs(value: Value) -> Value {
+        serde_json::json!({ "$defs": value })
+    }
+
     #[test]
     fn conditionals_are_stripped_and_reported() {
-        let mut value = serde_json::json!({
+        let mut schema = defs(serde_json::json!({
             "A": { "type": "object", "if": {}, "then": {}, "properties": { "x": { "else": {} } } }
-        });
-        let mut removed = Vec::new();
-        strip_unsupported(&mut value, "#/$defs", &mut removed);
-        removed.sort();
+        }));
+        let removed = run_pass(&mut schema, strip_unsupported);
         assert_eq!(
             removed,
             [
@@ -424,19 +450,55 @@ components:
                 "#/$defs/A/then"
             ]
         );
-        assert!(value["A"].get("if").is_none());
+        assert!(schema["$defs"]["A"].get("if").is_none());
     }
 
     #[test]
-    fn unanchored_patterns_are_anchored() {
-        let mut value = serde_json::json!({
-            "A": { "pattern": "\\*", "allOf": [{ "pattern": "^x$" }] }
-        });
-        let mut rewritten = Vec::new();
-        anchor_patterns(&mut value, "#/$defs", &mut rewritten);
-        assert_eq!(value["A"]["pattern"], "^[\\s\\S]*?(?:\\*)");
-        assert_eq!(value["A"]["allOf"][0]["pattern"], "^x$");
-        assert_eq!(rewritten, ["#/$defs/A/pattern"]);
+    fn every_pattern_gets_search_semantics() {
+        let mut schema = defs(serde_json::json!({
+            "A": { "pattern": "\\*", "allOf": [{ "pattern": "^x$" }, { "pattern": "^a|b" }] }
+        }));
+        let wrapped = run_pass(&mut schema, wrap_pattern);
+        let a = &schema["$defs"]["A"];
+        assert_eq!(a["pattern"], "^[\\s\\S]*?(?:\\*)");
+        assert_eq!(a["allOf"][0]["pattern"], "^[\\s\\S]*?(?:^x$)");
+        // `^a|b` is not anchored: `b` may match anywhere.
+        assert_eq!(a["allOf"][1]["pattern"], "^[\\s\\S]*?(?:^a|b)");
+        assert_eq!(wrapped.len(), 3);
+    }
+
+    #[test]
+    fn walkers_only_touch_schema_keywords() {
+        let mut schema = defs(serde_json::json!({
+            "A": {
+                "type": "object",
+                "properties": {
+                    // Property names that look like keywords.
+                    "pattern": { "type": "string", "maxLength": 3 },
+                    "const": { "type": "string", "const": "k" },
+                    "if": { "type": "boolean" }
+                },
+                "default": { "pattern": "x", "const": 1, "if": true },
+                "examples": [{ "pattern": "y", "const": 2 }],
+                "enum": [{ "const": 3, "pattern": "z" }]
+            }
+        }));
+        let original = schema.clone();
+        let removed = run_pass(&mut schema, strip_unsupported);
+        let wrapped = run_pass(&mut schema, wrap_pattern);
+        let constants = run_pass(&mut schema, const_to_enum);
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(wrapped.is_empty(), "{wrapped:?}");
+        assert_eq!(constants, ["#/$defs/A/properties/const/const"]);
+        let a = &schema["$defs"]["A"];
+        assert_eq!(
+            a["properties"]["pattern"],
+            original["$defs"]["A"]["properties"]["pattern"]
+        );
+        assert!(a["properties"].get("if").is_some());
+        assert_eq!(a["default"], original["$defs"]["A"]["default"]);
+        assert_eq!(a["examples"], original["$defs"]["A"]["examples"]);
+        assert_eq!(a["enum"], original["$defs"]["A"]["enum"]);
     }
 
     #[test]
@@ -456,16 +518,13 @@ components:
 
     #[test]
     fn const_becomes_one_value_enum() {
-        let mut value = serde_json::json!({
+        let mut schema = defs(serde_json::json!({
             "A": { "properties": { "type": { "type": "string", "const": "x.y" } } }
-        });
-        let mut rewritten = Vec::new();
-        const_to_enum(&mut value, "#/$defs", &mut rewritten);
-        assert_eq!(
-            value["A"]["properties"]["type"]["enum"],
-            serde_json::json!(["x.y"])
-        );
-        assert!(value["A"]["properties"]["type"].get("const").is_none());
+        }));
+        let rewritten = run_pass(&mut schema, const_to_enum);
+        let t = &schema["$defs"]["A"]["properties"]["type"];
+        assert_eq!(t["enum"], serde_json::json!(["x.y"]));
+        assert!(t.get("const").is_none());
         assert_eq!(rewritten, ["#/$defs/A/properties/type/const"]);
     }
 

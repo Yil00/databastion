@@ -13,7 +13,8 @@ prettyplease = "0.2"
 quote = "1"
 schemars = "0.8"
 serde_json = "1"
-serde_yaml = "0.9"
+# Maintained fork of the deprecated serde_yaml (same API).
+serde_yaml_ng = "0.10"
 syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit-mut"] }
 thiserror.workspace = true
 typify = { version = "0.8", default-features = false }
