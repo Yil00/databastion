@@ -66,12 +66,30 @@ review remain the primary controls.
   `console.ca_file` pins a single CA (built-in roots disabled).
 - TLS 1.3 minimum, no redirects, no http2 / cookies / compression,
   30 s request timeout (`wait + 15` s for the long-poll), 1 MiB response cap.
-  `http://` only with `insecure_dev_http: true` **and** a loopback URL
-  (development tests); such a client never uses a proxy.
+  `http://` only with `insecure_dev_http: true` **and** an IP-literal
+  loopback URL (`127.0.0.1` / `[::1]`, not `localhost`); such a client never
+  uses a proxy. Otherwise `HTTPS_PROXY` / `NO_PROXY` are honoured.
+  `console.ca_file` may hold a PEM bundle (all certificates trusted, built-in
+  roots disabled).
 - `<state_dir>/identity.json` (agent id, secret, pending rotation secret)
   and `<state_dir>/hmac.key` (32 random bytes, never transmitted) are
-  `0600`, written atomically (temp file, fsync, rename, directory fsync) and
-  refused on load if group / others have access.
+  `0600`, written atomically (temp file, fsync, rename, directory fsync).
+  `state_dir` must be a real directory owned by the agent user and not
+  group / world writable (a mode other than `0700` warns). State files are
+  opened with `O_NOFOLLOW` (`rustix`) and checked on the handle: regular
+  file, owned by the agent user, no group / other access.
+- Enrollment refuses a token file readable by others. `enroll --force`
+  replaces the identity (revoke the old agent in the console first) and keeps
+  the HMAC key unless `--new-hmac-key`.
+- Rotation (ADR-0008): a `/rotate` attempt with an unknown outcome keeps S1
+  first; S0 is preferred only after S1 got a `401` following the latest
+  attempt. Up to 8 rotate job ids satisfied by the pending / promoted secret
+  are persisted (redelivery acknowledged without a new secret); a new
+  rotation within 60 s of a promotion is deferred.
+- `long_poll_wait_s` is `5..=25` (below 5 only with `insecure_dev_http`),
+  and a poll returning in under 1 s without jobs is followed by at least
+  1 s plus jittered backoff. A config reload that changes `console.*` or
+  `state_dir` is refused (`invalid_params`).
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
   `<= 0` are ignored. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
@@ -79,7 +97,8 @@ review remain the primary controls.
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
   `deny.toml` sets `[graph] exclude-dev = true`: the hyper `server` feature
   it needs is never linked into the binary, and the bans stay strict for
-  the shipped graph.
+  the shipped graph. `deny-dev.toml` checks licenses and sources of the full
+  graph, dev-dependencies included.
 
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
@@ -128,6 +147,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --no-default-features --locked   # minimal binary, no connector
 cargo deny --locked check bans licenses sources
+cargo deny --config deny-dev.toml --locked check licenses sources   # dev-deps too
 cargo run -p databastion-protocol-codegen      # after changing shared/protocol/openapi.yaml
 cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
 cargo run -- run --config /etc/databastion/agent.yaml
