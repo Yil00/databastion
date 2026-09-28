@@ -5,6 +5,12 @@
 
 [graph]
 all-features = true
+# Dev-dependencies are never linked into the shipped binary. Test-only HTTP
+# mock servers (wiremock, bound to 127.0.0.1 inside tests) pull hyper's
+# `server` feature; excluding dev-dependencies keeps the bans below strict
+# for everything the binary links. `cargo tree -e normal` (no dev edges) is
+# the graph checked here.
+exclude-dev = true
 
 [licenses]
 # Licenses compatible with distributing the agent under Apache-2.0 (ADR-0005).

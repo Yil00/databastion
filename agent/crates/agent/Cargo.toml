@@ -22,7 +22,7 @@ databastion-connector-mysql = { workspace = true, optional = true }
 databastion-connector-mongodb = { workspace = true, optional = true }
 databastion-connector-openldap = { workspace = true, optional = true }
 clap.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
