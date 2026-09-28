@@ -90,14 +90,14 @@
       "pattern": "^(signature|shape|volume)\\.[a-z0-9_]+$"
     },
     "Fingerprint": {
-      "description": "`HMAC-SHA256(agent_local_key, normalized_value)`, lowercase hex. The key never leaves the agent,\nso fingerprints only correlate values seen by the same agent.\n",
+      "description": "`HMAC-SHA256(agent_local_key, \"databastion/fp/v1\" 0x00 classifier_id 0x00 normalized_value)`,\nlowercase hex, with `db_user` in place of the classifier id for `db_user_fingerprint`. The\ndomain separation keeps the same string under two classifiers, or as an account name, from\ncorrelating. The key never leaves the agent, so fingerprints only correlate values seen by the\nsame agent.\n",
       "type": "string",
       "minLength": 76,
       "maxLength": 76,
       "pattern": "^hmac-sha256:[0-9a-f]{64}$"
     },
     "MaskedSample": {
-      "description": "Sample masked by `classifiers::masking` (e.g. `j*******@e******.com`,\n`FR76 **** **** **** **** ***1 89`). Schema rules: contains at least one `*`, no run of more than\n4 consecutive letters or digits, no combining mark, no control / format / private-use / line\nseparator character. The console additionally requires at least 50 % of the non-separator characters (letters, digits\nand `*`; spaces and punctuation ignored) to be `*`: `06 ** ** ** 78` passes (6 of 10).\n",
+      "description": "Sample masked by `classifiers::masking` (e.g. `j***@e***.com`,\n`FR** **** **** **** **** ***0 189`). Schema rules: contains at least one `*`, no run of more than\n4 consecutive letters or digits, no combining mark, no control / format / private-use / line\nseparator character. The console additionally requires at least 50 % of the non-separator characters (letters, digits\nand `*`; spaces and punctuation ignored) to be `*`: `06 ** ** ** 78` passes (6 of 10).\n",
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
