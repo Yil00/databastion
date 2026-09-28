@@ -43,7 +43,7 @@ Normative details: [`shared/protocol/openapi.yaml`](../shared/protocol/openapi.y
 - Vault integration: later
 
 ## Console internal database
-*Introduced by P1-A (#17, not merged yet); details in `console/README.md` ("Database roles").*
+*Introduced by P1-A (#17); details in `console/README.md` ("Database roles").*
 
 ### Database roles
 The console uses three PostgreSQL roles, so that a compromised console process can neither remove the append-only trigger on `audit_log` nor plant code that migrations would run:
