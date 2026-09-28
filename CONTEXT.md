@@ -14,7 +14,7 @@ DataBastion is an open-source DLP (Apache 2.0) that finds sensitive data in Post
 - End-to-end harness merged (#22: `e2e/`, `.github/workflows/e2e.yml`, agent Dockerfile): enrollment, `online` status, `/metrics` and revocation (88–111 ms measured, criterion < 60 s) in containers, with no secret in container logs, the console database dump or the proxy log. Target reachability is not asserted yet (stub connectors).
 - Console P1-D follow-ups merged (#27): bounded `S0` argon2id cost, keyed and persisted known-good fingerprint, dedicated `/metrics` listener (`DATABASTION_METRICS_PORT`), digest-pinned console image, PostgreSQL in the Console CI job. Dependency advisory scanning runs in CI (`.github/workflows/advisories.yml`), outside the required checks.
 - Carried over from phase 1 (in progress, non-blocking): console hardening (per-IP / per-username limit scoping, `DELETE` revoked on `security_events`, bounded `/enroll` argon2id pool, `pgboss` owner guard, deploy example digest pins; `fix/p1-d-console-hardening` and related console work) and agent rotation fixes (`fix/p1-d-agent-rotation`: `rotate_epoch`, `S0` fallback on `429` / `503`, `accept::rotate`, `TargetHealth` failure code). See ROADMAP P1-C and P1-D.
-- Before the P2 PostgreSQL connector: the production grants of the agent's PostgreSQL role (ROADMAP P2-0) are decided in ADR-0012, accepted and in review (PR #28).
+- Before the P2 PostgreSQL connector: the production grants of the agent's PostgreSQL role (ROADMAP P2-0) are decided in [ADR-0012](docs/adr/0012-postgresql-agent-grants.md) (#28).
 
 ## Invariants (non-negotiable)
 | # | Invariant | Source |
