@@ -286,6 +286,9 @@ pub struct TargetConfig {
     /// PostgreSQL settings (`engine: postgres` only).
     #[serde(default)]
     pub postgres: Option<PostgresTargetConfig>,
+    /// MySQL / MariaDB settings (`engine: mysql` or `mariadb` only).
+    #[serde(default)]
+    pub mysql: Option<MysqlTargetConfig>,
 }
 
 /// Maximum number of databases declared for one PostgreSQL target.
@@ -351,6 +354,48 @@ impl TargetConfig {
     #[must_use]
     pub fn postgres_settings(&self) -> PostgresTargetConfig {
         self.postgres.clone().unwrap_or_default()
+    }
+}
+
+/// MySQL / MariaDB settings of a target. One connection covers every
+/// database (schema) of the server; the job's `databases` filter selects
+/// the ones scanned.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MysqlTargetConfig {
+    /// TLS to the server. Default: `verify_full`.
+    #[serde(default)]
+    pub tls: MysqlTlsMode,
+    /// PEM CA file trusted for the server certificate (`verify_full`).
+    /// When set, it is the only trusted root; otherwise the system store.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+/// TLS mode of a MySQL / MariaDB target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlTlsMode {
+    /// TLS required, certificate and host name verified (rustls).
+    #[default]
+    VerifyFull,
+    /// No TLS: a Unix socket or a loopback IP literal only (rejected for
+    /// any other host). The connector never sends the password in clear
+    /// nor through an RSA key exchange on such a connection, except
+    /// `caching_sha2_password` full authentication on a Unix socket.
+    Disable,
+    /// No TLS on a network connection: explicit, insecure opt-in (e.g. an
+    /// isolated container network). Traffic is readable and alterable on
+    /// the path; warned at every connection and in `check()`. Only the
+    /// `caching_sha2_password` fast path is accepted.
+    DisableInsecure,
+}
+
+impl TargetConfig {
+    /// MySQL / MariaDB settings, defaults when absent.
+    #[must_use]
+    pub fn mysql_settings(&self) -> MysqlTargetConfig {
+        self.mysql.clone().unwrap_or_default()
     }
 }
 
@@ -797,6 +842,17 @@ impl TargetConfig {
         if self.engine == TargetEngine::Postgres {
             self.validate_postgres_tls(i)?;
         }
+        if let Some(my) = &self.mysql {
+            self.validate_mysql(my, i)?;
+        }
+        if matches!(self.engine, TargetEngine::Mysql | TargetEngine::Mariadb) {
+            let tls = self.mysql_settings().tls;
+            self.validate_tls_placement(
+                format!("targets[{i}].mysql.tls"),
+                tls == MysqlTlsMode::VerifyFull,
+                tls == MysqlTlsMode::Disable,
+            )?;
+        }
         match (&self.secret.env, &self.secret.file) {
             (Some(name), None) if !is_env_name(name) => Err(invalid(
                 f("secret.env"),
@@ -814,24 +870,53 @@ impl TargetConfig {
     }
 
     fn validate_postgres_tls(&self, i: usize) -> Result<(), ConfigError> {
-        let field = format!("targets[{i}].postgres.tls");
+        let tls = self.postgres_settings().tls;
+        self.validate_tls_placement(
+            format!("targets[{i}].postgres.tls"),
+            tls == PgTlsMode::VerifyFull,
+            tls == PgTlsMode::Disable,
+        )
+    }
+
+    /// A Unix socket needs `disable`; `disable` is only for a Unix socket
+    /// or a loopback IP literal (never `localhost`).
+    fn validate_tls_placement(
+        &self,
+        field: String,
+        verify_full: bool,
+        disable: bool,
+    ) -> Result<(), ConfigError> {
         let loopback = self
             .host
             .as_deref()
             .and_then(|h| h.parse::<std::net::IpAddr>().ok())
             .is_some_and(|ip| ip.is_loopback());
-        match (self.postgres_settings().tls, self.socket.is_some()) {
-            (PgTlsMode::VerifyFull, true) => Err(invalid(
+        match (verify_full, disable, self.socket.is_some()) {
+            (true, _, true) => Err(invalid(
                 field,
                 "a Unix socket has no TLS: set `tls: disable` for this target",
             )),
-            (PgTlsMode::Disable, false) if !loopback => Err(invalid(
+            (_, true, false) if !loopback => Err(invalid(
                 field,
                 "`disable` is only for a Unix socket or a loopback IP literal; use \
                  `verify_full`, or `disable_insecure` to accept cleartext on this network",
             )),
             _ => Ok(()),
         }
+    }
+
+    fn validate_mysql(&self, my: &MysqlTargetConfig, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].mysql.{name}");
+        if !matches!(self.engine, TargetEngine::Mysql | TargetEngine::Mariadb) {
+            return Err(invalid(f("tls"), "only for engine mysql or mariadb"));
+        }
+        if my.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            return Err(invalid(f("ca_file"), "must be an absolute path"));
+        }
+        if my.ca_file.is_some() && my.tls != MysqlTlsMode::VerifyFull {
+            return Err(invalid(f("ca_file"), "only with tls: verify_full"));
+        }
+        Ok(())
     }
 
     fn validate_postgres(&self, pg: &PostgresTargetConfig, i: usize) -> Result<(), ConfigError> {
@@ -1160,6 +1245,88 @@ targets:
             "      file: /etc/databastion/secrets/ldap\n    postgres:\n      databases: [x]\n",
         );
         assert!(err(&ldap).contains("targets[1].postgres"), "{}", err(&ldap));
+    }
+
+    #[test]
+    fn mysql_settings() {
+        const MY: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: my
+    engine: mariadb
+    host: db2.internal
+    port: 3306
+    account: databastion
+    secret:
+      env: DATABASTION_MY_PASSWORD
+";
+        let cfg = parse(MY).unwrap();
+        assert_eq!(
+            cfg.targets[0].mysql_settings(),
+            MysqlTargetConfig::default()
+        );
+        assert_eq!(
+            cfg.targets[0].mysql_settings().tls,
+            MysqlTlsMode::VerifyFull
+        );
+        let with =
+            |block: &str| MY.replace("    port: 3306\n", &format!("    port: 3306\n{block}"));
+        let cfg = parse(&with(
+            "    mysql:\n      tls: verify_full\n      ca_file: /etc/databastion/my-ca.pem\n",
+        ))
+        .unwrap();
+        assert!(cfg.targets[0].mysql_settings().ca_file.is_some());
+        let cfg = parse(&with("    mysql: {tls: disable_insecure}\n")).unwrap();
+        assert_eq!(
+            cfg.targets[0].mysql_settings().tls,
+            MysqlTlsMode::DisableInsecure
+        );
+        for (block, expected) in [
+            ("    mysql: {ca_file: ca.pem}\n", "mysql.ca_file"),
+            (
+                "    mysql: {tls: disable_insecure, ca_file: /etc/ca.pem}\n",
+                "mysql.ca_file",
+            ),
+            ("    mysql: {tls: disable}\n", "mysql.tls"),
+            ("    mysql: {tls: preferred}\n", "invalid value"),
+            ("    mysql: {password: hunter2-SECRET}\n", "unknown field"),
+            (
+                "    postgres: {tls: disable_insecure}\n",
+                "only for engine postgres",
+            ),
+        ] {
+            let message = err(&with(block));
+            assert!(message.contains(expected), "{expected}: {message}");
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+        let local = MY
+            .replace("host: db2.internal", "host: \"127.0.0.1\"")
+            .replace(
+                "    port: 3306\n",
+                "    port: 3306\n    mysql: {tls: disable}\n",
+            );
+        assert!(parse(&local).is_ok());
+        assert!(err(&local.replace("127.0.0.1", "localhost")).contains("mysql.tls"));
+        let socket = MY.replace(
+            "    host: db2.internal\n    port: 3306\n",
+            "    socket: /run/mysqld/mysqld.sock\n",
+        );
+        assert!(err(&socket).contains("a Unix socket has no TLS"));
+        assert!(
+            parse(&socket.replace(
+                "    socket: /run/mysqld/mysqld.sock\n",
+                "    socket: /run/mysqld/mysqld.sock\n    mysql: {tls: disable}\n",
+            ))
+            .is_ok()
+        );
+        // The block is for MySQL / MariaDB targets only.
+        let pg = BASE.replace(
+            "    port: 5432\n",
+            "    port: 5432\n    mysql: {tls: verify_full}\n",
+        );
+        assert!(err(&pg).contains("targets[0].mysql"), "{}", err(&pg));
     }
 
     #[test]
