@@ -1,0 +1,16 @@
+# Build context of agent/Dockerfile: sources, manifests and Cargo.lock only.
+target/
+**/target/
+.git
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+Dockerfile
+.dockerignore
+# Runtime state and secrets must never reach the build context (nothing here is needed to build).
+**/identity.json
+**/.state/
+**/*.token
+**/agent.yaml
+**/hmac*.key
