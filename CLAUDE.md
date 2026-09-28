@@ -3,8 +3,8 @@
 @CONTEXT.md
 @AGENTS.md
 
-## Spécifique à Claude Code
-- Sous-agents du projet : `.claude/agents/` (`console-engineer`, `agent-engineer`, `security-reviewer`, `docs-keeper`). Déléguer selon la colonne « Propriétaire » de la ROADMAP.
-- Pour paralléliser : un worktree par tâche, un sous-agent par worktree. Ne jamais lancer deux sous-agents sur le même dossier propriétaire.
-- Toute tâche qui touche `shared/protocol/`, l'uplink, le masquage ou l'authentification se termine par une revue `security-reviewer`.
-- Si une demande contredit un invariant ou un ADR, le signaler et proposer un ADR au lieu de l'implémenter.
+## Claude Code specifics
+- Project subagents: `.claude/agents/` (`console-engineer`, `agent-engineer`, `security-reviewer`, `docs-keeper`). Delegate according to the ROADMAP's "Owner" column.
+- To parallelize: one worktree per task, one subagent per worktree. Never run two subagents on the same owner directory.
+- Any task that touches `shared/protocol/`, the uplink, masking or authentication ends with a `security-reviewer` review.
+- If a request contradicts an invariant or an ADR, flag it and propose an ADR instead of implementing it.

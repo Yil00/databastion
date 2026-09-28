@@ -2,7 +2,7 @@
   "name": "databastion",
   "version": "0.0.0",
   "private": true,
-  "description": "Outillage de release du dépôt DataBastion (la console a son propre package.json dans console/).",
+  "description": "Release tooling for the DataBastion repository (the console has its own package.json in console/).",
   "license": "Apache-2.0",
   "scripts": {
     "release": "release-it",

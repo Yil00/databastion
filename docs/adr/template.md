@@ -1,9 +1,9 @@
-# ADR-XXXX : Titre
+# ADR-XXXX: Title
 
-- **Statut** : Proposé | Accepté | Remplacé par ADR-YYYY
-- **Date** : AAAA-MM-JJ
+- **Status**: Proposed | Accepted | Superseded by ADR-YYYY
+- **Date**: YYYY-MM-DD
 
-## Contexte
-## Décision
-## Conséquences
-## Alternatives écartées
+## Context
+## Decision
+## Consequences
+## Rejected alternatives

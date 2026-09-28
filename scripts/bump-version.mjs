@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Aligne le numéro de version de tous les composants du dépôt.
-// Appelé par release-it (hook after:bump), ou à la main : node scripts/bump-version.mjs 0.2.0
-// Les fichiers absents sont ignorés : le script fonctionne dès la phase 0.
+// Aligns the version number of every component in the repository.
+// Called by release-it (after:bump hook), or manually: node scripts/bump-version.mjs 0.2.0
+// Missing files are skipped: the script works from phase 0 onward.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 const version = process.argv[2];
 const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 if (!version || !SEMVER.test(version)) {
-  console.error(`usage: bump-version.mjs <X.Y.Z[-pre.N]> (reçu : ${version ?? "rien"})`);
+  console.error(`usage: bump-version.mjs <X.Y.Z[-pre.N]> (got: ${version ?? "nothing"})`);
   process.exit(1);
 }
 
@@ -24,7 +24,7 @@ function bumpJson(path) {
   updated.push(path);
 }
 
-// Remplace `version = "…"` uniquement dans la section [workspace.package] (ou [package]).
+// Replaces `version = "…"` only in the [workspace.package] (or [package]) section.
 function bumpCargo(path) {
   if (!existsSync(path)) return;
   const lines = readFileSync(path, "utf8").split("\n");
@@ -40,7 +40,7 @@ function bumpCargo(path) {
     return line;
   });
   if (!done) {
-    console.error(`${path} : aucune clé version dans [workspace.package] ou [package]`);
+    console.error(`${path}: no version key in [workspace.package] or [package]`);
     process.exit(1);
   }
   writeFileSync(path, out.join("\n"));
@@ -48,7 +48,7 @@ function bumpCargo(path) {
 
   const lock = path.replace(/Cargo\.toml$/, "Cargo.lock");
   if (existsSync(lock)) {
-    // Met à jour les versions des crates du workspace dans le lockfile, sans toucher aux dépendances.
+    // Updates the workspace crate versions in the lockfile without touching dependencies.
     execFileSync("cargo", ["update", "--workspace", "--offline", "--manifest-path", path], { stdio: "inherit" });
     updated.push(lock);
   }
@@ -69,4 +69,4 @@ bumpJson("console/package.json");
 bumpCargo("agent/Cargo.toml");
 bumpYamlKeys("helm/databastion/Chart.yaml", ["version", "appVersion"]);
 
-console.log(`version ${version} → ${updated.length ? updated.join(", ") : "aucun fichier"}`);
+console.log(`version ${version} → ${updated.length ? updated.join(", ") : "no files"}`);

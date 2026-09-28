@@ -30,23 +30,23 @@
         "types": [
           {
             "type": "feat",
-            "section": "✨ Fonctionnalités"
+            "section": "✨ Features"
           },
           {
             "type": "fix",
-            "section": "🐛 Corrections"
+            "section": "🐛 Bug Fixes"
           },
           {
             "type": "perf",
-            "section": "⚡️ Performances"
+            "section": "⚡️ Performance"
           },
           {
             "type": "security",
-            "section": "🔒 Sécurité"
+            "section": "🔒 Security"
           },
           {
             "type": "revert",
-            "section": "⏪️ Retours arrière"
+            "section": "⏪️ Reverts"
           },
           {
             "type": "docs",
@@ -70,7 +70,7 @@
           },
           {
             "type": "chore",
-            "section": "🔧 Maintenance",
+            "section": "🔧 Chores",
             "hidden": true
           }
         ]

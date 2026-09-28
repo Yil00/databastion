@@ -1,82 +1,81 @@
-# AGENTS.md – règles pour les agents de code
+# AGENTS.md – rules for coding agents
 
-Ce fichier s'adresse à tout agent de code (Claude Code, Codex, Cursor…) et aux humains qui les pilotent. Le contexte métier est dans [CONTEXT.md](CONTEXT.md).
+This file is for every coding agent (Claude Code, Codex, Cursor…) and the humans who drive them. The domain context is in [CONTEXT.md](CONTEXT.md).
 
-## Avant chaque tâche
-1. Lire [CONTEXT.md](CONTEXT.md), en particulier les **invariants I1 à I7**.
-2. Repérer la tâche dans [docs/ROADMAP.md](docs/ROADMAP.md) (identifiant `Px-Y`) et la passer en `[~]`.
-3. Lire les ADR liés. **Ne jamais contourner un ADR accepté** : s'il bloque, s'arrêter et proposer un nouvel ADR ([docs/adr/template.md](docs/adr/template.md)).
+## Before each task
+1. Read [CONTEXT.md](CONTEXT.md), especially the **invariants I1 to I7**.
+2. Find the task in [docs/ROADMAP.md](docs/ROADMAP.md) (identifier `Px-Y`) and set it to `[~]`.
+3. Read the related ADRs. **Never work around an accepted ADR**: if it blocks you, stop and propose a new ADR ([docs/adr/template.md](docs/adr/template.md)).
 
-## Langues
-- Documentation : **français**
-- Code, identifiants, commentaires, messages de commit, noms de branches : **anglais**
+## Languages
+- Everything in the repository is in **English**: documentation, code, identifiers, comments, commit messages, branch names
 
-## Arborescence et propriétaires
-| Chemin | Contenu | Propriétaire principal |
+## Tree and owners
+| Path | Content | Main owner |
 |--------|---------|------------------------|
 | `console/` | Next.js (web + worker), Drizzle, pg-boss | `console-engineer` |
-| `agent/` | Workspace Cargo (core, classifiers, connecteurs) | `agent-engineer` |
-| `shared/protocol/` | OpenAPI + JSON Schemas + fixtures | `agent-engineer`, revue `security-reviewer` **obligatoire** |
-| `dev/` | Environnement de dev, bases seedées, vérité terrain | `agent-engineer` |
-| `deploy/` | Compose, plus tard Helm | `console-engineer` |
-| `docs/`, `*.md` racine | Documentation, ROADMAP, ADR | `docs-keeper` |
+| `agent/` | Cargo workspace (core, classifiers, connectors) | `agent-engineer` |
+| `shared/protocol/` | OpenAPI + JSON Schemas + fixtures | `agent-engineer`, `security-reviewer` review **required** |
+| `dev/` | Dev environment, seeded databases, ground truth | `agent-engineer` |
+| `deploy/` | Compose, Helm later | `console-engineer` |
+| `docs/`, root `*.md` | Documentation, ROADMAP, ADRs | `docs-keeper` |
 
-Un agent ne modifie **pas** les fichiers d'un autre propriétaire, sauf si la tâche le demande explicitement. S'il en a besoin, il le signale dans son compte rendu.
+An agent does **not** modify files belonging to another owner, unless the task explicitly requires it. If it needs to, it says so in its task report.
 
 ## Conventions – Console (`console/`)
-- TypeScript `strict`, pas de `any` non justifié
-- Next.js App Router ; le code serveur de l'API agent est dans `console/src/app/api/agent/v1/`
-- Toute entrée de l'API agent est validée contre le schéma généré depuis `shared/protocol/` (rejet si champ inconnu)
-- Migrations Drizzle versionnées ; jamais de modification manuelle du schéma
-- pnpm ; commandes (à compléter dès qu'elles existent) : `pnpm lint`, `pnpm test`, `pnpm build`
+- TypeScript `strict`, no unjustified `any`
+- Next.js App Router; the agent API server code lives in `console/src/app/api/agent/v1/`
+- Every agent API input is validated against the schema generated from `shared/protocol/` (rejected on unknown fields)
+- Versioned Drizzle migrations; never modify the schema by hand
+- pnpm; commands (to be filled in as soon as they exist): `pnpm lint`, `pnpm test`, `pnpm build`
 
 ## Conventions – Agent (`agent/`)
-- Rust stable, `#![forbid(unsafe_code)]` dans toutes les crates
-- `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` doivent passer
-- rustls uniquement (pas d'OpenSSL)
-- Chaque requête vers une base cible : `statement_timeout` / équivalent, et bornes sur l'échantillonnage
-- Toute donnée qui sort d'un connecteur passe par `classifiers::masking` **avant** d'atteindre l'uplink. Pas d'accès direct à l'uplink depuis un connecteur.
-- Pas de `println!` : `tracing` avec des logs JSON structurés ; **jamais** de valeur échantillonnée dans les logs
+- Stable Rust, `#![forbid(unsafe_code)]` in every crate
+- `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` must pass
+- rustls only (no OpenSSL)
+- Every query against a target database: `statement_timeout` / equivalent, and bounds on sampling
+- All data leaving a connector goes through `classifiers::masking` **before** reaching the uplink. No direct uplink access from a connector.
+- No `println!`: `tracing` with structured JSON logs; **never** any sampled value in the logs
 
-## Protocole (`shared/protocol/`)
-- Seule source de vérité agent ↔ console
-- Changement compatible (ajout de champ optionnel) : PR normale + revue `security-reviewer`
-- Changement incompatible : nouvel ADR + nouvelle version (`/api/agent/v2`)
-- Les types TS et Rust sont **générés**, jamais édités à la main
+## Protocol (`shared/protocol/`)
+- Single source of truth between agent ↔ console
+- Compatible change (adding an optional field): regular PR + `security-reviewer` review
+- Incompatible change: new ADR + new version (`/api/agent/v2`)
+- TS and Rust types are **generated**, never edited by hand
 
-## Commandes utiles (racine)
-- `python3 scripts/check-md-links.py` : liens internes de la documentation
-- `node scripts/bump-version.mjs <X.Y.Z>` : aligne les versions (normalement appelé par la CI de release, pas à la main)
-- `pre-commit install --hook-type pre-commit --hook-type commit-msg` : hooks gitleaks + format des commits
+## Useful commands (root)
+- `python3 scripts/check-md-links.py`: internal documentation links
+- `node scripts/bump-version.mjs <X.Y.Z>`: aligns versions (normally called by the release CI, not by hand)
+- `pre-commit install --hook-type pre-commit --hook-type commit-msg`: gitleaks + commit format hooks
 
-## Tests exigés
-- Classifieurs : cas positifs / négatifs + tests de propriété sur le masquage
-- Connecteurs : tests d'intégration contre `dev/` (conteneurs)
-- Console : tests de l'API agent avec les fixtures de `shared/protocol/fixtures/`
-- **Test d'invariant I2** (dès la phase 2) : aucune valeur de `dev/ground-truth.json` en clair dans la base de la console
+## Required tests
+- Classifiers: positive / negative cases + property tests on masking
+- Connectors: integration tests against `dev/` (containers)
+- Console: agent API tests with the fixtures from `shared/protocol/fixtures/`
+- **Invariant I2 test** (from phase 2): no value from `dev/ground-truth.json` in clear text in the console database
 
-## Travail multi-agents
-- **Une tâche = une branche = un worktree** (`git worktree`), créée depuis `dev`, nommée `<type>/<id-roadmap>-<slug>` (ex. `feat/p2-b-pg-discovery`). Les PR visent `dev`.
-- Des tâches en parallèle ne touchent pas les mêmes dossiers. Le découpage de la ROADMAP en chantiers est pensé pour ça.
-- Point de synchronisation unique : `shared/protocol/`. Le contrat est figé **avant** que console et agent l'implémentent en parallèle.
-- **Compte rendu de fin de tâche** (dans la description de PR) :
-  1. Ce qui a été fait (tâches ROADMAP cochées)
-  2. Ce qui n'a pas été fait, et pourquoi
-  3. Décisions prises qui mériteraient un ADR
-  4. Fichiers d'autres propriétaires qu'il faudrait modifier
-- Le `docs-keeper` met à jour `docs/ROADMAP.md` et `CONTEXT.md` (phase courante) après chaque merge.
+## Multi-agent work
+- **One task = one branch = one worktree** (`git worktree`), created from `dev`, named `<type>/<roadmap-id>-<slug>` (e.g. `feat/p2-b-pg-discovery`). PRs target `dev`.
+- Parallel tasks do not touch the same directories. The ROADMAP's split into workstreams is designed for this.
+- Single synchronization point: `shared/protocol/`. The contract is frozen **before** console and agent implement it in parallel.
+- **Task report** (in the PR description):
+  1. What was done (ROADMAP tasks checked off)
+  2. What was not done, and why
+  3. Decisions made that would warrant an ADR
+  4. Files from other owners that should be modified
+- The `docs-keeper` updates `docs/ROADMAP.md` and `CONTEXT.md` (current phase) after each merge.
 
-## Définition de « terminé »
-- [ ] Lint + tests verts pour le composant touché
-- [ ] Invariants I1–I7 respectés (le dire explicitement dans la PR si la tâche touche au réseau, aux données ou au protocole)
-- [ ] Documentation mise à jour si le comportement visible change
-- [ ] ROADMAP mise à jour
+## Definition of Done
+- [ ] Lint + tests green for the affected component
+- [ ] Invariants I1–I7 respected (state it explicitly in the PR if the task touches the network, data or the protocol)
+- [ ] Documentation updated if visible behavior changes
+- [ ] ROADMAP updated
 
 ## Git
-- Branches, tags et releases : [RELEASE.md](RELEASE.md). Ne jamais committer sur `main` ni sur `dev` directement ; ne jamais poser de tag de release.
-- Conventional Commits : `feat(agent): …`, `fix(console): …`, `docs(adr): …`
-- Commits signés DCO (`git commit -s`)
-- **Aucune attribution d'outil IA** dans les commits ou les PR : pas de trailer `Co-Authored-By` d'un assistant, pas de mention « Generated with … ». Seule l'identité git du mainteneur ou du contributeur apparaît.
-- Ne pas éditer `CHANGELOG.md` à la main (généré à la release), sauf la section « Non publié »
-- Ne jamais committer de secret, de dump de base, ni de fichier de `dev/.state/`
-- Ne jamais pousser ni ouvrir de PR sans demande explicite du mainteneur
+- Branches, tags and releases: [RELEASE.md](RELEASE.md). Never commit directly to `main` or `dev`; never create a release tag.
+- Conventional Commits: `feat(agent): …`, `fix(console): …`, `docs(adr): …`
+- DCO-signed commits (`git commit -s`)
+- **No AI tool attribution** in commits or PRs: no assistant `Co-Authored-By` trailer, no "Generated with …" mention. Only the git identity of the maintainer or contributor appears.
+- Do not edit `CHANGELOG.md` by hand (generated at release), except for the "Unreleased" section
+- Never commit secrets, database dumps, or files from `dev/.state/`
+- Never push or open a PR without an explicit request from the maintainer

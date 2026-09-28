@@ -1,4 +1,4 @@
-# Les écosystèmes console (npm/pnpm) et agent (cargo) seront ajoutés quand ces dossiers existeront.
+# The console (npm/pnpm) and agent (cargo) ecosystems will be added once those folders exist.
 version: 2
 updates:
   - package-ecosystem: github-actions

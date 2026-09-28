@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vérifie que les liens relatifs des fichiers Markdown pointent vers des fichiers existants."""
+"""Checks that relative links in Markdown files point to existing files."""
 
 import os
 import re
@@ -25,6 +25,6 @@ for root, dirs, files in os.walk("."):
                         broken.append(f"{path}:{lineno}: {target}")
 
 for b in broken:
-    print(f"lien cassé : {b}")
-print(f"{len(broken)} lien(s) cassé(s)")
+    print(f"broken link: {b}")
+print(f"{len(broken)} broken link(s)")
 sys.exit(1 if broken else 0)
