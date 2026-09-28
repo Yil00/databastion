@@ -7,7 +7,7 @@ Inspired by how [Portabase](https://github.com/Portabase/portabase) works: `main
 | Branch | Role | Protected | Branches from | Merges into |
 |---------|------|----------|---------|------------|
 | `main` | Released code. Each merge = one release | Yes: PR required, green `CI result` check, no direct push or force-push (only the admin bypasses, for the release commit) | — | — |
-| `dev` | Integration of the next version | Yes: PR required, green `CI result` check, no force-push | `main` | `main` (release PR) |
+| `dev` | Integration of the next version | Yes: PR required, green `CI result` check, no force-push, no deletion — **no bypass, not even for admins** | `main` | `main` (release PR) |
 | `feat/<id>-<slug>` | New feature | No | `dev` | `dev` |
 | `fix/<id>-<slug>` | Bug fix | No | `dev` | `dev` |
 | `docs/…`, `chore/…`, `ci/…`, `refactor/…`, `perf/…`, `test/…` | According to the Conventional Commits type | No | `dev` | `dev` |
@@ -16,7 +16,8 @@ Inspired by how [Portabase](https://github.com/Portabase/portabase) works: `main
 
 - `<id>` = lowercase ROADMAP identifier when there is one: `feat/p2-b-pg-discovery`.
 - Work branches are deleted after merge.
-- Merge strategy: **squash** into `dev` (one Conventional commit per PR, the PR title becomes the message); **merge commit** from `dev` into `main` (keeps the release history).
+- Merge strategy: **squash** for work branches into `dev` (one Conventional commit per PR, the PR title becomes the message); **merge commit** from `dev` into `main` (keeps the release history) and for the `main` → `dev` back-merge.
+- `dev` is never deleted: the "delete branch on merge" setting cannot remove it because its ruleset has no bypass.
 
 ## 2. Versions
 
@@ -86,7 +87,7 @@ cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
    - creates a **draft GitHub release**,
    - builds and publishes the images ([publish.yml](.github/workflows/publish.yml)).
 5. The maintainer reviews the draft, adds upgrade notes if needed, and **publishes** the release.
-6. Merge `main` into `dev` to bring back the version commit.
+6. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
 
 To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase. **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
 
@@ -101,7 +102,7 @@ Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-al
 ### Hotfix
 1. `hotfix/<slug>` from `main`, PR to `main` with a `fix:` commit.
 2. The merge publishes `X.Y.(Z+1)`.
-3. Merge `main` into `dev`.
+3. Back-merge `main` into `dev` through a PR (merge commit), as for a regular release.
 
 ### Security fix
 Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advisory), released as a hotfix, security advisory published at the same time as the release.
