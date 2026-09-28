@@ -5,8 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use databastion_classifiers::names::{
-    NormalizedName, conforms, normalize_ldap_attribute, normalize_ldap_dn, normalize_path,
-    violates_numeric_rule,
+    MAX_INDEX_DIGITS, NormalizedName, conforms, longest_digit_run, normalize_ldap_attribute,
+    normalize_ldap_dn, normalize_path, violates_numeric_rule,
 };
 
 /// xorshift64*: reproducible, dependency-free.
@@ -114,6 +114,10 @@ fn check(input: &str, name: &NormalizedName) {
         "{input:?} -> {s:?} violates `not`"
     );
     assert!(conforms(s));
+    assert!(
+        longest_digit_run(s) <= MAX_INDEX_DIGITS,
+        "{input:?} -> {s:?} keeps more than 6 consecutive digits"
+    );
     for seg in numeric_segments(input) {
         assert!(!s.contains(&seg), "{input:?} -> {s:?} leaks {seg:?}");
     }

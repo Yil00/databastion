@@ -48,7 +48,8 @@ binary: `cargo build --no-default-features --features postgres`.
 
 ### Results path: normalization, sanitization, spool (ADR-0009)
 - Names: `classifiers::names` is the only producer of `NormalizedName`
-  (array indices → `[]`, value-like segments such as long digit runs, UUIDs,
+  (array indices of up to 6 digits → `[]`; value-like segments such as any
+  segment with more than 6 digits (dates, phone or customer numbers), UUIDs,
   e-mail addresses → `*`, LDAP entry DN → parent container, attribute types
   lowercased, anything non-conforming → `*`). A `FindingLocation` is built
   only from `NormalizedName`s. Property tests

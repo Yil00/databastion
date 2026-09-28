@@ -28,9 +28,11 @@ const WILDCARD: &str = "*";
 pub const MAX_IDENTIFIER_CHARS: usize = 256;
 /// Largest input examined; longer names are replaced by `*` outright.
 const MAX_INPUT_BYTES: usize = 4096;
-/// Array indices up to this many digits become `[]`; longer digit runs are
-/// treated as values.
-const MAX_INDEX_DIGITS: usize = 6;
+/// Array indices up to this many digits become `[]`. A segment with more
+/// digits than this (consecutive or in total) is treated as a value: dates
+/// (`19800101`), local phone numbers (`61234567`), customer numbers
+/// (`cust_12345678`). Stricter than the contract `not` rule (9).
+pub const MAX_INDEX_DIGITS: usize = 6;
 /// LDAP RDN types allowed in a container DN (contract `Identifier`).
 const CONTAINER_TYPES: [&str; 6] = ["ou", "dc", "o", "c", "l", "st"];
 
@@ -53,7 +55,7 @@ impl NormalizedName {
     }
 
     fn checked(candidate: String) -> Self {
-        if conforms(&candidate) {
+        if conforms(&candidate) && longest_digit_run(&candidate) <= MAX_INDEX_DIGITS {
             Self(candidate)
         } else {
             Self::wildcard()
@@ -144,6 +146,17 @@ pub fn conforms(name: &str) -> bool {
     })
 }
 
+/// Longest run of consecutive ASCII digits.
+#[must_use]
+pub fn longest_digit_run(s: &str) -> usize {
+    let (mut best, mut run) = (0, 0);
+    for c in s.chars() {
+        run = if c.is_ascii_digit() { run + 1 } else { 0 };
+        best = best.max(run);
+    }
+    best
+}
+
 /// Whether a path segment looks like a value rather than a name.
 ///
 /// Structural rules only; P2-A adds classifier matches here.
@@ -155,8 +168,9 @@ pub fn segment_looks_like_value(segment: &str) -> bool {
     if is_numeric_run(segment, false) {
         return true;
     }
-    // Long digit content, even mixed with letters (account numbers, IDs).
-    if segment.chars().filter(char::is_ascii_digit).count() >= 9 {
+    // Digit content beyond an array index, consecutive or mixed with
+    // letters / separators (dates, phone and account numbers, IDs).
+    if segment.chars().filter(char::is_ascii_digit).count() > MAX_INDEX_DIGITS {
         return true;
     }
     // UUIDs, ObjectIds, hashes: long hexadecimal keys.
@@ -289,6 +303,19 @@ mod tests {
         );
         assert_eq!(normalize_ldap_dn("uid=a,cn=b").as_str(), "*");
         assert_eq!(normalize_ldap_dn("ou=123456789,dc=x").as_str(), "ou=*,dc=x");
+        // Review H1: 7-8 digit values.
+        for (raw, want) in [
+            ("users.19800101.dob", "users.*.dob"),
+            ("by_phone.61234567", "by_phone.*"),
+            ("12345678", "*"),
+            ("cust_12345678", "*"),
+            ("orders.1234567.email", "orders.*.email"),
+            ("orders.123456.email", "orders[].email"),
+        ] {
+            assert_eq!(normalize_path(raw).as_str(), want, "{raw}");
+        }
+        assert_eq!(normalize_ldap_dn("ou=19800101,dc=x").as_str(), "ou=*,dc=x");
+        assert_eq!(normalize_ldap_dn("uid=a,ou=c12345678").as_str(), "ou=*");
     }
 
     #[test]
@@ -307,7 +334,9 @@ mod tests {
         assert!(!conforms("jane@example.com"));
         assert!(!conforms("12345678901"));
         assert!(!conforms("a.123 456 789.b"));
+        // The contract allows 8 digits; the normalizer does not.
         assert!(conforms("a.12345678.b"));
+        assert_eq!(normalize_path("a.12345678.b").as_str(), "a.*.b");
         assert!(!conforms(&"a".repeat(257)));
     }
 }
