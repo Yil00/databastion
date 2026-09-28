@@ -34,7 +34,14 @@ import {
 
 import { ipBucket } from "@/server/request";
 
-import { cheapFailuresPerIp, expireVerifiedCacheForTests, failuresPerAgent, failuresPerIp } from "./auth";
+import {
+  cheapFailuresPerIp,
+  clearKnownGoodHintsForTests,
+  exemptionLookupStats,
+  expireVerifiedCacheForTests,
+  failuresPerAgent,
+  failuresPerIp,
+} from "./auth";
 import {
   enrollPerIp,
   handleEnroll,
@@ -492,6 +499,37 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(argon2Stats.started).toBe(before + 1);
       // The exemption does not change the limits of the IP.
       expect(failuresPerIp.check(key).limited).toBe(true);
+    });
+
+    it("N4: exemption lookups are counted, and skipped once the IP is over the cheap limit", async () => {
+      const known = await enroll("n4-known");
+      expect((await hb(known)).status).toBe(200);
+      const key = ipBucket(IP);
+      for (let i = 0; i < failuresPerIp.limit; i++) failuresPerIp.hit(key);
+      for (let i = 0; i < cheapFailuresPerIp.limit - 1; i++) cheapFailuresPerIp.hit(key);
+      const junk = { agentId: randomUUID(), secret: known.secret };
+      // Limited, no cache, no hint: one row read, charged to the cheap per-IP counter.
+      let lookups = exemptionLookupStats.lookups;
+      expect((await hb(junk)).status).toBe(429);
+      expect(exemptionLookupStats.lookups).toBe(lookups + 1);
+      expect(cheapFailuresPerIp.check(key).limited).toBe(true);
+      // Over the cheap limit: no row read at all.
+      lookups = exemptionLookupStats.lookups;
+      for (let i = 0; i < 5; i++) expect((await hb(junk)).status).toBe(429);
+      expect(exemptionLookupStats.lookups).toBe(lookups);
+      // The known-good agent still passes: the in-memory hint needs no row read (M1 preserved).
+      expireVerifiedCacheForTests();
+      expect((await hb(known)).status).toBe(200);
+      expect(exemptionLookupStats.lookups).toBe(lookups);
+      // Documented limit: right after a restart (no hint yet) and while the IP is over the cheap
+      // limit, the known-good agent waits for the window like the others.
+      expireVerifiedCacheForTests();
+      clearKnownGoodHintsForTests();
+      expect((await hb(known)).status).toBe(429);
+      // Below the cheap limit, the row read restores the exemption.
+      cheapFailuresPerIp.clear();
+      expect((await hb(known)).status).toBe(200);
+      expect(exemptionLookupStats.lookups).toBe(lookups + 1);
     });
 
     it("only argon2id-backed failures count toward the per-IP failure limit", async () => {

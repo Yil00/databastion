@@ -122,6 +122,8 @@ export function expireVerifiedCacheForTests(): void {
 
 export function purgeSecretCache(agentId?: string): void {
   verified.delete(agentId);
+  if (agentId === undefined) knownGoodHints.clear();
+  else knownGoodHints.delete(agentId);
 }
 
 /**
@@ -183,9 +185,10 @@ async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: str
     safeEqual(row.knownGoodFingerprint, fingerprint);
   if (fresh) return;
   try {
-    await getDb()
+    const knownGoodAt = new Date();
+    const updated = await getDb()
       .update(agents)
-      .set({ knownGoodFingerprint: fingerprint, knownGoodAt: new Date() })
+      .set({ knownGoodFingerprint: fingerprint, knownGoodAt })
       .where(
         and(
           eq(agents.id, row.id),
@@ -193,7 +196,10 @@ async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: str
           isNull(agents.revokedAt),
           isNull(agents.lockedAt),
         ),
-      );
+      )
+      .returning({ id: agents.id });
+    // N4: the in-memory hint follows the row at once (the next request may be a flood's victim).
+    if (updated.length > 0) rememberHint({ ...row, knownGoodFingerprint: fingerprint, knownGoodAt }, row.id);
   } catch (err) {
     // Best effort: the request is authenticated; only the lock-out exemption is not refreshed.
     logger.warn({ error: errorSummary(err), agentId: row.id }, "known-good fingerprint not persisted");
@@ -259,8 +265,47 @@ export interface AuthOptions {
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
 
-const loadAgent = async (agentId: string) =>
-  (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+/**
+ * In-memory copy of the known-good fields of recently read agent rows (P1-D N4). Only a HINT used by
+ * `authPrecheck` to exempt a known-good secret from the failure limits without a database read (the
+ * row is read on every request anyway, so it stays fresh); it never authenticates, and
+ * `authenticateAgent` re-checks everything on the fresh row. Bounded like the verified cache.
+ */
+type KnownGoodHint = Pick<
+  AgentRow,
+  "knownGoodFingerprint" | "knownGoodAt" | "knownGoodPendingFingerprint" | "pendingSecretHash"
+> & { currentSecretHash: string };
+const knownGoodHints = new Map<string, KnownGoodHint>();
+
+function rememberHint(agent: AgentRow | undefined, agentId: string): void {
+  knownGoodHints.delete(agentId);
+  if (!active(agent) || (agent.knownGoodFingerprint === null && agent.knownGoodPendingFingerprint === null)) return;
+  if (knownGoodHints.size >= MAX_CACHE_ENTRIES) {
+    const oldest = knownGoodHints.keys().next();
+    if (!oldest.done) knownGoodHints.delete(oldest.value);
+  }
+  knownGoodHints.set(agentId, {
+    knownGoodFingerprint: agent.knownGoodFingerprint,
+    knownGoodAt: agent.knownGoodAt,
+    knownGoodPendingFingerprint: agent.knownGoodPendingFingerprint,
+    pendingSecretHash: agent.pendingSecretHash,
+    currentSecretHash: agent.currentSecretHash,
+  });
+}
+
+/** Test hook: simulates a restarted process (no known-good hints in memory). */
+export function clearKnownGoodHintsForTests(): void {
+  knownGoodHints.clear();
+}
+
+/** Database reads made only to decide a failure-limit exemption (test / metrics counter, N4). */
+export const exemptionLookupStats = { lookups: 0 };
+
+const loadAgent = async (agentId: string) => {
+  const agent = (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+  rememberHint(agent, agentId);
+  return agent;
+};
 
 const active = (a: AgentRow | undefined): a is AgentRow & { currentSecretHash: string } =>
   !!a && !!a.currentSecretHash && a.revokedAt === null && a.lockedAt === null;
@@ -373,15 +418,27 @@ export function countTimedOutBody(ipKey: string | null): void {
   if (ipKey) cheapFailuresPerIp.hit(ipKey);
 }
 
+const knownGoodFor = (row: KnownGoodHint, secret: string) =>
+  isKnownGood(row, secret, row.currentSecretHash) || isKnownGoodPending(row, secret);
+
 /**
- * Whether the presented secret is exempt from the failure limits (M1, L2): verified less than 25 s
- * ago (cache, checked first: no database read), or known good for the current or pending hash.
- * Never authenticates: `authenticateAgent` still runs the hash-bound cache or a full verification.
+ * Whether the presented secret is exempt from the failure limits (M1, L2), checked in this order:
+ * verified less than 25 s ago (cache), known good per the in-memory hint (no database read), then
+ * known good per the agent row. N4: that database read is skipped when the source IP is over the
+ * cheap per-IP limit, and a read that does not end in an exemption is charged to it, so it cannot
+ * be used for uncounted database reads. Never authenticates: `authenticateAgent` still runs the
+ * hash-bound cache or a full verification.
  */
-async function exemptFromLimits(agentId: string, secret: string): Promise<boolean> {
+async function exemptFromLimits(agentId: string, secret: string, ipKey: string | null): Promise<boolean> {
   if (verified.holds(agentId, secret)) return true;
+  const hint = knownGoodHints.get(agentId);
+  if (hint && knownGoodFor(hint, secret)) return true;
+  if (ipKey && cheapFailuresPerIp.check(ipKey).limited) return false;
+  exemptionLookupStats.lookups++;
   const agent = await loadAgent(agentId);
-  return active(agent) && (isKnownGood(agent, secret, agent.currentSecretHash) || isKnownGoodPending(agent, secret));
+  const exempt = active(agent) && knownGoodFor(agent, secret);
+  if (!exempt && ipKey) cheapFailuresPerIp.hit(ipKey);
+  return exempt;
 }
 
 /**
@@ -401,7 +458,7 @@ export async function authPrecheck(req: Request): Promise<Precheck> {
   const key = agentKey(agentId, limits.ipKey);
   if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(limits);
   const limited = argon2PathLimited(limits.ipKey, key);
-  if (limited && !(await exemptFromLimits(agentId, secret))) return { ok: false, response: limited };
+  if (limited && !(await exemptFromLimits(agentId, secret, limits.ipKey))) return { ok: false, response: limited };
   return { ok: true, agentId, secret, ipKey: limits.ipKey, key };
 }
 
