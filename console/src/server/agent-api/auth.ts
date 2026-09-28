@@ -11,6 +11,7 @@ import {
   safeEqual,
   sha256Hex,
 } from "@/server/crypto";
+import { errorSummary, logger } from "@/lib/logger";
 import { writeAudit } from "@/server/audit";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket } from "@/server/request";
@@ -33,7 +34,8 @@ import { jobHub, REVOKED_CHANNEL } from "./job-hub";
  *   purged explicitly on revocation.
  * - A longer-lived "last verified secret" fingerprint (SHA-256, bound to the stored hash) is used
  *   ONLY to exempt the legitimate secret from the per-agent failure limit, never to authenticate:
- *   the secret still goes through the cache or a full argon2id verification.
+ *   the secret still goes through the cache or a full argon2id verification. It is persisted in the
+ *   agent row (P1-D), so a console restart does not expose the agent to a lock-out flood.
  */
 
 export type AgentRow = typeof agents.$inferSelect;
@@ -87,17 +89,68 @@ class BoundCache {
 
 /** Authenticates (< 30 s). */
 const verified = new BoundCache(CACHE_TTL_MS);
-/** Never authenticates: only exempts the legitimate secret from the per-agent failure limit. */
-const knownGood = new BoundCache(KNOWN_GOOD_TTL_MS);
 
-/** Test hook: simulates the expiry of the short verified-secret cache (the known-good set stays). */
+/** Test hook: simulates the expiry of the short verified-secret cache (known-good fingerprints stay). */
 export function expireVerifiedCacheForTests(): void {
   verified.delete();
 }
 
 export function purgeSecretCache(agentId?: string): void {
   verified.delete(agentId);
-  knownGood.delete(agentId);
+}
+
+/**
+ * "Known good" fingerprint (persisted in `agents.known_good_fingerprint`, P1-D). Never
+ * authenticates: it only exempts the last verified secret from the per-agent failure limit (and
+ * routes it to the reserved argon2id pool). Stored at rest, so it is:
+ * - domain-separated (no other console value is a SHA-256 over this input);
+ * - bound to the stored argon2id hash (a promotion, a lock or a revocation invalidates it);
+ * - computed over a 256-bit CSPRNG secret (`AgentSecret`, low-entropy values rejected): no
+ *   practical preimage, so it reveals nothing usable about the secret.
+ */
+export function knownGoodFingerprint(secret: string, storedHash: string): string {
+  return sha256Hex(`databastion.agent-known-good.v1\0${storedHash}\0${secret}`);
+}
+
+/** Refresh the persisted confirmation time at most this often (one write per agent per hour). */
+export const KNOWN_GOOD_REFRESH_MS = 60 * 60 * 1000;
+
+export function isKnownGood(
+  row: Pick<AgentRow, "knownGoodFingerprint" | "knownGoodAt">,
+  secret: string,
+  storedHash: string,
+  now = Date.now(),
+): boolean {
+  if (row.knownGoodFingerprint === null || row.knownGoodAt === null) return false;
+  if (now - row.knownGoodAt.getTime() >= KNOWN_GOOD_TTL_MS) return false;
+  return safeEqual(row.knownGoodFingerprint, knownGoodFingerprint(secret, storedHash));
+}
+
+/** Persists the fingerprint after a full verification (conditional on the hash still current). */
+async function rememberKnownGood(row: AgentRow, secret: string, matchedHash: string): Promise<void> {
+  const fingerprint = knownGoodFingerprint(secret, matchedHash);
+  const fresh =
+    row.knownGoodFingerprint !== null &&
+    row.knownGoodAt !== null &&
+    Date.now() - row.knownGoodAt.getTime() < KNOWN_GOOD_REFRESH_MS &&
+    safeEqual(row.knownGoodFingerprint, fingerprint);
+  if (fresh) return;
+  try {
+    await getDb()
+      .update(agents)
+      .set({ knownGoodFingerprint: fingerprint, knownGoodAt: new Date() })
+      .where(
+        and(
+          eq(agents.id, row.id),
+          eq(agents.currentSecretHash, matchedHash),
+          isNull(agents.revokedAt),
+          isNull(agents.lockedAt),
+        ),
+      );
+  } catch (err) {
+    // Best effort: the request is authenticated; only the lock-out exemption is not refreshed.
+    logger.warn({ error: errorSummary(err), agentId: row.id }, "known-good fingerprint not persisted");
+  }
 }
 
 /** Agent ids with an unrecognized-secret verification in flight (bounded by the pool size). */
@@ -185,6 +238,8 @@ export async function promotePending(
         currentSecretHash: pendingHash,
         previousSecretHash: currentHash,
         pendingSecretHash: null,
+        knownGoodFingerprint: null,
+        knownGoodAt: null,
         // L1: every rotation instant uses the console (Node) clock, like the window checks.
         promotedAt: promotedAt === "now" ? new Date() : promotedAt,
         // L4: the deadline of this rotation, answered to late S0 + S1 retries (ADR-0011).
@@ -265,7 +320,7 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   }
 
   // Expensive path. Everything up to argon2Verify is synchronous: reservations cannot race.
-  const exempt = knownGood.matches(agentId, secret, storedHash);
+  const exempt = isKnownGood(agent, secret, storedHash);
   const refundIp = ipKey ? failuresPerIp.reserve(ipKey) : () => undefined;
   const refundAgent = exempt ? () => undefined : failuresPerAgent.reserve(key);
   if (!refundIp || !refundAgent) {
@@ -344,6 +399,6 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   refundIp();
   refundAgent();
   verified.remember(agentId, secret, matchedHash);
-  knownGood.remember(agentId, secret, matchedHash);
+  await rememberKnownGood(fresh, secret, matchedHash);
   return { ok: true, agent: fresh, via: slot, matchedHash };
 }

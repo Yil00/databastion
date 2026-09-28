@@ -118,6 +118,15 @@ export const agents = pgTable(
      * deadline answered to a late `S0 + S1` retry, even after a newer rotation started (ADR-0011).
      */
     promotedGraceExpiresAt: tsz("promoted_grace_expires_at"),
+    /**
+     * "Known good" fingerprint of the last verified secret (P1-D): hex SHA-256 over a domain tag,
+     * the current hash and the 256-bit secret (see `knownGoodFingerprint`). Never authenticates:
+     * it only exempts that secret from the per-agent failure limit, across console restarts.
+     * Bound to the current hash, cleared on promotion, lock and revocation.
+     */
+    knownGoodFingerprint: text("known_good_fingerprint"),
+    /** When `known_good_fingerprint` was last confirmed by a full verification (24 h TTL). */
+    knownGoodAt: tsz("known_good_at"),
     lockedAt: tsz("locked_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),

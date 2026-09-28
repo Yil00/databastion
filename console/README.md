@@ -275,14 +275,15 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Data | Storage |
 |------|---------|
 | User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
+| Agent "known good" fingerprint (`agents.known_good_fingerprint`, `known_good_at`) | SHA-256 over a domain tag, the current argon2id hash and the 256-bit agent secret; never authenticates, only exempts the last verified secret from the per-agent failure limit (24 h, survives restarts); cleared on promotion, lock and revocation |
 | Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Masked samples (P2-D), webhook / SMTP settings (later) | AES-256-GCM with `DATABASTION_ENCRYPTION_KEY`, introduced with the first such column |
 
-Rate limiters, the argon2 concurrency cap and the verified-secret cache are in-memory, per
-process: the MVP runs one web process. Several web replicas would need a shared store for the
+Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are in-memory, per
+process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the
 limiters (the secret cache is already safe across processes, as it is bound to the stored hash).
 
 ## Layout

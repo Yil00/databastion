@@ -60,6 +60,8 @@ async function expectLocked(agentId: string): Promise<void> {
   expect(a?.currentSecretHash).toBeNull();
   expect(a?.pendingSecretHash).toBeNull();
   expect(a?.previousSecretHash).toBeNull();
+  expect(a?.knownGoodFingerprint).toBeNull();
+  expect(a?.knownGoodAt).toBeNull();
   const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, agentId));
   expect(events).toHaveLength(1);
   expect(events[0]?.kind).toBe("agent.rotation_conflict");
@@ -497,6 +499,19 @@ describe.skipIf(!hasDb)("POST /rotate (ADR-0008, ADR-0010)", () => {
       await expectNotLocked(s0.agentId);
       // The current secret was verified before: known good, exempt from the per-agent limit.
       expect((await heartbeat(s1)).status).toBe(200);
+    });
+
+    it("the persisted known-good fingerprint follows the promotion (S0's one is dropped)", async () => {
+      const s0 = await enroll();
+      expect((await heartbeat(s0)).status).toBe(200);
+      const before = (await row(s0.agentId))?.knownGoodFingerprint;
+      expect(before).toMatch(/^[0-9a-f]{64}$/);
+      const s1 = { agentId: s0.agentId, secret: newAgentSecret() };
+      expect((await rotate(s0, { new_secret: s1.secret })).status).toBe(200);
+      expect((await heartbeat(s1)).status).toBe(200); // promotion by first use
+      const after = await row(s0.agentId);
+      expect(after?.knownGoodFingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(after?.knownGoodFingerprint).not.toBe(before);
     });
 
     it("a /rotate duplicate with S0 gives its attempt back (inside and after the window)", async () => {

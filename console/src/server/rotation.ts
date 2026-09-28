@@ -60,6 +60,8 @@ export async function lockAgentForConflict(
         previousSecretHash: null,
         graceExpiresAt: null,
         promotedGraceExpiresAt: null,
+        knownGoodFingerprint: null,
+        knownGoodAt: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.lockedAt), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
