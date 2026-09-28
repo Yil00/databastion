@@ -20,9 +20,9 @@
 //! | IBAN, card, NIR (checksums) | `matched ≥ 1` and at least half of the checksum-shaped candidates are valid; card: not under an order / tracking / IMEI / SIRET name | `0.6 + 0.35·ratio (+0.05 hint)` |
 //! | AWS key id, secret key in context, password hash | `matched ≥ 1` | idem |
 //! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
-//! | phone | hint and `matched ≥ 1`, or `ratio ≥ 0.1`, or `matched ≥ 10` | `0.4 + 0.4·ratio (+0.2 hint)` |
+//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07`), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it) | `0.4 + 0.4·ratio (+0.2 hint)` |
 //! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
-//! | person name | hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 50 % with a known given name, surname or surname ending (60 % when the values are single words), 30 % with a listed one, 3 distinct | idem |
+//! | person name | hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
 //! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
 //! | AWS secret key (whole value) | secret-key hint and `≥ 0.5`; no hint: `≥ 0.8` and 3 values, and under a token / session / digest name 30 % with `/` or `+` | `0.6 + 0.35·ratio` |
 //! | password hash (raw hex / base64 digest) | password hint and `≥ 0.5` | idem |
@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::detect;
 use crate::hints::NameHints;
 use crate::id::ClassifierId;
+use crate::lexicon;
 use crate::masking::{
     FindingLocation, Fingerprint, HmacKey, MaskedFinding, MaskedSample, PhoneRegion, RawSample,
     mask_as,
@@ -60,10 +61,13 @@ pub const MAX_MASKED_SAMPLES: usize = 5;
 /// Most fingerprints per finding (contract `fingerprints.maxItems`).
 pub const MAX_FINGERPRINTS: usize = 50;
 
-/// Phone: share of values without a name hint.
-const PHONE_MIN_RATIO: f64 = 0.1;
-/// Phone: values without a name hint, whatever the share.
-const PHONE_MIN_MATCHED: u32 = 10;
+/// Phone without a name hint: share of values holding a normal or strong
+/// phone token (compact digits do not count).
+const PHONE_MIN_RATIO: f64 = 0.3;
+/// Phone without a name hint, in text: values with a strong token (`+`,
+/// parentheses, a phone label), and their share.
+const PHONE_STRONG_MIN_MATCHED: u32 = 3;
+const PHONE_STRONG_MIN_RATIO: f64 = 0.05;
 /// E-mail and labelled dates in text: share of values without a hint.
 const EMBEDDED_MIN_RATIO: f64 = 0.05;
 /// Tokens found in text: values whatever the share.
@@ -126,6 +130,13 @@ struct Stats<'v> {
     n: u32,
     card_cand: u32,
     iban_cand: u32,
+    /// Values with a strong phone token, and with a normal one at best.
+    phone_strong: u32,
+    phone_normal: u32,
+    /// Values that are a whole compact national number, and among them
+    /// those with a mobile prefix (`06`, `07`).
+    phone_compact: u32,
+    phone_compact_mobile: u32,
     nir_cand: u32,
     /// Up to 2 distinct e-mail tokens (borrowed for the call).
     emails: Vec<&'v str>,
@@ -141,8 +152,8 @@ struct Stats<'v> {
     dates: Vec<(u32, detect::TimeOfDay, u32)>,
     names_known: u32,
     names_listed: u32,
-    /// Name-shaped values of a single word.
-    names_single: u32,
+    /// Name-shaped values that name a well-known place or brand.
+    names_entities: u32,
     /// Up to 3 distinct name values (borrowed for the call).
     names: Vec<&'v str>,
     addr_strong: u32,
@@ -303,6 +314,11 @@ impl ColumnClassifier<'_> {
             st.card_cand += u32::from(cand.card);
             st.iban_cand += u32::from(cand.iban);
             st.nir_cand += u32::from(cand.nir);
+            match cand.phone {
+                Some(detect::PhoneStrength::Strong) => st.phone_strong += 1,
+                Some(detect::PhoneStrength::Normal) => st.phone_normal += 1,
+                _ => {}
+            }
             let mut hit = [false; ClassifierId::ALL.len()];
             let (mut aws, mut hash, mut labelled) = (false, false, false);
             for t in &tokens {
@@ -321,6 +337,15 @@ impl ColumnClassifier<'_> {
                     _ => {}
                 }
                 self.record(&ctx, &mut acc, &mut hit, t.classifier, token);
+            }
+            if cand.phone == Some(detect::PhoneStrength::Weak)
+                && let [t] = tokens.as_slice()
+                && t.classifier == ClassifierId::Phone
+                && value[t.range.clone()] == *value.trim()
+            {
+                st.phone_compact += 1;
+                let v = value.trim();
+                st.phone_compact_mobile += u32::from(v.starts_with("06") || v.starts_with("07"));
             }
             st.aws_tokens += u32::from(aws);
             st.hash_tokens += u32::from(hash);
@@ -355,7 +380,7 @@ impl ColumnClassifier<'_> {
             {
                 st.names_known += u32::from(e.known());
                 st.names_listed += u32::from(e.given || e.surname);
-                st.names_single += u32::from(e.words == 1);
+                st.names_entities += u32::from(lexicon::is_entity(value));
                 remember(&mut st.names, value.trim(), 3);
                 self.record(&ctx, &mut acc, &mut hit, ClassifierId::PersonName, value);
             }
@@ -459,7 +484,15 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> b
             !constant && (hint || ratio >= EMBEDDED_MIN_RATIO || matched >= EMBEDDED_MIN_MATCHED)
         }
         ClassifierId::Phone => {
-            (hint && hints.gates(c)) || ratio >= PHONE_MIN_RATIO || matched >= PHONE_MIN_MATCHED
+            (hint && hints.gates(c))
+                || share(st.phone_strong + st.phone_normal) >= PHONE_MIN_RATIO
+                || (st.phone_strong >= PHONE_STRONG_MIN_MATCHED
+                    && share(st.phone_strong) >= PHONE_STRONG_MIN_RATIO)
+                // A column of compact mobile numbers (zero-padded
+                // identifiers do not cluster on `06` / `07`).
+                || (share(st.phone_compact) >= 0.8
+                    && st.phone_compact >= 3
+                    && st.phone_compact_mobile * 10 >= st.phone_compact * 6)
         }
         ClassifierId::AwsKey => {
             let whole = share(st.aws_whole);
@@ -477,12 +510,12 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats<'_>, hints: &NameHints) -> b
             } else if hints.gates(c) {
                 ratio >= 0.7 && share(st.names_known) >= 0.25
             } else {
-                // Single words (`Austin`, `Madison`) are also places and
-                // brands: they need more known names.
-                let single = st.names_single * 5 >= matched * 4;
+                // Places and brands named after people (`Austin`, `Lincoln`,
+                // `Hugo Boss`) make a column of places or brands.
                 ratio >= 0.7
-                    && share(st.names_known) >= if single { 0.6 } else { 0.5 }
-                    && share(st.names_listed) >= 0.3
+                    && share(st.names_entities) < 0.2
+                    && share(st.names_known) >= 0.4
+                    && share(st.names_listed) >= 0.25
                     && st.names.len() >= 3
             }
         }

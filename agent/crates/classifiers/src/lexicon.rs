@@ -42,13 +42,18 @@ fn set(words: &'static [&'static str]) -> HashSet<&'static str> {
 }
 
 static GIVEN: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    set(GIVEN_NAMES)
-        .union(&set(GIVEN_NAMES_MORE))
-        .copied()
+    [GIVEN_NAMES, GIVEN_NAMES_MORE, GIVEN_NAMES_WORLD]
+        .iter()
+        .flat_map(|l| l.iter().copied())
         .collect()
 });
-static FAMILY: LazyLock<HashSet<&'static str>> =
-    LazyLock::new(|| set(SURNAMES).union(&set(SURNAMES_MORE)).copied().collect());
+static FAMILY: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [SURNAMES, SURNAMES_MORE, SURNAMES_WORLD]
+        .iter()
+        .flat_map(|l| l.iter().copied())
+        .collect()
+});
+static ENTITY: LazyLock<HashSet<&'static str>> = LazyLock::new(|| set(ENTITIES));
 static NOT_NAME: LazyLock<HashSet<&'static str>> = LazyLock::new(|| set(NOT_NAME_WORDS));
 
 /// Whether a folded word is a common given name.
@@ -69,6 +74,19 @@ pub(crate) fn has_surname_suffix(folded: &str) -> bool {
         && SURNAME_SUFFIXES
             .iter()
             .any(|s| folded.len() > s.len() + 1 && folded.ends_with(s))
+}
+
+/// Whether a whole value names a well-known place or brand (`Austin`,
+/// `New York`, `Hugo Boss`): case, accents, hyphens and repeated spaces
+/// ignored.
+pub(crate) fn is_entity(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || v.len() > 64 {
+        return false;
+    }
+    let folded = fold(v).replace(['-', '.'], " ");
+    let joined = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    ENTITY.contains(joined.as_str())
 }
 
 /// Whether a folded word rules a value out as a person name (company
@@ -805,6 +823,319 @@ const SURNAMES_MORE: &[&str] = &[
     "woodard", "wyatt", "yates", "zamora", "ziegler", "zimmerman",
 ];
 
+/// Given names of more cultures (PL, CZ, HU, TR, Arabic, IN, CN, JP, KR,
+/// VN, West / East African, Nordic, FI, GR, RU / UA, PT / BR, ES, IT),
+/// folded.
+#[rustfmt::skip]
+const GIVEN_NAMES_WORLD: &[&str] = &[
+    "aadhya", "aanya", "aarav", "abdelkader", "abderrahmane", "abdoulaye", "abdullah", "abena",
+    "adaeze", "ade", "aditya", "adrian", "adwoa", "afonso", "agnes", "agnieszka", "ahmad", "ahmet",
+    "aicha", "aisha", "akane", "akira", "akosua", "alberto", "alejandro", "alena", "alessandro",
+    "alexander", "alexey", "ali", "alice", "alicja", "alina", "aline", "ama", "amaka", "amel",
+    "amina", "aminata", "amit", "amparo", "ana", "ananya", "anas", "anastasia", "anders", "andrea",
+    "andrey", "andriy", "andrzej", "angel", "angelo", "anh", "anika", "aniko", "anil", "anjali",
+    "anna", "anne", "antonio", "antti", "aoi", "arjun", "arne", "artem", "arturo", "arun", "ashok",
+    "astrid", "attila", "awa", "axel", "ayaka", "ayman", "ayse", "babatunde", "balazs", "barbara",
+    "bartlomiej", "bassam", "beata", "beatriz", "bence", "bernardo", "birgitta", "bjorn", "bo",
+    "bogdan", "bohdan", "boubacar", "bruna", "bruno", "bukola", "burak", "busra", "camila",
+    "camilla", "carlo", "carlos", "carolina", "chaima", "chao", "cheikh", "chiamaka", "chinedu",
+    "christos", "chukwuemeka", "claudio", "concepcion", "csaba", "daiki", "daniele", "danuta",
+    "daria", "dariusz", "davide", "deepika", "derya", "dimitra", "dimitris", "dinesh", "diogo",
+    "divya", "diya", "djamel", "dmitry", "dolores", "domenico", "dominik", "dora", "dorota",
+    "dounia", "doyun", "duarte", "duc", "ebba", "ebru", "eduardo", "efua", "egor", "ekaterina",
+    "elena", "eleni", "elias", "elif", "ella", "elsa", "elzbieta", "emeka", "emil", "emilia",
+    "emine", "emre", "enrique", "erik", "ernesto", "erzsebet", "esra", "eszter", "eunji", "eva",
+    "ewa", "fabrizio", "fadi", "fang", "farid", "fatima", "fatma", "fatou", "federico", "femi",
+    "ferenc", "fernanda", "fernando", "folake", "francesco", "francisca", "francisco", "franco",
+    "frantisek", "frederik", "freja", "funmilayo", "gabor", "gabriel", "gabriela", "gabriele",
+    "ganesh", "geeta", "gianni", "giorgos", "giovanni", "giuseppe", "goncalo", "grazyna",
+    "grzegorz", "guadalupe", "gulsen", "gustav", "hafida", "hajar", "halil", "halima", "halina",
+    "halyna", "hana", "hanh", "hanna", "hanne", "hao", "haruka", "haruto", "hasan", "hatice",
+    "hauwa", "hayoon", "hector", "henning", "henrik", "henryk", "hicham", "hilde", "hina", "hinata",
+    "hiroshi", "hisham", "hoa", "hong", "houria", "hua", "hubert", "hugo", "hui", "hulya", "hung",
+    "huong", "huseyin", "huy", "hyejin", "hyun", "ibrahim", "ibrahima", "ichiro", "ida", "igor",
+    "ikechukwu", "ikram", "ilias", "ilona", "ines", "ingrid", "irena", "irina", "iryna", "ishaan",
+    "ismail", "istvan", "ivan", "iwona", "jamal", "jan", "jana", "janos", "jari", "jaroslav",
+    "javier", "jens", "jerzy", "jesus", "jie", "jiho", "jihun", "jimin", "jing", "jiri", "jisoo",
+    "jitka", "jiwoo", "joanna", "joao", "johan", "jolanta", "jonas", "jorge", "jose", "josef",
+    "jozsef", "juan", "juha", "jukka", "juliana", "jun", "justyna", "kadiatou", "kaito", "kamel",
+    "karel", "kari", "karim", "karima", "karin", "karl", "karolina", "kasper", "katalin",
+    "katarzyna", "katerina", "kavya", "kazimierz", "kazuki", "keiko", "kemal", "kenji", "khadija",
+    "khaled", "khoa", "kinga", "kiran", "kirill", "klara", "knut", "kofi", "kojo", "kostas",
+    "krishna", "kristian", "kristina", "krisztina", "krystyna", "krzysztof", "ksenia", "kunle",
+    "kwabena", "kwame", "lakshmi", "lan", "larissa", "lars", "laszlo", "latifa", "laura", "lei",
+    "lene", "lenka", "leonardo", "leonor", "leticia", "li", "liam", "lin", "lina", "ling", "linh",
+    "linnea", "lorenzo", "luana", "lucas", "lucie", "luigi", "luis", "lukas", "lukasz", "madalena",
+    "mads", "magnus", "mahesh", "mahmoud", "mahmut", "mai", "maja", "malgorzata", "malika",
+    "mamadou", "manoj", "manuel", "marcello", "marek", "margareta", "margarida", "maria", "mariama",
+    "mariana", "marie", "mario", "marit", "mariusz", "marta", "martim", "martin", "martyna",
+    "massimo", "mathias", "matilde", "matteo", "matti", "maurizio", "maxim", "meera", "mehdi",
+    "mehmet", "mei", "meriem", "merve", "mette", "michaela", "michal", "michele", "miguel", "mika",
+    "mikael", "mikhail", "milan", "ming", "minh", "minji", "minjun", "minna", "mio", "miroslav",
+    "misaki", "miyu", "modou", "mohammed", "mourad", "moussa", "muhammad", "murat", "mustafa",
+    "mykola", "myra", "na", "nabil", "nabila", "naima", "nam", "nanami", "naoki", "naoko", "nassim",
+    "natalia", "nataliya", "naveen", "navya", "nawal", "neha", "ngoc", "ngozi", "niels", "nikita",
+    "nikos", "nils", "nisha", "nnamdi", "noah", "nora", "nordine", "obinna", "oksana", "ole",
+    "oleg", "oleksandr", "oleksiy", "olena", "olga", "olof", "olumide", "oluwaseun", "omer",
+    "ondrej", "oskar", "osman", "oumou", "ousmane", "ozlem", "pablo", "paivi", "panagiotis",
+    "paolo", "pari", "patricia", "patrycja", "paulina", "pavel", "pawel", "pedro", "pekka", "peng",
+    "pernille", "peter", "petr", "petra", "phuc", "phuong", "pietro", "piotr", "polina", "pooja",
+    "poul", "pradeep", "prakash", "priscila", "priya", "przemyslaw", "qiang", "qing", "quang",
+    "rachid", "rachida", "radek", "radha", "rafael", "rafal", "rahul", "rajesh", "ramazan",
+    "ramesh", "rami", "rasmus", "raul", "recep", "redouane", "reka", "rekha", "renata", "reyansh",
+    "ricardo", "riccardo", "riikka", "riku", "rim", "rin", "roberto", "rocio", "rodrigo", "rohan",
+    "roman", "rosario", "ryota", "ryszard", "saanvi", "saga", "sai", "saida", "sakura", "salih",
+    "salma", "salvatore", "samer", "samia", "sandor", "sanjay", "santiago", "sari", "sarra",
+    "satoshi", "segun", "seojun", "seoyeon", "seoyun", "sergey", "sergio", "serkan", "seydou",
+    "shaurya", "shota", "shreya", "sibel", "silje", "simone", "sindre", "siwoo", "slawomir",
+    "sneha", "sofia", "sofiane", "soledad", "sooyoung", "soren", "sota", "souad", "soufiane",
+    "stefano", "suleyman", "sunil", "sunita", "suresh", "susanne", "sven", "svetlana", "svitlana",
+    "swati", "szymon", "tadeusz", "takeshi", "takumi", "tamas", "tao", "taras", "tarek", "taro",
+    "tatiana", "teresa", "tetyana", "thanh", "thao", "thomas", "thu", "tiago", "tiina", "timea",
+    "timo", "tomas", "tomasz", "tommaso", "tomoko", "tor", "trang", "trung", "tuan", "tugba",
+    "tunde", "urszula", "vaclav", "vanessa", "vasilis", "vasyl", "veronika", "vihaan", "vijay",
+    "vikram", "ville", "vincenzo", "vinh", "vivaan", "vladimir", "vojtech", "volkan", "walid",
+    "wei", "weronika", "wiam", "wieslaw", "wiktor", "wiktoria", "william", "wilma", "wojciech",
+    "xia", "xin", "xiu", "yacine", "yan", "yang", "yannis", "yasmina", "yaw", "yetunde", "ying",
+    "yoko", "younes", "yu", "yui", "yuki", "yulia", "yun", "yuna", "yuri", "yuriy", "yusuf", "yuto",
+    "zainab", "zakaria", "zbigniew", "zdenek", "zeynep", "ziad", "zofia", "zoltan", "zsolt",
+    "zsuzsanna",
+    "cem", "selin", "deniz", "oguz", "gokhan", "yasemin", "aysegul", "ozan", "eren", "kaan", "berk", "ece", "irem", "cansu", "gizem", "pinar", "sevgi", "tolga", "serdar", "onur", "baris", "cagla", "seda", "melike", "hakan", "umut", "sinan", "tugce", "didem", "ipek", "harsha", "nandini", "siddharth", "karthik", "meenakshi", "vikas", "nikhil", "shruti", "pallavi", "aishwarya", "daichi", "shun", "kaede", "sho", "yuka", "natsuki", "kazuya", "takahiro", "ayumi", "yaa", "babajide", "olamide", "chidi", "uche", "chioma", "nkechi", "ifeoma", "eskil", "leif", "solveig", "torben", "hakon", "liv", "sigurd", "halvard", "ragnhild", "tove",
+];
+
+/// Surnames of more cultures (same families), folded.
+#[rustfmt::skip]
+const SURNAMES_WORLD: &[&str] = &[
+    "abbas", "abe", "abramov", "acar", "acheampong", "adamczyk", "adamski", "adebayo", "adeyemi",
+    "afanasiev", "afolabi", "agyeman", "ahn", "ahonen", "ahuja", "akimov", "aktas", "alaoui",
+    "aleksandrov", "alekseev", "alexiou", "ali", "almeida", "alves", "amrani", "amundsen",
+    "andersen", "andersson", "ando", "andrade", "andreassen", "andreev", "andresen", "andrzejewski",
+    "anisimov", "ansah", "antal", "antonopoulou", "antonov", "antunes", "aoki", "appiah", "arai",
+    "araujo", "arkhipov", "arora", "arslan", "arvidsson", "asante", "aslan", "athanasiou", "avci",
+    "axelsson", "aydin", "azevedo", "aziz", "ba", "babatunde", "babic", "bae", "baek", "bah", "bak",
+    "bakke", "bakken", "balazs", "balde", "balog", "balogh", "balogun", "banerjee", "baran",
+    "baranov", "baranowski", "barbosa", "barros", "barry", "bartos", "batista", "belkacem", "belov",
+    "belyaev", "benali", "benes", "bengtsson", "benjelloun", "benmoussa", "bennani", "benyahia",
+    "berg", "berge", "berglund", "bergman", "bergqvist", "bergstrom", "berrada", "bhatia",
+    "bhattacharya", "biro", "biryukov", "bjork", "blazek", "blazevic", "blomqvist", "boateng",
+    "bogdan", "bogdanov", "bondar", "bondarenko", "borisov", "borkowski", "boros", "bose",
+    "bouazza", "boudiaf", "bouzid", "boyko", "bozkurt", "brzezinski", "bui", "bulut", "bykov",
+    "cai", "cakir", "camara", "campos", "cao", "cardoso", "carvalho", "castro", "cavalcanti",
+    "celik", "cermak", "cerny", "cetin", "cha", "chakraborty", "chan", "chatterjee", "chauhan",
+    "chen", "cheng", "cherif", "chernov", "chernyshev", "cheung", "chiba", "chmielewski", "cho",
+    "choi", "chopra", "chow", "chraibi", "christensen", "christodoulou", "cieslak", "ciobanu",
+    "cisse", "claesson", "coelho", "constantin", "conte", "correia", "costa", "coulibaly",
+    "cristea", "cruz", "cunha", "czarnecki", "czerwinski", "dabrowski", "dahl", "dang",
+    "danielsson", "danilov", "darko", "darwish", "das", "davydov", "dembele", "demir", "deng",
+    "denisov", "desai", "diallo", "dias", "dieng", "dimitriou", "ding", "dinh", "dinu", "diop",
+    "djordjevic", "dmitriev", "do", "doan", "dogan", "dolezal", "dong", "doumbia", "dragomir", "du",
+    "dubey", "dudek", "dumitru", "duong", "dutta", "dvorak", "efimov", "efremov", "egorov", "eide",
+    "eklund", "elamin", "elidrissi", "emelyanov", "endo", "engstrom", "erdogan", "eriksen",
+    "eriksson", "ermakov", "evensen", "eze", "fall", "farias", "farkas", "farouk", "fassi", "faye",
+    "fazekas", "fedorov", "fedotov", "feher", "fekete", "feng", "fernandes", "ferreira", "fiala",
+    "figueiredo", "filatov", "filippov", "florea", "fodor", "fomin", "fonseca", "forsberg",
+    "fransson", "fredriksen", "fredriksson", "freitas", "frolov", "fu", "fujii", "fujimoto",
+    "fujita", "fujiwara", "fukuda", "fung", "gajewski", "gal", "gao", "gavrilov", "georgiou",
+    "gerasimov", "gheorghe", "ghosh", "giannopoulos", "glowacki", "golubev", "gomes", "goncalves",
+    "goncharov", "gorbunov", "gorski", "goto", "grabowski", "grachev", "grgic", "grigoriev",
+    "grishin", "gromov", "grover", "gueye", "gul", "guler", "gulyas", "gundersen", "gunes",
+    "gunnarsson", "guo", "gupta", "gusev", "gustafsson", "ha", "haddad", "hagen", "hajek",
+    "hakansson", "halvorsen", "hamalainen", "hamdan", "hamidi", "han", "hansen", "hansson", "hara",
+    "harada", "hasegawa", "hashimoto", "hassan", "hauge", "haugen", "hayashi", "he", "heikkila",
+    "heikkinen", "heinonen", "henriksen", "henriksson", "heo", "hirano", "ho", "hoang", "holm",
+    "holmberg", "holub", "hong", "horak", "horvat", "horvath", "hu", "huang", "hussein", "huynh",
+    "hwang", "ibrahim", "ikeda", "ilic", "ilyin", "imai", "inoue", "ioannou", "ionescu", "isaev",
+    "isaksson", "ishida", "ishii", "ishikawa", "isik", "ito", "ivanov", "iversen", "iwasaki",
+    "iyengar", "iyer", "jablonski", "jacobsen", "jakab", "jakobsen", "jakobsson", "jakubowski",
+    "jang", "jankowski", "jansson", "jarvinen", "jasinski", "jaworski", "jelinek", "jensen", "jeon",
+    "jesus", "jiang", "jin", "johannessen", "johansen", "johansson", "johnsen", "jokinen",
+    "jonsson", "joo", "jorgensen", "joshi", "jovanovic", "juhasz", "jung", "juric", "kaczmarek",
+    "kadlec", "kalinin", "kalinowski", "kamau", "kaminski", "kaneko", "kang", "kante", "kaplan",
+    "kapoor", "kara", "karagiannis", "karim", "kariuki", "karjalainen", "karlsen", "karlsson",
+    "karpov", "kato", "katona", "kaya", "kazakov", "kazmierczak", "keita", "kelemen", "keskin",
+    "kettani", "khalil", "khanna", "khoury", "kikuchi", "kilic", "kim", "kimura", "kinnunen",
+    "kinoshita", "kiraly", "kirillov", "kis", "kiselev", "kiselyov", "klimov", "knezevic",
+    "knudsen", "knutsen", "ko", "kobayashi", "koc", "kocsis", "kojima", "kolar", "kolesnikov",
+    "kolesov", "kolodziej", "komarov", "konate", "kondo", "kondratiev", "kone", "konecny",
+    "konovalov", "konstantinou", "koo", "kopecky", "korhonen", "korkmaz", "korolev", "koskinen",
+    "kotov", "kovacevic", "kovacic", "kovacs", "kovalchuk", "kovalenko", "kovalev", "kovalyov",
+    "kovar", "kowalczyk", "kowalski", "kozlov", "kozlowski", "krajewski", "kral", "kravchenko",
+    "krawczyk", "krishnan", "kristensen", "kristiansen", "kristoffersen", "kriz", "krol", "krylov",
+    "kubiak", "kubo", "kucera", "kucharski", "kudo", "kudryavtsev", "kulikov", "kumar", "kurt",
+    "kuzmin", "kuznetsov", "kwak", "kwiatkowski", "kwok", "kwon", "lahlou", "lahtinen", "laine",
+    "laitinen", "lakatos", "lam", "larsen", "larsson", "laskowski", "laszlo", "lau", "lazar",
+    "lazarev", "le", "lebedev", "lee", "lehtinen", "lehtonen", "leonov", "leung", "lewandowski",
+    "li", "liang", "lien", "lim", "lima", "lin", "lind", "lindberg", "lindgren", "lindqvist",
+    "lindstrom", "lis", "liu", "lofgren", "lopes", "lourenco", "lu", "lui", "lukacs", "lukin",
+    "lund", "lundberg", "lunde", "lundgren", "lundin", "lundqvist", "luo", "luu", "ly", "lysenko",
+    "ma", "machado", "maciejewski", "maeda", "magnusson", "magyar", "mai", "majewski", "mak",
+    "makarov", "makela", "makinen", "makowski", "makris", "maksimov", "malhotra", "malinowski",
+    "maly", "malyshev", "mansour", "marchenko", "marciniak", "marek", "maric", "marin", "markov",
+    "markovic", "marques", "martins", "martinsen", "martynov", "maruyama", "maslov", "masuda",
+    "matei", "mathisen", "matos", "matsuda", "matsui", "matsumoto", "matsuo", "mattila", "mattsson",
+    "matveev", "mazur", "mazurek", "mbaye", "medvedev", "mehta", "melnikov", "melnyk", "melo",
+    "mendes", "menon", "mensah", "meszaros", "meziane", "michalak", "michalski", "mihai",
+    "mikhailov", "milosevic", "min", "miranda", "mironov", "mishra", "miura", "miyamoto",
+    "miyazaki", "moe", "moen", "moiseev", "moldovan", "molnar", "monteiro", "moreira", "mori",
+    "morita", "moroz", "morozov", "mostafa", "moura", "mukherjee", "munteanu", "murakami", "murata",
+    "mwangi", "na", "nagy", "naidu", "nair", "najjar", "nakagawa", "nakajima", "nakamura", "nakano",
+    "nakayama", "nam", "nascimento", "nasser", "naumov", "navratil", "nazarov", "ndiaye", "neagu",
+    "nemec", "nemeth", "neves", "ng", "ngo", "nguyen", "niang", "nielsen", "niemi", "nieminen",
+    "nikiforov", "nikitin", "nikolaev", "nikolaou", "nikolic", "nilsen", "nilsson", "nishimura",
+    "njoroge", "noguchi", "noh", "nomura", "nordstrom", "novak", "novikov", "novotny", "nowak",
+    "nowakowski", "nowicki", "nunes", "nwosu", "nyberg", "nygard", "nystrom", "obi", "ochieng",
+    "odhiambo", "ogawa", "ogunleye", "oh", "ohno", "oikonomou", "okada", "okafor", "okamoto",
+    "okeke", "okonkwo", "oladipo", "olah", "oliveira", "oliynyk", "olsen", "olsson", "olszewski",
+    "omar", "onishi", "ono", "orban", "orlov", "orsos", "osei", "osipov", "ostrowski", "ota",
+    "otieno", "otsuka", "ovchinnikov", "owusu", "ozcan", "ozdemir", "ozer", "ozkan", "ozturk",
+    "pan", "pandey", "panov", "papadakis", "papadopoulos", "papp", "pappas", "patel", "paulsen",
+    "pavlov", "pavlovic", "pawlak", "pawlowski", "pedersen", "peng", "pereira", "persson",
+    "petrenko", "petrov", "petrovic", "pettersen", "pettersson", "pham", "phan", "pietrzak",
+    "pillai", "pinter", "pinto", "piotrowski", "pires", "pokorny", "polak", "polat", "polishchuk",
+    "polyakov", "ponomarev", "pop", "popa", "popescu", "popov", "pospisil", "potapov", "prochazka",
+    "prokhorov", "przybylski", "racz", "radu", "rahman", "raman", "ramos", "rantanen", "rao",
+    "raposo", "rasmussen", "rathore", "reddy", "reis", "ren", "rezende", "ribeiro", "rocha",
+    "rodionov", "rodrigues", "romanov", "roy", "rudenko", "rumyantsev", "rusu", "rutkowski",
+    "ruzicka", "ryu", "saadi", "saarinen", "sadowski", "saha", "sahin", "said", "saito", "sakai",
+    "sakamoto", "sakurai", "saleh", "salem", "salminen", "salo", "salonen", "samuelsson",
+    "sandberg", "sandor", "sane", "sangare", "sano", "santos", "sari", "sasaki", "sato",
+    "savchenko", "savelyev", "savolainen", "sawicki", "sayed", "seck", "sedlacek", "semenov", "sen",
+    "seo", "serban", "sergeev", "sethi", "shah", "sharma", "shcherbakov", "shen", "shevchenko",
+    "shevchuk", "shibata", "shimizu", "shin", "sidibe", "sidorov", "sikora", "sikorski", "silva",
+    "simoes", "simon", "simsek", "singh", "sipos", "sjoberg", "slimani", "smirnov", "soares",
+    "sobczak", "sobolev", "soderberg", "sokolov", "sokolowski", "solberg", "solheim", "soloviev",
+    "somogyi", "son", "sorensen", "sorokin", "sousa", "souza", "sow", "stan", "stankovic",
+    "stepanek", "stepanov", "stepien", "stoica", "stojanovic", "strand", "su", "subramanian",
+    "sugawara", "sugimoto", "sugiyama", "sung", "suzuki", "svendsen", "svensson", "svoboda",
+    "sylla", "szabo", "szalai", "szczepanski", "szewczyk", "szilagyi", "szucs", "szulc",
+    "szymanski", "szymczak", "takacs", "takada", "takagi", "takahashi", "takeda", "takeuchi",
+    "taleb", "tamura", "tanaka", "tang", "taniguchi", "tarasov", "tas", "tavares", "tazi",
+    "teixeira", "thakur", "tian", "tikhonov", "timofeev", "titov", "tiwari", "tkachenko", "tkachuk",
+    "todorovic", "tomaszewski", "torok", "toth", "touati", "toure", "tran", "traore", "trinh",
+    "trofimov", "truong", "tsang", "tudor", "tuominen", "turan", "turunen", "uchida", "ueda",
+    "ueno", "unal", "urban", "urbanski", "vanek", "varga", "vasileiou", "vasiliev", "verma",
+    "vesely", "vieira", "vinogradov", "virtanen", "vlasov", "vlcek", "vo", "volkov", "vorobiev",
+    "voronin", "vu", "vukovic", "wada", "walczak", "wallin", "wang", "wanjiru", "wasilewski",
+    "watanabe", "wei", "wieczorek", "wikstrom", "wilczynski", "wilk", "wisniewski", "witkowski",
+    "wlodarczyk", "wojciechowski", "wojcik", "wong", "woo", "wozniak", "wrobel", "wroblewski", "wu",
+    "wysocki", "xiao", "xie", "xu", "yadav", "yakovlev", "yalcin", "yamada", "yamaguchi",
+    "yamamoto", "yamashita", "yamazaki", "yang", "yao", "yavuz", "ye", "yeung", "yildirim",
+    "yildiz", "yilmaz", "yokoyama", "yoo", "yoon", "yoshida", "yousef", "yu", "yuan", "zaitsev",
+    "zajac", "zakharov", "zakrzewski", "zalewski", "zawadzki", "zeman", "zeng", "zerrouki", "zhang",
+    "zhao", "zheng", "zhong", "zhou", "zhu", "zhukov", "zhuravlev", "zielinski", "ziolkowski",
+];
+
+/// Places (major cities, countries, US states, regions) and brands (car
+/// makers, fashion houses, large companies) whose names are also person
+/// names (`Austin`, `Lincoln`, `Hugo Boss`): folded whole values, words
+/// separated by single spaces. A column of such values is not a column of
+/// person names.
+#[rustfmt::skip]
+const ENTITIES: &[&str] = &[
+    "aarhus", "aberdeen", "abidjan", "abu dhabi", "abuja", "accra", "addis ababa", "adelaide",
+    "adobe", "airbnb", "airbus", "aix en provence", "ajaccio", "akron", "alabama", "alaska",
+    "albania", "alberta", "albuquerque", "aldi", "alexandria", "alfa romeo", "algeria", "algerie",
+    "algiers", "alicante", "allemagne", "almere", "alsace", "amazon", "amiens", "amman",
+    "amsterdam", "anaheim", "anchorage", "andalucia", "andalusia", "angers", "ankara", "annecy",
+    "antibes", "antwerp", "antwerpen", "apple", "aquitaine", "argenteuil", "argentina", "arizona",
+    "arkansas", "arlington", "armani", "armenia", "aston martin", "asuncion", "athens", "atlanta",
+    "auchan", "auckland", "audi", "augsburg", "aurora", "austin", "australia", "austria",
+    "autriche", "auvergne", "avignon", "azerbaijan", "baghdad", "bakersfield", "balenciaga",
+    "baltimore", "bangalore", "bangkok", "bangladesh", "barcelona", "bari", "basel", "bastia",
+    "bath", "baton rouge", "bavaria", "bayern", "beijing", "beirut", "belarus", "belfast",
+    "belgique", "belgium", "belo horizonte", "bengaluru", "bentley", "bergen", "berlin", "bern",
+    "besancon", "bielefeld", "bilbao", "birmingham", "bmw", "bochum", "boeing", "bogota", "boise",
+    "bologna", "bonn", "bordeaux", "bosch", "bosnia", "boston", "boulogne billancourt", "bourgogne",
+    "braga", "brasilia", "brazil", "breda", "bremen", "brescia", "brest", "bretagne", "brighton",
+    "brisbane", "bristol", "british columbia", "brno", "bruges", "brugge", "brussels", "bruxelles",
+    "bucharest", "bucuresti", "budapest", "buenos aires", "buffalo", "bugatti", "buick", "bulgaria",
+    "burberry", "busan", "cadillac", "caen", "cairo", "calais", "calgary", "california",
+    "calvin klein", "cambridge", "canada", "canberra", "cancun", "cannes", "cape town", "caracas",
+    "cardiff", "carrefour", "casablanca", "catalonia", "catalunya", "catania", "celine",
+    "champagne", "chandler", "chanel", "charleroi", "charleston", "charlotte", "chengdu", "chennai",
+    "chesapeake", "chester", "chevrolet", "chicago", "chile", "china", "chloe", "christchurch",
+    "christian dior", "christian louboutin", "chrysler", "chula vista", "cincinnati", "cisco",
+    "citroen", "clermont ferrand", "cleveland", "clinton", "cluj napoca", "coco chanel", "coimbra",
+    "cologne", "colombes", "colombia", "colorado", "colorado springs", "columbus", "connecticut",
+    "copenhagen", "cordoba", "cork", "corpus christi", "corse", "creteil", "croatia", "cuba",
+    "cupra", "curitiba", "cyprus", "czech republic", "czechia", "dacia", "dakar", "dallas",
+    "danone", "dayton", "debrecen", "decathlon", "delaware", "delhi", "dell", "den haag", "denmark",
+    "denver", "des moines", "detroit", "deutschland", "dhaka", "dijon", "dior", "disney", "dodge",
+    "doha", "dolce gabbana", "dortmund", "dresden", "dubai", "dublin", "duisburg", "dundee",
+    "durban", "durham", "dusseldorf", "edinburgh", "edmonton", "egypt", "eindhoven", "el paso",
+    "engie", "england", "ericsson", "espagne", "espana", "espoo", "essen", "estee lauder",
+    "estonia", "ethiopia", "faro", "fendi", "ferrari", "fes", "fiat", "finland", "firenze",
+    "florence", "florida", "ford", "fort wayne", "fort worth", "fortaleza", "france", "frankfurt",
+    "franklin", "freiburg", "fremont", "fresno", "fukuoka", "galicia", "galway", "garland",
+    "gdansk", "geneva", "geneve", "genoa", "genova", "gent", "georgia", "germany", "ghana", "ghent",
+    "gijon", "gilbert", "giorgio armani", "givenchy", "glasgow", "glendale", "google", "goteborg",
+    "gothenburg", "granada", "graz", "greece", "greensboro", "grenoble", "groningen", "guadalajara",
+    "guangzhou", "gucci", "guy laroche", "halifax", "hamburg", "hamilton", "hannover", "hanoi",
+    "hanover", "hartford", "havana", "hawaii", "heidelberg", "helsinki", "henderson", "hermes",
+    "hesse", "hessen", "hialeah", "ho chi minh city", "honda", "hong kong", "honolulu", "houston",
+    "hp", "hugo boss", "hungary", "hyderabad", "hyundai", "ibm", "iceland", "idaho", "ikea",
+    "ile de france", "illinois", "incheon", "india", "indiana", "indianapolis", "indonesia",
+    "innsbruck", "intel", "iowa", "iran", "iraq", "ireland", "irvine", "irving", "israel",
+    "istanbul", "italia", "italie", "italy", "izmir", "jackson", "jacksonville", "jaguar",
+    "jakarta", "japan", "jean paul gaultier", "jeddah", "jeep", "jersey city", "jerusalem",
+    "johannesburg", "jordan", "kansas", "kansas city", "karachi", "karlsruhe", "kazakhstan",
+    "kentucky", "kenya", "kenzo", "kharkiv", "kia", "kiev", "kinshasa", "knoxville", "kobe",
+    "kobenhavn", "kolkata", "koln", "korea", "krakow", "kuala lumpur", "kyiv", "kyoto", "la paz",
+    "la rochelle", "lacoste", "lagos", "lahore", "lamborghini", "lancia", "land rover", "las vegas",
+    "latvia", "lausanne", "le havre", "le mans", "lebanon", "leclerc", "leeds", "leicester",
+    "leipzig", "lenovo", "lexington", "lexus", "liban", "lidl", "liege", "lille", "lima",
+    "limerick", "limoges", "lincoln", "linz", "lisboa", "lisbon", "lithuania", "little rock",
+    "liverpool", "lodz", "lombardia", "lombardy", "london", "long beach", "loreal", "lorraine",
+    "los angeles", "louis vuitton", "louisiana", "louisville", "lubbock", "lucerne", "lugano",
+    "luxembourg", "lviv", "lyon", "madison", "madrid", "maine", "malaga", "malaysia", "malmo",
+    "malta", "manaus", "manchester", "manila", "manitoba", "mannheim", "marc jacobs", "maroc",
+    "marrakech", "marseille", "maryland", "maserati", "massachusetts", "mazda", "mclaren",
+    "medellin", "melbourne", "memphis", "mercedes", "mercedes benz", "mesa", "messina", "meta",
+    "metz", "mexico", "mexico city", "miami", "michael kors", "michelin", "michigan", "microsoft",
+    "milan", "milano", "milwaukee", "mini", "minneapolis", "minnesota", "minsk", "mississippi",
+    "missouri", "mitsubishi", "mobile", "modena", "monaco", "montana", "monterrey", "montevideo",
+    "montgomery", "montpellier", "montreal", "montreuil", "morocco", "moschino", "moscow",
+    "mulhouse", "mumbai", "munchen", "munich", "munster", "murcia", "nagoya", "nairobi", "namur",
+    "nancy", "nanterre", "nantes", "naples", "napoli", "nashville", "nebraska", "nederland",
+    "nestle", "netflix", "netherlands", "nevada", "new delhi", "new hampshire", "new jersey",
+    "new mexico", "new orleans", "new york", "new zealand", "newark", "newcastle", "nice",
+    "nigeria", "nijmegen", "nimes", "nissan", "nokia", "norfolk", "normandie", "north carolina",
+    "north dakota", "north las vegas", "norway", "nottingham", "nuremberg", "nurnberg", "oakland",
+    "occitanie", "odense", "odesa", "ohio", "oklahoma", "oklahoma city", "omaha", "ontario", "opel",
+    "oracle", "oran", "orange", "oregon", "orlando", "orleans", "osaka", "oslo", "ostrava",
+    "ottawa", "oxford", "padova", "padua", "pakistan", "palermo", "palma", "paris", "parma", "pau",
+    "pays bas", "pennsylvania", "perpignan", "perth", "peru", "peugeot", "philadelphia",
+    "philippines", "philips", "phoenix", "picardie", "pierre cardin", "pisa", "pittsburgh", "plano",
+    "plymouth", "poitiers", "poland", "pologne", "porsche", "portland", "porto", "porto alegre",
+    "portsmouth", "portugal", "poznan", "prada", "prague", "praha", "pretoria", "provence",
+    "providence", "pune", "qatar", "quebec", "quito", "rabat", "raleigh", "ralph lauren", "recife",
+    "reims", "renault", "rennes", "reno", "reykjavik", "rhode island", "richmond", "riga",
+    "rio de janeiro", "riverside", "riyadh", "rolls royce", "roma", "romania", "rome", "rosario",
+    "rotterdam", "roubaix", "rouen", "russia", "sachsen", "sacramento", "saint etienne",
+    "saint laurent", "saint louis", "saint paul", "saint petersburg", "salamanca", "salem",
+    "salesforce", "salt lake city", "salvador", "salvatore ferragamo", "salzburg", "samsung",
+    "san antonio", "san diego", "san francisco", "san jose", "santa ana", "santiago", "sao paulo",
+    "sapporo", "sardinia", "saudi arabia", "savannah", "savoie", "saxony", "schweiz", "scotland",
+    "scottsdale", "seat", "seattle", "senegal", "seoul", "serbia", "sevilla", "seville", "sfax",
+    "shanghai", "sheffield", "shenzhen", "sicilia", "sicily", "siemens", "siena", "singapore",
+    "skoda", "slovakia", "slovenia", "smart", "sofia", "sony", "south africa", "south carolina",
+    "south dakota", "south korea", "southampton", "spain", "spokane", "spotify", "springfield",
+    "st louis", "stockholm", "stockton", "strasbourg", "stuttgart", "subaru", "suisse", "suzuki",
+    "swansea", "sweden", "switzerland", "sydney", "syria", "szczecin", "tacoma", "taipei",
+    "tallinn", "tampa", "tampere", "tangier", "tehran", "tel aviv", "tennessee", "tesla", "texas",
+    "thailand", "the hague", "thessaloniki", "tilburg", "tokyo", "toledo", "tom ford",
+    "tommy hilfiger", "torino", "toronto", "toscana", "total", "toulon", "toulouse", "tourcoing",
+    "tours", "toyota", "trieste", "trondheim", "tucson", "tulsa", "tunis", "tunisia", "tunisie",
+    "turin", "turkey", "turku", "tuscany", "tyler", "uber", "ukraine", "united kingdom",
+    "united states", "uppsala", "usa", "utah", "utrecht", "valencia", "valentino", "valladolid",
+    "vancouver", "venezia", "venezuela", "venice", "vermont", "verona", "versace", "versailles",
+    "vienna", "vietnam", "vigo", "villeurbanne", "vilnius", "virginia", "virginia beach",
+    "vitry sur seine", "volkswagen", "volvo", "wales", "walmart", "warren", "warsaw", "warszawa",
+    "washington", "wellington", "west virginia", "wichita", "wien", "wiesbaden", "winnipeg",
+    "winston salem", "wisconsin", "wroclaw", "wuhan", "wuppertal", "wyoming", "yokohama", "york",
+    "yves saint laurent", "zara", "zaragoza", "zurich",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +1156,8 @@ mod tests {
             GIVEN_NAMES_MORE,
             SURNAMES,
             SURNAMES_MORE,
+            GIVEN_NAMES_WORLD,
+            SURNAMES_WORLD,
             NOT_NAME_WORDS,
             SURNAME_SUFFIXES,
         ] {
@@ -841,6 +1174,11 @@ mod tests {
         assert!(has_surname_suffix("gustavsson"));
         assert!(!has_surname_suffix("son"));
         assert!(is_not_name_word("gmbh"));
+        assert!(is_entity("Austin"));
+        assert!(is_entity("NEW YORK"));
+        assert!(is_entity("Saint-Étienne"));
+        assert!(is_entity("Hugo Boss"));
+        assert!(!is_entity("Jean Dupont"));
         assert_eq!(month(&fold("Févr")), Some(2));
         assert_eq!(month("mai"), Some(5));
     }

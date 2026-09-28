@@ -1462,6 +1462,210 @@ fn build() -> Vec<Case> {
         });
     }
 
+    // Name columns of one culture, one token, under opaque names. Pools
+    // include less common names on purpose.
+    const CULTURE_GIVEN: &[&[&str]] = &[
+        &[
+            "Zofia",
+            "Bartosz",
+            "Kacper",
+            "Wiktoria",
+            "Grzegorz",
+            "Aleksandra",
+            "Radosław",
+            "Małgorzata",
+            "Jakub",
+            "Dobromir",
+            "Bożena",
+            "Zbigniew",
+        ],
+        &[
+            "Mehmet",
+            "Elif",
+            "Emre",
+            "Zeynep",
+            "Burak",
+            "Ayşegül",
+            "Cem",
+            "Selin",
+            "Oğuz",
+            "Gökhan",
+            "Deniz",
+            "Yasemin",
+        ],
+        &[
+            "Arjun",
+            "Priya",
+            "Rohan",
+            "Ananya",
+            "Vikram",
+            "Deepika",
+            "Siddharth",
+            "Lakshmi",
+            "Harsha",
+            "Nandini",
+            "Karthik",
+            "Meenakshi",
+        ],
+        &[
+            "Haruto", "Yui", "Sota", "Hina", "Kenta", "Aoi", "Ren", "Misaki", "Daichi", "Sakura",
+            "Shun", "Kaede",
+        ],
+        &[
+            "Chinedu", "Ngozi", "Kwame", "Abena", "Tunde", "Folake", "Emeka", "Adaeze", "Kofi",
+            "Yaa", "Babajide", "Olamide",
+        ],
+        &[
+            "Astrid", "Magnus", "Sigrid", "Leif", "Ingrid", "Bjørn", "Solveig", "Torben", "Freja",
+            "Håkon", "Liv", "Eskil",
+        ],
+        &[
+            "João",
+            "Beatriz",
+            "Gonçalo",
+            "Inês",
+            "Rui",
+            "Leonor",
+            "Tiago",
+            "Mafalda",
+            "Duarte",
+            "Constança",
+            "Vasco",
+            "Lara",
+        ],
+        &[
+            "Youssef", "Salma", "Amine", "Imane", "Hamza", "Khadija", "Othmane", "Zineb", "Anas",
+            "Houda", "Ilyas", "Soukaina",
+        ],
+    ];
+    const CULTURE_LAST: &[&[&str]] = &[
+        &[
+            "Kowalczyk",
+            "Zieliński",
+            "Wójcik",
+            "Kamińska",
+            "Lewandowski",
+            "Szymańska",
+            "Dąbrowski",
+            "Kaczmarek",
+            "Mazur",
+            "Krawczyk",
+            "Grabowska",
+            "Pawlak",
+        ],
+        &[
+            "Yılmaz", "Kaya", "Demir", "Şahin", "Çelik", "Öztürk", "Aydın", "Arslan", "Doğan",
+            "Koç", "Kurt", "Özdemir",
+        ],
+        &[
+            "Sharma",
+            "Iyer",
+            "Reddy",
+            "Banerjee",
+            "Nair",
+            "Chatterjee",
+            "Kulkarni",
+            "Deshpande",
+            "Menon",
+            "Pillai",
+            "Venkatesan",
+            "Rao",
+        ],
+        &[
+            "Takahashi",
+            "Watanabe",
+            "Nakamura",
+            "Kobayashi",
+            "Yamaguchi",
+            "Matsumoto",
+            "Inoue",
+            "Hayashi",
+            "Shimizu",
+            "Fujiwara",
+            "Kondo",
+            "Morimoto",
+        ],
+        &[
+            "Okonkwo", "Adeyemi", "Mensah", "Boateng", "Mwangi", "Okafor", "Nwosu", "Asante",
+            "Diallo", "Traoré", "Ndiaye", "Kamara",
+        ],
+        &[
+            "Lindqvist",
+            "Johansson",
+            "Bergström",
+            "Nyström",
+            "Halvorsen",
+            "Pedersen",
+            "Sørensen",
+            "Virtanen",
+            "Korhonen",
+            "Eriksen",
+            "Holmberg",
+            "Sandvik",
+        ],
+        &[
+            "Carvalho",
+            "Ribeiro",
+            "Gonçalves",
+            "Figueiredo",
+            "Magalhães",
+            "Antunes",
+            "Loureiro",
+            "Pinheiro",
+            "Sequeira",
+            "Quintela",
+            "Mourão",
+            "Valente",
+        ],
+        &[
+            "Benali",
+            "El Amrani",
+            "Bennani",
+            "Alaoui",
+            "Tazi",
+            "Berrada",
+            "Chraibi",
+            "Haddad",
+            "Khoury",
+            "Mansour",
+            "Saleh",
+            "Belkacem",
+        ],
+    ];
+    for (k, pool) in CULTURE_GIVEN.iter().chain(CULTURE_LAST.iter()).enumerate() {
+        for upper in [false, true] {
+            let values = column(r, 90, false, |r| {
+                let v = (*r.pick(pool)).to_owned();
+                if upper { v.to_uppercase() } else { v }
+            });
+            cases.push(Case {
+                label: format!("names culture {k} upper={upper}"),
+                name: format!("col_{}", 100 + k),
+                values,
+                want: vec![C::PersonName],
+            });
+        }
+    }
+    for (i, fmt) in [(0, "particles"), (1, "compound"), (2, "upper last first")].into_iter() {
+        let values = column(r, 90, false, |r| match i {
+            0 => format!("{} {}", r.pick(FIRST), r.pick(PARTICLE_LAST)),
+            1 => format!(
+                "{}-{} {}-{}",
+                r.pick(FIRST),
+                r.pick(FIRST),
+                r.pick(LAST),
+                r.pick(LAST)
+            ),
+            _ => format!("{} {}", r.pick(LAST).to_uppercase(), r.pick(FIRST)),
+        });
+        cases.push(Case {
+            label: format!("names {fmt}"),
+            name: "f9".to_owned(),
+            values,
+            want: vec![C::PersonName],
+        });
+    }
+
     // Mixed columns: 75 % values, the rest free text placeholders.
     for (i, (want, name)) in [
         (C::BirthDate, "col_50"),
@@ -2294,6 +2498,132 @@ fn build() -> Vec<Case> {
         ),
     ] {
         negative(&mut cases, r, what, "col_70", 60, &|r| {
+            (*r.pick(pool)).to_owned()
+        });
+    }
+    // Numeric identifiers and codes that are not phones (opaque names).
+    negative(
+        &mut cases,
+        r,
+        "customer numbers compact",
+        "col_80",
+        150,
+        &|r| format!("0{}{}", r.range(1, 9), r.digits(8)),
+    );
+    negative(
+        &mut cases,
+        r,
+        "account numbers 9 digits",
+        "col_81",
+        150,
+        &|r| format!("0{}", r.digits(8)),
+    );
+    negative(
+        &mut cases,
+        r,
+        "reference numbers dashed",
+        "col_82",
+        150,
+        &|r| format!("0{}-{}-{}", r.digits(3), r.digits(3), r.digits(3)),
+    );
+    negative(
+        &mut cases,
+        r,
+        "account numbers grouped",
+        "col_83",
+        150,
+        &|r| format!("0{} {} {}", r.digits(3), r.digits(4), r.digits(2)),
+    );
+    negative(&mut cases, r, "dotted codes", "col_84", 150, &|r| {
+        format!(
+            "0{}.0{}.0{}.0{}",
+            r.digits(2),
+            r.digits(2),
+            r.digits(2),
+            r.digits(2)
+        )
+    });
+    negative(&mut cases, r, "siret spaced", "col_85", 150, &|r| {
+        format!(
+            "{} {} {} {}",
+            r.range(100, 999),
+            r.digits(3),
+            r.digits(3),
+            r.digits(5)
+        )
+    });
+    negative(&mut cases, r, "epoch milliseconds", "col_86", 150, &|r| {
+        format!("{}{}", r.range(1_500_000_000, 1_790_000_000), r.digits(3))
+    });
+    negative(&mut cases, r, "zip+4", "col_87", 150, &|r| {
+        format!("{}-{}", r.digits(5), r.digits(4))
+    });
+    negative(&mut cases, r, "padded quantities", "col_88", 150, &|r| {
+        format!("{:06}", r.range(0, 99_999))
+    });
+    negative(&mut cases, r, "codes with prefixes", "col_89", 150, &|r| {
+        format!("REF-0{}-{}", r.digits(4), r.digits(5))
+    });
+    negative(&mut cases, r, "decimal amounts", "col_90", 150, &|r| {
+        format!("0{},{:02}", r.digits(9), r.range(0, 99))
+    });
+    negative(&mut cases, r, "tracking dashed", "col_91", 150, &|r| {
+        format!("0{}-{}", r.digits(4), r.digits(6))
+    });
+    negative(&mut cases, r, "mixed ids", "col_92", 200, &|r| {
+        if r.chance(15) {
+            format!("0{}{}", r.range(1, 9), r.digits(8))
+        } else {
+            let n = r.range(4, 12) as usize;
+            r.digits(n)
+        }
+    });
+    for (what, pool) in [
+        (
+            "european cities",
+            &[
+                "Lyon", "Bordeaux", "Florence", "Porto", "Valencia", "Bruges", "Salzburg",
+                "Krakow", "Seville", "Nancy", "Annecy", "Toulouse", "Geneva", "Munich", "Bologna",
+                "Antwerp", "Gdansk", "Brno", "Dresden", "Lille",
+            ][..],
+        ),
+        (
+            "us states",
+            &[
+                "Georgia",
+                "Virginia",
+                "Carolina",
+                "Florida",
+                "Texas",
+                "Nevada",
+                "Montana",
+                "Dakota",
+                "Indiana",
+                "Kentucky",
+                "Maryland",
+                "Louisiana",
+                "Arizona",
+                "Oregon",
+                "Vermont",
+            ][..],
+        ),
+        (
+            "fashion houses",
+            &[
+                "Hugo Boss",
+                "Ralph Lauren",
+                "Calvin Klein",
+                "Christian Dior",
+                "Giorgio Armani",
+                "Tom Ford",
+                "Marc Jacobs",
+                "Michael Kors",
+                "Pierre Cardin",
+                "Jean Paul Gaultier",
+            ][..],
+        ),
+    ] {
+        negative(&mut cases, r, what, "col_71", 80, &|r| {
             (*r.pick(pool)).to_owned()
         });
     }
