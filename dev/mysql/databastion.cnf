@@ -1,0 +1,8 @@
+# MySQL Community audit prerequisites (docs/08-engine-capabilities.md): performance_schema with the
+# statement history consumers. Level reached: Partial (no audit plugin in Community edition).
+[mysqld]
+performance_schema = ON
+performance-schema-consumer-events-statements-current = ON
+performance-schema-consumer-events-statements-history = ON
+performance-schema-consumer-events-statements-history-long = ON
+performance_schema_events_statements_history_long_size = 10000

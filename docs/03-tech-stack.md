@@ -54,6 +54,9 @@ A single binary, `databastion-agent`, with connectors enabled through Cargo *fea
 - **Docker Compose** → MVP and small installations ([deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml))
 - **Helm** → phase 2
 
+## Dev environment
+`make dev` (root [Makefile](../Makefile)) starts, in Docker Compose, PostgreSQL + pgaudit, MariaDB + server_audit, MySQL, MongoDB and OpenLDAP + accesslog seeded with fake PII, plus Mailpit, Prometheus and Grafana (on port 3001, so that the console keeps 3000). Ports are bound to `127.0.0.1`. The console and the agent are not containerized in it yet and run on the host. Ports, accounts and audit settings: [dev/README.md](../dev/README.md).
+
 ## Repository structure
 ```
 databastion/
@@ -72,7 +75,7 @@ databastion/
 │   └── crates/connector-openldap/
 ├── shared/protocol/    # openapi.yaml + JSON Schemas + fixtures
 ├── deploy/             # docker-compose, later helm/
-├── dev/                # dev environment: databases seeded with fake PII (P0-C, not created yet)
+├── dev/                # dev environment: databases seeded with fake PII + ground truth
 ├── scripts/            # link check, version bump
 └── docs/
 ```
