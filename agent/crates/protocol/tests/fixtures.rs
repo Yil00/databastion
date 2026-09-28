@@ -55,6 +55,24 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "JobList.sample-rows-too-large.json",
         "maximum on an integer",
     ),
+    // Empty scan filters: `Option<Vec<_>>` keeps `[]` distinct from absent
+    // ("all"); see `empty_scan_filters_stay_distinct_from_absent`.
+    (
+        "JobList.scan-empty-classifiers.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-databases.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-include-objects.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    (
+        "JobList.scan-empty-schemas.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
     ("JobList.too-many-jobs.json", "maxItems"),
     (
         "JobStatusUpdate.failed-without-error.json",
@@ -195,4 +213,51 @@ fn invalid_fixtures_are_rejected_or_allowlisted() {
         accepted, allowlisted,
         "invalid fixtures accepted by serde differ from NOT_ENFORCED_BY_SERDE"
     );
+}
+
+/// Gate for the P2 `discovery.scan` mapping: an empty filter list must never
+/// be read as "absent = all". serde accepts `[]` (it does not enforce
+/// `minItems`), but the generated `Option<Vec<_>>` keeps it distinguishable.
+///
+/// TODO(P2): the `TryFrom<DiscoveryScanParams>` mapping into the scanner's
+/// configuration must reject `Some(vec![])` for `databases`, `schemas`,
+/// `include_objects` and `classifiers` (job reported `failed`), and this test
+/// must then also assert that rejection.
+#[test]
+fn empty_scan_filters_stay_distinct_from_absent() {
+    let invalid = fixtures_dir("invalid");
+    type Field = fn(&p::DiscoveryScanParams) -> Option<usize>;
+    let cases: [(&str, Field); 4] = [
+        ("JobList.scan-empty-classifiers.json", |s| {
+            s.classifiers.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-databases.json", |s| {
+            s.databases.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-include-objects.json", |s| {
+            s.include_objects.as_ref().map(Vec::len)
+        }),
+        ("JobList.scan-empty-schemas.json", |s| {
+            s.schemas.as_ref().map(Vec::len)
+        }),
+    ];
+    for (file, field) in cases {
+        let json = fs::read_to_string(invalid.join(file)).unwrap();
+        let list: p::JobList = serde_json::from_str(&json).unwrap();
+        let p::Job::DiscoveryScanJob(job) = &list.jobs[0] else {
+            panic!("{file}: not a discovery.scan job");
+        };
+        assert_eq!(
+            field(&job.params),
+            Some(0),
+            "{file}: [] must be Some(empty)"
+        );
+    }
+    // Absent stays `None`.
+    let absent: p::DiscoveryScanParams =
+        serde_json::from_str(r#"{"sample_rows": 200, "max_duration_s": 900}"#).unwrap();
+    assert!(absent.databases.is_none());
+    assert!(absent.schemas.is_none());
+    assert!(absent.include_objects.is_none());
+    assert!(absent.classifiers.is_none());
 }

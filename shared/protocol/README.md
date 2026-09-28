@@ -58,6 +58,17 @@ Validators must use Ajv 2020 with `ajv-formats`, `strict: true` and `strictRequi
 CI (from the repository root) runs `npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml`.
 
 ## Consumers
-- **Console**: validates every agent API input against these schemas (unknown fields rejected), and tests its agent API with `fixtures/`.
-- **Agent**: serializes only through the generated types; masked samples and fingerprints come from `classifiers::masking`; each item is validated and sanitized before spooling (see the `openapi.yaml` description).
-- TypeScript and Rust types are **generated** from `openapi.yaml`, never written by hand (ROADMAP P0-B, item 3).
+TypeScript and Rust types are **generated** from `openapi.yaml`, never written by hand (invariant I6). Each side commits its generated output, and a drift test fails when it no longer matches the contract: after any change here, run both generators and commit the result.
+
+| Side | Regenerate | Output | Drift test |
+|------|------------|--------|------------|
+| Console | `pnpm protocol:generate` (from `console/`) | `console/src/generated/protocol/types.gen.ts`, `schemas.gen.json` | `console/src/lib/protocol/generated.test.ts` (`pnpm test`) |
+| Agent | `cargo run -p databastion-protocol-codegen` (from `agent/`) | `agent/crates/protocol/src/generated.rs` | `agent/crates/protocol/tests/drift.rs` (`cargo test`) |
+
+- **Console**: validates every agent API input against these schemas with Ajv (unknown fields rejected), and tests its agent API with `fixtures/` (every valid fixture accepted, every invalid one rejected). Ajv is the **enforcement point** for keywords the Rust types cannot express. Besides the JSON Schema keywords, an `ErrorDetail.keyword` sent by the console can be one of its own:
+  - `maxBytes`: the body exceeds the schema's `x-databastion-max-bytes`;
+  - `maskRatio`: a `MaskedSample` has fewer than 50 % `*`;
+  - `falseSchema`: Ajv's `false schema` error (e.g. `JobStatusUpdate`'s `error` on a non-failed status);
+  - `invalid`: fallback when an Ajv keyword does not match the `ErrorDetail.keyword` pattern, or when no detail is available.
+- **Agent**: serializes only through the generated types; masked samples and fingerprints come from `classifiers::masking`; each item is validated and sanitized before spooling (see the `openapi.yaml` description). The Rust generator (typify) replaces a few schemas with **hand-written** types in `databastion-protocol`: credentials `AgentSecret` and `EnrollmentToken` (`src/secret.rs`: redacted `Debug`, zeroized) and `Uuid` / `UuidV7` (`src/ids.rs`: canonical lowercase, version 7 checked). The header of `generated.rs` lists the keywords removed or rewritten before generation (`if` / `then` / `else`, `not`, `const`); typify also ignores most `minItems` / `maxItems` / `maxProperties` and number bounds. The invalid fixtures serde therefore accepts are listed with a reason in `agent/crates/protocol/tests/fixtures.rs` (`NOT_ENFORCED_BY_SERDE`, exact list).
+- **Optional filter arrays** (`DiscoveryScanParams.databases`, `schemas`, `include_objects`, `classifiers`): absent means "all", so an empty list is rejected (`minItems: 1`) rather than read as "none" or "all". The Rust generator emits them as `Option<Vec<_>>` so that `[]` stays distinguishable from absent; the agent's job mapping must reject `Some([])` (P2).
