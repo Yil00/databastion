@@ -9,8 +9,9 @@
 //    fixtures/invalid/ is rejected, with the JSON Schema keyword listed in
 //    fixtures/invalid-expectations.json (so that it fails for the intended reason).
 // 3. Coverage: every request / response body schema has at least one valid and one invalid fixture.
-// 4. Classifier registry: classifiers.json conforms to classifiers.schema.json (ids sorted), and
-//    the classifier ids of the valid fixtures belong to their `classifiers_version`.
+// 4. Classifier registry: classifiers.json conforms to classifiers.schema.json (ids sorted), its
+//    published versions are unchanged (classifiers.lock.json), and the classifier ids of the valid
+//    fixtures belong to their `classifiers_version`.
 //
 // Fixture file name: `<SchemaName>.<case>.json`, where SchemaName is a key of components.schemas.
 // Usage: node scripts/validate-fixtures.mjs   (from shared/protocol/, or any directory)
@@ -18,7 +19,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
-import { fixtureRegistryProblems, registryProblems } from "./classifier-registry.mjs";
+import { fixtureRegistryProblems, lockProblems, registryProblems } from "./classifier-registry.mjs";
 import { ROOT_ID, buildAjv, root } from "./contract-ajv.mjs";
 import { lintDocument } from "./schema-lint.mjs";
 
@@ -38,6 +39,8 @@ const ajv = buildAjv(doc);
 // ----------------------------------------------------------- 2b. classifier registry
 const registry = JSON.parse(readFileSync(join(root, "classifiers.json"), "utf8"));
 for (const problem of registryProblems(ajv, registry)) fail(problem);
+const lock = JSON.parse(readFileSync(join(root, "classifiers.lock.json"), "utf8"));
+for (const problem of lockProblems(registry, lock)) fail(problem);
 
 const validatorFor = (name) => {
   if (!schemas[name]) return undefined;

@@ -43,7 +43,20 @@ describe("generator ref guard (no remote refs)", () => {
 });
 
 describe("classifier registry rendering (fails closed)", () => {
-  const patterns = { version: /^[0-9]{4}\.[0-9]{2}\.[0-9]{1,4}$/u, id: /^[a-z]+(\.[a-z0-9_]+)+$/u };
+  const patterns = {
+    version: /^[0-9]{4}\.[0-9]{2}\.[0-9]{1,4}$/u,
+    id: /^[a-z]+(\.[a-z0-9_]+)+$/u,
+    maxVersions: 64,
+    maxIds: 200,
+  };
+  const manyIds = (n: number) => Array.from({ length: n }, (_, i) => `pii.c${String(i).padStart(3, "0")}`);
+  const manyVersions = (n: number) =>
+    Object.fromEntries(Array.from({ length: n }, (_, i) => [`2026.09.${i + 1}`, ["pii.email"]]));
+
+  it("accepts the bounds exactly", () => {
+    expect(() => renderClassifierRegistry({ "2026.09.1": manyIds(200) }, patterns)).not.toThrow();
+    expect(() => renderClassifierRegistry(manyVersions(64), patterns)).not.toThrow();
+  });
 
   it("renders a const", () => {
     expect(renderClassifierRegistry({ "2026.09.1": ["pii.email"] }, patterns)).toContain(
@@ -58,6 +71,9 @@ describe("classifier registry rendering (fails closed)", () => {
     ["empty list", { "2026.09.1": [] }],
     ["bad id", { "2026.09.1": ["PII Email"] }],
     ["duplicate id", { "2026.09.1": ["pii.email", "pii.email"] }],
+    ["unsorted ids", { "2026.09.1": ["pii.phone", "pii.email"] }],
+    ["more than maxItems ids", { "2026.09.1": manyIds(201) }],
+    ["more than maxProperties versions", manyVersions(65)],
   ])("rejects %s", (_name, registry) => {
     expect(() => renderClassifierRegistry(registry, patterns)).toThrow();
   });

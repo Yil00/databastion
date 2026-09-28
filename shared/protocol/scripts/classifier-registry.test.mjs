@@ -6,11 +6,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
-import { fixtureRegistryProblems, registryProblems } from "./classifier-registry.mjs";
+import { fixtureRegistryProblems, lockProblems, registryProblems, versionHash } from "./classifier-registry.mjs";
 import { buildAjv, root } from "./contract-ajv.mjs";
 
 const ajv = buildAjv(parse(readFileSync(join(root, "openapi.yaml"), "utf8")));
 const registry = JSON.parse(readFileSync(join(root, "classifiers.json"), "utf8"));
+const lock = JSON.parse(readFileSync(join(root, "classifiers.lock.json"), "utf8"));
 const [version] = Object.keys(registry);
 
 test("classifiers.json passes", () => {
@@ -42,3 +43,29 @@ test("fixture consistency: registered ids pass, others fail", () => {
   const job = { jobs: [{ classifiers_version: version, params: { classifiers: ["pii.email", "pii.nope"] } }] };
   assert.equal(fixtureRegistryProblems(job, registry, "x").length, 1);
 });
+
+test("classifiers.lock.json pins every published version", () => {
+  assert.deepEqual(lockProblems(registry, lock), []);
+});
+
+test("version hash ignores id order", () => {
+  assert.equal(versionHash(["pii.iban", "pii.email"]), versionHash(["pii.email", "pii.iban"]));
+});
+
+const lockBreaks = {
+  "id added to a published version": () => [{ ...registry, [version]: [...registry[version], "pii.zzz"].sort() }, lock],
+  "id removed from a published version": () => [{ ...registry, [version]: registry[version].slice(1) }, lock],
+  "id renamed in a published version": () => [
+    { ...registry, [version]: registry[version].map((id, i) => (i === 0 ? "pii.renamed" : id)).sort() },
+    lock,
+  ],
+  "published version removed": () => [{ "2099.01.1": ["pii.email"] }, { ...lock, "2099.01.1": versionHash(["pii.email"]) }],
+  "new version not appended to the lock": () => [{ ...registry, "2099.01.1": ["pii.email"] }, lock],
+  "malformed lock hash": () => [registry, { ...lock, [version]: "deadbeef" }],
+};
+for (const [name, make] of Object.entries(lockBreaks)) {
+  test(`lock rejects: ${name}`, () => {
+    const [r, l] = make();
+    assert.notDeepEqual(lockProblems(r, l), []);
+  });
+}

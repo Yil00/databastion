@@ -21,6 +21,7 @@ export const OPENAPI_URL = new URL("../../../shared/protocol/openapi.yaml", impo
 export const TYPES_URL = new URL("../../src/generated/protocol/types.gen.ts", import.meta.url);
 export const SCHEMAS_URL = new URL("../../src/generated/protocol/schemas.gen.json", import.meta.url);
 export const REGISTRY_URL = new URL("../../../shared/protocol/classifiers.json", import.meta.url);
+export const REGISTRY_SCHEMA_URL = new URL("../../../shared/protocol/classifiers.schema.json", import.meta.url);
 export const CLASSIFIERS_URL = new URL("../../src/generated/protocol/classifiers.gen.ts", import.meta.url);
 
 /** Same $id as shared/protocol/scripts/contract-ajv.mjs. */
@@ -70,27 +71,40 @@ export interface Artifacts {
   classifiers: string;
 }
 
+/** Patterns (from openapi.yaml) and bounds (from classifiers.schema.json) of the registry. */
+export interface RegistryRules {
+  version: RegExp;
+  id: RegExp;
+  /** `maxProperties`: versions in the registry. */
+  maxVersions: number;
+  /** `additionalProperties.maxItems`: ids per version. */
+  maxIds: number;
+}
+
 /**
  * Renders the classifier registry as a TypeScript `const`. Fails closed on anything that is not a
- * `{ "<ClassifiersVersion>": ["<ClassifierId>", ...] }` map (the full check, JSON Schema included,
- * is `npm test` in shared/protocol/), with the patterns taken from openapi.yaml.
+ * `{ "<ClassifiersVersion>": ["<ClassifierId>", ...] }` map within the schema bounds, with unique
+ * ids sorted ascending (the full check, JSON Schema and immutability lock included, is `npm test`
+ * in shared/protocol/).
  */
-export function renderClassifierRegistry(
-  registry: unknown,
-  patterns: { version: RegExp; id: RegExp },
-): string {
+export function renderClassifierRegistry(registry: unknown, rules: RegistryRules): string {
   if (registry === null || typeof registry !== "object" || Array.isArray(registry)) {
     throw new Error("classifiers.json must be an object");
   }
   const entries = Object.entries(registry as Record<string, unknown>);
   if (entries.length === 0) throw new Error("classifiers.json has no version");
+  if (entries.length > rules.maxVersions) throw new Error("classifiers.json: too many versions");
   for (const [version, ids] of entries) {
-    if (!patterns.version.test(version)) throw new Error("classifiers.json: invalid classifiers_version key");
+    if (!rules.version.test(version)) throw new Error("classifiers.json: invalid classifiers_version key");
     if (!Array.isArray(ids) || ids.length === 0) throw new Error(`classifiers.json/${version}: expected a non-empty array`);
-    for (const id of ids) {
-      if (typeof id !== "string" || !patterns.id.test(id)) throw new Error(`classifiers.json/${version}: invalid classifier id`);
-    }
-    if (new Set(ids).size !== ids.length) throw new Error(`classifiers.json/${version}: duplicate classifier id`);
+    if (ids.length > rules.maxIds) throw new Error(`classifiers.json/${version}: too many classifier ids`);
+    ids.forEach((id: unknown, i: number) => {
+      if (typeof id !== "string" || !rules.id.test(id)) throw new Error(`classifiers.json/${version}: invalid classifier id`);
+      const previous: unknown = i > 0 ? ids[i - 1] : undefined;
+      if (typeof previous === "string" && !(previous < id)) {
+        throw new Error(`classifiers.json/${version}: ids must be unique and sorted ascending`);
+      }
+    });
   }
   return (
     "// GENERATED FILE, DO NOT EDIT. Source: shared/protocol/classifiers.json.\n" +
@@ -127,9 +141,20 @@ export async function renderArtifacts(): Promise<Artifacts> {
   };
 
   const registry: unknown = JSON.parse(await readFile(REGISTRY_URL, "utf8"));
+  const registrySchema = JSON.parse(await readFile(REGISTRY_SCHEMA_URL, "utf8")) as {
+    maxProperties?: unknown;
+    additionalProperties?: { maxItems?: unknown };
+  };
+  const maxVersions = registrySchema.maxProperties;
+  const maxIds = registrySchema.additionalProperties?.maxItems;
+  if (typeof maxVersions !== "number" || typeof maxIds !== "number") {
+    throw new Error("classifiers.schema.json: missing maxProperties / additionalProperties.maxItems");
+  }
   const classifiers = renderClassifierRegistry(registry, {
     version: schemaPattern(schemas, "ClassifiersVersion"),
     id: schemaPattern(schemas, "ClassifierId"),
+    maxVersions,
+    maxIds,
   });
 
   const ast = await openapiTS(yamlText, { silent: true });

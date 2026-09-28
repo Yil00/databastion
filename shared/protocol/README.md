@@ -11,6 +11,7 @@ Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.**
 | `openapi.yaml` | OpenAPI 3.1 contract: endpoints, headers, responses, and **all** JSON Schemas under `components/schemas` |
 | `classifiers.json` | Classifier registry: the valid classifier ids of each `classifiers_version` |
 | `classifiers.schema.json` | JSON Schema of the registry (keys `ClassifiersVersion`, ids `ClassifierId`, from `openapi.yaml`) |
+| `classifiers.lock.json` | SHA-256 of each published version's sorted id list: published versions are immutable |
 | `fixtures/valid/<Schema>.<case>.json` | Bodies that must be accepted by `<Schema>` |
 | `fixtures/invalid/<Schema>.<case>.json` | Bodies that must be rejected by `<Schema>` |
 | `fixtures/invalid-expectations.json` | For each invalid fixture, the JSON Schema keyword it must fail on (so it fails for the intended reason) |
@@ -18,8 +19,8 @@ Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.**
 | `scripts/schema-lint.test.mjs` | Self-test: the contract passes the lint, and known mutations (`{}`, `true`, nullable unbounded types, open objects…) are caught |
 | `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + registry check |
 | `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schema) shared by the scripts |
-| `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, valid fixtures only use ids registered for their `classifiers_version` |
-| `scripts/classifier-registry.test.mjs` | Self-test: the registry passes, known mutations (bad id, duplicate, empty list, unsorted…) are caught |
+| `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, published versions unchanged (lock), valid fixtures only use ids registered for their `classifiers_version` |
+| `scripts/classifier-registry.test.mjs` | Self-test: the registry and lock pass, known mutations (bad id, duplicate, empty list, unsorted, id added / removed / renamed in a published version, version removed, new version not locked…) are caught |
 | `redocly.yaml` | Redocly ruleset for local linting (`recommended-strict`) |
 
 `<Schema>` is a key of `components/schemas` in `openapi.yaml` (e.g. `FindingsBatch`, `HeartbeatRequest`). Fixture data is fake: `example.com` domains, documentation IP ranges (`192.0.2.0/24`, `198.51.100.0/24`, `2001:db8::/32`), secrets made of `EXAMPLE`.
@@ -39,11 +40,12 @@ The schemas sit in `components/schemas` rather than in separate `schemas/*.json`
 - Valid fixtures of a schema with `x-databastion-max-bytes` stay under that size.
 - Every fixture in `valid/` passes, every fixture in `invalid/` fails with its expected keyword.
 - Every request and response body schema has at least one valid and one invalid fixture.
-- `classifiers.json` conforms to `classifiers.schema.json`, its ids are sorted, and every valid fixture that carries a `classifiers_version` only uses classifier ids registered for it.
+- `classifiers.json` conforms to `classifiers.schema.json`, its ids are sorted, every version pinned in `classifiers.lock.json` still has the same hash, every version is pinned, and every valid fixture that carries a `classifiers_version` only uses classifier ids registered for it.
 
 ## Classifier registry (`classifiers.json`)
 A map `classifiers_version -> [classifier ids]`, e.g. `{"2026.09.1": ["pii.birth_date", …]}`. The console rejects findings whose `classifiers_version` is not a key (`400`, `/classifiers_version`, `enum`) or whose `classifier` is not listed for that version (`400`, `/findings/<i>/classifier`, `enum`), and only issues `discovery.scan` jobs with a registered version. Rules:
 - a published version is **never modified** (ids are frozen, see `agent/crates/classifiers/README.md`); a new or changed classifier is a new version, added by a compatible change (regular PR + `security-reviewer` review);
+- **immutability is tested**: `classifiers.lock.json` maps each published version to `sha256:` + the hex SHA-256 of the JSON array of its ids, sorted, without whitespace (`["pii.birth_date","pii.card_number",…]`). `npm test` fails if a locked version's ids change or the version disappears, and if a registry version is missing from the lock. A new version is added to `classifiers.json` **and appended** to the lock in the same change (the failing test prints the expected hash); a lock entry is never edited nor removed, and reviewers reject any diff that does;
 - ids sorted ascending, at most 200 per version (the `DiscoveryScanParams.classifiers` bound);
 - the agent's compiled classifier set must equal the entry of its `CLASSIFIERS_VERSION` (contract test `agent/crates/classifiers/tests/contract_registry.rs`).
 

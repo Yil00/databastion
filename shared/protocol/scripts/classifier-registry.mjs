@@ -2,7 +2,42 @@
 // The console rejects findings whose version or classifier id is not in it (see openapi.yaml,
 // "Console-side checks"); the console and agent generators consume it.
 
+import { createHash } from "node:crypto";
 import { REGISTRY_SCHEMA_ID } from "./contract-ajv.mjs";
+
+/**
+ * Hash pinned in classifiers.lock.json for a version: `sha256:` + hex SHA-256 of the JSON array of
+ * its ids, sorted ascending, without whitespace (e.g. `["pii.email","pii.iban"]`).
+ */
+export function versionHash(ids) {
+  return `sha256:${createHash("sha256").update(JSON.stringify([...ids].sort())).digest("hex")}`;
+}
+
+/**
+ * Published versions are immutable: every version of classifiers.lock.json must still be in the
+ * registry with the same hash, and every registry version must be pinned in the lock (a new
+ * version is appended to the lock in the same change). A lock entry is never edited nor removed.
+ */
+export function lockProblems(registry, lock) {
+  const problems = [];
+  if (!lock || typeof lock !== "object" || Array.isArray(lock)) return ["classifiers.lock.json must be an object"];
+  const HASH = /^sha256:[0-9a-f]{64}$/;
+  for (const [version, hash] of Object.entries(lock)) {
+    if (typeof hash !== "string" || !HASH.test(hash)) {
+      problems.push(`classifiers.lock.json/${version}: malformed hash`);
+    } else if (!Object.hasOwn(registry, version)) {
+      problems.push(`classifiers.json: published version ${version} was removed (published versions are immutable)`);
+    } else if (versionHash(registry[version]) !== hash) {
+      problems.push(`classifiers.json/${version}: ids changed since publication (published versions are immutable; add a new version instead)`);
+    }
+  }
+  for (const [version, ids] of Object.entries(registry)) {
+    if (!Object.hasOwn(lock, version)) {
+      problems.push(`classifiers.lock.json: new version ${version} must be appended to the lock as "${versionHash(ids)}"`);
+    }
+  }
+  return problems;
+}
 
 /** Problems of a registry: JSON Schema (classifiers.schema.json), then ids sorted ascending. */
 export function registryProblems(ajv, registry) {
