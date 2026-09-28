@@ -12,13 +12,15 @@ use std::sync::LazyLock;
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use zeroize::Zeroizing;
 
 /// Lowercase ASCII-folded form of a word: accents removed (NFD, combining
 /// marks dropped), `ß` -> `ss`, `æ` -> `ae`, `œ` -> `oe`, `ø` -> `o`,
-/// `ł` -> `l`, `đ` -> `d`, apostrophes removed.
+/// `ł` -> `l`, `đ` -> `d`, apostrophes removed. Zeroized on drop (it
+/// copies a value).
 #[must_use]
-pub(crate) fn fold(word: &str) -> String {
-    let mut out = String::with_capacity(word.len());
+pub(crate) fn fold(word: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(word.len()));
     for c in word.nfd() {
         if is_combining_mark(c) || matches!(c, '\'' | '’' | '`' | 'ʼ') {
             continue;
@@ -84,8 +86,8 @@ pub(crate) fn is_entity(value: &str) -> bool {
     if v.is_empty() || v.len() > 64 {
         return false;
     }
-    let folded = fold(v).replace(['-', '.'], " ");
-    let joined = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let folded = Zeroizing::new(fold(v).replace(['-', '.'], " "));
+    let joined = Zeroizing::new(folded.split_whitespace().collect::<Vec<_>>().join(" "));
     ENTITY.contains(joined.as_str())
 }
 
@@ -1142,11 +1144,11 @@ mod tests {
 
     #[test]
     fn folding() {
-        assert_eq!(fold("Anaïs"), "anais");
-        assert_eq!(fold("ÉLODIE"), "elodie");
-        assert_eq!(fold("O'Connor"), "oconnor");
-        assert_eq!(fold("Straße"), "strasse");
-        assert_eq!(fold("Łukasz"), "lukasz");
+        assert_eq!(fold("Anaïs").as_str(), "anais");
+        assert_eq!(fold("ÉLODIE").as_str(), "elodie");
+        assert_eq!(fold("O'Connor").as_str(), "oconnor");
+        assert_eq!(fold("Straße").as_str(), "strasse");
+        assert_eq!(fold("Łukasz").as_str(), "lukasz");
     }
 
     #[test]

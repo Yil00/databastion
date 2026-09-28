@@ -24,6 +24,7 @@ use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use zeroize::Zeroizing;
 
 use crate::id::ClassifierId;
 use crate::lexicon;
@@ -33,6 +34,10 @@ use crate::validate;
 pub const MAX_SCAN_BYTES: usize = 8 * 1024;
 /// Most tokens reported for one value.
 const MAX_TOKENS_PER_VALUE: usize = 64;
+/// Longest whole value [`parse_date`] accepts (bytes).
+const DATE_MAX_BYTES: usize = 64;
+/// Bytes examined before an e-mail token for its context.
+const EMAIL_PREFIX_BYTES: usize = 64;
 
 /// A validated token found in a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,9 +236,9 @@ static TEXT_DATE_YMD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Compiles every detector pattern now (they are otherwise compiled on
-/// first use). Panics with the pattern name if one does not compile: call it
-/// at startup so that a build defect stops the agent before any scan
-/// instead of disabling a detector.
+/// first use). Panics with the pattern name if one does not compile. The
+/// agent calls it at startup (`core::runtime::run`), so a build defect
+/// stops it before any scan instead of disabling a detector.
 pub fn check_patterns() {
     for r in [
         &EMAIL,
@@ -344,6 +349,9 @@ pub(crate) fn scan(
     {
         let r = &*EMAIL;
         for m in r.find_iter(v) {
+            if out.len() >= MAX_TOKENS_PER_VALUE {
+                break;
+            }
             let s = m.as_str().trim_end_matches(['.', '-']);
             let range = m.start()..m.start() + s.len();
             if validate::email_valid(s) && personal_email(v, range.clone()) {
@@ -366,7 +374,8 @@ pub(crate) fn scan(
             if overlaps(&out, &m.range()) {
                 continue;
             }
-            let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
+            let digits: Zeroizing<String> =
+                Zeroizing::new(m.as_str().chars().filter(char::is_ascii_digit).collect());
             let phone_like = prev_char(v, m.start()) == Some('+') || digits.starts_with("00");
             if phone_like || validate::nir_valid(&digits) {
                 continue;
@@ -388,12 +397,14 @@ pub(crate) fn scan(
                 continue;
             }
             cand.nir = true;
-            let alnum: String = m
-                .as_str()
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect();
-            if validate::nir_valid(&alnum.to_ascii_uppercase()) {
+            let alnum: Zeroizing<String> = Zeroizing::new(
+                m.as_str()
+                    .chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect(),
+            );
+            if validate::nir_valid(&alnum) {
                 push(&mut out, ClassifierId::Nir, m.range());
             }
         }
@@ -616,14 +627,23 @@ fn personal_email(v: &str, r: Range<usize>) -> bool {
     let Some((local, domain)) = token.rsplit_once('@') else {
         return false;
     };
-    // What precedes the token in the same whitespace-delimited word.
-    let word_start = v[..r.start]
+    // What precedes the token in the same whitespace-delimited word, at
+    // most `EMAIL_PREFIX_BYTES` back (constant work per token).
+    let mut window = r.start.saturating_sub(EMAIL_PREFIX_BYTES);
+    while !v.is_char_boundary(window) {
+        window += 1;
+    }
+    let word_start = v[window..r.start]
         .char_indices()
         .rev()
         .find(|(_, c)| c.is_whitespace())
-        .map_or(0, |(i, c)| i + c.len_utf8());
+        .map_or(window, |(i, c)| window + i + c.len_utf8());
     let prefix = &v[word_start..r.start];
-    let prefix_lower = prefix.to_ascii_lowercase();
+    let mailto = prefix
+        .len()
+        .checked_sub(7)
+        .and_then(|i| prefix.as_bytes().get(i..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(b"mailto:"));
     if prefix.contains("//") {
         return false;
     }
@@ -633,7 +653,7 @@ fn personal_email(v: &str, r: Range<usize>) -> bool {
             !prefix.contains('/')
         }
         Some(':') => {
-            prefix_lower.ends_with("mailto:")
+            mailto
                 || prefix[..prefix.len() - 1]
                     .chars()
                     .all(|c| c.is_alphabetic() || matches!(c, '-' | '_' | '"' | '\''))
@@ -660,7 +680,7 @@ fn personal_email(v: &str, r: Range<usize>) -> bool {
     if !suffix_ok {
         return false;
     }
-    let lower_local = local.to_lowercase();
+    let lower_local = Zeroizing::new(local.to_lowercase());
     let base = lower_local.split('+').next().unwrap_or("");
     if SYSTEM_LOCAL_PARTS.contains(&base)
         || [
@@ -676,7 +696,7 @@ fn personal_email(v: &str, r: Range<usize>) -> bool {
     {
         return false;
     }
-    let lower_domain = domain.to_lowercase();
+    let lower_domain = Zeroizing::new(domain.to_lowercase());
     if lower_domain.contains("noreply") || lower_domain.contains("no-reply") {
         return false;
     }
@@ -783,7 +803,7 @@ fn iban_tokens(v: &str) -> Vec<(Range<usize>, bool)> {
         let Some(len) = validate::iban_length(&m.as_str()[..2].to_ascii_uppercase()) else {
             continue;
         };
-        let mut compact = String::with_capacity(len);
+        let mut compact = Zeroizing::new(String::with_capacity(len));
         let mut end = m.start();
         let mut last_sep = false;
         for (i, c) in v[m.start()..].char_indices() {
@@ -828,7 +848,8 @@ fn card_token(v: &str, range: Range<usize>) -> Option<Range<usize>> {
         .collect();
     ends.reverse();
     for end in ends {
-        let digits: String = s[..end].chars().filter(char::is_ascii_digit).collect();
+        let digits: Zeroizing<String> =
+            Zeroizing::new(s[..end].chars().filter(char::is_ascii_digit).collect());
         if (13..=19).contains(&digits.len())
             && validate::luhn_valid(&digits)
             && validate::card_prefix_valid(&digits)
@@ -842,10 +863,19 @@ fn card_token(v: &str, range: Range<usize>) -> Option<Range<usize>> {
 /// Dates of birth introduced by a label (`born 17/05/1980`, `DOB: …`,
 /// `née le 3 mars 1975`).
 fn birth_date_tokens(v: &str, out: &mut Vec<Token>) {
-    let r = &*BIRTH_LABEL;
-    for m in r.find_iter(v) {
-        let rest = &v[m.end()..];
-        // The date is one to five words long; try the longest first.
+    for m in BIRTH_LABEL.find_iter(v) {
+        if out.len() >= MAX_TOKENS_PER_VALUE {
+            break;
+        }
+        // The date is at most `DATE_MAX_BYTES` long (the `parse_date`
+        // bound): only that window after the label is examined, so the
+        // work per label is constant.
+        let mut end = (m.end() + DATE_MAX_BYTES + 8).min(v.len());
+        while !v.is_char_boundary(end) {
+            end -= 1;
+        }
+        let rest = &v[m.end()..end];
+        // One to five words; try the longest first.
         let mut ends: Vec<usize> = rest
             .char_indices()
             .filter(|(_, c)| c.is_whitespace())
@@ -917,11 +947,9 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
             if glued {
                 continue;
             }
-            let digits: usize = text
-                .replace("(0)", "")
-                .chars()
-                .filter(char::is_ascii_digit)
-                .count();
+            // Digits, without the `0` of a trunk `(0)` (no copy).
+            let digits: usize =
+                text.chars().filter(char::is_ascii_digit).count() - text.matches("(0)").count();
             let separated = text.chars().any(|c| !c.is_ascii_digit() && c != '+');
             let strength = match kind {
                 // `+` / `00` prefix: 8 to 15 digits after it; `00` needs
@@ -1132,7 +1160,7 @@ fn grp<'h>(c: &regex::Captures<'h>, i: usize) -> Option<&'h str> {
 #[must_use]
 pub(crate) fn parse_date(value: &str) -> Option<DateParts> {
     let v = value.trim();
-    if v.len() < 6 || v.len() > 64 {
+    if v.len() < 6 || v.len() > DATE_MAX_BYTES {
         return None;
     }
     let num = |s: &str| s.parse::<u32>().ok();
@@ -1338,7 +1366,7 @@ pub(crate) fn name_evidence(value: &str) -> Option<NameEvidence> {
         let parts: Vec<&str> = f.split('-').collect();
         let given = lexicon::is_given_name(&f) || parts.iter().all(|p| lexicon::is_given_name(p));
         let surname = lexicon::is_surname(&f)
-            || lexicon::is_surname(&f.replace('-', ""))
+            || lexicon::is_surname(&Zeroizing::new(f.replace('-', "")))
             || parts.iter().any(|p| lexicon::is_surname(p));
         let suffix = parts.iter().any(|p| lexicon::has_surname_suffix(p));
         if lower && !(given || surname) {
@@ -1381,7 +1409,7 @@ pub(crate) enum AddressKind {
 
 struct AddrWord<'a> {
     raw: &'a str,
-    folded: String,
+    folded: Zeroizing<String>,
     /// Last word of a comma / line / `$` separated segment.
     seg_end: bool,
 }
@@ -1478,14 +1506,13 @@ fn postcode_at(ws: &[AddrWord<'_>], i: usize) -> bool {
         }
         // UK `NW1 6XE`, CA `H2X 1Y4`.
         2..=4 => {
-            let s = w.to_ascii_uppercase();
-            let c: Vec<char> = s.chars().collect();
+            let c: Vec<char> = w.chars().map(|x| x.to_ascii_uppercase()).collect();
             let outward = c.len() >= 2
                 && c[0].is_ascii_alphabetic()
                 && c.iter().any(char::is_ascii_digit)
                 && c.iter().all(char::is_ascii_alphanumeric);
             let inward = next.is_some_and(|n| {
-                let c: Vec<char> = n.raw.to_ascii_uppercase().chars().collect();
+                let c: Vec<char> = n.raw.chars().map(|x| x.to_ascii_uppercase()).collect();
                 c.len() == 3
                     && c[0].is_ascii_digit()
                     && c[1].is_ascii_alphabetic()
@@ -1533,7 +1560,7 @@ pub(crate) fn address_kind(value: &str) -> AddressKind {
             }
             ws.push(AddrWord {
                 raw,
-                folded: lexicon::fold(raw).replace('.', ""),
+                folded: Zeroizing::new(lexicon::fold(raw).replace('.', "")),
                 seg_end: false,
             });
         }
@@ -2195,6 +2222,32 @@ mod tests {
         let v = "DE07 9994 3094 0336 6126 78";
         let t = scan_tokens(v, &|c| c != C::Iban);
         assert!(t.is_empty(), "{t:?}");
+    }
+
+    /// Crafted inputs that repeat a label or an e-mail at the scan bound:
+    /// the work per label / token is constant (bounded windows), so a
+    /// whole value scans in far less than the generous limit below, and at
+    /// most `MAX_TOKENS_PER_VALUE` tokens come out.
+    #[test]
+    fn crafted_repetitions_scan_in_linear_time() {
+        let inputs = [
+            "dob:".repeat(MAX_SCAN_BYTES / 4),
+            "born ".repeat(MAX_SCAN_BYTES / 5),
+            "dob: 17/05/1980 ".repeat(MAX_SCAN_BYTES / 16),
+            "a@bc.fr;".repeat(MAX_SCAN_BYTES / 8),
+            "x".repeat(MAX_SCAN_BYTES - 16) + "a@bc.fr",
+            "a@bc.fr ".repeat(MAX_SCAN_BYTES / 8),
+            "tel 01 99 00 27 59 ".repeat(MAX_SCAN_BYTES / 19),
+        ];
+        for v in &inputs {
+            let start = std::time::Instant::now();
+            let t = scan_tokens(v, &|_| true);
+            let took = start.elapsed();
+            assert!(t.len() <= MAX_TOKENS_PER_VALUE);
+            // Debug builds on a slow CI runner included: linear scans of
+            // 8 KiB take milliseconds; quadratic ones took far longer.
+            assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        }
     }
 
     #[test]

@@ -43,7 +43,9 @@
 //! key is drawn for the call. Fingerprints are the [`MAX_FINGERPRINTS`]
 //! smallest distinct ones, emitted sorted.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::BuildHasher;
 
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use zeroize::Zeroizing;
@@ -163,13 +165,11 @@ struct Stats {
     addr_weak: u32,
 }
 
-/// Remembers up to `max` distinct values by an in-memory hash (only
-/// compared within the call, never output).
-fn remember(set: &mut Vec<u64>, v: &str, max: usize) {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.hash(&mut h);
-    let h = h.finish();
+/// Remembers up to `max` distinct values by an in-memory SipHash keyed at
+/// random for the call (`keys`): only compared within the call, never
+/// output, and crafted values cannot collide on purpose.
+fn remember(keys: &RandomState, set: &mut Vec<u64>, v: &str, max: usize) {
+    let h = keys.hash_one(v);
     if set.len() < max && !set.contains(&h) {
         set.push(h);
     }
@@ -307,6 +307,8 @@ impl ColumnClassifier<'_> {
         let mut acc: Vec<Acc> = ClassifierId::ALL.iter().map(|_| Acc::default()).collect();
         let mut sampled: u32 = 0;
         let mut st = Stats::default();
+        // Random SipHash keys for the distinct-value sets of this call.
+        let hash_keys = RandomState::new();
         let on = |c| self.enabled(c);
 
         for raw in values.iter().take(MAX_SAMPLE_VALUES) {
@@ -350,7 +352,7 @@ impl ColumnClassifier<'_> {
                     {
                         continue;
                     }
-                    ClassifierId::Email => remember(&mut st.emails, token, 2),
+                    ClassifierId::Email => remember(&hash_keys, &mut st.emails, token, 2),
                     ClassifierId::AwsKey => aws = true,
                     ClassifierId::PasswordHash => hash = true,
                     ClassifierId::BirthDate => labelled = true,
@@ -401,7 +403,7 @@ impl ColumnClassifier<'_> {
                 st.names_known += u32::from(e.known());
                 st.names_listed += u32::from(e.given || e.surname);
                 st.names_entities += u32::from(lexicon::is_entity(value));
-                remember(&mut st.names, value.trim(), 3);
+                remember(&hash_keys, &mut st.names, value.trim(), 3);
                 self.record(&ctx, &mut acc, &mut hit, ClassifierId::PersonName, value);
             }
             if on(ClassifierId::AwsKey) && detect::is_aws_secret_key(value) {
