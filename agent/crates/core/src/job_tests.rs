@@ -165,13 +165,27 @@ fn filters_match_globs() {
     assert!(!job.includes_database("hr"));
     assert!(job.includes_schema("anything"));
     assert!(job.includes_object("customers"));
+    let dup = ScanParams::try_from(&scan(serde_json::json!({
+        "sample_rows": 200, "max_duration_s": 900,
+        "databases": ["shop", "shop"], "exclude_objects": ["a", "a", "b"]
+    })))
+    .unwrap();
+    assert_eq!(dup.databases.as_deref(), Some(&["shop".to_owned()][..]));
+    assert_eq!(dup.exclude_objects, ["a", "b"]);
     assert!(!job.includes_object("customers_old"));
     assert!(!job.includes_object("orders"));
 }
 
 #[test]
 fn classify_uses_the_job_filter_key_region_and_bound() {
-    let params = ScanParams::contract_defaults().with_classifiers(&[ClassifierId::Phone]);
+    assert!(
+        ScanParams::contract_defaults()
+            .with_classifiers(&[])
+            .is_err()
+    );
+    let params = ScanParams::contract_defaults()
+        .with_classifiers(&[ClassifierId::Phone])
+        .unwrap();
     let job = ScanJob::new(params, &target(), &limits(3, 30_000, 3_600), key());
     let raw = [
         "06 12 34 56 78",

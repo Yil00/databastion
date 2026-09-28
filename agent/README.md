@@ -84,8 +84,12 @@ binary: `cargo build --no-default-features --features postgres`.
   or duplicate classifier ids refused → `invalid_params`), then
   `ScanJob::new` / `AuditConfig::new`, which clamp to `limits` in
   `agent.yaml`. A statement timeout is never `0`: a requested `0` becomes
-  `limits.statement_timeout_ms`. The core stops a scan after its clamped
-  duration (`timeout`), and spools its findings per chunk of 500.
+  `limits.statement_timeout_ms`. Scans run in a scan worker next to the jobs
+  loop (at most 16 queued, one at a time), so `rotate` / `reload` jobs never
+  wait behind a scan. A scan is stopped at its clamped duration (`timeout`)
+  and when the agent is suspended or revoked (`cancelled`); findings are
+  spooled per chunk of 500, the partial chunk is flushed on every exit, and
+  findings that cannot be spooled are counted (`findings_lost_total`).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
   removed at startup, unreadable files are moved to `spool/quarantine/` (32

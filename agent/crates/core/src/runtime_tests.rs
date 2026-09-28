@@ -1918,6 +1918,14 @@ async fn discovery_scans_go_through_the_gate_and_spool_fingerprinted_findings() 
     rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
         .await
         .unwrap();
+    // Refused jobs are reported at once; the valid one waits for the worker,
+    // and a redelivery does not queue it twice.
+    assert!(statuses(&server).await.iter().all(|(i, _)| i != ok));
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rt.lock_scans().queued.len(), 1);
+    run_queued_scans(&rt).await;
     let got = statuses(&server).await;
     let find = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
     assert_eq!(find(ok)["status"], "succeeded");
@@ -1966,4 +1974,118 @@ async fn discovery_scans_go_through_the_gate_and_spool_fingerprinted_findings() 
     assert!(fps.iter().any(|f| f == jane.as_str()));
     let text = batch.to_string();
     assert!(!text.contains("jane") && !text.contains("smith"), "{text}");
+}
+
+/// Runs every queued scan (the scan worker, without its loop).
+async fn run_queued_scans(rt: &Runtime) {
+    loop {
+        let next = rt.lock_scans().queued.pop_front();
+        let Some(prepared) = next else {
+            return;
+        };
+        rt.run_prepared_scan(prepared, std::future::pending()).await;
+    }
+}
+
+/// Submits one finding, then never returns (a stuck scan).
+struct Stuck;
+
+#[async_trait::async_trait]
+impl Connector for Stuck {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        use databastion_classifiers::masking::{FindingLocation, RawSample};
+        use databastion_classifiers::names::normalize_path;
+        let values = [RawSample::new("jane.doe@example.com")];
+        for f in job.classify("email", &values) {
+            let location = FindingLocation {
+                database: normalize_path("shop"),
+                schema: None,
+                object: normalize_path("customers"),
+                field: normalize_path("email"),
+            };
+            sink.submit(f.into_finding(location)).await?;
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn suspension_cancels_a_running_scan_and_flushes_its_findings() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(&env.config_path, env.config.clone(), vec![Box::new(Stuck)]).unwrap();
+    let id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f91";
+    let reload = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f92";
+    let body = serde_json::json!({ "jobs": [{
+        "job_id": id, "type": "discovery.scan", "created_at": "2026-09-28T14:00:00Z",
+        "target_id": "pg-main", "classifiers_version": "2026.09.1",
+        "params": {"sample_rows": 200, "max_duration_s": 900}
+    }]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown) = watch::channel(false);
+    let worker = rt.scan_loop(shutdown);
+    let driver = async {
+        // The jobs path is free while the scan runs.
+        for _ in 0..50 {
+            if rt.counters.findings_received.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rt.handle_job_list(
+            &serde_json::to_vec(&serde_json::json!({"jobs": [
+                job(reload, "agent.config.reload", serde_json::json!({}))
+            ]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(statuses(&server).await.iter().any(|(i, _)| i == reload));
+        // Revocation: a fatal 401 suspends the agent.
+        rt.set_state(RunState::Suspended);
+        for _ in 0..50 {
+            if statuses(&server).await.iter().any(|(i, _)| i == id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown_tx.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == id).unwrap().1;
+    assert_eq!(update["error"]["code"], "cancelled");
+    // The finding handed over before the cancellation was spooled.
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    assert_eq!(rt.counters.findings_lost.load(Ordering::Relaxed), 0);
+    assert!(rt.lock_scans().in_flight.is_empty());
 }

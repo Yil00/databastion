@@ -283,7 +283,30 @@ struct Counters {
     jobs_invalid_params: AtomicU64,
     /// Findings received from connectors (before sanitization).
     findings_received: AtomicU64,
+    /// Findings lost because they could not be spooled.
+    findings_lost: AtomicU64,
 }
+
+/// A `discovery.scan` that passed the gates, waiting for the scan worker.
+struct PreparedScan {
+    id: Uuid,
+    target_id: TargetId,
+    engine: databastion_protocol::Engine,
+    /// Index in `Runtime::connectors`.
+    connector: usize,
+    scan: ScanJob,
+}
+
+/// Scans waiting for the worker, and the ids queued or running (a
+/// redelivered job is not queued twice).
+#[derive(Default)]
+struct ScanQueue {
+    queued: std::collections::VecDeque<PreparedScan>,
+    in_flight: std::collections::HashSet<Uuid>,
+}
+
+/// Scans queued at most; more are left unacknowledged and redelivered.
+const MAX_QUEUED_SCANS: usize = 16;
 
 fn bump(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
@@ -303,6 +326,10 @@ struct Runtime {
     /// startup from `<state_dir>/hmac.key`. Never sent, logged or
     /// serialized (redacted `Debug`, zeroized on drop).
     hmac: Arc<HmacKey>,
+    /// Scans waiting for, or run by, the scan worker.
+    scans: Mutex<ScanQueue>,
+    /// Wakes the scan worker when a scan is queued.
+    scan_ready: tokio::sync::Notify,
     /// Host root for local detection (`/`; a fixture tree in tests).
     host_root: PathBuf,
     /// Heartbeats refused with a fatal `401` since the last success.
@@ -390,6 +417,8 @@ impl Runtime {
             state: watch::channel(RunState::Active).0,
             spool: Mutex::new(spool),
             hmac,
+            scans: Mutex::new(ScanQueue::default()),
+            scan_ready: tokio::sync::Notify::new(),
             host_root: PathBuf::from("/"),
             detection: Mutex::new(None),
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
@@ -399,10 +428,12 @@ impl Runtime {
     async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let heartbeat = self.heartbeat_loop(shutdown.clone());
         let jobs = self.jobs_loop(shutdown.clone());
+        let scans = self.scan_loop(shutdown.clone());
         let spool = self.spool_loop(shutdown);
         tokio::select! {
             r = heartbeat => r,
             r = jobs => r,
+            r = scans => r,
             r = spool => r,
         }
     }
@@ -468,6 +499,7 @@ impl Runtime {
             ("jobs_deferred_total", &c.jobs_deferred),
             ("jobs_invalid_params_total", &c.jobs_invalid_params),
             ("findings_received_total", &c.findings_received),
+            ("findings_lost_total", &c.findings_lost),
             ("batches_sent_total", &c.batches_sent),
             ("batches_duplicate_total", &c.batches_duplicate),
             ("batches_rejected_total", &c.batches_rejected),
@@ -1049,7 +1081,7 @@ impl Runtime {
     /// Executes a job. `None`: leave it unacknowledged (redelivered later).
     async fn execute(&self, job: &Job, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         match job {
-            Job::DiscoveryScanJob(scan) => Ok(Some(self.discovery_scan(scan, id).await)),
+            Job::DiscoveryScanJob(scan) => Ok(self.queue_scan(scan, id)),
             Job::AuditConfigureJob(audit) => {
                 // Gate now; audit collection lands in P4.
                 let outcome = match crate::job::AuditParams::try_from(&audit.params) {
@@ -1069,18 +1101,19 @@ impl Runtime {
         Outcome::failed(FailureCode::InvalidParams)
     }
 
-    /// Runs a `discovery.scan`: parameters go through the contract gate
-    /// (`ScanParams::try_from`) and the `agent.yaml` clamp (`ScanJob::new`)
-    /// before the connector sees them; findings are spooled per chunk while
-    /// the scan runs, and the scan is stopped after its clamped duration.
-    async fn discovery_scan(
+    /// Checks a `discovery.scan` and queues it for the scan worker.
+    /// Parameters go through the contract gate (`ScanParams::try_from`) and
+    /// the `agent.yaml` clamp (`ScanJob::new`) here, so a refused job is
+    /// reported at once. `None`: queued, already running, or queue full
+    /// (left unacknowledged, redelivered later).
+    fn queue_scan(
         &self,
         job: &databastion_protocol::DiscoveryScanJob,
         id: Uuid,
-    ) -> Outcome {
+    ) -> Option<Outcome> {
         let params = match ScanParams::try_from(&job.params) {
             Ok(p) => p,
-            Err(e) => return self.invalid_params(id, &e),
+            Err(e) => return Some(self.invalid_params(id, &e)),
         };
         let config = self.config();
         let Some(target) = config
@@ -1089,67 +1122,190 @@ impl Runtime {
             .find(|t| t.id == job.target_id.as_str())
         else {
             tracing::warn!(job_id = %id, "scan job for an undeclared target");
-            return Outcome::failed(FailureCode::UnknownTarget);
+            return Some(Outcome::failed(FailureCode::UnknownTarget));
         };
         let Some(connector) = self
             .connectors
             .iter()
-            .find(|c| c.engine() == target.engine.connector())
+            .position(|c| c.engine() == target.engine.connector())
         else {
+            return Some(Outcome::failed(FailureCode::Unsupported));
+        };
+        let mut queue = self.lock_scans();
+        if queue.in_flight.contains(&id) {
+            return None;
+        }
+        if queue.queued.len() >= MAX_QUEUED_SCANS {
+            tracing::warn!(job_id = %id, "scan queue full; the job will be redelivered");
+            return None;
+        }
+        queue.in_flight.insert(id);
+        queue.queued.push_back(PreparedScan {
+            id,
+            target_id: job.target_id.clone(),
+            engine: proto_engine(target.engine),
+            connector,
+            scan: ScanJob::new(params, target, &config.limits, Arc::clone(&self.hmac)),
+        });
+        drop(queue);
+        self.scan_ready.notify_one();
+        None
+    }
+
+    fn lock_scans(&self) -> std::sync::MutexGuard<'_, ScanQueue> {
+        self.scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Scan worker: runs queued scans one at a time, next to the jobs loop,
+    /// so that `rotate` / `reload` jobs never wait behind a scan.
+    async fn scan_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let next = self.lock_scans().queued.pop_front();
+            let Some(prepared) = next else {
+                tokio::select! {
+                    () = self.scan_ready.notified() => {}
+                    _ = shutdown.changed() => {}
+                }
+                continue;
+            };
+            let cancel = {
+                let mut shutdown = shutdown.clone();
+                async move {
+                    let _ = shutdown.wait_for(|stop| *stop).await;
+                }
+            };
+            self.run_prepared_scan(prepared, cancel).await;
+        }
+    }
+
+    /// Runs one prepared scan and reports its outcome.
+    async fn run_prepared_scan(
+        &self,
+        prepared: PreparedScan,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
+        let id = prepared.id;
+        let outcome = self.discovery_scan(prepared, shutdown).await;
+        self.lock_scans().in_flight.remove(&id);
+        self.finish(id, outcome).await;
+    }
+
+    /// Resolves once the agent leaves [`RunState::Active`] (suspension
+    /// after a fatal `401`, i.e. revocation).
+    fn inactive(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let mut state = self.state.subscribe();
+        async move {
+            if state.wait_for(|s| *s != RunState::Active).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Runs a queued scan. Findings are spooled per chunk while it runs.
+    /// The connector future is dropped at the clamped deadline (`timeout`),
+    /// when the agent is suspended or revoked, or on shutdown (`cancelled`);
+    /// findings already handed over are flushed first. Findings that cannot
+    /// be spooled are counted as lost.
+    async fn discovery_scan(
+        &self,
+        prepared: PreparedScan,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Outcome {
+        let PreparedScan {
+            id,
+            target_id,
+            engine,
+            connector,
+            scan,
+        } = prepared;
+        let Some(connector) = self.connectors.get(connector) else {
             return Outcome::failed(FailureCode::Unsupported);
         };
-        let scan = ScanJob::new(params, target, &config.limits, Arc::clone(&self.hmac));
-        let engine = proto_engine(target.engine);
         let Some(version) = classifiers_version() else {
             return Outcome::failed(FailureCode::Internal);
         };
-        let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let deadline = scan.max_duration();
-        let run = async move {
-            let r = connector.discover(&scan, &sink).await;
-            drop(sink);
-            r
+        let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
+        let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
+        let spool_failed = std::sync::atomic::AtomicBool::new(false);
+        let flush = || {
+            let mut chunk = chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if chunk.is_empty() {
+                return;
+            }
+            if let Err(e) = self.spool_findings(id, &target_id, engine, &version, &chunk) {
+                let lost = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                bump(&self.counters.findings_lost, lost);
+                tracing::error!(job_id = %id, error = %e.kind(), lost, "cannot spool findings");
+                spool_failed.store(true, Ordering::Relaxed);
+            }
+            chunk.clear();
         };
-        let collect = async {
-            let mut chunk: Vec<MaskedFinding> = Vec::new();
-            let mut spool_failed = false;
-            loop {
-                let next = rx.recv().await;
-                let done = next.is_none();
-                if let Some(f) = next {
+        let outcome = {
+            let run = async {
+                let r = connector.discover(&scan, &sink).await;
+                drop(sink);
+                r
+            };
+            let collect = async {
+                while let Some(f) = rx.recv().await {
                     bump(&self.counters.findings_received, 1);
-                    chunk.push(f);
-                }
-                if !chunk.is_empty() && (done || chunk.len() >= FINDINGS_CHUNK) {
-                    if let Err(e) =
-                        self.spool_findings(id, &job.target_id, engine, &version, &chunk)
-                    {
-                        tracing::error!(job_id = %id, error = %e.kind(), "cannot spool findings");
-                        spool_failed = true;
+                    let full = {
+                        let mut c = chunk
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        c.push(f);
+                        c.len() >= FINDINGS_CHUNK
+                    };
+                    if full {
+                        flush();
                     }
-                    chunk.clear();
                 }
-                if done {
-                    return spool_failed;
+            };
+            let work = async { tokio::join!(run, collect).0 };
+            tokio::select! {
+                r = work => match r {
+                    Ok(()) => Outcome::SUCCEEDED,
+                    Err(crate::ConnectorError::NotImplemented { .. }) => {
+                        Outcome::failed(FailureCode::Unsupported)
+                    }
+                    Err(e) => {
+                        tracing::warn!(job_id = %id, error = %e, "scan failed");
+                        Outcome::failed(FailureCode::Internal)
+                    }
+                },
+                () = tokio::time::sleep(deadline) => {
+                    tracing::warn!(job_id = %id, "scan stopped at its maximum duration");
+                    Outcome::failed(FailureCode::Timeout)
                 }
+                () = self.inactive() => {
+                    tracing::warn!(job_id = %id, "scan cancelled: the agent is no longer active");
+                    Outcome::failed(FailureCode::Cancelled)
+                }
+                () = shutdown => Outcome::failed(FailureCode::Cancelled),
             }
         };
-        let scan_and_collect = async { tokio::join!(run, collect) };
-        match tokio::time::timeout(deadline, scan_and_collect).await {
-            Err(_) => {
-                tracing::warn!(job_id = %id, "scan stopped at its maximum duration");
-                Outcome::failed(FailureCode::Timeout)
-            }
-            Ok((_, true)) => Outcome::failed(FailureCode::ResourceLimit),
-            Ok((Ok(()), false)) => Outcome::SUCCEEDED,
-            Ok((Err(crate::ConnectorError::NotImplemented { .. }), false)) => {
-                Outcome::failed(FailureCode::Unsupported)
-            }
-            Ok((Err(e), false)) => {
-                tracing::warn!(job_id = %id, error = %e, "scan failed");
-                Outcome::failed(FailureCode::Internal)
-            }
+        // The connector future (and its sink) is dropped: drain what it
+        // handed over, then flush the partial chunk.
+        while let Ok(f) = rx.try_recv() {
+            bump(&self.counters.findings_received, 1);
+            chunk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(f);
         }
+        flush();
+        if spool_failed.load(Ordering::Relaxed) && outcome.error.is_none() {
+            return Outcome::failed(FailureCode::ResourceLimit);
+        }
+        outcome
     }
 
     fn reload_config(&self) -> Outcome {

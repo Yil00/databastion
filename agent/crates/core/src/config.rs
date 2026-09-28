@@ -354,6 +354,9 @@ const KNOWN_KEYS: &[&str] = &[
     "max_scan_duration_s",
     "min_audit_poll_interval_s",
     "phone_region",
+    // Values of closed enums (`engine`, `phone_region`) are listed too, so
+    // that an "unknown variant" error can name the expected ones; they are
+    // schema constants, never user data.
     "fr",
     "targets",
     "id",

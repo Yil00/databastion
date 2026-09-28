@@ -5,9 +5,12 @@
 //! 1. `TryFrom<&DiscoveryScanParams>` for [`ScanParams`] and
 //!    `TryFrom<&AuditConfigureParams>` for [`AuditParams`] enforce the
 //!    contract ranges and the keywords serde does not (`minItems`,
-//!    `maxItems`, `uniqueItems`, the `Identifier` `not` rule), and map
-//!    classifier ids through `ClassifierId::parse` (unknown id = error). An
-//!    empty filter list (`Some([])`) is rejected: it never means "all".
+//!    `maxItems`, `uniqueItems` of classifier lists, the `Identifier` `not`
+//!    rule), and map classifier ids through `ClassifierId::parse` (unknown
+//!    or duplicate id = error). An empty filter list (`Some([])`) is
+//!    rejected: it never means "all". Duplicate name patterns in
+//!    `databases` / `schemas` / `include_objects` / `exclude_objects` (no
+//!    `uniqueItems` in the contract) are removed.
 //! 2. [`ScanJob::new`] / [`AuditConfig::new`] then clamp the values to the
 //!    local hard limits of `agent.yaml` (`limits`). A statement timeout is
 //!    never `0` (unlimited on PostgreSQL / MySQL): a requested `0` becomes
@@ -69,7 +72,20 @@ fn in_range(field: &'static str, v: i64, (lo, hi): (u32, u32)) -> Result<u32, Pa
         .ok_or(err(field, "out of the contract range"))
 }
 
-/// An optional include filter: absent = all, `Some([])` is refused.
+/// Patterns without duplicates, in their first-seen order (the contract
+/// has no `uniqueItems` on name filters: duplicates are harmless, removed).
+fn dedup(list: &[IdentifierPattern]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    for p in list {
+        if !out.iter().any(|x| x == p.as_str()) {
+            out.push(p.as_str().to_owned());
+        }
+    }
+    out
+}
+
+/// An optional include filter: absent = all, `Some([])` is refused, above
+/// `maxItems` is refused, duplicates are removed.
 fn include_filter(
     field: &'static str,
     list: Option<&Vec<IdentifierPattern>>,
@@ -79,7 +95,7 @@ fn include_filter(
         None => Ok(None),
         Some(l) if l.is_empty() => Err(err(field, "empty list (absent means all)")),
         Some(l) if l.len() > max => Err(err(field, "too many items")),
-        Some(l) => Ok(Some(l.iter().map(|p| p.as_str().to_owned()).collect())),
+        Some(l) => Ok(Some(dedup(l))),
     }
 }
 
@@ -143,10 +159,17 @@ impl ScanParams {
 
     /// Restricts the classifiers (tests and local tooling; the console
     /// filter goes through `TryFrom`).
-    #[must_use]
-    pub fn with_classifiers(mut self, classifiers: &[ClassifierId]) -> Self {
-        self.classifiers = (!classifiers.is_empty()).then(|| classifiers.to_vec());
-        self
+    ///
+    /// # Errors
+    /// An empty or duplicated list, like the `TryFrom` gate: an empty
+    /// filter never means "all".
+    pub fn with_classifiers(mut self, classifiers: &[ClassifierId]) -> Result<Self, ParamsError> {
+        self.classifiers = Some(classifier_list(
+            "classifiers",
+            classifiers.iter().map(|c| c.as_str()),
+            MAX_SCAN_CLASSIFIERS,
+        )?);
+        Ok(self)
     }
 }
 
@@ -197,11 +220,7 @@ impl TryFrom<&DiscoveryScanParams> for ScanParams {
                 p.include_objects.as_ref(),
                 MAX_OBJECT_FILTERS,
             )?,
-            exclude_objects: p
-                .exclude_objects
-                .iter()
-                .map(|x| x.as_str().to_owned())
-                .collect(),
+            exclude_objects: dedup(&p.exclude_objects),
             classifiers,
         })
     }

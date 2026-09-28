@@ -54,7 +54,15 @@ pub trait Connector: Send + Sync {
     /// column with `job.classify(raw_column_name, &values)`, normalize names
     /// with `databastion_classifiers::names` (`normalize_field_path` for
     /// document keys), and submit `ColumnFinding::into_finding(location)`.
-    /// The core stops the scan after `job.max_duration()`.
+    /// The core stops the scan after `job.max_duration()`, or when the
+    /// agent is suspended or revoked, by dropping this future.
+    ///
+    /// TODO(P2-B / P2-C, security review L6): dropping the future does not
+    /// stop a statement already running on the server. Connectors must also
+    /// cancel it server-side on drop (PostgreSQL `CancelRequest` /
+    /// `pg_cancel_backend` through the client's cancel token, MySQL
+    /// `KILL QUERY` on a separate connection) and rely on the statement
+    /// timeout as the last bound.
     async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError>;
 
     /// Streams normalized access events into `sink` until stopped.
