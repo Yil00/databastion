@@ -297,13 +297,16 @@ export interface components {
         /** @description Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`. */
         Signal: string;
         /**
-         * @description `HMAC-SHA256(agent_local_key, normalized_value)`, lowercase hex. The key never leaves the agent,
-         *     so fingerprints only correlate values seen by the same agent.
+         * @description `HMAC-SHA256(agent_local_key, "databastion/fp/v1" 0x00 classifier_id 0x00 normalized_value)`,
+         *     lowercase hex, with `db_user` in place of the classifier id for `db_user_fingerprint`. The
+         *     domain separation keeps the same string under two classifiers, or as an account name, from
+         *     correlating. The key never leaves the agent, so fingerprints only correlate values seen by the
+         *     same agent.
          */
         Fingerprint: string;
         /**
-         * @description Sample masked by `classifiers::masking` (e.g. `j*******@e******.com`,
-         *     `FR76 **** **** **** **** ***1 89`). Schema rules: contains at least one `*`, no run of more than
+         * @description Sample masked by `classifiers::masking` (e.g. `j***@e***.com`,
+         *     `FR** **** **** **** **** ***0 189`). Schema rules: contains at least one `*`, no run of more than
          *     4 consecutive letters or digits, no combining mark, no control / format / private-use / line
          *     separator character. The console additionally requires at least 50 % of the non-separator characters (letters, digits
          *     and `*`; spaces and punctuation ignored) to be `*`: `06 ** ** ** 78` passes (6 of 10).
