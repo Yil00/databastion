@@ -373,18 +373,15 @@ async function mailpitReachable(): Promise<boolean> {
     });
   });
 }
-const mailpit = await mailpitReachable();
-if (!mailpit) {
+if (!MAILPIT) {
   // eslint-disable-next-line no-console -- test harness message
-  console.warn(
-    MAILPIT
-      ? `[smtp tests] Mailpit SKIPPED: ${MAILPIT} unreachable (start it with \`make dev\`).`
-      : "[smtp tests] Mailpit SKIPPED: set DATABASTION_TEST_SMTP=127.0.0.1:1025 (Mailpit from `make dev`) to run it.",
-  );
+  console.warn("[smtp tests] Mailpit SKIPPED: set DATABASTION_TEST_SMTP=127.0.0.1:1025 (Mailpit from `make dev`) to run it.");
 }
 
-describe.skipIf(!mailpit)("SMTP sender against Mailpit", () => {
+// Set but unreachable is a failure, not a skip (CI starts Mailpit and sets the variable).
+describe.skipIf(!MAILPIT)("SMTP sender against Mailpit", () => {
   it("delivers a message that Mailpit receives", async () => {
+    expect(await mailpitReachable(), `Mailpit unreachable at ${MAILPIT} although DATABASTION_TEST_SMTP is set`).toBe(true);
     const [host = "127.0.0.1", port = "1025"] = String(MAILPIT).split(":");
     const api = process.env.DATABASTION_TEST_MAILPIT_API ?? `http://${host}:8025`;
     const deliveryId = crypto.randomUUID();
