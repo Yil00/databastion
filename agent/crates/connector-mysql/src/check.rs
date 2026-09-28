@@ -10,7 +10,7 @@
 //!   statements only, easily missed).
 //! - **Full** needs the agent to read an audit log (MariaDB
 //!   `server_audit`, Percona / Enterprise `audit_log`) from the file
-//!   system. Its path is not configured before P4-A, so Full is never
+//!   system. Its path is not configured before P4-B, so Full is never
 //!   reported yet: an active audit plugin is only mentioned in the detail.
 //! - **None** otherwise.
 //!
@@ -52,6 +52,9 @@ const MAX_LOGGED_NAMES: usize = 20;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AuditProbe {
     pub(crate) ps_enabled: bool,
+    /// `performance_schema.setup_consumers` is readable (a grant on
+    /// `performance_schema`, Audit only).
+    pub(crate) consumers_readable: bool,
     pub(crate) history_long_enabled: bool,
     pub(crate) history_long_readable: bool,
     pub(crate) current_enabled: bool,
@@ -80,7 +83,7 @@ impl AuditProbe {
         if let Some((logging, file)) = self.server_audit {
             out.push(format!(
                 "server_audit active (logging {}, {} output); Full needs the agent to read its \
-                 log file (not configured before P4-A)",
+                 log file (not configured before P4-B)",
                 if logging { "ON" } else { "OFF" },
                 if file { "file" } else { "non-file" }
             ));
@@ -88,11 +91,13 @@ impl AuditProbe {
         if self.audit_log_plugin {
             out.push(
                 "audit_log plugin active; Full needs the agent to read its log file (not \
-                 configured before P4-A)"
+                 configured before P4-B)"
                     .to_owned(),
             );
         }
-        if self.ps_enabled && !self.history_long_enabled {
+        if self.ps_enabled && !self.consumers_readable {
+            out.push("performance_schema not readable by the account (no Audit grant)".to_owned());
+        } else if self.ps_enabled && !self.history_long_enabled {
             out.push(
                 "performance_schema events_statements_history_long consumer disabled".to_owned(),
             );
@@ -133,9 +138,11 @@ fn label(privilege: &str) -> String {
     }
 }
 
-/// Evaluates over-privilege. Returns closed labels.
-pub(crate) fn evaluate_privileges(g: &Grants) -> Vec<String> {
+/// Evaluates over-privilege. Returns (over-privileged, expected) closed
+/// labels; with the extended-variant flag, a global `SELECT` is expected.
+pub(crate) fn evaluate_privileges(g: &Grants, extended: bool) -> (Vec<String>, Vec<String>) {
     let mut over = Vec::new();
+    let mut expected = Vec::new();
     let mut global: BTreeSet<String> = BTreeSet::new();
     let mut grantable = false;
     for (p, gr) in &g.global {
@@ -145,12 +152,14 @@ pub(crate) fn evaluate_privileges(g: &Grants) -> Vec<String> {
             global.insert(label(&p));
         }
     }
-    if global.contains("SELECT") {
-        over.push(
-            "global SELECT (system tables readable, including mysql.user password hashes)"
-                .to_owned(),
-        );
-        global.remove("SELECT");
+    if global.remove("SELECT") {
+        let label = "global SELECT (system tables readable, including mysql.user password hashes)"
+            .to_owned();
+        if extended {
+            expected.push(label);
+        } else {
+            over.push(label);
+        }
     }
     if !global.is_empty() {
         over.push(format!(
@@ -189,13 +198,15 @@ pub(crate) fn evaluate_privileges(g: &Grants) -> Vec<String> {
             g.roles
         ));
     }
-    over
+    (over, expected)
 }
 
 /// Privileges and coverage of the account.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Report {
     pub(crate) over_privileged: Vec<String>,
+    /// Expected with the extended-variant flag.
+    pub(crate) expected: Vec<String>,
     /// The account name cannot be matched in the privilege tables.
     pub(crate) privileges_unknown: bool,
     pub(crate) init_connect: bool,
@@ -280,7 +291,8 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     if target.mysql_settings().tls == MysqlTlsMode::DisableInsecure {
         notes.push(
             "INSECURE: TLS disabled on a network connection (tls: disable_insecure): traffic \
-             in clear, read-only not guaranteed"
+             in clear, read-only not guaranteed, password scramble exposed to offline \
+             brute force"
                 .to_owned(),
         );
     }
@@ -314,7 +326,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     let level = probe.level();
     notes.extend(probe.notes());
     if state.due(&target.id) && !session.is_poisoned() {
-        match report(&mut session).await {
+        match report(&mut session, target.mysql_settings().extended_grants).await {
             Ok(r) => {
                 if state.store(target.id.clone(), r.clone()) {
                     log_report(target, &r);
@@ -352,6 +364,9 @@ fn summary(r: &Report) -> Vec<String> {
     if !r.over_privileged.is_empty() {
         out.push(format!("over-privileged: {}", r.over_privileged.join(", ")));
     }
+    if !r.expected.is_empty() {
+        out.push(format!("extended variant: {}", r.expected.join(", ")));
+    }
     if r.privileges_unknown {
         out.push("privileges not evaluated (account name not matched)".to_owned());
     }
@@ -384,6 +399,14 @@ fn log_report(target: &TargetConfig, r: &Report) {
             target_id = %target.id,
             over_privileged = r.over_privileged.join(", "),
             "the agent account is over-privileged"
+        );
+    }
+    if !r.expected.is_empty() {
+        tracing::warn!(
+            target_id = %target.id,
+            grants = r.expected.join(", "),
+            "extended grant variant: system tables with password hashes are readable by the \
+             agent account (the connector never reads them)"
         );
     }
     if r.init_connect {
@@ -450,6 +473,7 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
     }
     if p.ps_enabled {
         if let Some(rows) = optional(session, sql::PS_CONSUMERS).await? {
+            p.consumers_readable = true;
             for row in &rows {
                 let enabled = truthy(row.get(1).and_then(|v| v.as_deref()));
                 match row.first().and_then(|v| v.as_deref()) {
@@ -485,7 +509,7 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
     Ok(p)
 }
 
-async fn report(session: &mut Session) -> Result<Report, MyError> {
+async fn report(session: &mut Session, extended: bool) -> Result<Report, MyError> {
     let current = probe(session, sql::CURRENT_USER).await?;
     let current = cell(&current, 0, 0).unwrap_or_default().to_owned();
     // The grantee expression cannot match names with quotes or
@@ -533,8 +557,10 @@ async fn report(session: &mut Session) -> Result<Report, MyError> {
         }
     };
     let (_, coverage) = catalog::plan(&tables, |_, _| true);
+    let (over_privileged, expected) = evaluate_privileges(&grants, extended);
     Ok(Report {
-        over_privileged: evaluate_privileges(&grants),
+        over_privileged,
+        expected,
         privileges_unknown,
         init_connect,
         coverage,
@@ -560,7 +586,7 @@ mod tests {
             scoped: vec![s("hr", "SELECT"), s("performance_schema", "SELECT")],
             roles: 0,
         };
-        assert!(evaluate_privileges(&grants).is_empty());
+        assert_eq!(evaluate_privileges(&grants, false), (vec![], vec![]));
     }
 
     #[test]
@@ -571,10 +597,15 @@ mod tests {
             scoped: vec![s("performance_schema", "SELECT")],
             roles: 0,
         };
-        let over = evaluate_privileges(&grants);
+        let (over, expected) = evaluate_privileges(&grants, false);
         assert_eq!(over.len(), 2, "{over:?}");
+        assert!(expected.is_empty());
         assert!(over[0].starts_with("global SELECT"));
         assert_eq!(over[1], "global privileges: PROCESS, SHOW VIEW");
+        // Extended variant: global SELECT expected, PROCESS / SHOW VIEW not.
+        let (over, expected) = evaluate_privileges(&grants, true);
+        assert_eq!(over, ["global privileges: PROCESS, SHOW VIEW"]);
+        assert!(expected[0].starts_with("global SELECT"));
     }
 
     #[test]
@@ -589,7 +620,7 @@ mod tests {
             ],
             roles: 2,
         };
-        let over = evaluate_privileges(&grants);
+        let (over, _) = evaluate_privileges(&grants, true);
         for label in [
             "global privileges: FILE, SUPER",
             "SELECT on the mysql or sys system database",
@@ -606,6 +637,7 @@ mod tests {
     fn audit_level_is_proven_not_assumed() {
         let full = AuditProbe {
             ps_enabled: true,
+            consumers_readable: true,
             history_long_enabled: true,
             history_long_readable: true,
             current_enabled: true,
@@ -633,5 +665,11 @@ mod tests {
             ..full
         };
         assert_eq!(off.level(), AuditLevel::None);
+        let no_grant = AuditProbe {
+            ps_enabled: true,
+            ..AuditProbe::default()
+        };
+        assert_eq!(no_grant.level(), AuditLevel::None);
+        assert!(no_grant.notes()[0].contains("not readable by the account"));
     }
 }

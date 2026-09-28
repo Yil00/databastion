@@ -34,6 +34,8 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
 serde_json = "1"
 tracing-subscriber.workspace = true
+# Property tests of the protocol parsers and exchanges (src/proptests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

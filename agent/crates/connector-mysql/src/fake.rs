@@ -6,6 +6,7 @@ use tokio::io::DuplexStream;
 
 use crate::auth::{self, Channel, KnownPlugin, Refusal};
 use crate::conn::{AuthFail, Flow, Streamed, login, read_result};
+use crate::discover::{MAX_SAMPLE_BYTES, RowSampler, VALUE_OVERHEAD};
 use crate::proto::{self, PacketIo, ProtoError, cap};
 
 const PASSWORD: &[u8] = b"dev-only-fake-PASSWORD";
@@ -320,4 +321,48 @@ async fn a_consumer_can_stop_and_errors_end_the_result() {
         other => panic!("{other:?}"),
     }
     drop(client);
+}
+
+/// A hostile server that ignores the `LIMIT` and streams rows of empty
+/// values: the sampler stops at the limit, and empty values still count
+/// against the byte budget (M1).
+#[tokio::test]
+async fn a_server_ignoring_the_limit_is_stopped() {
+    let (mut client, mut server) = pair();
+    tokio::spawn(async move {
+        let _ = server.read().await.unwrap();
+        server.write(&[2]).await.unwrap();
+        server.write(&column_def(b"a")).await.unwrap();
+        server.write(&column_def(b"b")).await.unwrap();
+        server.write(&EOF).await.unwrap();
+        // Unbounded rows of an empty string and a NULL.
+        loop {
+            if server.write(&[0, 0xFB]).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut values = vec![Vec::new(), Vec::new()];
+    let mut sampler = RowSampler::new(200, 0, &mut values);
+    let r = read_result(&mut client, "SELECT a, b", |row| sampler.accept(row))
+        .await
+        .unwrap();
+    assert_eq!(r, Streamed::Stopped);
+    assert_eq!(sampler.rows, 200);
+    assert_eq!(sampler.bytes, 200 * 2 * VALUE_OVERHEAD);
+    assert_eq!(
+        sampler.stop,
+        Some("the server sent more rows than the LIMIT")
+    );
+    assert_eq!(values[0].len(), 200);
+    assert!(values[1].is_empty());
+
+    // Empty values alone reach the byte budget.
+    let mut values = vec![Vec::new()];
+    let mut sampler = RowSampler::new(u32::MAX, MAX_SAMPLE_BYTES - 3 * VALUE_OVERHEAD, &mut values);
+    for _ in 0..3 {
+        assert_eq!(sampler.accept(&[Some(&b""[..])]), Flow::Continue);
+    }
+    assert_eq!(sampler.accept(&[None]), Flow::Stop);
+    assert_eq!(sampler.stop, Some("sample byte budget reached"));
 }

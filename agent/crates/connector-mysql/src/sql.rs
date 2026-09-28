@@ -180,7 +180,8 @@ pub(crate) const MAX_COLUMNS: u32 = 4096;
 /// No statistics column (`TABLE_ROWS`, `DATA_LENGTH`…): computing them
 /// opens the table's handler, and a `FEDERATED` handler then connects to
 /// its remote server (verified on MySQL 8.4, I5). Row estimates are read
-/// per sampled table by [`table_rows`], filtered on local engines.
+/// per sampled table by [`table_rows`], once [`table_engine`] showed a local
+/// engine.
 pub(crate) const INTROSPECT: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
      FROM information_schema.TABLES t \
      WHERE LOWER(t.TABLE_SCHEMA) NOT IN \
@@ -188,22 +189,28 @@ pub(crate) const INTROSPECT: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABL
      ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME \
      LIMIT 100000";
 
-/// Engine and estimated rows of one table, only if its engine is still a
-/// local one (checked again in the sampling transaction). Columns: engine,
-/// estimated rows.
+/// Type and engine of one table (no statistics column: see
+/// [`INTROSPECT`]). Columns: type, engine.
+#[must_use]
+pub(crate) fn table_engine(schema: &str, table: &str) -> Option<String> {
+    Some(format!(
+        "SELECT t.TABLE_TYPE, t.ENGINE FROM information_schema.TABLES t \
+         WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}",
+        quote_str(schema)?,
+        quote_str(table)?
+    ))
+}
+
+/// Estimated rows of one table. Computing `TABLE_ROWS` opens the table's
+/// handler (MariaDB does so before applying any `ENGINE` filter): only
+/// sent for a table whose engine [`table_engine`] showed to be local.
 #[must_use]
 pub(crate) fn table_rows(schema: &str, table: &str) -> Option<String> {
-    let engines: Vec<String> = crate::catalog::LOCAL_ENGINES
-        .iter()
-        .map(|e| format!("'{e}'"))
-        .collect();
     Some(format!(
-        "SELECT t.ENGINE, t.TABLE_ROWS FROM information_schema.TABLES t \
-         WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {} \
-           AND t.TABLE_TYPE IN ('BASE TABLE', 'SYSTEM VERSIONED') AND t.ENGINE IN ({})",
+        "SELECT t.TABLE_ROWS FROM information_schema.TABLES t \
+         WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}",
         quote_str(schema)?,
-        quote_str(table)?,
-        engines.join(", ")
+        quote_str(table)?
     ))
 }
 
@@ -443,11 +450,7 @@ mod tests {
         ] {
             assert!(!INTROSPECT.contains(column), "{column}");
         }
-        let rows = table_rows("hr", "t").unwrap();
-        assert!(
-            rows.contains("t.ENGINE IN ('InnoDB', 'MyISAM', 'Aria'"),
-            "{rows}"
-        );
+        assert!(!table_engine("hr", "t").unwrap().contains("TABLE_ROWS"));
     }
 
     #[test]
@@ -475,6 +478,7 @@ mod tests {
             kill_query(42),
             INTROSPECT.to_owned(),
             columns("hr", "employees").unwrap(),
+            table_engine("hr", "employees").unwrap(),
             table_rows("hr", "employees").unwrap(),
             CURRENT_USER.to_owned(),
             USER_PRIVILEGES.to_owned(),

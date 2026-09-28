@@ -17,7 +17,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, `agent.yaml`, enrollment, runtime (heartbeat / jobs), crate-private HTTPS uplink and session |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B); Audit is P4-A |
-| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C); Audit is P4-A |
+| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C); Audit is P4-B |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
@@ -272,16 +272,30 @@ Behavior:
   (definer code), `FEDERATED` / `CONNECT` / `SPIDER` / `S3` / `SPHINX` / NDB tables (I5),
   merge tables or other engines; never virtual generated columns; a partitioned table is one
   table. The introspection reads no statistics column (`TABLE_ROWS` opens the handler, and a
-  `FEDERATED` handler connects to its remote server): row estimates are read per sampled table,
-  filtered on local engines, which also re-checks the engine in the sampling transaction;
-- sampling: `LIMIT sample_rows` (no `ORDER BY RAND()`: a full scan and sort), text columns as
-  `LEFT(col, 4096)`, values cut to 4096 bytes in Rust; character, JSON, `int` / `bigint` /
-  `decimal` and `date` columns only;
+  `FEDERATED` handler connects to its remote server; MariaDB opens the table before applying an
+  `ENGINE` filter): in the sampling transaction the engine is read alone and checked again, and
+  `TABLE_ROWS` is only asked for a local table;
+- sampling: `LIMIT sample_rows` (no `ORDER BY RAND()`: a full scan and sort), also enforced on
+  the client (a server sending more rows is stopped); text columns as `LEFT(col, 4096)`, values
+  cut to 4096 bytes in Rust; every value charged its length plus 16 bytes to the budget (NULL and
+  empty values included); at most 1024 columns per statement, so that a row stays far below the
+  largest accepted packet (40 MiB); a table whose row is still too large is skipped and reported
+  as not covered, the scan goes on; character, JSON, `int` / `bigint` / `decimal` and `date`
+  columns only;
 - `check()`: reachability; audit level Partial with the `events_statements_history_long`
   consumer readable, Limited with the per-thread consumers only, Full never before the audit
-  log path exists (P4-A; an active `server_audit` / `audit_log` is noted); over-privilege
-  (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`, `WITH GRANT
-  OPTION`, `SELECT` on `mysql` / `sys`, roles), `init_connect`, and coverage (views, engines).
+  log path exists (P4-B; an active `server_audit` / `audit_log` is noted), None when the
+  account cannot read `performance_schema` (the ADR-0018 minimal variant before Audit);
+  over-privilege (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`,
+  `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, roles), `init_connect`, and coverage (views,
+  engines). With `extended_grants: true` on the target (ADR-0018 extended variant), a global
+  `SELECT` is an expected warning instead of over-privilege; the system schemas are never read
+  either way.
+
+`disable_insecure` accepts the `caching_sha2_password` fast path only, and its scramble
+(SHA-256, no key stretching) can be brute-forced offline by anyone who sees it; an attacker on the
+path can force that exchange with an auth switch. Use it only on an isolated network, with a long
+random password.
 
 Target settings: the `mysql` block of a target in `agent.example.yaml`. Integration tests
 (`src/it.rs`) run against the dev environment (`make dev`, see

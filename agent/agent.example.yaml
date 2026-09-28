@@ -77,9 +77,13 @@ targets:
       #   the host.
       # disable: Unix socket or loopback IP literal only (required for a socket)
       # disable_insecure: no TLS on a network, explicit opt-in (warned); only
-      #   the caching_sha2_password fast path is accepted
+      #   the caching_sha2_password fast path is accepted, and its scramble can
+      #   be brute-forced offline by an observer
       tls: verify_full
       # ca_file: /etc/databastion/mariadb-ca.pem   # only trusted root for this target
+      # ADR-0018 extended grant variant (SELECT ON *.*): check() then reports the
+      # global SELECT as an expected warning instead of over-privilege.
+      extended_grants: false
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

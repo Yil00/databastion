@@ -29,6 +29,13 @@ use crate::sql::{self, Sampled};
 pub(crate) const MAX_SAMPLE_BYTES: usize = 32 * 1024 * 1024;
 /// Longest value handed to the classifiers, in bytes.
 pub(crate) const MAX_VALUE_BYTES: usize = 4096;
+/// Bytes charged to the budget for every sampled value on top of its
+/// length (NULL and empty values included).
+pub(crate) const VALUE_OVERHEAD: usize = 16;
+/// Most columns per sampling statement: a text value is at most 4096
+/// characters (16 KiB in utf8mb4, plus its length prefix), so a row of a
+/// batch stays under 17 MiB, below `proto::MAX_LOGICAL`.
+pub(crate) const MAX_BATCH_COLUMNS: usize = 1024;
 
 /// Normalizes a catalog name (ADR-0009). A MySQL identifier is one key: a
 /// name containing a dot becomes `*`.
@@ -122,6 +129,17 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         }
         let sample = match sampled {
             Ok(s) => s,
+            Err(e) if !e.fatal && e.code == FailureCode::ResourceLimit => {
+                skipped += 1;
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = db.as_str(),
+                    object = object.as_str(),
+                    reason = "a row larger than the connector accepts",
+                    "object not covered"
+                );
+                continue;
+            }
             Err(e) if !e.fatal => {
                 skipped += 1;
                 tracing::warn!(
@@ -250,6 +268,56 @@ impl std::fmt::Debug for TableSample {
     }
 }
 
+/// Accepts the rows of one sampling statement: at most `limit` rows (a
+/// server that ignores the `LIMIT` is stopped), and at most
+/// [`MAX_SAMPLE_BYTES`] per table, counting every value's length plus
+/// [`VALUE_OVERHEAD`] (so rows of NULL or empty values are bounded too).
+pub(crate) struct RowSampler<'v> {
+    limit: u32,
+    pub(crate) rows: u32,
+    /// Bytes charged so far for the table (all batches).
+    pub(crate) bytes: usize,
+    pub(crate) stop: Option<&'static str>,
+    values: &'v mut [Vec<RawValue>],
+}
+
+impl<'v> RowSampler<'v> {
+    pub(crate) fn new(limit: u32, bytes: usize, values: &'v mut [Vec<RawValue>]) -> Self {
+        Self {
+            limit,
+            rows: 0,
+            bytes,
+            stop: None,
+            values,
+        }
+    }
+
+    pub(crate) fn accept(&mut self, row: &[Option<&[u8]>]) -> Flow {
+        if self.rows >= self.limit {
+            self.stop = Some("the server sent more rows than the LIMIT");
+            return Flow::Stop;
+        }
+        let row_bytes: usize = row
+            .iter()
+            .map(|v| v.map_or(0, <[u8]>::len).saturating_add(VALUE_OVERHEAD))
+            .fold(0, usize::saturating_add);
+        // Budget checked per row, before decoding it. The row itself was
+        // already received whole: one row is the residual peak.
+        if self.bytes.saturating_add(row_bytes) > MAX_SAMPLE_BYTES {
+            self.stop = Some("sample byte budget reached");
+            return Flow::Stop;
+        }
+        self.bytes = self.bytes.saturating_add(row_bytes);
+        self.rows = self.rows.saturating_add(1);
+        for (raw, out) in row.iter().zip(self.values.iter_mut()) {
+            if let Some(v) = raw.and_then(decode_value) {
+                out.push(RawValue::new(v));
+            }
+        }
+        Flow::Continue
+    }
+}
+
 /// Reads the columns and a sample of one table in one read-only
 /// transaction, committed (or, after a budget stop, abandoned with the
 /// session) before returning.
@@ -284,22 +352,38 @@ async fn read_table(
         estimated_rows: None,
     };
     // The engine is checked again in this transaction (a table altered to
-    // a remote engine since the introspection is not read).
-    let statement = sql::table_rows(&table.schema, &table.name)
+    // a remote engine since the introspection is not read). The engine is
+    // read alone first: computing `TABLE_ROWS` opens the table's handler
+    // (a FEDERATED handler connects out), so it is only asked for a table
+    // whose engine is local.
+    let statement = sql::table_engine(&table.schema, &table.name)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Columns))?;
-    let Some(row) = tx
+    let engine = tx
         .query(Stage::Columns, &statement)
         .await?
         .into_iter()
         .next()
-    else {
+        .and_then(|row| {
+            let kind = row.first().cloned().flatten().unwrap_or_default();
+            let engine = row.get(1).cloned().flatten();
+            matches!(kind.as_str(), "BASE TABLE" | "SYSTEM VERSIONED").then_some(engine)
+        });
+    if engine.is_none_or(|e| catalog::engine_skip(e.as_deref()).is_some()) {
         tracing::warn!("table gone or no longer on a local engine: not sampled");
         return Err(MyError {
             fatal: false,
             ..MyError::new(FailureCode::Internal, Stage::Columns)
         });
-    };
-    sample.estimated_rows = row.get(1).cloned().flatten().and_then(|r| r.parse().ok());
+    }
+    let statement = sql::table_rows(&table.schema, &table.name)
+        .ok_or(MyError::new(FailureCode::Internal, Stage::Columns))?;
+    sample.estimated_rows = tx
+        .query(Stage::Columns, &statement)
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|row| row.first().cloned().flatten())
+        .and_then(|r| r.parse().ok());
     let statement = sql::columns(&table.schema, &table.name)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Columns))?;
     let rows = tx.query(Stage::Columns, &statement).await?;
@@ -332,39 +416,44 @@ async fn read_table(
     if cols.is_empty() {
         return Ok(sample);
     }
-    let selected: Vec<(&str, Sampled)> = cols.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-    let statement = sql::sample_statement(
-        tx.flavor(),
-        tx.timeouts().statement_ms(),
-        &table.schema,
-        &table.name,
-        &selected,
-        limit,
-    )
-    .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
     let mut values: Vec<Vec<RawValue>> = cols.iter().map(|_| Vec::new()).collect();
-    let mut rows = 0u32;
     let mut bytes = 0usize;
-    let streamed = tx
-        .query_stream(Stage::Sample, &statement, |row| {
-            let row_bytes: usize = row.iter().map(|v| v.map_or(0, <[u8]>::len)).sum();
-            // Budget checked per row, before decoding it. The row itself
-            // was already received whole: one row is the residual peak.
-            if bytes.saturating_add(row_bytes) > MAX_SAMPLE_BYTES {
-                return Flow::Stop;
-            }
-            bytes += row_bytes;
-            rows += 1;
-            for (raw, out) in row.iter().zip(values.iter_mut()) {
-                if let Some(v) = raw.and_then(decode_value) {
-                    out.push(RawValue::new(v));
-                }
-            }
-            Flow::Continue
-        })
-        .await?;
-    if streamed == Streamed::Stopped {
-        tracing::info!(rows, "sample byte budget reached: statement killed");
+    let mut rows = 0u32;
+    // Columns in batches, so that one row of a batch stays well under the
+    // largest packet the connector accepts (a table with thousands of text
+    // columns cannot make a single row oversized and abort the scan).
+    for (batch, (cols_batch, values_batch)) in cols
+        .chunks(MAX_BATCH_COLUMNS)
+        .zip(values.chunks_mut(MAX_BATCH_COLUMNS))
+        .enumerate()
+    {
+        let selected: Vec<(&str, Sampled)> =
+            cols_batch.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        let statement = sql::sample_statement(
+            tx.flavor(),
+            tx.timeouts().statement_ms(),
+            &table.schema,
+            &table.name,
+            &selected,
+            limit,
+        )
+        .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
+        let mut sampler = RowSampler::new(limit, bytes, values_batch);
+        let streamed = tx
+            .query_stream(Stage::Sample, &statement, |row| sampler.accept(row))
+            .await?;
+        let (batch_rows, used, stop) = (sampler.rows, sampler.bytes, sampler.stop);
+        bytes = used;
+        rows = rows.max(batch_rows);
+        if streamed == Streamed::Stopped {
+            tracing::info!(
+                rows = batch_rows,
+                batch,
+                reason = stop.unwrap_or("stopped"),
+                "sample stopped: statement killed"
+            );
+            break;
+        }
     }
     sample.rows = rows;
     sample.columns = cols.into_iter().map(|(n, _)| n).zip(values).collect();
@@ -415,6 +504,12 @@ mod tests {
         }
         assert_eq!(sampled_kind("text"), Some(Sampled::Text));
         assert_eq!(sampled_kind("date"), Some(Sampled::Plain));
+    }
+
+    #[test]
+    fn a_batch_row_fits_in_a_packet() {
+        let text_value = 4 * sql::MAX_VALUE_CHARS as usize + 9;
+        assert!(MAX_BATCH_COLUMNS * text_value < crate::proto::MAX_LOGICAL / 2);
     }
 
     #[test]

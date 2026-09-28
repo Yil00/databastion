@@ -321,7 +321,9 @@ impl Session {
                     "TLS disabled on a network connection (tls: disable_insecure): samples and \
                      statements travel in clear, and read-only is not guaranteed (an attacker \
                      on the path can relay the authentication and send its own statements); \
-                     only the caching_sha2_password fast path is accepted"
+                     only the caching_sha2_password fast path is accepted, and its scramble \
+                     (SHA-256, no salt stretching) can be brute-forced offline by anyone who \
+                     sees it, which an attacker on the path can force with an auth switch"
                 );
                 None
             }
@@ -336,7 +338,7 @@ impl Session {
         })?;
         let mut io = PacketIo::new(transport);
         let handshake = io
-            .read()
+            .read_small()
             .await
             .and_then(|p| proto::parse_handshake(&p))
             .map_err(|e| MyError::from_proto(e, Stage::Connect))?;
@@ -454,6 +456,12 @@ impl Session {
                 "the server connection id differs from the handshake (proxy?): statements \
                  could not be killed",
             ),
+            (
+                // Read after TLS: the handshake that announced the flavor
+                // was not authenticated.
+                parse_version(&text(6)).map(|(f, _)| f) == Some(self.flavor),
+                "the server flavor differs from the handshake",
+            ),
             (timeout_ok, "statement timeout not applied"),
             (
                 !read_only || text(2) == "1",
@@ -532,7 +540,7 @@ impl Session {
         self.io
             .command(proto::COM_QUERY, statement.as_bytes())
             .await?;
-        let first = self.io.read().await?;
+        let first = self.io.read_small().await?;
         let out = match first.first() {
             Some(0x00) => proto::parse_ok(&first),
             Some(0xFF) => Err(ProtoError::Server(proto::parse_err(&first)?)),
@@ -716,7 +724,7 @@ where
     F: FnMut(&[Option<&[u8]>]) -> Flow,
 {
     io.command(proto::COM_QUERY, statement.as_bytes()).await?;
-    let first = io.read().await?;
+    let first = io.read_small().await?;
     let columns = match first.first() {
         Some(0x00) => return Ok(Streamed::Complete),
         Some(0xFF) => return Err(ProtoError::Server(proto::parse_err(&first)?)),
@@ -733,10 +741,10 @@ where
         }
     };
     for _ in 0..columns {
-        let def = io.read().await?;
+        let def = io.read_small().await?;
         proto::column_type(&def)?;
     }
-    let eof = io.read().await?;
+    let eof = io.read_small().await?;
     if !proto::is_eof(&eof) {
         return Err(ProtoError::Malformed);
     }
@@ -767,7 +775,7 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), AuthFail> {
     let mut plugin = plugin.to_vec();
     for _ in 0..8 {
-        let packet = io.read().await?;
+        let packet = io.read_small().await?;
         match packet.first() {
             Some(0x00) => return Ok(()),
             Some(0xFF) => return Err(ProtoError::Server(proto::parse_err(&packet)?).into()),
@@ -795,7 +803,9 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
                     if !channel.may_send_password() {
                         return Err(AuthFail::Refused(Refusal::FullAuthWithoutTls));
                     }
-                    let mut clear = Zeroizing::new(password.to_vec());
+                    // Capacity reserved first: the buffer never moves.
+                    let mut clear = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+                    clear.extend_from_slice(password);
                     clear.push(0);
                     io.write(&clear).await?;
                 }

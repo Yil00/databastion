@@ -96,7 +96,13 @@ impl MyError {
                 tracing::debug!(%kind, stage = stage.as_str(), "connection error");
                 Self::new(FailureCode::TargetUnreachable, stage)
             }
-            ProtoError::TooLarge => Self::new(FailureCode::ResourceLimit, stage),
+            // An oversized row while sampling ends that table only (the
+            // session is poisoned and replaced); anywhere else the session
+            // is unusable.
+            ProtoError::TooLarge => Self {
+                fatal: stage != Stage::Sample,
+                ..Self::new(FailureCode::ResourceLimit, stage)
+            },
             ProtoError::Malformed => Self::new(FailureCode::Internal, stage),
         }
     }
@@ -163,6 +169,13 @@ pub(crate) fn failure_of(errno: u16) -> FailureCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_row_only_skips_its_table() {
+        let e = MyError::from_proto(ProtoError::TooLarge, Stage::Sample);
+        assert_eq!((e.code, e.fatal), (FailureCode::ResourceLimit, false));
+        assert!(MyError::from_proto(ProtoError::TooLarge, Stage::Introspection).fatal);
+    }
 
     #[test]
     fn error_numbers_map_to_closed_codes() {

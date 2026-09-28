@@ -41,13 +41,27 @@ pub(crate) fn verify_full(ca_file: Option<&Path>) -> Result<Arc<ClientConfig>, T
             }
         }
         None => {
+            // The system store is loaded once per process (every session,
+            // including `KILL QUERY` sessions, builds a configuration); a
+            // failure is not cached.
+            static SYSTEM: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+            if let Some(config) = SYSTEM.get() {
+                return Ok(Arc::clone(config));
+            }
             let native = rustls_native_certs::load_native_certs();
             let (added, _) = roots.add_parsable_certificates(native.certs);
             if added == 0 {
                 return Err(TlsSetupError::NoRoots);
             }
+            let config = build(roots)?;
+            let _ = SYSTEM.set(Arc::clone(&config));
+            return Ok(config);
         }
     }
+    build(roots)
+}
+
+fn build(roots: rustls::RootCertStore) -> Result<Arc<ClientConfig>, TlsSetupError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

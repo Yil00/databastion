@@ -28,6 +28,11 @@ const MAX_PHYSICAL: usize = 0xFF_FFFF;
 /// Largest logical packet (a row) accepted from the server. A larger row is
 /// a protocol error: the statement is killed and the session dropped.
 pub(crate) const MAX_LOGICAL: usize = 40 * 1024 * 1024;
+/// Largest non-row packet accepted (handshake, authentication, OK / EOF /
+/// error, column definitions).
+pub(crate) const MAX_SMALL: usize = 64 * 1024;
+/// Growth step of a packet buffer.
+const READ_CHUNK: usize = 64 * 1024;
 /// `max_packet_size` announced to the server.
 const CLIENT_MAX_PACKET: u32 = 64 * 1024 * 1024;
 /// `utf8mb4_general_ci`: exists on MySQL 5.5.3+ and every MariaDB.
@@ -348,15 +353,8 @@ pub(crate) fn handshake_response(
     auth: &[u8],
     plugin: &[u8],
 ) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(ssl_request(capabilities));
-    out.extend_from_slice(user.as_bytes());
-    out.push(0);
-    put_lenenc(&mut out, auth.len() as u64);
-    out.extend_from_slice(auth);
-    out.extend_from_slice(plugin);
-    out.push(0);
+    let mut attrs = Vec::new();
     if capabilities & cap::CONNECT_ATTRS != 0 {
-        let mut attrs = Vec::new();
         for (k, v) in [
             ("_client_name", "databastion-agent"),
             ("program_name", "databastion-agent"),
@@ -366,9 +364,23 @@ pub(crate) fn handshake_response(
             put_lenenc(&mut attrs, v.len() as u64);
             attrs.extend_from_slice(v.as_bytes());
         }
+    }
+    // The final size is reserved up front: the buffer never moves, so no
+    // copy of the scramble is left in freed memory.
+    let size = 32 + user.len() + 1 + 9 + auth.len() + plugin.len() + 1 + 9 + attrs.len();
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
+    out.extend_from_slice(&ssl_request(capabilities));
+    out.extend_from_slice(user.as_bytes());
+    out.push(0);
+    put_lenenc(&mut out, auth.len() as u64);
+    out.extend_from_slice(auth);
+    out.extend_from_slice(plugin);
+    out.push(0);
+    if capabilities & cap::CONNECT_ATTRS != 0 {
         put_lenenc(&mut out, attrs.len() as u64);
         out.extend_from_slice(&attrs);
     }
+    debug_assert!(out.len() <= size);
     out
 }
 
@@ -431,6 +443,21 @@ pub(crate) fn parse_row(payload: &[u8], columns: usize) -> Result<Vec<Option<&[u
     Ok(out)
 }
 
+/// Makes room for `additional` bytes without leaving a copy behind: when
+/// the buffer must move, the new one is allocated first, the bytes copied,
+/// and the old one zeroized (dropped as `Zeroizing`).
+fn reserve_zeroizing(buf: &mut Zeroizing<Vec<u8>>, additional: usize) {
+    let needed = buf.len().saturating_add(additional);
+    if needed <= buf.capacity() {
+        return;
+    }
+    let capacity = needed.max(buf.capacity().saturating_mul(2));
+    let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+    grown.extend_from_slice(buf);
+    std::mem::swap(buf, &mut grown);
+    // `grown` (the old buffer) is zeroized here.
+}
+
 /// Packet framing with sequence ids over a byte stream.
 pub(crate) struct PacketIo<S> {
     pub(crate) stream: S,
@@ -447,9 +474,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketIo<S> {
         self.seq = 0;
     }
 
-    /// Reads one logical packet (joining `0xFFFFFF`-byte continuations).
-    /// The buffer is zeroized on drop (rows carry sampled values).
+    /// Reads one logical packet of at most [`MAX_LOGICAL`] bytes (a row).
     pub(crate) async fn read(&mut self) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
+        self.read_max(MAX_LOGICAL).await
+    }
+
+    /// Reads one logical packet of at most [`MAX_SMALL`] bytes (handshake,
+    /// authentication, OK / EOF / error, column definitions).
+    pub(crate) async fn read_small(&mut self) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
+        self.read_max(MAX_SMALL).await
+    }
+
+    /// Reads one logical packet (joining `0xFFFFFF`-byte continuations) of
+    /// at most `max` bytes. The buffer grows as bytes arrive, in chunks of
+    /// [`READ_CHUNK`], never from the announced length alone (a lying
+    /// header costs no memory), and every buffer it outgrows is zeroized
+    /// (rows carry sampled values); the result is zeroized on drop.
+    pub(crate) async fn read_max(&mut self, max: usize) -> Result<Zeroizing<Vec<u8>>, ProtoError> {
         let mut out = Zeroizing::new(Vec::new());
         loop {
             let mut header = [0u8; 4];
@@ -460,12 +501,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PacketIo<S> {
                 return Err(ProtoError::Malformed);
             }
             self.seq = self.seq.wrapping_add(1);
-            if out.len() + len > MAX_LOGICAL {
+            if out.len().saturating_add(len) > max {
                 return Err(ProtoError::TooLarge);
             }
-            let start = out.len();
-            out.resize(start + len, 0);
-            self.stream.read_exact(&mut out[start..]).await?;
+            let mut remaining = len;
+            while remaining > 0 {
+                let n = remaining.min(READ_CHUNK);
+                reserve_zeroizing(&mut out, n);
+                let start = out.len();
+                out.resize(start + n, 0);
+                self.stream.read_exact(&mut out[start..]).await?;
+                remaining -= n;
+            }
             if len < MAX_PHYSICAL {
                 return Ok(out);
             }

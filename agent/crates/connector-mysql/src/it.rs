@@ -57,6 +57,10 @@ const MIN_USER: &str = "databastion_it_min";
 const SINK_USER: &str = "databastion_it_sink";
 const PAM_USER: &str = "databastion_it_pam";
 const AUTH_USER: &str = "databastion_it_auth";
+const EXT_USER: &str = "databastion_it_ext";
+/// SELECT on the probe database only (the dev agent account reads the
+/// seeded database only, ADR-0018 minimal variant).
+const SCAN_USER: &str = "databastion_it_scan";
 const IT_PASSWORD: &str = "dev-only-it-account-FAKE";
 
 #[derive(Debug, Clone)]
@@ -179,12 +183,17 @@ fn servers() -> Vec<Server> {
             );
             continue;
         };
+        // The dev agent account requires TLS (ADR-0018): without the CA,
+        // the server is not tested.
         let ca = var("CA_FILE");
         if ca.is_none() {
             skip(
                 &format!("{name}-tls"),
-                &format!("DATABASTION_TEST_{upper}_CA_FILE is not set (TLS tests)"),
+                &format!(
+                    "DATABASTION_TEST_{upper}_CA_FILE is not set (the dev account requires TLS)"
+                ),
             );
+            continue;
         }
         out.push(Server {
             name,
@@ -420,22 +429,22 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         let health = MysqlConnector::new().check(&t).await;
         assert!(health.reachable, "{}: {health:?}", server.name);
         assert_eq!(health.failure, None);
-        // The dev servers enable the statement history consumers: Partial.
-        // Never Full before the audit log path can be checked (P4-A).
+        // ADR-0018 minimal variant: no performance_schema grant before
+        // Audit (P4-B), so no audit source the account can read: None.
         assert_eq!(
             health.audit_level,
-            AuditLevel::Partial,
+            AuditLevel::None,
             "{}: {health:?}",
             server.name
         );
         let detail = health.detail.unwrap();
         eprintln!("{} check: {detail}", server.name);
-        // The documented dev grants (docs/05) are server-wide.
         assert!(
-            detail.contains("over-privileged: global SELECT")
-                && detail.contains("global privileges: PROCESS, SHOW VIEW"),
+            detail.contains("performance_schema not readable by the account"),
             "{detail}"
         );
+        // The dev account is not over-privileged.
+        assert!(!detail.contains("over-privileged"), "{detail}");
         if server.name == "mariadb" {
             assert!(
                 detail.contains("server_audit active (logging ON, file output)"),
@@ -539,9 +548,13 @@ async fn dropped_statement_is_killed_on_the_server() {
         let timeouts = Timeouts::new(Duration::from_secs(60));
 
         // Control: a statement whose future is dropped without the guard
-        // keeps running on the server.
+        // keeps running on the server (administrator account: the agent
+        // account is limited to 4 sessions).
         {
-            let mut plain = Session::connect_unguarded(&t, timeouts).await.unwrap();
+            let (_dir, admin_t) = target(&server, &admin.user, &admin.password);
+            let mut plain = Session::connect_unguarded(&admin_t, timeouts)
+                .await
+                .unwrap();
             let fut = plain.query(Stage::Sample, "SELECT SLEEP(4) /* it-control */");
             assert!(
                 tokio::time::timeout(Duration::from_millis(300), fut)
@@ -763,7 +776,7 @@ async fn probe_fixtures(server: &Server, admin: &Url) -> bool {
     ] {
         exec(&mut a, &statement).await;
     }
-    for user in [RW_USER, MIN_USER, SINK_USER] {
+    for user in [RW_USER, MIN_USER, SINK_USER, SCAN_USER] {
         exec(&mut a, &format!("DROP USER IF EXISTS '{user}'@'%'")).await;
         let plugin = match server.flavor() {
             Flavor::Mysql => "IDENTIFIED WITH caching_sha2_password BY",
@@ -821,6 +834,24 @@ async fn probe_fixtures(server: &Server, admin: &Url) -> bool {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // M2: 2600 text columns of 4096 4-byte characters in one row
+        // (about 42 MB, over the largest packet the connector accepts):
+        // sampled in column batches, so the row never has to fit in one
+        // packet and the scan goes on.
+        format!(
+            "CREATE TABLE {p}.a_many (email VARCHAR(120), {}) ENGINE=MyISAM",
+            (0..2600)
+                .map(|i| format!("m{i} MEDIUMTEXT"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!(
+            "INSERT INTO {p}.a_many SELECT 'many.user@example.com', {}",
+            (0..2600)
+                .map(|_| "REPEAT('\u{1F600}', 4096)".to_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         // The sink of the FEDERATED table.
         format!("CREATE TABLE {SINK_DB}.src (email VARCHAR(120)) ENGINE=InnoDB"),
         format!("INSERT INTO {SINK_DB}.src VALUES ('sink.user@example.com')"),
@@ -829,6 +860,7 @@ async fn probe_fixtures(server: &Server, admin: &Url) -> bool {
         // over-privilege), one with SELECT on one table only.
         format!("GRANT SELECT, INSERT, EXECUTE ON {p}.* TO '{RW_USER}'@'%'"),
         format!("GRANT SELECT ON {p}.people TO '{MIN_USER}'@'%'"),
+        format!("GRANT SELECT ON {p}.* TO '{SCAN_USER}'@'%'"),
         format!("GRANT SELECT ON performance_schema.* TO '{MIN_USER}'@'%'"),
     ] {
         exec(&mut a, &statement).await;
@@ -886,7 +918,7 @@ async fn probes() {
         };
         let federated = probe_fixtures(&server, &admin).await;
         let mut a = admin_session(&server, &admin).await;
-        let (_dir, t) = agent_target(&server);
+        let (_dir, t) = target(&server, SCAN_USER, IT_PASSWORD);
         let db = normalize(PROBE_DB).as_str().to_owned();
 
         // Control for the FEDERATED probe: a read through the table
@@ -987,6 +1019,14 @@ async fn probes() {
             lingering, 0,
             "{}: the stopped sample still runs",
             server.name
+        );
+        // M2: the very wide row is sampled in batches (its first batch
+        // holds the e-mail column), the second batch stops at the byte
+        // budget; no row was refused as oversized, and the scan went on.
+        assert_eq!(sampled(&findings, &db, "a_many", "email"), Some(1));
+        assert!(
+            !text.contains("a row larger than the connector accepts"),
+            "{text}"
         );
         // No system schema is ever sampled.
         for k in &found {
@@ -1173,6 +1213,90 @@ async fn authentication_refusals() {
                 }
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn extended_variant_is_an_expected_warning_and_reads_no_system_table() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        exec(&mut a, &format!("DROP USER IF EXISTS '{EXT_USER}'@'%'")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{EXT_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        exec(&mut a, &format!("GRANT SELECT ON *.* TO '{EXT_USER}'@'%'")).await;
+        // Secrets in system tables the extended account can read (the
+        // connector must never output them): a server definition password
+        // (`mysql.servers`) and the textual password hashes.
+        exec(&mut a, "DROP SERVER IF EXISTS databastion_it_srv").await;
+        exec(
+            &mut a,
+            "CREATE SERVER databastion_it_srv FOREIGN DATA WRAPPER mysql \
+             OPTIONS (USER 'u', PASSWORD 'ServerPwMarker-FAKE', HOST '192.0.2.1')",
+        )
+        .await;
+        let mut hashes: Vec<String> = a
+            .query(
+                Stage::Check,
+                "SELECT authentication_string FROM mysql.user \
+                 WHERE CHAR_LENGTH(authentication_string) > 0",
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .collect();
+        hashes.push("ServerPwMarker-FAKE".to_owned());
+        let with_flag = format!("{}, extended_grants: true", server.tls());
+        let (_dir, t) = target_tls(&server, EXT_USER, IT_PASSWORD, &with_flag);
+        let logs = Logs::default();
+        let (r, findings, health) = {
+            let _guard = logs.capture();
+            let (r, findings) = scan(&t).await;
+            let health = MysqlConnector::new().check(&t).await;
+            (r, findings, health)
+        };
+        r.unwrap();
+        let detail = health.detail.clone().unwrap();
+        assert!(
+            detail.contains("extended variant: global SELECT"),
+            "{}: {detail}",
+            server.name
+        );
+        assert!(!detail.contains("over-privileged"), "{detail}");
+        // Every database readable, never a system one.
+        let found = located(&findings);
+        assert!(found.iter().any(|k| k.0 == server.url.dbname));
+        for k in &found {
+            assert!(
+                !["mysql", "sys", "information_schema", "performance_schema"]
+                    .contains(&k.0.as_str()),
+                "{k:?}"
+            );
+        }
+        let output = format!("{findings:?}\n{health:?}\n{}", logs.text());
+        for hash in &hashes {
+            assert!(
+                !output.contains(hash.as_str()),
+                "a password hash in agent output"
+            );
+        }
+        // Same account without the flag: over-privileged.
+        let (_dir, t) = target(&server, EXT_USER, IT_PASSWORD);
+        let detail = MysqlConnector::new().check(&t).await.detail.unwrap();
+        assert!(
+            detail.contains("over-privileged: global SELECT"),
+            "{}: {detail}",
+            server.name
+        );
+        exec(&mut a, &format!("DROP USER '{EXT_USER}'@'%'")).await;
+        exec(&mut a, "DROP SERVER databastion_it_srv").await;
     }
 }
 

@@ -7,8 +7,8 @@
 //!   the ADR-0009 normalizer; only masked findings reach the sink (I2).
 //! - [`check`](Connector::check): reachability, honest audit level (docs/08:
 //!   `performance_schema` history = Partial; audit plugins are reported but
-//!   Full needs the audit log file, P4-A), over-privilege and coverage.
-//! - Audit (`audit_stream`) is P4-A: not implemented.
+//!   Full needs the audit log file, P4-B), over-privilege and coverage.
+//! - Audit (`audit_stream`) is P4-B: not implemented.
 //!
 //! The connector only reads (I4): read-only transactions and session
 //! default, statement timeouts on every query (`max_execution_time` /
@@ -36,6 +36,8 @@ mod tls;
 mod fake;
 #[cfg(test)]
 mod it;
+#[cfg(test)]
+mod proptests;
 
 use async_trait::async_trait;
 use databastion_core::config::TargetConfig;
