@@ -17,6 +17,7 @@ import {
   handleLogout,
   handleRevokeAgent,
   handleRevokeToken,
+  handleRotateAgent,
   handleSession,
   loginFailuresPerIp,
   loginFailuresPerUser,
@@ -231,6 +232,28 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     const [row] = await getDb().select().from(agents).where(eq(agents.id, a.agentId));
     expect(row?.status).toBe("revoked");
     expect(await auditCount("agent.revoke")).toBeGreaterThanOrEqual(1);
+  });
+
+  it("queues a secret rotation (admin, CSRF), refused while one is in progress", async () => {
+    const s = await login();
+    const a = await enroll("rotate-host");
+    const path = `/api/agents/${a.agentId}/rotate`;
+    const noCsrf = await handleRotateAgent(userReq("POST", path, { cookie: s.cookie }), a.agentId);
+    expect(noCsrf.status).toBe(403);
+    const res = await handleRotateAgent(userReq("POST", path, { cookie: s.cookie, csrf: s.csrf }), a.agentId);
+    expect(res.status).toBe(202);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = (await res.json()) as { job_id: string };
+    expect(body.job_id).toMatch(/^[0-9a-f-]{36}$/);
+    const again = await handleRotateAgent(userReq("POST", path, { cookie: s.cookie, csrf: s.csrf }), a.agentId);
+    expect(again.status).toBe(409);
+    expect(await auditCount("agent.rotate_request")).toBe(1);
+    expect(await auditCount("agent.rotate_request", "failure")).toBe(1);
+    const unknown = await handleRotateAgent(
+      userReq("POST", "/api/agents/x/rotate", { cookie: s.cookie, csrf: s.csrf }),
+      "not-a-uuid",
+    );
+    expect(unknown.status).toBe(404);
   });
 
   it("logs out: session deleted, cookie cleared, audited", async () => {

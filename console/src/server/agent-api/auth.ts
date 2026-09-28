@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
@@ -11,10 +11,12 @@ import {
   safeEqual,
   sha256Hex,
 } from "@/server/crypto";
+import { writeAudit } from "@/server/audit";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket } from "@/server/request";
 
 import { rateLimited, unauthorized, unavailable } from "./errors";
+import { jobHub, REVOKED_CHANNEL } from "./job-hub";
 
 /**
  * Agent authentication (contract `agentSecret` security scheme).
@@ -101,11 +103,101 @@ export function purgeSecretCache(agentId?: string): void {
 /** Agent ids with an unrecognized-secret verification in flight (bounded by the pool size). */
 const unrecognizedInFlight = new Set<string>();
 
-export type AuthResult = { ok: true; agent: AgentRow } | { ok: false; response: Response };
+/**
+ * Rotation (ADR-0008, ADR-0010): after promotion, the previous secret `S0` is answered `401` without
+ * incident during this window (requests in flight during the switch); `/rotate` retries with `S0`
+ * and the same `S1` inside it are duplicates. Any use of `S0` after it is a `rotation_conflict`.
+ */
+export const TOLERANCE_WINDOW_MS = 60_000;
+
+/**
+ * `stale`: `S0` presented after the tolerance window (`/rotate` only, see `allowPrevious`).
+ * Which stored secret the presented one matched:
+ * - `current`: the current secret (which is `S0` while a rotation is pending);
+ * - `pending`: the pending `S1`, promoted by this very request (first successful use);
+ * - `previous`: `S0` within the tolerance window after promotion. Only returned to `/rotate`
+ *   (`allowPrevious`); every other endpoint answers `401`.
+ * `matchedHash` is the stored hash the secret was verified against, so a handler can re-check the
+ * slot against a fresh row (a promotion may land between authentication and the handler).
+ */
+export type SecretSlot = "current" | "pending" | "previous";
+
+export type AuthResult =
+  | { ok: true; agent: AgentRow; via: SecretSlot; matchedHash: string; stale?: boolean }
+  | { ok: false; response: Response; staleSecret?: undefined }
+  /** `S0` used after the tolerance window: the caller locks the agent (`rotation_conflict`). */
+  | { ok: false; staleSecret: true; agentId: string; response?: undefined };
+
+export interface AuthOptions {
+  /** `/rotate` only: accept `S0` inside the tolerance window (the handler decides duplicate / conflict). */
+  allowPrevious?: boolean;
+}
 
 const agentKey = (agentId: string, ip: string | null) => (ip ? `${agentId}|${ip}` : agentId);
 
-export async function authenticateAgent(req: Request): Promise<AuthResult> {
+const loadAgent = async (agentId: string) =>
+  (await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1))[0];
+
+const active = (a: AgentRow | undefined): a is AgentRow & { currentSecretHash: string } =>
+  !!a && !!a.currentSecretHash && a.revokedAt === null && a.lockedAt === null;
+
+/**
+ * Promotes the pending secret (conditional on the row still holding `pendingHash` and
+ * `currentHash`, so concurrent promotions are idempotent). `S0` becomes the previous secret: it
+ * never authenticates again, it is only kept to tell a retry inside the window from a conflict,
+ * and to detect a later use of `S0` (replaced at the next promotion).
+ */
+export async function promotePending(
+  agentId: string,
+  currentHash: string,
+  pendingHash: string,
+  promotedAt: Date | "now",
+  trigger: "first_use" | "grace_expired",
+): Promise<void> {
+  const promoted = await getDb().transaction(async (tx) => {
+    const rows = await tx
+      .update(agents)
+      .set({
+        currentSecretHash: pendingHash,
+        previousSecretHash: currentHash,
+        pendingSecretHash: null,
+        // L1: every rotation instant uses the console (Node) clock, like the window checks.
+        promotedAt: promotedAt === "now" ? new Date() : promotedAt,
+        // L4: the deadline of this rotation, answered to late S0 + S1 retries (ADR-0011).
+        promotedGraceExpiresAt: sql`${agents.graceExpiresAt}`,
+      })
+      .where(
+        and(
+          eq(agents.id, agentId),
+          eq(agents.currentSecretHash, currentHash),
+          eq(agents.pendingSecretHash, pendingHash),
+          isNull(agents.revokedAt),
+          isNull(agents.lockedAt),
+        ),
+      )
+      .returning({ id: agents.id });
+    if (rows.length === 0) return false;
+    await writeAudit(tx, {
+      actorType: trigger === "first_use" ? "agent" : "system",
+      actorId: trigger === "first_use" ? agentId : null,
+      action: "agent.secret_promote",
+      targetType: "agent",
+      targetId: agentId,
+      details: { trigger },
+    });
+    return true;
+  });
+  // The cache entries are bound to the old current hash: they are dead already; purge anyway.
+  purgeSecretCache(agentId);
+  // Only the request that actually promoted wakes the polls (a lost race changes nothing).
+  if (!promoted) return;
+  // L2: wake held long-polls here and in every console process; each one re-checks that the secret
+  // it was opened with is still the current one (polls opened with S0 are closed).
+  jobHub.closeAgent(agentId);
+  await getDb().execute(sql`select pg_notify(${REVOKED_CHANNEL}, ${agentId})`);
+}
+
+export async function authenticateAgent(req: Request, opts: AuthOptions = {}): Promise<AuthResult> {
   const ip = clientIp(req);
   const ipKey = ip ? ipBucket(ip) : null;
   const headerId = req.headers.get("x-databastion-agent-id");
@@ -135,12 +227,18 @@ export async function authenticateAgent(req: Request): Promise<AuthResult> {
   const key = agentKey(agentId, ipKey);
   if (!AGENT_SECRET_FORMAT.test(secret) || isLowEntropySecret(secret)) return cheapFailure(key);
 
-  const [agent] = await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1);
-  const storedHash = agent?.currentSecretHash;
-  if (!agent || !storedHash || agent.revokedAt !== null || agent.lockedAt !== null) {
-    return cheapFailure(key);
+  let agent = await loadAgent(agentId);
+  if (!active(agent)) return cheapFailure(key);
+  // Grace deadline reached without any use of S1: promotion at the deadline (ADR-0008).
+  if (agent.pendingSecretHash && agent.graceExpiresAt && agent.graceExpiresAt.getTime() <= Date.now()) {
+    await promotePending(agentId, agent.currentSecretHash, agent.pendingSecretHash, agent.graceExpiresAt, "grace_expired");
+    agent = await loadAgent(agentId);
+    if (!active(agent)) return cheapFailure(key);
   }
-  if (verified.matches(agentId, secret, storedHash)) return { ok: true, agent };
+  const storedHash = agent.currentSecretHash;
+  if (verified.matches(agentId, secret, storedHash)) {
+    return { ok: true, agent, via: "current", matchedHash: storedHash };
+  }
 
   // Expensive path. Everything up to argon2Verify is synchronous: reservations cannot race.
   const exempt = knownGood.matches(agentId, secret, storedHash);
@@ -168,22 +266,46 @@ export async function authenticateAgent(req: Request): Promise<AuthResult> {
     refundAgent();
     return { ok: false, response: unavailable() };
   }
-  let ok: boolean;
+  // Candidates, in order, under the same pool slot (one attempt for the rate limits). A known-good
+  // secret is the current one by construction: nothing else to try.
+  const candidates: [SecretSlot, string][] = [["current", storedHash]];
+  if (!exempt && agent.pendingSecretHash) candidates.push(["pending", agent.pendingSecretHash]);
+  if (!exempt && agent.previousSecretHash) candidates.push(["previous", agent.previousSecretHash]);
+  let match: [SecretSlot, string] | undefined;
   try {
-    ok = await argon2Verify(storedHash, secret);
+    for (const candidate of candidates) {
+      if (await argon2Verify(candidate[1], secret)) {
+        match = candidate;
+        break;
+      }
+    }
   } finally {
     release();
   }
-  if (!ok) return denied();
+  if (!match) return denied();
+  const [slot, matchedHash] = match;
 
-  // Re-read: a revocation may have landed during the (slow) verification.
-  const [fresh] = await getDb().select().from(agents).where(eq(agents.id, agentId)).limit(1);
-  if (!fresh || fresh.currentSecretHash !== storedHash || fresh.revokedAt || fresh.lockedAt) {
+  if (slot === "previous") {
+    // Not a guessing attempt: the secret is genuine (old). Never counted against the limits.
+    refundIp();
+    refundAgent();
+    const promotedAt = agent.promotedAt?.getTime() ?? 0;
+    const stale = Date.now() - promotedAt >= TOLERANCE_WINDOW_MS;
+    // `/rotate` decides itself (ADR-0011): S0 + the promoted S1 is a harmless retry at any time.
+    if (opts.allowPrevious) return { ok: true, agent, via: "previous", matchedHash, stale };
+    if (stale) return { ok: false, staleSecret: true, agentId };
     return denied();
   }
+  if (slot === "pending") {
+    await promotePending(agentId, storedHash, matchedHash, "now", "first_use");
+  }
+
+  // Re-read: a revocation may have landed during the (slow) verification.
+  const fresh = await loadAgent(agentId);
+  if (!active(fresh) || fresh.currentSecretHash !== matchedHash) return denied();
   refundIp();
   refundAgent();
-  verified.remember(agentId, secret, storedHash);
-  knownGood.remember(agentId, secret, storedHash);
-  return { ok: true, agent: fresh };
+  verified.remember(agentId, secret, matchedHash);
+  knownGood.remember(agentId, secret, matchedHash);
+  return { ok: true, agent: fresh, via: slot, matchedHash };
 }

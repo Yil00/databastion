@@ -9,7 +9,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     restoreMocks: true,
     // Throwaway PostgreSQL cluster for the DB tests (skipped with a message when unavailable).
     globalSetup: ["./src/test/pg-global-setup.ts"],

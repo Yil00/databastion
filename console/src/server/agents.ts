@@ -178,6 +178,7 @@ export async function revokeAgent(
         pendingSecretHash: null,
         previousSecretHash: null,
         graceExpiresAt: null,
+        promotedGraceExpiresAt: null,
       })
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
@@ -229,6 +230,9 @@ export async function listAgents(db: Database) {
       lockedAt: agents.lockedAt,
       connectors: agents.connectors,
       classifiersVersion: agents.classifiersVersion,
+      rotationPending: sql<boolean>`${agents.pendingSecretHash} is not null`,
+      graceExpiresAt: agents.graceExpiresAt,
+      promotedAt: agents.promotedAt,
     })
     .from(agents)
     .orderBy(agents.enrolledAt)
@@ -249,4 +253,50 @@ export async function listAgents(db: Database) {
         lastReportedAt: t.lastReportedAt,
       })),
   }));
+}
+
+/** One agent and its reported targets, for the detail page. Never returns a secret hash. */
+export async function getAgentDetail(db: Database, agentId: string) {
+  const [agent] = await db
+    .select({
+      id: agents.id,
+      name: agents.name,
+      hostname: agents.hostname,
+      version: agents.version,
+      os: agents.os,
+      arch: agents.arch,
+      status: agents.status,
+      connectors: agents.connectors,
+      classifiersVersion: agents.classifiersVersion,
+      enrolledAt: agents.enrolledAt,
+      lastSeenAt: agents.lastSeenAt,
+      uptimeS: agents.uptimeS,
+      clockSkewMs: agents.clockSkewMs,
+      revokedAt: agents.revokedAt,
+      lockedAt: agents.lockedAt,
+      rotationPending: sql<boolean>`${agents.pendingSecretHash} is not null`,
+      graceExpiresAt: agents.graceExpiresAt,
+      promotedAt: agents.promotedAt,
+    })
+    .from(agents)
+    .where(eq(agents.id, agentId))
+    .limit(1);
+  if (!agent) return null;
+  const targets = await db
+    .select({
+      targetId: agentTargets.targetId,
+      engine: agentTargets.engine,
+      edition: agentTargets.edition,
+      serverVersion: agentTargets.serverVersion,
+      reachable: agentTargets.reachable,
+      auditLevel: agentTargets.auditLevel,
+      auditSource: agentTargets.auditSource,
+      lastError: agentTargets.lastError,
+      present: agentTargets.present,
+      lastReportedAt: agentTargets.lastReportedAt,
+    })
+    .from(agentTargets)
+    .where(eq(agentTargets.agentId, agentId))
+    .orderBy(agentTargets.targetId);
+  return { ...agent, targets };
 }

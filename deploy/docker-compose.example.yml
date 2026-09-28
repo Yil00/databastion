@@ -7,10 +7,17 @@
 name: databastion
 
 services:
+  # One image (console/Dockerfile), four commands: web (default), worker, migrate, bootstrap-admin.
+  # First administrator, once, after `migrate`:
+  #   docker compose run --rm -e DATABASTION_BOOTSTRAP_ADMIN_USERNAME=admin \
+  #     -e DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/admin_password \
+  #     console bootstrap-admin
+  #   (add `admin_password` to the console secrets for that run; remove the file afterwards)
+
   # One-shot: applies the console migrations as the database OWNER role, then exits.
   migrate:
     image: ghcr.io/yil00/databastion-console:latest
-    command: ["migrate"]         # pnpm db:migrate
+    command: ["migrate"]         # src/db/migrate.ts (pnpm db:migrate)
     restart: "no"
     environment:
       DATABASE_MIGRATION_URL_FILE: /run/secrets/db_owner_url
@@ -38,13 +45,22 @@ services:
       # Remove this line if nothing in front of the console does (clients could spoof their IP).
       # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
       DATABASTION_TRUST_PROXY: "1"
+      # Prometheus scrape token for GET /metrics (ADR-0004); /metrics answers 404 when unset.
+      # /metrics must stay on the internal network: the reverse proxy must NOT publish it.
+      DATABASTION_METRICS_TOKEN_FILE: /run/secrets/metrics_token
       TZ: Europe/Paris
-    secrets: [db_url, encryption_key]
+    secrets: [db_url, encryption_key, metrics_token]
     user: "10001:10001"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    healthcheck:                 # liveness only, no database access (readiness: /api/health/ready)
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -100,6 +116,9 @@ secrets:
     file: ./secrets/db_url            # postgresql://databastion_runtime:<db_app_password>@db:5432/databastion
   encryption_key:
     file: ./secrets/encryption_key    # openssl rand -base64 32
+  metrics_token:
+    file: ./secrets/metrics_token     # openssl rand -base64 32 (>= 32 chars); also given to Prometheus
+                                      # (scrape_configs: authorization.credentials_file)
 
 volumes:
   postgres-data:

@@ -1,6 +1,7 @@
 import { getDb } from "@/db/client";
 import { errorSummary, logger } from "@/lib/logger";
 import { listAgents, revokeAgent } from "@/server/agents";
+import { requestSecretRotation } from "@/server/rotation";
 import { writeAudit } from "@/server/audit";
 import {
   clearSessionCookie,
@@ -281,5 +282,18 @@ export function handleRevokeAgent(req: Request, id: string): Promise<Response> {
     if (!UUID.test(id)) return error(404, "not_found");
     const ok = await revokeAgent(getDb(), id, { userId: g.session.user.id, ip: g.ip });
     return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+export function handleRotateAgent(req: Request, id: string): Promise<Response> {
+  return guardedUser("agent.rotate_request", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "agent.rotate_request" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const r = await requestSecretRotation(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome === "not_found") return error(404, "not_found");
+    // ADR-0010: never while a secret is pending or within 60 s of a promotion.
+    if (r.outcome === "busy") return error(409, "rotation_in_progress");
+    return json({ job_id: r.jobId }, 202);
   });
 }
