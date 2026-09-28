@@ -1,7 +1,8 @@
 //! Architecture guards, run by `cargo test` in CI.
 //!
 //! - rustls only: no OpenSSL / native-tls in the dependency graph.
-//! - Connectors never depend on an HTTP client nor reference the uplink
+//! - Connectors never depend on an HTTP client nor on the generated protocol
+//!   types, and never reference the uplink or `databastion_protocol`
 //!   (AGENTS.md: no direct uplink access from a connector; I2).
 //! - No listening socket in agent code (I1). The future opt-in
 //!   `metrics.local_listen` (127.0.0.1 only) will be the single allowlisted
@@ -24,7 +25,7 @@ const CONNECTORS: [&str; 4] = [
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
-const BANNED_CONNECTOR_DEPS: [&str; 9] = [
+const BANNED_CONNECTOR_DEPS: [&str; 11] = [
     "reqwest",
     "hyper",
     "hyper-util",
@@ -34,6 +35,10 @@ const BANNED_CONNECTOR_DEPS: [&str; 9] = [
     "attohttpc",
     "socket2",
     "databastion-agent",
+    // Generated protocol types: only the uplink builds payloads, from masked
+    // types (I2, ADR-0003). The codegen is a developer tool.
+    "databastion-protocol",
+    "databastion-protocol-codegen",
 ];
 
 /// Identifiers that indicate a listening (or raw) socket.
@@ -200,7 +205,7 @@ package = "ureq"
 }
 
 #[test]
-fn connectors_do_not_depend_on_http_clients() {
+fn connectors_do_not_depend_on_http_clients_or_protocol_types() {
     let aliases = banned_workspace_aliases();
     for connector in CONNECTORS {
         let manifest = fs::read_to_string(
@@ -230,8 +235,10 @@ fn connectors_do_not_reference_the_uplink() {
         for source in sources {
             let text = fs::read_to_string(&source).unwrap();
             assert!(
-                !code_lines(&text).any(|l| l.contains("uplink") || l.contains("Uplink")),
-                "{} references the uplink",
+                !code_lines(&text).any(|l| l.contains("uplink")
+                    || l.contains("Uplink")
+                    || l.contains("databastion_protocol")),
+                "{} references the uplink or the protocol types",
                 source.display()
             );
         }

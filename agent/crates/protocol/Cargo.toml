@@ -1,0 +1,23 @@
+[package]
+name = "databastion-protocol"
+description = "DataBastion agent <-> console protocol types, generated from shared/protocol/openapi.yaml (used by the uplink only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Required by the generated code (typify): keep in sync with generated.rs.
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+regress = "0.12"
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
+
+[dev-dependencies]
+databastion-protocol-codegen.workspace = true
+serde_json = "1"
+
+[lints]
+workspace = true

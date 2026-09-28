@@ -7,15 +7,18 @@ use crate::sink::{EventSink, FindingSink, SinkClosed};
 
 /// Parameters of a `discovery.scan` job.
 ///
-/// Placeholder: will be derived from the job type generated from
-/// `shared/protocol/openapi.yaml` (P0-B). Not hand-written here (I6).
+/// Placeholder: the core will map the generated
+/// `databastion_protocol::DiscoveryScanParams` into it; connectors never see
+/// the generated type. Protocol fields are not hand-written here (I6).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ScanJob {}
 
 /// Audit configuration of a target (`audit.configure` job).
 ///
-/// Placeholder: will be derived from the generated protocol types (P0-B).
+/// Placeholder: the core will map the generated
+/// `databastion_protocol::AuditConfigureParams` into it; connectors never see
+/// the generated type.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct AuditConfig {}
