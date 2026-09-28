@@ -5,7 +5,7 @@ import { errorSummary, type Logger } from "@/lib/logger";
 import { silentAgentThresholdS } from "@/server/alerting-config";
 import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
-import { drainDeliveries } from "@/server/notifications";
+import { drainDeliveries, enqueueSuppressionDigests } from "@/server/notifications";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 import { checkSilentAgents } from "@/server/system-alerts";
 
@@ -112,6 +112,7 @@ export function createNotificationHandler(
     if (jobs.length === 0) return;
     const thresholdS = silentAgentThresholdS();
     await checkSilentAgents(db(), { thresholdS, notBefore: new Date(startedAt.getTime() + thresholdS * 1000) });
+    await enqueueSuppressionDigests(db());
     const stats = await drainDeliveries(db(), { budgetMs: opts.budgetMs ?? NOTIFICATION_JOB_BUDGET_MS });
     if (stats.attempted > 0) log.info({ ...stats }, "notifications");
     if (stats.more) {

@@ -607,6 +607,11 @@ export const notificationDeliveries = pgTable(
       .on(t.nextAttemptAt)
       .where(sql`${t.status} in ('pending', 'sending')`),
     index("notification_deliveries_incident_idx").on(t.incidentId),
+    // L6: per-channel hourly budget of incident notifications, and the suppression digests.
+    index("notification_deliveries_channel_created_idx").on(t.channelId, t.createdAt),
+    index("notification_deliveries_rate_limited_idx")
+      .on(t.createdAt)
+      .where(sql`${t.lastError} = 'rate_limited'`),
     check("notification_deliveries_attempts", sql`${t.attempts} >= 0`),
     check("notification_deliveries_last_error_format", sql`${t.lastError} ~ '^[a-z0-9_]{1,64}$'`),
   ],

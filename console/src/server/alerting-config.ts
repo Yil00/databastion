@@ -53,6 +53,21 @@ export function silentAgentIntervals(env: Env = process.env): number {
   return Number.isInteger(n) && n >= 3 && n <= 2880 ? n : DEFAULT_SILENT_AGENT_INTERVALS;
 }
 
+/**
+ * L6: incident notifications per channel and clock hour (`DATABASTION_NOTIFY_MAX_PER_HOUR`,
+ * default 30, accepted 1 to 10000). Beyond, they are recorded as skipped (`rate_limited`) and one
+ * digest per channel and hour reports how many were suppressed (counts only).
+ */
+export const NOTIFY_MAX_PER_HOUR_VAR = "DATABASTION_NOTIFY_MAX_PER_HOUR";
+export const DEFAULT_NOTIFY_MAX_PER_HOUR = 30;
+
+export function notifyMaxPerHour(env: Env = process.env): number {
+  const raw = env[NOTIFY_MAX_PER_HOUR_VAR];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_NOTIFY_MAX_PER_HOUR;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 10_000 ? n : DEFAULT_NOTIFY_MAX_PER_HOUR;
+}
+
 export function silentAgentThresholdS(env: Env = process.env): number {
   return silentAgentIntervals(env) * HEARTBEAT_INTERVAL_S;
 }

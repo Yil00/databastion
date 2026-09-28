@@ -55,7 +55,20 @@ export interface ChannelTestPayload {
   channel: string;
 }
 
+/** L6: incident notifications of a channel suppressed by its hourly budget (counts only). */
+export interface SuppressedPayload {
+  event: "notifications.suppressed";
+  occurred_at: string;
+  url: string | null;
+  channel: string;
+  window_start: string;
+  window_end: string;
+  suppressed: number;
+  limit_per_hour: number;
+}
+
 export type NotificationPayload =
+  | SuppressedPayload
   | IncidentOpenedPayload
   | AgentSilentPayload
   | AgentRecoveredPayload
@@ -132,6 +145,13 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
       return {
         subject: `[DataBastion] ${p.severity.toUpperCase()} agent-integrity event: ${one(p.kind, 64)}`,
         text: `The console recorded ${one(p.kind, 64)} for the agent ${p.agent_id} at ${p.occurred_at} (security event ${p.security_event_id}). A conforming agent never causes it.\n\n${details}\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "notifications.suppressed": {
+      const p = payload;
+      return {
+        subject: `[DataBastion] ${p.suppressed} incident notification${p.suppressed > 1 ? "s" : ""} suppressed`,
+        text: `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} incident notifications per hour between ${p.window_start} and ${p.window_end}: ${p.suppressed} more incident${p.suppressed > 1 ? "s were" : " was"} opened without a notification. See the incidents in the console.\n${link(p.url)}${FOOTER}`,
       };
     }
     case "channel.test": {

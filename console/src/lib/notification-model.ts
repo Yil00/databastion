@@ -63,6 +63,7 @@ export const NOTIFICATION_EVENTS = [
   "agent.recovered",
   "agent.integrity",
   "channel.test",
+  "notifications.suppressed",
 ] as const;
 export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
 
@@ -72,6 +73,7 @@ export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
  */
 export const DELIVERY_ERROR_TEXT: Record<string, string> = {
   unknown_channel: "no channel has this name",
+  rate_limited: "over the channel's hourly limit (counted in the next suppression digest)",
   channel_disabled: "the channel is disabled",
   channel_deleted: "the channel was deleted",
   secret_unavailable: "the channel secret cannot be decrypted (server key missing or changed)",

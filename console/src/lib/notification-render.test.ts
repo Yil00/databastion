@@ -33,6 +33,21 @@ describe("notification contents", () => {
     expect(renderEmail({ ...INCIDENT, url: null }).text).not.toContain("Open in the console");
   });
 
+  it("suppression digest: counts only", () => {
+    const { subject, text } = renderEmail({
+      event: "notifications.suppressed",
+      occurred_at: "t",
+      url: null,
+      channel: "soc-hook",
+      window_start: "2026-09-28T11:00:00.000Z",
+      window_end: "2026-09-28T12:00:00.000Z",
+      suppressed: 12,
+      limit_per_hour: 30,
+    });
+    expect(subject).toBe("[DataBastion] 12 incident notifications suppressed");
+    expect(text).toContain("limit of 30 incident notifications per hour");
+  });
+
   it("system alerts", () => {
     const agent = { id: "a-1", name: "db-host-1", hostname: "db-host-1.example" };
     expect(

@@ -141,6 +141,13 @@
       "when": 1790626036835,
       "tag": "0019_notification_deliveries_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790628183929,
+      "tag": "0020_notification_rate_limit_indexes",
+      "breakpoints": true
     }
   ]
 }

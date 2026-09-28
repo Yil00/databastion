@@ -22,7 +22,7 @@ import { pgBossOptions, registerNotificationQueue, registerPolicyQueue } from "@
 import { drainPolicyWork, getIncident } from "./incidents";
 import { POLICY_QUEUE } from "./policy-queue";
 import { recordIntegrityEvent } from "./integrity";
-import { backoffSeconds, drainDeliveries, listDeliveries, MAX_DELIVERY_ATTEMPTS, type Senders } from "./notifications";
+import { backoffSeconds, drainDeliveries, enqueueSuppressionDigests, listDeliveries, MAX_DELIVERY_ATTEMPTS, type Senders } from "./notifications";
 import { verifyWebhookSignature } from "./senders/webhook";
 import { checkSilentAgents } from "./system-alerts";
 import {
@@ -194,6 +194,7 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
     await getDb().execute(sql`update notification_deliveries set status = 'failed', last_error = 'internal' where status in ('pending', 'sending')`);
   });
   afterEach(() => {
+    delete process.env.DATABASTION_NOTIFY_MAX_PER_HOUR;
     delete process.env.DATABASTION_ALERTING_INSECURE_DEV;
     delete process.env.DATABASTION_PUBLIC_URL;
   });
@@ -523,6 +524,44 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
       const tests = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.event, "channel.test"));
       expect(tests.length).toBeGreaterThan(0);
       expect(tests.filter((t) => t.status === "pending").every((t) => t.lastError === "connect_failed")).toBe(true);
+    });
+
+    it("L6: over its hourly budget a channel skips incident notifications, then gets one digest (counts only)", async () => {
+      process.env.DATABASTION_NOTIFY_MAX_PER_HOUR = "2";
+      const { id: channelId } = await webhookChannel("burst-hook");
+      const auth = await agentWithTargets();
+      await policyNotifying(auth.agentId, ["burst-hook"]);
+      // Three findings, three incidents in the same hour.
+      const jobId = await enqueueJob(getDb(), {
+        agentId: auth.agentId,
+        type: "discovery.scan",
+        targetId: "pg-prod-1",
+        classifiersVersion: "2026.09.1",
+        params: { sample_rows: 200, max_duration_s: 900 },
+      });
+      expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+      const items = ["email", "email2", "email3"].map((field) => ({ ...FINDING, location: { ...FINDING.location, field } }));
+      const body = { batch_id: uuidv7(), job_id: jobId, classifiers_version: "2026.09.1", findings: items };
+      expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+      await drainPolicyWork(getDb());
+      const rows = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.channelId, channelId));
+      expect(rows.map((r) => [r.status, r.lastError]).sort()).toEqual([
+        ["pending", null],
+        ["pending", null],
+        ["skipped", "rate_limited"],
+      ]);
+      // The hour is not over: no digest yet.
+      expect(await enqueueSuppressionDigests(getDb())).toBe(0);
+      // Fake time: the suppressed row belongs to a closed hour.
+      await getDb().execute(sql`update notification_deliveries set created_at = date_trunc('hour', now()) - interval '30 minutes' where channel_id = ${channelId} and last_error = 'rate_limited'`);
+      expect(await enqueueSuppressionDigests(getDb())).toBe(1);
+      expect(await enqueueSuppressionDigests(getDb())).toBe(0);
+      const [digest] = await getDb().select().from(notificationDeliveries).where(and(eq(notificationDeliveries.channelId, channelId), eq(notificationDeliveries.event, "notifications.suppressed")));
+      expect(digest?.payload).toMatchObject({ event: "notifications.suppressed", channel: "burst-hook", suppressed: 1, limit_per_hour: 2 });
+      expect(JSON.stringify(digest?.payload)).not.toContain(auth.agentId);
+      const rec = fakeSenders(() => ({ ok: true }));
+      await drainDeliveries(getDb(), { senders: rec.senders });
+      expect(rec.calls.some((c) => c.body.includes('"suppressed":1'))).toBe(true);
     });
 
     it("a secret sealed under another server key is unusable: secret_unavailable (retried)", async () => {

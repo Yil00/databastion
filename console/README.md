@@ -29,6 +29,7 @@ database (also used as the job queue: no Redis). See
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin. The worker also uses it for the links in notifications (unset: notifications carry ids only) |
 | `DATABASTION_SILENT_AGENT_INTERVALS` | Worker: "silent agent" alert after this many heartbeat intervals (30 s) without a heartbeat; integer 3 to 2880, default 10 (5 minutes). See "Alerting" |
+| `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -501,7 +502,7 @@ contents: `src/lib/notification-render.ts`.*
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `channel.test`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence). **Never a
   sampled value, masked or not** (I2); the masked samples stay encrypted on the finding.
@@ -551,6 +552,19 @@ contents: `src/lib/notification-render.ts`.*
   what policies raise (policy snapshot, dedup key, lifecycle column grants, ADR-0014), while agent
   health is an integrity signal that must not be erasable by the runtime role. Limitation: an outage
   of the web process alone (worker up) makes every agent silent after the threshold.
+- **Volume limit** (L6): at most `DATABASTION_NOTIFY_MAX_PER_HOUR` (default 30) incident
+  notifications per channel and clock hour (a soft limit: concurrent evaluations may overshoot by a
+  few). Beyond, the delivery is recorded as `skipped` (`rate_limited`, visible on the incident) and,
+  once the hour is over, one `notifications.suppressed` digest per channel and hour reports how many
+  were suppressed (counts only, link to the incidents list). System alerts, tests and digests are
+  not counted.
+- **Hardening (security review)**: moving an e-mail channel with a stored password to another host,
+  port, TLS mode or user requires the password again (`400 password_required`); SMTP ports 25, 465,
+  587 and 2525 only (any port with the dev flag); SMTP replies capped at 100 lines / 64 KiB; any
+  byte received in clear after the STARTTLS `220` aborts the session; the upgraded certificate is
+  verified against the configured host; channel tests are limited to 10 per administrator and 3 per
+  channel per 10 minutes (`429`), and report refused and filtered connections alike
+  (`connect_failed`).
 - **Agent-integrity alerts**: every `security_events` row written by the console
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
   `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind

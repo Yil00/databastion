@@ -90,6 +90,7 @@ describe("notifications.deliver handler", () => {
 
   it("checks silent agents with the startup grace, then drains; re-queues only when work remains", async () => {
     const check = vi.spyOn(systemAlerts, "checkSilentAgents").mockResolvedValue({ silent: 0, recovered: 0 });
+    const digests = vi.spyOn(notifications, "enqueueSuppressionDigests").mockResolvedValue(0);
     const drain = vi
       .spyOn(notifications, "drainDeliveries")
       .mockResolvedValueOnce(delivery({ attempted: 1, delivered: 1 }))
@@ -104,6 +105,7 @@ describe("notifications.deliver handler", () => {
     expect(requeue).toHaveBeenCalledTimes(1);
     await handler([]);
     expect(drain).toHaveBeenCalledTimes(2);
+    expect(digests).toHaveBeenCalledTimes(2);
   });
 
   it("a failed check fails the job (pg-boss retries it; the outbox keeps the work)", async () => {

@@ -8,7 +8,7 @@ import { errorSummary, logger } from "@/lib/logger";
 import type { DeliveryStatus } from "@/lib/notification-model";
 import { renderEmail, webhookBody, type NotificationPayload } from "@/lib/notification-render";
 
-import { consoleUrl, insecureDevAllowed } from "./alerting-config";
+import { consoleUrl, insecureDevAllowed, notifyMaxPerHour } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { loadChannelForDelivery } from "./channels";
 import type { Tx } from "./findings";
@@ -100,10 +100,30 @@ export async function enqueueIncidentNotifications(
     .from(notificationChannels)
     .where(inArray(notificationChannels.slug, [...slugs]));
   const bySlug = new Map(channels.map((c) => [c.slug, c]));
+  // L6: hourly budget per channel (soft: concurrent evaluations may overshoot by a few).
+  const enabledIds = channels.filter((c) => c.enabled).map((c) => c.id);
+  const used = new Map<string, number>();
+  if (enabledIds.length > 0) {
+    const counts = await tx
+      .select({ channelId: notificationDeliveries.channelId, n: sql<number>`count(*)::int` })
+      .from(notificationDeliveries)
+      .where(
+        and(
+          inArray(notificationDeliveries.channelId, enabledIds),
+          eq(notificationDeliveries.event, "incident.opened"),
+          sql`${notificationDeliveries.status} <> 'skipped'`,
+          sql`${notificationDeliveries.createdAt} >= date_trunc('hour', now())`,
+        ),
+      )
+      .groupBy(notificationDeliveries.channelId);
+    for (const c of counts) if (c.channelId) used.set(c.channelId, c.n);
+  }
+  const limit = notifyMaxPerHour();
   return insertDeliveries(
     tx,
     [...new Set(slugs)].map((slug) => {
       const ch = bySlug.get(slug);
+      const overBudget = ch?.enabled === true && (used.get(ch.id) ?? 0) >= limit;
       return {
         key: `incident:${incidentId}|${payload.event}|channel:${slug}`,
         event: payload.event,
@@ -111,8 +131,8 @@ export async function enqueueIncidentNotifications(
         channelSlug: slug,
         incidentId,
         payload,
-        status: ch?.enabled ? "pending" : "skipped",
-        lastError: !ch ? "unknown_channel" : ch.enabled ? null : "channel_disabled",
+        status: ch?.enabled && !overBudget ? "pending" : "skipped",
+        lastError: !ch ? "unknown_channel" : !ch.enabled ? "channel_disabled" : overBudget ? "rate_limited" : null,
       };
     }),
   );
@@ -144,6 +164,45 @@ export async function enqueueSystemAlert(
       status: "pending",
     })),
   );
+}
+
+/**
+ * L6: one digest per channel and closed clock hour in which incident notifications were suppressed
+ * by the hourly budget (last 2 days; idempotent). Counts only. Returns the number queued.
+ */
+export async function enqueueSuppressionDigests(db: Database): Promise<number> {
+  const res = await db.execute<{ channel_id: string; channel_slug: string; window_start: Date | string; n: number }>(sql`
+    select channel_id, max(channel_slug) as channel_slug, date_trunc('hour', created_at) as window_start, count(*)::int as n
+    from notification_deliveries
+    where last_error = 'rate_limited' and event = 'incident.opened' and channel_id is not null
+      and created_at >= now() - interval '2 days' and created_at < date_trunc('hour', now())
+    group by channel_id, date_trunc('hour', created_at)`);
+  const limit = notifyMaxPerHour();
+  let queued = 0;
+  for (const r of res.rows) {
+    const start = new Date(r.window_start);
+    const end = new Date(start.getTime() + 3600_000);
+    queued += await insertDeliveries(db, [
+      {
+        key: `digest:${r.channel_id}|${start.toISOString()}|notifications.suppressed|channel:${r.channel_id}`,
+        event: "notifications.suppressed",
+        channelId: r.channel_id,
+        channelSlug: r.channel_slug,
+        payload: {
+          event: "notifications.suppressed",
+          occurred_at: end.toISOString(),
+          url: consoleUrl("/incidents"),
+          channel: r.channel_slug,
+          window_start: start.toISOString(),
+          window_end: end.toISOString(),
+          suppressed: r.n,
+          limit_per_hour: limit,
+        },
+        status: "pending",
+      },
+    ]);
+  }
+  return queued;
 }
 
 /** A test notification to one channel (admin, audited); sent even when the channel is disabled. */
