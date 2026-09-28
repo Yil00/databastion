@@ -6,10 +6,11 @@ Project context for every contributor, human or AI agent. Read it **before** any
 DataBastion is an open-source DLP (Apache 2.0) that finds sensitive data in PostgreSQL, MySQL/MariaDB, MongoDB and OpenLDAP (*Discovery*) and detects abnormal extractions of it (*Audit*), using agents that never accept an inbound connection.
 
 ## Where the project stands
-- **Current phase**: 0 – Foundations (see [docs/ROADMAP.md](docs/ROADMAP.md))
-- Skeletons only (P0-D): `console/` (Next.js + Drizzle + pg-boss, health endpoints, agent API placeholder answering `501`) and `agent/` (Cargo workspace that compiles; connectors are stubs). No enrollment, uplink, Discovery or Audit logic yet.
+- **Current phase**: 1 – Console foundation & agent core (see [docs/ROADMAP.md](docs/ROADMAP.md)). Phase 0 – Foundations is done.
+- Merged code is still skeleton-level (P0-D): `console/` (Next.js + Drizzle + pg-boss, health endpoints, agent API placeholder answering `501`) and `agent/` (Cargo workspace that compiles; connectors are stubs). No enrollment, uplink, Discovery or Audit logic yet.
 - Protocol v1 contract merged (P0-B): `shared/protocol/openapi.yaml` + fixtures is the source of truth ([docs/09-agent-protocol.md](docs/09-agent-protocol.md) is an overview). Types are generated on both sides (console: openapi-typescript + Ajv runtime validator; agent: typify), with drift tests. The console agent API still answers `501` and the agent uplink is a stub: the contract is not exercised end to end yet.
-- Remaining in phase 0: dev environment `dev/` (P0-C).
+- Dev environment merged (P0-C): `make dev` starts PostgreSQL + pgaudit, MariaDB + server_audit, MySQL, MongoDB, OpenLDAP + accesslog, Mailpit, Prometheus and Grafana, with seeded fake PII and a ground truth ([dev/README.md](dev/README.md)). The console and the agent are not containerized in it yet and run on the host.
+- In progress (phase 1): console DB schema, local auth, audit log, enrollment tokens and agent API (P1-A); agent configuration, enrollment, uplink and heartbeat (P1-B).
 
 ## Invariants (non-negotiable)
 | # | Invariant | Source |

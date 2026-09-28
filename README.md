@@ -60,6 +60,7 @@ Details: [docs/EDITIONS.md](docs/EDITIONS.md).
 
 ## Contributing
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). PRs target the `dev` branch.
+Dev environment: `make dev` starts the seeded databases (fake PII only), Mailpit, Prometheus and Grafana (port 3001) on `127.0.0.1`; see [dev/README.md](dev/README.md).
 Versions and releases: [RELEASE.md](RELEASE.md) · [CHANGELOG.md](CHANGELOG.md).
 Vulnerabilities: **do not open a public issue**, see [SECURITY.md](SECURITY.md).
 
