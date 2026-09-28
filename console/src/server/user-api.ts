@@ -3,6 +3,20 @@ import { errorSummary, logger } from "@/lib/logger";
 import { listAgents, revokeAgent } from "@/server/agents";
 import { requestSecretRotation } from "@/server/rotation";
 import { setFalsePositive } from "@/server/findings";
+import { transitionIncident } from "@/server/incidents";
+import { isIncidentStatus, transitionNeedsAdmin } from "@/lib/policy-model";
+import {
+  createException,
+  createPolicy,
+  deleteException,
+  deletePolicy,
+  parseExceptionInput,
+  parsePolicyInput,
+  policySource,
+  updatePolicy,
+  type PolicyInput,
+} from "@/server/policies";
+import { requestPolicyEvaluation } from "@/server/policy-queue";
 import { buildScanParams, requestScan } from "@/server/scans";
 import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
@@ -452,6 +466,142 @@ export function handleFalsePositive(req: Request, findingId: string): Promise<Re
       userId: g.session.user.id,
       ip: g.ip,
     });
+    // Unmarked: the finding is pending for the policy engine again.
+    if (ok && !body.value.false_positive) void requestPolicyEvaluation();
     return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+// ------------------------------------------------------------------ policies (P3-A)
+
+/**
+ * Creates a policy (admin, CSRF): `{name, description?, enabled?, source?, conditions, actions}`,
+ * strictly validated (`src/lib/policy-model.ts`; unknown keys, unregistered classifiers, bad
+ * globs or thresholds -> `400 invalid_policy` with the failing `field`). `409 name_taken` on a
+ * duplicate name (case-insensitive). `201 {id}`; audited `policy.create` (identifiers only). The
+ * worker then applies it to the existing findings.
+ */
+export function handleCreatePolicy(req: Request): Promise<Response> {
+  return guardedUser("policy.create", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy.create" });
+    if (!g.ok) return g.response;
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const parsed = parsePolicyInput(body.value, false);
+    if (!parsed.ok) return json({ error: "invalid_policy", field: parsed.error }, 400);
+    const input: PolicyInput = {
+      name: parsed.value.name as string,
+      description: parsed.value.description ?? null,
+      enabled: parsed.value.enabled ?? true,
+      source: parsed.value.source ?? "finding",
+      conditions: parsed.value.conditions ?? {},
+      actions: parsed.value.actions ?? [],
+    };
+    const r = await createPolicy(getDb(), input, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome === "name_taken") return error(409, "name_taken");
+    if (r.outcome !== "ok") return error(404, "not_found");
+    void requestPolicyEvaluation();
+    return json({ id: r.id }, 201);
+  });
+}
+
+/** Updates a policy (admin, CSRF): any subset of the create keys (`source` cannot change). `204`. */
+export function handleUpdatePolicy(req: Request, id: string): Promise<Response> {
+  return guardedUser("policy.update", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy.update" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const source = await policySource(getDb(), id);
+    if (!source) return error(404, "not_found");
+    const parsed = parsePolicyInput(body.value, true, { source });
+    if (!parsed.ok) return json({ error: "invalid_policy", field: parsed.error }, 400);
+    const r = await updatePolicy(getDb(), id, parsed.value, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome === "name_taken") return error(409, "name_taken");
+    if (r.outcome === "not_found") return error(404, "not_found");
+    void requestPolicyEvaluation();
+    return new Response(null, { status: 204, headers: NO_STORE });
+  });
+}
+
+/** Deletes a policy and its exceptions (admin, CSRF); its incidents are kept. `204`. */
+export function handleDeletePolicy(req: Request, id: string): Promise<Response> {
+  return guardedUser("policy.delete", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy.delete" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const ok = await deletePolicy(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+/**
+ * Creates an exception (admin, CSRF): `{policy_id?, agent_id?, target_id?, classifier?, location?,
+ * reason, expires_at?}`, at least one of agent / target / classifier / location. `400
+ * invalid_exception` (+ `field`), `404 not_found` for an unknown policy or agent. `201 {id}`.
+ */
+export function handleCreateException(req: Request): Promise<Response> {
+  return guardedUser("policy_exception.create", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy_exception.create" });
+    if (!g.ok) return g.response;
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const parsed = parseExceptionInput(body.value);
+    if (!parsed.ok) return json({ error: "invalid_exception", field: parsed.error }, 400);
+    const r = await createException(getDb(), parsed.value, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome !== "ok") return error(404, "not_found");
+    return json({ id: r.id }, 201);
+  });
+}
+
+/** Deletes an exception (admin, CSRF); the policies it covered are re-evaluated. `204`. */
+export function handleDeleteException(req: Request, id: string): Promise<Response> {
+  return guardedUser("policy_exception.delete", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy_exception.delete" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const ok = await deleteException(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    if (ok) void requestPolicyEvaluation();
+    return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+// ----------------------------------------------------------------- incidents (P3-B)
+
+/**
+ * Moves an incident (`{"status": "acknowledged" | "resolved" | "false_positive"}`, CSRF). Any
+ * signed-in user acknowledges and resolves; `false_positive` is an administrator decision (same
+ * rule as on findings: it marks the linked finding). `409 invalid_transition` outside the
+ * lifecycle; `204`. Audited `incident.transition`, refusals included.
+ */
+export function handleIncidentTransition(req: Request, id: string): Promise<Response> {
+  return guardedUser("incident.transition", async () => {
+    const g = await requireUser(req, { stateChanging: true, route: "incident.transition" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const v = body.value;
+    if (!isPlainObject(v) || !onlyKeys(v, ["status"]) || !isIncidentStatus(v.status) || v.status === "open") {
+      return error(400, "invalid_request");
+    }
+    const status = v.status;
+    if (transitionNeedsAdmin(status) && g.session.user.role !== "admin") {
+      // Same audit as the other authorization failures (L3).
+      await writeAudit(getDb(), {
+        actorType: "user",
+        actorId: g.session.user.id,
+        action: "user.access_denied",
+        outcome: "failure",
+        sourceIp: g.ip,
+        details: { route: "incident.transition", reason: "role" },
+      });
+      return error(403, "forbidden");
+    }
+    const r = await transitionIncident(getDb(), id, status, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome === "not_found") return error(404, "not_found");
+    if (r.outcome === "invalid_transition") return json({ error: "invalid_transition", from: r.from }, 409);
+    return new Response(null, { status: 204, headers: NO_STORE });
   });
 }

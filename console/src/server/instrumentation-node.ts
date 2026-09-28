@@ -16,6 +16,9 @@ export async function registerNode(): Promise<void> {
   for (const message of startupErrors()) logger.error(message);
   await startMetricsListenerOnce();
   if (!process.env.DATABASE_URL && !process.env.DATABASE_URL_FILE) return;
+  // Policy engine wake-ups after findings ingestion and policy changes (sent to the worker).
+  const { installPgBossPolicySender } = await import("@/server/policy-queue-boss");
+  installPgBossPolicySender();
   try {
     const { getPool } = await import("@/db/client");
     const { runtimeRoleWarnings } = await import("@/server/db-role-check");

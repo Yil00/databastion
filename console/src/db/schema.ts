@@ -359,6 +359,12 @@ export const findings = pgTable(
      */
     falsePositiveMatched: integer("false_positive_matched"),
     falsePositiveClassifiersVersion: text("false_positive_classifiers_version"),
+    /**
+     * `last_seen_at` of the revision last evaluated by the policy engine (P3-A). The finding is
+     * pending evaluation while it differs from `last_seen_at` (set by the worker with a
+     * compare-and-set on `last_seen_at`, so a rescan during an evaluation is never lost).
+     */
+    policyEvaluatedAt: tsz("policy_evaluated_at"),
   },
   (t) => [
     foreignKey({
@@ -372,5 +378,139 @@ export const findings = pgTable(
     check("findings_confidence_range", sql`${t.confidence} >= 0 and ${t.confidence} <= 1`),
     check("findings_counts", sql`${t.matched} >= 0 and ${t.matched} <= ${t.sampled} and ${t.sampled} <= 10000`),
     check("findings_location_key_format", sql`${t.locationKey} ~ '^[0-9a-f]{64}$'`),
+    index("findings_policy_pending_idx")
+      .on(t.id)
+      .where(sql`${t.policyEvaluatedAt} is distinct from ${t.lastSeenAt}`),
+  ],
+);
+
+// ------------------------------------------------------------------- policies (P3-A)
+
+/**
+ * What a policy evaluates. `finding` today; phase 4 adds `access_event` (`ALTER TYPE ... ADD
+ * VALUE`, a compatible change). The condition document is validated per source
+ * (src/lib/policy-model.ts), so a new source brings its own keys without changing this table.
+ */
+export const policySource = pgEnum("policy_source", ["finding"]);
+
+export const incidentSeverity = pgEnum("incident_severity", ["low", "medium", "high", "critical"]);
+
+/**
+ * Condition -> action rules applied by the worker. `conditions` and `actions` are JSON documents
+ * validated by `parsePolicyConditions` / `parsePolicyActions` (unknown keys rejected); they only
+ * hold identifiers, globs on normalized names and thresholds, never a sampled value.
+ * - `revision` grows on every edit (incidents record the revision that created them);
+ * - `changed_at` / `evaluated_at`: the policy needs a full pass over the existing findings while
+ *   `evaluated_at` is null or older than `changed_at` (or than an exception expiry, see the worker).
+ */
+export const policies = pgTable(
+  "policies",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    description: text("description"),
+    enabled: boolean("enabled").notNull().default(true),
+    source: policySource("source").notNull().default("finding"),
+    conditions: jsonb("conditions").$type<Record<string, unknown>>().notNull(),
+    actions: jsonb("actions").$type<Record<string, unknown>[]>().notNull(),
+    revision: integer("revision").notNull().default(1),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    updatedAt: tsz("updated_at").notNull().defaultNow(),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+    changedAt: tsz("changed_at").notNull().defaultNow(),
+    evaluatedAt: tsz("evaluated_at"),
+  },
+  (t) => [
+    uniqueIndex("policies_name_key").on(sql`lower(${t.name})`),
+    check("policies_name_len", sql`char_length(${t.name}) between 1 and 100`),
+    check("policies_description_len", sql`char_length(${t.description}) <= 500`),
+    check("policies_revision_positive", sql`${t.revision} >= 1`),
+  ],
+);
+
+/**
+ * Exceptions: a finding matching one is never turned into an incident by the policy (or by every
+ * policy when `policy_id` is null). At least one scope column is set, so an exception can never
+ * silence everything. `location` holds globs on normalized names, like the conditions. Expired
+ * exceptions are kept (listed as expired) until an administrator deletes them.
+ */
+export const policyExceptions = pgTable(
+  "policy_exceptions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    policyId: uuid("policy_id").references(() => policies.id, { onDelete: "cascade" }),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+    targetId: text("target_id"),
+    classifier: text("classifier"),
+    location: jsonb("location").$type<Record<string, string>>(),
+    reason: text("reason").notNull(),
+    expiresAt: tsz("expires_at"),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [
+    index("policy_exceptions_policy_idx").on(t.policyId),
+    check(
+      "policy_exceptions_scope",
+      sql`${t.agentId} is not null or ${t.targetId} is not null or ${t.classifier} is not null or ${t.location} is not null`,
+    ),
+    check("policy_exceptions_reason_len", sql`char_length(${t.reason}) between 1 and 500`),
+  ],
+);
+
+// ------------------------------------------------------------------ incidents (P3-B)
+
+export const incidentStatus = pgEnum("incident_status", ["open", "acknowledged", "resolved", "false_positive"]);
+
+/**
+ * Incidents created by policies. One row per (policy, subject) occurrence: `dedup_key` identifies
+ * the pair (`policy:<id>|finding:<id>`) and a partial unique index allows at most one open or
+ * acknowledged incident per key, so re-evaluations (retries, rescans) never duplicate one.
+ * Snapshots (`policy_name`, target, classifier, `finding_matched`, `finding_classifiers_version`)
+ * keep the incident readable when the policy or the finding goes away; no sampled value is ever
+ * stored here (masked samples stay encrypted on the finding row). Never deleted by the runtime
+ * role (migration 0015).
+ */
+export const incidents = pgTable(
+  "incidents",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    dedupKey: text("dedup_key").notNull(),
+    source: policySource("source").notNull(),
+    policyId: uuid("policy_id").references(() => policies.id, { onDelete: "set null" }),
+    policyName: text("policy_name").notNull(),
+    policyRevision: integer("policy_revision").notNull(),
+    severity: incidentSeverity("severity").notNull(),
+    status: incidentStatus("status").notNull().default("open"),
+    /** Channel references of the policy's `notify` actions at creation time (delivery: P3-C). */
+    notifyChannels: jsonb("notify_channels").$type<string[]>().notNull().default([]),
+    findingId: uuid("finding_id").references(() => findings.id, { onDelete: "set null" }),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
+    targetId: text("target_id"),
+    classifier: text("classifier"),
+    findingMatched: integer("finding_matched"),
+    findingClassifiersVersion: text("finding_classifiers_version"),
+    /** `last_seen_at` of the latest finding revision that matched (idempotent re-matches). */
+    lastFindingSeenAt: tsz("last_finding_seen_at"),
+    matchCount: integer("match_count").notNull().default(1),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    updatedAt: tsz("updated_at").notNull().defaultNow(),
+    acknowledgedAt: tsz("acknowledged_at"),
+    acknowledgedBy: uuid("acknowledged_by").references(() => users.id, { onDelete: "set null" }),
+    resolvedAt: tsz("resolved_at"),
+    resolvedBy: uuid("resolved_by").references(() => users.id, { onDelete: "set null" }),
+    falsePositiveAt: tsz("false_positive_at"),
+    falsePositiveBy: uuid("false_positive_by").references(() => users.id, { onDelete: "set null" }),
+  },
+  (t) => [
+    uniqueIndex("incidents_active_dedup_key")
+      .on(t.dedupKey)
+      .where(sql`${t.status} in ('open', 'acknowledged')`),
+    index("incidents_dedup_key_idx").on(t.dedupKey, t.createdAt),
+    index("incidents_status_idx").on(t.status, t.createdAt),
+    index("incidents_finding_idx").on(t.findingId),
+    check("incidents_policy_name_len", sql`char_length(${t.policyName}) between 1 and 100`),
+    check("incidents_match_count", sql`${t.matchCount} >= 1`),
   ],
 );

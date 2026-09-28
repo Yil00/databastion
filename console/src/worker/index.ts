@@ -11,7 +11,17 @@ import { errorSummary, logger } from "@/lib/logger";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { startupErrors, startupFatal } from "@/server/startup-checks";
 
-import { createNoopHandler, NOOP_QUEUE, pgBossOptions, type NoopPayload } from "./queues";
+import { getDb } from "@/db/client";
+import { POLICY_QUEUE } from "@/server/policy-queue";
+
+import {
+  createNoopHandler,
+  NOOP_QUEUE,
+  pgBossOptions,
+  registerPolicyQueue,
+  schedulePolicyQueue,
+  type NoopPayload,
+} from "./queues";
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
@@ -58,8 +68,10 @@ async function main(): Promise<void> {
   await boss.start();
   await boss.createQueue(NOOP_QUEUE);
   await boss.work<NoopPayload>(NOOP_QUEUE, createNoopHandler(log));
+  await registerPolicyQueue(boss, getDb, log);
+  await schedulePolicyQueue(boss);
 
-  log.info({ queues: [NOOP_QUEUE] }, "worker started");
+  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE] }, "worker started");
 }
 
 main().catch((err: unknown) => {

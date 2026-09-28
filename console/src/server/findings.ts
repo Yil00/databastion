@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { agents, agentTargets, findings, findingsBatches, jobs } from "@/db/schema";
+import { agents, agentTargets, findings, findingsBatches, incidents, jobs } from "@/db/schema";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import type { FindingFilter } from "@/lib/findings-filter";
@@ -237,7 +237,7 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
   });
 }
 
-type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+export type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 const excluded = (column: string) => sql.raw(`excluded.${column}`);
 
@@ -398,27 +398,7 @@ function filterWhere(filter: FindingFilter): SQL | undefined {
  */
 export async function listFindings(db: Database, filter: FindingFilter = {}): Promise<FindingView[]> {
   const rows = await db
-    .select({
-      id: findings.id,
-      agentId: findings.agentId,
-      agentName: agents.name,
-      targetId: findings.targetId,
-      engine: findings.engine,
-      databaseName: findings.databaseName,
-      schemaName: findings.schemaName,
-      objectName: findings.objectName,
-      fieldName: findings.fieldName,
-      classifier: findings.classifier,
-      confidence: findings.confidence,
-      sampled: findings.sampled,
-      matched: findings.matched,
-      estimatedRows: findings.estimatedRows,
-      fingerprintCount: sql<number>`jsonb_array_length(${findings.fingerprints})::int`,
-      maskedSamples: findings.maskedSamples,
-      firstSeenAt: findings.firstSeenAt,
-      lastSeenAt: findings.lastSeenAt,
-      falsePositiveAt: findings.falsePositiveAt,
-    })
+    .select(FINDING_VIEW_COLUMNS)
     .from(findings)
     .innerJoin(agents, eq(agents.id, findings.agentId))
     .where(filterWhere(filter))
@@ -435,7 +415,6 @@ export async function listFindings(db: Database, filter: FindingFilter = {}): Pr
       asc(findings.fieldName),
     )
     .limit(MAX_LISTED_FINDINGS);
-  const key = maskedSamplesKey();
   // Fetched fairly (see above), displayed in a stable reading order.
   rows.sort(
     (a, b) =>
@@ -447,14 +426,53 @@ export async function listFindings(db: Database, filter: FindingFilter = {}): Pr
       cmp(a.objectName, b.objectName) ||
       cmp(a.fieldName, b.fieldName),
   );
-  return rows.map(({ maskedSamples, ...r }) => {
-    let samples: FindingView["samples"] = { state: "none" };
-    if (maskedSamples) {
-      const values = key ? decryptMaskedSamples(key, r.id, maskedSamples) : null;
-      samples = values ? { state: "ok", values } : { state: "unavailable" };
-    }
-    return { ...r, samples };
-  });
+  const key = maskedSamplesKey();
+  return rows.map((r) => toFindingView(r, key));
+}
+
+const FINDING_VIEW_COLUMNS = {
+  id: findings.id,
+  agentId: findings.agentId,
+  agentName: agents.name,
+  targetId: findings.targetId,
+  engine: findings.engine,
+  databaseName: findings.databaseName,
+  schemaName: findings.schemaName,
+  objectName: findings.objectName,
+  fieldName: findings.fieldName,
+  classifier: findings.classifier,
+  confidence: findings.confidence,
+  sampled: findings.sampled,
+  matched: findings.matched,
+  estimatedRows: findings.estimatedRows,
+  fingerprintCount: sql<number>`jsonb_array_length(${findings.fingerprints})::int`,
+  maskedSamples: findings.maskedSamples,
+  firstSeenAt: findings.firstSeenAt,
+  lastSeenAt: findings.lastSeenAt,
+  falsePositiveAt: findings.falsePositiveAt,
+};
+
+type FindingViewRow = Omit<FindingView, "samples"> & { maskedSamples: Buffer | null };
+
+/** The single decryption path of masked samples for display (`unavailable` on any failure). */
+function toFindingView({ maskedSamples, ...r }: FindingViewRow, key: Buffer | null): FindingView {
+  let samples: FindingView["samples"] = { state: "none" };
+  if (maskedSamples) {
+    const values = key ? decryptMaskedSamples(key, r.id, maskedSamples) : null;
+    samples = values ? { state: "ok", values } : { state: "unavailable" };
+  }
+  return { ...r, samples };
+}
+
+/** One finding for a server-rendered page (e.g. an incident's linked finding), or null. */
+export async function getFindingView(db: Database, findingId: string): Promise<FindingView | null> {
+  const [row] = await db
+    .select(FINDING_VIEW_COLUMNS)
+    .from(findings)
+    .innerJoin(agents, eq(agents.id, findings.agentId))
+    .where(eq(findings.id, findingId))
+    .limit(1);
+  return row ? toFindingView(row, maskedSamplesKey()) : null;
 }
 
 export interface FindingSummaryRow {
@@ -522,7 +540,7 @@ export async function summarizeFindings(db: Database, filter: FindingFilter = {}
  * Marks (or unmarks) a finding as a false positive (admin decision, M2). The mark records `matched`
  * and `classifiers_version` at marking time; a later scan matching more values or using another
  * classifier set resets it (see `fpResetNeeded`). Kept across other rescans. Audited, including
- * when the finding does not exist.
+ * when the finding does not exist. See {@link applyFalsePositive} for the incidents side.
  */
 export async function setFalsePositive(
   db: Database,
@@ -530,34 +548,85 @@ export async function setFalsePositive(
   falsePositive: boolean,
   actor: { userId: string; ip: string | null },
 ): Promise<boolean> {
-  return db.transaction(async (tx) => {
-    const rows = await tx
-      .update(findings)
-      .set(
-        falsePositive
-          ? {
-              falsePositiveAt: sql`coalesce(${findings.falsePositiveAt}, now())`,
-              falsePositiveBy: sql`coalesce(${findings.falsePositiveBy}, ${actor.userId}::uuid)`,
-              falsePositiveMatched: sql`case when ${findings.falsePositiveAt} is null then ${findings.matched} else ${findings.falsePositiveMatched} end`,
-              falsePositiveClassifiersVersion: sql`case when ${findings.falsePositiveAt} is null then ${findings.classifiersVersion} else ${findings.falsePositiveClassifiersVersion} end`,
-            }
-          : { falsePositiveAt: null, falsePositiveBy: null, falsePositiveMatched: null, falsePositiveClassifiersVersion: null },
-      )
-      .where(eq(findings.id, findingId))
-      .returning({ agentId: findings.agentId, targetId: findings.targetId, classifier: findings.classifier });
-    const row = rows[0];
-    await writeAudit(tx, {
-      actorType: "user",
-      actorId: actor.userId,
-      action: "finding.false_positive",
-      outcome: row ? "success" : "failure",
-      targetType: "finding",
-      targetId: findingId,
-      sourceIp: actor.ip,
-      details: row
-        ? { false_positive: falsePositive, agent_id: row.agentId, target_id: row.targetId, classifier: row.classifier }
-        : { false_positive: falsePositive, reason: "not_found" },
-    });
-    return row !== undefined;
+  return db.transaction(async (tx) => (await applyFalsePositive(tx, findingId, falsePositive, actor)) !== null);
+}
+
+/**
+ * The false-positive decision lives on the finding (location + classifier), for findings and
+ * incidents alike (P3-B): in the caller's transaction,
+ * - marking closes every open / acknowledged incident of the finding as `false_positive` (same
+ *   actor, audited `incident.transition`), and the policy engine skips false-positive findings;
+ * - unmarking sets the finding pending for the policy engine (`policy_evaluated_at = null`), so
+ *   the policies are applied to it again.
+ * Returns the finding's identifiers, or `null` when it does not exist (audited as a failure).
+ */
+export async function applyFalsePositive(
+  tx: Tx,
+  findingId: string,
+  falsePositive: boolean,
+  actor: { userId: string; ip: string | null },
+  via?: { incidentId: string },
+): Promise<{ agentId: string; targetId: string; classifier: string } | null> {
+  const rows = await tx
+    .update(findings)
+    .set(
+      falsePositive
+        ? {
+            falsePositiveAt: sql`coalesce(${findings.falsePositiveAt}, now())`,
+            falsePositiveBy: sql`coalesce(${findings.falsePositiveBy}, ${actor.userId}::uuid)`,
+            falsePositiveMatched: sql`case when ${findings.falsePositiveAt} is null then ${findings.matched} else ${findings.falsePositiveMatched} end`,
+            falsePositiveClassifiersVersion: sql`case when ${findings.falsePositiveAt} is null then ${findings.classifiersVersion} else ${findings.falsePositiveClassifiersVersion} end`,
+          }
+        : {
+            falsePositiveAt: null,
+            falsePositiveBy: null,
+            falsePositiveMatched: null,
+            falsePositiveClassifiersVersion: null,
+            policyEvaluatedAt: null,
+          },
+    )
+    .where(eq(findings.id, findingId))
+    .returning({ agentId: findings.agentId, targetId: findings.targetId, classifier: findings.classifier });
+  const row = rows[0];
+  await writeAudit(tx, {
+    actorType: "user",
+    actorId: actor.userId,
+    action: "finding.false_positive",
+    outcome: row ? "success" : "failure",
+    targetType: "finding",
+    targetId: findingId,
+    sourceIp: actor.ip,
+    details: row
+      ? {
+          false_positive: falsePositive,
+          agent_id: row.agentId,
+          target_id: row.targetId,
+          classifier: row.classifier,
+          ...(via ? { incident_id: via.incidentId } : {}),
+        }
+      : { false_positive: falsePositive, reason: "not_found" },
   });
+  if (row && falsePositive) {
+    const active = await tx
+      .select({ id: incidents.id, status: incidents.status })
+      .from(incidents)
+      .where(and(eq(incidents.findingId, findingId), inArray(incidents.status, ["open", "acknowledged"])))
+      .for("update");
+    for (const incident of active) {
+      await tx
+        .update(incidents)
+        .set({ status: "false_positive", falsePositiveAt: sql`now()`, falsePositiveBy: actor.userId, updatedAt: sql`now()` })
+        .where(eq(incidents.id, incident.id));
+      await writeAudit(tx, {
+        actorType: "user",
+        actorId: actor.userId,
+        action: "incident.transition",
+        targetType: "incident",
+        targetId: incident.id,
+        sourceIp: actor.ip,
+        details: { from: incident.status, to: "false_positive", finding_id: findingId, via: via ? "incident" : "finding" },
+      });
+    }
+  }
+  return row ?? null;
 }
