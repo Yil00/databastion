@@ -323,7 +323,8 @@ export const findingsBatches = pgTable(
  *   array of masked samples; NULL when the batch carried none or when the server key is unavailable
  *   (fail closed: the finding is stored, its samples are not).
  * - `fingerprints`: `hmac-sha256:` values as sent (keyed by the agent-local key, never leaves it).
- * - False positives are a user decision on the location + classifier: kept across rescans.
+ * - False positives are an admin decision on the location + classifier: kept across rescans unless
+ *   `matched` rises above its value at marking time or the classifier set changes.
  */
 export const findings = pgTable(
   "findings",
@@ -352,6 +353,12 @@ export const findings = pgTable(
     lastSeenAt: tsz("last_seen_at").notNull().defaultNow(),
     falsePositiveAt: tsz("false_positive_at"),
     falsePositiveBy: uuid("false_positive_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * `matched` and `classifiers_version` when the false positive was marked: a later scan that
+     * matches more values or runs another classifier set resets the mark (audited).
+     */
+    falsePositiveMatched: integer("false_positive_matched"),
+    falsePositiveClassifiersVersion: text("false_positive_classifiers_version"),
   },
   (t) => [
     foreignKey({

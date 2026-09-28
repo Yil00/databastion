@@ -129,6 +129,47 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
+  describe("0012: findings_batches append-only, findings not deletable by the runtime role (L3)", () => {
+    it("the runtime role can insert and read, update findings, but not delete / rewrite batches", async () => {
+      const { url } = await createRuntimeRole();
+      await withClient(url, async (c) => {
+        const agent = await c.query<{ id: string }>(
+          "insert into agents (name, hostname, version) values ('h2', 'h2', '0.1.0') returning id",
+        );
+        const agentId = agent.rows[0]?.id;
+        await c.query(
+          "insert into agent_targets (agent_id, target_id, engine, reachable, audit_level) values ($1, 'pg', 'postgres', true, 'none')",
+          [agentId],
+        );
+        await c.query(
+          "insert into findings_batches (agent_id, batch_id, body_sha256, findings_count) values ($1, $2, $3, 1)",
+          [agentId, "01920f60-3c1a-7b2e-9f00-5a1b2c3d4e70", "d".repeat(64)],
+        );
+        await c.query(
+          `insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+             field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id)
+           values ($1, $2, 'pg', $3, 'postgres', 'crm', 'clients', 'email', 'pii.email', '2026.09.1', 0.5, 10, 5, $1)`,
+          ["01920f60-3c1a-7b2e-9f00-5a1b2c3d4e71", agentId, "e".repeat(64)],
+        );
+        await c.query("update findings set matched = 6, false_positive_matched = 6 where agent_id = $1", [agentId]);
+        for (const stmt of [
+          "delete from findings_batches",
+          "truncate findings_batches",
+          "update findings_batches set body_sha256 = repeat('0', 64)",
+          "update findings_batches set findings_count = 0",
+          "delete from findings",
+          "truncate findings",
+        ]) {
+          await expect(c.query(stmt), stmt).rejects.toThrow(/permission denied/);
+        }
+        // Deleting the agent still cascades (foreign-key actions run as the table owner).
+        await c.query("delete from agents where id = $1", [agentId]);
+        const left = await c.query("select (select count(*) from findings)::int + (select count(*) from findings_batches)::int as n");
+        expect((left.rows[0] as { n: number }).n).toBe(0);
+      });
+    });
+  });
+
   describe("0009: refuses to run when pgboss is owned by another role", () => {
     const guardSql = readFileSync(path.join(MIGRATIONS_FOLDER, "0009_pgboss_owner_guard.sql"), "utf8");
 
