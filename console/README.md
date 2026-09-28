@@ -10,7 +10,8 @@ database (also used as the job queue: no Redis). See
 > Status: phase 1 (ROADMAP P1-A): database schema, local auth, console audit log, enrollment
 > tokens, agent API `/enroll`, `/heartbeat`, `/jobs` (long-poll), `/jobs/{job_id}/status`,
 > `/rotate`; Prometheus `/metrics`; UI pages (login, agents, agent detail, enrollment tokens);
-> Docker image.
+> Docker image. Phase 2 (P2-D): `/findings` ingestion, scan launching, findings view, false
+> positives.
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -39,7 +40,8 @@ database (also used as the job queue: no Redis). See
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
 e.g. `openssl rand -base64 32`) is the console server key of the web process. It keys the agent "known good" fingerprints (HKDF-SHA256
 subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
-`login-device.v1`, see "Brute-force protection"). **Set it in production: the shared-IP protection
+`login-device.v1`, see "Brute-force protection") and encrypts masked samples at rest (domain
+`masked-samples.v1`, see "Data at rest"). **Set it in production: the shared-IP protection
 of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.** Unset, too short
 or unreadable: fingerprints and device cookies are neither issued nor accepted (fail closed: agents
 lose the lock-out exemption, so agents behind a shared NAT / proxy IP can be blocked by floods from
@@ -142,7 +144,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 |-------|---------|
 | `GET /api/health` | Liveness: `{"status":"ok"}`, never touches the database |
 | `GET /api/health/ready` | Readiness: `200 {"status":"ok"}` or `503 {"status":"unavailable"}`; the cause is only logged |
-| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/findings`, `/events` still `501` |
+| `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)); `/events` still `501` (phase 4) |
 | `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP, per username + IP, and per username (slow-down, never a lock-out; see "Brute-force protection") |
 | `POST /api/auth/logout` | Ends the session |
@@ -152,12 +154,18 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
+| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h |
+| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (any authenticated user, CSRF, audited `finding.false_positive`); `204`, `404` unknown finding |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
 90 s) / revoked / locked, last seen, targets with audit level), `/agents/{id}` (targets; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
-`dbe_…` token is shown once with a copy button; list; revoke). Agent-reported strings are rendered
+`dbe_…` token is shown once with a copy button; list; revoke), `/findings` (counts per target and
+classifier, then one row per location with its masked samples decrypted server side; filters
+`?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
+row). The agent detail page shows the last scan of each target, a link to its findings and (admin)
+a "Scan" dialog. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
 (new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the
 confirmation dialog uses the native `<dialog>` element).
@@ -167,7 +175,8 @@ confirmation dialog uses the native `<dialog>` element).
   (`script-src 'self' 'nonce-…' 'strict-dynamic'`, `style-src 'self' 'nonce-…'`, `object-src 'none'`,
   `base-uri 'none'`, `form-action 'self'`, `frame-ancestors 'none'`; `'unsafe-eval'` in `next dev`
   only). Every page is rendered per request (root layout `force-dynamic`), so no prerendered page
-  lacks the nonce. Not applied to `/api/*` and `/metrics` (no HTML).
+  lacks the nonce. Not applied to `/api/*` and `/metrics` (no HTML). UI pages also get
+  `Cache-Control: no-store` (the findings view carries decrypted masked samples).
 - Every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy` / `-Resource-Policy: same-origin`,
   a restrictive `Permissions-Policy` (`next.config.ts`). HSTS is set by the TLS reverse proxy.
@@ -273,8 +282,12 @@ All rotation instants (registration deadline, promotion time, window checks) use
 revocation wakes them (locally and via `NOTIFY` in other processes) and a poll whose secret is no
 longer the current one is closed with `401`.
 
-`security_events` is a placeholder for the incident model of phase 3 (agent-integrity alerts:
-`rotation_conflict` today, rejected batches and `batch_conflict` with P2-D).
+`security_events` is a placeholder for the incident model of phase 3 (agent-integrity alerts):
+`agent.rotation_conflict` (`critical`), and since P2-D `agent.batch_rejected` (a `400` on
+`/findings`), `agent.batch_conflict` and `agent.foreign_target` (a finding for a target the agent
+never reported), all `high`, each with an audit-log entry of the same name. Their details are the
+endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
+per 10 minutes; beyond, they are counted and logged once per window.
 
 ## Metrics
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
@@ -346,10 +359,14 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | User passwords, agent secrets (current / pending / previous) | argon2id (`@node-rs/argon2`, m = 19 MiB, t = 2, p = 1) |
 | Agent "known good" fingerprints (`agents.known_good_fingerprint`, `known_good_at`, `known_good_pending_fingerprint`) | HMAC-SHA256 (subkey of `DATABASTION_ENCRYPTION_KEY`) over the bound argon2id hash and the 256-bit agent secret; never authenticate, only exempt the last verified secret (24 h, survives restarts) and the pending secret registered by the authenticated agent from the per-agent failure limit; the pending one becomes the current one at promotion; cleared on lock and revocation |
 | Security events (`security_events`) | console-computed kind / severity / scalar details, never a secret or hash |
+| Findings (`findings`) | one row per (agent, target, location, classifier), keyed by `location_key` = SHA-256 of that tuple; names, counts, confidence, first / last seen, false-positive decision in plain columns (normalized names, escaped on display) |
+| Masked samples (`findings.masked_samples`) | AES-256-GCM, key = HKDF-SHA256 subkey `masked-samples.v1` of `DATABASTION_ENCRYPTION_KEY`, random 96-bit nonce, AAD = label + finding id; layout `0x01 ‖ nonce ‖ ciphertext ‖ tag`. Without a usable key no sample is stored (the finding is); a key change makes stored samples "unavailable" in the view until the next scan |
+| HMAC fingerprints (`findings.fingerprints`) | as sent by the agent (keyed by its local key, which never leaves it) |
+| Findings batches (`findings_batches`) | `(agent_id, batch_id)`, SHA-256 of the validated batch, job, item count: idempotency only, never the body |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
-| Masked samples (P2-D), webhook / SMTP settings (later) | AES-256-GCM with `DATABASTION_ENCRYPTION_KEY`, introduced with the first such column |
+| Webhook / SMTP settings (later) | AES-256-GCM with a subkey of `DATABASTION_ENCRYPTION_KEY`, like masked samples |
 
 Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are in-memory, per
 process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the

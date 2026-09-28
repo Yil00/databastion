@@ -1,6 +1,9 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { AgentActions } from "@/components/console/agent-actions";
+import { findingsHref } from "@/components/console/findings-table";
+import { ScanDialog } from "@/components/console/scan-dialog";
 import { StatusBadge } from "@/components/console/status-badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -8,6 +11,7 @@ import { getDb } from "@/db/client";
 import { displayStatus, formatAge } from "@/lib/agent-status";
 import { getAgentDetail } from "@/server/agents";
 import { rotationBlocked } from "@/server/rotation";
+import { latestScans } from "@/server/scans";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
 export const dynamic = "force-dynamic";
@@ -21,7 +25,9 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
   if (!UUID.test(id)) notFound();
   const agent = await getAgentDetail(getDb(), id);
   if (!agent) notFound();
+  const scans = await latestScans(getDb(), id);
   const now = requestTime();
+  const isAdmin = session.user.role === "admin";
   const status = displayStatus(agent, now);
   const active = status !== "revoked" && status !== "locked";
   const rotating = rotationBlocked(
@@ -44,7 +50,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-2xl font-semibold tracking-tight">{agent.name}</h1>
         <StatusBadge status={status} />
-        {session.user.role === "admin" && active && (
+        {isAdmin && active && (
           <div className="ml-auto">
             <AgentActions agentId={agent.id} agentName={agent.name} csrfToken={session.csrfToken} rotationBlocked={rotating} />
           </div>
@@ -87,6 +93,8 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                   <TableHead>Audit source</TableHead>
                   <TableHead>Last error</TableHead>
                   <TableHead>Reported</TableHead>
+                  <TableHead>Last scan</TableHead>
+                  <TableHead />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -103,6 +111,28 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     <TableCell>{t.auditSource ?? ""}</TableCell>
                     <TableCell>{t.lastError ?? ""}</TableCell>
                     <TableCell>{formatAge(t.lastReportedAt, now)}</TableCell>
+                    <TableCell>
+                      {(() => {
+                        const scan = scans.get(t.targetId);
+                        if (!scan) return "never";
+                        return `${scan.status}${scan.errorCode ? ` (${scan.errorCode})` : ""}, ${formatAge(scan.createdAt, now)}`;
+                      })()}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-start gap-2">
+                        <Link className="text-sm hover:underline" href={findingsHref({ agent: agent.id, target: t.targetId })}>
+                          Findings
+                        </Link>
+                        {isAdmin && active && t.present && (
+                          <ScanDialog
+                            agentId={agent.id}
+                            targetId={t.targetId}
+                            csrfToken={session.csrfToken}
+                            disabled={["pending", "delivered", "running"].includes(scans.get(t.targetId)?.status ?? "")}
+                          />
+                        )}
+                      </div>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

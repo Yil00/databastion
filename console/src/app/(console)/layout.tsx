@@ -16,6 +16,9 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
           <Link href="/agents" className="hover:underline">
             Agents
           </Link>
+          <Link href="/findings" className="hover:underline">
+            Findings
+          </Link>
           {session.user.role === "admin" && (
             <Link href="/enrollment-tokens" className="hover:underline">
               Enrollment tokens
