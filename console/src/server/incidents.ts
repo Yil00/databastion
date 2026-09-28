@@ -350,7 +350,11 @@ export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } 
           for (const p of active) results.push(await applyPolicy(tx, p, f, exceptions, new Date(now)));
           count(results);
         }
-        await tx.update(findings).set({ policyEvaluatedAt: f.lastSeenAt }).where(eq(findings.id, f.id));
+        // The column itself, not the JS value read above: `last_seen_at` has microsecond precision
+        // and a JS Date only milliseconds, so the finding would stay pending forever (and a drain
+        // would re-select the same first chunk until its deadline). The row is locked, so
+        // `last_seen_at` cannot have moved since it was read.
+        await tx.update(findings).set({ policyEvaluatedAt: sql`${findings.lastSeenAt}` }).where(eq(findings.id, f.id));
       }
       return rows.length;
     });

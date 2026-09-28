@@ -401,6 +401,26 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
     });
   });
 
+  describe("drain", () => {
+    it("evaluates every pending finding once, beyond one chunk, and leaves none pending (timestamp precision)", async () => {
+      const auth = await agentWithTargets();
+      await newPolicy();
+      const items = Array.from({ length: 250 }, (_, i) => finding({ location: { engine: "postgres", database: "crm", schema: "public", object: `t${i}`, field: "email" } }));
+      const jobId = await claimedScan(auth);
+      await sendBatch(auth, jobId, items.slice(0, 200));
+      await sendBatch(auth, jobId, items.slice(200));
+      const stats = await drainPolicyWork(getDb());
+      expect(stats.findings).toBe(250);
+      expect(stats.more).toBe(false);
+      expect(await incidentsOf(auth.agentId)).toHaveLength(250);
+      const [pending] = (
+        await getDb().execute<{ n: number }>(sql`select count(*)::int as n from findings where policy_evaluated_at is distinct from last_seen_at`)
+      ).rows;
+      expect(pending?.n).toBe(0);
+      expect((await drainPolicyWork(getDb())).findings).toBe(0);
+    });
+  });
+
   describe("exceptions", () => {
     it("suppresses matching findings; expiry and deletion let the policy apply again", async () => {
       const auth = await agentWithTargets();
