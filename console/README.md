@@ -31,6 +31,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_METRICS_TOKEN` / `_FILE` | Bearer token required by `GET /metrics` (at least 32 characters, e.g. `openssl rand -base64 32`). Unset or too short: `/metrics` answers `404`. See "Metrics" |
 | `DATABASTION_METRICS_PORT` | Serve `GET /metrics` on a dedicated listener on this port (e.g. `9464`) instead of the main port, which then answers `404` on `/metrics`. Unset: no dedicated listener, `/metrics` stays on the main port (a startup warning is logged in production when the token is set). Must differ from `PORT`. See "Metrics" |
 | `DATABASTION_METRICS_HOST` | Bind address (IP literal) of that listener: `127.0.0.1` by default; `0.0.0.0` inside a container whose metrics port is not published. Invalid port / host: `/metrics` is disabled everywhere and an error is logged |
+| `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` | Let the web and worker processes start in production without a usable `DATABASTION_ENCRYPTION_KEY(_FILE)` (see below; not recommended) |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
@@ -38,7 +39,7 @@ database (also used as the job queue: no Redis). See
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
-e.g. `openssl rand -base64 32`) is the console server key of the web process. It keys the agent "known good" fingerprints (HKDF-SHA256
+e.g. `openssl rand -base64 32`) is the console server key of the web and worker processes. It keys the agent "known good" fingerprints (HKDF-SHA256
 subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
 `login-device.v1`, see "Brute-force protection") and encrypts masked samples at rest (domain
 `masked-samples.v1`, see "Data at rest"). **Set it in production: the shared-IP protection
@@ -46,7 +47,9 @@ of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.*
 or unreadable: fingerprints and device cookies are neither issued nor accepted (fail closed: agents
 lose the lock-out exemption, so agents behind a shared NAT / proxy IP can be blocked by floods from
 it, and a distributed guessing attack on a username can keep its user out), and in production the
-web process logs an **error** at startup naming those disabled protections (it still starts). Changing it
+web and worker processes **refuse to start** (a `fatal` log, exit code 1), unless
+`DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` is set: they then start and log an **error** naming
+those disabled protections (masked samples are then neither stored nor shown). Changing it
 invalidates the stored fingerprints. The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
@@ -88,7 +91,8 @@ Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
-objects), then run `migrate` again. The roles and passwords are created outside migrations (the
+objects), then run `migrate` again. `migrate` repeats the same check as a pre-flight on every run,
+before any migration SQL (also when no migration is pending). The roles and passwords are created outside migrations (the
 owner has no `CREATEROLE`); with the example compose file,
 [deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
 first database initialization, reading the passwords from the Docker secret files inside psql
@@ -155,7 +159,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/agents` | Agents and their reported targets (audit level, reachability) |
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
-| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`) |
+| `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 900, `statement_timeout_ms` 30000); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (no `classifiers_version` reported yet), `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. Before the busy check, the agent's dead scans are swept: pending past `expires_at` → `expired`, delivered / running past `delivered_at + max_duration_s + 1 h` → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline) |
 | `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor) |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
@@ -166,7 +170,9 @@ browser): `/login`, `/agents` (name, hostname, version, status online / silent (
 classifier, then one row per location with its masked samples decrypted server side; filters
 `?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
 row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
-(most recently seen first within each), so one noisy agent or target cannot hide the others. The agent detail page shows the last scan of each target, a link to its findings and (admin)
+(most recently seen first within each), so one noisy agent or target cannot hide the others; the
+counts show at most 1000 (target, classifier) groups, fetched round-robin over agents then over
+the targets of each agent. The agent detail page shows the last scan of each target, a link to its findings and (admin)
 a "Scan" dialog. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
 (new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the
@@ -207,7 +213,9 @@ Failed logins (P1-D M2), all over 15 minutes:
 - 5 per username **and** source IP: a failure flood from one IP never locks the account out for
   another IP (`429` from that IP only);
 - when the client IP is unknown (no trusted proxy), that counter is per username alone, shared by
-  everyone: reaching it never answers `429`, the username degrades like below (N2);
+  everyone: reaching it never answers `429`, the username degrades like below (N2), with a
+  slow-down that grows with the username's failed degraded attempts: 2 s, doubling per failure
+  (4, 8, 16 s), capped at 30 s (15-minute window; a success refunds its own attempt only);
 - 100 per username across all IPs. Reaching it never refuses the login: the username degrades to a
   slow-down (2 s before the verification) with one attempt in flight at a time, other concurrent
   attempts for that username get `503 busy` + `Retry-After`. Wrong passwords still answer `401`
@@ -220,7 +228,8 @@ user id, the issue time and a random nonce, signed with HMAC-SHA256 under the se
 `login-device.v1`; nothing is stored server side. A login presenting a valid device cookie for the
 username it tries skips the global per-username cap and its degraded single slot, so an attacker
 spread over many IPs cannot keep the real user out by holding that slot. It never replaces the
-password, and stays subject to the per-(username, IP) limit, a limit of 5 failures per cookie
+password (nor the growing slow-down of an unknown IP), its failures still count toward the global
+per-username cap, and it stays subject to the per-(username, IP) limit, a limit of 5 failures per cookie
 (beyond, the cookie gives no bypass: a stolen cookie cannot be used to guess) and the login
 argon2id pool. A cookie for another user, tampered, expired or signed with another key is ignored.
 Without the server key, no device cookie is issued or accepted.
