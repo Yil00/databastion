@@ -336,28 +336,43 @@ done
 [ -n "$online" ] || fail "agent not online with target pg-e2e within 90 s"
 log "agent online; target pg-e2e: $(jq -c '.targets[] | select(.targetId == "pg-e2e") | {reachable, auditLevel, lastError}' <<<"$online")"
 
-log "checking the agent's target account (least privilege, read-only: I4)"
+log "checking the agent's target account (ADR-0012 minimal variant, read-only: I4)"
 role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
   psql -XAt -v ON_ERROR_STOP=1 -U postgres -d app -c "SELECT concat_ws(',', rolcanlogin, rolsuper,
-    rolcreatedb, rolcreaterole, rolreplication, rolbypassrls,
+    rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolconnlimit,
     pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER'), pg_has_role(r.oid, 'pg_monitor', 'MEMBER'),
+    pg_has_role(r.oid, 'pg_read_all_stats', 'MEMBER'),
     has_database_privilege(r.oid, 'app', 'CONNECT'),
     (SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
-       JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = r.oid))
+       JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = r.oid),
+    (SELECT string_agg(c, '+' ORDER BY c COLLATE \"C\") FROM pg_db_role_setting s,
+       unnest(s.setconfig) AS c WHERE s.setrole = r.oid))
     FROM pg_roles r WHERE rolname = 'databastion_agent'")" || fail "cannot inspect databastion_agent"
-# psql renders booleans as t / f. Direct memberships must be exactly these two roles: a later
-# grant of a write-capable role would otherwise pass (default_transaction_read_only is only a
-# session default).
-[ "$role" = "t,f,f,f,f,f,t,t,t,pg_monitor+pg_read_all_data" ] \
-  || fail "databastion_agent has unexpected attributes: $role"
+# psql renders booleans as t / f. Direct memberships must be exactly pg_read_all_stats: a later
+# grant of pg_read_all_data / pg_monitor or of a write-capable role would otherwise pass
+# (default_transaction_read_only is only a session default). The role settings (every database)
+# must be exactly the four ADR-0012 defaults.
+expected_role="t,f,f,f,f,f,4,f,f,t,t,pg_read_all_stats"
+expected_role+=",default_transaction_read_only=on+idle_in_transaction_session_timeout=60s"
+expected_role+="+lock_timeout=2s+statement_timeout=30s"
+[ "$role" = "$expected_role" ] || fail "databastion_agent has unexpected attributes: $role"
 # Logs in over TCP with its own password (read by the shell inside the container, never on a
-# command line) and checks that its sessions are read-only by default.
+# command line) and checks, in its own session, the role defaults (read-only transactions,
+# timeouts) and that the credential-bearing catalogs are denied (no pg_read_all_data).
 # shellcheck disable=SC2016 # expanded by the container shell, on purpose
 ro="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg sh -c \
   'PGPASSWORD="$(cat /run/secrets/target_agent_password)" exec psql -XAt -h 127.0.0.1 \
-     -U databastion_agent -d app -c "SHOW default_transaction_read_only"')" \
+     -U databastion_agent -d app -c "SELECT concat_ws(\$\$,\$\$,
+       current_setting(\$\$default_transaction_read_only\$\$),
+       current_setting(\$\$statement_timeout\$\$)::interval = interval \$\$30s\$\$,
+       current_setting(\$\$lock_timeout\$\$)::interval = interval \$\$2s\$\$,
+       current_setting(\$\$idle_in_transaction_session_timeout\$\$)::interval = interval \$\$60s\$\$,
+       has_table_privilege(\$\$pg_catalog.pg_authid\$\$, \$\$SELECT\$\$),
+       has_table_privilege(\$\$pg_catalog.pg_user_mapping\$\$, \$\$SELECT\$\$))"')" \
   || fail "databastion_agent cannot log in to the target"
-[ "$ro" = on ] || fail "databastion_agent sessions are not read-only by default ($ro)"
+[ "$ro" = "on,t,t,t,f,f" ] \
+  || fail "databastion_agent session defaults / catalog privileges are unexpected ($ro)"
+unset role expected_role ro
 
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
