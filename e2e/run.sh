@@ -69,7 +69,8 @@ DB_APP_PASSWORD="$(rand_hex 24)"
 ENCRYPTION_KEY="$(openssl rand -base64 32)"
 METRICS_TOKEN="$(rand_hex 32)"
 ADMIN_PASSWORD="$(rand_hex 24)"
-TARGET_PG_PASSWORD="$(rand_hex 24)"
+TARGET_PG_PASSWORD="$(rand_hex 24)"     # target superuser: stays in target-pg
+TARGET_AGENT_PASSWORD="$(rand_hex 24)"  # databastion_agent (least privilege, read-only)
 put_secret db_password "$DB_PASSWORD"
 put_secret db_owner_password "$DB_OWNER_PASSWORD"
 put_secret db_app_password "$DB_APP_PASSWORD"
@@ -79,6 +80,7 @@ put_secret encryption_key "$ENCRYPTION_KEY"
 put_secret metrics_token "$METRICS_TOKEN"
 put_secret admin_password "$ADMIN_PASSWORD"
 put_secret target_pg_password "$TARGET_PG_PASSWORD"
+put_secret target_agent_password "$TARGET_AGENT_PASSWORD"
 chmod 0700 "$S"
 
 # --------------------------------------------------------------------------- test CA
@@ -119,9 +121,9 @@ targets:
     engine: postgres
     host: target-pg
     port: 5432
-    account: postgres
+    account: databastion_agent
     secret:
-      file: /run/databastion-secrets/target_pg_password
+      file: /run/databastion-secrets/target_agent_password
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -201,7 +203,7 @@ timeout 60 docker compose -f "$HERE/docker-compose.yml" run --rm -T --no-deps ag
 state_mode="$(files_root 'stat -c "%u:%g %a" /state')"
 [ "$state_mode" = "10001:10001 700" ] || fail "state volume is '$state_mode', expected '10001:10001 700'"
 files_root 'chmod 0700 /secrets && chown 10001:10001 /secrets'
-printf '%s' "$TARGET_PG_PASSWORD" | files_agent 'umask 077; cat > /secrets/target_pg_password'
+printf '%s' "$TARGET_AGENT_PASSWORD" | files_agent 'umask 077; cat > /secrets/target_agent_password'
 printf '%s' "$ENROLLMENT_TOKEN" | files_agent 'umask 077; cat > /secrets/enrollment_token'
 
 # --------------------------------------------------------------------------- enroll + run
@@ -235,6 +237,8 @@ deadline=$(( $(date +%s) + 90 ))
 online=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   a="$(agent_json || true)"
+  # TODO(P2): also assert `.reachable == true` once the PostgreSQL connector lands (it is a stub
+  # in phase 1: the target is reported unreachable, audit level `none`).
   if [ -n "$a" ] && jq -e '.status == "online" and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present)' \
       <<<"$a" >/dev/null; then
     online="$a"
@@ -244,6 +248,24 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 [ -n "$online" ] || fail "agent not online with target pg-e2e within 90 s"
 log "agent online; target pg-e2e: $(jq -c '.targets[] | select(.targetId == "pg-e2e") | {reachable, auditLevel, lastError}' <<<"$online")"
+
+log "checking the agent's target account (least privilege, read-only: I4)"
+role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
+  psql -XAt -v ON_ERROR_STOP=1 -U postgres -d app -c "SELECT concat_ws(',', rolcanlogin, rolsuper,
+    rolcreatedb, rolcreaterole, rolreplication, rolbypassrls,
+    pg_has_role(oid, 'pg_read_all_data', 'MEMBER'), pg_has_role(oid, 'pg_monitor', 'MEMBER'),
+    has_database_privilege(oid, 'app', 'CONNECT'))
+    FROM pg_roles WHERE rolname = 'databastion_agent'")" || fail "cannot inspect databastion_agent"
+[ "$role" = "true,false,false,false,false,false,true,true,true" ] \
+  || fail "databastion_agent has unexpected attributes: $role"
+# Logs in over TCP with its own password (read by the shell inside the container, never on a
+# command line) and checks that its sessions are read-only by default.
+# shellcheck disable=SC2016 # expanded by the container shell, on purpose
+ro="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg sh -c \
+  'PGPASSWORD="$(cat /run/secrets/target_agent_password)" exec psql -XAt -h 127.0.0.1 \
+     -U databastion_agent -d app -c "SHOW default_transaction_read_only"')" \
+  || fail "databastion_agent cannot log in to the target"
+[ "$ro" = on ] || fail "databastion_agent sessions are not read-only by default ($ro)"
 
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
@@ -305,6 +327,7 @@ patterns="$E2E_WORK_DIR/patterns"
   printf 'db_app_password\t%s\n' "$DB_APP_PASSWORD"
   printf 'encryption_key\t%s\n' "$ENCRYPTION_KEY"
   printf 'target_pg_password\t%s\n' "$TARGET_PG_PASSWORD"
+  printf 'target_agent_password\t%s\n' "$TARGET_AGENT_PASSWORD"
 } >"$patterns"
 leaks=0
 while IFS=$'\t' read -r name value; do

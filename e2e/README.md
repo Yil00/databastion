@@ -12,7 +12,7 @@ revocation effective in < 60 s*. [`run.sh`](run.sh) drives
 | `migrate` | `console/Dockerfile` | One-shot migrations as the owner role |
 | `web`, `worker` | `console/Dockerfile` | Console processes (runtime role) |
 | `proxy` | Caddy | TLS 1.3 reverse proxy, certificate from a throwaway CA; `/metrics` answers `404` |
-| `target-pg` | PostgreSQL 17 | Declared target of the agent (heartbeat target status) |
+| `target-pg` | PostgreSQL 17 | Declared target of the agent (heartbeat target status); [`target-initdb/`](target-initdb/) creates the agent's read-only role |
 | `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA) |
 | `bootstrap-admin`, `agent-files` | console / PostgreSQL | One-shot helpers (`tools` profile) |
 
@@ -22,8 +22,11 @@ cannot reach the console database or the outside. Only the proxy is published, o
 `cap_drop: ALL` (PostgreSQL gets back what its entrypoint needs) and `no-new-privileges`.
 
 ## Flow
-1. Generate every secret (database passwords, metrics token, admin password, target password)
-   and the test CA + proxy certificate into a private temporary directory, write `agent.yaml`.
+1. Generate every secret (database passwords, metrics token, admin password, target superuser
+   and agent passwords) and the test CA + proxy certificate into a private temporary directory,
+   write `agent.yaml`. The agent connects to the target as `databastion_agent` (`LOGIN`, no
+   superuser / createdb / createrole, `CONNECT`, `pg_read_all_data`, `pg_monitor`,
+   `default_transaction_read_only = on`: I4); the superuser password never leaves `target-pg`.
 2. Build the console and agent images, start the console stack and the target, wait for
    `/api/health/ready` through the proxy.
 3. `bootstrap-admin` with the random password (Docker secret file), log in through the user API
@@ -32,7 +35,8 @@ cannot reach the console database or the outside. Only the proxy is published, o
    command line), run `databastion-agent enroll --token-file …`, then `databastion-agent run`.
 5. Assert through `GET /api/agents` that the agent is `online` with target `pg-e2e` reported
    (the PostgreSQL connector is still a stub: the target is reported unreachable, audit level
-   `none`, which is printed but not asserted), and that `/metrics` (scraped from inside the web
+   `none`, which is printed but not asserted), that `databastion_agent` has exactly the
+   attributes above and gets read-only sessions, and that `/metrics` (scraped from inside the web
    container with the metrics token) shows `databastion_agent_up{agent_id="…"} 1`.
 6. Revoke the agent through the user API; within 60 s the agent must log
    `console rejected the current secret (401)`; the measured latency is printed and the test

@@ -138,7 +138,11 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/target_pg_password
       POSTGRES_DB: app
-    secrets: [target_pg_password]
+    # The superuser password stays here; target-initdb/ creates the agent's least-privilege,
+    # read-only role `databastion_agent` (I4) from the target_agent_password secret.
+    secrets: [target_pg_password, target_agent_password]
+    volumes:
+      - ./target-initdb:/docker-entrypoint-initdb.d:ro
     tmpfs: [/var/lib/postgresql/data, /var/run/postgresql, /tmp]
     networks: [agent-net]
     healthcheck:
@@ -173,7 +177,8 @@ services:
 
   # Test helper (run.sh only), no network. As root (CHOWN only): hands the secrets volume to
   # the agent user and checks the state volume owner / mode. As 10001: writes the enrollment
-  # token and the target password, received on stdin, as 0600 files; reads identity.json.
+  # token and the agent's target password, received on stdin, as 0600 files; reads
+  # identity.json and checks its owner / mode.
   agent-files:
     <<: *hardening
     profiles: [tools]
@@ -214,3 +219,5 @@ secrets:
     file: ${E2E_WORK_DIR:?set by run.sh}/secrets/admin_password
   target_pg_password:
     file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_pg_password
+  target_agent_password:
+    file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_agent_password
