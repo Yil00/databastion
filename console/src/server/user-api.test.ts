@@ -62,6 +62,57 @@ async function login(username = "admin", password = PASSWORD, ip?: string, cooki
   return { res, setCookie, cookie: setCookie.split(";")[0] ?? "", device, csrf: body?.csrf_token ?? "" };
 }
 
+/**
+ * Deterministic login slow-down (replaces `loginSlowdown.sleep`): records every requested delay
+ * and, while `hold()` is active, keeps the slowed-down attempts waiting until `release()`. The
+ * tests assert on the requested delays and on explicit ordering, never on wall-clock time: in a
+ * full-suite run (parallel test files, argon2id under CPU contention) the former elapsed-time
+ * bounds and fixed sleeps were flaky.
+ */
+const realSleep = loginSlowdown.sleep;
+function fakeSlowdown() {
+  const delays: number[] = [];
+  let gate: { promise: Promise<void>; release: () => void } | null = null;
+  const watchers: { n: number; resolve: () => void }[] = [];
+  loginSlowdown.sleep = async (ms: number) => {
+    delays.push(ms);
+    for (const w of watchers) if (delays.length >= w.n) w.resolve();
+    if (gate) await gate.promise;
+  };
+  return {
+    delays,
+    hold() {
+      let release: () => void = () => undefined;
+      const promise = new Promise<void>((r) => {
+        release = r;
+      });
+      gate = { promise, release };
+    },
+    release() {
+      gate?.release();
+      gate = null;
+    },
+    /** Resolves once `n` slowed-down attempts (in total) have started waiting. */
+    sleeping(n: number): Promise<void> {
+      if (delays.length >= n) return Promise.resolve();
+      return new Promise((resolve) => watchers.push({ n, resolve }));
+    },
+  };
+}
+
+/** Resolves once `n` of `promises` have settled, whatever their outcome. */
+function settled(promises: Promise<unknown>[], n: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = 0;
+    if (n <= 0) resolve();
+    const one = () => {
+      done += 1;
+      if (done === n) resolve();
+    };
+    for (const p of promises) p.then(one, one);
+  });
+}
+
 async function auditCount(action: string, outcome = "success") {
   const rows = await getDb().select().from(auditLog).where(eq(auditLog.action, action));
   return rows.filter((r) => r.outcome === outcome).length;
@@ -80,6 +131,11 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     loginFailuresPerDevice.clear();
     loginFailuresUnknownUser.clear();
     loginDegradedFailures.clear();
+  });
+  afterEach(() => {
+    loginSlowdown.sleep = realSleep;
+    loginSlowdown.ms = 2000;
+    loginSlowdown.maxMs = 30_000;
   });
 
   it("bootstraps the first admin once, with no default password", async () => {
@@ -112,24 +168,24 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
 
   it("unknown IP: the per-username limit degrades to the slow-down, never a hard 429 (N2)", async () => {
     loginSlowdown.ms = 150;
-    try {
-      const statuses: number[] = [];
-      for (let i = 0; i < 5; i++) statuses.push((await login("admin", "not the password")).res.status);
-      expect(statuses).toEqual([401, 401, 401, 401, 401]);
-      // Over the limit: still 401 for a wrong password, after the slow-down.
-      let start = performance.now();
-      expect((await login("admin", "not the password")).res.status).toBe(401);
-      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
-      // One attempt in flight: concurrent ones get 503.
-      const burst = await Promise.all([login("admin", "nope nope"), login("admin", "nope nope")]);
-      expect(burst.map((r) => r.res.status).sort()).toEqual([401, 503]);
-      // The right password still logs in (slowed down).
-      start = performance.now();
-      expect((await login()).res.status).toBe(200);
-      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
-    } finally {
-      loginSlowdown.ms = 2000;
-    }
+    const slow = fakeSlowdown();
+    const statuses: number[] = [];
+    for (let i = 0; i < 5; i++) statuses.push((await login("admin", "not the password")).res.status);
+    expect(statuses).toEqual([401, 401, 401, 401, 401]);
+    expect(slow.delays).toEqual([]);
+    // Over the limit: still 401 for a wrong password, after the slow-down.
+    expect((await login("admin", "not the password")).res.status).toBe(401);
+    expect(slow.delays).toEqual([150]);
+    // One attempt in flight: a concurrent one gets 503 while the first one is still waiting.
+    slow.hold();
+    const burst = [login("admin", "nope nope"), login("admin", "nope nope")];
+    await slow.sleeping(2);
+    expect((await Promise.race(burst)).res.status).toBe(503);
+    slow.release();
+    expect((await Promise.all(burst)).map((r) => r.res.status).sort()).toEqual([401, 503]);
+    // The right password still logs in, slowed down (two failed degraded attempts: 150 * 2^2).
+    expect((await login()).res.status).toBe(200);
+    expect(slow.delays).toEqual([150, 300, 600]);
   });
 
   it("unknown IP: a valid device cookie skips the degraded slot (N1, N2)", async () => {
@@ -137,55 +193,44 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     expect(first.res.status).toBe(200);
     expect(first.device).toMatch(/^databastion_device=v1\./);
     for (let i = 0; i < 5; i++) await login("admin", "not the password");
-    loginSlowdown.ms = 1000;
-    try {
-      const attacker = login("admin", "held slot guess");
-      await new Promise((r) => setTimeout(r, 50));
-      expect((await login()).res.status).toBe(503);
-      const start = performance.now();
-      expect((await login("admin", PASSWORD, undefined, first.device)).res.status).toBe(200);
-      expect(performance.now() - start).toBeLessThan(900);
-      expect((await attacker).res.status).toBe(401);
-    } finally {
-      loginSlowdown.ms = 2000;
-    }
+    const slow = fakeSlowdown();
+    slow.hold();
+    const attacker = login("admin", "held slot guess");
+    await slow.sleeping(1);
+    expect((await login()).res.status).toBe(503);
+    expect((await login("admin", PASSWORD, undefined, first.device)).res.status).toBe(200);
+    // The device-cookie login neither took the slot nor waited.
+    expect(slow.delays).toHaveLength(1);
+    slow.release();
+    expect((await attacker).res.status).toBe(401);
   });
 
   it("unknown IP: the slow-down past the per-username counter doubles per failure, capped (L)", async () => {
     loginSlowdown.ms = 60;
     loginSlowdown.maxMs = 250;
-    try {
-      for (let i = 0; i < loginFailuresPerUser.limit; i++) await login("admin", "not the password");
-      const elapsed: number[] = [];
-      for (let i = 0; i < 4; i++) {
-        const start = performance.now();
-        expect((await login("admin", "not the password")).res.status).toBe(401);
-        elapsed.push(performance.now() - start);
-      }
-      // 60, 120, 240, then capped at 250 ms (plus the argon2id verification).
-      expect(elapsed[0]).toBeGreaterThanOrEqual(55);
-      expect(elapsed[0]).toBeLessThan(115);
-      expect(elapsed[1]).toBeGreaterThanOrEqual(115);
-      expect(elapsed[2]).toBeGreaterThanOrEqual(235);
-      expect(elapsed[3]).toBeGreaterThanOrEqual(245);
-      expect(loginSlowdownMs("admin", true)).toBe(250);
-      // A concurrent attempt is told to retry after the current delay.
-      const held = login("admin", "held slot guess");
-      await new Promise((r) => setTimeout(r, 20));
-      const busy = await login("admin", "nope nope");
-      expect(busy.res.status).toBe(503);
-      expect(Number(busy.res.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
-      await held;
-      // Known IP over the global cap: the flat base delay.
-      expect(loginSlowdownMs("admin", false)).toBe(60);
-      // A success refunds its own count only.
-      const before = loginDegradedFailures.count("admin");
-      expect((await login()).res.status).toBe(200);
-      expect(loginDegradedFailures.count("admin")).toBe(before);
-    } finally {
-      loginSlowdown.ms = 2000;
-      loginSlowdown.maxMs = 30_000;
+    const slow = fakeSlowdown();
+    for (let i = 0; i < loginFailuresPerUser.limit; i++) await login("admin", "not the password");
+    for (let i = 0; i < 4; i++) {
+      expect((await login("admin", "not the password")).res.status).toBe(401);
     }
+    // 60, 120, 240, then capped at 250 ms.
+    expect(slow.delays).toEqual([60, 120, 240, 250]);
+    expect(loginSlowdownMs("admin", true)).toBe(250);
+    // A concurrent attempt is told to retry after the current delay.
+    slow.hold();
+    const held = login("admin", "held slot guess");
+    await slow.sleeping(5);
+    const busy = await login("admin", "nope nope");
+    expect(busy.res.status).toBe(503);
+    expect(Number(busy.res.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
+    slow.release();
+    await held;
+    // Known IP over the global cap: the flat base delay.
+    expect(loginSlowdownMs("admin", false)).toBe(60);
+    // A success refunds its own count only.
+    const before = loginDegradedFailures.count("admin");
+    expect((await login()).res.status).toBe(200);
+    expect(loginDegradedFailures.count("admin")).toBe(before);
   });
 
   it("slow-down formula: 2 s, doubling, capped at 30 s", () => {
@@ -207,9 +252,9 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     for (let i = 0; i < loginFailuresPerUser.limit; i++) await login("admin", "not the password");
     for (let i = 0; i < 10; i++) loginDegradedFailures.hit("admin");
     expect(loginSlowdownMs("admin", true)).toBe(30_000);
-    const start = performance.now();
+    const slow = fakeSlowdown();
     expect((await login("admin", PASSWORD, undefined, first.device)).res.status).toBe(200);
-    expect(performance.now() - start).toBeLessThan(1500);
+    expect(slow.delays).toEqual([]);
   });
 
   it("device-cookie failures count toward the global per-username cap and the per-cookie limit", async () => {
@@ -244,7 +289,6 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     });
     afterEach(() => {
       delete process.env.DATABASTION_TRUST_PROXY;
-      loginSlowdown.ms = 2000;
     });
 
     it("the per-username limit is keyed by source IP when it is known", async () => {
@@ -262,25 +306,29 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
     it("the global per-username cap slows down and serializes, never locks the right password out", async () => {
       for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
       loginSlowdown.ms = 150;
+      const slow = fakeSlowdown();
       // Correct password from a fresh IP: still logs in, after the slow-down.
-      const start = performance.now();
       expect((await login("admin", PASSWORD, "198.51.100.200")).res.status).toBe(200);
-      expect(performance.now() - start).toBeGreaterThanOrEqual(140);
+      expect(slow.delays).toEqual([150]);
       // A wrong password is still a plain 401 (no enumeration of the degraded state through 429).
       expect((await login("admin", "not the password", "198.51.100.201")).res.status).toBe(401);
-      // One attempt in flight per username: concurrent ones get 503 + Retry-After.
-      const results = await Promise.all(
-        ["198.51.100.202", "198.51.100.203", "198.51.100.204"].map((ip) => login("admin", "nope nope nope", ip)),
-      );
+      // Known IP: the flat base delay.
+      expect(slow.delays).toEqual([150, 150]);
+      // One attempt in flight per username: concurrent ones get 503 + Retry-After while it waits.
+      slow.hold();
+      const pending = ["198.51.100.202", "198.51.100.203", "198.51.100.204"].map((ip) => login("admin", "nope nope nope", ip));
+      await slow.sleeping(3);
+      await settled(pending, 2);
+      slow.release();
+      const results = await Promise.all(pending);
       const statuses = results.map((r) => r.res.status).sort();
       expect(statuses).toEqual([401, 503, 503]);
       for (const r of results.filter((x) => x.res.status === 503)) {
         expect(Number(r.res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
       }
-      // Other usernames are not affected.
-      const other = performance.now();
+      // Other usernames are not affected (no slow-down).
       expect((await login("someone-else", "nope nope", "198.51.100.205")).res.status).toBe(401);
-      expect(performance.now() - other).toBeLessThan(140 + 1000);
+      expect(slow.delays).toHaveLength(3);
     });
 
     it("a valid device cookie for that username skips the global cap and a held slot (N1)", async () => {
@@ -304,21 +352,23 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
       ).split(";")[0];
 
       for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
-      loginSlowdown.ms = 1000;
       // A distributed attacker holds the single degraded slot.
+      const slow = fakeSlowdown();
+      slow.hold();
       const attacker = login("admin", "distributed guess", "203.0.113.90");
-      await new Promise((r) => setTimeout(r, 50));
+      await slow.sleeping(1);
       expect((await login("admin", PASSWORD, "198.51.100.62")).res.status).toBe(503);
       for (const cookie of [analyst.device, tampered, otherKey]) {
         expect((await login("admin", PASSWORD, "198.51.100.62", cookie)).res.status).toBe(503);
       }
-      const start = performance.now();
       const ok = await login("admin", PASSWORD, "198.51.100.62", admin.device);
       expect(ok.res.status).toBe(200);
-      expect(performance.now() - start).toBeLessThan(900);
+      // It neither took the slot nor waited.
+      expect(slow.delays).toHaveLength(1);
       // A fresh device cookie is issued on every successful login.
       expect(ok.device).not.toBe("");
       expect(ok.device).not.toBe(admin.device);
+      slow.release();
       expect((await attacker).res.status).toBe(401);
     });
 
@@ -329,10 +379,12 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
       expect((await login("admin", PASSWORD, "198.51.100.71", admin.device)).res.status).toBe(429);
       // The cookie saw 5 failures: no bypass any more (a stolen cookie cannot be used to guess).
       for (let i = 0; i < loginFailuresPerUserGlobal.limit; i++) loginFailuresPerUserGlobal.hit("admin");
-      loginSlowdown.ms = 1000;
+      const slow = fakeSlowdown();
+      slow.hold();
       const attacker = login("admin", "distributed guess", "203.0.113.91");
-      await new Promise((r) => setTimeout(r, 50));
+      await slow.sleeping(1);
       expect((await login("admin", PASSWORD, "198.51.100.72", admin.device)).res.status).toBe(503);
+      slow.release();
       await attacker;
     });
 
@@ -390,25 +442,27 @@ describe.skipIf(!hasDb)("user API (PostgreSQL)", () => {
 
   it("40 concurrent wrong logins, unknown IP: the limit plus the single degraded slot reach argon2id (H1, N2)", async () => {
     await burstUser("burst-unknown");
-    loginSlowdown.ms = 100;
-    try {
-      const before = argon2Stats.started;
-      const results = await Promise.all(
-        Array.from({ length: 40 }, () =>
-          handleLogin(userReq("POST", "/api/auth/login", { body: { username: "burst-unknown", password: "wrong wrong wrong" } })),
-        ),
-      );
-      const verified = argon2Stats.started - before;
-      const failed = results.filter((r) => r.status === 401).length;
-      expect(verified).toBe(failed);
-      // N2: with an unknown IP the per-username counter never answers 429; beyond it the username
-      // degrades to ONE slowed-down attempt in flight, the others get 503. In a burst that is at
-      // most one attempt more than the limit (all others arrive while the slot is held).
-      expect(failed).toBeLessThanOrEqual(loginFailuresPerUser.limit + 1);
-      expect(results.every((r) => [401, 503].includes(r.status))).toBe(true);
-    } finally {
-      loginSlowdown.ms = 2000;
-    }
+    // The attempt holding the degraded slot waits until every other one has answered, so a slow
+    // run cannot let a second attempt take the slot after the first one released it.
+    const slow = fakeSlowdown();
+    slow.hold();
+    const before = argon2Stats.started;
+    const pending = Array.from({ length: 40 }, () =>
+      handleLogin(userReq("POST", "/api/auth/login", { body: { username: "burst-unknown", password: "wrong wrong wrong" } })),
+    );
+    await slow.sleeping(1);
+    await settled(pending, 39);
+    slow.release();
+    const results = await Promise.all(pending);
+    expect(slow.delays).toHaveLength(1);
+    const verified = argon2Stats.started - before;
+    const failed = results.filter((r) => r.status === 401).length;
+    expect(verified).toBe(failed);
+    // N2: with an unknown IP the per-username counter never answers 429; beyond it the username
+    // degrades to ONE slowed-down attempt in flight, the others get 503: at most one attempt more
+    // than the limit.
+    expect(failed).toBeLessThanOrEqual(loginFailuresPerUser.limit + 1);
+    expect(results.every((r) => [401, 503].includes(r.status))).toBe(true);
   });
 
   it("caps concurrent argon2id verifications for logins (H1)", async () => {

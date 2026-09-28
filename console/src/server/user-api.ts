@@ -17,6 +17,19 @@ import {
   type PolicyInput,
 } from "@/server/policies";
 import { requestPolicyEvaluation } from "@/server/policy-queue";
+import {
+  channelType,
+  createChannel,
+  deleteChannel,
+  listChannels,
+  parseChannelCreate,
+  parseChannelUpdate,
+  rotateWebhookSecret,
+  updateChannel,
+} from "@/server/channels";
+import { requestNotificationDelivery } from "@/server/notification-queue";
+import { enqueueTestNotification } from "@/server/notifications";
+import type { ChannelView } from "@/lib/notification-model";
 import { buildScanParams, requestScan } from "@/server/scans";
 import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
@@ -126,10 +139,15 @@ export const loginFailuresPerUserGlobal = new RateLimiter(100, 15 * 60_000);
 /** Failed logins per device cookie (nonce): beyond, the cookie gives no bypass (a stolen cookie). */
 export const loginFailuresPerDevice = new RateLimiter(5, 15 * 60_000);
 /**
- * Delay before each verification of a degraded login (test hook: tests shorten it). Unknown IP:
- * `ms * 2^n` for the n-th failed degraded attempt of the username in the window, at most `maxMs`.
+ * Delay before each verification of a degraded login. Unknown IP: `ms * 2^n` for the n-th failed
+ * degraded attempt of the username in the window, at most `maxMs`. Test hooks: tests shorten the
+ * delays and replace `sleep` (the wait itself) to observe and control it without wall-clock timing.
  */
-export const loginSlowdown = { ms: 2000, maxMs: 30_000 };
+export const loginSlowdown = {
+  ms: 2000,
+  maxMs: 30_000,
+  sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)),
+};
 /** Failed degraded logins per username with an unknown IP (drives the growing slow-down). */
 export const loginDegradedFailures = new RateLimiter(Number.MAX_SAFE_INTEGER, 15 * 60_000);
 
@@ -223,7 +241,7 @@ export function handleLogin(req: Request): Promise<Response> {
       try {
         // Counted before the delay (refunded on success), so the next attempt waits longer.
         const refunds = degradeUnknownIp ? [...baseRefunds, loginDegradedFailures.charge(userKey)] : baseRefunds;
-        await new Promise((r) => setTimeout(r, delayMs));
+        await loginSlowdown.sleep(delayMs);
         return await verifyLogin(req, username, password, ip, refunds);
       } finally {
         degradedLoginsInFlight.delete(userKey);
@@ -603,5 +621,142 @@ export function handleIncidentTransition(req: Request, id: string): Promise<Resp
     if (r.outcome === "not_found") return error(404, "not_found");
     if (r.outcome === "invalid_transition") return json({ error: "invalid_transition", from: r.from }, 409);
     return new Response(null, { status: 204, headers: NO_STORE });
+  });
+}
+
+// ------------------------------------------------------- notification channels (P3-C)
+
+const CHANNEL_ERRORS = {
+  slug_taken: [409, "slug_taken"],
+  not_found: [404, "not_found"],
+  key_unavailable: [409, "encryption_key_unavailable"],
+} as const;
+
+function channelError(outcome: keyof typeof CHANNEL_ERRORS | "invalid_password" | "password_required"): Response {
+  if (outcome === "invalid_password") return json({ error: "invalid_channel", field: "password" }, 400);
+  if (outcome === "password_required") return error(400, "password_required");
+  const [status, code] = CHANNEL_ERRORS[outcome];
+  return error(status, code);
+}
+
+function channelJson(c: ChannelView) {
+  return {
+    id: c.id,
+    slug: c.slug,
+    type: c.type,
+    enabled: c.enabled,
+    system_alerts: c.systemAlerts,
+    config: c.config,
+    secret_set: c.secretSet,
+    created_at: c.createdAt.toISOString(),
+    updated_at: c.updatedAt.toISOString(),
+  };
+}
+
+/** Lists the channels (admin): settings without any secret (webhooks: URL origin only). */
+export function handleListChannels(req: Request): Promise<Response> {
+  return guardedUser("notification_channel.list", async () => {
+    const g = await requireUser(req, { admin: true, route: "notification_channel.list" });
+    if (!g.ok) return g.response;
+    return json({ channels: (await listChannels(getDb())).map(channelJson) });
+  });
+}
+
+/**
+ * Creates a channel (admin, CSRF): `{slug, type, enabled?, system_alerts?, config, password?}`,
+ * strictly validated (`400 {"error": "invalid_channel", "field"}`), `409 slug_taken`, `409
+ * encryption_key_unavailable` (a secret is needed and the server key is missing). `201 {id}`; a
+ * webhook also gets `signing_secret`, returned this once only. Audited without any secret.
+ */
+export function handleCreateChannel(req: Request): Promise<Response> {
+  return guardedUser("notification_channel.create", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.create" });
+    if (!g.ok) return g.response;
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const parsed = parseChannelCreate(body.value);
+    if (!parsed.ok) return json({ error: "invalid_channel", field: parsed.error }, 400);
+    const r = await createChannel(getDb(), parsed.value, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome !== "ok") return channelError(r.outcome);
+    return json(r.signingSecret ? { id: r.id, signing_secret: r.signingSecret } : { id: r.id }, 201);
+  });
+}
+
+/** Updates a channel (admin, CSRF): any subset of `{enabled, system_alerts, config, password}`. `204`. */
+export function handleUpdateChannel(req: Request, id: string): Promise<Response> {
+  return guardedUser("notification_channel.update", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.update" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_USER_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const type = await channelType(getDb(), id);
+    if (!type) return error(404, "not_found");
+    const parsed = parseChannelUpdate(body.value, type);
+    if (!parsed.ok) return json({ error: "invalid_channel", field: parsed.error }, 400);
+    const r = await updateChannel(getDb(), id, parsed.value, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome !== "ok") return channelError(r.outcome);
+    return new Response(null, { status: 204, headers: NO_STORE });
+  });
+}
+
+/** Deletes a channel (admin, CSRF); its delivery records are kept. `204`. */
+export function handleDeleteChannel(req: Request, id: string): Promise<Response> {
+  return guardedUser("notification_channel.delete", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.delete" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const ok = await deleteChannel(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+/** New signing secret for a webhook channel (admin, CSRF): `200 {signing_secret}`, shown once. */
+export function handleRotateChannelSecret(req: Request, id: string): Promise<Response> {
+  return guardedUser("notification_channel.rotate_signing_key", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.rotate_signing_key" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const r = await rotateWebhookSecret(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    if (r.outcome !== "ok") return channelError(r.outcome);
+    return json({ signing_secret: r.signingSecret });
+  });
+}
+
+/**
+ * L3: test sends are bounded per administrator and per channel (a test is an outbound connection
+ * chosen by the caller: no scanning through it). In memory, per web process.
+ */
+export const channelTestsPerUser = new RateLimiter(10, 10 * 60_000);
+export const channelTestsPerChannel = new RateLimiter(3, 10 * 60_000);
+
+/** Queues a test notification on a channel (admin, CSRF, audited): `202`; `429` over the limits. */
+export function handleTestChannel(req: Request, id: string): Promise<Response> {
+  return guardedUser("notification_channel.test", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.test" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id)) return error(404, "not_found");
+    const byUser = channelTestsPerUser.check(g.session.user.id);
+    const byChannel = channelTestsPerChannel.check(id);
+    if (byUser.limited || byChannel.limited) {
+      await writeAudit(getDb(), {
+        actorType: "user",
+        actorId: g.session.user.id,
+        action: "notification_channel.test",
+        outcome: "failure",
+        targetType: "notification_channel",
+        targetId: id,
+        sourceIp: g.ip,
+        details: { reason: "rate_limited" },
+      });
+      const retry = Math.max(byUser.limited ? byUser.retryAfterS : 1, byChannel.limited ? byChannel.retryAfterS : 1);
+      return error(429, "rate_limited", { "Retry-After": String(retry) });
+    }
+    channelTestsPerUser.hit(g.session.user.id);
+    channelTestsPerChannel.hit(id);
+    const ok = await enqueueTestNotification(getDb(), id, { userId: g.session.user.id, ip: g.ip });
+    if (!ok) return error(404, "not_found");
+    void requestNotificationDelivery();
+    return new Response(null, { status: 202, headers: NO_STORE });
   });
 }

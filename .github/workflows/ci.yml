@@ -105,11 +105,28 @@ jobs:
           done
           docker logs databastion-test-pg
           exit 1
+      # Mailpit (same pinned image as dev/docker-compose.yml) for the real-SMTP alerting test
+      # (P3-C). With DATABASTION_TEST_SMTP set, that test fails instead of skipping when Mailpit
+      # is unreachable. Loopback only.
+      - name: Start Mailpit (SMTP alerting test)
+        env:
+          MAILPIT_IMAGE: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
+        run: |
+          docker run -d --name databastion-test-mailpit -p 127.0.0.1:1025:1025 -p 127.0.0.1:8025:8025 \
+            -e MP_MAX_MESSAGES=500 "$MAILPIT_IMAGE"
+          for _ in $(seq 1 60); do
+            if curl -sSf http://127.0.0.1:8025/readyz >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs databastion-test-mailpit
+          exit 1
       - run: pnpm test
         env:
           # Admin URL used by src/test/pg-global-setup.ts; src/test/ci-guard.test.ts fails the job
           # when the DB suites would be skipped (CI=true without a database).
           TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+          DATABASTION_TEST_SMTP: 127.0.0.1:1025
+          DATABASTION_TEST_MAILPIT_API: http://127.0.0.1:8025
       - run: pnpm build
 
   agent:

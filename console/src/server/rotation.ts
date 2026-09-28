@@ -9,6 +9,8 @@ import { jobHub, JOBS_CHANNEL, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { argon2Hash, argon2Verify, isLowEntropySecret, rotateArgon2Gate } from "./crypto";
 import { RateLimiter } from "./rate-limit";
+import { requestNotificationDelivery } from "./notification-queue";
+import { notifyIntegrityEvent } from "./system-alerts";
 
 /**
  * Agent secret rotation, console side (ADR-0008, refined by ADR-0010).
@@ -71,12 +73,26 @@ export async function lockAgentForConflict(
       .update(jobs)
       .set({ status: "cancelled", finishedAt: sql`now()` })
       .where(and(eq(jobs.agentId, agentId), inArray(jobs.status, ["pending", "delivered", "running"])));
-    await tx.insert(securityEvents).values({
-      kind: "agent.rotation_conflict",
-      severity: "critical",
-      agentId,
-      details: { reason },
-    });
+    const [event] = await tx
+      .insert(securityEvents)
+      .values({
+        kind: "agent.rotation_conflict",
+        severity: "critical",
+        agentId,
+        details: { reason },
+      })
+      .returning({ id: securityEvents.id, at: securityEvents.at });
+    // P3-C: alert the system-alert channels.
+    if (event) {
+      await notifyIntegrityEvent(tx, {
+        securityEventId: event.id,
+        agentId,
+        kind: "agent.rotation_conflict",
+        severity: "critical",
+        details: { reason, locked: true },
+        at: event.at,
+      });
+    }
     await writeAudit(tx, {
       actorType: "agent",
       actorId: agentId,
@@ -92,6 +108,7 @@ export async function lockAgentForConflict(
   });
   purgeSecretCache(agentId);
   jobHub.closeAgent(agentId);
+  if (locked) void requestNotificationDelivery();
   return locked;
 }
 

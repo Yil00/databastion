@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { DeliveriesTable } from "@/components/console/deliveries-table";
 import { FindingsTable } from "@/components/console/findings-table";
 import { IncidentActions } from "@/components/console/incident-actions";
 import { IncidentStatusBadge, SeverityBadge } from "@/components/console/incidents-table";
@@ -9,6 +10,7 @@ import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
 import { getFindingView } from "@/server/findings";
 import { getIncident } from "@/server/incidents";
+import { listDeliveries } from "@/server/notifications";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
 export const dynamic = "force-dynamic";
@@ -27,7 +29,10 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
   const db = getDb();
   const incident = await getIncident(db, id);
   if (!incident) notFound();
-  const finding = incident.findingId ? await getFindingView(db, incident.findingId) : null;
+  const [finding, deliveries] = await Promise.all([
+    incident.findingId ? getFindingView(db, incident.findingId) : null,
+    listDeliveries(db, { incidentId: incident.id }),
+  ]);
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const trail: [string, Date | null, string | null][] = [
@@ -96,6 +101,14 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                 </div>
               ))}
           </dl>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Notifications</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <DeliveriesTable deliveries={deliveries} now={now} />
         </CardContent>
       </Card>
       <Card>

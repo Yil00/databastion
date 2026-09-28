@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { getDb } from "@/db/client";
 import * as schema from "@/db/schema";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
-import { auditLog, findings, incidents, policies, policyExceptions, users } from "@/db/schema";
+import { auditLog, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
 import { logger } from "@/lib/logger";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
 import { failuresPerAgent } from "@/server/agent-api/auth";
@@ -101,8 +101,8 @@ async function agentWithTargets(): Promise<Auth> {
   return auth;
 }
 
-/** One delivered scan of `targetId` and a batch of `items`, accepted. */
-async function scanWith(auth: Auth, items: Record<string, unknown>[], targetId = "pg-prod-1"): Promise<void> {
+/** A scan job of `targetId`, delivered to (claimed by) the agent. */
+async function claimedScan(auth: Auth, targetId = "pg-prod-1"): Promise<string> {
   const jobId = await enqueueJob(getDb(), {
     agentId: auth.agentId,
     type: "discovery.scan",
@@ -111,9 +111,19 @@ async function scanWith(auth: Auth, items: Record<string, unknown>[], targetId =
     params: { sample_rows: 200, max_duration_s: 900 },
   });
   expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+  return jobId;
+}
+
+/** A batch of `items` for the claimed job `jobId`, accepted. */
+async function sendBatch(auth: Auth, jobId: string, items: Record<string, unknown>[]): Promise<void> {
   const body = { batch_id: uuidv7(), job_id: jobId, classifiers_version: "2026.09.1", findings: items };
   const res = await handleFindings(agentRequest("POST", "/findings", { auth, body }));
   expect(res.status).toBe(202);
+}
+
+/** One delivered scan of `targetId` and a batch of `items`, accepted. */
+async function scanWith(auth: Auth, items: Record<string, unknown>[], targetId = "pg-prod-1"): Promise<void> {
+  await sendBatch(auth, await claimedScan(auth, targetId), items);
 }
 
 async function findingId(agentId: string, classifier = "pii.email", field = "email"): Promise<string> {
@@ -514,6 +524,29 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect(rows[1]?.matchCount).toBe(1);
     });
 
+    it("N1: a scan in flight during the resolution does not reopen; the next scan does", async () => {
+      const { auth, id } = await openIncident();
+      // The scan is claimed by the agent (it may already be reading) before the resolution.
+      const inFlight = await claimedScan(auth);
+      const [claimed] = await getDb().select({ first: jobs.firstDeliveredAt }).from(jobs).where(eq(jobs.id, inFlight));
+      expect(claimed?.first).not.toBeNull();
+      expect((await transition(id, "resolved", analyst)).status).toBe(204);
+      // Its batch arrives after the resolution (ingestion time later than resolved_at): data read
+      // before the resolution, so nothing reopens.
+      await sendBatch(auth, inFlight, [finding()]);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(auth.agentId)).map((r) => r.status)).toEqual(["resolved"]);
+      // A later redelivery (lease expiry) does not move the first claim time.
+      await getDb().execute(sql`update jobs set delivered_at = now() + interval '1 hour' where id = ${inFlight}`);
+      await getDb().update(policies).set({ changedAt: sql`now()` });
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      // A scan claimed after the resolution still sees the finding: a new incident.
+      await scanWith(auth, [finding()]);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(auth.agentId)).map((r) => r.status)).toEqual(["resolved", "open"]);
+    });
+
     it("M1: an admin false positive stays silent across identical rescans", async () => {
       const { auth, id } = await openIncident();
       expect((await transition(id, "false_positive")).status).toBe(204);
@@ -530,6 +563,11 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect(reopensResolved(inc, { ...f, lastSeenAt: new Date(t.getTime() + 1) })).toBe(true);
       expect(reopensResolved(inc, { ...f, matched: 151 })).toBe(true);
       expect(reopensResolved(inc, { ...f, classifiersVersion: "2099.01.1" })).toBe(true);
+      // N1: the scan claim time decides, not the ingestion time.
+      const late = new Date(t.getTime() + 60_000);
+      expect(reopensResolved(inc, { ...f, lastSeenAt: late, scanClaimedAt: new Date(t.getTime() - 1) })).toBe(false);
+      expect(reopensResolved(inc, { ...f, lastSeenAt: late, scanClaimedAt: new Date(t.getTime() + 1) })).toBe(true);
+      expect(reopensResolved(inc, { ...f, lastSeenAt: late, scanClaimedAt: null })).toBe(true);
     });
 
     it("L3: an incident resolved while the engine re-matches it falls through to the resolved rules", async () => {

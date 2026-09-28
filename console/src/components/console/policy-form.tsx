@@ -92,6 +92,19 @@ export const POLICY_FIELD_ERRORS: Record<string, string> = {
   "actions.severity": "Pick a severity.",
 };
 
+/**
+ * Warning for notify channel names that match no channel or a disabled one (saving is still
+ * allowed: the incidents are opened and these notifications are recorded as skipped).
+ */
+export function notifyWarning(value: string, channels: readonly { slug: string; enabled: boolean }[] | undefined): string | null {
+  if (!channels) return null;
+  const known = new Map(channels.map((c) => [c.slug, c.enabled]));
+  const problems = list(value).flatMap((slug) =>
+    !known.has(slug) ? [`${slug}: no such channel`] : known.get(slug) ? [] : [`${slug}: channel disabled`],
+  );
+  return problems.length > 0 ? `${problems.join("; ")}. These notifications will be skipped.` : null;
+}
+
 export function policyErrorMessage(status: number, body: unknown): string {
   const b = body !== null && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
   if (status === 409) return "A policy with this name already exists.";
@@ -109,14 +122,20 @@ export function PolicyForm({
   csrfToken,
   policyId,
   initial,
+  channels,
 }: {
   csrfToken: string;
   /** Edit mode when set. */
   policyId?: string;
   initial?: Partial<PolicyFormValues>;
+  /** Existing notification channels (warnings on unknown / disabled names). */
+  channels?: { slug: string; enabled: boolean }[];
 }) {
   const router = useRouter();
   const [message, setMessage] = useState<string | null>(null);
+  const [notifyNote, setNotifyNote] = useState<string | null>(() =>
+    notifyWarning(typeof initial?.notify === "string" ? initial.notify : "", channels),
+  );
   const v = (name: string) => {
     const x = initial?.[name];
     return typeof x === "string" ? x : "";
@@ -215,8 +234,25 @@ export function PolicyForm({
             </select>
           </div>
           <div className="flex flex-col gap-1">
-            <Label htmlFor={id("notify")}>Notify channels, comma-separated (delivery comes with alerting)</Label>
-            <Input id={id("notify")} name="notify" maxLength={400} defaultValue={v("notify")} autoComplete="off" />
+            <Label htmlFor={id("notify")}>Notify channels, comma-separated</Label>
+            <Input
+              id={id("notify")}
+              name="notify"
+              maxLength={400}
+              defaultValue={v("notify")}
+              autoComplete="off"
+              onChange={(e) => setNotifyNote(notifyWarning(e.target.value, channels))}
+            />
+            {channels && (
+              <p className="text-xs text-muted-foreground">
+                {channels.length > 0 ? `Channels: ${channels.map((c) => c.slug).join(", ")}` : "No notification channel yet."}
+              </p>
+            )}
+            {notifyNote && (
+              <p role="alert" className="text-xs text-destructive">
+                {notifyNote}
+              </p>
+            )}
           </div>
         </div>
       </fieldset>

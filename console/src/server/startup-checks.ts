@@ -1,3 +1,4 @@
+import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
 import { trustedProxyHops } from "./request";
 
@@ -23,6 +24,7 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
       "/metrics is served on the main port: set DATABASTION_METRICS_PORT to move it to a dedicated listener, or block /metrics at the reverse proxy.",
     );
   }
+  warnings.push(...alertingWarnings(env));
   return warnings;
 }
 
@@ -41,6 +43,9 @@ function serverKeyUsable(env: NodeJS.ProcessEnv): boolean {
  */
 export function startupFatal(env: NodeJS.ProcessEnv = process.env): string | null {
   if (env.NODE_ENV !== "production") return null;
+  // L5 (P3-C): the alerting dev flag needs a second explicit opt-in in production.
+  const alerting = alertingFatal(env);
+  if (alerting !== null) return alerting;
   if (serverKeyUsable(env) || env[ALLOW_MISSING_KEY_VAR] === "1") return null;
   return (
     "DATABASTION_ENCRYPTION_KEY(_FILE) unset, shorter than 32 characters or unreadable in production: refusing to start. " +

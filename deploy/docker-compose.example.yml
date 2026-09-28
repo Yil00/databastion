@@ -81,9 +81,17 @@ services:
     image: *console-image
     command: ["worker"]          # policies, correlation, alerting
     restart: unless-stopped
+    # Alerting (P3-C): the worker is the only process that connects out (SMTP relay, webhook
+    # receivers), directly (no proxy); allow that egress in your firewall. Webhooks to private or
+    # loopback addresses are refused (SSRF defense).
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
+      # Also decrypts the channel secrets (SMTP password, webhook URL and signing secret).
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      # Links to incidents / agents in the notifications.
+      DATABASTION_PUBLIC_URL: https://databastion.example.com
+      # "Silent agent" alert after N heartbeat intervals of 30 s (default 10 = 5 min).
+      # DATABASTION_SILENT_AGENT_INTERVALS: "10"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key]
     user: "10001:10001"

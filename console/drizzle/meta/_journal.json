@@ -120,6 +120,34 @@
       "when": 1790624432368,
       "tag": "0016_incidents_update_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790625436847,
+      "tag": "0017_jobs_first_delivered_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790626026745,
+      "tag": "0018_p3c_alerting",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790626036835,
+      "tag": "0019_notification_deliveries_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790628183929,
+      "tag": "0020_notification_rate_limit_indexes",
+      "breakpoints": true
     }
   ]
 }

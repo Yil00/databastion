@@ -12,7 +12,8 @@ database (also used as the job queue: no Redis). See
 > `/rotate`; Prometheus `/metrics`; UI pages (login, agents, agent detail, enrollment tokens);
 > Docker image. Phase 2 (P2-D): `/findings` ingestion, scan launching, findings view, false
 > positives. Phase 3 (P3-A, P3-B): policy engine in the worker, exceptions, incidents and their
-> lifecycle (see "Policies and incidents").
+> lifecycle (see "Policies and incidents"); P3-C: e-mail and HMAC-signed webhook notifications,
+> "silent agent" and agent-integrity alerts (see "Alerting").
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -26,7 +27,10 @@ database (also used as the job queue: no Redis). See
 | `DATABASE_MIGRATION_URL` / `_FILE` | `pnpm db:migrate` only: connection string of the OWNER role. Unset: `DATABASE_URL` is used (single-role development setups) |
 | `LOG_LEVEL` | pino level (`info` by default) |
 | `NEXT_OUTPUT_STANDALONE=1` | At build time: produce `.next/standalone` for the Docker image |
-| `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin |
+| `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin. The worker also uses it for the links in notifications (unset: notifications carry ids only) |
+| `DATABASTION_SILENT_AGENT_INTERVALS` | Worker: "silent agent" alert after this many heartbeat intervals (30 s) without a heartbeat; integer 3 to 2880, default 10 (5 minutes). See "Alerting" |
+| `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
+| `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
 | `DATABASTION_METRICS_TOKEN` / `_FILE` | Bearer token required by `GET /metrics` (at least 32 characters, e.g. `openssl rand -base64 32`). Unset or too short: `/metrics` answers `404`. See "Metrics" |
@@ -37,13 +41,15 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
 | `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
+| `DATABASTION_TEST_SMTP`, `DATABASTION_TEST_MAILPIT_API` | Tests only: `host:port` of a Mailpit SMTP listener (e.g. `127.0.0.1:1025` from `make dev`) and its API (default `http://<host>:8025`); unset or unreachable: the Mailpit test is skipped with a message (the in-process SMTP server tests always run) |
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
 e.g. `openssl rand -base64 32`) is the console server key of the web and worker processes. It keys the agent "known good" fingerprints (HKDF-SHA256
 subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
 `login-device.v1`, see "Brute-force protection") and encrypts masked samples at rest (domain
-`masked-samples.v1`, see "Data at rest"). **Set it in production: the shared-IP protection
+`masked-samples.v1`, see "Data at rest") and the notification channel secrets (domain
+`notification-channels.v1`, see "Alerting"). **Set it in production: the shared-IP protection
 of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.** Unset, too short
 or unreadable: fingerprints and device cookies are neither issued nor accepted (fail closed: agents
 lose the lock-out exemption, so agents behind a shared NAT / proxy IP can be blocked by floods from
@@ -51,7 +57,7 @@ it, and a distributed guessing attack on a username can keep its user out), and 
 web and worker processes **refuse to start** (a `fatal` log, exit code 1), unless
 `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` is set: they then start and log an **error** naming
 those disabled protections (masked samples are then neither stored nor shown). Changing it
-invalidates the stored fingerprints. The console only knows its own database: it never stores target
+invalidates the stored fingerprints and makes the stored channel secrets unusable (re-enter them). The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
 ## Commands
@@ -89,9 +95,11 @@ and migrations must never run code planted by the console. Production uses three
 Grants come from migrations `0003_runtime_role_grants.sql`, `0004_pgboss_schema_hardening.sql`,
 `0010_security_events_no_delete.sql`, `0012_findings_runtime_grants.sql` (`findings_batches`:
 `SELECT, INSERT` only; `findings`: no `DELETE`, `TRUNCATE`), `0015_incidents_runtime_grants.sql`
-(`incidents`: no `DELETE`, `TRUNCATE`) and `0016_incidents_update_columns.sql` (`incidents`:
+(`incidents`: no `DELETE`, `TRUNCATE`), `0016_incidents_update_columns.sql` (`incidents`:
 `UPDATE` only on the lifecycle columns and the engine's re-match counters, never the policy
-snapshot, severity, dedup key or subject) (custom, every name schema-qualified). Migration
+snapshot, severity, dedup key or subject) and `0019_notification_deliveries_grants.sql`
+(`notification_deliveries`: no `DELETE`, `TRUNCATE`, `UPDATE` only on the delivery-state columns)
+(custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
 superuser (`ALTER SCHEMA pgboss OWNER TO databastion_owner`, after checking the schema for planted
@@ -169,6 +177,10 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `PATCH` / `DELETE /api/policies/{id}` | Update any subset of the create keys (`source` is fixed) / delete (admin, CSRF); `204`, `404`. A deleted policy's exceptions go with it, its incidents are kept. Audited `policy.update` (with the changed keys) / `policy.delete` |
 | `POST /api/policy-exceptions` | Create an exception (admin, CSRF): `{policy_id?, agent_id?, target_id?, classifier?, location?, reason, expires_at?}`, at least one of agent / target / classifier / location; `201 {id}`, `400 {"error": "invalid_exception", "field"}`, `404` unknown policy or agent. Audited `policy_exception.create` (never the reason) |
 | `DELETE /api/policy-exceptions/{id}` | Delete an exception (admin, CSRF); the policies it covered are re-applied to the existing findings. Audited |
+| `GET` / `POST /api/notification-channels` | List / create a notification channel (admin; create with CSRF). Body `{slug, type: "email" \| "webhook", enabled?, system_alerts?, config, password?}`; `config` e-mail: `{host, port, tls: "starttls" \| "implicit" \| "none", from, recipients, username?}`, webhook: `{url}`. `201 {id}` (webhook: also `signing_secret`, returned this once only), `400 {"error": "invalid_channel", "field"}`, `409 slug_taken`, `409 encryption_key_unavailable`. The list never returns a secret (`secret_set` flag; webhooks: URL origin only). Audited `notification_channel.create` (slug, type, flags, TLS mode, port, recipient count: never a host, URL, address, user or secret) |
+| `PATCH` / `DELETE /api/notification-channels/{id}` | Update any of `{enabled, system_alerts, config, password}` (e-mail settings replaced as a whole; `password: null` removes it; slug and type fixed) / delete (admin, CSRF); `204`. Audited |
+| `POST /api/notification-channels/{id}/rotate-secret` | New webhook signing secret (admin, CSRF): `200 {signing_secret}`, shown once; audited `notification_channel.rotate_signing_key` |
+| `POST /api/notification-channels/{id}/test` | Queue a test notification (admin, CSRF): `202`, audited `notification_channel.test`; sent even when the channel is disabled |
 | `POST /api/incidents/{id}/transition` | `{"status": "acknowledged" \| "resolved" \| "false_positive"}` (CSRF). Any signed-in user acknowledges and resolves; `false_positive` is admin only (`403`, audited `user.access_denied`). `409 {"error": "invalid_transition", "from"}` outside the lifecycle; `204`. Audited `incident.transition` with actor, `from`, `to`; refusals as failures |
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
@@ -186,9 +198,13 @@ a "Scan" dialog. `/incidents` lists the incidents (active ones by default; filte
 `?status=open|acknowledged|resolved|false_positive|all&severity=&agent=&target=`, at most 500, most
 severe first); `/incidents/{id}` shows the incident, its lifecycle (who and when), the transition
 buttons ("False positive" for admins only, with a confirmation) and the linked finding with its
-masked samples, decrypted server side through the same path as `/findings` (`no-store`).
+masked samples, decrypted server side through the same path as `/findings` (`no-store`), and its
+notifications (channel, status, attempts, last error code with its explanation).
+`/notifications` (admin) lists the channels (create, edit, enable / disable, test, new webhook
+secret, delete) and the last 100 deliveries.
 `/policies` lists the policies and exceptions (admin: create, enable / disable, delete, add or
-delete exceptions); `/policies/{id}` shows one policy with its exceptions (admin: edit form). A scan that failed with `unsupported` while its `classifiers_version` differs from
+delete exceptions); `/policies/{id}` shows one policy with its exceptions (admin: edit form) and
+warns when a notify channel name matches no channel or a disabled one (the form warns as you type). A scan that failed with `unsupported` while its `classifiers_version` differs from
 the agent's current heartbeat version is shown as "classifier set mismatch" (the agent build runs
 another classifier set) instead of a bare `unsupported`. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
@@ -316,7 +332,8 @@ longer the current one is closed with `401`.
 table only holds what policies raise; merging both views is left to a later task):
 `agent.rotation_conflict` (`critical`), and since P2-D `agent.batch_rejected` (a `400` on
 `/findings`), `agent.batch_conflict` and `agent.foreign_target` (a finding for a target the agent
-never reported), all `high`, each with an audit-log entry of the same name. Their details are the
+never reported), all `high`, each with an audit-log entry of the same name; since P3-C also
+`agent.silent` (`medium`, see "Alerting"). Each one is notified to the system-alert channels. Their details are the
 endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
 per 10 minutes; beyond, they are counted, logged once per window, and the next recorded event of the
 agent carries the count (`suppressed_before`). The budget is in memory, per web process (like the
@@ -401,7 +418,8 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
-| Webhook / SMTP settings (later) | AES-256-GCM with a subkey of `DATABASTION_ENCRYPTION_KEY`, like masked samples |
+| Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
+| Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
 
 Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are in-memory, per
 process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the
@@ -421,7 +439,8 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   source, so existing policies keep their meaning.
 - **Actions**: exactly one `{"type": "create_incident", "severity": "low|medium|high|critical"}`,
   and up to 5 `{"type": "notify", "channel": "<slug>"}`. Channel references are stored on the policy
-  and copied to each incident (`notify_channels`); delivery comes with P3-C.
+  and copied to each incident (`notify_channels`); a new incident is notified to them (see
+  "Alerting").
 - **Exceptions**: scoped to one policy or to all, by agent, target, classifier (id or family) and / or
   location globs (at least one), with a mandatory reason and an optional expiry. A covered finding
   opens no incident; expired exceptions are listed as expired and ignored. An exception without a
@@ -442,10 +461,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   runs for at most 50 s and re-queues itself when work remains.
 - **Dedup**: `dedup_key = policy:<id>|finding:<id>`; a partial unique index allows one open or
   acknowledged incident per key. A later scan of the same finding increments `match_count` once per
-  finding revision. **`resolved` means remediated**: when a scan that ran after the resolution still
-  sees the finding (its `last_seen_at` is later than `resolved_at`, both from the database clock), or
-  when the finding matches more values or is reclassified by another classifier set, a new incident
-  opens; re-evaluations without a new scan open nothing. Durable suppression is an administrator
+  finding revision. **`resolved` means remediated**: when a scan that read the data after the
+  resolution still sees the finding, or when the finding matches more values or is reclassified by
+  another classifier set, a new incident opens; re-evaluations without a new scan open nothing.
+  "Read after the resolution" compares `resolved_at` with the first console-side delivery of the
+  scan job that produced the finding's latest revision (`jobs.first_delivered_at`, set when the
+  agent first fetches the job and never moved by a redelivery; both from the database clock), not
+  with the ingestion time: a scan already in flight when the incident is resolved does not reopen
+  it (N1). A finding whose job is gone falls back to its `last_seen_at`. Durable suppression is an administrator
   decision only: a false positive (a false-positive finding never opens an incident) or an
   exception. Incident creation is audited `incident.create` (system actor).
 - **Lifecycle**: `open` -> `acknowledged` -> `resolved`, `open` -> `resolved`, `open` /
@@ -457,13 +480,105 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - The `audit.configure` confirmation of P3-A (warning when a change empties `sensitive_objects`)
   depends on phase 4 and is not implemented.
 
+## Alerting
+*P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
+`src/server/notifications.ts`; senders: `src/server/senders/`; address policy:
+`src/server/net-guard.ts`; silent agents and integrity alerts: `src/server/system-alerts.ts`;
+contents: `src/lib/notification-render.ts`.*
+
+- **Channels** (admin only, CSRF, audited without secrets), referenced by `slug` from the policies'
+  `notify` actions:
+  - `email`: SMTP host, port, TLS mode, sender, 1 to 20 recipients, optional SMTP AUTH user and
+    password. `starttls` requires the server to offer STARTTLS (never a silent downgrade),
+    `implicit` is TLS from the first byte, `none` is accepted only towards a loopback relay
+    (`localhost`, `127.0.0.0/8`, `::1`) or with `DATABASTION_ALERTING_INSECURE_DEV=1`; AUTH (PLAIN or
+    LOGIN) only over TLS (same exceptions). Certificates are always verified.
+  - `webhook`: `https://` URL only (`http://` with the dev flag), no credentials, no fragment. The
+    console generates a 256-bit signing secret (`whsec_…`), returned once on creation or rotation.
+  - `system_alerts`: the channel also receives the console alerts below.
+- **Unknown or disabled channel**: the incident is always created; the delivery for that slug is
+  recorded as `skipped` (`unknown_channel` / `channel_disabled`) and shown on the incident page. A
+  channel created later does not receive past incidents. The policy page and form warn about such
+  names; the API accepts them (policies may be written before their channels).
+- **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
+  follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
+  `agent.integrity`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  policy id / name / revision, agent and target ids, classifier and classifier set, normalized
+  location (engine, database, schema, object, field), counts (sampled, matched, confidence). **Never a
+  sampled value, masked or not** (I2); the masked samples stay encrypted on the finding.
+- **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:
+  application/json`, `X-DataBastion-Event`, `X-DataBastion-Delivery` (stable across retries: the
+  receiver deduplicates on it) and `X-DataBastion-Signature: t=<unix seconds>,v1=<hex>`, where `v1` =
+  HMAC-SHA256 keyed with the UTF-8 bytes of the signing secret over `"<t>.<raw body>"`. `t` is the
+  time of the attempt: receivers recompute the MAC, compare in constant time and reject `t` older than
+  5 minutes (replay protection); `verifyWebhookSignature` in `src/server/senders/webhook.ts` is the
+  reference. 2xx = delivered; redirects are never followed (3xx fails); 408, 425, 429, 5xx, network
+  and TLS errors are retried; other 4xx fail. 5 s to connect, 15 s in total, response read up to 64 KiB
+  and discarded.
+- **E-mail**: plain text, UTF-8 (base64 body, RFC 2047 subject), `Message-ID` derived from the
+  delivery id, `Auto-Submitted: auto-generated`. 10 s to connect, 30 s per reply, 60 s in total. A 4xx
+  reply or a network / TLS error is retried; a 5xx reply fails.
+- **SSRF defense** (webhooks; outbound connections are made by the worker only): the host is resolved
+  and **every** address checked; the socket connects to the vetted addresses only (no second
+  resolution, so no DNS rebinding), in the resolver's order with a fallback to the next one on a
+  connection error (happy eyeballs, so an unreachable IPv6 address does not fail a dual-stack
+  destination); TLS is always verified against the host name. Always refused: unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`,
+  `fe80::/10`, including the metadata endpoints `169.254.169.254`, `fd00:ec2::254`), multicast,
+  broadcast, reserved. Refused unless `DATABASTION_ALERTING_INSECURE_DEV=1`: loopback, RFC 1918, CGNAT,
+  ULA, documentation / benchmark ranges and the IPv6 prefixes embedding an IPv4 address (NAT64,
+  6to4, Teredo). IPv4-mapped IPv6 addresses are checked as IPv4. SMTP relays may be internal
+  (loopback and private allowed), never link-local / metadata. No HTTP proxy is used.
+- **Delivery** (transactional outbox, `notification_deliveries`): rows are written in the same
+  transaction as the incident (policy engine) or the alert, one per (subject, event, channel) with a
+  unique idempotency key, so retried or concurrent evaluations never notify twice. The worker queue
+  `notifications.deliver` (pg-boss, `stately`, no payload: the outbox is the work) is woken after
+  new incidents, integrity events and tests, and scheduled every minute. Due rows are claimed with
+  `FOR UPDATE SKIP LOCKED` and a 2-minute lease (a crashed worker's attempt is claimed again), sent
+  outside any transaction, 10 in parallel, and recorded: `delivered`; `pending` again after 1, 2, 4,
+  8, 16, 32 then 60 minutes; `failed` after 8 attempts or on a permanent error; `skipped` for a
+  disabled channel. At least once: a crash after sending and before recording sends again (same
+  delivery id). `last_error` is a closed code (`http_503`, `smtp_550`, `address_internal`,
+  `tls_failed`, …), never the response text, a host or a URL; logs carry the delivery id, event,
+  channel slug and code only. A deleted channel fails its pending deliveries (`channel_deleted`);
+  a secret that no longer decrypts (server key changed) is retried as `secret_unavailable`.
+- **Silent agent**: an agent that was online (at least one heartbeat), is neither revoked nor locked,
+  and has sent no heartbeat for `DATABASTION_SILENT_AGENT_INTERVALS` x 30 s (default 5 minutes;
+  the Agents page already shows "silent" after 90 s) raises one alert per silence episode
+  (`agents.silence_alerted_for` = the `last_seen_at` of the alerted episode, set by a conditional
+  update, so concurrent workers alert once): a `security_events` row `agent.silent` (`medium`), an
+  audit entry (system) and a notification to the system-alert channels. The next heartbeat ends the
+  episode: audit `agent.recovered` and a recovery notice to the same channels; a later silence is a
+  new episode. The check runs every minute in the worker; no new silence alert is raised during the
+  first threshold after the worker starts, so a console outage (no heartbeat could be received) does
+  not become one alert per agent. It is recorded in `security_events`, not `incidents`: incidents are
+  what policies raise (policy snapshot, dedup key, lifecycle column grants, ADR-0014), while agent
+  health is an integrity signal that must not be erasable by the runtime role. Limitation: an outage
+  of the web process alone (worker up) makes every agent silent after the threshold.
+- **Volume limit** (L6): at most `DATABASTION_NOTIFY_MAX_PER_HOUR` (default 30) incident
+  notifications per channel and clock hour (a soft limit: concurrent evaluations may overshoot by a
+  few). Beyond, the delivery is recorded as `skipped` (`rate_limited`, visible on the incident) and,
+  once the hour is over, one `notifications.suppressed` digest per channel and hour reports how many
+  were suppressed (counts only, link to the incidents list). System alerts, tests and digests are
+  not counted.
+- **Hardening (security review)**: moving an e-mail channel with a stored password to another host,
+  port, TLS mode or user requires the password again (`400 password_required`); SMTP ports 25, 465,
+  587 and 2525 only (any port with the dev flag); SMTP replies capped at 100 lines / 64 KiB; any
+  byte received in clear after the STARTTLS `220` aborts the session; the upgraded certificate is
+  verified against the configured host; channel tests are limited to 10 per administrator and 3 per
+  channel per 10 minutes (`429`), and report refused and filtered connections alike
+  (`connect_failed`).
+- **Agent-integrity alerts**: every `security_events` row written by the console
+  (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
+  `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
+  and hour per channel (the events themselves are all recorded, within their own budget).
+
 ## Layout
 ```
 drizzle/                  versioned SQL migrations (generated, never edited by hand)
 scripts/protocol/         protocol code generator (`pnpm protocol:generate`)
 src/app/                  Next.js App Router (UI + API routes)
 src/app/api/agent/v1/     agent API routes (thin, logic in src/server/agent-api/)
-src/app/api/{auth,agents,enrollment-tokens,findings,policies,policy-exceptions,incidents}/
+src/app/api/{auth,agents,enrollment-tokens,findings,policies,policy-exceptions,incidents,notification-channels}/
                           user API routes (logic in src/server/user-api.ts)
 src/app/(console)/, src/app/login/  UI pages (server components)
 src/app/metrics/          Prometheus endpoint on the main port (logic in src/server/metrics.ts;
@@ -472,7 +587,9 @@ src/components/           UI components (ui/: shadcn-style primitives, console/:
 src/proxy.ts              per-request CSP nonce for UI pages
 docker/                   image entrypoint and healthcheck
 src/cli/                  admin bootstrap command
-src/server/               auth, audit log, enrollment, agents, jobs, rotation, metrics, rate limiting
+src/server/               auth, audit log, enrollment, agents, jobs, rotation, metrics, rate limiting,
+                          policies, incidents, notification channels and outbox
+src/server/senders/       SMTP and webhook senders (worker only)
 src/test/                 test harness (throwaway PostgreSQL cluster, fixture helpers)
 src/config/               configuration loading (NAME / NAME_FILE)
 src/db/                   Drizzle schema, client, migrator

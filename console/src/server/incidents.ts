@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, or, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { agents, findings, incidents, policies, policyExceptions, users } from "@/db/schema";
+import { agents, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
 import {
   ACTIVE_STATUSES,
@@ -20,8 +20,10 @@ import {
   type Severity,
 } from "@/lib/policy-model";
 
+import { consoleUrl } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { applyFalsePositive, fpResetNeeded, type Tx } from "./findings";
+import { enqueueIncidentNotifications } from "./notifications";
 
 /**
  * Policy engine (P3-A, worker) and incidents (P3-B).
@@ -37,8 +39,9 @@ import { applyFalsePositive, fpResetNeeded, type Tx } from "./findings";
  *
  * Dedup: `dedup_key = policy:<id>|finding:<id>`; a partial unique index allows one open or
  * acknowledged incident per key. A re-match of an active incident only bumps `match_count` (once
- * per finding revision). After `resolved`, a new incident opens only when the finding changed the
- * way that also resets a false positive (more values matched, or another classifier set). A
+ * per finding revision). After `resolved`, a new incident opens when a scan claimed after the
+ * resolution still sees the finding, or when the finding changed the way that also resets a false
+ * positive (more values matched, or another classifier set); see `reopensResolved`. A
  * false-positive finding never raises an incident.
  *
  * Nothing here reads or stores a sampled value: masked samples stay encrypted on the finding row.
@@ -121,27 +124,42 @@ const FACT_COLUMNS = {
   matched: findings.matched,
   lastSeenAt: findings.lastSeenAt,
   falsePositiveAt: findings.falsePositiveAt,
+  /**
+   * N1: first delivery (console clock) of the scan job that produced the latest revision; no
+   * value of that revision was read before it. Null for a job that is gone (then `last_seen_at`).
+   * A scalar subquery, so the `FOR UPDATE` of the callers only locks the findings rows.
+   */
+  scanClaimedAt: sql<Date | null>`(select coalesce(${jobs.firstDeliveredAt}, ${jobs.deliveredAt}) from ${jobs} where ${jobs.id} = ${findings.lastJobId})`.mapWith(
+    jobs.deliveredAt,
+  ),
 };
 
 type FindingRow = FindingFacts & {
   id: string;
   classifiersVersion: string;
   lastSeenAt: Date;
+  scanClaimedAt: Date | null;
   falsePositiveAt: Date | null;
 };
 
 /**
  * M1: `resolved` means remediated. A resolved incident is followed by a new one when a scan that
- * ran after the resolution still sees the finding (`last_seen_at` of the finding, set by the
- * database clock at ingestion, later than `resolved_at`, same clock), or when the finding matches
- * more values or is classified by another classifier set (the false-positive reset rule). Durable
+ * read the data after the resolution still sees the finding, or when the finding matches more
+ * values or is classified by another classifier set (the false-positive reset rule). Durable
  * suppression is an administrator decision: a false positive or an exception.
+ *
+ * N1: "read after the resolution" is decided on the console-side claim time of the scan job that
+ * produced the latest revision (`jobs.first_delivered_at`, database clock, like `resolved_at`): the
+ * agent cannot read anything for a job before fetching it. The ingestion time (`last_seen_at`) is
+ * not used, as a scan in flight during the resolution would otherwise reopen at once with data read
+ * before it. Without a job (deleted), `last_seen_at` is the fallback.
  */
 export function reopensResolved(
   incident: { resolvedAt: Date | null; findingMatched: number | null; findingClassifiersVersion: string | null },
-  f: { lastSeenAt: Date; matched: number; classifiersVersion: string },
+  f: { lastSeenAt: Date; scanClaimedAt?: Date | null; matched: number; classifiersVersion: string },
 ): boolean {
-  if (incident.resolvedAt === null || f.lastSeenAt.getTime() > incident.resolvedAt.getTime()) return true;
+  const readFrom = f.scanClaimedAt ?? f.lastSeenAt;
+  if (incident.resolvedAt === null || readFrom.getTime() > incident.resolvedAt.getTime()) return true;
   return fpResetNeeded(
     { falsePositiveMatched: incident.findingMatched, falsePositiveClassifiersVersion: incident.findingClassifiersVersion },
     f.matched,
@@ -245,6 +263,20 @@ async function applyPolicy(
       classifier: f.classifier,
       severity: policy.severity,
     },
+  });
+  // P3-C: the notifications of the policy's `notify` channels, in the same transaction (outbox).
+  await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, {
+    event: "incident.opened",
+    occurred_at: now.toISOString(),
+    url: consoleUrl(`/incidents/${row.id}`),
+    incident: { id: row.id, severity: policy.severity, status: "open", reopened_from: latest?.status === "resolved" ? latest.id : null },
+    policy: { id: policy.id, name: policy.name, revision: policy.revision },
+    agent_id: f.agentId,
+    target_id: f.targetId,
+    classifier: f.classifier,
+    classifiers_version: f.classifiersVersion,
+    location: { engine: f.engine, database: f.databaseName, schema: f.schemaName, object: f.objectName, field: f.fieldName },
+    counts: { sampled: f.sampled, matched: f.matched, confidence: f.confidence },
   });
   return "created";
 }
@@ -577,12 +609,12 @@ export async function activeIncidentCounts(db: Database): Promise<Record<Severit
   return out;
 }
 
-/** Worker entry point: drains, logs a summary (counts only), and reports whether work remains. */
-export async function runPolicyEvaluation(db: Database, budgetMs?: number): Promise<boolean> {
+/** Worker entry point: drains and logs a summary (counts only). */
+export async function runPolicyEvaluation(db: Database, budgetMs?: number): Promise<DrainStats> {
   try {
     const stats = await drainPolicyWork(db, { budgetMs });
     if (stats.findings > 0 || stats.policyPasses > 0) log.info({ ...stats }, "policy evaluation");
-    return stats.more;
+    return stats;
   } catch (err) {
     log.error({ error: errorSummary(err) }, "policy evaluation failed");
     throw err;
