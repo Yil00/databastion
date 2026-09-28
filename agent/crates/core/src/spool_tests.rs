@@ -176,10 +176,10 @@ fn replacement_keeps_its_place_with_new_ids() {
     spool.push(&b[0]).unwrap();
     spool.push(&b[1]).unwrap();
     let (key, front) = spool.front().unwrap();
-    let rest = front.without(&[0, 5, 199]).unwrap();
+    let rest = front.without(&[0, 5, 199]).unwrap().unwrap();
     assert_eq!(rest.len(), 197);
     assert_ne!(rest.batch_id(), front.batch_id());
-    let (h1, h2) = rest.halves().unwrap();
+    let (h1, h2) = rest.halves().unwrap().unwrap();
     assert_eq!((h1.len(), h2.len()), (98, 99));
     spool.replace(&key, &[h1.clone(), h2.clone()], 3).unwrap();
     assert_eq!(spool.counters.dropped_items, 3);
@@ -221,7 +221,7 @@ fn replacement_keys_never_collide_with_crash_leftovers() {
     spool.push(&b[0]).unwrap();
     spool.push(&b[1]).unwrap();
     let (key, front) = spool.front().unwrap();
-    let (h1, h2) = front.halves().unwrap();
+    let (h1, h2) = front.halves().unwrap().unwrap();
     // Crash after writing the children but before removing the parent.
     let sdir = dir.path().join("spool");
     crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 0], true)), h1.bytes()).unwrap();
