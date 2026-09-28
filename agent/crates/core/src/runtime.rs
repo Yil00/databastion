@@ -407,7 +407,7 @@ impl Runtime {
             let (reachable, level, last_error) = match connector {
                 None => (false, AuditLevel::None, Some(FailureCode::Unsupported)),
                 Some(c) => match tokio::time::timeout(Duration::from_secs(10), c.check()).await {
-                    Ok(h) => (h.reachable, h.audit_level, None),
+                    Ok(h) => (h.reachable, h.audit_level, h.failure),
                     Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
                 },
             };

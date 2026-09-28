@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub use databastion_protocol::FailureCode;
+
 /// A database or directory engine supported by a connector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Engine {
@@ -57,6 +59,9 @@ pub struct TargetHealth {
     pub reachable: bool,
     /// Audit level actually reachable on this target.
     pub audit_level: AuditLevel,
+    /// Why the target is unreachable or degraded, as reported to the
+    /// console (`TargetStatus.last_error`). `None` when healthy.
+    pub failure: Option<FailureCode>,
     /// Human-readable explanation, e.g. why the audit level is degraded.
     /// Must never contain a sampled value or a credential.
     pub detail: Option<String>,
@@ -69,6 +74,7 @@ impl TargetHealth {
         Self {
             reachable: false,
             audit_level: AuditLevel::None,
+            failure: Some(FailureCode::Unsupported),
             detail: Some(format!("{engine} connector is not implemented yet")),
         }
     }
@@ -98,5 +104,6 @@ mod tests {
         let health = TargetHealth::not_implemented(Engine::Mysql);
         assert!(!health.reachable);
         assert_eq!(health.audit_level, AuditLevel::None);
+        assert_eq!(health.failure, Some(FailureCode::Unsupported));
     }
 }

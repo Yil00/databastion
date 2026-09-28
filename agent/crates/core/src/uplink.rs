@@ -139,7 +139,7 @@ fn is_json_media_type(value: Option<&HeaderValue>) -> bool {
 /// promoted, once its checker accepts it: a middlebox's `200` page proves
 /// nothing (see `Session::call`).
 pub(crate) mod accept {
-    use databastion_protocol::{BatchAck, HeartbeatResponse, UuidV7};
+    use databastion_protocol::{BatchAck, HeartbeatResponse, RotateResponse, UuidV7};
     use reqwest::StatusCode;
 
     use super::Reply;
@@ -154,6 +154,11 @@ pub(crate) mod accept {
 
     /// `POST /heartbeat`: `200` + `HeartbeatResponse`.
     pub(crate) fn heartbeat(reply: &Reply) -> Option<HeartbeatResponse> {
+        json(reply, StatusCode::OK)
+    }
+
+    /// `POST /rotate`: `200` + `RotateResponse`.
+    pub(crate) fn rotate(reply: &Reply) -> Option<RotateResponse> {
         json(reply, StatusCode::OK)
     }
 
@@ -539,7 +544,8 @@ impl ResultBatch {
     }
 
     /// Two halves, each under a new `batch_id` (`413`); `Ok(None)` for a
-    /// single item, `Err` if a half could not be serialized.
+    /// single item, `Err` if a half could not be serialized or would be
+    /// empty (`len` disagreeing with the decoded items).
     pub(crate) fn halves(&self) -> Result<Option<(Self, Self)>, Unserializable> {
         let n = self.len;
         if n < 2 {
@@ -548,7 +554,8 @@ impl ResultBatch {
         let first: Vec<usize> = (0..n / 2).collect();
         let second: Vec<usize> = (n / 2..n).collect();
         let (a, b) = (self.without(&second)?, self.without(&first)?);
-        debug_assert!(a.is_some() && b.is_some(), "both halves hold items");
+        // An empty half means `len` disagrees with the decoded items: an
+        // error, never a panic.
         match (a, b) {
             (Some(a), Some(b)) => Ok(Some((a, b))),
             _ => Err(Unserializable),
@@ -795,6 +802,13 @@ mod tests {
         assert!(accept::job_list(&reply(200, false, br#"{"jobs":[]}"#)).is_none());
         assert!(accept::job_list(&reply(200, true, b"[]")).is_none());
 
+        let rotated = br#"{"grace_expires_at":"2026-09-28T14:07:11Z","duplicate":false}"#;
+        assert!(accept::rotate(&reply(200, true, rotated)).is_some());
+        assert!(accept::rotate(&reply(200, false, rotated)).is_none());
+        assert!(accept::rotate(&reply(201, true, rotated)).is_none());
+        assert!(accept::rotate(&reply(200, true, b"<html>")).is_none());
+        assert!(accept::rotate(&reply(200, true, hb)).is_none());
+
         assert!(accept::no_content(&reply(204, false, b"")).is_some());
         assert!(accept::no_content(&reply(200, true, b"{}")).is_none());
         assert!(accept::no_content(&reply(202, false, b"")).is_none());
@@ -809,6 +823,16 @@ mod tests {
             bytes: b"not a batch".to_vec(),
         };
         assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
+        assert_eq!(batch.halves().unwrap_err(), Unserializable);
+    }
+
+    #[test]
+    fn splitting_a_batch_whose_len_disagrees_with_its_items_is_an_error() {
+        let built = pack_events(vec![crate::sanitize::tests::event("read", 16)]);
+        let mut batch = built.batches.into_iter().next().unwrap();
+        assert_eq!(batch.len(), 1);
+        // Claims more items than it decodes to: one half ends up empty.
+        batch.len = 4;
         assert_eq!(batch.halves().unwrap_err(), Unserializable);
     }
 
