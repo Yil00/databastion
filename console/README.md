@@ -37,10 +37,14 @@ database (also used as the job queue: no Redis). See
 
 `DATABASTION_ENCRYPTION_KEY(_FILE)` from
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
-e.g. `openssl rand -base64 32`) is the console server key of the web process. Today it only keys the
-agent "known good" fingerprints (HKDF-SHA256 subkey, domain `agent-known-good.v1`, see "Data at
-rest"); unset, too short or unreadable: those fingerprints are neither stored nor matched (fail
-closed: agents lose the lock-out exemption, nothing else) and a warning is logged. Changing it
+e.g. `openssl rand -base64 32`) is the console server key of the web process. It keys the agent "known good" fingerprints (HKDF-SHA256
+subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
+`login-device.v1`, see "Brute-force protection"). **Set it in production: the shared-IP protection
+of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.** Unset, too short
+or unreadable: fingerprints and device cookies are neither issued nor accepted (fail closed: agents
+lose the lock-out exemption, so agents behind a shared NAT / proxy IP can be blocked by floods from
+it, and a distributed guessing attack on a username can keep its user out), and in production the
+web process logs an **error** at startup naming those disabled protections (it still starts). Changing it
 invalidates the stored fingerprints. The console only knows its own database: it never stores target
 database credentials (invariant I3).
 
@@ -187,14 +191,27 @@ login flood can never block agents. Failed logins on unknown usernames share a p
 known (trusted proxy).
 
 Failed logins (P1-D M2), all over 15 minutes:
-- 20 per source IP;
-- 5 per username **and** source IP (per username alone when the IP is unknown): a failure flood
-  from one IP never locks the account out for another IP;
+- 20 per source IP (IPv6 bucketed by /56 for logins, not /64);
+- 5 per username **and** source IP: a failure flood from one IP never locks the account out for
+  another IP (`429` from that IP only);
+- when the client IP is unknown (no trusted proxy), that counter is per username alone, shared by
+  everyone: reaching it never answers `429`, the username degrades like below (N2);
 - 100 per username across all IPs. Reaching it never refuses the login: the username degrades to a
   slow-down (2 s before the verification) with one attempt in flight at a time, other concurrent
-  attempts for that username get `503 busy` + `Retry-After`. The right password from a fresh IP
-  still logs in, while distributed guessing is throttled to about one attempt every 2 s per
-  username. Wrong passwords still answer `401` (the degraded state is not revealed as `429`).
+  attempts for that username get `503 busy` + `Retry-After`. Wrong passwords still answer `401`
+  (the degraded state is not revealed as `429`).
+
+Device cookies (P1-D N1, OWASP "device cookies"): every successful login sets a long-lived
+(90 days) `__Host-databastion_device` cookie (`Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`;
+`databastion_device` without `Secure` outside production, like the session cookie) carrying the
+user id, the issue time and a random nonce, signed with HMAC-SHA256 under the server-key subkey
+`login-device.v1`; nothing is stored server side. A login presenting a valid device cookie for the
+username it tries skips the global per-username cap and its degraded single slot, so an attacker
+spread over many IPs cannot keep the real user out by holding that slot. It never replaces the
+password, and stays subject to the per-(username, IP) limit, a limit of 5 failures per cookie
+(beyond, the cookie gives no bypass: a stolen cookie cannot be used to guess) and the login
+argon2id pool. A cookie for another user, tampered, expired or signed with another key is ignored.
+Without the server key, no device cookie is issued or accepted.
 
 Failed agent authentications (P1-D M1), all over 5 minutes: 10 per (agent, source IP), 50 per
 source IP. Only failures that ran an argon2id verification count; cheap failures (missing or
@@ -202,7 +219,12 @@ malformed headers or secret, unknown or inactive agent, `/rotate` body missing i
 count toward a separate limit of 500 per source IP that only gates reaching argon2id. No failure
 limit holds a secret verified less than 25 s ago or a known-good secret (current or pending, see
 "Data at rest"): agents sharing a NAT or proxy IP cannot be blocked by junk requests from it, which
-need no secret.
+need no secret. The known-good exemption is checked first against an in-memory copy of the agent
+row (refreshed on every request of the agent), then against the row itself; that database read is
+skipped while the source IP is over the cheap limit, and a read that grants no exemption counts as
+a cheap failure (N4). Consequence: right after a console restart, while an IP is over the cheap
+limit, a known-good agent behind it waits for the window (at most 5 minutes) like the others. The
+known-good exemption requires the server key (`DATABASTION_ENCRYPTION_KEY`); the 25 s cache does not.
 
 ## Agent secret rotation
 `POST /api/agent/v1/rotate` follows [ADR-0008](../docs/adr/0008-agent-generated-secret-rotation.md)

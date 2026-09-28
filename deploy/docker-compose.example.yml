@@ -8,7 +8,8 @@ name: databastion
 
 # Console image, pinned by version tag (never `latest`): one place to change on upgrade. Use a
 # published tag (RELEASE.md: `X.Y.Z` or `X.Y.Z-alpha.N`, no `v` prefix); `0.1.0-alpha.1` is the first
-# planned pre-release. For a fully immutable pin, append the digest: `...:<tag>@sha256:<digest>`
+# planned pre-release: it is published with that first pre-release (end of phase 2), and does not
+# exist on GHCR before then. For a fully immutable pin, append the digest: `...:<tag>@sha256:<digest>`
 # (verify it first: `cosign verify`, see RELEASE.md).
 x-console-image: &console-image ghcr.io/yil00/databastion-console:0.1.0-alpha.1
 
