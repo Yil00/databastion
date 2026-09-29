@@ -197,16 +197,18 @@ impl PrivilegeReport {
                 None => None,
             };
             let mut actions: Vec<&str> = Vec::new();
-            if let Some(list) = p.array("actions")? {
-                for (j, a) in list.iter().enumerate() {
-                    if j >= MAX_ACTIONS {
-                        r.any_database = true;
-                        break;
-                    }
-                    if let (_, Value::Str(s)) = a? {
-                        actions.push(std::str::from_utf8(s).map_err(|_| Malformed)?);
-                    }
+            // A privilege without its actions list, or with an action that
+            // is not a string, is not understood: fail closed.
+            let list = p.array("actions")?.ok_or(Malformed)?;
+            for (j, a) in list.iter().enumerate() {
+                if j >= MAX_ACTIONS {
+                    r.any_database = true;
+                    break;
                 }
+                let (_, Value::Str(s)) = a? else {
+                    return Err(Malformed);
+                };
+                actions.push(std::str::from_utf8(s).map_err(|_| Malformed)?);
             }
             r.add(res, &actions);
         }
@@ -489,6 +491,35 @@ mod tests {
     #[test]
     fn a_reply_without_privileges_is_malformed() {
         let bytes = DocBuf::new().i32("ok", 1).finish();
+        assert!(PrivilegeReport::from_connection_status(Doc::new(&bytes).unwrap()).is_err());
+        // A privilege without actions, or with a non-string action.
+        for p in [
+            DocBuf::new().doc("resource", ns("app", "")),
+            DocBuf::new()
+                .doc("resource", ns("app", ""))
+                .doc("actions", DocBuf::new().i32("0", 1)),
+        ] {
+            let bytes = DocBuf::new()
+                .doc(
+                    "authInfo",
+                    DocBuf::new().array("authenticatedUserPrivileges", vec![p]),
+                )
+                .finish();
+            assert!(PrivilegeReport::from_connection_status(Doc::new(&bytes).unwrap()).is_err());
+        }
+        let bytes = DocBuf::new()
+            .doc(
+                "authInfo",
+                DocBuf::new().array(
+                    "authenticatedUserPrivileges",
+                    vec![DocBuf::new().doc("resource", ns("app", "")).raw(
+                        0x04,
+                        "actions",
+                        &DocBuf::new().str("0", "find").i32("1", 7).finish(),
+                    )],
+                ),
+            )
+            .finish();
         assert!(PrivilegeReport::from_connection_status(Doc::new(&bytes).unwrap()).is_err());
     }
 }

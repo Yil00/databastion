@@ -43,7 +43,7 @@ pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_CHECKED_DATABASES: usize = 64;
 
 /// The detailed report of a target.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Report {
     pub(crate) privileges: PrivilegeReport,
     /// Whether `connectionStatus` could be evaluated.
@@ -55,14 +55,36 @@ pub(crate) struct Report {
     /// their bucket collections); counted only when the privileges are
     /// known.
     pub(crate) timeseries_unreadable: u64,
-    /// Databases beyond [`MAX_CHECKED_DATABASES`], or listings cut.
+    /// Databases beyond [`MAX_CHECKED_DATABASES`], or listings cut or
+    /// failed.
     pub(crate) coverage_truncated: bool,
+    /// Whether the databases could be listed at all.
+    pub(crate) coverage_known: bool,
+}
+
+impl Default for Report {
+    fn default() -> Self {
+        Self {
+            privileges: PrivilegeReport::default(),
+            privileges_known: false,
+            databases: 0,
+            views: 0,
+            other_kinds: 0,
+            timeseries_unreadable: 0,
+            coverage_truncated: false,
+            coverage_known: true,
+        }
+    }
 }
 
 impl Report {
     /// Closed notes: privileges and views (counts only).
     pub(crate) fn notes(&self) -> Vec<TargetNote> {
-        let mut out = self.privileges.notes();
+        let mut out = if self.privileges_known {
+            self.privileges.notes()
+        } else {
+            vec![TargetNote::new(NoteCode::PrivilegeNotEvaluated)]
+        };
         if self.views > 0 {
             out.push(TargetNote::new(NoteCode::CoverageViewsNotSampled).with_count(self.views));
         }
@@ -85,7 +107,9 @@ impl Report {
                 self.privileges.summary().join("; ")
             ));
         }
-        if self.databases == 0 {
+        if !self.coverage_known {
+            out.push("coverage not evaluated (databases not listed)".to_owned());
+        } else if self.databases == 0 {
             out.push("the account holds privileges on no database: nothing to scan".to_owned());
         }
         if self.timeseries_unreadable > 0 {
@@ -236,9 +260,7 @@ pub(crate) async fn build_info<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Privileges and coverage.
-pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(
-    session: &mut Session<S>,
-) -> Result<Report, MgError> {
+pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(session: &mut Session<S>) -> Report {
     let mut r = Report::default();
     let status = session
         .command(
@@ -256,17 +278,32 @@ pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(
                 r.privileges = p;
                 r.privileges_known = true;
             }
-            Err(_) => tracing::warn!("connectionStatus reply not understood"),
+            Err(_) => {
+                tracing::warn!("connectionStatus reply not understood: privileges not evaluated")
+            }
         },
-        Err(e) if !e.fatal => tracing::warn!(
+        Err(e) => tracing::warn!(
             server_code = e.server_code,
             "connectionStatus failed: privileges not evaluated"
         ),
-        Err(e) => return Err(e),
     }
-    let (databases, truncated) = catalog::list_databases(session).await?;
+    // Coverage: a failure here keeps the privilege evaluation above.
+    let databases = match catalog::list_databases(session).await {
+        Ok((databases, truncated)) => {
+            r.coverage_truncated = truncated;
+            databases
+        }
+        Err(e) => {
+            tracing::warn!(
+                server_code = e.server_code,
+                "databases not listed: coverage not evaluated"
+            );
+            r.coverage_known = false;
+            return r;
+        }
+    };
     r.databases = databases.len();
-    r.coverage_truncated = truncated || databases.len() > MAX_CHECKED_DATABASES;
+    r.coverage_truncated |= databases.len() > MAX_CHECKED_DATABASES;
     for db in databases.iter().take(MAX_CHECKED_DATABASES) {
         match catalog::list_collections(session, db).await {
             Ok((collections, truncated)) => {
@@ -284,11 +321,14 @@ pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
-            Err(e) if !e.fatal => {}
-            Err(e) => return Err(e),
+            Err(e) if !e.fatal => r.coverage_truncated = true,
+            Err(_) => {
+                r.coverage_truncated = true;
+                break;
+            }
         }
     }
-    Ok(r)
+    r
 }
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth {
@@ -331,23 +371,22 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     );
     codes.add(TargetNote::new(NoteCode::AuditStreamNotAvailable));
     if state.due(&target.id) && !session.is_broken() {
-        match report(&mut session).await {
-            Ok(r) => {
-                if state.store(target.id.clone(), r.clone()) {
-                    log_report(target, &r);
-                }
-            }
-            Err(e) => tracing::warn!(
-                target_id = %target.id,
-                stage = e.stage.as_str(),
-                server_code = e.server_code,
-                "privilege and coverage report failed"
-            ),
+        let r = report(&mut session).await;
+        if state.store(target.id.clone(), r.clone()) {
+            log_report(target, &r);
         }
     }
-    if let Some(r) = state.cached(&target.id) {
-        detail.extend(r.summary());
-        codes.extend(r.notes());
+    match state.cached(&target.id) {
+        Some(r) => {
+            detail.extend(r.summary());
+            codes.extend(r.notes());
+        }
+        // No report yet (the session broke before it): the privileges are
+        // not evaluated, which must not read as least privilege.
+        None => {
+            detail.push("privileges not evaluated".to_owned());
+            codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+        }
     }
     if !session.is_broken() {
         session.close().await;
@@ -421,6 +460,7 @@ mod tests {
             NoteCode::SecurityTlsDisabled,
             NoteCode::CoverageViewsNotSampled,
             NoteCode::CoverageTimeseriesNotReadable,
+            NoteCode::PrivilegeNotEvaluated,
             NoteCode::PrivilegeWriteActions,
             NoteCode::PrivilegeReadBeyondDiscovery,
             NoteCode::PrivilegeClusterActions,

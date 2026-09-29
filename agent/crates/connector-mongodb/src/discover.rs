@@ -28,7 +28,7 @@ use crate::bson::{DocBuf, Value};
 use crate::catalog::{self, CollKind, Collection};
 use crate::conn::{Kind, Session, Timeouts};
 use crate::error::{MgError, Stage};
-use crate::paths::{Collector, WalkStats};
+use crate::paths::{Collector, Shape, WalkStats};
 
 /// `$sample` is used above this many times the sample size (below, it
 /// would scan and sort the whole collection).
@@ -51,8 +51,13 @@ pub(crate) fn normalize_collection(raw: &str) -> NormalizedName {
 pub(crate) enum Method {
     /// `aggregate` with `$sample`.
     Sample,
-    /// `find` in natural order with `limit`.
+    /// `find` in natural order with `limit`, in a single batch.
     Natural,
+    /// `find` with `limit` on a view-backed collection (time-series): the
+    /// server turns a `find` on a view into an aggregation, which refuses
+    /// `singleBatch` (`InvalidPipelineOperator`, 168); a batch of `n + 1`
+    /// exhausts it in the first reply instead.
+    NaturalView,
 }
 
 /// The read method for a collection of `estimated` documents.
@@ -85,6 +90,11 @@ pub(crate) fn read_command(collection: &str, method: Method, n: u32) -> DocBuf {
             .i64("limit", n)
             .i64("batchSize", n)
             .bool("singleBatch", true),
+        Method::NaturalView => DocBuf::new()
+            .str("find", collection)
+            .doc("filter", DocBuf::new())
+            .i64("limit", n)
+            .i64("batchSize", n + 1),
     }
 }
 
@@ -147,7 +157,10 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
         CollKind::Collection => Some(count(session, db, &collection.name).await?),
         _ => None,
     };
-    let method = method(estimated_rows, n);
+    let method = match collection.kind {
+        CollKind::Timeseries => Method::NaturalView,
+        _ => method(estimated_rows, n),
+    };
     let reply = session
         .command(
             Stage::Sample,
@@ -156,8 +169,8 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
             Kind::Read,
         )
         .await?;
-    let mut collector = Collector::new(n as usize);
-    let cursor_id = {
+    let cursor_id;
+    let collector = {
         let doc = reply.doc();
         let bad = |_| non_fatal(FailureCode::Internal);
         let cursor = doc
@@ -168,18 +181,26 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
             .array("firstBatch")
             .map_err(bad)?
             .ok_or(non_fatal(FailureCode::Internal))?;
+        let mut documents = Vec::new();
         for element in batch.iter() {
             // A server that ignores the limit is not read further.
-            if collector.stats.documents >= n {
+            if documents.len() >= n as usize {
                 break;
             }
             let (_, value) = element.map_err(bad)?;
             let Value::Doc(document) = value else {
                 return Err(non_fatal(FailureCode::Internal));
             };
+            documents.push(document);
+        }
+        // First the shape (which object levels are maps keyed by data),
+        // then the values.
+        let mut collector = Collector::with_shape(n as usize, Shape::learn(&documents));
+        for document in documents {
             collector.add_document(document).map_err(bad)?;
         }
-        cursor.int("id").map_err(bad)?.unwrap_or(0)
+        cursor_id = cursor.int("id").map_err(bad)?.unwrap_or(0);
+        collector
     };
     drop(reply);
     if cursor_id != 0 {
@@ -488,6 +509,11 @@ mod tests {
             d.doc("cursor").unwrap().unwrap().int("batchSize").unwrap(),
             Some(201)
         );
+        // A time-series (view) read has no `singleBatch`.
+        let view = read_command("metrics", Method::NaturalView, 200).finish();
+        let d_view = Doc::new(&view).unwrap();
+        assert_eq!(d_view.flag("singleBatch").unwrap(), None);
+        assert_eq!(d_view.int("batchSize").unwrap(), Some(201));
         let pipeline = d.array("pipeline").unwrap().unwrap();
         let stages: Vec<_> = pipeline.iter().map(Result::unwrap).collect();
         assert_eq!(stages.len(), 1);

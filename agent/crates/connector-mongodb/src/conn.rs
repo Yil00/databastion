@@ -251,12 +251,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             self.broken = true;
             return Err(refused());
         }
-        let (last, expected) = exchange
-            .client_final(&server_first, password)
-            .map_err(|e| {
-                self.broken = true;
-                MgError::from_scram(e)
-            })?;
+        // PBKDF2 (up to `scram::MAX_ITERATIONS` rounds) runs on the
+        // blocking pool, not on the async runtime, and within the exchange
+        // deadline.
+        let owned_password = Zeroizing::new(password.to_owned());
+        let derivation = tokio::task::spawn_blocking(move || {
+            exchange.client_final(&server_first, &owned_password)
+        });
+        let (last, expected) =
+            match tokio::time::timeout(self.timeouts.exchange(), derivation).await {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(e))) => {
+                    self.broken = true;
+                    return Err(MgError::from_scram(e));
+                }
+                Ok(Err(_)) => {
+                    self.broken = true;
+                    return Err(MgError::new(FailureCode::Internal, Stage::Auth));
+                }
+                Err(_) => {
+                    self.broken = true;
+                    return Err(MgError::new(FailureCode::Timeout, Stage::Auth));
+                }
+            };
         let body = Zeroizing::new(
             DocBuf::new()
                 .i32("saslContinue", 1)

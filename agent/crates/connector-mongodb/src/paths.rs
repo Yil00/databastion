@@ -38,6 +38,21 @@ pub(crate) const MAX_PATHS: usize = 1024;
 pub(crate) const MAX_RAW_PATHS: usize = 4096;
 /// Longest value handed to the classifiers, in bytes.
 pub(crate) const MAX_VALUE_BYTES: usize = 4096;
+/// An object level with more distinct keys than this across the sample is
+/// a map keyed by data (dynamic keys): its keys become `*`.
+pub(crate) const MAX_STATIC_KEYS: usize = 16;
+/// An object level seen in at least 2 documents, with at least this many
+/// distinct keys, each in one document only, is also a map keyed by data.
+pub(crate) const MIN_SINGLETON_KEYS: usize = 3;
+/// Rounds of the shape pass (a map nested in a map is found in the next
+/// round, once its parent is collapsed).
+const SHAPE_ROUNDS: usize = 4;
+/// Object levels tracked per round.
+const MAX_TRACKED_LEVELS: usize = 4096;
+/// Distinct keys tracked per object level (past it: dynamic).
+const MAX_TRACKED_KEYS: usize = 64;
+/// The key a dynamic level's keys are replaced with.
+const WILD: &[u8] = b"*";
 
 /// One step of a raw path.
 #[derive(Clone, Copy)]
@@ -65,6 +80,8 @@ pub(crate) struct Collector {
     /// Raw path encoding -> slot in `paths` (`None`: dropped past
     /// [`MAX_PATHS`]). The keys are zeroized when the collector is dropped.
     raw: HashMap<Vec<u8>, Option<usize>>,
+    /// Object levels whose keys are data (see [`Shape`]).
+    shape: Shape,
     pub(crate) stats: WalkStats,
 }
 
@@ -120,6 +137,14 @@ pub(crate) fn normalize_steps(steps: &[(bool, &[u8])]) -> NormalizedName {
 }
 
 impl Collector {
+    /// A collector keeping at most `per_path` values per normalized path,
+    /// collapsing the dynamic levels of `shape`.
+    pub(crate) fn with_shape(per_path: usize, shape: Shape) -> Self {
+        let mut c = Self::new(per_path);
+        c.shape = shape;
+        c
+    }
+
     /// A collector keeping at most `per_path` values per normalized path.
     pub(crate) fn new(per_path: usize) -> Self {
         let mut c = Self::default();
@@ -150,6 +175,7 @@ impl Collector {
         depth: usize,
         budget: &mut Budget,
     ) -> Result<(), Malformed> {
+        let dynamic = !is_array && depth > 0 && self.shape.is_dynamic(steps);
         for (i, element) in doc.iter().enumerate() {
             if budget.values == 0 || budget.visits == 0 {
                 return Ok(());
@@ -162,6 +188,8 @@ impl Collector {
             budget.visits -= 1;
             steps.push(if is_array {
                 Step::Index
+            } else if dynamic {
+                Step::Key(WILD)
             } else {
                 Step::Key(key)
             });
@@ -232,6 +260,173 @@ impl Collector {
     /// The pooled values, by normalized path, in first-seen order.
     pub(crate) fn into_paths(mut self) -> Vec<(NormalizedName, Vec<RawValue>)> {
         std::mem::take(&mut self.paths)
+    }
+}
+
+/// Object levels whose keys are data rather than field names (dynamic
+/// keys that do not look like values: logins, surnames, short ids, codes).
+/// Learned from the sampled documents before the values are collected
+/// (security review M3): a level with more than [`MAX_STATIC_KEYS`]
+/// distinct keys, or seen in at least 2 documents with at least
+/// [`MIN_SINGLETON_KEYS`] keys that each appear in one document only, is
+/// collapsed to `*`. The top level is never collapsed (a collection's
+/// fields). Levels are identified by their raw path (collapsed ancestors
+/// as `*`), zeroized on drop.
+#[derive(Default)]
+pub(crate) struct Shape {
+    dynamic: std::collections::HashSet<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shape")
+            .field("dynamic_levels", &self.dynamic.len())
+            .finish()
+    }
+}
+
+impl Drop for Shape {
+    fn drop(&mut self) {
+        for key in self.dynamic.drain() {
+            drop(Zeroizing::new(key));
+        }
+    }
+}
+
+#[derive(Default)]
+struct LevelStats {
+    documents: u32,
+    last_document: Option<usize>,
+    /// Key -> (documents holding it, last document).
+    keys: HashMap<Vec<u8>, (u32, usize)>,
+    overflow: bool,
+}
+
+impl LevelStats {
+    fn is_dynamic(&self) -> bool {
+        self.overflow
+            || self.keys.len() > MAX_STATIC_KEYS
+            || (self.documents >= 2
+                && self.keys.len() >= MIN_SINGLETON_KEYS
+                && self.keys.values().all(|(n, _)| *n == 1))
+    }
+}
+
+impl Drop for LevelStats {
+    fn drop(&mut self) {
+        for (key, _) in self.keys.drain() {
+            drop(Zeroizing::new(key));
+        }
+    }
+}
+
+impl Shape {
+    /// Learns the dynamic levels of a sample.
+    pub(crate) fn learn(documents: &[Doc<'_>]) -> Self {
+        let mut shape = Self::default();
+        for _ in 0..SHAPE_ROUNDS {
+            let mut levels: HashMap<Vec<u8>, LevelStats> = HashMap::new();
+            for (i, d) in documents.iter().enumerate() {
+                let mut steps = Vec::new();
+                let mut visits = MAX_VISITS_PER_DOC;
+                shape.observe(*d, false, &mut steps, 0, i, &mut levels, &mut visits);
+            }
+            let found: Vec<Vec<u8>> = levels
+                .iter()
+                .filter(|(level, stats)| !shape.dynamic.contains(*level) && stats.is_dynamic())
+                .map(|(level, _)| level.clone())
+                .collect();
+            for (level, _) in levels.drain() {
+                drop(Zeroizing::new(level));
+            }
+            if found.is_empty() {
+                break;
+            }
+            shape.dynamic.extend(found);
+        }
+        shape
+    }
+
+    fn is_dynamic(&self, steps: &[Step<'_>]) -> bool {
+        if self.dynamic.is_empty() {
+            return false;
+        }
+        let level = Zeroizing::new(encode(steps));
+        self.dynamic.contains(&*level)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe<'a>(
+        &self,
+        doc: Doc<'a>,
+        is_array: bool,
+        steps: &mut Vec<Step<'a>>,
+        depth: usize,
+        document: usize,
+        levels: &mut HashMap<Vec<u8>, LevelStats>,
+        visits: &mut usize,
+    ) {
+        let dynamic = !is_array && depth > 0 && self.is_dynamic(steps);
+        // Keys of this level (bounded like the collection walk).
+        let mut children: Vec<(&'a [u8], Value<'a>)> = Vec::new();
+        for (i, element) in doc.iter().enumerate() {
+            if *visits == 0 || (is_array && i >= MAX_ARRAY_ELEMENTS) {
+                break;
+            }
+            let Ok((key, value)) = element else {
+                break;
+            };
+            *visits -= 1;
+            children.push((key, value));
+        }
+        if !is_array && depth > 0 && !dynamic {
+            let level = encode(steps);
+            if levels.len() < MAX_TRACKED_LEVELS || levels.contains_key(&level) {
+                let stats = levels.entry(level).or_default();
+                if stats.last_document != Some(document) {
+                    stats.last_document = Some(document);
+                    stats.documents = stats.documents.saturating_add(1);
+                }
+                for (key, _) in &children {
+                    if let Some((n, last)) = stats.keys.get_mut(*key) {
+                        if *last != document {
+                            *last = document;
+                            *n = n.saturating_add(1);
+                        }
+                    } else if stats.keys.len() < MAX_TRACKED_KEYS {
+                        stats.keys.insert(key.to_vec(), (1, document));
+                    } else {
+                        stats.overflow = true;
+                    }
+                }
+            }
+        }
+        for (key, value) in children {
+            let (Value::Doc(child) | Value::Array(child)) = value else {
+                continue;
+            };
+            if depth + 1 > MAX_DEPTH {
+                continue;
+            }
+            steps.push(if is_array {
+                Step::Index
+            } else if dynamic {
+                Step::Key(WILD)
+            } else {
+                Step::Key(key)
+            });
+            let child_is_array = matches!(value, Value::Array(_));
+            self.observe(
+                child,
+                child_is_array,
+                steps,
+                depth + 1,
+                document,
+                levels,
+                visits,
+            );
+            steps.pop();
+        }
     }
 }
 

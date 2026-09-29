@@ -67,6 +67,8 @@ pub(crate) struct Script {
     /// The header of every `find` / `aggregate` reply claims more than the
     /// limit.
     pub(crate) oversized_find: bool,
+    /// Commands answered `Unauthorized`.
+    pub(crate) failing: Vec<&'static str>,
 }
 
 impl Default for Script {
@@ -90,6 +92,7 @@ impl Default for Script {
                     .finish(),
             ],
             oversized_find: false,
+            failing: Vec::new(),
         }
     }
 }
@@ -150,6 +153,10 @@ fn frame(response_to: i32, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&wire::OP_MSG.to_le_bytes());
     out.extend_from_slice(&payload);
     out
+}
+
+fn keys_have(body: &Doc<'_>, key: &str) -> bool {
+    body.get(key).unwrap().is_some()
 }
 
 fn payload_of(body: &Doc<'_>) -> Vec<u8> {
@@ -222,6 +229,7 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                 .cloned()
         };
         let reply: Vec<u8> = match name.as_str() {
+            n if script.failing.contains(&n) => error_reply(13),
             "hello" => DocBuf::new()
                 .bool("isWritablePrimary", true)
                 .i32("maxWireVersion", script.wire_version)
@@ -340,6 +348,12 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                 }
                 match find_coll(&db) {
                     Some(c) if c.unauthorized => error_reply(13),
+                    // Like the server: a `find` on a view (time-series) is
+                    // converted to an aggregation, which refuses
+                    // `singleBatch`.
+                    Some(c) if c.kind == "timeseries" && keys_have(&body, "singleBatch") => {
+                        error_reply(168)
+                    }
                     Some(c) => {
                         let n = usize::try_from(size.unwrap_or(0)).unwrap();
                         let docs: Vec<Vec<u8>> = c.docs.iter().take(n).cloned().collect();
@@ -793,7 +807,7 @@ async fn check_reports_privileges_and_views() {
     let build = crate::check::build_info(&mut s).await.unwrap();
     assert_eq!(build.version, "8.0.32");
     assert_eq!(build.edition, "community");
-    let r = crate::check::report(&mut s).await.unwrap();
+    let r = crate::check::report(&mut s).await;
     assert!(r.privileges_known);
     assert_eq!(r.databases, 1);
     assert_eq!(r.views, 1);
@@ -1037,7 +1051,7 @@ async fn unreadable_time_series_collections_are_reported() {
         };
         let (s, _) = session(script, PASSWORD).await;
         let mut s = s.unwrap();
-        let r = crate::check::report(&mut s).await.unwrap();
+        let r = crate::check::report(&mut s).await;
         assert!(r.privileges.is_minimal());
         let note = r
             .notes()
@@ -1045,4 +1059,37 @@ async fn unreadable_time_series_collections_are_reported() {
             .find(|n| n.code() == databastion_core::NoteCode::CoverageTimeseriesNotReadable);
         assert_eq!(note.and_then(|n| n.count()), expected);
     }
+}
+
+/// Privileges that cannot be read are reported as not evaluated (never as
+/// least privilege), and a coverage listing that fails keeps the privilege
+/// evaluation (security review M1).
+#[tokio::test]
+async fn privileges_not_evaluated_and_coverage_failures() {
+    let over = DocBuf::new()
+        .doc("resource", DocBuf::new().bool("cluster", true))
+        .array_str("actions", &["inprog"])
+        .finish();
+    let codes = |r: &crate::check::Report| -> Vec<&'static str> {
+        r.notes().iter().map(|n| n.code().as_str()).collect()
+    };
+    // connectionStatus refused.
+    let script = Script {
+        failing: vec!["connectionStatus"],
+        ..Script::default()
+    };
+    let (s, _) = session(script, PASSWORD).await;
+    let r = crate::check::report(&mut s.unwrap()).await;
+    assert!(!r.privileges_known);
+    assert_eq!(codes(&r), ["privilege.not_evaluated"]);
+    // listDatabases refused after connectionStatus answered.
+    let script = Script {
+        failing: vec!["listDatabases"],
+        privileges: vec![over],
+        ..Script::default()
+    };
+    let (s, _) = session(script, PASSWORD).await;
+    let r = crate::check::report(&mut s.unwrap()).await;
+    assert!(r.privileges_known && !r.coverage_known);
+    assert_eq!(codes(&r), ["privilege.cluster_actions"]);
 }

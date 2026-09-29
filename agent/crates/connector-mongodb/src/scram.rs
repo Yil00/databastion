@@ -25,8 +25,9 @@ pub(crate) const MECHANISM: &str = "SCRAM-SHA-256";
 /// path could otherwise lower to make a captured proof cheap to attack).
 pub(crate) const MIN_ITERATIONS: u32 = 4096;
 /// Highest iteration count accepted: bounds the work a hostile server can
-/// ask for (MongoDB's default is 15000).
-pub(crate) const MAX_ITERATIONS: u32 = 1_000_000;
+/// ask for. MongoDB's default (`scramSHA256IterationCount`) is 15000; a
+/// server configured above this bound is refused.
+pub(crate) const MAX_ITERATIONS: u32 = 100_000;
 /// Longest server message accepted.
 const MAX_MESSAGE: usize = 4096;
 
@@ -90,10 +91,23 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
 
 /// PBKDF2-HMAC-SHA-256 with a 32-byte output (`Hi` of RFC 5802).
 fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
-    let mut u = hmac(password, &[salt, &1u32.to_be_bytes()]);
-    let mut out = Zeroizing::new(*u);
+    let mut out = Zeroizing::new([0u8; 32]);
+    // Keyed once; each iteration clones the keyed state instead of
+    // re-deriving the pads from the password. HMAC accepts keys of any
+    // length (an all-zero output would only fail authentication).
+    let Ok(keyed) = <HmacSha256 as KeyInit>::new_from_slice(password) else {
+        return out;
+    };
+    let mut u = Zeroizing::new([0u8; 32]);
+    let mut mac = keyed.clone();
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    u.copy_from_slice(&mac.finalize().into_bytes());
+    out.copy_from_slice(&u[..]);
     for _ in 1..iterations {
-        u = hmac(password, &[&u[..]]);
+        let mut mac = keyed.clone();
+        mac.update(&u[..]);
+        u.copy_from_slice(&mac.finalize().into_bytes());
         for (o, x) in out.iter_mut().zip(u.iter()) {
             *o ^= x;
         }
@@ -334,7 +348,7 @@ p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
             // too high (work forced on the agent).
             (format!("r=abcdefXYZ,{s},i=1"), ScramError::Iterations),
             (format!("r=abcdefXYZ,{s},i=4095"), ScramError::Iterations),
-            (format!("r=abcdefXYZ,{s},i=1000001"), ScramError::Iterations),
+            (format!("r=abcdefXYZ,{s},i=100001"), ScramError::Iterations),
             (format!("r=abcdefXYZ,{s},i=-5"), ScramError::Malformed),
             (
                 format!("m=ext,r=abcdefXYZ,{s},i=4096"),
