@@ -1119,6 +1119,9 @@ impl EventObject {
 pub const MAX_EVENT_OBJECTS: usize = 16;
 /// Contract `AccessEvent.aggregated_count.maximum`.
 pub const MAX_AGGREGATED_COUNT: u64 = 1_000_000;
+/// Contract `Count.maximum` (the JavaScript safe integer bound): row counts
+/// saturate here.
+pub const MAX_COUNT: u64 = 9_007_199_254_740_991;
 
 /// A normalized access event: no query text, no bound parameter, no
 /// returned value (ADR-0007), only who, which objects (normalized names),
@@ -1201,10 +1204,10 @@ impl MaskedEvent {
         }
     }
 
-    /// Sets the rows returned or affected.
+    /// Sets the rows returned or affected (saturated at [`MAX_COUNT`]).
     #[must_use]
     pub fn with_rows(mut self, rows: Option<u64>) -> Self {
-        self.rows = rows;
+        self.rows = rows.map(|r| r.min(MAX_COUNT));
         self
     }
 
@@ -1244,7 +1247,8 @@ impl MaskedEvent {
 
     /// Merges an event of the same group (see [`Self::group_key`]): counts
     /// and rows add up (rows known on either side), timestamps widen,
-    /// signals are united. The count saturates at [`MAX_AGGREGATED_COUNT`].
+    /// signals are united. The count saturates at [`MAX_AGGREGATED_COUNT`],
+    /// rows at [`MAX_COUNT`].
     pub fn merge(&mut self, other: Self) {
         let other_last = other.ts_last.unwrap_or(other.ts);
         let last = self.ts_last.unwrap_or(self.ts).max(other_last);
@@ -1255,7 +1259,7 @@ impl MaskedEvent {
             .saturating_add(other.aggregated_count)
             .min(MAX_AGGREGATED_COUNT);
         self.rows = match (self.rows, other.rows) {
-            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(a), Some(b)) => Some(a.saturating_add(b).min(MAX_COUNT)),
             (a, b) => a.or(b),
         };
         for s in other.signals {
@@ -1333,18 +1337,19 @@ mod tests {
 
     #[test]
     fn signals_follow_the_contract_pattern() {
+        // `^(signature|shape|volume)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`
         for sig in Signal::ALL {
             let v = sig.as_str();
             let (family, name) = v.split_once('.').unwrap();
             assert!(matches!(family, "signature" | "shape" | "volume"), "{v}");
-            assert!(
-                !name.is_empty()
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-                "{v}"
-            );
-            assert!(v.len() <= 64);
+            let words: Vec<&str> = name.split('_').collect();
+            assert!((1..=6).contains(&words.len()), "{v}");
+            for w in words {
+                assert!(
+                    (1..=16).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_lowercase()),
+                    "{v}"
+                );
+            }
         }
     }
 
@@ -1610,5 +1615,28 @@ mod tests {
     fn short_keys_are_rejected() {
         assert_eq!(HmacKey::new(&[0; 31]).err(), Some(KeyTooShort));
         assert!(!format!("{:?}", key(0x41)).contains("AAAA"));
+    }
+
+    #[test]
+    fn event_rows_saturate_at_the_contract_count_bound() {
+        let ev = |rows: u64| {
+            MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("report"),
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .with_rows(Some(rows))
+        };
+        assert_eq!(ev(u64::MAX).rows(), Some(MAX_COUNT));
+        let mut a = ev(MAX_COUNT - 1);
+        a.merge(ev(10));
+        assert_eq!(a.rows(), Some(MAX_COUNT));
+        let mut b = ev(u64::MAX);
+        b.merge(ev(u64::MAX));
+        assert_eq!(b.rows(), Some(MAX_COUNT));
+        let mut c = ev(2);
+        c.merge(ev(3));
+        assert_eq!(c.rows(), Some(5));
     }
 }

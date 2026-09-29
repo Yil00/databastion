@@ -735,9 +735,11 @@ fn event_item(
             EventAction::Dcl => AccessEventAction::Dcl,
         },
         aggregated_count: std::num::NonZeroU64::new(e.aggregated_count())?,
+        // No connector reports a result size yet (the PostgreSQL sources have none).
+        bytes: None,
         objects,
         principal,
-        rows: e.rows().and_then(|r| i64::try_from(r).ok()).map(Count),
+        rows: e.rows().map(sanitize::clamped_count),
         signals: (!signals.is_empty()).then_some(signals),
         source,
         target_id: target_id.clone(),

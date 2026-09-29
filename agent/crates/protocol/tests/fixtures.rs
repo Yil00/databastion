@@ -23,6 +23,10 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "EventsBatch.read-without-objects.json",
         "minItems (via if/then, removed before generation)",
     ),
+    (
+        "EventsBatch.negative-bytes.json",
+        "minimum on an integer newtype (Count)",
+    ),
     ("EventsBatch.too-many-events.json", "maxItems"),
     (
         "FindingsBatch.card-number-as-table.json",
@@ -45,12 +49,19 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "HeartbeatRequest.detected-target-without-endpoint.json",
         "minProperties",
     ),
+    ("HeartbeatRequest.duplicate-note-labels.json", "uniqueItems"),
+    (
+        "HeartbeatRequest.note-negative-count.json",
+        "minimum on an integer newtype (Count)",
+    ),
     ("HeartbeatRequest.too-many-metrics.json", "maxProperties"),
+    ("HeartbeatRequest.too-many-notes.json", "maxItems"),
     ("HeartbeatRequest.too-many-targets.json", "maxItems"),
     (
         "HeartbeatResponse.interval-too-short.json",
         "minimum on an integer newtype",
     ),
+    ("HeartbeatResponse.too-many-capabilities.json", "maxItems"),
     ("JobList.empty.json", "minItems"),
     (
         "JobList.sample-rows-too-large.json",
@@ -75,6 +86,10 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "minItems (Some([]), distinct from absent)",
     ),
     ("JobList.too-many-jobs.json", "maxItems"),
+    (
+        "JobStatusUpdate.negative-skipped-count.json",
+        "minimum on an integer newtype (Count)",
+    ),
     (
         "JobStatusUpdate.failed-without-error.json",
         "required (via if/then, removed before generation)",

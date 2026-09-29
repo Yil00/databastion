@@ -33,6 +33,7 @@
 
 pub mod audit;
 mod backoff;
+mod capabilities;
 pub mod config;
 pub mod connector;
 mod detect;
