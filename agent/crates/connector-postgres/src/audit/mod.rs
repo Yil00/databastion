@@ -89,7 +89,6 @@ fn own_account(
         &target.account,
         pre.own_addr,
         u64::from(cfg.max_sample_rows()),
-        cfg.aggregation_window(),
     )
 }
 

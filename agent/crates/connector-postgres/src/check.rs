@@ -189,7 +189,9 @@ pub(crate) struct CheckState {
     reports: Mutex<HashMap<(String, String), Cached>>,
     sources: Mutex<HashMap<String, EventSource>>,
     records: Mutex<HashMap<String, Instant>>,
-    severity_mismatches: Mutex<HashMap<String, u64>>,
+    /// Per target: records dropped for their severity, and when the
+    /// count started (reported for 24 h, then reset).
+    severity_mismatches: Mutex<HashMap<String, (u64, Instant)>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -211,8 +213,13 @@ impl CheckState {
             .severity_mismatches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let c = map.entry(target_id.to_owned()).or_insert(0);
-        *c = c.saturating_add(n);
+        let entry = map
+            .entry(target_id.to_owned())
+            .or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= RECORD_FRESHNESS {
+            *entry = (0, Instant::now());
+        }
+        entry.0 = entry.0.saturating_add(n);
     }
 
     fn severity_mismatches(&self, target_id: &str) -> u64 {
@@ -220,8 +227,8 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(target_id)
-            .copied()
-            .unwrap_or(0)
+            .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)
+            .map_or(0, |(n, _)| *n)
     }
 
     /// Whether a pgaudit record of `target_id` was parsed recently.
@@ -403,7 +410,8 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     let mismatched = state.severity_mismatches(&target.id);
     if mismatched > 0 {
         notes.push(format!(
-            "{mismatched} pgaudit record(s) dropped: severity differs from pgaudit.log_level"
+            "{mismatched} pgaudit record(s) dropped in the last 24 h: severity differs from \
+             pgaudit.log_level"
         ));
     }
     notes.sort();

@@ -36,7 +36,7 @@
 //! object and window (`OwnAccount`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use databastion_classifiers::masking::{
     ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
@@ -264,61 +264,98 @@ impl DumpTracker {
     }
 }
 
+/// Period over which the agent's own reads of one object are budgeted.
+const OWN_PERIOD_HOURS: u64 = 24;
+/// Objects budgeted at most; beyond, the agent's own reads of a new
+/// object are reported.
+const OWN_MAX_OBJECTS: usize = 10_000;
+
+/// Where the client address of an event comes from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClientSeen {
+    /// The source logs it (pgaudit); `None`: not logged.
+    Logged(Option<ClientAddr>),
+    /// The source never shows it (`pg_stat_statements`).
+    NotVisible,
+}
+
 /// The agent's own activity, which may be left out of the events.
 pub(crate) struct OwnAccount {
     account: String,
-    /// Client address the server sees for the agent (`None`: unknown).
+    /// Client address the server sees for the agent (`None`: could not be
+    /// read; then nothing is left out).
     addr: Option<ClientAddr>,
-    /// Rows per object and window above which the agent's own reads are
-    /// reported anyway (`limits.max_sample_rows`: Discovery never reads
-    /// more per object).
+    /// Rows per object over [`OWN_PERIOD_HOURS`] above which the agent's
+    /// own reads are reported anyway (`limits.max_sample_rows`: one
+    /// Discovery scan never reads more per object).
     budget: u64,
-    window: Duration,
-    opened: Option<Instant>,
-    rows: HashMap<String, u64>,
+    start: Instant,
+    /// Per object: rows per hour (hour index, rows), last 24 hours.
+    usage: HashMap<String, VecDeque<(u64, u64)>>,
 }
 
 impl OwnAccount {
-    pub(crate) fn new(
-        account: &str,
-        addr: Option<ClientAddr>,
-        budget: u64,
-        window: Duration,
-    ) -> Self {
+    pub(crate) fn new(account: &str, addr: Option<ClientAddr>, budget: u64) -> Self {
         Self {
             account: account.to_owned(),
             addr,
             budget,
-            window,
-            opened: None,
-            rows: HashMap::new(),
+            start: Instant::now(),
+            usage: HashMap::new(),
         }
     }
 
+    /// Charges `rows` to an object; `true` when its 24 h total exceeds the
+    /// budget (or it cannot be tracked).
+    fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
+        let hour = now.saturating_duration_since(self.start).as_secs() / 3600;
+        if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
+            // Drop objects with no use in the period, then fail open to
+            // reporting.
+            self.usage.retain(|_, v| {
+                v.back()
+                    .is_some_and(|(h, _)| hour.saturating_sub(*h) < OWN_PERIOD_HOURS)
+            });
+            if self.usage.len() >= OWN_MAX_OBJECTS {
+                return true;
+            }
+        }
+        let buckets = self.usage.entry(key).or_default();
+        while buckets
+            .front()
+            .is_some_and(|(h, _)| hour.saturating_sub(*h) >= OWN_PERIOD_HOURS)
+        {
+            buckets.pop_front();
+        }
+        match buckets.back_mut() {
+            Some((h, n)) if *h == hour => *n = n.saturating_add(rows),
+            _ => buckets.push_back((hour, rows)),
+        }
+        let total = buckets
+            .iter()
+            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
+        total > self.budget
+    }
+
     /// Whether an event may be left out: the agent's account, its
-    /// `application_name` (pgaudit), its own client address (when known),
-    /// no signal, and at most `budget` rows per object within the window.
-    /// With stolen agent credentials, reads from elsewhere, reads that
-    /// look like exports, and paging through a table beyond what Discovery
-    /// reads are still reported.
+    /// `application_name` (pgaudit), its own client address (pgaudit; the
+    /// agent's address must be known), no signal, and at most `budget`
+    /// rows per object over 24 hours (unknown rows are charged the whole
+    /// budget). With stolen agent credentials, reads from elsewhere, reads
+    /// that look like exports, and reading more of a table than one
+    /// Discovery scan per day are still reported.
     fn routine(
         &mut self,
         user: &str,
         application: Option<&str>,
-        client: Option<ClientAddr>,
+        client: ClientSeen,
         e: &MaskedEvent,
         now: Instant,
     ) -> bool {
         if user != self.account {
             return false;
         }
-        if self
-            .opened
-            .is_none_or(|t| now.duration_since(t) >= self.window)
-        {
-            self.opened = Some(now);
-            self.rows.clear();
-        }
+        let rows = e.rows().unwrap_or(self.budget);
         let mut over = false;
         for o in e.objects() {
             let key = format!(
@@ -327,13 +364,13 @@ impl OwnAccount {
                 o.schema().map_or("", |s| s.as_str()),
                 o.object().as_str()
             );
-            let n = self.rows.entry(key).or_insert(0);
-            *n = n.saturating_add(e.rows().unwrap_or(0));
-            over |= *n > self.budget;
+            over |= self.charge(key, rows, now);
         }
         let addr_ok = match (self.addr, client) {
-            (Some(own), Some(c)) => own == c,
-            _ => true,
+            (None, _) => false,
+            (Some(own), ClientSeen::Logged(Some(c))) => own == c,
+            (Some(_), ClientSeen::Logged(None)) => false,
+            (Some(_), ClientSeen::NotVisible) => true,
         };
         application.is_none_or(|a| a == APPLICATION_NAME)
             && addr_ok
@@ -522,7 +559,7 @@ impl PgauditEvents {
             if self.own.routine(
                 &first.user,
                 Some(&first.application),
-                client,
+                ClientSeen::Logged(client),
                 &e,
                 Instant::now(),
             ) {
@@ -621,7 +658,7 @@ pub(crate) fn pss_events(
         } else if d.rows > LARGE_ROWS {
             e = e.with_signal(Signal::LargeResult);
         }
-        if own.routine(d.user, None, None, &e, Instant::now()) {
+        if own.routine(d.user, None, ClientSeen::NotVisible, &e, Instant::now()) {
             continue;
         }
         out.push(e);
@@ -675,12 +712,7 @@ mod tests {
     }
 
     fn own() -> OwnAccount {
-        OwnAccount::new(
-            "databastion",
-            ClientAddr::parse("192.0.2.14"),
-            1000,
-            Duration::from_secs(60),
-        )
+        OwnAccount::new("databastion", ClientAddr::parse("192.0.2.14"), 1000)
     }
 
     fn json(e: &MaskedEvent) -> String {
@@ -1006,9 +1038,29 @@ mod tests {
             "databastion",
             ClientAddr::parse("198.51.100.7"),
             1000,
-            Duration::from_secs(60),
         ));
         assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
+        // The agent's address could not be read: nothing is left out.
+        let mut b = PgauditEvents::new(OwnAccount::new("databastion", None, 1000));
+        assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
+        // Unknown rows (pgaudit.log_rows off) are charged the whole budget:
+        // the second statement on the same object is reported.
+        let unknown = |i: u64| {
+            rec(
+                "p2",
+                i,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1",
+                None,
+                "databastion-agent",
+            )
+        };
+        let mut b = PgauditEvents::new(own());
+        assert!(b.convert(vec![unknown(1)], SystemTime::now()).is_empty());
+        assert_eq!(b.convert(vec![unknown(2)], SystemTime::now()).len(), 1);
         // pg_stat_statements: rows per object within the poll.
         let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
         let deltas = [StatementDelta {
@@ -1020,6 +1072,20 @@ mod tests {
         }];
         let t0 = SystemTime::UNIX_EPOCH;
         assert_eq!(pss_events(&deltas, &mut own(), t0, t0).len(), 1);
+    }
+
+    #[test]
+    fn own_budget_spans_a_day_not_a_window() {
+        let mut o = own();
+        let t0 = Instant::now();
+        let key = || "shop\u{0}crm\u{0}t".to_owned();
+        assert!(!o.charge(key(), 600, t0));
+        // An hour later (past any aggregation window): still counted.
+        assert!(o.charge(key(), 600, t0 + std::time::Duration::from_secs(3600)));
+        // A day later: the first charges have aged out.
+        let mut o = own();
+        assert!(!o.charge(key(), 600, t0));
+        assert!(!o.charge(key(), 600, t0 + std::time::Duration::from_secs(25 * 3600)));
     }
 
     #[test]

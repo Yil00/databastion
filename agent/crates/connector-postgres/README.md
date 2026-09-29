@@ -37,7 +37,7 @@ pgaudit source needs `pgaudit.log_rows = on`.
   protection**: keep it at `default`. A forged record can add false
   events; it cannot remove real ones. Records dropped because their
   severity is not `pgaudit.log_level` (likely genuine: the setting differs
-  per database or role) are counted, logged, and noted in `check()`.
+  per database or role) are counted, logged, and noted in `check()` (for 24 h).
 - **Server-side exports hidden in dynamic SQL.** A `COPY` record whose text
   does not show the `COPY` (dynamic `EXECUTE`, `format()`, nested `DO`) is
   reported with `signature.copy_to_file`: PL/pgSQL cannot copy to the
@@ -45,17 +45,24 @@ pgaudit source needs `pgaudit.log_rows = on`.
 - **Objects not named by the log** (function or procedure bodies without
   `pgaudit.log_relation`, text that does not parse) are reported as `*` in
   the database, never dropped.
-- **The agent's own account.** Its statements are left out only when they
-  come from its `application_name` (`databastion-agent`) and from its own
-  client address (as the server sees it), carry no signal, and read at
-  most `limits.max_sample_rows` rows per object within the aggregation
-  window (per poll with `pg_stat_statements`, where application and
-  address are not visible). Residual: someone holding the agent's
-  credentials, on the agent host (same address), spoofing its
-  `application_name` and reading at most that many rows per object and
-  window with filtered queries stays unreported; without
-  `pgaudit.log_rows` the row budget cannot be applied (rows unknown count
-  as 0). The agent's database credentials never leave its host (I3).
+- **The agent's own account.** Its statements are left out only when all
+  hold: they come from its `application_name` (`databastion-agent`, pgaudit
+  only) and from its own client address as the server sees it
+  (`inet_client_addr()`, probed at stream start; when it cannot be read,
+  nothing is left out), they carry no signal, and the agent's reads of the
+  object stay within `limits.max_sample_rows` rows over a rolling 24 h
+  (unknown rows, without `pgaudit.log_rows`, are charged the whole budget
+  per statement). A second Discovery scan of a table within 24 h therefore
+  shows up as events of the agent's own account. With
+  `pg_stat_statements`, application and address are not visible: only the
+  signal and row-budget rules apply. Limits of the address check: behind a
+  connection pooler (PgBouncer…) every client has the pooler's address, and
+  another process on the agent host shares the agent's address; there the
+  check only separates remote clients. Residual: someone holding the
+  agent's credentials on the agent host (or behind the same pooler),
+  spoofing its `application_name` and reading at most that many rows per
+  object and day with filtered queries stays unreported. The agent's
+  database credentials never leave its host (I3).
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.
 - **`pg_stat_statements` mode** sees no client address, application name,
