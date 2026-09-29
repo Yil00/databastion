@@ -263,7 +263,7 @@ services:
   # read-only), loaded with the committed dev seed (dev/seed/out/{mysql,mariadb}.sql, value-bearing
   # table name included). target-initdb/15-agent-password.sh reads the agent password from its
   # Docker secret (/run/secrets/agent_password) for dev's 20-databastion.sh, which creates the ADR-0018 minimal account
-  # `databastion` (SELECT on the application database only, REQUIRE SSL, MAX_USER_CONNECTIONS 4;
+  # `databastion` (SELECT on the application database only, REQUIRE SSL, MAX_USER_CONNECTIONS 5;
   # MariaDB: MAX_STATEMENT_TIME 30); dev's 30-tls.sh creates the throwaway CA and the server
   # certificate (SAN `mysql` / `mariadb`: the network aliases the agent connects to). run.sh copies
   # the CA out of the container and hands it to the agent (`ca_file`, `tls: verify_full`) and to

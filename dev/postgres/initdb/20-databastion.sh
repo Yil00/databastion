@@ -3,7 +3,7 @@
 # - databastion: the agent's read-only account, minimal grant variant of ADR-0012
 #   (docs/adr/0012-postgresql-agent-grants.md), so that connector integration tests run with the
 #   production grants:
-#   - LOGIN, no superuser / createdb / createrole / replication / bypassrls, CONNECTION LIMIT 4;
+#   - LOGIN, no superuser / createdb / createrole / replication / bypassrls, CONNECTION LIMIT 5;
 #   - role defaults (a safety net only, the client can override them): read-only transactions,
 #     statement / lock / idle-in-transaction timeouts;
 #   - Discovery: USAGE + SELECT on the seeded application schemas (crm, billing, ops) and default
@@ -41,7 +41,7 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 \set ro_password `printenv DATABASTION_DB_PASSWORD`
 CREATE ROLE databastion LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
-  CONNECTION LIMIT 4 PASSWORD :'ro_password';
+  CONNECTION LIMIT 5 PASSWORD :'ro_password';
 \unset ro_password
 ALTER ROLE databastion SET default_transaction_read_only = on;
 ALTER ROLE databastion SET statement_timeout = '30s';

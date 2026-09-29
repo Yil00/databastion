@@ -599,7 +599,7 @@ unset role expected_role ro grants
 # MySQL / MariaDB agent accounts: ADR-0018 minimal variant (dev/{mysql,mariadb}/initdb/
 # 20-databastion.sh; ADR-0020). Inspected as root, whose password is read inside the target from its
 # Docker secret (never on a command line). Exactly USAGE on *.* and SELECT on the application
-# database, REQUIRE SSL, MAX_USER_CONNECTIONS 4 (MariaDB: MAX_STATEMENT_TIME 30), no role, no other
+# database, REQUIRE SSL, MAX_USER_CONNECTIONS 5 (MariaDB: MAX_STATEMENT_TIME 30), no role, no other
 # account named `databastion`; a session without TLS is refused.
 # my_sql SERVICE CLIENT SQL: runs SQL as root in SERVICE, one row per line, tab-separated.
 my_sql() {

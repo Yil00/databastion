@@ -188,8 +188,9 @@ review remain the primary controls.
   `<= 0` are ignored. The heartbeat runs the targets' `check()`
   concurrently under one 10 s deadline, so it waits at most 10 s for all of
   them (P2-G); targets reaching the same account (engine, host or socket,
-  port, account) are checked one at a time, to stay within the ADR-0018
-  `MAX_USER_CONNECTIONS` budget. A check still running or waiting for its
+  port, account) are checked one at a time, so an account holds at most one
+  check next to one scan; Audit streams hold their own connections outside
+  these turns (sizing in ADR-0025 decision 11). A check still running or waiting for its
   turn at the deadline is reported unreachable with `timeout` and the
   `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /

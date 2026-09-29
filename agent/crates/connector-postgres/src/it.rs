@@ -9,7 +9,7 @@
 //!   fixtures (database `databastion_probe`, dropped and recreated) and the
 //!   extended-variant role. Without it, those tests are skipped.
 //!
-//! The tests are serialized (the agent role has `CONNECTION LIMIT 4`).
+//! The tests are serialized (the agent role has `CONNECTION LIMIT 5`).
 //! They live in the crate (not `tests/`) to reach the session layer for
 //! the cancellation and transaction probes.
 
