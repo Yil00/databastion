@@ -898,11 +898,16 @@ pub enum Signal {
     Mongodump,
     /// `signature.mongoexport`: the same with `mongoexport`.
     Mongoexport,
+    /// `shape.bulk_search`: an LDAP search over a container or a subtree
+    /// (scope one-level, subtree or children) whose filter selects no entry
+    /// by value (presence tests and `objectClass` assertions only): the
+    /// shape of an LDIF export or a bulk `ldapsearch` (ADR-0029).
+    BulkSearch,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -913,6 +918,7 @@ impl Signal {
         Self::IntoOutfile,
         Self::Mongodump,
         Self::Mongoexport,
+        Self::BulkSearch,
     ];
 
     /// Contract value.
@@ -929,6 +935,7 @@ impl Signal {
             Self::IntoOutfile => "signature.into_outfile",
             Self::Mongodump => "signature.mongodump",
             Self::Mongoexport => "signature.mongoexport",
+            Self::BulkSearch => "shape.bulk_search",
         }
     }
 }

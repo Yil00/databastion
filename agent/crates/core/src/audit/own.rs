@@ -28,8 +28,15 @@ const OWN_MAX_OBJECTS: usize = 10_000;
 pub enum ClientSeen {
     /// The source logs it; `None`: not logged for this event.
     Logged(Option<ClientAddr>),
-    /// The source never shows it (`pg_stat_statements`).
+    /// The source never shows it (`pg_stat_statements`); the agent's own
+    /// address must still be known (read from the server) for anything to
+    /// be left out.
     NotVisible,
+    /// The source records no client address at all, for anyone (OpenLDAP
+    /// `cn=accesslog`), and the engine cannot tell the agent its own
+    /// address: the address rule does not apply, and only the identity,
+    /// signal and row-budget rules remain (ADR-0029 decision 9).
+    NotRecorded,
 }
 
 /// Rows the agent's own account read per object, per hour, over the last
@@ -205,6 +212,7 @@ impl OwnAccount {
     /// agent's; the agent's own address must be known.
     fn identity(&self, application: Option<&str>, client: ClientSeen) -> bool {
         let addr_ok = match (self.addr, client) {
+            (_, ClientSeen::NotRecorded) => true,
             (None, _) => false,
             (Some(own), ClientSeen::Logged(Some(c))) => own == c,
             (Some(_), ClientSeen::Logged(None)) => false,
@@ -278,6 +286,38 @@ mod tests {
                 "{action:?}"
             );
         }
+    }
+
+    #[test]
+    fn sources_without_addresses_rely_on_identity_signal_and_budget() {
+        let now = Instant::now();
+        // No address known for the agent, none recorded by the source.
+        let mut o = OwnAccount::new(
+            "cn=databastion,ou=services,dc=example,dc=org",
+            None,
+            None,
+            1000,
+            SharedOwnUsage::default(),
+        );
+        let user = "cn=databastion,ou=services,dc=example,dc=org";
+        let seen = ClientSeen::NotRecorded;
+        assert!(o.routine(user, None, seen, &ev(Some(600)), now));
+        assert!(o.routine_unbudgeted(user, None, seen, &ev(Some(5000))));
+        // Over the budget, with a signal, another identity, or a write:
+        // reported.
+        assert!(!o.routine(user, None, seen, &ev(Some(600)), now));
+        assert!(!o.routine("cn=other", None, seen, &ev(Some(1)), now));
+        let signalled = ev(Some(1)).with_signal(Signal::LargeResult);
+        assert!(!o.routine_unbudgeted(user, None, seen, &signalled));
+        let write = MaskedEvent::new(
+            EventSource::OpenldapAccesslog,
+            EventAction::Write,
+            EventPrincipal::account(user),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(!o.routine_unbudgeted(user, None, seen, &write));
+        // `NotVisible` still needs the agent's own address.
+        assert!(!o.routine_unbudgeted(user, None, ClientSeen::NotVisible, &ev(Some(1))));
     }
 
     #[test]

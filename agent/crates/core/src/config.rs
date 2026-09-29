@@ -277,6 +277,9 @@ pub struct TargetConfig {
     /// Least-privilege read-only account (I4).
     pub account: String,
     /// Where the account secret is read from. Never the secret itself (I3).
+    /// Required for every target except an OpenLDAP target that binds with
+    /// SASL `EXTERNAL` (`openldap.bind: sasl_external`), where it is refused.
+    #[serde(default)]
     pub secret: SecretRef,
     /// Region of national phone numbers without `+` in this target (`fr`),
     /// used to normalize them before fingerprinting. Absent: unknown (the
@@ -292,6 +295,9 @@ pub struct TargetConfig {
     /// MongoDB settings (`engine: mongodb` only).
     #[serde(default)]
     pub mongodb: Option<MongodbTargetConfig>,
+    /// OpenLDAP settings (`engine: openldap` only).
+    #[serde(default)]
+    pub openldap: Option<OpenldapTargetConfig>,
 }
 
 /// Maximum number of databases declared for one PostgreSQL target.
@@ -563,6 +569,99 @@ impl TargetConfig {
     }
 }
 
+/// Longest `openldap.accesslog_base`.
+pub const MAX_OPENLDAP_DN: usize = 512;
+
+/// OpenLDAP settings of a target (ADR-0029). One connection to the declared
+/// server covers every naming context the account can read; the job's
+/// `databases` filter selects the ones scanned. Referrals are never
+/// followed (I5).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenldapTargetConfig {
+    /// TLS to the server. Default: `verify_full` (LDAPS).
+    #[serde(default)]
+    pub tls: OpenldapTlsMode,
+    /// PEM CA file trusted for the server certificate (`verify_full`,
+    /// `start_tls`). When set, it is the only trusted root; otherwise the
+    /// system store.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// How the agent authenticates. Default: `simple` (the service DN in
+    /// `account`, its password in `secret`).
+    #[serde(default)]
+    pub bind: OpenldapBind,
+    /// DN of the `slapo-accesslog` database read by the Audit connector
+    /// (`olcAccessLogDB`). Never scanned by Discovery. Default:
+    /// `cn=accesslog`.
+    #[serde(default = "default_accesslog_base")]
+    pub accesslog_base: String,
+}
+
+fn default_accesslog_base() -> String {
+    "cn=accesslog".to_owned()
+}
+
+impl Default for OpenldapTargetConfig {
+    fn default() -> Self {
+        Self {
+            tls: OpenldapTlsMode::default(),
+            ca_file: None,
+            bind: OpenldapBind::default(),
+            accesslog_base: default_accesslog_base(),
+        }
+    }
+}
+
+/// TLS mode of an OpenLDAP target. There is no `disable_insecure`: a
+/// simple bind sends the password itself, so cleartext on a network is
+/// refused (ADR-0029 decision 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenldapTlsMode {
+    /// LDAPS: TLS from the first byte (default port 636), certificate and
+    /// host name verified (rustls).
+    #[default]
+    VerifyFull,
+    /// StartTLS on the LDAP port (default 389), then verified as
+    /// `verify_full`; no fallback to cleartext.
+    StartTls,
+    /// No TLS: an `ldapi://` Unix socket or a loopback IP literal only
+    /// (rejected for any other host).
+    Disable,
+}
+
+impl OpenldapTlsMode {
+    /// Whether the server certificate is verified (`verify_full`,
+    /// `start_tls`).
+    #[must_use]
+    pub const fn verified(self) -> bool {
+        matches!(self, Self::VerifyFull | Self::StartTls)
+    }
+}
+
+/// Authentication of an OpenLDAP target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenldapBind {
+    /// Simple bind with the service DN (`account`) and its password
+    /// (`secret`).
+    #[default]
+    Simple,
+    /// SASL `EXTERNAL` over an `ldapi://` socket: slapd authenticates the
+    /// agent's Unix uid / gid; `account` is the expected authorization DN,
+    /// and no `secret` is set.
+    SaslExternal,
+}
+
+impl TargetConfig {
+    /// OpenLDAP settings, defaults when absent.
+    #[must_use]
+    pub fn openldap_settings(&self) -> OpenldapTargetConfig {
+        self.openldap.clone().unwrap_or_default()
+    }
+}
+
 /// Phone region of a target (`agent.yaml`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -586,7 +685,7 @@ impl TargetConfig {
 /// Reference to a database secret: exactly one of `env` (variable name) or
 /// `file` (absolute path, `0600`). The value is read on the agent host only
 /// when a connector needs it (I3).
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
     /// Name of an environment variable.
@@ -734,6 +833,11 @@ const KNOWN_KEYS: &[&str] = &[
     "mariadb",
     "mongodb",
     "openldap",
+    "start_tls",
+    "bind",
+    "simple",
+    "sasl_external",
+    "accesslog_base",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -1037,6 +1141,28 @@ impl TargetConfig {
                 tls == MongodbTlsMode::Disable,
             )?;
         }
+        if let Some(ldap) = &self.openldap {
+            self.validate_openldap(ldap, i)?;
+        }
+        if self.engine == TargetEngine::Openldap {
+            let tls = self.openldap_settings().tls;
+            self.validate_tls_placement(
+                format!("targets[{i}].openldap.tls"),
+                tls.verified(),
+                tls == OpenldapTlsMode::Disable,
+            )?;
+            if self.openldap_settings().bind == OpenldapBind::SaslExternal {
+                // The peer credentials of the socket authenticate the
+                // agent: a password would never be used.
+                if self.secret != SecretRef::default() {
+                    return Err(invalid(
+                        f("secret"),
+                        "not used with openldap.bind: sasl_external (remove it)",
+                    ));
+                }
+                return Ok(());
+            }
+        }
         match (&self.secret.env, &self.secret.file) {
             (Some(name), None) if !is_env_name(name) => Err(invalid(
                 f("secret.env"),
@@ -1146,6 +1272,47 @@ impl TargetConfig {
         Ok(())
     }
 
+    fn validate_openldap(&self, ldap: &OpenldapTargetConfig, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].openldap.{name}");
+        if self.engine != TargetEngine::Openldap {
+            return Err(invalid(
+                format!("targets[{i}].openldap"),
+                "only for engine openldap",
+            ));
+        }
+        if ldap.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            return Err(invalid(f("ca_file"), "must be an absolute path"));
+        }
+        if ldap.ca_file.is_some() && !ldap.tls.verified() {
+            return Err(invalid(
+                f("ca_file"),
+                "only with tls: verify_full or start_tls",
+            ));
+        }
+        if ldap.bind == OpenldapBind::SaslExternal && self.socket.is_none() {
+            return Err(invalid(
+                f("bind"),
+                "sasl_external needs an ldapi:// Unix socket (socket, tls: disable)",
+            ));
+        }
+        // A DN of `attr=value` RDNs, without control characters.
+        let dn = &ldap.accesslog_base;
+        if dn.is_empty()
+            || dn.len() > MAX_OPENLDAP_DN
+            || dn.chars().any(char::is_control)
+            || !dn.split(',').all(|rdn| {
+                rdn.split_once('=')
+                    .is_some_and(|(t, v)| !t.trim().is_empty() && !v.trim().is_empty())
+            })
+        {
+            return Err(invalid(
+                f("accesslog_base"),
+                "must be a DN (attr=value[,attr=value…]), at most 512 bytes",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_postgres(&self, pg: &PostgresTargetConfig, i: usize) -> Result<(), ConfigError> {
         let f = |name: &str| format!("targets[{i}].postgres.{name}");
         if self.engine != TargetEngine::Postgres {
@@ -1203,6 +1370,8 @@ targets:
     account: cn=databastion,dc=example,dc=com
     secret:
       file: /etc/databastion/secrets/ldap
+    openldap:
+      tls: disable
 ";
 
     fn parse(text: &str) -> Result<AgentConfig, ConfigError> {
@@ -1500,6 +1669,86 @@ targets:
             "      file: /etc/databastion/secrets/ldap\n    postgres:\n      databases: [x]\n",
         );
         assert!(err(&ldap).contains("targets[1].postgres"), "{}", err(&ldap));
+    }
+
+    #[test]
+    fn openldap_settings() {
+        const LDAP: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: ldap
+    engine: openldap
+    host: ldap1.internal
+    account: cn=databastion,ou=services,dc=example,dc=org
+    secret:
+      env: DATABASTION_LDAP_PASSWORD
+";
+        let cfg = parse(LDAP).unwrap();
+        let settings = cfg.targets[0].openldap_settings();
+        assert_eq!(settings, OpenldapTargetConfig::default());
+        assert_eq!(settings.tls, OpenldapTlsMode::VerifyFull);
+        assert_eq!(settings.bind, OpenldapBind::Simple);
+        assert_eq!(settings.accesslog_base, "cn=accesslog");
+        let with = |block: &str| {
+            LDAP.replace(
+                "    host: ldap1.internal\n",
+                &format!("    host: ldap1.internal\n{block}"),
+            )
+        };
+        let cfg = parse(&with(
+            "    openldap:\n      tls: start_tls\n      ca_file: /etc/databastion/ldap-ca.pem\n      \
+             accesslog_base: cn=log\n",
+        ))
+        .unwrap();
+        let settings = cfg.targets[0].openldap_settings();
+        assert_eq!(settings.tls, OpenldapTlsMode::StartTls);
+        assert!(settings.tls.verified());
+        assert_eq!(settings.accesslog_base, "cn=log");
+        // No cleartext on a network, and no `disable_insecure` at all.
+        assert!(err(&with("    openldap: {tls: disable}\n")).contains("openldap.tls"));
+        assert!(err(&with("    openldap: {tls: disable_insecure}\n")).contains("invalid value"));
+        assert!(err(&with("    openldap: {tls: disable, ca_file: /x.pem}\n")).contains("ca_file"));
+        assert!(
+            err(&with("    openldap: {accesslog_base: accesslog}\n")).contains("accesslog_base")
+        );
+        assert!(err(&with("    openldap: {accesslog_base: \"cn=\"}\n")).contains("accesslog_base"));
+        // SASL EXTERNAL: ldapi only, and no secret.
+        assert!(err(&with("    openldap: {bind: sasl_external}\n")).contains("openldap.bind"));
+        let socket = LDAP.replace(
+            "    host: ldap1.internal\n",
+            "    socket: /run/slapd/ldapi\n",
+        );
+        let external = socket.replace(
+            "    secret:\n      env: DATABASTION_LDAP_PASSWORD\n",
+            "    openldap: {tls: disable, bind: sasl_external}\n",
+        );
+        let cfg = parse(&external).unwrap();
+        assert_eq!(
+            cfg.targets[0].openldap_settings().bind,
+            OpenldapBind::SaslExternal
+        );
+        assert_eq!(cfg.targets[0].secret, SecretRef::default());
+        let both = socket.replace(
+            "    secret:\n",
+            "    openldap: {tls: disable, bind: sasl_external}\n    secret:\n",
+        );
+        assert!(err(&both).contains("targets[0].secret"), "{}", err(&both));
+        // Every other target still needs its secret.
+        let none = socket.replace(
+            "    secret:\n      env: DATABASTION_LDAP_PASSWORD\n",
+            "    openldap: {tls: disable}\n",
+        );
+        assert!(err(&none).contains("targets[0].secret"), "{}", err(&none));
+        // The block belongs to openldap targets only.
+        assert!(
+            err(&BASE.replace(
+                "      env: DATABASTION_PG_MAIN_PASSWORD\n",
+                "      env: DATABASTION_PG_MAIN_PASSWORD\n    openldap: {tls: start_tls}\n",
+            ))
+            .contains("targets[0].openldap")
+        );
     }
 
     #[test]
