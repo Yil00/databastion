@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
+import { PgBoss } from "pg-boss";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
@@ -19,7 +20,9 @@ import {
   handlePollJobs,
 } from "@/server/agent-api/handlers";
 import { enqueueJob } from "@/server/jobs";
+import { logger } from "@/lib/logger";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
+import { pgBossOptions, registerPolicyQueue } from "@/worker/queues";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
@@ -29,6 +32,7 @@ import { getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, lis
 import { setFalsePositive } from "./findings";
 import { drainPolicyWork, getIncident, transitionIncident } from "./incidents";
 import { createException, createPolicy, type PolicyInput } from "./policies";
+import { POLICY_QUEUE, setPolicyJobSender } from "./policy-queue";
 
 type Auth = { agentId: string; secret: string };
 
@@ -405,6 +409,31 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const [first] = await listEvents(getDb(), { agentId: auth.agentId, targetId: "pg-prod-1", principalKey: principalKey({ db_user: "backup" }) });
       expect(first).toMatchObject({ principal: "backup", fingerprinted: false, application: "pg_dump", evaluated: true, incidentIds: [] });
     });
+  });
+
+  it("exit criterion path: an accepted pg_dump batch wakes a real pg-boss worker, which opens the incident within seconds", async () => {
+    const { url } = await createRuntimeRole();
+    const boss = new PgBoss(pgBossOptions(url));
+    boss.on("error", () => undefined);
+    await boss.start();
+    try {
+      await registerPolicyQueue(boss, getDb, logger, { pollingIntervalSeconds: 0.5 });
+      setPolicyJobSender(async () => {
+        await boss.send(POLICY_QUEUE, {});
+      });
+      const auth = await agentWithTargets();
+      await policy({ signals: ["signature.pg_dump", "signature.mysqldump"] });
+      const started = Date.now();
+      await send(auth, [dumpEvent({ ts: new Date().toISOString() })]);
+      for (let i = 0; i < 100 && (await incidentsOf(auth.agentId)).length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      setPolicyJobSender(null);
+      await boss.stop({ graceful: false, timeout: 2000 });
+    }
   });
 
   it("ingestion, correlation, incidents, purge and Audit settings work as the runtime role; the role check stays quiet", async () => {
