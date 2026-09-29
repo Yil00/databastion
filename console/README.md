@@ -780,7 +780,7 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
 `src/server/notifications.ts`; senders: `src/server/senders/`; address policy:
 `src/server/net-guard.ts`; silent agents and integrity alerts: `src/server/system-alerts.ts`;
-contents: `src/lib/notification-render.ts`.*
+dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notification-render.ts`.*
 
 - **Channels** (admin only, CSRF, audited without secrets), referenced by `slug` from the policies'
   `notify` actions:
@@ -798,7 +798,7 @@ contents: `src/lib/notification-render.ts`.*
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -834,7 +834,7 @@ contents: `src/lib/notification-render.ts`.*
   transaction as the incident (policy engine) or the alert, one per (subject, event, channel) with a
   unique idempotency key, so retried or concurrent evaluations never notify twice. The worker queue
   `notifications.deliver` (pg-boss, `stately`, no payload: the outbox is the work) is woken after
-  new incidents, integrity events and tests, and scheduled every minute. Due rows are claimed with
+  new incidents, integrity events, dropped-batches alerts and tests, and scheduled every minute. Due rows are claimed with
   `FOR UPDATE SKIP LOCKED` and a 2-minute lease (a crashed worker's attempt is claimed again), sent
   outside any transaction, 10 in parallel, and recorded: `delivered`; `pending` again after 1, 2, 4,
   8, 16, 32 then 60 minutes; `failed` after 8 attempts or on a permanent error; `skipped` for a
@@ -873,6 +873,22 @@ contents: `src/lib/notification-render.ts`.*
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
   `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
   and hour per channel (the events themselves are all recorded, within their own budget).
+- **Dropped batches** (P7, end-of-phase-4 review M2): each heartbeat reports `spool.dropped_batches`,
+  the batches the agent dropped since it started (spool full, or rejected with a non-retryable
+  4xx): findings or access events that never reached the console, e.g. the signature batches of a
+  dump evicted by a failed-login flood. The heartbeat handler adds the rise of that counter since
+  the previous heartbeat (after a restart, seen as a lower uptime or counter, the whole counter; on
+  an agent's first heartbeat too) to `agents.dropped_batches_unalerted`, in the heartbeat
+  transaction. At most once per agent and hour (conditional update on
+  `agents.dropped_batches_alerted_at`, so concurrent heartbeats and workers alert once), the count
+  becomes a `security_events` row `agent.batches_dropped` (`medium`), an audit entry (system) and
+  an `agent.batches_dropped` notification to the system-alert channels, with `dropped_batches` (the
+  batches since `since`, the first unalerted drop seen), `min_interval_s` and the security event
+  id. Drops within the hour are counted in the next alert: raised by the next heartbeat after the
+  hour or, when the agent stops dropping, by the worker's minute schedule. Only console-computed
+  numbers, timestamps and ids: no agent-provided text (not even the host name). Revoked and locked
+  agents are not alerted. The agent page shows the spool counters of the latest heartbeat, the
+  last five alerts and the drops held back for the next one.
 
 ## Layout
 ```

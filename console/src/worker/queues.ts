@@ -9,6 +9,7 @@ import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
 import { pruneRateLimitCounters } from "@/server/rate-limit";
 import { drainDeliveries, enqueueSuppressionDigests } from "@/server/notifications";
 import { POLICY_QUEUE } from "@/server/policy-queue";
+import { flushDroppedBatchAlerts } from "@/server/dropped-batches";
 import { checkSilentAgents } from "@/server/system-alerts";
 
 /**
@@ -102,7 +103,8 @@ export const NOTIFICATION_JOB_BUDGET_MS = 50_000;
 
 /**
  * `notifications.deliver`: the silent-agent check (no new silence alert during the first threshold
- * after the worker started, see `checkSilentAgents`), then the due deliveries. Re-queued when due
+ * after the worker started, see `checkSilentAgents`), the dropped-batches alerts held back by the
+ * per-agent interval (`flushDroppedBatchAlerts`), then the due deliveries. Re-queued when due
  * deliveries remain; a failure is retried by pg-boss, the outbox keeps the work.
  */
 export function createNotificationHandler(
@@ -116,6 +118,8 @@ export function createNotificationHandler(
     if (jobs.length === 0) return;
     const thresholdS = silentAgentThresholdS();
     await checkSilentAgents(db(), { thresholdS, notBefore: new Date(startedAt.getTime() + thresholdS * 1000) });
+    const dropped = await flushDroppedBatchAlerts(db());
+    if (dropped > 0) log.info({ dropped }, "dropped-batches alerts");
     await enqueueSuppressionDigests(db());
     const stats = await drainDeliveries(db(), { budgetMs: opts.budgetMs ?? NOTIFICATION_JOB_BUDGET_MS });
     if (stats.attempted > 0) log.info({ ...stats }, "notifications");

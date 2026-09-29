@@ -1,11 +1,13 @@
-import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { agents, agentTargets, enrollmentTokens, jobs } from "@/db/schema";
+import { agents, agentTargets, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
 import type { Schemas } from "@/lib/protocol/validate";
 import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
+import { addDroppedBatches, droppedBatchesDelta, raiseDroppedBatchesAlert } from "./dropped-batches";
+import { requestNotificationDelivery } from "./notification-queue";
 import { purgeSecretCache } from "./agent-api/auth";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
@@ -113,7 +115,11 @@ async function auditEnrollFailure(db: Database, ip: string | null): Promise<void
   });
 }
 
-/** Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. */
+/**
+ * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
+ * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
+ * `dropped-batches.ts`), in the same transaction.
+ */
 export async function recordHeartbeat(
   db: Database,
   agentId: string,
@@ -121,7 +127,13 @@ export async function recordHeartbeat(
 ): Promise<void> {
   const skew = Date.parse(hb.ts) - Date.now();
   const clockSkewMs = Math.max(-2_000_000_000, Math.min(2_000_000_000, Math.round(skew)));
-  await db.transaction(async (tx) => {
+  const alerted = await db.transaction(async (tx) => {
+    // The previous spool counters, under the row lock (concurrent heartbeats count a rise once).
+    const [previous] = await tx
+      .select({ spool: agents.spool, uptimeS: agents.uptimeS, unalerted: agents.droppedBatchesUnalerted })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
+      .for("update");
     await tx
       .update(agents)
       .set({
@@ -166,7 +178,13 @@ export async function recordHeartbeat(
           ? and(eq(agentTargets.agentId, agentId), notInArray(agentTargets.targetId, ids))
           : eq(agentTargets.agentId, agentId),
       );
+    if (!previous) return false;
+    const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
+    await addDroppedBatches(tx, agentId, delta);
+    if (previous.unalerted + delta === 0) return false;
+    return (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
   });
+  if (alerted) void requestNotificationDelivery();
 }
 
 /**
@@ -294,11 +312,29 @@ export async function getAgentDetail(db: Database, agentId: string) {
       rotationPending: sql<boolean>`${agents.pendingSecretHash} is not null`,
       graceExpiresAt: agents.graceExpiresAt,
       promotedAt: agents.promotedAt,
+      spool: agents.spool,
+      droppedBatchesUnalerted: agents.droppedBatchesUnalerted,
+      droppedBatchesSince: agents.droppedBatchesSince,
+      droppedBatchesAlertedAt: agents.droppedBatchesAlertedAt,
     })
     .from(agents)
     .where(eq(agents.id, agentId))
     .limit(1);
   if (!agent) return null;
+  // The latest dropped-batches alerts (P7): console-computed counts and timestamps only.
+  const droppedAlerts = (
+    await db
+      .select({ id: securityEvents.id, at: securityEvents.at, details: securityEvents.details })
+      .from(securityEvents)
+      .where(and(eq(securityEvents.agentId, agentId), eq(securityEvents.kind, "agent.batches_dropped")))
+      .orderBy(desc(securityEvents.at))
+      .limit(5)
+  ).map((e) => ({
+    id: e.id,
+    at: e.at,
+    droppedBatches: typeof e.details?.dropped_batches === "number" ? e.details.dropped_batches : null,
+    since: typeof e.details?.since === "string" ? e.details.since : null,
+  }));
   const targets = await db
     .select({
       targetId: agentTargets.targetId,
@@ -316,5 +352,5 @@ export async function getAgentDetail(db: Database, agentId: string) {
     .from(agentTargets)
     .where(eq(agentTargets.agentId, agentId))
     .orderBy(agentTargets.targetId);
-  return { ...agent, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
+  return { ...agent, droppedAlerts, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
 }

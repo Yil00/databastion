@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 /**
  * Notification channels (P3-C, admin only): e-mail (SMTP) and HMAC-signed webhooks, referenced by
  * name from the policies' notify actions; channels flagged for console alerts also receive the
- * silent-agent and agent-integrity alerts. No secret is ever rendered here.
+ * silent-agent, agent-integrity and dropped-batches alerts. No secret is ever rendered here.
  */
 export default async function NotificationsPage() {
   const session = await requirePageSession();

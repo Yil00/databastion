@@ -214,7 +214,7 @@ export function ChannelForm({ csrfToken, initial }: { csrfToken: string; initial
           </label>
           <label className="flex items-center gap-2 text-sm">
             <input name="system_alerts" type="checkbox" defaultChecked={initial?.systemAlerts ?? false} className="size-4" />
-            Also receive console alerts (silent agents, agent-integrity events)
+            Also receive console alerts (silent agents, agent-integrity events, dropped batches)
           </label>
         </div>
         <div className="flex items-center gap-3">

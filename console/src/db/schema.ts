@@ -147,6 +147,15 @@ export const agents = pgTable(
      * the episode (recovery).
      */
     silenceAlertedFor: tsz("silence_alerted_for"),
+    /**
+     * P7 "dropped batches" alert (end-of-phase-4 review M2): batches the agent reported dropped
+     * (increase of `spool.dropped_batches` between heartbeats, a counter since agent start) and not
+     * alerted yet; when the first of them was seen; when the last alert was raised (at most one per
+     * agent and hour, see `src/server/dropped-batches.ts`).
+     */
+    droppedBatchesUnalerted: integer("dropped_batches_unalerted").notNull().default(0),
+    droppedBatchesSince: tsz("dropped_batches_since"),
+    droppedBatchesAlertedAt: tsz("dropped_batches_alerted_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),
   },
@@ -573,7 +582,7 @@ export const notificationChannelType = pgEnum("notification_channel_type", ["ema
  * `secret` is the only secret (SMTP password or webhook signing secret): AES-256-GCM under the
  * subkey `notification-channels.v1`, AAD bound to the channel id; never returned by the API.
  * `system_alerts`: the channel also receives the console's own alerts (silent agents,
- * agent-integrity events).
+ * agent-integrity events, dropped batches).
  */
 export const notificationChannels = pgTable(
   "notification_channels",

@@ -43,6 +43,7 @@ export type AuditAction =
   | "notification_channel.test"
   | "agent.silent"
   | "agent.recovered"
+  | "agent.batches_dropped"
   | "job.timeout"
   | "user.access_denied";
 

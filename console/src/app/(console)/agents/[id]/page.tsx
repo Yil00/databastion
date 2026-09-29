@@ -14,6 +14,7 @@ import { auditWarningText } from "@/lib/audit-warning";
 import { eventsHref } from "@/lib/events-filter";
 import { getAgentDetail } from "@/server/agents";
 import { auditSummaries } from "@/server/audit-config";
+import { DROPPED_BATCHES_ALERT_INTERVAL_S } from "@/server/dropped-batches";
 import { rotationBlocked } from "@/server/rotation";
 import { latestScans, scanStatusLabel } from "@/server/scans";
 import { requestTime, requirePageSession } from "@/server/ui-session";
@@ -21,6 +22,16 @@ import { requestTime, requirePageSession } from "@/server/ui-session";
 export const dynamic = "force-dynamic";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Spool state of the latest heartbeat (agent-reported counts; `dropped_*` count since agent start). */
+function spoolText(spool: Record<string, number> | null): string {
+  if (!spool) return "unknown";
+  const n = (k: string) => (typeof spool[k] === "number" ? spool[k] : null);
+  const parts = [`${n("batches") ?? "?"} batches, ${n("bytes") ?? "?"} of ${n("max_bytes") ?? "?"} bytes`];
+  if (n("dropped_batches") !== null) parts.push(`${n("dropped_batches")} batches dropped since agent start`);
+  if (n("dropped_items") !== null) parts.push(`${n("dropped_items")} items dropped`);
+  return parts.join(", ");
+}
 
 /** Agent-reported strings are rendered as text nodes only (never as HTML). */
 export default async function AgentPage({ params }: { params: Promise<{ id: string }> }) {
@@ -48,7 +59,10 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
     ["Last seen", formatAge(agent.lastSeenAt, now)],
     ["Clock skew", agent.clockSkewMs === null ? "unknown" : `${(agent.clockSkewMs / 1000).toFixed(1)} s`],
     ["Secret rotation", agent.rotationPending ? "pending" : agent.promotedAt ? `last ${agent.promotedAt.toISOString()}` : "never"],
+    ["Spool", spoolText(agent.spool)],
   ];
+  const dropped = agent.droppedAlerts;
+  const heldBack = agent.droppedBatchesUnalerted;
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-wrap items-center gap-3">
@@ -78,6 +92,51 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
           </dl>
         </CardContent>
       </Card>
+      {(dropped.length > 0 || heldBack > 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Dropped batches</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm">
+            <p>
+              The agent reported spool batches it dropped (spool full, or rejected by the console): findings or access
+              events that never reached the console. At most one alert per agent and hour is sent to the system-alert
+              channels; later drops are counted in the next one. The Audit or Discovery results of that time may be
+              incomplete.
+            </p>
+            {heldBack > 0 && (
+              <p role="alert" className="text-destructive">
+                {heldBack} more batch{heldBack === 1 ? "" : "es"} dropped
+                {agent.droppedBatchesSince ? ` since ${agent.droppedBatchesSince.toISOString()}` : ""}, to be alerted
+                {agent.droppedBatchesAlertedAt
+                  ? ` after ${new Date(agent.droppedBatchesAlertedAt.getTime() + DROPPED_BATCHES_ALERT_INTERVAL_S * 1000).toISOString()}`
+                  : " shortly"}
+                .
+              </p>
+            )}
+            {dropped.length > 0 && (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Alerted</TableHead>
+                    <TableHead>Batches dropped</TableHead>
+                    <TableHead>Since</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {dropped.map((e) => (
+                    <TableRow key={e.id}>
+                      <TableCell>{e.at.toISOString()}</TableCell>
+                      <TableCell>{e.droppedBatches ?? "unknown"}</TableCell>
+                      <TableCell>{e.since ?? ""}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Targets</CardTitle>
