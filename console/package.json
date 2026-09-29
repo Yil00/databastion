@@ -11,7 +11,8 @@
   },
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build && node scripts/check-build-wakeups.mjs",
+    "check:build": "node scripts/check-build-wakeups.mjs",
     "start": "next start",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "next typegen && tsc --noEmit",
