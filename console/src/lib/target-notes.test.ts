@@ -23,8 +23,8 @@ describe("target note rendering", () => {
     expect(renderTargetNote({ code: "privilege.role_attributes", labels: ["bypassrls", "createrole"] }).text).toBe(
       "Role attributes beyond the minimal grants: BYPASSRLS, CREATEROLE.",
     );
-    expect(renderTargetNote({ code: "privilege.beyond_select", labels: ["alter_routine", "binlog_admin", "other"] }).text).toBe(
-      "Privileges beyond SELECT on databases, tables or columns: ALTER ROUTINE, BINLOG ADMIN, other.",
+    expect(renderTargetNote({ code: "privilege.beyond_select", count: 3, labels: ["alter_routine", "binlog_admin", "other"] }).text).toBe(
+      "3 privilege(s) beyond SELECT on databases, tables or columns; the most severe: ALTER ROUTINE, BINLOG ADMIN, other.",
     );
     expect(renderTargetNote({ code: "privilege.predefined_roles", labels: ["pg_write_all_data"] }).text).toBe(
       "Member of predefined roles beyond the minimal grants: pg_write_all_data.",
