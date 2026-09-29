@@ -24,7 +24,7 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 | **MongoDB Enterprise**, **Percona Server for MongoDB** | `auditLog` JSON file (`mongo` schema), read locally by the agent; no document counts | Partial once a successful `authCheck` record was parsed in the last 24 h, Limited before; never Full | `auditLog.destination: file`, `format: JSON`, `auditAuthorizationSuccess: true` (otherwise reads and writes are not logged), file readable by the agent and declared in `agent.yaml` |
 | **MongoDB** (any edition) | Structured JSON server log (slow operations: `appName`, `nreturned`), read locally by the agent | Limited once a record was parsed in the last 24 h, None before | `systemLog.destination: file`, a `slowms` low enough for the operations to audit, file readable by the agent and declared in `agent.yaml` |
 | **MongoDB** (any edition, not a `mongos`), no readable file | Profiler (`system.profile`), polled over the agent's connection | Limited once an entry was read in the last 24 h, None before | Profiling on (level 1 with a suitable `slowms`, set by the operator); `find` on `system.profile` of each database to audit (see [05-security.md](05-security.md#recommended-database-accounts-read-only)) |
-| **OpenLDAP** | `slapo-accesslog` overlay (`cn=accesslog` database, queryable over LDAP) | Full | `olcAccessLogOps: reads writes session`, read account on `cn=accesslog` |
+| **OpenLDAP** | `slapo-accesslog` overlay (`cn=accesslog` database), read over LDAP by the agent | Full once reads **and** failed operations are proven logged for every naming context; Partial / Limited otherwise | `olcAccessLogOps: reads writes session`, `olcAccessLogSuccess: FALSE`, an `entryCSN` index on the log database, `read` on `cn=accesslog` for the agent's service DN |
 
 > **PostgreSQL, as implemented (P2-B, P4-A #58; [ADR-0015](adr/0015-postgresql-connector-decisions.md))**: see [PostgreSQL Audit](#postgresql-audit) below.
 
@@ -35,6 +35,8 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 > **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations only: those the server logs or profiles (slower than `slowms`, sampled by `slowOpSampleRate`; the profiler is also a ring buffer). A fast `mongodump` of a small collection can go unnoticed. The console shows the level Limited and the note `audit.slow_operations_only`.
 
 > **MongoDB, as implemented (P5-A #74; P5-B / P5-C #76, [ADR-0027](adr/0027-mongodb-audit.md))**: see [MongoDB Audit](#mongodb-audit) below. **Full is never reported** for MongoDB: the `auditLog` has no document counts, and the server log and the profiler only hold the operations the server records.
+
+> **OpenLDAP, as implemented (#79, [ADR-0029](adr/0029-openldap-connector.md))**: see [OpenLDAP Discovery](#openldap-discovery) and [OpenLDAP Audit](#openldap-audit) below. Full is reported only when `check()` has proof, for every naming context, that searches and failed operations are logged; the log records no client address.
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
@@ -292,6 +294,100 @@ Limits of these rules: behind a proxy or NAT every client has the same address. 
 - **Log literals on the agent host.** The files the agent reads hold other users' literals; the agent keeps none (zeroized buffers, never logged or sent), but a compromised agent host can read them through the file ACL it was given ([05-security.md](05-security.md#recommended-database-accounts-read-only)).
 - **At-most-once delivery**, as for the other engines; the profiler position is in memory, so an agent restart skips what the profiler recorded while the agent was stopped.
 
+## OpenLDAP Discovery
+
+What the OpenLDAP connector does, as implemented in phase 6 (#79, [ADR-0029](adr/0029-openldap-connector.md)). The reference is [the connector README](../agent/crates/connector-openldap/README.md); the account is in [05-security.md](05-security.md#recommended-database-accounts-read-only).
+
+### Scope
+- **One declared server**, over LDAPS, StartTLS, or cleartext on `ldapi://` / loopback only. Referrals and continuation references are never followed (counted as `skipped_remote`); aliases are never dereferenced.
+- **Naming contexts** from the root DSE (at most 64), filtered by the job's `databases`; the Audit log base (`openldap.accesslog_base`, default `cn=accesslog`) is never scanned.
+- **Containers**: per naming context, one subtree listing of `organizationalUnit`, `organization`, `dcObject`, `domain`, `country` and `locality` entries (DNs only, at most 1024; a cut listing counts `skipped_limit`), filtered by the job's `schemas`. Entries whose parent is not a container (`uid=x,cn=group,ou=a,…`) and the root entry of each naming context are not read.
+- **Attributes**: from the server's schema (subschema subentry, `SUP` chains resolved), only `userApplications` attributes of a text syntax: Directory String, IA5 String, Printable String, Numeric String, Country String, Telephone Number, Postal Address, Generalized Time, Integer. Custom attributes are covered like standard ones. DN-valued attributes (group members, `seeAlso`), octet strings, binaries, certificates, photos, UUIDs and unknown syntaxes are never requested (fail closed). At most 1024 attributes.
+- **Password attributes are never read**: `userPassword`, `authPassword`, their subtypes and a closed list of other credential attributes (Samba, Kerberos, `pwdHistory`, `userPKCS12`) are never requested, whatever the ACL grants, and no finding is produced for them; their presence and hash schemes are not reported. `check()` only flags an account that could read them (`privilege.password_attributes_readable`, from an attributes-only search of the first 64 entries of each naming context: the values never cross the wire).
+
+### Sampling
+- Per container (and the naming context itself), one one-level search, filter `(objectClass=*)`, `sizeLimit` = the job's `sample_rows`, `timeLimit` from the job's statement timeout (at least 1 s). No paged results: a server size limit below `sample_rows` gives a smaller sample.
+- The sample is the first entries of each container **in server order** (entry id order on `back-mdb`: oldest entries first), not a random sample.
+- Entries are grouped by normalized container and structural object class; per group at most `sample_rows` values per attribute, values cut to 4096 bytes, values that are not UTF-8 skipped, Generalized Time read as `YYYY-MM-DD`, attribute options (`;lang-fr`) pooled with the base attribute. Each search is read to its end before any finding is submitted.
+
+### Locations
+`database` = the naming context, `schema` = the entry's container, `object` = the structural object class, `field` = the attribute (lowercased). The container is the entry's parent DN reduced to container RDNs, a value that looks like data becoming `*` (`ou=Oliver O'Connor,ou=teams,…` → `ou=*,ou=teams,…`). **Entry DNs never leave the agent** and are never logged ([09-agent-protocol.md](09-agent-protocol.md#location-mapping-per-engine)). A container named after a person or a customer that the normalization does not recognize keeps its name.
+
+### Coverage counters and notes
+| Counter | Meaning |
+|---------|---------|
+| `objects_sampled` | (container, structural object class) groups read |
+| `skipped_not_readable` | A container the server refuses (`insufficientAccessRights`, or `noSuchObject` hiding it) |
+| `skipped_remote` | Continuation references (referrals, never followed) |
+| `skipped_limit` | Container listing cut at its bound |
+| `skipped_error` | Any other failure of one search |
+
+`check()` notes for OpenLDAP targets, Discovery part: `privilege.password_attributes_readable`, `privilege.config_readable` (`cn=config` readable: ACLs, root password hashes), `privilege.accesslog_without_audit` (`cn=accesslog` readable while no Audit stream runs), `privilege.write_not_evaluated` (always: OpenLDAP shows a read-only account neither its ACLs nor its effective rights, so write access is never evaluated; check `olcAccess`), `check.stage_failed`, `check.timed_out`. The privilege report is recomputed at most every 10 minutes per target.
+
+## OpenLDAP Audit
+
+What the OpenLDAP connector does for Audit, as implemented in phase 6 (#79, [ADR-0029](adr/0029-openldap-connector.md) decisions 7 to 10). The reference is [the connector README](../agent/crates/connector-openldap/README.md#audit).
+
+### Source and level
+
+One source: the `slapo-accesslog` database (`audit_source` `openldap_accesslog`), read over LDAP with the agent's service DN and transport. Recommended overlay settings on each monitored database: `olcAccessLogOps: reads writes session`, `olcAccessLogSuccess: FALSE` (failed operations logged too), a purge (`olcAccessLogPurge`), and `olcDbIndex: entryCSN eq` on the log database.
+
+- **Incremental by `entryCSN`** (commit order). `reqStart` is not used as the cursor: a long search is written at its end with an early `reqStart`, so a `reqStart` cursor would skip exactly the long exports. Each poll reads the records from the cursor minus a 10 s overlap (records already read are recognized by their CSN), `sizeLimit` 1000 per search, repeated at most 16 times while the server cuts the result. The cursor is persisted; the first start reads from one minute back (no history replay).
+
+| Level | Condition |
+|-------|-----------|
+| **Full** | For **every** scanned naming context: a successful search record in `cn=accesslog` from the last 24 h (reads are logged) **and** a logged failed operation from the last 24 h (failed operations are logged, so a search cut by a size, time or administrative limit after returning entries leaves a record) |
+| **Partial** | Reads proven logged for some contexts only (`audit.reads_not_logged`, count of contexts), or reads proven for every context but failed operations not proven for at least one (`audit.failed_operations_not_logged`, count of contexts) |
+| **Limited** | `cn=accesslog` readable, but no context shows a search record (`audit.reads_not_logged`); binds and writes may still be logged |
+| **None** | `cn=accesslog` not readable or absent (`audit.accesslog_not_readable`), or the Audit stream stopped after repeated internal errors (`audit.stream_stopped`) |
+
+How the level is proven: `check()` looks, per naming context, for a search record under the context; when there is none, it runs one base-scope search on the context (attributes `1.1`) and looks again, so a server that logs reads proves it at once. For failed operations, it looks for a search record of the context with a non-zero result and, when there is none, reads an entry that does not exist below the context (`cn=databastion-absent-probe,<context>`: `noSuchObject`, which reads nothing) and looks again. With `olcAccessLogSuccess: TRUE`, only successful operations are logged: the level is capped at Partial. A context whose failed-operation proof is missing or not known yet (a probe refused, a context beyond the 8 evaluated per round, a report cut by its time bound) also caps the level at Partial. The stream's own records renew the proofs.
+
+Limits of the Full proof:
+- **Proofs are cached** 10 minutes per target and kept up to 24 h: a later change of `olcAccessLogSuccess` or of `olcAccessLogOps` can go unseen for up to 24 h (phase-7 follow-up: re-run the absent-entry probe at every report interval and keep only the latest answer).
+- **Nested naming contexts can lend each other proof**: the proof search matches records by `reqDN` subtree, so a record under a deeper naming context (held by another database with its own overlay) also counts for the parent context (phase-7 follow-up: ignore such records, or rely only on the agent's own probe).
+- An `olcAccessLogBase` that covers only part of a naming context cannot be seen: the proof may fall inside it.
+
+Full means docs/08's definition is met (every search logged with its authorization identity, base, scope and entry count); what the log does not have is listed below.
+
+### What is kept
+
+Read from each record: `reqType`, `reqStart`, `reqSession`, `reqAuthzID`, `reqDN`, `reqResult`, `reqScope`, `reqFilter`, `reqAttr`, `reqAttrsOnly`, `reqEntries`, `reqSizeLimit`, `entryCSN`. Never requested: `reqMod`, `reqOld`, `reqAssertion`, `reqMessage`, the controls and the other value-bearing attributes. `reqFilter` (which carries assertion values) and `reqDN` are reduced in memory to closed facts: whether the filter selects entries by value, whether it is one of the agent's own filters, the naming context, the normalized container and a keyed hash of the base (for paged totals). Neither is kept, logged or sent.
+
+- **Actions**: search and compare are `read` (`rows` = `reqEntries` for a search); add, modify (password changes included), delete and modrdn are `write`; bind is `connect`, or `auth_failure` when it failed. Unbind, abandon and extended operations give no event. A failed search that returned entries is reported; other failed operations are not.
+- **Principal**: the authorization DN (`reqAuthzID`), `anonymous` when empty; the bind DN for a bind. Sent in clear only for `anonymous`, the agent's own DN and the DNs listed in `openldap.clear_principals`; **every other principal is a keyed fingerprint** (an entry DN usually names a person). Failed binds are always fingerprinted.
+- **Objects**: the naming context of `reqDN`, and the console's `sensitive_objects` of that context the operation could reach (from the base's container, and for a subtree search every container below it, at most 16). With none, the object is `*` with the container as `schema`: the log does not give the object class of the entries a search returned.
+- **Missing from the log**: the client address (events carry none) and the application name.
+
+### Signals
+
+The signal ids are registered for `openldap` in [`shared/protocol/signals.json`](../shared/protocol/signals.json).
+
+| Signal | When it is set |
+|--------|----------------|
+| `shape.bulk_search` | A search with scope one-level, subtree or children whose filter selects no entry by value: only presence tests (`(objectClass=*)`, `(mail=*)`) and `objectClass` equality assertions, combined with `&` / `|`. The shape of an LDIF export or a bulk `ldapsearch` |
+| `volume.large_result` | More than 10 000 entries returned by one search, **or by the pages of one paged search**: the records of one connection with the same base and scope are summed, and the record crossing 10 000 and the later ones carry the signal |
+
+There is no `signature.*` for OpenLDAP: `ldapsearch` declares nothing, and `slapcat` (an offline LDIF export on the server host) performs no LDAP operation, so it leaves no `cn=accesslog` record and is not seen. These are heuristics: a selective filter that matches everything (`(uid=a*)` … `(uid=z*)`, `(!(uid=nobody))`), per-entry base-scope reads, or pages spread over several connections evade them. The volume × sensitivity score remains the robust signal, and it works here (`reqEntries` on every search).
+
+### The agent's own account
+
+An event is left out only when it is a read or a connection of the agent's identity (the DN returned by Who am I?), carries no signal, and the agent's reads of each object stay within `limits.max_sample_rows` entries over a rolling 24 h. The log has no client address, so **no address rule applies** (unlike the other engines). The agent's exact container listing and check probes are not charged to the budget; its entry sampling is. Writes, and anything else with the agent's identity, are always reported.
+
+Limit: someone holding the agent's DN and password can bind from anywhere unreported and read up to the budget per object and day with the agent's sampling shape. Restricting the service DN to the agent's address in `olcAccess` (`peername.ip`, [05-security.md](05-security.md#recommended-database-accounts-read-only)) is the recommended control.
+
+### Notes
+
+`check()` Audit notes for OpenLDAP targets: `audit.accesslog_not_readable`, `audit.reads_not_logged`, `audit.failed_operations_not_logged`, `audit.records_dropped` (log entries that do not parse, counted for 24 h), `audit.stream_stopped`.
+
+### Known limits
+
+- **No client address** in the log: principals carry none, and fingerprinted principals are grouped by the console per policy, database and hour.
+- **Log gaps**: records purged by `olcAccessLogPurge` before the agent read them (agent stopped longer than the purge age) are lost; on first start, a server clock behind the agent's by more than 60 s skips records until it catches up.
+- **`slapcat` and other offline exports** are not visible.
+- **Heuristic signals** and **own-account residuals** (above).
+- **Delivery**: at most once, as for the other engines; after a caught internal error (panic), the stream restarts from its persisted cursor and the events of at most one search round may be sent twice. After 3 such errors in a row the stream stops (`audit.stream_stopped`, level None) until Audit is reconfigured or the agent restarts.
+
 ## Known export signatures
 | Tool | Observable signature | Engine |
 |-------|---------------------|--------|
@@ -300,9 +396,9 @@ Limits of these rules: behind a proxy or NAT every client has the same address. 
 | `mysqldump` | `SELECT /*!40001 SQL_NO_CACHE */ * FROM`, `SHOW CREATE TABLE` in sequence, `FLUSH TABLES WITH READ LOCK` | MySQL / MariaDB |
 | `SELECT … INTO OUTFILE` | Explicit statement | MySQL / MariaDB |
 | `mongodump` / `mongoexport` | Tool's `appName`, unfiltered `find` over the whole collection | MongoDB |
-| LDIF export / bulk `ldapsearch` | `scope=sub` search from the root, `(objectClass=*)` filter, high `reqEntries` | OpenLDAP |
+| LDIF export / bulk `ldapsearch` | One-level or subtree search with an unselective filter (`(objectClass=*)`, presence tests), high `reqEntries` | OpenLDAP |
 
-As implemented: on PostgreSQL (P4-A) the agent uses the `application_name` and the whole-relation `COPY … TO STDOUT` parts of the `pg_dump` signature (not the `REPEATABLE READ` transaction) and the outbound `COPY` signatures; see [PostgreSQL Audit](#postgresql-audit). On MySQL / MariaDB (P4-B) the agent uses the `SQL_NO_CACHE`, `SHOW CREATE TABLE` and `FLUSH TABLES WITH READ LOCK` parts of the `mysqldump` signature, plus the dump tools' `program_name`, consistent snapshots and `LOCK TABLES`, as one heuristic `signature.mysqldump`, and the `INTO OUTFILE` / `INTO DUMPFILE` signature; see [MySQL / MariaDB Audit](#mysql--mariadb-audit). On MongoDB (P5-B / P5-C, #76) the agent uses the tools' `appName` (`signature.mongodump`, `signature.mongoexport`) and, separately, the whole-collection `find` shape (`shape.full_table_read`); see [MongoDB Audit](#mongodb-audit). The OpenLDAP (phase 6) signatures are not implemented yet.
+As implemented: on PostgreSQL (P4-A) the agent uses the `application_name` and the whole-relation `COPY … TO STDOUT` parts of the `pg_dump` signature (not the `REPEATABLE READ` transaction) and the outbound `COPY` signatures; see [PostgreSQL Audit](#postgresql-audit). On MySQL / MariaDB (P4-B) the agent uses the `SQL_NO_CACHE`, `SHOW CREATE TABLE` and `FLUSH TABLES WITH READ LOCK` parts of the `mysqldump` signature, plus the dump tools' `program_name`, consistent snapshots and `LOCK TABLES`, as one heuristic `signature.mysqldump`, and the `INTO OUTFILE` / `INTO DUMPFILE` signature; see [MySQL / MariaDB Audit](#mysql--mariadb-audit). On MongoDB (P5-B / P5-C, #76) the agent uses the tools' `appName` (`signature.mongodump`, `signature.mongoexport`) and, separately, the whole-collection `find` shape (`shape.full_table_read`); see [MongoDB Audit](#mongodb-audit). On OpenLDAP (#79) there is no tool signature (`ldapsearch` declares nothing): the agent uses the search shape (`shape.bulk_search`) and the entry count summed over the pages of a paged search (`volume.large_result`); `slapcat` leaves no log record; see [OpenLDAP Audit](#openldap-audit).
 
 Signatures are easy to forge (`application_name` and `program_name` are chosen by the client). They are only **one** of the three signals; the volume × sensitivity combination remains the primary signal (see [02-architecture.md](02-architecture.md#exfiltration-detection-audit)). The console computes it from the row count the source reports ([ADR-0021](adr/0021-access-event-correlation.md)): an event without `rows` scores 0 and feeds no baseline (the contract has an optional `AccessEvent.bytes` since #60; no connector produces it yet, and the console stores and shows it but does not use it in the score, #62), so on a source that gives no volume only signatures, shapes and object or principal conditions can raise an incident. Sensitivity is per object (table, collection), not per column.
 

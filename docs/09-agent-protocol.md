@@ -225,7 +225,7 @@ A `discovery.scan` status update can report how much of its scope the scan cover
 Object and field names are engine metadata that can embed values (MongoDB dynamic keys, LDAP entry DNs, generated table names). The schema alone cannot prove that a name is free of values, so the agent normalizes every name before the uplink ([ADR-0009](adr/0009-name-normalization-and-item-sanitization.md)):
 - array indices become `[]` (`orders.3.email` → `orders[].email`);
 - dynamic keys and any name segment matched by a classifier become `*` (`contacts.jane@example.com.phone` → `contacts.*.phone`);
-- an LDAP entry DN is reduced to its parent container (`uid=jdoe,ou=people,dc=example,dc=com` → `ou=people,dc=example,dc=com`);
+- an LDAP entry DN is reduced to its parent container (`uid=jdoe,ou=people,dc=example,dc=com` → `ou=people,dc=example,dc=com`), and a container value that looks like data becomes `*` (`ou=Oliver O'Connor,ou=teams,…` → `ou=*,ou=teams,…`);
 - a name that still does not match the `Identifier` schema is replaced by `*`.
 
 The `Identifier` pattern rejects e-mail addresses, `key=value` forms other than LDAP container RDNs (`ou=`, `dc=`, `o=`, `c=`, `l=`, `st=`; never `uid=` or `cn=`), URLs, SQL fragments, and names or path segments made only of 9 or more digits and separators. It remains a safety net: a person name used as a key (`ou=Jane Doe`) passes the pattern and is only caught by the agent's normalization.
@@ -262,6 +262,16 @@ Before spooling, the agent validates **each item** and sanitizes it rather than 
 - **Masked samples** must contain at least one `*` and no run of more than 4 letters or digits; the console also requires at least 50 % of the non-separator characters to be `*`.
 - **Forbidden**: any field containing a raw value. The console rejects non-conforming batches.
 
+### Location mapping per engine
+| Engine | `database` | `schema` | `object` | `field` |
+|--------|------------|----------|----------|---------|
+| PostgreSQL | database | schema | table (or partitioned root) | column |
+| MySQL / MariaDB | database | absent | table | column |
+| MongoDB | database | absent | collection | normalized field path |
+| OpenLDAP | naming context (`dc=example,dc=org`) | the entry's container: its parent DN reduced to `ou` / `dc` / `o` / `c` / `l` / `st` RDNs, values that look like data replaced by `*` | structural object class (canonical schema name) | attribute type (canonical name, lowercased, options such as `;lang-fr` dropped) |
+
+For OpenLDAP ([ADR-0029](adr/0029-openldap-connector.md) decision 6), **an entry DN never appears in a location**: `uid=jdoe,ou=people,dc=example,dc=org` gives `database` `dc=example,dc=org`, `schema` `ou=people,dc=example,dc=org`, and for instance `object` `inetOrgPerson`, `field` `mail`. Entries of containers with the same normalized name are pooled. Using `schema` for the container is a clarification of the `Location` description (compatible change). In access events, the log does not give the object class of the entries a search returned: `objects[]` names the console's `sensitive_objects` reachable from the search base and scope, else `*` with the container as `schema` ([08-engine-capabilities.md](08-engine-capabilities.md#openldap-audit)).
+
 ### Console-side checks on findings
 The full list, pointers and order are in `openapi.yaml` ("Console-side checks not expressible in this schema"). In short, after the duplicate check:
 1. **Job window.** `job_id` must be a `discovery.scan` job of the calling agent that still accepts findings (`404`, `/job_id`, `notFound`; the agent drops the batch). A scan job accepts findings while it is `delivered` (the first batch may overtake the `running` status) or `running`, until `delivered_at + params.max_duration_s + 1 h`, and for **24 h** after it reached `succeeded` or `failed` (counted from that deadline at the latest, so a late final status does not reopen the window), so late spooled batches still land. After that, late batches get `404` and the agent drops them. A job never delivered, expired or cancelled accepts none.
@@ -293,7 +303,7 @@ Access events are masked in the agent before the uplink ([ADR-0007](adr/0007-mas
   ]
 }
 ```
-- `principal` carries **exactly one** of `db_user` (account or LDAP bind DN as logged by the engine) or `db_user_fingerprint` (`hmac-sha256:…`). The agent sends the fingerprint for a failed authentication with an account that does not exist on the target (the attempted name may be a mistyped password), and for any account name that does not match the `db_user` pattern.
+- `principal` carries **exactly one** of `db_user` (account or LDAP bind DN as logged by the engine) or `db_user_fingerprint` (`hmac-sha256:…`). The agent sends the fingerprint for a failed authentication with an account that does not exist on the target (the attempted name may be a mistyped password), and for any account name that does not match the `db_user` pattern. On OpenLDAP, where a principal is an entry DN that usually names a person, `db_user` is sent only for `anonymous`, the agent's own DN and the DNs listed in the target's `openldap.clear_principals`; every other principal is a fingerprint ([ADR-0029](adr/0029-openldap-connector.md) decision 7).
 - `client_addr` is an IP literal or `local`, never a host name. `application` is reduced to `[A-Za-z0-9 ._:/+-]` and 64 characters by the agent. The console escapes `db_user` and `application` on display.
 - `action`: `connect`, `auth_failure`, `read`, `write`, `ddl`, `dcl`. `read` and `write` events name at least one object.
 - The agent **pre-aggregates** repetitive events (same principal, object set and action within the aggregation window, 60 s by default); `ts_last` and `aggregated_count` describe the merged events.
