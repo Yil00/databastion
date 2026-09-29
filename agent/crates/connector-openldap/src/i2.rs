@@ -1,11 +1,12 @@
 //! Interim I2 check of the OpenLDAP paths (end-of-phase-6 security review
 //! L2, until the end-to-end gate of `e2e/`): no ground-truth value and no
 //! entry DN (`uid=`, `cn=`) in clear in what would leave the agent (the
-//! serialized masked findings and access events) nor in the logs.
+//! findings and access events as the core's real conversion serializes
+//! them, `databastion_core::test_support`) nor in the logs.
 
 use std::sync::{Arc, Mutex};
 
-use databastion_classifiers::masking::{MaskedEvent, MaskedFinding};
+use databastion_classifiers::masking::{HmacKey, MaskedEvent, MaskedFinding};
 
 /// Values shorter than this are too common to be a meaningful leak (a
 /// masked sample keeps a few characters by design).
@@ -16,51 +17,20 @@ const MIN_LEN: usize = 4;
 /// `openldap.clear_principals` of a test are added by the caller.
 const ALLOWED: [&str; 3] = ["cn=accesslog", "cn=subschema", "cn=config"];
 
-/// Every text of the findings that would leave the agent: location names,
-/// classifier, masked samples, fingerprints.
+/// The findings as the core would send them (its real masked ->
+/// contract conversion, JSON bodies).
 pub(crate) fn findings_text(findings: &[MaskedFinding]) -> String {
-    let items: Vec<serde_json::Value> = findings
-        .iter()
-        .map(|f| {
-            let l = f.location();
-            serde_json::json!({
-                "classifier": f.classifier().as_str(),
-                "database": l.map(|l| l.database.as_str()),
-                "schema": l.and_then(|l| l.schema.as_ref().map(|s| s.as_str())),
-                "object": l.map(|l| l.object.as_str()),
-                "field": l.map(|l| l.field.as_str()),
-                "masked_samples": f.masked_samples().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                "fingerprints": f.fingerprints().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    serde_json::to_string(&items).expect("findings serialize")
+    databastion_core::test_support::contract_findings_json(
+        findings,
+        databastion_core::config::TargetEngine::Openldap,
+    )
 }
 
-/// Every text of the events that would leave the agent: the objects, the
-/// principal (its name only when the core sends it in clear; otherwise the
-/// core sends a fingerprint), its application and client, the signals.
+/// The events as the core would send them: principals in clear only when
+/// the core sends them so, else their fingerprint (test key).
 pub(crate) fn events_text(events: &[MaskedEvent]) -> String {
-    let items: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            let p = e.principal();
-            serde_json::json!({
-                "action": format!("{:?}", e.action()),
-                "principal": p.send_name().then(|| p.account_name()),
-                "application": p.application(),
-                "client": p.client().map(|c| format!("{c:?}")),
-                "objects": e.objects().iter().map(|o| serde_json::json!({
-                    "database": o.database().as_str(),
-                    "schema": o.schema().map(|s| s.as_str()),
-                    "object": o.object().as_str(),
-                })).collect::<Vec<_>>(),
-                "signals": e.signals().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                "rows": e.rows(),
-            })
-        })
-        .collect();
-    serde_json::to_string(&items).expect("events serialize")
+    let key = HmacKey::new(&[7u8; 32]).expect("test key");
+    databastion_core::test_support::contract_events_json(events, &key)
 }
 
 /// The OpenLDAP ground-truth values (`values` and `name_values`) of at

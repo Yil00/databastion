@@ -1,35 +1,29 @@
-//! Interim I2 check of the MongoDB Discovery path (end-of-phase-5 review
-//! M1, until the end-to-end gate of `e2e/`): no ground-truth value of the
-//! scanned database appears in clear in the serialized masked findings.
+//! Interim I2 check of the MongoDB paths (end-of-phase-5 review M1, until
+//! the end-to-end gate of `e2e/`): no ground-truth value of the scanned
+//! database appears in clear in the findings and events as the core would
+//! send them (its real conversion, `databastion_core::test_support`), nor
+//! in the captured logs.
 
-use databastion_classifiers::masking::MaskedFinding;
+use databastion_classifiers::masking::{HmacKey, MaskedEvent, MaskedFinding};
 
 /// Values shorter than this are too common to be a meaningful leak
 /// (a masked sample keeps a few characters by design).
 const MIN_LEN: usize = 4;
 
-/// Every text of the findings that would leave the agent: the location
-/// names, the classifier, the masked samples and the fingerprints, one
-/// JSON document per finding.
+/// The findings as the core would send them (its real masked ->
+/// contract conversion, JSON bodies).
 pub(crate) fn serialize(findings: &[MaskedFinding]) -> String {
-    let items: Vec<serde_json::Value> = findings
-        .iter()
-        .map(|f| {
-            let l = f.location();
-            serde_json::json!({
-                "classifier": f.classifier().as_str(),
-                "database": l.map(|l| l.database.as_str()),
-                "schema": l.and_then(|l| l.schema.as_ref().map(|s| s.as_str())),
-                "object": l.map(|l| l.object.as_str()),
-                "field": l.map(|l| l.field.as_str()),
-                "masked_samples": f.masked_samples().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                "fingerprints": f.fingerprints().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                "sampled": f.sampled(),
-                "matched": f.matched(),
-            })
-        })
-        .collect();
-    serde_json::to_string(&items).expect("findings serialize")
+    databastion_core::test_support::contract_findings_json(
+        findings,
+        databastion_core::config::TargetEngine::Mongodb,
+    )
+}
+
+/// The events as the core would send them (account names fingerprinted
+/// with a test key when the core would).
+pub(crate) fn serialize_events(events: &[MaskedEvent]) -> String {
+    let key = HmacKey::new(&[7u8; 32]).expect("test key");
+    databastion_core::test_support::contract_events_json(events, &key)
 }
 
 /// The ground-truth values (`values` and `name_values`) of the MongoDB
@@ -58,6 +52,29 @@ pub(crate) fn ground_truth_values(gt: &serde_json::Value, database: &str) -> Vec
     out
 }
 
+/// Asserts that no ground-truth value of `database` is in `text` (a
+/// serialized payload or captured logs); `what` names it. Returns how many
+/// values were checked.
+pub(crate) fn assert_clean(
+    what: &str,
+    gt: &serde_json::Value,
+    database: &str,
+    text: &str,
+) -> usize {
+    let values = ground_truth_values(gt, database);
+    for v in &values {
+        let escaped = serde_json::to_string(v).expect("string serializes");
+        let escaped = &escaped[1..escaped.len() - 1];
+        // The value itself is never printed (I2 hygiene in test output).
+        assert!(
+            !text.contains(v.as_str()) && !text.contains(escaped),
+            "a MongoDB ground-truth value of {} characters is in clear in the {what}",
+            v.chars().count()
+        );
+    }
+    values.len()
+}
+
 /// Asserts that no ground-truth value of `database` is in `findings`.
 /// Returns how many values were checked.
 pub(crate) fn assert_no_value(
@@ -65,19 +82,5 @@ pub(crate) fn assert_no_value(
     database: &str,
     findings: &[MaskedFinding],
 ) -> usize {
-    let text = serialize(findings);
-    // Also compare with JSON escapes undone (non-ASCII is kept as is by
-    // `serde_json`, but quotes and backslashes are escaped).
-    let values = ground_truth_values(gt, database);
-    for v in &values {
-        let escaped = serde_json::to_string(v).expect("string serializes");
-        let escaped = &escaped[1..escaped.len() - 1];
-        // The value itself is never printed (I2 hygiene in test output).
-        assert!(
-            !text.contains(escaped),
-            "a MongoDB ground-truth value of {} characters is in clear in the serialized findings",
-            v.chars().count()
-        );
-    }
-    values.len()
+    assert_clean("serialized findings", gt, database, &serialize(findings))
 }
