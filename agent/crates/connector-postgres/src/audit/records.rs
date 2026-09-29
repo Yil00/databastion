@@ -1,9 +1,9 @@
 //! Server log records: splitting (jsonlog, csvlog), and parsing of the
 //! pgaudit `AUDIT:` records only (ADR-0012 obligation 7).
 //!
-//! - Records are split out of the byte stream with a bound
-//!   ([`MAX_RECORD_BYTES`]): a longer record is skipped to its end and
-//!   counted, never buffered.
+//! - Records are split out of the byte stream by the core's tailer
+//!   (`databastion_core::audit::tail`), with a bound: a longer record is
+//!   skipped to its end and counted, never buffered.
 //! - Only records whose message starts with `AUDIT: ` are parsed. From
 //!   them, only the structured fields are kept (time, user, database,
 //!   client address, application, session) plus the pgaudit fields; the
@@ -16,10 +16,9 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use databastion_core::audit::tail::Framing;
 use zeroize::Zeroizing;
 
-/// Longest log record kept, in bytes.
-pub(crate) const MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// Longest CSV field count accepted in a record.
 const MAX_FIELDS: usize = 64;
 /// Prefix of pgaudit messages.
@@ -32,82 +31,12 @@ pub(crate) enum Format {
     Csvlog,
 }
 
-/// Splits a byte stream into records (a newline ends a record; in csvlog,
-/// only outside a quoted field). Bounded: see [`MAX_RECORD_BYTES`].
-pub(crate) struct Splitter {
-    csv: bool,
-    buf: Zeroizing<Vec<u8>>,
-    in_quotes: bool,
-    skipping: bool,
-    /// Bytes consumed since the end of the last complete record.
-    pending: u64,
-    /// Records skipped for their size.
-    pub(crate) oversized: u64,
-    max: usize,
-}
-
-impl Splitter {
-    pub(crate) fn new(format: Format) -> Self {
-        Self::with_max(format, MAX_RECORD_BYTES)
-    }
-
-    pub(crate) fn with_max(format: Format, max: usize) -> Self {
-        Self {
-            csv: format == Format::Csvlog,
-            buf: Zeroizing::new(Vec::new()),
-            in_quotes: false,
-            skipping: false,
-            pending: 0,
-            oversized: 0,
-            max,
-        }
-    }
-
-    /// Bytes of an incomplete record at the end of what was fed.
-    pub(crate) fn pending(&self) -> u64 {
-        self.pending
-    }
-
-    /// Forgets any incomplete record (file rotated or truncated).
-    pub(crate) fn reset(&mut self) {
-        self.buf.clear();
-        self.in_quotes = false;
-        self.skipping = false;
-        self.pending = 0;
-    }
-
-    /// Feeds bytes; complete records are appended to `out`.
-    pub(crate) fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
-        for &b in data {
-            self.pending += 1;
-            if self.csv && b == b'"' {
-                self.in_quotes = !self.in_quotes;
-            }
-            if b == b'\n' && !self.in_quotes {
-                if self.skipping {
-                    self.skipping = false;
-                    self.oversized += 1;
-                } else if !self.buf.is_empty() {
-                    let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
-                    record.extend_from_slice(&self.buf);
-                    if record.last() == Some(&b'\r') {
-                        record.pop();
-                    }
-                    out.push(record);
-                }
-                self.buf.clear();
-                self.pending = 0;
-                continue;
-            }
-            if self.skipping {
-                continue;
-            }
-            if self.buf.len() >= self.max {
-                self.skipping = true;
-                self.buf.clear();
-                continue;
-            }
-            self.buf.push(b);
+impl Format {
+    /// How records are delimited in a log of this format.
+    pub(crate) fn framing(self) -> Framing {
+        match self {
+            Self::Jsonlog => Framing::Lines,
+            Self::Csvlog => Framing::Csv,
         }
     }
 }
@@ -480,8 +409,10 @@ mod tests {
 
     const CSV_MULTILINE: &str = "2026-09-28 21:45:31.455 UTC,\"postgres\",\"shop\",1015,\"127.0.0.1:42692\",6abadffb.3f7,8,\"PREPARE\",2026-09-28 21:45:31 UTC,3/71,0,LOG,00000,\"AUDIT: SESSION,5,1,READ,PREPARE,,,\"\"PREPARE dumpFunc(pg_catalog.oid) AS\nSELECT\nproretset, 'lit,eral'\nFROM pg_catalog.pg_proc p\"\",<not logged>,1\",,,,,,,,,\"pg_dump\",\"client backend\",,6233516217350320405\n";
 
+    use databastion_core::audit::tail::{MAX_RECORD_BYTES, Splitter};
+
     fn split(format: Format, data: &[u8], max: usize) -> (Vec<Vec<u8>>, Splitter) {
-        let mut s = Splitter::with_max(format, max);
+        let mut s = Splitter::with_max(format.framing(), max);
         let mut out = Vec::new();
         s.feed(data, &mut out);
         (out.into_iter().map(|r| r.to_vec()).collect(), s)
@@ -587,25 +518,6 @@ mod tests {
             .unwrap();
         assert_eq!(ok.rows, None);
         assert_eq!(ok.statement.as_str(), "COPY t TO stdout;");
-    }
-
-    #[test]
-    fn huge_records_are_skipped_not_buffered() {
-        let mut data = vec![b'x'; 5000];
-        data.push(b'\n');
-        data.extend_from_slice(JSON_AUDIT.as_bytes());
-        data.push(b'\n');
-        let (records, s) = split(Format::Jsonlog, &data, 4096);
-        assert_eq!(records.len(), 1);
-        assert_eq!(s.oversized, 1);
-        assert_eq!(s.pending(), 0);
-        // A huge unterminated record keeps at most `max` bytes.
-        let mut s = Splitter::with_max(Format::Jsonlog, 16);
-        let mut out = Vec::new();
-        s.feed(&[b'y'; 100_000], &mut out);
-        assert!(out.is_empty());
-        assert!(s.buf.len() <= 16);
-        assert_eq!(s.pending(), 100_000);
     }
 
     #[test]

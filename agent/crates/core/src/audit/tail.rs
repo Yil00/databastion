@@ -1,5 +1,6 @@
-//! Incremental, bounded reading of the server log file with a persisted
-//! cursor.
+//! Incremental, bounded reading of an audit log file with a persisted
+//! cursor (engine-agnostic: the PostgreSQL server log, the MariaDB
+//! `server_audit` log, the `audit_log` JSON file).
 //!
 //! - The cursor is `(device, inode, offset)` of the end of the last
 //!   complete record whose events were submitted; it is saved through the
@@ -23,17 +24,117 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use databastion_core::audit::CursorStore;
 use zeroize::Zeroizing;
 
-use super::records::{Format, Splitter};
+use super::CursorStore;
 
 /// Most bytes read per poll.
-pub(crate) const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
 /// Read chunk.
 const CHUNK: usize = 256 * 1024;
 /// Bytes before the offset compared at each poll (in-place rewrite).
 const TAIL_BYTES: usize = 32;
+
+/// Longest record kept, in bytes: a longer record is skipped to its end
+/// and counted, never buffered.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// How records are delimited in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// One record per line (`jsonlog`, `server_audit`, `audit_log` JSON
+    /// lines).
+    Lines,
+    /// CSV records: a newline inside a quoted field does not end the
+    /// record (`csvlog`).
+    Csv,
+}
+
+/// Splits a byte stream into records (a newline ends a record; with
+/// [`Framing::Csv`], only outside a quoted field). Bounded: see
+/// [`MAX_RECORD_BYTES`].
+pub struct Splitter {
+    csv: bool,
+    buf: Zeroizing<Vec<u8>>,
+    in_quotes: bool,
+    skipping: bool,
+    /// Bytes consumed since the end of the last complete record.
+    pending: u64,
+    /// Records skipped for their size.
+    pub oversized: u64,
+    max: usize,
+}
+
+impl Splitter {
+    /// A splitter with the default record bound.
+    #[must_use]
+    pub fn new(framing: Framing) -> Self {
+        Self::with_max(framing, MAX_RECORD_BYTES)
+    }
+
+    /// A splitter keeping records of at most `max` bytes.
+    #[must_use]
+    pub fn with_max(framing: Framing, max: usize) -> Self {
+        Self {
+            csv: framing == Framing::Csv,
+            buf: Zeroizing::new(Vec::new()),
+            in_quotes: false,
+            skipping: false,
+            pending: 0,
+            oversized: 0,
+            max,
+        }
+    }
+
+    /// Bytes of an incomplete record at the end of what was fed.
+    #[must_use]
+    pub fn pending(&self) -> u64 {
+        self.pending
+    }
+
+    /// Forgets any incomplete record (file rotated or truncated).
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.in_quotes = false;
+        self.skipping = false;
+        self.pending = 0;
+    }
+
+    /// Feeds bytes; complete records are appended to `out`.
+    pub fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
+        for &b in data {
+            self.pending += 1;
+            if self.csv && b == b'"' {
+                self.in_quotes = !self.in_quotes;
+            }
+            if b == b'\n' && !self.in_quotes {
+                if self.skipping {
+                    self.skipping = false;
+                    self.oversized += 1;
+                } else if !self.buf.is_empty() {
+                    let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
+                    record.extend_from_slice(&self.buf);
+                    if record.last() == Some(&b'\r') {
+                        record.pop();
+                    }
+                    out.push(record);
+                }
+                self.buf.clear();
+                self.pending = 0;
+                continue;
+            }
+            if self.skipping {
+                continue;
+            }
+            if self.buf.len() >= self.max {
+                self.skipping = true;
+                self.buf.clear();
+                continue;
+            }
+            self.buf.push(b);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Cursor {
@@ -45,21 +146,23 @@ struct Cursor {
 
 /// Why the log could not be read (kind only; never a path or content).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TailError {
+pub enum TailError {
     /// Missing, not a regular file, or not readable by the agent.
     Unreadable(std::io::ErrorKind),
 }
 
 /// Result of one poll.
-pub(crate) struct Polled {
-    pub(crate) records: Vec<Zeroizing<Vec<u8>>>,
+pub struct Polled {
+    /// Complete records read (zeroized on drop).
+    pub records: Vec<Zeroizing<Vec<u8>>>,
     /// More data is waiting (the poll stopped at its byte bound).
-    pub(crate) more: bool,
+    pub more: bool,
 }
 
-pub(crate) struct Tailer {
+/// Follows one log file (see the module documentation).
+pub struct Tailer {
     path: PathBuf,
-    format: Format,
+    framing: Framing,
     file: Option<(File, u64, u64)>,
     /// Offset read up to in the open file.
     offset: u64,
@@ -70,9 +173,9 @@ pub(crate) struct Tailer {
     splitter: Splitter,
     store: Option<CursorStore>,
     /// Oversized records seen (skipped).
-    pub(crate) oversized: u64,
+    pub oversized: u64,
     /// Rotations or truncations seen.
-    pub(crate) rotations: u64,
+    pub rotations: u64,
 }
 
 /// Opens the log without blocking (a FIFO or device planted at the path
@@ -99,7 +202,8 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
 
 /// Whether the configured log file can be opened and read (for `check()`
 /// and the source choice). Blocking I/O: call from a blocking thread.
-pub(crate) fn readable(path: &std::path::Path) -> bool {
+#[must_use]
+pub fn readable(path: &std::path::Path) -> bool {
     open_regular(path).is_ok_and(|(mut f, _, _, _)| {
         let mut b = [0u8; 1];
         f.read(&mut b).is_ok()
@@ -107,23 +211,27 @@ pub(crate) fn readable(path: &std::path::Path) -> bool {
 }
 
 impl Tailer {
-    pub(crate) fn new(path: PathBuf, format: Format, store: Option<CursorStore>) -> Self {
+    /// A tailer of the file at `path`, with the cursor kept in `store`
+    /// (none: always start at the end of the file).
+    #[must_use]
+    pub fn new(path: PathBuf, framing: Framing, store: Option<CursorStore>) -> Self {
         Self {
             path,
-            format,
+            framing,
             file: None,
             offset: 0,
             tail: Zeroizing::new(Vec::new()),
-            splitter: Splitter::new(format),
+            splitter: Splitter::new(framing),
             store,
             oversized: 0,
             rotations: 0,
         }
     }
 
-    /// Format of the log.
-    pub(crate) fn format(&self) -> Format {
-        self.format
+    /// Framing of the log records.
+    #[must_use]
+    pub fn framing(&self) -> Framing {
+        self.framing
     }
 
     fn load_cursor(&self) -> Option<Cursor> {
@@ -173,8 +281,13 @@ impl Tailer {
         Ok(())
     }
 
-    /// Reads what was appended since the last poll (bounded).
-    pub(crate) fn poll(&mut self) -> Result<Polled, TailError> {
+    /// Reads what was appended since the last poll (bounded). Blocking
+    /// I/O: call from a blocking thread.
+    ///
+    /// # Errors
+    /// [`TailError`] when the file is missing, not a regular file or not
+    /// readable.
+    pub fn poll(&mut self) -> Result<Polled, TailError> {
         self.ensure_open()?;
         let mut records = Vec::new();
         let mut read_total: u64 = 0;
@@ -253,7 +366,7 @@ impl Tailer {
     }
 
     /// Saves the position of the end of the last complete record read.
-    pub(crate) fn commit(&self) {
+    pub fn commit(&self) {
         let (Some(store), Some((_, dev, ino))) = (self.store.as_ref(), self.file.as_ref()) else {
             return;
         };
@@ -276,6 +389,7 @@ impl Tailer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use std::io::Write as _;
 
     use super::*;
@@ -322,7 +436,7 @@ mod tests {
         let d = Dir::new("rot");
         let log = d.0.join("postgresql.json");
         append(&log, "old history\n");
-        let mut t = Tailer::new(log.clone(), Format::Jsonlog, None);
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
         // First start: history is not replayed.
         assert!(lines(t.poll().unwrap()).is_empty());
         append(&log, "a\nb\npart");
@@ -347,7 +461,7 @@ mod tests {
         let d = Dir::new("bound");
         let log = d.0.join("pg.json");
         append(&log, "");
-        let mut t = Tailer::new(log.clone(), Format::Jsonlog, None);
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
         t.poll().unwrap();
         let line = format!("{}\n", "x".repeat(1023));
         let big: String = line.repeat(9 * 1024);
@@ -373,7 +487,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send((
                 readable(&path),
-                Tailer::new(path, Format::Jsonlog, None).poll().is_err(),
+                Tailer::new(path, Framing::Lines, None).poll().is_err(),
             ));
         });
         let (ok, err) = rx
@@ -385,9 +499,39 @@ mod tests {
     #[test]
     fn rejects_non_regular_files() {
         let d = Dir::new("fifo");
-        let mut t = Tailer::new(d.0.clone(), Format::Csvlog, None);
+        let mut t = Tailer::new(d.0.clone(), Framing::Csv, None);
         assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
         assert!(!readable(&d.0));
         assert!(!readable(&d.0.join("missing")));
+    }
+
+    #[test]
+    fn csv_records_span_quoted_newlines() {
+        let mut s = Splitter::with_max(Framing::Csv, MAX_RECORD_BYTES);
+        let mut out = Vec::new();
+        s.feed(b"a,\"b\nc\"\nd\npartial,\"open", &mut out);
+        let got: Vec<Vec<u8>> = out.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(got, [b"a,\"b\nc\"".to_vec(), b"d".to_vec()]);
+        assert_eq!(s.pending(), "partial,\"open".len() as u64);
+    }
+
+    #[test]
+    fn huge_records_are_skipped_not_buffered() {
+        let mut data = vec![b'x'; 5000];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":1}\n");
+        let mut s = Splitter::with_max(Framing::Lines, 4096);
+        let mut out = Vec::new();
+        s.feed(&data, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(s.oversized, 1);
+        assert_eq!(s.pending(), 0);
+        // A huge unterminated record keeps at most `max` bytes.
+        let mut s = Splitter::with_max(Framing::Lines, 16);
+        let mut out = Vec::new();
+        s.feed(&[b'y'; 100_000], &mut out);
+        assert!(out.is_empty());
+        assert!(s.buf.len() <= 16);
+        assert_eq!(s.pending(), 100_000);
     }
 }
