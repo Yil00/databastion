@@ -67,7 +67,7 @@ fn push_len(out: &mut Vec<u8>, len: usize) {
         let skip = bytes.iter().take_while(|b| **b == 0).count();
         let n = bytes.len() - skip;
         out.push(0x80 | u8::try_from(n).unwrap_or(0));
-        out.extend_from_slice(&bytes[skip..]);
+        out.extend_from_slice(bytes.get(skip..).unwrap_or_default());
     }
 }
 
@@ -95,15 +95,14 @@ impl Enc {
     pub(crate) fn int(tag: u8, value: i64) -> Self {
         let bytes = value.to_be_bytes();
         let mut start = 0;
-        while start < 7 {
-            let (b, next) = (bytes[start], bytes[start + 1]);
+        while let (Some(&b), Some(&next)) = (bytes.get(start), bytes.get(start + 1)) {
             if (b == 0x00 && next & 0x80 == 0) || (b == 0xff && next & 0x80 != 0) {
                 start += 1;
             } else {
                 break;
             }
         }
-        Self::raw(tag, &bytes[start..])
+        Self::raw(tag, bytes.get(start..).unwrap_or_default())
     }
 
     /// A BOOLEAN.
@@ -142,11 +141,11 @@ pub(crate) fn message_len(head: &[u8]) -> Result<Option<usize>, BerError> {
             // Indefinite length, or more than 4 GiB.
             return Err(BerError);
         }
-        if head.len() < 2 + n {
+        let Some(octets) = head.get(2..2 + n) else {
             return Ok(None);
-        }
+        };
         let mut len = 0usize;
-        for b in &head[2..2 + n] {
+        for b in octets {
             len = (len << 8) | usize::from(*b);
         }
         (len, 2 + n)
@@ -199,14 +198,15 @@ impl<'a> Reader<'a> {
             (usize::from(first), rest)
         } else {
             let n = usize::from(first & 0x7f);
-            if n == 0 || n > 4 || rest.len() < n {
+            if n == 0 || n > 4 {
                 return Err(BerError);
             }
+            let (octets, rest) = rest.split_at_checked(n).ok_or(BerError)?;
             let mut len = 0usize;
-            for b in &rest[..n] {
+            for b in octets {
                 len = (len << 8) | usize::from(*b);
             }
-            (len, &rest[n..])
+            (len, rest)
         };
         if len > rest.len() {
             return Err(BerError);
@@ -246,10 +246,11 @@ impl<'a> Reader<'a> {
 
 /// A two's-complement integer of 1 to 8 bytes.
 pub(crate) fn decode_int(content: &[u8]) -> Result<i64, BerError> {
-    if content.is_empty() || content.len() > 8 {
+    let first = *content.first().ok_or(BerError)?;
+    if content.len() > 8 {
         return Err(BerError);
     }
-    let mut v: i64 = if content[0] & 0x80 != 0 { -1 } else { 0 };
+    let mut v: i64 = if first & 0x80 != 0 { -1 } else { 0 };
     for b in content {
         v = (v << 8) | i64::from(*b);
     }

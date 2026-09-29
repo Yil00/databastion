@@ -213,3 +213,53 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Security review H1: any UTF-8 in any log attribute (a hostile or
+    /// broken server) is dropped or reduced, never a panic.
+    #[test]
+    fn log_records_with_arbitrary_text_never_panic(
+        start in "(\\PC{0,24}|[0-9é.]{10,16}Z)",
+        csn in "\\PC{0,48}",
+        kind in "(search|bind|modify|unbind|\\PC{0,8})",
+        dn in "\\PC{0,64}",
+        authz in "\\PC{0,64}",
+        filter in "\\PC{0,64}",
+        numbers in proptest::collection::vec("\\PC{0,12}", 4),
+        attrs in proptest::collection::vec("\\PC{0,16}", 0..4),
+    ) {
+        let csn_ok = "20260929202642.012954Z#000000#000#000000".to_owned();
+        for (start, csn) in [(start.as_str(), csn.as_str()), (start.as_str(), csn_ok.as_str()), ("20260929202642Z", csn.as_str())] {
+            let mut list: Vec<(&str, Vec<&str>)> = vec![
+                ("reqStart", vec![start]),
+                ("entryCSN", vec![csn]),
+                ("reqType", vec![kind.as_str()]),
+                ("reqDN", vec![dn.as_str()]),
+                ("reqAuthzID", vec![authz.as_str()]),
+                ("reqFilter", vec![filter.as_str()]),
+                ("reqResult", vec![numbers[0].as_str()]),
+                ("reqEntries", vec![numbers[1].as_str()]),
+                ("reqSession", vec![numbers[2].as_str()]),
+                ("reqSizeLimit", vec![numbers[3].as_str()]),
+                ("reqScope", vec!["sub"]),
+            ];
+            list.push(("reqAttr", attrs.iter().map(String::as_str).collect()));
+            let e = Entry {
+                dn: Zeroizing::new(String::new()),
+                attributes: list
+                    .iter()
+                    .map(|(n, vs)| Attribute {
+                        name: (*n).to_owned(),
+                        values: vs.iter().map(|v| Zeroizing::new(v.as_bytes().to_vec())).collect(),
+                    })
+                    .collect(),
+                skipped: 0,
+            };
+            let _ = records::parse(&e);
+            let _ = time::parse_generalized(start);
+            let _ = time::csn_time(csn);
+        }
+    }
+}

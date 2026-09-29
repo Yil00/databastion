@@ -57,10 +57,10 @@ pub(crate) fn text_value(raw: &[u8], time: bool) -> Option<Zeroizing<String>> {
     }
     if time {
         let b = s.as_bytes();
-        if b.len() < 8 || !b[..8].iter().all(u8::is_ascii_digit) {
+        if !b.get(..8).is_some_and(|p| p.iter().all(u8::is_ascii_digit)) {
             return None;
         }
-        let (y, m, d) = (&s[0..4], &s[4..6], &s[6..8]);
+        let (y, m, d) = (s.get(0..4)?, s.get(4..6)?, s.get(6..8)?);
         let month: u8 = m.parse().ok()?;
         let day: u8 = d.parse().ok()?;
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) || y == "0000" {
@@ -72,7 +72,7 @@ pub(crate) fn text_value(raw: &[u8], time: bool) -> Option<Zeroizing<String>> {
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    Some(Zeroizing::new(s[..end].to_owned()))
+    s.get(..end).map(|v| Zeroizing::new(v.to_owned()))
 }
 
 /// The sampled values of one (container, object class) group.

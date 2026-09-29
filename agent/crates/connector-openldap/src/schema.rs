@@ -74,8 +74,8 @@ fn tokens(s: &str) -> Option<Vec<Token<'_>>> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    while let Some(&c) = bytes.get(i) {
+        match c {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             b'(' => {
                 out.push(Token::Open);
@@ -86,18 +86,18 @@ fn tokens(s: &str) -> Option<Vec<Token<'_>>> {
                 i += 1;
             }
             b'\'' => {
-                let end = s[i + 1..].find('\'')? + i + 1;
-                out.push(Token::Quoted(&s[i + 1..end]));
+                let end = s.get(i + 1..)?.find('\'')? + i + 1;
+                out.push(Token::Quoted(s.get(i + 1..end)?));
                 i = end + 1;
             }
             _ => {
                 let start = i;
-                while i < bytes.len()
-                    && !matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'\'')
-                {
+                while bytes.get(i).is_some_and(|c| {
+                    !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'\'')
+                }) {
                     i += 1;
                 }
-                out.push(Token::Word(&s[start..i]));
+                out.push(Token::Word(s.get(start..i)?));
             }
         }
     }
@@ -158,14 +158,14 @@ fn description(s: &str) -> Option<(String, Fields<'_>)> {
     if toks.first() != Some(&Token::Open) || toks.last() != Some(&Token::Close) {
         return None;
     }
-    let inner = &toks[1..toks.len() - 1];
+    let inner = toks.get(1..toks.len() - 1)?;
     let Some(Token::Word(oid)) = inner.first() else {
         return None;
     };
     let mut pos = 1;
     let mut fields = Vec::new();
     while pos < inner.len() {
-        let Token::Word(k) = inner[pos] else {
+        let Some(Token::Word(k)) = inner.get(pos).cloned() else {
             return None;
         };
         pos += 1;
@@ -307,7 +307,7 @@ impl Schema {
         let base = description.split(';').next().unwrap_or(description);
         self.by_name
             .get(&base.to_ascii_lowercase())
-            .map(|i| &self.attrs[*i])
+            .and_then(|i| self.attrs.get(*i))
     }
 
     /// The `SUP` chain of an attribute, itself first (bounded).
@@ -319,10 +319,13 @@ impl Schema {
                 break;
             }
             match self.by_name.get(&sup.to_ascii_lowercase()) {
-                Some(i) => {
-                    cur = &self.attrs[*i];
-                    out.push(cur);
-                }
+                Some(i) => match self.attrs.get(*i) {
+                    Some(t) => {
+                        cur = t;
+                        out.push(cur);
+                    }
+                    None => break,
+                },
                 None => break,
             }
         }
@@ -369,8 +372,9 @@ impl Schema {
         let mut names: Vec<String> = self
             .attrs
             .iter()
-            .filter(|t| !t.names.is_empty() && self.eligible(&t.names[0]))
-            .map(|t| t.names[0].clone())
+            .filter_map(|t| t.names.first())
+            .filter(|n| self.eligible(n))
+            .cloned()
             .collect();
         names.sort();
         names.dedup();

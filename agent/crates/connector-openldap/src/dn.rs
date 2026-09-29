@@ -21,8 +21,8 @@ pub(crate) fn rdns(dn: &str) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    while let Some(&c) = bytes.get(i) {
+        match c {
             b'\\' => {
                 if i + 1 >= bytes.len() {
                     return None;
@@ -31,14 +31,14 @@ pub(crate) fn rdns(dn: &str) -> Option<Vec<&str>> {
                 continue;
             }
             b',' | b';' => {
-                out.push(&dn[start..i]);
+                out.push(dn.get(start..i)?);
                 start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
-    out.push(&dn[start..]);
+    out.push(dn.get(start..)?);
     if out.len() > MAX_RDNS || out.iter().any(|r| !r.contains('=')) {
         return None;
     }
@@ -81,17 +81,26 @@ pub(crate) fn parent(dn: &str) -> Option<&str> {
     if rdns.len() < 2 {
         return None;
     }
-    let first = rdns[0].len();
-    Some(dn[first + 1..].trim_start())
+    let first = rdns.first()?.len();
+    dn.get(first + 1..).map(str::trim_start)
 }
 
-/// Whether the canonical DN `dn` is `base` or below it.
+/// Whether the canonical DN `dn` is `base` or below it, RDN by RDN (an
+/// escaped comma inside a value is not a separator).
 pub(crate) fn is_within(dn: &str, base: &str) -> bool {
-    base.is_empty()
-        || dn == base
-        || (dn.len() > base.len()
-            && dn.ends_with(base)
-            && dn.as_bytes()[dn.len() - base.len() - 1] == b',')
+    if base.is_empty() {
+        return true;
+    }
+    match (rdns(dn), rdns(base)) {
+        (Some(d), Some(b)) => {
+            d.len() >= b.len()
+                && d.iter()
+                    .rev()
+                    .zip(b.iter().rev())
+                    .all(|(x, y)| x.trim() == y.trim())
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +141,9 @@ mod tests {
         assert!(is_within("dc=example,dc=org", "dc=example,dc=org"));
         assert!(!is_within("dc=myexample,dc=org", "example,dc=org"));
         assert!(!is_within("dc=org", "dc=example,dc=org"));
+        // An escaped comma is part of a value, not a separator (security
+        // review L2).
+        assert!(!is_within("ou=a\\,dc=example,dc=org", "dc=example,dc=org"));
+        assert!(is_within("ou=a\\,b,dc=example,dc=org", "dc=example,dc=org"));
     }
 }

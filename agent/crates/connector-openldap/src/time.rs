@@ -38,6 +38,11 @@ fn digits(s: &str) -> Option<i64> {
 
 /// A UTC Generalized Time (`YYYYMMDDHHMMSS[.f…]Z`, years 1970 to 9999).
 pub(crate) fn parse_generalized(s: &str) -> Option<SystemTime> {
+    // ASCII only: the byte offsets below are then character boundaries
+    // (a log value is server input).
+    if !s.is_ascii() {
+        return None;
+    }
     let body = s.strip_suffix('Z')?;
     let (whole, fraction) = match body.split_once('.') {
         Some((w, f)) => (w, Some(f)),
@@ -47,14 +52,14 @@ pub(crate) fn parse_generalized(s: &str) -> Option<SystemTime> {
         return None;
     }
     let (y, mo, d) = (
-        digits(&whole[0..4])?,
-        digits(&whole[4..6])?,
-        digits(&whole[6..8])?,
+        digits(whole.get(0..4)?)?,
+        digits(whole.get(4..6)?)?,
+        digits(whole.get(6..8)?)?,
     );
     let (h, mi, se) = (
-        digits(&whole[8..10])?,
-        digits(&whole[10..12])?,
-        digits(&whole[12..14])?,
+        digits(whole.get(8..10)?)?,
+        digits(whole.get(10..12)?)?,
+        digits(whole.get(12..14)?)?,
     );
     if !(1970..=9999).contains(&y)
         || !(1..=12).contains(&mo)
@@ -102,25 +107,21 @@ pub(crate) fn csn_at(t: SystemTime) -> String {
 
 /// Whether `s` has the form of an OpenLDAP CSN.
 pub(crate) fn valid_csn(s: &str) -> bool {
+    // `YYYYMMDDHHMMSS.ffffffZ#cccccc#sid#mmmmmm`, byte by byte.
+    const SHAPE: &[u8; 40] = b"dddddddddddddd.ddddddZ#xxxxxx#xxx#xxxxxx";
     let b = s.as_bytes();
-    let hex = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_hexdigit);
-    b.len() == 40
-        && b[..14].iter().all(u8::is_ascii_digit)
-        && b[14] == b'.'
-        && b[15..21].iter().all(u8::is_ascii_digit)
-        && b[21] == b'Z'
-        && b[22] == b'#'
-        && hex(23..29)
-        && b[29] == b'#'
-        && hex(30..33)
-        && b[33] == b'#'
-        && hex(34..40)
+    b.len() == SHAPE.len()
+        && b.iter().zip(SHAPE).all(|(c, k)| match k {
+            b'd' => c.is_ascii_digit(),
+            b'x' => c.is_ascii_hexdigit(),
+            k => c == k,
+        })
 }
 
 /// The time part of a CSN.
 pub(crate) fn csn_time(csn: &str) -> Option<SystemTime> {
     valid_csn(csn)
-        .then(|| parse_generalized(&csn[..22]))
+        .then(|| csn.get(..22).and_then(parse_generalized))
         .flatten()
 }
 
@@ -141,6 +142,11 @@ mod tests {
         assert!(parse_generalized("20260929202642").is_none());
         assert!(parse_generalized("20260929202642.Z").is_none());
         assert!(parse_generalized("+0260929202642Z").is_none());
+        // Non-ASCII of the right byte length never panics (security review
+        // H1: `é` straddles byte 4).
+        assert!(parse_generalized("202é092920264Z").is_none());
+        assert!(parse_generalized("20260929é0264Z").is_none());
+        assert!(parse_generalized("20260929202642.é1Z").is_none());
     }
 
     #[test]

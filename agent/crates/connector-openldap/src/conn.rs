@@ -338,15 +338,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
 
     /// Reads one message: length checked before the body.
     async fn read_message(&mut self) -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
-        let mut head = [0u8; 6];
-        self.io.read_exact(&mut head[..2]).await?;
-        let mut have = 2;
+        let mut head: Vec<u8> = Vec::with_capacity(6);
+        let mut byte = [0u8; 1];
         let total = loop {
-            match ber::message_len(&head[..have]) {
+            match ber::message_len(&head) {
                 Ok(Some(total)) => break total,
-                Ok(None) if have < head.len() => {
-                    self.io.read_exact(&mut head[have..=have]).await?;
-                    have += 1;
+                Ok(None) if head.len() < 6 => {
+                    self.io.read_exact(&mut byte).await?;
+                    head.push(byte[0]);
                 }
                 _ => {
                     return Err(std::io::Error::new(
@@ -356,15 +355,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 }
             }
         };
+        let have = head.len();
         if total < have {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "bad message length",
             ));
         }
-        let mut buf = Zeroizing::new(vec![0u8; total]);
-        buf[..have].copy_from_slice(&head[..have]);
-        self.io.read_exact(&mut buf[have..]).await?;
+        let mut buf = Zeroizing::new(head);
+        buf.resize(total, 0);
+        if let Some(body) = buf.get_mut(have..) {
+            self.io.read_exact(body).await?;
+        }
         Ok(buf)
     }
 

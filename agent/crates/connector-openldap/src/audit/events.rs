@@ -72,11 +72,10 @@ impl std::fmt::Debug for EventBuilder {
 /// Whether a container name `c` (normalized) is `base` or below it,
 /// without case.
 fn under(c: &str, base: &str) -> bool {
-    let (c, base) = (c.to_ascii_lowercase(), base.to_ascii_lowercase());
-    c == base
-        || (c.len() > base.len()
-            && c.ends_with(&base)
-            && c.as_bytes()[c.len() - base.len() - 1] == b',')
+    match (dn::canon(c), dn::canon(base)) {
+        (Some(c), Some(base)) => dn::is_within(&c, &base),
+        _ => false,
+    }
 }
 
 impl EventBuilder {

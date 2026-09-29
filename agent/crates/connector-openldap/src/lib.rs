@@ -26,6 +26,9 @@
 //! `agent.yaml` references (I3), over rustls TLS (LDAPS or StartTLS).
 
 #![forbid(unsafe_code)]
+// Server input is sliced in this crate: slicing a string must be proven on
+// ASCII or on a boundary found by the code (security review H1).
+#![cfg_attr(not(test), deny(clippy::string_slice, clippy::indexing_slicing))]
 
 mod audit;
 mod ber;

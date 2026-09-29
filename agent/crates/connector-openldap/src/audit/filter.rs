@@ -94,9 +94,9 @@ impl Parser<'_> {
         while !matches!(self.s.get(self.pos)?, b'=' | b'~' | b'<' | b'>' | b':') {
             self.pos += 1;
         }
-        let attr = &self.s[start..self.pos];
+        let attr = self.s.get(start..self.pos)?;
         let attr = attr.strip_prefix(b"?").unwrap_or(attr);
-        let op = self.s[self.pos];
+        let op = *self.s.get(self.pos)?;
         if op != b'=' {
             // `~=`, `<=`, `>=`, extensible: selective. Skip the value.
             self.skip_value()?;
@@ -105,7 +105,7 @@ impl Parser<'_> {
         self.pos += 1;
         let value_start = self.pos;
         self.skip_value()?;
-        let value = &self.s[value_start..self.pos];
+        let value = self.s.get(value_start..self.pos)?;
         if value == b"*" {
             return Some(true);
         }
