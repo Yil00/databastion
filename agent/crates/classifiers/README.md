@@ -224,13 +224,20 @@ this agent emits only the closed set below:
 | `signature.copy_to_file` | `COPY … TO '<server file>'` |
 | `signature.copy_to_program` | `COPY … TO PROGRAM` |
 | `shape.full_table_copy` | `COPY` out of a whole relation, or of a query without filter, aggregation or small limit |
-| `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit of at least 10 000 rows |
-| `volume.large_result` | at least 10 000 rows returned or affected by one statement (or one counter delta) |
+| `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit above 10 000 rows |
+| `volume.large_result` | more than 10 000 rows returned or affected by one statement (or one counter delta); on the pgaudit source only with `pgaudit.log_rows = on` |
+
+The thresholds sit above the agent's own maximum sample (10 000 rows), so
+its Discovery never raises them. `shape.*` and `signature.*` are heuristics
+and **evadable by design** (`WHERE true`, `LIMIT 10000` pagination, a
+forged `application_name`); volume × sensitivity in the console is the
+robust signal.
 
 ## Query normalizer (ADR-0012 obligation 5)
 
 `query::analyze` lexes PostgreSQL statement text and keeps only
-literal-free tokens: statement kind, relation names (from identifier tokens,
+literal-free tokens, for every statement of the text and for the body of a
+dollar-quoted `DO` block (one level): statement kind, relation names (from identifier tokens,
 normalized before the uplink), `COPY` form, and shape (`*`, `WHERE`,
 aggregation, `LIMIT`). The normalized text (DML allow-list only: `SELECT`,
 `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `VALUES`, `TABLE`, `WITH`) has every

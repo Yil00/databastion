@@ -30,8 +30,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "alloc"
 getrandom = { version = "0.4", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
-# Safe syscalls for state files: open with O_NOFOLLOW, effective uid.
 futures-util.workspace = true
+# Safe syscalls for state files: open with O_NOFOLLOW, effective uid.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
 [dev-dependencies]
