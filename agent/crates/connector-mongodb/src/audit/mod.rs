@@ -667,6 +667,14 @@ async fn profiler_run(
                 if !polled.records.is_empty() {
                     state.note_record(&target.id, Source::Profiler);
                 }
+                if polled.dropped > 0 {
+                    state.note_dropped(&target.id, polled.dropped);
+                    tracing::warn!(
+                        target_id = %target.id,
+                        dropped = polled.dropped,
+                        "profiler entries that do not parse dropped"
+                    );
+                }
                 let events = st.builder.convert(
                     polled.records,
                     EventSource::MongodbProfiler,
