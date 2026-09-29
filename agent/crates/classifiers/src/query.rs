@@ -1090,7 +1090,10 @@ fn my_kind(s: &[Tok]) -> StatementKind {
     match word(s.get(i)) {
         Some("replace") => StatementKind::Insert,
         Some("handler") => StatementKind::Handler,
-        Some("create" | "alter" | "drop" | "rename") if matches!(second, Some("user" | "role")) => {
+        // Digest text writes `USER` as `SYSTEM_USER` (MySQL).
+        Some("create" | "alter" | "drop" | "rename")
+            if matches!(second, Some("user" | "role" | "system_user")) =>
+        {
             StatementKind::Dcl
         }
         Some("set") if matches!(second, Some("password" | "role" | "default")) => {
@@ -2491,6 +2494,10 @@ mod tests {
         }
         for (q, k) in [
             ("CREATE USER u IDENTIFIED BY 'x'", StatementKind::Dcl),
+            (
+                "CREATE SYSTEM_USER ? @? IDENTIFIED BY ?",
+                StatementKind::Dcl,
+            ),
             ("drop role r", StatementKind::Dcl),
             ("SET PASSWORD = 'x'", StatementKind::Dcl),
             ("CREATE TABLE t (a int)", StatementKind::Ddl),
