@@ -288,17 +288,11 @@ describe("dedup scope", () => {
     expect(key).toBe(`policy:p1|agent:${FACTS.agentId}|target:pg-prod-1|principal:${"a".repeat(64)}|database:-|hour:2026-09-28T14:00:00.000Z`);
   });
 
-  it("principal part: coarse for failed logins only; fingerprints keyed per fingerprint and network (end-of-phase-6 M1)", () => {
+  it("principal part: coarse for failed logins only, else the principal key (ADR-0031 decision 1)", () => {
     const net = "n".repeat(64);
     const pk = "a".repeat(64);
-    expect(dedupPrincipal({ fingerprinted: true, action: "auth_failure", principalKey: pk, networkHash: net })).toBe(`unknown:${net}`);
-    expect(dedupPrincipal({ fingerprinted: false, action: "auth_failure", principalKey: pk, networkHash: net })).toBe(`unknown:${net}`);
-    expect(dedupPrincipal({ fingerprinted: true, action: "read", principalKey: pk, networkHash: net })).toBe(`fp:${pk}:${net}`);
-    // Two fingerprinted principals never share a key.
-    expect(dedupPrincipal({ fingerprinted: true, action: "read", principalKey: "b".repeat(64), networkHash: net })).not.toBe(
-      dedupPrincipal({ fingerprinted: true, action: "read", principalKey: pk, networkHash: net }),
-    );
-    expect(dedupPrincipal({ fingerprinted: false, action: "read", principalKey: pk, networkHash: net })).toBe(pk);
+    expect(dedupPrincipal({ action: "auth_failure", principalKey: pk, networkHash: net })).toBe(`unknown:${net}`);
+    for (const action of ["read", "write", "connect", "ddl", "dcl"]) expect(dedupPrincipal({ action, principalKey: pk, networkHash: net })).toBe(pk);
   });
 
   it("after a false positive only a new signature signal or a strictly higher score is worse (end-of-phase-6 M1)", () => {

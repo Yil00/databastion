@@ -541,7 +541,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const of = (fp: string) => list.find((x) => x.principal === fp);
       expect(of(alice)?.matchCount).toBe(2);
       expect(of(bob)?.matchCount).toBe(1);
-      expect(of(alice)?.dedupKey).toContain("|principal:fp:");
+      expect(of(alice)?.dedupKey).not.toContain("principal:unknown:");
       expect(of(alice)?.dedupKey).not.toContain(alice);
       // A false positive on one principal does not suppress another's incident of the hour.
       await transitionIncident(getDb(), String(of(alice)?.id), "false_positive", actor());
@@ -552,21 +552,15 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       list = await incidentsOf(auth.agentId);
       expect(list).toHaveLength(3);
       expect(list.filter((x) => x.principal === carol)).toHaveLength(1);
-      // The same fingerprint (e.g. every unidentified account of the agent) from two client
-      // networks: grouped per network, as the coarse key did.
+      // One fingerprint (e.g. every unidentified account of the agent) is one principal, whatever
+      // the client network (the coarse per-network key is for failed logins only).
       const unidentified = randomFp();
       await send(auth, [
         read(20, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "192.0.2.10" } }),
-        read(21, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "192.0.2.99" } }),
-        read(22, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "198.51.100.7" } }),
+        read(21, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "198.51.100.7" } }),
       ]);
       await drainPolicyWork(getDb());
-      expect(
-        (await incidentsOf(auth.agentId))
-          .filter((x) => x.principal === unidentified)
-          .map((x) => x.matchCount)
-          .sort(),
-      ).toEqual([1, 2]);
+      expect((await incidentsOf(auth.agentId)).filter((x) => x.principal === unidentified).map((x) => x.matchCount)).toEqual([2]);
     });
 
     it("M2: one chunk takes at most a fair share of each agent's events", async () => {

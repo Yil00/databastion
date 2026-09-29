@@ -435,15 +435,13 @@ export function exceptionCoversEvent(
  *   (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
  *   `local` kept), so random account names or rotating addresses cannot open one incident each
  *   (security review H1, re-review N2);
- * - other fingerprinted principals (a name the agent does not send: a non-conforming account name,
- *   an OpenLDAP DN not listed in `clear_principals`, an unidentified account): their principal key
- *   (the fingerprint's hash) together with the client network. Distinct principals are never
- *   merged (end-of-phase-6 review M1: on OpenLDAP nearly every principal is fingerprinted and has
- *   no client address, so the former coarse key merged them all, and a false positive of one
- *   suppressed every other user's incidents of the hour). The agent fingerprints every
- *   unidentified account alike (the HMAC of an empty name, which the console cannot tell apart),
- *   so with the client network these keep the coarse grouping by network;
- * - named principals: their principal key. On top of that, a policy opens at most a configured number
+ * - every other event: its principal key (SHA-256 of the name, or of the fingerprint sent in its
+ *   place), so distinct principals are never merged (ADR-0031 decision 1, end-of-phase-6 review
+ *   M1: on OpenLDAP nearly every principal is fingerprinted and has no client address, so the
+ *   former coarse key for fingerprinted principals merged them all, and a false positive of one
+ *   suppressed every other user's incidents of the hour). The console cannot recognize the
+ *   fingerprint of an unidentified account (the HMAC key never leaves the agent): the agent sends
+ *   every unidentified account of one agent as the same fingerprint, so they form one principal. On top of that, a policy opens at most a configured number
  * of incidents per hour on one target; the further matches go to one overflow incident of the
  * policy on that target, except severe events (`severeEvent`). The database is the one of the most sensitive
  * retained object (the first on a tie), none for an event without object. While that incident is
@@ -467,13 +465,11 @@ export function coarsePrincipal(e: { action: string }): boolean {
 }
 
 /**
- * Principal part of the dedup key (see above). `principalKey` = SHA-256 of the principal,
- * `networkHash` = SHA-256 of the client network: hashes only, never agent-provided text.
+ * Principal part of the dedup key (see above, ADR-0031 decision 1). `principalKey` = SHA-256 of
+ * the principal, `networkHash` = SHA-256 of the client network: hashes only, never agent text.
  */
-export function dedupPrincipal(e: { fingerprinted: boolean; action: string; principalKey: string; networkHash: string }): string {
-  if (coarsePrincipal(e)) return `unknown:${e.networkHash}`;
-  if (e.fingerprinted) return `fp:${e.principalKey}:${e.networkHash}`;
-  return e.principalKey;
+export function dedupPrincipal(e: { action: string; principalKey: string; networkHash: string }): string {
+  return coarsePrincipal(e) ? `unknown:${e.networkHash}` : e.principalKey;
 }
 
 /** Key parts are identifiers and hashes only: never agent-provided free text. */
@@ -530,7 +526,7 @@ export function worseThanResolved(
 
 /**
  * After the incident of a scope was marked a false positive, a later event of the same scope opens
- * a new incident only when it is clearly worse than what was judged (end-of-phase-6 review M1): a
+ * a new incident only when it is clearly worse than what was judged (ADR-0031 decision 2): a
  * `signature.*` signal (a dump or export tool) the incident did not have, or a strictly higher
  * score. A higher volume alone is only worse when it raises the score; the baseline verdict and
  * other signals do not count (the administrator judged this principal's activity on this

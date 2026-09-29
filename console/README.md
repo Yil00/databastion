@@ -753,18 +753,20 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot
-  open one incident each. Any other event with a fingerprint instead of a name (a non-conforming
-  account name, an OpenLDAP DN not listed in `clear_principals`, an unidentified account) is keyed
-  `fp:<principal key>:<sha256 of the client network>` (end-of-phase-6 review M1): two
-  fingerprinted principals never share an incident, even on OpenLDAP where events have no client
-  address. The agent sends every unidentified account as the same fingerprint (of an empty name,
-  which the console cannot recognize), so these stay grouped per client network. The database is that
+  open one incident each. Every other event is keyed by its principal key (the name, or the
+  fingerprint sent in its place: a non-conforming account name, an OpenLDAP DN not listed in
+  `clear_principals`, an unidentified account), ADR-0031
+  decision 1, end-of-phase-6 review M1: two fingerprinted principals never share an incident,
+  even on OpenLDAP where events have no client address. The console cannot recognize the
+  fingerprint of an unidentified account (the HMAC key never leaves the agent); the agent sends
+  every unidentified account of one agent as the same fingerprint, so they form one principal. The database is that
   of the most sensitive retained object. While the incident of a key is open or acknowledged,
   later events of the key are added to it (`match_count`, total rows, highest score, signals,
   anomaly, and a link in `incident_events`). Once it is a **false positive**, a later event of the
   hour opens a new incident (`reopened_from` in the notification) only when it is clearly worse
   than what was judged: a `signature.*` signal the incident did not have, or a strictly higher
-  score (end-of-phase-6 review M1); otherwise it is only linked to it. Once it is **resolved**, a
+  score (ADR-0031 decision 2; a new `shape.*` / `volume.*` signal alone, or being above the
+  baseline, does not count); otherwise it is only linked to it. Once it is **resolved**, a
   later event of the hour opens a new incident (`reopened_from`) only when it is worse: a higher
   score, above the baseline while the incident was not, or a signal the incident did not have;
   otherwise it is linked to the resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus

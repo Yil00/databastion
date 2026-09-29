@@ -408,7 +408,6 @@ async function applyEventPolicy(
     agentId: e.agentId,
     targetId: e.targetId,
     principalKey: dedupPrincipal({
-      fingerprinted: e.dbUser === null,
       action: e.action,
       principalKey: e.principalKey,
       networkHash: sha256Hex(clientNetwork(e.clientAddr)),
