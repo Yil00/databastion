@@ -21,7 +21,7 @@
       "signals": [
         "signature.pg_dump",
         "shape.full_table_copy",
-        "volume.above_baseline"
+        "volume.large_result"
       ],
       "source": "pgaudit",
       "aggregated_count": 1
@@ -60,9 +60,6 @@
         }
       ],
       "rows": 5400,
-      "signals": [
-        "shape.subtree_all_entries"
-      ],
       "source": "openldap_accesslog",
       "aggregated_count": 1
     },
@@ -76,9 +73,6 @@
       },
       "action": "connect",
       "objects": [],
-      "signals": [
-        "signature.mongodump"
-      ],
       "source": "mongodb_log",
       "aggregated_count": 1
     },

@@ -84,7 +84,7 @@
       "pattern": "^[0-9]{4}\\.[0-9]{2}\\.[0-9]{1,4}$"
     },
     "Signal": {
-      "description": "Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`.",
+      "description": "Exfiltration indicator computed by the agent from the raw audit data (ADR-0007). The\nvocabulary is the **signal registry** `shared/protocol/signals.json` (next to this file,\nschema `signals.schema.json`), which describes each id: a conforming agent emits only\nregistered ids. Registered today: `signature.pg_dump`, `signature.copy_to_file`,\n`signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,\n`volume.large_result`. Families: `signature.*` a dump or export tool or command (the\nconsole treats it as severe), `shape.*` a query shape (heuristic, evadable), `volume.*` a\nvolume threshold of the agent. The registry is **append-only**: a new signal (e.g.\n`signature.mysqldump` for a future connector) is a new entry added by a compatible\ncontract change; an id is never removed, renamed or given another meaning.\n\nThis schema checks the **form** only (pattern), not registration, so that a console\naccepts a signal registered after it was built; it stores such a signal and matches it by\nexact id or family (`signature.*`). The console computes its own baseline verdict and\ndoes not rely on any `volume.*` signal for it (ADR-0021).\n",
       "type": "string",
       "maxLength": 64,
       "pattern": "^(signature|shape|volume)\\.[a-z0-9_]+$"
@@ -315,7 +315,7 @@
           "pattern": "^(/([a-z][a-z0-9_]{0,63}|[0-9]{1,6}))*$"
         },
         "keyword": {
-          "description": "Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`), or the\nkeyword of a console-side check (see \"Console-side checks\" in the description of this\ncontract):\n- `const`: a value that must equal the job's (`/classifiers_version`,\n  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);\n- `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,\n  `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;\n- `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;\n- `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),\n  or a classifier id not registered for the batch's version or outside the job's\n  `params.classifiers` (`/findings/<i>/classifier`);\n- `maxItems`: the per-job findings cap would be exceeded (`/findings`);\n- `formatMaximum`: a timestamp more than 5 min in the future;\n- `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.\n",
+          "description": "Violated JSON Schema keyword (e.g. `additionalProperties`, `maximum`, `pattern`), or the\nkeyword of a console-side check (see \"Console-side checks\" in the description of this\ncontract):\n- `const`: a value that must equal the job's (`/classifiers_version`,\n  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);\n- `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,\n  `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;\n- `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;\n- `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),\n  or a classifier id not registered for the batch's version or outside the job's\n  `params.classifiers` (`/findings/<i>/classifier`);\n- `maxItems`: the per-job findings cap would be exceeded (`/findings`);\n- `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status\n  update, `/events/<i>/ts`, `/events/<i>/ts_last`);\n- `formatMinimum`: an access event's `ts_last` earlier than its `ts`\n  (`/events/<i>/ts_last`), or its `ts` older than the console's event retention\n  (`/events/<i>/ts`);\n- `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.\n",
           "type": "string",
           "maxLength": 32,
           "pattern": "^[A-Za-z]+$"
@@ -537,9 +537,24 @@
           "description": "Cause of the last failed `check()` or connection, if any.",
           "$ref": "#/$defs/FailureCode"
         },
+        "detail": {
+          "$ref": "#/$defs/TargetDetail"
+        },
         "metrics": {
           "$ref": "#/$defs/MetricsMap"
         }
+      }
+    },
+    "TargetDetail": {
+      "description": "Human-readable explanation of the target's status from the last `check()`, for the\nconsole's display: why the audit level is degraded, what is not covered, an insecure\nsetting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2\nschema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:\nthe console does not parse it and never derives a decision from it (`reachable`,\n`audit_level` and `last_error` are the machine-readable status).\n\nBuilt by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error\nnumbers) and engine metadata names (privileges, roles, normalized object names). It\n**never** contains a sampled value, a credential, a connection string, a target host\nname or address, query text, or a driver or server message. At most 1024 characters, no\ncontrol, format, private-use or line / paragraph separator character, no `://` and no\n`@` (the obvious forms of a URL, connection string or `user@host` account). The agent\ntruncates it on a character boundary and omits it when it does not conform; the console\nescapes it on display.\n",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$",
+      "not": {
+        "description": "No URL or connection string (`://`), no `user@host` or e-mail form (`@`).",
+        "type": "string",
+        "pattern": "://|@"
       }
     },
     "DetectedTarget": {
@@ -1028,9 +1043,11 @@
           "maximum": 1
         },
         "objects_done": {
+          "description": "Objects processed so far (sampled or skipped).",
           "$ref": "#/$defs/Count"
         },
         "objects_total": {
+          "description": "Objects in the job's scope (`discovery.scan`: after its filters, across all databases\nof the target).\n",
           "$ref": "#/$defs/Count"
         },
         "findings": {
@@ -1039,6 +1056,34 @@
         },
         "batches": {
           "description": "Findings batches sent so far for this job. On `succeeded`, lets the console check that it\nreceived all of them.\n",
+          "$ref": "#/$defs/Count"
+        },
+        "objects_sampled": {
+          "description": "`discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually\nsampled so far. With the `skipped_*` counters below, `objects_total` (the objects\nlisted in the job's scope, after its filters, across all databases of the target) and\n`objects_done` (the objects processed, sampled or skipped), it tells how much of the\nscope a scan covered: `objects_total - objects_done` objects were not reached (scan\nstopped by its deadline, cancellation or the findings cap). Coverage counters are\ncounts only, never a name; each is optional (absent: not reported; a `skipped_*`\nreason absent counts 0) and none is checked by the console. A new skip reason is a new\noptional `skipped_*` counter (compatible change).\n",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_not_readable": {
+          "description": "Objects not sampled because the agent's account cannot read them (e.g. no `SELECT` on any column).",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_row_level_security": {
+          "description": "Objects not sampled because of row-level security (PostgreSQL: a policy depending on\nuser code or on another relation, or a row-level security ancestor; ADR-0012).\n",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_remote": {
+          "description": "Objects whose data is held outside the target (foreign tables, remote-access engines); never read (I5).",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_unsupported": {
+          "description": "Objects of a kind the connector does not sample (views, merge tables, sequences,\nstorage engines outside the connector's allow-list).\n",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_limit": {
+          "description": "Objects beyond a structural bound of the connector (partition leaves over the per-root\ncap, a truncated catalog listing).\n",
+          "$ref": "#/$defs/Count"
+        },
+        "skipped_error": {
+          "description": "Objects whose sampling failed (e.g. statement timeout, a privilege error at query\ntime), after which the scan went on with the next object.\n",
           "$ref": "#/$defs/Count"
         }
       }
@@ -1220,7 +1265,7 @@
       }
     },
     "AccessEvent": {
-      "description": "Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter\nand no returned value: only who, what object, which action, how many rows, and signals.\n`read` and `write` events name at least one object.\n",
+      "description": "Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter\nand no returned value: only who, what object, which action, how many rows, and signals.\n`read` and `write` events name at least one object: when the agent cannot tell which\nobjects a read or write reached, it reports the object `*` rather than dropping the\nevent (see `ObjectRef`).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1270,7 +1315,12 @@
           "description": "Rows (documents, entries) returned or affected, when the source provides it.",
           "$ref": "#/$defs/Count"
         },
+        "bytes": {
+          "description": "Size in bytes of the result returned (or of the data affected), when the source\nreports it; absent otherwise, never estimated. For a pre-aggregated event, the total\nof the merged events, as for `rows`. Not produced by the PostgreSQL connector:\nneither pgaudit nor `pg_stat_statements` reports a result size.\n",
+          "$ref": "#/$defs/Count"
+        },
         "signals": {
+          "description": "Signal ids of the registry `signals.json` (see `Signal`).",
           "type": "array",
           "maxItems": 16,
           "uniqueItems": true,
@@ -1349,7 +1399,7 @@
       ]
     },
     "ObjectRef": {
-      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.",
+      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of two reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`.\n\nIn both cases `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [

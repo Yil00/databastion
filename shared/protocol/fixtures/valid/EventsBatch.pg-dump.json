@@ -21,7 +21,7 @@
       "signals": [
         "signature.pg_dump",
         "shape.full_table_copy",
-        "volume.above_baseline"
+        "volume.large_result"
       ],
       "source": "pgaudit",
       "aggregated_count": 1

@@ -1,6 +1,6 @@
 // Builds the Ajv instance used by the contract tests: the `components.schemas` of openapi.yaml
 // as a JSON Schema 2020-12 document (`$defs`, refs rewritten, nothing else), plus the classifier
-// registry schema (classifiers.schema.json), which refers to it.
+// and signal registry schemas (classifiers.schema.json, signals.schema.json), which refer to it.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -12,6 +12,7 @@ import { MAP_MARK } from "./schema-lint.mjs";
 export const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const ROOT_ID = "https://databastion.invalid/protocol/v1/schemas.json";
 export const REGISTRY_SCHEMA_ID = "https://databastion.invalid/protocol/v1/classifiers.schema.json";
+export const SIGNALS_SCHEMA_ID = "https://databastion.invalid/protocol/v1/signals.schema.json";
 
 const rewrite = (value) => {
   if (Array.isArray(value)) return value.map(rewrite);
@@ -25,7 +26,7 @@ const rewrite = (value) => {
   return value;
 };
 
-/** Ajv 2020 with the contract schemas (`${ROOT_ID}#/$defs/<Name>`) and the registry schema. */
+/** Ajv 2020 with the contract schemas (`${ROOT_ID}#/$defs/<Name>`) and the registry schemas. */
 export function buildAjv(doc) {
   // strictRequired off: `oneOf: [{required: [a]}, {required: [b]}]` (exactly one of) is intended.
   const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true });
@@ -34,5 +35,6 @@ export function buildAjv(doc) {
   ajv.addVocabulary(["discriminator", MAP_MARK, "x-databastion-normalized-name", "x-databastion-max-bytes"]);
   ajv.addSchema({ $id: ROOT_ID, $defs: rewrite(doc.components.schemas) });
   ajv.addSchema(JSON.parse(readFileSync(join(root, "classifiers.schema.json"), "utf8")));
+  ajv.addSchema(JSON.parse(readFileSync(join(root, "signals.schema.json"), "utf8")));
   return ajv;
 }

@@ -12,15 +12,19 @@ Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.**
 | `classifiers.json` | Classifier registry: the valid classifier ids of each `classifiers_version` |
 | `classifiers.schema.json` | JSON Schema of the registry (keys `ClassifiersVersion`, ids `ClassifierId`, from `openapi.yaml`) |
 | `classifiers.lock.json` | SHA-256 of each published version's sorted id list: published versions are immutable |
+| `signals.json` | Signal registry: the access-event signal ids a conforming agent emits, with their meaning and engines |
+| `signals.schema.json` | JSON Schema of the signal registry (keys `Signal`, engines `Engine`, from `openapi.yaml`) |
 | `fixtures/valid/<Schema>.<case>.json` | Bodies that must be accepted by `<Schema>` |
 | `fixtures/invalid/<Schema>.<case>.json` | Bodies that must be rejected by `<Schema>` |
 | `fixtures/invalid-expectations.json` | For each invalid fixture, the JSON Schema keyword it must fail on (so it fails for the intended reason) |
 | `scripts/schema-lint.mjs` | Closure / bounds lint of every schema (used by `validate-fixtures.mjs`) |
 | `scripts/schema-lint.test.mjs` | Self-test: the contract passes the lint, and known mutations (`{}`, `true`, nullable unbounded types, open objects…) are caught |
-| `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + registry check |
-| `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schema) shared by the scripts |
+| `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + classifier and signal registry checks |
+| `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schemas) shared by the scripts |
 | `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, published versions unchanged (lock), valid fixtures only use ids registered for their `classifiers_version` |
 | `scripts/classifier-registry.test.mjs` | Self-test: the registry and lock pass, known mutations (bad id, duplicate, empty list, unsorted, id added / removed / renamed in a published version, version removed, new version not locked…) are caught |
+| `scripts/signal-registry.mjs` | Signal registry checks: schema, ids sorted, valid fixtures only use registered signals |
+| `scripts/signal-registry.test.mjs` | Self-test: the signal registry passes and holds the six PostgreSQL signals, an appended signal passes, known mutations are caught, and the `Signal` schema stays form-only (a signal registered later is accepted) |
 | `redocly.yaml` | Redocly ruleset for local linting (`recommended-strict`) |
 
 `<Schema>` is a key of `components/schemas` in `openapi.yaml` (e.g. `FindingsBatch`, `HeartbeatRequest`). Fixture data is fake: `example.com` domains, documentation IP ranges (`192.0.2.0/24`, `198.51.100.0/24`, `2001:db8::/32`), secrets made of `EXAMPLE`.
@@ -41,6 +45,7 @@ The schemas sit in `components/schemas` rather than in separate `schemas/*.json`
 - Every fixture in `valid/` passes, every fixture in `invalid/` fails with its expected keyword.
 - Every request and response body schema has at least one valid and one invalid fixture.
 - `classifiers.json` conforms to `classifiers.schema.json`, its ids are sorted, every version pinned in `classifiers.lock.json` still has the same hash, every version is pinned, and every valid fixture that carries a `classifiers_version` only uses classifier ids registered for it.
+- `signals.json` conforms to `signals.schema.json`, its ids are sorted, and every signal of a valid fixture is registered.
 
 ## Classifier registry (`classifiers.json`)
 A map `classifiers_version -> [classifier ids]`, e.g. `{"2026.09.1": ["pii.birth_date", …]}`. The console rejects findings whose `classifiers_version` is not a key (`400`, `/classifiers_version`, `enum`) or whose `classifier` is not listed for that version (`400`, `/findings/<i>/classifier`, `enum`), and only issues `discovery.scan` jobs with a registered version. Rules:
@@ -48,6 +53,13 @@ A map `classifiers_version -> [classifier ids]`, e.g. `{"2026.09.1": ["pii.birth
 - **immutability is tested**: `classifiers.lock.json` maps each published version to `sha256:` + the hex SHA-256 of the JSON array of its ids, sorted, without whitespace (`["pii.birth_date","pii.card_number",…]`). `npm test` fails if a locked version's ids change or the version disappears, and if a registry version is missing from the lock. A new version is added to `classifiers.json` **and appended** to the lock in the same change (the failing test prints the expected hash); a lock entry is never edited nor removed, and reviewers reject any diff that does;
 - ids sorted ascending, at most 200 per version (the `DiscoveryScanParams.classifiers` bound);
 - the agent's compiled classifier set must equal the entry of its `CLASSIFIERS_VERSION` (contract test `agent/crates/classifiers/tests/contract_registry.rs`).
+
+## Signal registry (`signals.json`)
+A map `signal id -> {description, engines}`, e.g. `{"signature.pg_dump": {"description": "…", "engines": ["postgres"]}}`: the vocabulary of `AccessEvent.signals` (see `Signal` in `openapi.yaml`). Rules:
+- **append-only**: an id is never removed, renamed or given another meaning (a wording fix of its description is fine). A new signal (e.g. `signature.mysqldump` with the MySQL Audit connector) is a new entry, added by a compatible change (regular PR + `security-reviewer` review) in the same change as the connector that emits it;
+- a conforming agent emits only registered ids. The agent's signal enum (`classifiers::masking::Signal`, P4-A) must list exactly the registry's ids (agent contract test to add with P4-A, like `contract_registry.rs` for classifiers);
+- the `Signal` schema checks the **form** only (`^(signature|shape|volume)\.[a-z0-9_]+$`): an older console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`). Registration is checked on the fixtures, not by the console;
+- unlike `classifiers.lock.json`, there is no lock file: CI does not yet compare `signals.json` with the base branch, so reviewers reject a diff that removes or renames an id.
 
 ## Commands
 Run from `shared/protocol/`:
@@ -86,6 +98,6 @@ TypeScript and Rust types are **generated** from `openapi.yaml`, never written b
   - `invalid`: fallback when an Ajv keyword does not match the `ErrorDetail.keyword` pattern, or when no detail is available;
   - `notFound`: unknown job or target, or one not assigned to the calling agent (`404`).
 
-  Console-side cross-field checks also reuse JSON Schema keywords: `const` (value must equal the job's or the target's), `maximum` (`matched > sampled`, `sampled > sample_rows`), `enum` (classifier registry), `maxItems` (per-job findings cap), `formatMaximum` (timestamp in the future). The list, pointers and order of the checks are in `openapi.yaml` ("Console-side checks").
+  Console-side cross-field checks also reuse JSON Schema keywords: `const` (value must equal the job's or the target's), `maximum` (`matched > sampled`, `sampled > sample_rows`), `enum` (classifier registry), `maxItems` (per-job findings cap), `formatMaximum` (timestamp in the future), `formatMinimum` (access event `ts_last` before `ts`, or `ts` older than the event retention). The list, pointers and order of the checks are in `openapi.yaml` ("Console-side checks").
 - **Agent**: serializes only through the generated types; masked samples and fingerprints come from `classifiers::masking`; each item is validated and sanitized before spooling (see the `openapi.yaml` description). The Rust generator (typify) replaces a few schemas with **hand-written** types in `databastion-protocol`: credentials `AgentSecret` and `EnrollmentToken` (`src/secret.rs`: redacted `Debug`, zeroized) and `Uuid` / `UuidV7` (`src/ids.rs`: canonical lowercase, version 7 checked). The header of `generated.rs` lists the keywords removed or rewritten before generation (`if` / `then` / `else`, `not`, `const`); typify also ignores most `minItems` / `maxItems` / `maxProperties` and number bounds. The invalid fixtures serde therefore accepts are listed with a reason in `agent/crates/protocol/tests/fixtures.rs` (`NOT_ENFORCED_BY_SERDE`, exact list).
 - **Optional filter arrays** (`DiscoveryScanParams.databases`, `schemas`, `include_objects`, `classifiers`): absent means "all", so an empty list is rejected (`minItems: 1`) rather than read as "none" or "all". The Rust generator emits them as `Option<Vec<_>>` so that `[]` stays distinguishable from absent; for these console -> agent payloads, the **agent's** job mapping (`TryFrom`, ROADMAP P2-B / P2-C) is the enforcement point and must reject `Some([])`; the console's outgoing validation is a second layer, not a substitute. The Rust generator fails closed if `minItems >= 1` appears anywhere it cannot rewrite (a `$ref` to an array schema, a `type` list, a nested object, a composition).

@@ -1,0 +1,10 @@
+{
+  "status": "succeeded",
+  "ts": "2026-09-28T14:12:00Z",
+  "progress": {
+    "objects_done": 420,
+    "objects_total": 420,
+    "objects_sampled": 421,
+    "skipped_error": -1
+  }
+}

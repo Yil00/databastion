@@ -566,9 +566,12 @@ impl Runtime {
                     }
                 }
             };
+            // `detail` (the connector's `TargetHealth::detail`) is not uplinked yet: it needs the
+            // `TargetDetail` sanitization first (ROADMAP P2-G).
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
                 audit_source: None,
+                detail: None,
                 edition: None,
                 engine: proto_engine(target.engine),
                 last_error,

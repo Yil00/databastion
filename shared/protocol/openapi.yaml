@@ -108,8 +108,10 @@ info:
     - `job_id` of a status update exists and is assigned to the calling agent (`404`);
     - every `target_id` belongs to the calling agent, i.e. was reported in one of its heartbeats
       (`404`, `/findings/<i>/target_id` or `/events/<i>/target_id`, keyword `notFound`);
-    - `ts_last >= ts`; no timestamp more than 5 min in the future (clock skew tolerance, keyword
-      `formatMaximum`);
+    - no `JobStatusUpdate.ts` more than 5 min ahead of the console clock (clock skew tolerance;
+      `400`, pointer `/ts`, keyword `formatMaximum`); the time bounds of access events are listed
+      under `POST /events` below. `HeartbeatRequest.ts` is not bounded: the console uses it to
+      detect clock skew;
     - in each masked sample, at least 50 % of the non-separator characters (letters, digits and `*`)
       are `*` (e.g. `06 ** ** ** 78`: 6 of 10; keyword `maskRatio`).
 
@@ -145,6 +147,47 @@ info:
        with `resource_limit` (the scan was truncated by a limit; the findings already accepted are
        kept), so a conforming agent never hits the `400`.
 
+    `POST /events`, in this order (ADR-0021):
+    1. **Request rate.** At most **300** authenticated requests per minute per agent, whatever their
+       outcome, checked after authentication and **before the body is read** (`429`, see below).
+    2. **Body.** Size (`413` above 4 MiB), schema, then the batch-level checks (`400`, all
+       reported together, up to 20 details):
+       - serialized size above `x-databastion-max-bytes` (pointer `""`, keyword `maxBytes`);
+       - `ts_last` earlier than `ts` (`/events/<i>/ts_last`, keyword `formatMinimum`).
+    3. **Back-pressure.** While more than **20 000** events of the calling agent are not evaluated
+       yet by the console's worker: `429` with `Retry-After: 30` (see below).
+    4. **Stored-batch rate.** At most **60** stored batches per minute per agent (`429`, see
+       below). A batch that turns out to be a duplicate or is rejected by a later step does not
+       count.
+    5. **Duplicate check** of "Idempotency" (`202` with `duplicate: true`, or `409`
+       `batch_conflict`). The batches of one agent are ingested one at a time.
+    6. **Targets.** Every `target_id` belongs to the calling agent (`404`, `/events/<i>/target_id`,
+       `notFound`).
+    7. **Future timestamps.** `ts` or `ts_last` more than **5 min** ahead of the console clock
+       (`400`, `/events/<i>/ts` or `/events/<i>/ts_last`, keyword `formatMaximum`).
+    8. **Retention.** Only when step 7 found nothing: `ts` older than the console's event
+       retention (`DATABASTION_EVENTS_RETENTION_DAYS`, default 90 days, accepted 7 to 3650)
+       (`400`, `/events/<i>/ts`, keyword `formatMinimum`). Such an event would be purged at once.
+       A conforming agent with an old spool can hit this check: the console counts it and raises
+       **no** agent-integrity alert (every other `400` on `/events`, a `batch_conflict` and a
+       foreign target do raise one). The agent handles it with the generic item-pointer rule:
+       it drops those events and resends the rest under a new `batch_id`.
+
+    Every item-level answer above carries item pointers (`/events/<i>/...`), so the agent drops
+    only the offending events. A batch holding both a future and an expired event is first
+    answered on the future one (step 7), then, once resent without it, on the expired one.
+
+    **`429` on `POST /events`** (`rate_limited`, no `details`, `Retry-After` always present, in
+    seconds): `30` for back-pressure (step 3); the time left in the current one-minute window,
+    1 to 60, for the rate limits (steps 1 and 4). A `429` records nothing: the agent keeps the
+    batch spooled, waits at least `Retry-After` (plus jitter), and resends it **unchanged, under
+    the same `batch_id`**. Because steps 1, 3 and 4 run **before** the duplicate check, a batch
+    that got a `429` was never recorded, so its retry is processed as a new batch (`duplicate:
+    false`), not as a duplicate; and while an agent is throttled, even the replay of a batch that
+    was already accepted (e.g. its `202` was lost) gets `429`, then `duplicate: true` once the
+    throttle ends. The rate limits of steps 1 and 4 are kept in memory by each console process;
+    the back-pressure threshold of step 3 is read from the database.
+
     `discovery.scan` jobs and `classifiers_version`:
     - the console issues a `discovery.scan` job only with the `classifiers_version` reported in the
       agent's **latest heartbeat**, and only if that version is registered in `classifiers.json`
@@ -161,6 +204,12 @@ info:
     console issues `discovery.scan` jobs only with a registered `classifiers_version` and
     `params.classifiers` ids of that version. Both generators consume the registry (console constant,
     agent contract test).
+
+    **Signal registry** (`signals.json`, next to this file, schema `signals.schema.json`): the
+    access-event signal ids with their meaning (see `Signal`). Append-only: an id is never removed,
+    renamed or given another meaning; a new signal is a new entry, added by a compatible contract
+    change. A conforming agent emits only registered ids. The `Signal` schema checks the form only,
+    so that an older console accepts a signal registered after it was built.
 
     Every string coming from an agent is escaped on display and in exports (no HTML, CSV or log injection).
 servers:
@@ -423,6 +472,14 @@ paths:
         action within the aggregation window, 60 s by default) and carry no query text. `404` when a
         `target_id` does not belong to this agent (`details[].pointer` designates the items).
 
+        Time bounds (`400`, item pointers): `ts_last` earlier than `ts` (`formatMinimum` on
+        `/events/<i>/ts_last`), `ts` or `ts_last` more than 5 min in the future (`formatMaximum`),
+        `ts` older than the console's event retention (`formatMinimum` on `/events/<i>/ts`; not an
+        agent-integrity event). `429` for back-pressure (`Retry-After: 30`) and rate limits,
+        **before** the duplicate check: a batch answered `429` was not recorded, and its retry
+        under the same `batch_id` is processed as new. See "Console-side checks" in the
+        description of this contract for the order and the exact answers.
+
         A console that does not implement Audit yet (before phase 4) answers `501`
         (`NotImplemented`) without reading the body. The agent then parks `POST /events` only;
         `POST /findings` and every other endpoint keep working (see `NotImplemented`).
@@ -453,7 +510,19 @@ paths:
         "426":
           $ref: "#/components/responses/UpgradeRequired"
         "429":
-          $ref: "#/components/responses/TooManyRequests"
+          description: |
+            `rate_limited`, with `Retry-After` (seconds): back-pressure while more than 20 000 events
+            of the agent are not evaluated yet (`Retry-After: 30`), or a per-agent rate limit (300
+            requests or 60 stored batches per minute; the rest of the window, 1 to 60 s). Nothing
+            was recorded: the agent keeps the batch spooled and resends it unchanged, under the
+            same `batch_id`, after `Retry-After` plus jitter. Answered before the duplicate check.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "501":
           $ref: "#/components/responses/NotImplemented"
         "503":
@@ -832,7 +901,22 @@ components:
       maxLength: 16
       pattern: "^[0-9]{4}\\.[0-9]{2}\\.[0-9]{1,4}$"
     Signal:
-      description: Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`.
+      description: |
+        Exfiltration indicator computed by the agent from the raw audit data (ADR-0007). The
+        vocabulary is the **signal registry** `shared/protocol/signals.json` (next to this file,
+        schema `signals.schema.json`), which describes each id: a conforming agent emits only
+        registered ids. Registered today: `signature.pg_dump`, `signature.copy_to_file`,
+        `signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
+        `volume.large_result`. Families: `signature.*` a dump or export tool or command (the
+        console treats it as severe), `shape.*` a query shape (heuristic, evadable), `volume.*` a
+        volume threshold of the agent. The registry is **append-only**: a new signal (e.g.
+        `signature.mysqldump` for a future connector) is a new entry added by a compatible
+        contract change; an id is never removed, renamed or given another meaning.
+
+        This schema checks the **form** only (pattern), not registration, so that a console
+        accepts a signal registered after it was built; it stores such a signal and matches it by
+        exact id or family (`signature.*`). The console computes its own baseline verdict and
+        does not rely on any `volume.*` signal for it (ADR-0021).
       type: string
       maxLength: 64
       pattern: "^(signature|shape|volume)\\.[a-z0-9_]+$"
@@ -1065,7 +1149,11 @@ components:
               or a classifier id not registered for the batch's version or outside the job's
               `params.classifiers` (`/findings/<i>/classifier`);
             - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
-            - `formatMaximum`: a timestamp more than 5 min in the future;
+            - `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
+              update, `/events/<i>/ts`, `/events/<i>/ts_last`);
+            - `formatMinimum`: an access event's `ts_last` earlier than its `ts`
+              (`/events/<i>/ts_last`), or its `ts` older than the console's event retention
+              (`/events/<i>/ts`);
             - `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
           type: string
           maxLength: 32
@@ -1239,8 +1327,35 @@ components:
         last_error:
           description: Cause of the last failed `check()` or connection, if any.
           $ref: "#/components/schemas/FailureCode"
+        detail:
+          $ref: "#/components/schemas/TargetDetail"
         metrics:
           $ref: "#/components/schemas/MetricsMap"
+    TargetDetail:
+      description: |
+        Human-readable explanation of the target's status from the last `check()`, for the
+        console's display: why the audit level is degraded, what is not covered, an insecure
+        setting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2
+        schema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:
+        the console does not parse it and never derives a decision from it (`reachable`,
+        `audit_level` and `last_error` are the machine-readable status).
+
+        Built by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error
+        numbers) and engine metadata names (privileges, roles, normalized object names). It
+        **never** contains a sampled value, a credential, a connection string, a target host
+        name or address, query text, or a driver or server message. At most 1024 characters, no
+        control, format, private-use or line / paragraph separator character, no `://` and no
+        `@` (the obvious forms of a URL, connection string or `user@host` account). The agent
+        truncates it on a character boundary and omits it when it does not conform; the console
+        escapes it on display.
+      type: string
+      minLength: 1
+      maxLength: 1024
+      pattern: '^[^\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+$'
+      not:
+        description: No URL or connection string (`://`), no `user@host` or e-mail form (`@`).
+        type: string
+        pattern: "://|@"
     DetectedTarget:
       description: |
         A local engine spotted by a Unix socket, a local listening port or a process name. At least one
@@ -1591,8 +1706,12 @@ components:
           minimum: 0
           maximum: 1
         objects_done:
+          description: Objects processed so far (sampled or skipped).
           $ref: "#/components/schemas/Count"
         objects_total:
+          description: |
+            Objects in the job's scope (`discovery.scan`: after its filters, across all databases
+            of the target).
           $ref: "#/components/schemas/Count"
         findings:
           description: Findings reported so far for this job.
@@ -1601,6 +1720,44 @@ components:
           description: |
             Findings batches sent so far for this job. On `succeeded`, lets the console check that it
             received all of them.
+          $ref: "#/components/schemas/Count"
+        objects_sampled:
+          description: |
+            `discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually
+            sampled so far. With the `skipped_*` counters below, `objects_total` (the objects
+            listed in the job's scope, after its filters, across all databases of the target) and
+            `objects_done` (the objects processed, sampled or skipped), it tells how much of the
+            scope a scan covered: `objects_total - objects_done` objects were not reached (scan
+            stopped by its deadline, cancellation or the findings cap). Coverage counters are
+            counts only, never a name; each is optional (absent: not reported; a `skipped_*`
+            reason absent counts 0) and none is checked by the console. A new skip reason is a new
+            optional `skipped_*` counter (compatible change).
+          $ref: "#/components/schemas/Count"
+        skipped_not_readable:
+          description: Objects not sampled because the agent's account cannot read them (e.g. no `SELECT` on any column).
+          $ref: "#/components/schemas/Count"
+        skipped_row_level_security:
+          description: |
+            Objects not sampled because of row-level security (PostgreSQL: a policy depending on
+            user code or on another relation, or a row-level security ancestor; ADR-0012).
+          $ref: "#/components/schemas/Count"
+        skipped_remote:
+          description: Objects whose data is held outside the target (foreign tables, remote-access engines); never read (I5).
+          $ref: "#/components/schemas/Count"
+        skipped_unsupported:
+          description: |
+            Objects of a kind the connector does not sample (views, merge tables, sequences,
+            storage engines outside the connector's allow-list).
+          $ref: "#/components/schemas/Count"
+        skipped_limit:
+          description: |
+            Objects beyond a structural bound of the connector (partition leaves over the per-root
+            cap, a truncated catalog listing).
+          $ref: "#/components/schemas/Count"
+        skipped_error:
+          description: |
+            Objects whose sampling failed (e.g. statement timeout, a privilege error at query
+            time), after which the scan went on with the next object.
           $ref: "#/components/schemas/Count"
     JobError:
       type: object
@@ -1726,7 +1883,9 @@ components:
       description: |
         Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
         and no returned value: only who, what object, which action, how many rows, and signals.
-        `read` and `write` events name at least one object.
+        `read` and `write` events name at least one object: when the agent cannot tell which
+        objects a read or write reached, it reports the object `*` rather than dropping the
+        event (see `ObjectRef`).
       type: object
       additionalProperties: false
       required: [target_id, ts, principal, action, objects, source, aggregated_count]
@@ -1753,7 +1912,15 @@ components:
         rows:
           description: Rows (documents, entries) returned or affected, when the source provides it.
           $ref: "#/components/schemas/Count"
+        bytes:
+          description: |
+            Size in bytes of the result returned (or of the data affected), when the source
+            reports it; absent otherwise, never estimated. For a pre-aggregated event, the total
+            of the merged events, as for `rows`. Not produced by the PostgreSQL connector:
+            neither pgaudit nor `pg_stat_statements` reports a result size.
+          $ref: "#/components/schemas/Count"
         signals:
+          description: Signal ids of the registry `signals.json` (see `Signal`).
           type: array
           maxItems: 16
           uniqueItems: true
@@ -1807,7 +1974,29 @@ components:
         - required: [db_user]
         - required: [db_user_fingerprint]
     ObjectRef:
-      description: Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+      description: |
+        Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+
+        **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
+        one of two reasons:
+        - **unknown object**: the source does not say which objects were reached and the agent
+          cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
+          it cannot parse). `database` is the session's database and `schema` is absent. Such a
+          read or write is reported against `*`, never dropped; the event may also list, next to
+          `*`, the objects the agent could tell;
+        - **masked name**: normalization replaced the name (a name matched by a classifier, or
+          one that does not conform to `Identifier`). This also applies to `database` and
+          `schema`.
+
+        In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+        The console compares it as the string `*` (ADR-0021): an `objects` condition or a
+        location exception selects it only when its glob matches the string `*` (the glob `*`,
+        or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its
+        sensitivity is that of the findings recorded under the same normalized name (any
+        schema when `schema` is absent), usually none, so its score is usually 0; the event
+        still matches conditions that do not depend on objects (signals, principals, rows,
+        anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
+        therefore does not see such accesses: signal, volume and anomaly conditions do.
       type: object
       additionalProperties: false
       required: [database, object]

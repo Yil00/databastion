@@ -1,0 +1,96 @@
+{
+  "batch_id": "01920f62-5e3c-7d40-9122-7c3d4e5f6071",
+  "events": [
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:10:00Z",
+      "principal": {
+        "db_user": "etl",
+        "client_addr": "192.0.2.30",
+        "application": "psql"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "clients"
+        }
+      ],
+      "rows": 1250000,
+      "signals": [
+        "shape.full_table_read",
+        "volume.large_result"
+      ],
+      "source": "pgaudit",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:11:00Z",
+      "principal": {
+        "db_user": "etl",
+        "client_addr": "192.0.2.30",
+        "application": "psql"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "orders"
+        }
+      ],
+      "signals": [
+        "signature.copy_to_file",
+        "shape.full_table_copy"
+      ],
+      "source": "pgaudit",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:12:00Z",
+      "principal": {
+        "db_user": "etl",
+        "client_addr": "192.0.2.30",
+        "application": "psql"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.copy_to_program"
+      ],
+      "source": "pgaudit",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-09-28T14:00:00Z",
+      "ts_last": "2026-09-28T14:01:00Z",
+      "principal": {
+        "db_user": "report"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "invoices"
+        },
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "rows": 480,
+      "source": "pg_stat_statements",
+      "aggregated_count": 12
+    }
+  ]
+}

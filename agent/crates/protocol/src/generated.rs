@@ -11,8 +11,9 @@
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
+// - #/$defs/TargetDetail/not
 //
-// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 20.
+// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 21.
 //
 // `const: X` rewritten as `enum: [X]` (typify ignores string `const`):
 // - #/$defs/AgentConfigReloadJob/properties/type/const
@@ -21,7 +22,7 @@
 // - #/$defs/ClientAddress/anyOf/2/const
 // - #/$defs/DiscoveryScanJob/properties/type/const
 //
-// Patterns wrapped as `^[\s\S]*?(?:P)` (search semantics, same language): 25.
+// Patterns wrapped as `^[\s\S]*?(?:P)` (search semantics, same language): 27.
 //
 // Optional arrays with `minItems >= 1` generated as `Option<Vec<_>>` (absent != empty;
 // `Some([])` is accepted by serde and must be rejected by the agent-side mapping):
@@ -32,7 +33,9 @@
 
 /**Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
 and no returned value: only who, what object, which action, how many rows, and signals.
-`read` and `write` events name at least one object.
+`read` and `write` events name at least one object: when the agent cannot tell which
+objects a read or write reached, it reports the object `*` rather than dropping the
+event (see `ObjectRef`).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -41,11 +44,19 @@ pub struct AccessEvent {
     pub action: AccessEventAction,
     ///Number of raw events merged into this one.
     pub aggregated_count: ::std::num::NonZeroU64,
+    /**Size in bytes of the result returned (or of the data affected), when the source
+reports it; absent otherwise, never estimated. For a pre-aggregated event, the total
+of the merged events, as for `rows`. Not produced by the PostgreSQL connector:
+neither pgaudit nor `pg_stat_statements` reports a result size.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub bytes: ::std::option::Option<Count>,
     pub objects: ::std::vec::Vec<ObjectRef>,
     pub principal: Principal,
     ///Rows (documents, entries) returned or affected, when the source provides it.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub rows: ::std::option::Option<Count>,
+    ///Signal ids of the registry `signals.json` (see `Signal`).
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub signals: ::std::option::Option<::std::vec::Vec<Signal>>,
     pub source: AuditSource,
@@ -1585,7 +1596,11 @@ contract):
   or a classifier id not registered for the batch's version or outside the job's
   `params.classifiers` (`/findings/<i>/classifier`);
 - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
-- `formatMaximum`: a timestamp more than 5 min in the future;
+- `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
+  update, `/events/<i>/ts`, `/events/<i>/ts_last`);
+- `formatMinimum`: an access event's `ts_last` earlier than its `ts`
+  (`/events/<i>/ts_last`), or its `ts` older than the console's event retention
+  (`/events/<i>/ts`);
 - `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
 */
     pub keyword: ErrorDetailKeyword,
@@ -1604,7 +1619,11 @@ contract):
   or a classifier id not registered for the batch's version or outside the job's
   `params.classifiers` (`/findings/<i>/classifier`);
 - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
-- `formatMaximum`: a timestamp more than 5 min in the future;
+- `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
+  update, `/events/<i>/ts`, `/events/<i>/ts_last`);
+- `formatMinimum`: an access event's `ts_last` earlier than its `ts`
+  (`/events/<i>/ts_last`), or its `ts` older than the console's event retention
+  (`/events/<i>/ts`);
 - `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
 */
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2365,13 +2384,55 @@ received all of them.
     ///Findings reported so far for this job.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub findings: ::std::option::Option<Count>,
+    ///Objects processed so far (sampled or skipped).
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub objects_done: ::std::option::Option<Count>,
+    /**`discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually
+sampled so far. With the `skipped_*` counters below, `objects_total` (the objects
+listed in the job's scope, after its filters, across all databases of the target) and
+`objects_done` (the objects processed, sampled or skipped), it tells how much of the
+scope a scan covered: `objects_total - objects_done` objects were not reached (scan
+stopped by its deadline, cancellation or the findings cap). Coverage counters are
+counts only, never a name; each is optional (absent: not reported; a `skipped_*`
+reason absent counts 0) and none is checked by the console. A new skip reason is a new
+optional `skipped_*` counter (compatible change).
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub objects_sampled: ::std::option::Option<Count>,
+    /**Objects in the job's scope (`discovery.scan`: after its filters, across all databases
+of the target).
+*/
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub objects_total: ::std::option::Option<Count>,
     ///Estimated completion, from 0 to 1.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub ratio: ::std::option::Option<f64>,
+    /**Objects whose sampling failed (e.g. statement timeout, a privilege error at query
+time), after which the scan went on with the next object.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_error: ::std::option::Option<Count>,
+    /**Objects beyond a structural bound of the connector (partition leaves over the per-root
+cap, a truncated catalog listing).
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_limit: ::std::option::Option<Count>,
+    ///Objects not sampled because the agent's account cannot read them (e.g. no `SELECT` on any column).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_not_readable: ::std::option::Option<Count>,
+    ///Objects whose data is held outside the target (foreign tables, remote-access engines); never read (I5).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_remote: ::std::option::Option<Count>,
+    /**Objects not sampled because of row-level security (PostgreSQL: a policy depending on
+user code or on another relation, or a row-level security ancestor; ADR-0012).
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_row_level_security: ::std::option::Option<Count>,
+    /**Objects of a kind the connector does not sample (views, merge tables, sequences,
+storage engines outside the connector's allow-list).
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub skipped_unsupported: ::std::option::Option<Count>,
 }
 ///`error` is required when `status` is `failed`, and forbidden otherwise.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
@@ -2629,7 +2690,29 @@ impl<'de> ::serde::Deserialize<'de> for MetricsMapKey {
             })
     }
 }
-///Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+/**Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+
+**The name `*`.** An `object` equal to `*` means the agent does not name the object, for
+one of two reasons:
+- **unknown object**: the source does not say which objects were reached and the agent
+  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
+  it cannot parse). `database` is the session's database and `schema` is absent. Such a
+  read or write is reported against `*`, never dropped; the event may also list, next to
+  `*`, the objects the agent could tell;
+- **masked name**: normalization replaced the name (a name matched by a classifier, or
+  one that does not conform to `Identifier`). This also applies to `database` and
+  `schema`.
+
+In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+The console compares it as the string `*` (ADR-0021): an `objects` condition or a
+location exception selects it only when its glob matches the string `*` (the glob `*`,
+or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its
+sensitivity is that of the findings recorded under the same normalized name (any
+schema when `schema` is absent), usually none, so its score is usually 0; the event
+still matches conditions that do not depend on objects (signals, principals, rows,
+anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
+therefore does not see such accesses: signal, volume and anomaly conditions do.
+*/
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectRef {
@@ -3022,7 +3105,22 @@ pub struct SensitiveObject {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
 }
-///Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`.
+/**Exfiltration indicator computed by the agent from the raw audit data (ADR-0007). The
+vocabulary is the **signal registry** `shared/protocol/signals.json` (next to this file,
+schema `signals.schema.json`), which describes each id: a conforming agent emits only
+registered ids. Registered today: `signature.pg_dump`, `signature.copy_to_file`,
+`signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
+`volume.large_result`. Families: `signature.*` a dump or export tool or command (the
+console treats it as severe), `shape.*` a query shape (heuristic, evadable), `volume.*` a
+volume threshold of the agent. The registry is **append-only**: a new signal (e.g.
+`signature.mysqldump` for a future connector) is a new entry added by a compatible
+contract change; an id is never removed, renamed or given another meaning.
+
+This schema checks the **form** only (pattern), not registration, so that a console
+accepts a signal registered after it was built; it stores such a signal and matches it by
+exact id or family (`signature.*`). The console computes its own baseline verdict and
+does not rely on any `volume.*` signal for it (ADR-0021).
+*/
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct Signal(::std::string::String);
@@ -3107,6 +3205,92 @@ pub struct SpoolStatus {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub oldest_age_s: ::std::option::Option<Count>,
 }
+/**Human-readable explanation of the target's status from the last `check()`, for the
+console's display: why the audit level is degraded, what is not covered, an insecure
+setting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2
+schema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:
+the console does not parse it and never derives a decision from it (`reachable`,
+`audit_level` and `last_error` are the machine-readable status).
+
+Built by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error
+numbers) and engine metadata names (privileges, roles, normalized object names). It
+**never** contains a sampled value, a credential, a connection string, a target host
+name or address, query text, or a driver or server message. At most 1024 characters, no
+control, format, private-use or line / paragraph separator character, no `://` and no
+`@` (the obvious forms of a URL, connection string or `user@host` account). The agent
+truncates it on a character boundary and omits it when it does not conform; the console
+escapes it on display.
+*/
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct TargetDetail(::std::string::String);
+impl ::std::ops::Deref for TargetDetail {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<TargetDetail> for ::std::string::String {
+    fn from(value: TargetDetail) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for TargetDetail {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 1024usize {
+            return Err("longer than 1024 characters".into());
+        }
+        if value.chars().count() < 1usize {
+            return Err("shorter than 1 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags(
+                    "^[\\s\\S]*?(?:^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$)",
+                    "u",
+                )
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$)\""
+                    .into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for TargetDetail {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for TargetDetail {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for TargetDetail {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
 /**Identifier of a target, as declared in `agent.yaml` (ADR-0006). Unique per agent. A slug: it
 cannot contain a host name, address or credential.
 */
@@ -3187,6 +3371,8 @@ pub struct TargetStatus {
     pub audit_level: AuditLevel,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub audit_source: ::std::option::Option<AuditSource>,
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub detail: ::std::option::Option<TargetDetail>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub edition: ::std::option::Option<Edition>,
     pub engine: Engine,
