@@ -200,6 +200,26 @@ Requirements for every connector (acceptance criteria of P2-B and P2-C, in addit
 - no TCP keepalive on target connections: a silently dropped connection is only detected by the timeouts;
 - RLS policy expressions (which may hold literals) are read into agent memory for the check.
 
+## MongoDB connector
+*Implemented in P5-A (#74, in review), `agent/crates/connector-mongodb`; decisions in [ADR-0026](adr/0026-mongodb-connector.md) (Proposed); details in `agent/README.md` and the crate README. Discovery only: `check()` reports the audit level None.*
+
+- **Own client** (ADR-0026 decision 1): a closed subset of the wire protocol (`OP_MSG` only, no compression, no exhaust), a closed command set built in code (no write command, no `getMore`, no user-supplied filter or pipeline), the reply length checked on the header before the body is read (at most 16 MiB + 64 KiB), BSON parsed by a bounded reader that fails closed. Minimum server: MongoDB 5.0.
+- **One declared host, direct connection** (I5): a standalone, one replica-set member or a `mongos`. The hosts named by the server in `hello` are never contacted, `mongodb+srv` is not supported (no DNS SRV / TXT lookups), and there is no pool or monitoring connection. To scan a replica set, declare the member to read from.
+- **TLS** (`targets[].mongodb.tls`, rustls only), placed as for PostgreSQL: `verify_full` by default, TLS 1.2 or 1.3 from the first byte, certificate verified against a pinned CA file (`mongodb.ca_file`) or the system store, host name or IP SAN checked; no client certificate. `disable` is accepted only on a Unix socket or a loopback IP literal (never `localhost`). `disable_insecure` is an explicit opt-in on a network: a warning at every connection and the `security.tls_disabled` note, since samples travel in clear and read-only is not guaranteed (see the residual risks).
+- **Authentication: SCRAM-SHA-256 only, mutual.** The mechanism is fixed by the client, never taken from the server's list. The password is read from its `agent.yaml` reference into zeroized memory and SASLprepped; the server's iteration count must be between 4096 and 100 000, its nonce must extend the client's, and its signature is verified before any other command runs. SCRAM-SHA-1, `PLAIN` (LDAP), X.509, Kerberos, AWS and OIDC are refused or not implemented. `authSource` comes from `mongodb.auth_source` (default `admin`).
+- **Read-only and bounded** (I4). MongoDB has no read-only session mode: the command set and the role are the only controls. `maxTimeMS` (from the clamped job parameter, never `0`) on every command that reads data or metadata, plus a client-side deadline on every exchange. The only pipeline is `[{$sample: {size: n}}]` with `allowDiskUse: false`. No cursor is left open (`singleBatch`, or a batch of `n + 1`, and `killCursors` on any reply with an open cursor); no session id is sent, so no server session or transaction exists. Each collection is read by one command parsed whole before `FindingSink::submit().await`.
+- **Scope**: views are never read (their pipeline could read other collections or run JavaScript); `admin`, `local`, `config`, `system.*` and queryable-encryption state collections (`enxcol_.*`) are never read. Encrypted, UUID, compressed, sensitive and vector binaries are never read.
+- **Server messages** are reduced to the numeric error code and a closed stage; `errmsg`, `codeName` and any other server text are never kept, logged or sent.
+
+**Residual risks** ([ADR-0026](adr/0026-mongodb-connector.md#residual-risks)):
+- the connector parses BSON and `OP_MSG` from a possibly hostile server with its own code: bounded and fail-closed, exercised by property tests, but not fuzzed yet (ROADMAP follow-up);
+- one reply (up to 16 MiB + 64 KiB) is received whole before its documents are walked: that is the memory peak per collection;
+- interrupting a running operation on disconnect is the server's behavior; `maxTimeMS` remains the bound, and no `killOp` is sent;
+- **dynamic map keys** (review M3): object levels keyed by data are collapsed to `*` when the sample shows them (more than 16 distinct keys, or at least 3 keys each seen in one document only across at least 2 documents). Not caught: a map with at most 16 keys that recur across the sampled documents, fewer than 3 distinct keys, or a sample of one document with at most 16 keys; such keys, if they do not look like values, reach the field path. Conversely, a genuine sub-document with more than 16 fields, or with optional fields each present in one sampled document, loses its field names (`profile.*`);
+- collections the account holds no privilege on are not listed (`authorizedCollections`), so they cannot be reported as not covered; data reachable only through a view is not covered;
+- a generic binary that is valid UTF-8 is classified as text; one that is not is skipped;
+- no SCRAM channel binding (MongoDB offers no `-PLUS` mechanism): with `disable_insecure`, an attacker on the path can relay the exchange and act as the agent's account; with `verify_full`, server authentication rests on the certificate and the SCRAM signature.
+
 ## Recommended database accounts (read-only)
 **PostgreSQL** ([ADR-0012](adr/0012-postgresql-agent-grants.md), minimal variant, recommended default). Discovery through explicit per-schema grants; Audit through `pg_read_all_stats` only.
 ```sql
@@ -264,7 +284,36 @@ GRANT SELECT ON app.* TO 'databastion'@'10.0.0.15';
 - The connector (P2-C, #52) samples base tables of local storage engines only (never `FEDERATED`, `CONNECT`, `SPIDER`, `S3`, `SPHINX`, NDB or `MERGE` tables, views or virtual generated columns), reads no statistics column during introspection and asks for a table's `TABLE_ROWS` only after reading its engine alone and finding a local one (computing `TABLE_ROWS` opens the table's handler, so a `FEDERATED` table would connect to its remote server; [ADR-0020](adr/0020-mysql-mariadb-connector-as-merged.md)), refuses cleartext, PAM, `sha256_password`, `client_ed25519` and RSA key retrieval, and does not support proxies (ProxySQL, MaxScale). Details and residual risks in ADR-0018. ADR-0025 narrows its "role privileges are not evaluated" risk to MariaDB non-default roles, `PUBLIC` grants and MySQL before 8.0.19.
 - The dev accounts (`dev/mysql/`, `dev/mariadb/`) use the minimal variant (#52): `SELECT` on the seeded application database only, `REQUIRE SSL`, `MAX_USER_CONNECTIONS 5` (raised from 4 in #72, matching [ADR-0025](adr/0025-mysql-mariadb-role-privileges-and-heartbeat-checks.md) decision 11 for audit-log-file Audit; the MySQL Audit tests create their own `performance_schema` account), and `MAX_STATEMENT_TIME 30` on MariaDB. As a dev-only deviation, the host is `'%'` (the agent connects through a published port). They have no `performance_schema` grant, also after P4-B; the Audit integration tests create a dedicated account with it (ADR-0023).
 
-MongoDB: `read` roles on the targeted databases + `clusterMonitor`. OpenLDAP: a service DN with read rights on the tree and on `cn=accesslog`.
+**MongoDB** ([ADR-0026](adr/0026-mongodb-connector.md) decision 5, Discovery). A custom role with `find` and `listCollections` on each monitored database; nothing cluster-wide.
+```js
+// mongosh, in the admin database. One privilege per monitored database.
+db.getSiblingDB("admin").createRole({
+  role: "databastionDiscovery",
+  privileges: [
+    { resource: { db: "app", collection: "" }, actions: ["find", "listCollections"] }
+    // Only if the server refuses the time-series collections (see below):
+    // , { resource: { db: "app", system_buckets: "" }, actions: ["find"] }
+  ],
+  roles: []
+});
+// passwordPrompt() keeps the password out of the shell history.
+// SCRAM-SHA-256 credentials only: the agent refuses SCRAM-SHA-1.
+// authenticationRestrictions (recommended): the agent's address(es) only.
+db.getSiblingDB("admin").createUser({
+  user: "databastion",
+  pwd: passwordPrompt(),
+  mechanisms: ["SCRAM-SHA-256"],
+  roles: [{ role: "databastionDiscovery", db: "admin" }],
+  authenticationRestrictions: [{ clientSource: ["10.0.0.15"] }]
+});
+```
+- `collection: ""` covers every collection of the database except `system.*` ones. Nothing else is needed: databases and collections are listed with `authorizedDatabases` / `authorizedCollections` (no `listDatabases` privilege), the size estimate is a `count` (covered by `find`), and a user can always kill its own cursors.
+- Never grant `read` (it includes `changeStream`, every future write with its values, `dbHash` and `find` on `system.js`), `clusterMonitor` (`inprog`: other sessions' operations with their literals; `system.profile` of every database; `getCmdLineOpts`), `readAnyDatabase`, any privilege on `admin`, `local` or `config`, or any write or administration action. `check()` evaluates the account's resolved privileges (`connectionStatus` with `showPrivileges`, inherited roles included) and reports, as closed notes with counts: write or administration actions (`privilege.write_actions`), read actions beyond `find` / `listCollections` (`privilege.read_beyond_discovery`), cluster-wide actions (`privilege.cluster_actions`), privileges on every database (`privilege.any_database`) and system collections or the `admin` / `local` / `config` databases (`privilege.system_collections`). A resource it cannot parse counts as a privilege on every database (fail closed); privileges it cannot read are reported as `privilege.not_evaluated`.
+- **Time-series collections** are read through their view (`find` with a limit). `collection: ""` does not cover their bucket collections (`system.buckets.*`). If the server refuses the read, the scan counts the collection as not readable and `check()` reports `coverage.timeseries_not_readable` with the count observed in the last scan (never predicted from the privileges). The fallback grant, shown commented above, reads the time-series collections' own documents only and is not reported as over-privilege.
+- Accounts without SCRAM-SHA-256 credentials (SCRAM-SHA-1 only, LDAP, Kerberos, X.509, AWS, OIDC) cannot be used by the agent. The grants of the Audit sources (profiler, logs) will be defined with P5-B / P5-C.
+- The dev account (`dev/mongo/initdb/`) uses this role on the seeded `app` database with SCRAM-SHA-256 only. As a dev-only deviation, it has no `authenticationRestrictions` (the agent connects through the published port, from the Docker gateway).
+
+**OpenLDAP**: a service DN with read rights on the tree and on `cn=accesslog` (to be defined in phase 6).
 
 ## Deployment recommendations
 - Agents and console run as a **non-root** user, read-only file system, `cap_drop: ALL`, `no-new-privileges`
