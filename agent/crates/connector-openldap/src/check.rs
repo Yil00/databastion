@@ -166,7 +166,17 @@ impl CheckState {
             .map(|(b, _)| *b)
     }
 
-    /// Records whether failed searches of `context` are logged.
+    /// When the failed-operation answer of `context` was last recorded
+    /// (`None`: never, or more than 24 h ago).
+    pub(crate) fn failures_tested_at(&self, target_id: &str, context: &str) -> Option<Instant> {
+        lock(&self.failures_logged)
+            .get(&(target_id.to_owned(), context.to_owned()))
+            .filter(|(_, t)| t.elapsed() < RECORD_FRESHNESS)
+            .map(|(_, t)| *t)
+    }
+
+    /// Records whether failed searches of `context` are logged (the latest
+    /// answer replaces the previous one).
     pub(crate) fn note_failures_logged(&self, target_id: &str, context: &str, logged: bool) {
         lock(&self.failures_logged).insert(
             (target_id.to_owned(), context.to_owned()),
@@ -354,18 +364,8 @@ pub(crate) async fn base_readable<S: AsyncRead + AsyncWrite + Unpin>(
         .is_some_and(|n| n > 0))
 }
 
-/// Which search records [`search_record`] looks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Outcome {
-    /// `reqResult` 0.
-    Succeeded,
-    /// Any other result: `olcAccessLogSuccess` is all or nothing, so one
-    /// failed operation logged proves they all are.
-    Failed,
-}
-
-/// Whether `cn=accesslog` holds a search record of `context` from the last
-/// 24 h with the given outcome. Records below one of `deeper` (naming
+/// Whether `cn=accesslog` holds a successful search record of `context`
+/// from the last 24 h. Records below one of `deeper` (naming
 /// contexts nested in `context`, raw DNs) do not count: a context never
 /// borrows the proof of another one (#79 round-3 review L2).
 pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
@@ -373,17 +373,11 @@ pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
     accesslog_base: &str,
     context: &str,
     deeper: &[&str],
-    outcome: Outcome,
 ) -> Result<bool, LdError> {
-    let success = Filter::Eq("reqResult", "0".to_owned());
-    let result = match outcome {
-        Outcome::Succeeded => success,
-        Outcome::Failed => Filter::Not(Box::new(success)),
-    };
     let since = time::csn_at(SystemTime::now() - RECORD_FRESHNESS);
     let mut and = vec![
         Filter::Eq("objectClass", "auditSearch".to_owned()),
-        result,
+        Filter::Eq("reqResult", "0".to_owned()),
         Filter::Extensible {
             rule: "dnSubtreeMatch",
             attr: "reqDN",
@@ -464,7 +458,8 @@ fn deeper_contexts<'a>(contexts: &'a [(String, String)], canon: &str) -> Vec<&'a
 }
 
 /// Looks for a recent search record of each unproven context; when there
-/// is none, runs one base search of the context and looks again.
+/// is none, runs one base search of the context and looks again. Then
+/// re-runs the failed-operation probe (see below).
 pub(crate) async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
     state: &CheckState,
     target: &TargetConfig,
@@ -478,12 +473,12 @@ pub(crate) async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
         .take(MAX_PROVEN_PER_REPORT)
     {
         let deeper = deeper_contexts(contexts, canon);
-        let mut found = search_record(s, accesslog_base, raw, &deeper, Outcome::Succeeded).await?;
+        let mut found = search_record(s, accesslog_base, raw, &deeper).await?;
         if !found {
             // A read of the context itself: a server logging reads records
             // it at once.
             base_readable(s, raw).await?;
-            found = search_record(s, accesslog_base, raw, &deeper, Outcome::Succeeded).await?;
+            found = search_record(s, accesslog_base, raw, &deeper).await?;
         }
         if found {
             state.note_search(&target.id, canon);
@@ -492,28 +487,69 @@ pub(crate) async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
     // Failed operations (a search cut by a limit after returning entries:
     // a capped export) must be logged too: `olcAccessLogSuccess: TRUE`
     // leaves them out, and the agent cannot read that setting. A base read
-    // of an entry that does not exist fails on any context (32).
-    for (raw, canon) in contexts
-        .iter()
-        .filter(|(_, c)| state.failures_logged(&target.id, c) != Some(true))
-        .take(MAX_PROVEN_PER_REPORT)
-    {
-        let deeper = deeper_contexts(contexts, canon);
-        if search_record(s, accesslog_base, raw, &deeper, Outcome::Failed).await? {
-            state.note_failures_logged(&target.id, canon, true);
-            continue;
-        }
-        let probe_dn = format!("{ABSENT_RDN},{raw}");
+    // of an entry that does not exist fails on any context (32). The probe
+    // runs at every report, on the contexts whose answer is the oldest
+    // first, and only its own record counts (a DN unique to this probe):
+    // the latest answer replaces the previous one, so a change of
+    // `olcAccessLogSuccess` is seen within one report interval (#79
+    // round-3 review L1). Its DN is below the context itself, so a nested
+    // context's records never count either.
+    let mut order: Vec<&(String, String)> = contexts.iter().collect();
+    order.sort_by_key(|(_, c)| state.failures_tested_at(&target.id, c));
+    for (raw, canon) in order.into_iter().take(MAX_PROVEN_PER_REPORT) {
+        let probe_dn = format!("{},{raw}", absent_rdn());
         base_readable(s, &probe_dn).await?;
-        let logged = search_record(s, accesslog_base, raw, &deeper, Outcome::Failed).await?;
+        let logged = probe_record(s, accesslog_base, &probe_dn).await?;
         state.note_failures_logged(&target.id, canon, logged);
     }
     Ok(())
 }
 
-/// The RDN of the entry the check reads to cause a failed search
+/// Whether `cn=accesslog` holds the failed search record of the probe read
+/// of `probe_dn` (exact `reqDN`).
+async fn probe_record<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut Session<S>,
+    accesslog_base: &str,
+    probe_dn: &str,
+) -> Result<bool, LdError> {
+    let since = time::csn_at(SystemTime::now() - RECORD_FRESHNESS);
+    let search = Search {
+        base: accesslog_base,
+        scope: Scope::One,
+        size_limit: 1,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::And(vec![
+            Filter::Eq("objectClass", "auditSearch".to_owned()),
+            Filter::Not(Box::new(Filter::Eq("reqResult", "0".to_owned()))),
+            Filter::Eq("reqDN", probe_dn.to_owned()),
+            Filter::Ge("entryCSN", since),
+        ]),
+        attributes: &["1.1"],
+    };
+    Ok(probe(s, &search, &mut |_: Entry| {})
+        .await?
+        .is_some_and(|n| n > 0))
+}
+
+/// The RDN prefix of the entry the check reads to cause a failed search
 /// (`noSuchObject`); it is not expected to exist.
 pub(crate) const ABSENT_RDN: &str = "cn=databastion-absent-probe";
+
+/// The RDN of one probe: [`ABSENT_RDN`] and a suffix unique to the probe
+/// (time and a process counter), so its log record is told apart from the
+/// previous probes' ones.
+fn absent_rdn() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| {
+            u64::try_from(d.as_nanos() & u128::from(u64::MAX)).unwrap_or(0)
+        });
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{ABSENT_RDN}-{nanos:x}{n:x}")
+}
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth, Source) {
     let mut detail: Vec<String> = Vec::new();

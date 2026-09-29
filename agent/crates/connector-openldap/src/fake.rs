@@ -544,4 +544,34 @@ mod proofs {
                 >= 1
         );
     }
+
+    /// #79 round-3 review L1: the absent-entry probe runs at every report,
+    /// with a DN of its own, and only its latest answer counts.
+    #[tokio::test]
+    async fn the_failed_operation_probe_keeps_only_the_latest_answer() {
+        let failures = Arc::new(AtomicBool::new(true));
+        let probes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (s, _) = session(log_server(Arc::clone(&failures), Arc::clone(&probes))).await;
+        let mut s = s.unwrap();
+        let state = CheckState::default();
+        let t = target();
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert_eq!(state.failures_logged(&t.id, OUTER), Some(true));
+        assert_eq!(state.failures_logged(&t.id, NESTED), Some(true));
+        // `olcAccessLogSuccess: TRUE` from now on: the next report sees it,
+        // although the earlier probes' records are still in the log.
+        failures.store(false, Ordering::SeqCst);
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert_eq!(state.failures_logged(&t.id, OUTER), Some(false));
+        assert_eq!(state.failures_logged(&t.id, NESTED), Some(false));
+        // Every probe has its own DN, below its context.
+        let probes = probes.lock().unwrap();
+        assert_eq!(probes.len(), 4);
+        assert_eq!(probes.iter().collect::<HashSet<_>>().len(), 4);
+        assert!(probes.iter().all(|p| p.ends_with(OUTER)));
+    }
 }
