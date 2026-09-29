@@ -146,7 +146,7 @@ services:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
-    # Community edition: no audit log. Profiler level 1 + structured JSON log (docs/08: Limited -> Partial).
+    # Community edition: no audit log. Profiler level 1 + structured JSON log (ADR-0027: Limited).
     command:
       - mongod
       - --profile

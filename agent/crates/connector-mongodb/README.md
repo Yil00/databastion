@@ -1,11 +1,11 @@
 # databastion-connector-mongodb
 
 MongoDB connector of the DataBastion agent: Discovery and `check()` (P5-A,
-[ADR-0026](../../../docs/adr/0026-mongodb-connector.md)). The client, the
-commands and the sampling are described in
+[ADR-0026](../../../docs/adr/0026-mongodb-connector.md)) and Audit (P5-B,
+P5-C, [ADR-0027](../../../docs/adr/0027-mongodb-audit.md), Proposed). The
+client, the commands, the sampling and the Audit sources are described in
 [agent/README.md](../../README.md#mongodb-connector); this page records what
-an operator sets up and what the connector does not cover. Audit (P5-B,
-P5-C) is not implemented: `check()` reports the audit level **None**.
+an operator sets up and what the connector does not cover.
 
 ## Account
 
@@ -58,8 +58,81 @@ notes, anything beyond this grant:
 
 The built-in `read` role (change streams, `system.js`) and `clusterMonitor`
 (other sessions' operations, `system.profile` of every database) are
-reported: they are not needed for Discovery. The grants of the Audit sources
-will be defined with P5-B / P5-C.
+reported: they are not needed for Discovery.
+
+## Audit
+
+| Edition | Source (`audit_source`) | Level |
+|---|---|---|
+| Enterprise, Percona Server for MongoDB | `auditLog` JSON file (`mongodb_audit_log`) | Partial once a successful `authCheck` was read in the last 24 h, Limited before |
+| Any | structured JSON server log (`mongodb_log`) | Limited |
+| Any (not a `mongos`) | profiler, `system.profile` (`mongodb_profiler`) | Limited |
+
+Full is never reported: the `auditLog` has no document counts, and the log
+and the profiler only hold the operations the server records (slower than
+`slowms`, or sampled; the profiler also overwrites itself). One source per
+target, in this order of preference.
+
+**File sources** (no database grant). Declare the file in the target:
+
+```yaml
+  mongodb:
+    audit_log: {path: /var/log/mongodb/auditLog.json, format: audit_log}   # or format: server_log
+```
+
+- `auditLog`: `auditLog.destination: file`, `auditLog.format: JSON` (the
+  `mongo` schema; BSON and OCSF are not supported), and
+  `setParameter.auditAuthorizationSuccess: true`, without which reads and
+  writes are not logged (only authentications, DDL, user changes and
+  refused commands): the level stays Limited with
+  `audit.authcheck_success_pending`. An `auditLog.filter` that leaves reads
+  out is the operator's choice and cannot be detected.
+- Server log: `systemLog.destination: file` (JSON, MongoDB 4.4 and later).
+  Operations are logged when slower than `operationProfiling.slowOpThresholdMs`
+  (`slowms`), sampled by `slowOpSampleRate`: a low `slowms` sees more, at a
+  cost.
+- File ACL: the agent's user reads the file (for instance `0640` with a
+  dedicated group on the log directory), never the data directory. These
+  files hold other users' literals (filters, documents): never make them
+  world-readable. The agent keeps no literal (closed-shape facts only).
+
+**Profiler** (when the agent cannot read the files, e.g. it does not run on
+the database host). Profiling itself (`profile` level, `slowms`) is set by
+the operator. The account needs `find` on each database's `system.profile`,
+in a role of its own:
+
+```js
+db.getSiblingDB("admin").createRole({
+  role: "databastionAuditProfiler",
+  privileges: [
+    { resource: { db: "app", collection: "system.profile" }, actions: ["find"] }
+  ],
+  roles: []
+});
+db.getSiblingDB("admin").grantRolesToUser("databastion", [{ role: "databastionAuditProfiler", db: "admin" }]);
+```
+
+This grant lets the account read every profiled command of the database,
+literals included, over the network: prefer a file source. `check()` counts
+it as the Audit grant only while an Audit stream reads the profiler, and
+reports it as `privilege.system_collections` otherwise.
+
+| Note | Meaning |
+|---|---|
+| `audit.authcheck_success_pending` | `auditLog`: no successful `authCheck` read in the last 24 h (Limited) |
+| `audit.auditlog_on_community` | an `auditLog` is declared, but the server is Community: not used |
+| `audit.log_without_row_counts` | the `auditLog` has no document counts |
+| `audit.slow_operations_only` | server log or profiler: slow or sampled operations only |
+| `audit.source_not_configured` | no usable source (level None) |
+| `audit.log_not_readable` | the declared file cannot be read by the agent |
+| `audit.records_dropped` | records that did not parse, oversized or damaged, in the last 24 h |
+
+Detected: `signature.mongodump` and `signature.mongoexport` (the tools'
+application name, which a client declares itself), whole-collection reads
+(`shape.full_table_read`) and more than 10 000 documents in one operation
+(`volume.large_result`, log and profiler). The agent's own reads are left
+out only from its account, its address and its application name
+(`databastion-agent`), within its Discovery budget.
 
 ## Target settings
 
@@ -93,5 +166,10 @@ the primary); the connector never contacts the other members.
   non-integral doubles.
 - Accounts without SCRAM-SHA-256 credentials (SCRAM-SHA-1 only, LDAP,
   Kerberos, X.509, AWS, OIDC), `mongodb+srv` URIs, servers older than 5.0.
+- Audit: operations the server does not record (Community: faster than
+  `slowms`), profiler entries overwritten between two polls, the activity of
+  other replica-set members (the log and the profiler are per node), the
+  user of a connection that authenticated before the agent started reading
+  the server log (reported as an unidentified account).
 
-Residual risks are listed in ADR-0026.
+Residual risks are listed in ADR-0026 and ADR-0027.
