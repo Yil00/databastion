@@ -36,11 +36,13 @@
 //! address, carry no signal, and either are one of the connector's own
 //! statements that read no relation (exact text with pgaudit, normalized
 //! shape with `pg_stat_statements`; not charged) or stay within
-//! Discovery's row budget per named object and window (`OwnAccount`). Any
+//! Discovery's row budget per named object and window (`PgOwn`). Any
 //! other event of the agent's account on `*` is reported.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime};
+
+use databastion_core::audit::own::{ClientSeen, OwnAccount};
 
 use databastion_classifiers::masking::{
     ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
@@ -52,7 +54,6 @@ use databastion_classifiers::query::{
 };
 
 use super::records::AuditRecord;
-use crate::conn::APPLICATION_NAME;
 use crate::discover::normalize;
 use crate::sql;
 
@@ -339,54 +340,17 @@ impl DumpTracker {
     }
 }
 
-/// Period over which the agent's own reads of one object are budgeted.
-const OWN_PERIOD_HOURS: u64 = 24;
-/// Objects budgeted at most; beyond, the agent's own reads of a new
-/// object are reported.
-const OWN_MAX_OBJECTS: usize = 10_000;
-
-/// Where the client address of an event comes from.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ClientSeen {
-    /// The source logs it (pgaudit); `None`: not logged.
-    Logged(Option<ClientAddr>),
-    /// The source never shows it (`pg_stat_statements`).
-    NotVisible,
-}
-
-/// Most statements registered at run time ([`OwnAccount::allow_statement`]).
+/// Most statements registered at run time ([`PgOwn::allow_statement`]).
 const OWN_MAX_EXTRA_STATEMENTS: usize = 8;
 
-/// Rows the agent's own account read per object, per hour, over the
-/// last 24 hours. Kept per target by the connector (`CheckState`), so it
-/// outlives streams: a restarted stream (failure, source switch, the
-/// agent's sessions terminated on purpose) does not get a fresh budget.
-/// Not persisted: an agent restart resets it.
-///
-/// Also keeps the table-less statements registered at run time (the
-/// `pg_stat_statements` text query, whose schema is only known then), so
+/// Table-less statements registered at run time for a target (the
+/// `pg_stat_statements` text query, whose schema is only known then). Kept
+/// per target by the connector (`CheckState`), like the row budget, so
 /// that a pgaudit stream started after a `pg_stat_statements` period
-/// recognizes them in the records of that period.
-pub(crate) struct OwnUsage {
-    start: Instant,
-    usage: HashMap<String, VecDeque<(u64, u64)>>,
-    statements: Vec<String>,
-}
+/// recognizes them in the records of that period. Not persisted.
+pub(crate) type SharedOwnStatements = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-impl Default for OwnUsage {
-    fn default() -> Self {
-        Self {
-            start: Instant::now(),
-            usage: HashMap::new(),
-            statements: Vec::new(),
-        }
-    }
-}
-
-/// Shared handle on a target's [`OwnUsage`].
-pub(crate) type SharedOwnUsage = std::sync::Arc<std::sync::Mutex<OwnUsage>>;
-
-/// What an event of the agent's account is about, for [`OwnAccount`].
+/// What an event of the agent's account is about, for [`PgOwn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnKind {
     /// One of the connector's own statements that read no relation.
@@ -413,46 +377,39 @@ fn statement_shape(n: &NormalizedQuery) -> String {
         .join(" ")
 }
 
-/// The agent's own activity, which may be left out of the events.
-pub(crate) struct OwnAccount {
-    account: String,
-    /// Client address the server sees for the agent (`None`: could not be
-    /// read; then nothing is left out).
-    addr: Option<ClientAddr>,
-    /// Rows per object over [`OWN_PERIOD_HOURS`] above which the agent's
-    /// own reads are reported anyway (`limits.max_sample_rows`: one
-    /// Discovery scan never reads more per object).
-    budget: u64,
-    /// Per object: rows per hour (hour index, rows), last 24 hours.
-    usage: SharedOwnUsage,
-    /// The connector's own statements that name no relation (closed
-    /// list: `sql::OWN_TABLELESS`, and the `pg_stat_statements` text
-    /// query of this stream), as sent (pgaudit logs the text verbatim)
-    /// and as normalized shapes (`pg_stat_statements` replaces the
-    /// constants).
+/// The agent's own activity in the PostgreSQL sources: the core rule
+/// (`databastion_core::audit::own`: account, application, address, no
+/// signal, row budget per object) plus what is PostgreSQL-specific.
+///
+/// - The connector's own statements that name no relation (closed list:
+///   [`sql::OWN_TABLELESS`], and the `pg_stat_statements` text query
+///   registered by its stream) are left out on the core's identity and
+///   signal rules without being charged ([`OwnKind::Tableless`]): they read
+///   no row, and charging them used up the `*` budget within one scan.
+///   They are recognized as sent (pgaudit logs the text verbatim) and by
+///   normalized shape (`pg_stat_statements` replaces the constants).
+/// - Any other event of the agent's account on the unknown object `*`
+///   ([`OwnKind::Unknown`]: a function call, even in `pg_catalog`, e.g.
+///   `query_to_xml`; a text that does not parse) is reported and never
+///   budgeted: the connector names every relation it reads.
+pub(crate) struct PgOwn {
+    core: OwnAccount,
     own_texts: Vec<String>,
     own_shapes: Vec<String>,
+    registry: SharedOwnStatements,
 }
 
-impl OwnAccount {
-    pub(crate) fn new(
-        account: &str,
-        addr: Option<ClientAddr>,
-        budget: u64,
-        usage: SharedOwnUsage,
-    ) -> Self {
-        let extra = usage
+impl PgOwn {
+    pub(crate) fn new(core: OwnAccount, registry: SharedOwnStatements) -> Self {
+        let extra = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .statements
             .clone();
         let mut own = Self {
-            account: account.to_owned(),
-            addr,
-            budget,
-            usage,
+            core,
             own_texts: Vec::new(),
             own_shapes: Vec::new(),
+            registry,
         };
         for text in sql::OWN_TABLELESS {
             own.add_statement(text);
@@ -479,13 +436,11 @@ impl OwnAccount {
     pub(crate) fn allow_statement(&mut self, text: &str) {
         self.add_statement(text);
         let mut guard = self
-            .usage
+            .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !guard.statements.iter().any(|t| t == text)
-            && guard.statements.len() < OWN_MAX_EXTRA_STATEMENTS
-        {
-            guard.statements.push(text.to_owned());
+        if !guard.iter().any(|t| t == text) && guard.len() < OWN_MAX_EXTRA_STATEMENTS {
+            guard.push(text.to_owned());
         }
     }
 
@@ -501,61 +456,7 @@ impl OwnAccount {
             .is_some_and(|n| self.own_shapes.contains(&statement_shape(n)))
     }
 
-    /// Charges `rows` to an object; `true` when its 24 h total exceeds the
-    /// budget (or it cannot be tracked).
-    fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
-        let mut guard = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let hour = now.saturating_duration_since(guard.start).as_secs() / 3600;
-        let usage = &mut guard.usage;
-        if !usage.contains_key(&key) && usage.len() >= OWN_MAX_OBJECTS {
-            // Drop objects with no use in the period, then fail open to
-            // reporting.
-            usage.retain(|_, v| {
-                v.back()
-                    .is_some_and(|(h, _)| hour.saturating_sub(*h) < OWN_PERIOD_HOURS)
-            });
-            if usage.len() >= OWN_MAX_OBJECTS {
-                return true;
-            }
-        }
-        let buckets = usage.entry(key).or_default();
-        while buckets
-            .front()
-            .is_some_and(|(h, _)| hour.saturating_sub(*h) >= OWN_PERIOD_HOURS)
-        {
-            buckets.pop_front();
-        }
-        match buckets.back_mut() {
-            Some((h, n)) if *h == hour => *n = n.saturating_add(rows),
-            _ => buckets.push_back((hour, rows)),
-        }
-        let total = buckets
-            .iter()
-            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
-        total > self.budget
-    }
-
-    /// Whether an event may be left out: the agent's account, its
-    /// `application_name` (pgaudit), its own client address (pgaudit; the
-    /// agent's address must be known), no signal, and at most `budget`
-    /// rows per object over 24 hours (unknown rows are charged the whole
-    /// budget). With stolen agent credentials, reads from elsewhere, reads
-    /// that look like exports, and reading more of a table than one
-    /// Discovery scan per day are still reported.
-    ///
-    /// [`OwnKind::Tableless`]: the event is one of the connector's own
-    /// statements that read no relation ([`sql::OWN_TABLELESS`]: the
-    /// per-transaction `set_config`, `current_setting`,
-    /// `inet_client_addr`; the `pg_stat_statements` text query). Such an
-    /// event is left out on the same identity and signal rules, without
-    /// being charged: it reads no row, and charging it would use up the
-    /// `*` budget within one scan. Any other table-less statement of the
-    /// account ([`OwnKind::Unknown`]: a function call, even in
-    /// `pg_catalog`, e.g. `query_to_xml`; a text that does not parse) is
-    /// reported: events on the unknown object `*` are never left out.
+    /// Whether an event may be left out (see the type documentation).
     fn routine(
         &mut self,
         user: &str,
@@ -565,44 +466,16 @@ impl OwnAccount {
         kind: OwnKind,
         now: Instant,
     ) -> bool {
-        if user != self.account {
-            return false;
-        }
-        let addr_ok = match (self.addr, client) {
-            (None, _) => false,
-            (Some(own), ClientSeen::Logged(Some(c))) => own == c,
-            (Some(_), ClientSeen::Logged(None)) => false,
-            (Some(_), ClientSeen::NotVisible) => true,
-        };
-        let identity = application.is_none_or(|a| a == APPLICATION_NAME) && addr_ok;
         match kind {
-            OwnKind::Tableless => return identity && e.signals().is_empty(),
-            // The connector names every relation it reads, and its only
-            // table-less statements are the ones above: an event of the
-            // account on the unknown object is not the agent's own
-            // traffic. Reported, never budgeted: the unknown object is
-            // never charged, so no traffic can exhaust its budget.
-            OwnKind::Unknown => return false,
-            OwnKind::Named => {}
+            OwnKind::Tableless => self.core.routine_unbudgeted(user, application, client, e),
+            OwnKind::Unknown => false,
+            OwnKind::Named => self.core.routine(user, application, client, e, now),
         }
-        let rows = e.rows().unwrap_or(self.budget);
-        let mut over = false;
-        for o in e.objects() {
-            let key = format!(
-                "{}\u{0}{}\u{0}{}",
-                o.database().as_str(),
-                o.schema().map_or("", |s| s.as_str()),
-                o.object().as_str()
-            );
-            over |= self.charge(key, rows, now);
-        }
-        identity && e.signals().is_empty() && !over
     }
 }
-
 /// Builds events from pgaudit records.
 pub(crate) struct PgauditEvents {
-    own: OwnAccount,
+    own: PgOwn,
     dumps: DumpTracker,
     catalogs: Catalogs,
 }
@@ -626,7 +499,7 @@ struct ClassPart {
 }
 
 impl PgauditEvents {
-    pub(crate) fn new(own: OwnAccount) -> Self {
+    pub(crate) fn new(own: PgOwn) -> Self {
         Self {
             own,
             dumps: DumpTracker::default(),
@@ -869,7 +742,7 @@ pub(crate) struct StatementDelta<'a> {
 /// (the application name is not visible here).
 pub(crate) fn pss_events(
     deltas: &[StatementDelta<'_>],
-    own: &mut OwnAccount,
+    own: &mut PgOwn,
     catalogs: &Catalogs,
     from: SystemTime,
     to: SystemTime,
@@ -1024,10 +897,32 @@ mod tests {
         );
         c
     }
+    use databastion_core::audit::own::SharedOwnUsage;
 
-    fn own() -> OwnAccount {
-        OwnAccount::new(
-            "databastion",
+    fn own_shared(
+        addr: Option<ClientAddr>,
+        budget: u64,
+        usage: SharedOwnUsage,
+        statements: SharedOwnStatements,
+    ) -> PgOwn {
+        PgOwn::new(
+            OwnAccount::new(
+                "databastion",
+                Some(crate::conn::APPLICATION_NAME),
+                addr,
+                budget,
+                usage,
+            ),
+            statements,
+        )
+    }
+
+    fn own_with(addr: Option<ClientAddr>, budget: u64, usage: SharedOwnUsage) -> PgOwn {
+        own_shared(addr, budget, usage, SharedOwnStatements::default())
+    }
+
+    fn own() -> PgOwn {
+        own_with(
             ClientAddr::parse("192.0.2.14"),
             1000,
             SharedOwnUsage::default(),
@@ -1353,20 +1248,14 @@ mod tests {
         assert!(b.convert(vec![page(1)], SystemTime::now()).is_empty());
         assert_eq!(b.convert(vec![page(2)], SystemTime::now()).len(), 1);
         // Another client address than the agent's.
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
+        let mut b = PgauditEvents::new(own_with(
             ClientAddr::parse("198.51.100.7"),
             1000,
             SharedOwnUsage::default(),
         ));
         assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
         // The agent's address could not be read: nothing is left out.
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
-            None,
-            1000,
-            SharedOwnUsage::default(),
-        ));
+        let mut b = PgauditEvents::new(own_with(None, 1000, SharedOwnUsage::default()));
         assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
         // Unknown rows (pgaudit.log_rows off) are charged the whole budget:
         // the second statement on the same object is reported.
@@ -1406,8 +1295,7 @@ mod tests {
     fn own_budget_survives_stream_restarts_and_source_switches() {
         let shared = SharedOwnUsage::default();
         let own_on = |u: &SharedOwnUsage| {
-            OwnAccount::new(
-                "databastion",
+            own_with(
                 ClientAddr::parse("192.0.2.14"),
                 1000,
                 std::sync::Arc::clone(u),
@@ -1456,20 +1344,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn own_budget_spans_a_day_not_a_window() {
-        let mut o = own();
-        let t0 = Instant::now();
-        let key = || "shop\u{0}crm\u{0}t".to_owned();
-        assert!(!o.charge(key(), 600, t0));
-        // An hour later (past any aggregation window): still counted.
-        assert!(o.charge(key(), 600, t0 + std::time::Duration::from_secs(3600)));
-        // A day later: the first charges have aged out.
-        let mut o = own();
-        assert!(!o.charge(key(), 600, t0));
-        assert!(!o.charge(key(), 600, t0 + std::time::Duration::from_secs(25 * 3600)));
-    }
-
     /// The per-transaction statements of one Discovery scan (about 90
     /// transactions) and the check / stream probes, as the agent sends
     /// them.
@@ -1513,15 +1387,14 @@ mod tests {
     }
 
     fn charged_keys(u: &SharedOwnUsage) -> Vec<String> {
-        u.lock().unwrap().usage.keys().cloned().collect()
+        u.lock().unwrap().budgeted_objects()
     }
 
     #[test]
     fn own_tableless_statements_are_skipped_and_not_charged() {
         let usage = SharedOwnUsage::default();
         // A small budget: one charge of the old rule would exceed it.
-        let acct = OwnAccount::new(
-            "databastion",
+        let acct = own_with(
             ClientAddr::parse("192.0.2.14"),
             10,
             std::sync::Arc::clone(&usage),
@@ -1554,8 +1427,7 @@ mod tests {
             assert!(events.iter().all(|e| json(e).contains("shop..*")), "{app}");
         }
         // The agent's application and account from another address.
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
+        let mut b = PgauditEvents::new(own_with(
             ClientAddr::parse("198.51.100.7"),
             1000,
             SharedOwnUsage::default(),
@@ -1570,8 +1442,7 @@ mod tests {
     #[test]
     fn own_account_other_tableless_statements_are_reported() {
         let usage = SharedOwnUsage::default();
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
+        let mut b = PgauditEvents::new(own_with(
             ClientAddr::parse("192.0.2.14"),
             1000,
             std::sync::Arc::clone(&usage),
@@ -1737,8 +1608,7 @@ mod tests {
         };
         let own_account = own;
         let usage = SharedOwnUsage::default();
-        let mut own = OwnAccount::new(
-            "databastion",
+        let mut own = own_with(
             ClientAddr::parse("192.0.2.14"),
             10,
             std::sync::Arc::clone(&usage),
@@ -1793,20 +1663,21 @@ mod tests {
         // target (source switch: the pgaudit stream reads the records of
         // that period).
         let usage = SharedOwnUsage::default();
-        let mut pss = OwnAccount::new(
-            "databastion",
+        let statements = SharedOwnStatements::default();
+        let mut pss = own_shared(
             ClientAddr::parse("192.0.2.14"),
             1000,
             std::sync::Arc::clone(&usage),
+            std::sync::Arc::clone(&statements),
         );
         pss.allow_statement(&sql::pss_texts("public", true).unwrap());
         pss.allow_statement(&sql::pss_texts("public", false).unwrap());
         drop(pss);
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
+        let mut b = PgauditEvents::new(own_shared(
             ClientAddr::parse("192.0.2.14"),
             1000,
             std::sync::Arc::clone(&usage),
+            statements,
         ));
         b.set_catalogs(shop_catalogs(Some(false)));
         let mut recs = own_tableless_records("databastion-agent", 90);

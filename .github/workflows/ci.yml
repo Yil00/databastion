@@ -317,6 +317,9 @@ jobs:
   # with the documented agent grants and the dev-only TLS material of initdb/30-tls.sh. Every probe
   # is required (DATABASTION_TEST_REQUIRE): kill on drop, no transaction across submit, views,
   # FEDERATED, generated columns, read-only, over-privilege, TLS and authentication refusals.
+  # Audit (P4-B) too: the MariaDB server_audit log, the Percona audit_log_filter JSON log
+  # (dev/percona) and performance_schema, with real mysqldump / mariadb-dump runs inside the
+  # containers.
   agent-mysql:
     name: Agent MySQL / MariaDB integration
     needs: detect
@@ -335,7 +338,7 @@ jobs:
         run: |
           cp dev/.env.example dev/.env
           make dev-dirs
-          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 mysql mariadb
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 mysql mariadb percona
       - name: Connector integration tests (dev images, all probes required)
         run: |
           set -a; . dev/.env; set +a
@@ -351,11 +354,23 @@ jobs:
           export DATABASTION_TEST_MARIADB_CA_FILE="$PWD/dev/.state/tls/mariadb-ca.pem"
           DATABASTION_TEST_MARIADB_NETWORK_HOST="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(compose ps -q mariadb)")"
           export DATABASTION_TEST_MARIADB_NETWORK_HOST
-          export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network
+          # Audit (P4-B): the audit logs as the agent host sees them (bind mounts, 0644 in dev only),
+          # the Percona service, and the real dump tools run inside the containers.
+          compose exec -T percona cat /var/lib/mysql/ca.pem > dev/.state/tls/percona-ca.pem
+          export DATABASTION_TEST_MARIADB_AUDIT_LOG="$PWD/dev/.state/logs/mariadb/server_audit.log"
+          export DATABASTION_TEST_PERCONA_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PERCONA_PORT}/hr"
+          export DATABASTION_TEST_PERCONA_ADMIN_URL="mysql://root:${PERCONA_ROOT_PASSWORD}@127.0.0.1:${PERCONA_PORT}/"
+          export DATABASTION_TEST_PERCONA_CA_FILE="$PWD/dev/.state/tls/percona-ca.pem"
+          export DATABASTION_TEST_PERCONA_AUDIT_LOG="$PWD/dev/.state/logs/percona/audit_filter.log"
+          exec_in="timeout 120 docker compose -f $PWD/dev/docker-compose.yml exec -T"
+          export DATABASTION_TEST_MARIADB_DUMP_CMD="$exec_in -e MYSQL_PWD=${MARIADB_ROOT_PASSWORD} mariadb mariadb-dump -uroot --single-transaction support"
+          export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
+          export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
+          export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
           (cd agent && cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
       - name: Service logs
         if: failure()
-        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mysql mariadb
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mysql mariadb percona
       - name: Stop
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v

@@ -201,8 +201,11 @@ pub(crate) struct CheckState {
     /// count started (reported for 24 h, then reset).
     severity_mismatches: Mutex<HashMap<String, (u64, Instant)>>,
     /// Per target: the agent's own reads, shared by every Audit stream of
-    /// the target (see `audit::events::OwnUsage`).
-    own_usage: Mutex<HashMap<String, crate::audit::events::SharedOwnUsage>>,
+    /// the target (see `databastion_core::audit::own::OwnUsage`).
+    own_usage: Mutex<HashMap<String, databastion_core::audit::own::SharedOwnUsage>>,
+    /// Per target: the table-less statements registered by its streams
+    /// (see `audit::events::PgOwn`).
+    own_statements: Mutex<HashMap<String, crate::audit::events::SharedOwnStatements>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -219,9 +222,27 @@ impl CheckState {
 
     /// The agent's own-read counters of `target_id`, created once and kept
     /// for the life of the connector.
-    pub(crate) fn own_usage(&self, target_id: &str) -> crate::audit::events::SharedOwnUsage {
+    pub(crate) fn own_usage(
+        &self,
+        target_id: &str,
+    ) -> databastion_core::audit::own::SharedOwnUsage {
         std::sync::Arc::clone(
             self.own_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The table-less statements registered for `target_id`, kept for the
+    /// life of the connector.
+    pub(crate) fn own_statements(
+        &self,
+        target_id: &str,
+    ) -> crate::audit::events::SharedOwnStatements {
+        std::sync::Arc::clone(
+            self.own_statements
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(target_id.to_owned())

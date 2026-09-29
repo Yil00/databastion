@@ -38,8 +38,8 @@ const ACCESS: AccessIncidentOpenedPayload = {
     score: 1,
     sensitivity: 1,
     anomaly: false,
-    signals: ["signature.pg_dump", "signature.mysqldump", "shape.full_table_copy"],
-    unregistered_signals: ["signature.mysqldump"],
+    signals: ["signature.pg_dump", "signature.unregistered_example", "shape.full_table_copy"],
+    unregistered_signals: ["signature.unregistered_example"],
     objects: [{ database: "crm", schema: "public", object: "clients" }],
   },
 };
@@ -63,12 +63,12 @@ describe("notification contents", () => {
 
   it("access incident: flags unregistered signal ids", () => {
     const { text } = renderEmail(ACCESS);
-    expect(text).toContain("Signals:    signature.pg_dump, signature.mysqldump (unregistered), shape.full_table_copy\n");
+    expect(text).toContain("Signals:    signature.pg_dump, signature.unregistered_example (unregistered), shape.full_table_copy\n");
     // Rows written before P4-D carry no list: computed from this console's registry.
     const { unregistered_signals: _drop, ...legacy } = ACCESS.access;
-    expect(renderEmail({ ...ACCESS, access: legacy }).text).toContain("signature.mysqldump (unregistered), shape.full_table_copy\n");
+    expect(renderEmail({ ...ACCESS, access: legacy }).text).toContain("signature.unregistered_example (unregistered), shape.full_table_copy\n");
     const body = JSON.parse(webhookBody("d-2", ACCESS)) as { access: { unregistered_signals: string[] } };
-    expect(body.access.unregistered_signals).toEqual(["signature.mysqldump"]);
+    expect(body.access.unregistered_signals).toEqual(["signature.unregistered_example"]);
   });
 
   it("access incident: db_user stays on one line in the subject and body (P1-A)", () => {

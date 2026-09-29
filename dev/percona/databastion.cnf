@@ -1,0 +1,9 @@
+# Percona Server for MySQL audit prerequisites (docs/08-engine-capabilities.md): the audit_log_filter
+# component (installed by initdb/20-databastion.sh) writing JSON, read by the agent from
+# /var/log/databastion (P4-B, `mysql.audit_log` with `format: json`). `loose-`: the component's
+# variables do not exist before it is installed (first start of the entrypoint).
+[mysqld]
+loose-audit_log_filter.format = JSON
+loose-audit_log_filter.file = /var/log/databastion/audit_filter.log
+# performance_schema stays on (default) with its default consumers; the agent does not use it on
+# this server (no grant): the audit log is the source.

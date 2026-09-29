@@ -29,10 +29,13 @@ rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+# Audit: audit_log JSON records (serde only; no protocol types). The log
+# file is tailed by the core (`databastion_core::audit::tail`).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
-serde_json = "1"
 tracing-subscriber.workspace = true
 # Property tests of the protocol parsers and exchanges (src/proptests.rs).
 proptest = { version = "1", default-features = false, features = ["std"] }

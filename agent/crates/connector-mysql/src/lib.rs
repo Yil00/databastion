@@ -6,9 +6,15 @@
 //!   columns), classification through `ScanJob::classify`, names through
 //!   the ADR-0009 normalizer; only masked findings reach the sink (I2).
 //! - [`check`](Connector::check): reachability, honest audit level (docs/08:
-//!   `performance_schema` history = Partial; audit plugins are reported but
-//!   Full needs the audit log file, P4-B), over-privilege and coverage.
-//! - Audit (`audit_stream`) is P4-B: not implemented.
+//!   a readable audit log or `performance_schema` history = Partial, never
+//!   Full: neither logs row counts per statement), over-privilege and
+//!   coverage.
+//! - Audit ([`audit_stream`](Connector::audit_stream), P4-B): access
+//!   events from the MariaDB `server_audit` log or the Percona / MySQL
+//!   Enterprise `audit_log` JSON file (`mysql.audit_log`, cursor
+//!   persisted), or, as a degraded level, from `performance_schema`
+//!   statement history; statement text is only analyzed locally
+//!   (`classifiers::query`, MySQL dialect), never sent.
 //!
 //! The connector only reads (I4): read-only transactions and session
 //! default, statement timeouts on every query (`max_execution_time` /
@@ -21,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod auth;
 mod catalog;
 mod check;
@@ -83,13 +90,21 @@ impl Connector for MysqlConnector {
 
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
-        _sink: &EventSink,
+        cfg: &AuditConfig,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(ConnectorError::NotImplemented {
-            engine: self.engine(),
-            operation: "audit_stream",
-        })
+        audit::audit_stream(cfg, sink, &self.check_state).await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        self.check_state.audit_source(&target.id)
     }
 }
 
@@ -134,11 +149,15 @@ mod tests {
             })
         ));
         let (events, _rx) = EventSink::channel(1);
+        assert!(connector.supports_audit());
         assert!(matches!(
             connector
                 .audit_stream(&AuditConfig::default(), &events)
                 .await,
-            Err(ConnectorError::NotImplemented { .. })
+            Err(ConnectorError::Target {
+                code: FailureCode::Internal,
+                ..
+            })
         ));
     }
 }

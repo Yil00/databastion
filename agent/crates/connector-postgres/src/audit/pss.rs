@@ -27,7 +27,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{Catalogs, OwnAccount, StatementDelta, analyze_pss, pss_events};
+use super::events::{Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -51,7 +51,7 @@ struct Counters {
 pub(crate) struct PssPoller {
     schema: String,
     toplevel: bool,
-    own: OwnAccount,
+    own: PgOwn,
     catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
     analyses: HashMap<Key, QueryAnalysis>,
@@ -63,7 +63,7 @@ pub(crate) struct PssPoller {
 pub(crate) async fn connect(
     target: &TargetConfig,
     timeouts: Timeouts,
-    own: OwnAccount,
+    own: PgOwn,
 ) -> Result<(Session, PssPoller), PgError> {
     let mut own = Some(own);
     let settings = target.postgres_settings();

@@ -5,7 +5,7 @@
   },
   "shape.full_table_read": {
     "description": "A read (SELECT, TABLE) of whole relations: no top-level filter, no aggregation, and no limit or a limit above the agent's large-result threshold. Heuristic: evadable by design.",
-    "engines": ["postgres"]
+    "engines": ["postgres", "mysql", "mariadb"]
   },
   "signature.copy_to_file": {
     "description": "A server-side export to a file (COPY ... TO '<file>'), including one issued from dynamic SQL or a procedural block.",
@@ -15,12 +15,20 @@
     "description": "A server-side export to a program (COPY ... TO PROGRAM).",
     "engines": ["postgres"]
   },
+  "signature.into_outfile": {
+    "description": "A server-side export to a file on the database server (SELECT ... INTO OUTFILE or INTO DUMPFILE), including one the server refused.",
+    "engines": ["mysql", "mariadb"]
+  },
+  "signature.mysqldump": {
+    "description": "A mysqldump, mariadb-dump, mysqlpump or mydumper run: a whole-table read with SQL_NO_CACHE (what these tools send), by a client whose program_name is one of them, or in a session that took a consistent snapshot, a global read lock or LOCK TABLES, or ran SHOW CREATE TABLE on that table. Heuristic: evadable by design.",
+    "engines": ["mysql", "mariadb"]
+  },
   "signature.pg_dump": {
     "description": "A pg_dump or pg_dumpall run: that application name on a whole-relation read or copy, or one session copying several whole relations to the client, whatever its application name.",
     "engines": ["postgres"]
   },
   "volume.large_result": {
     "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it).",
-    "engines": ["postgres"]
+    "engines": ["postgres", "mysql", "mariadb"]
   }
 }

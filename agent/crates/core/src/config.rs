@@ -406,6 +406,38 @@ pub struct MysqlTargetConfig {
     /// way.
     #[serde(default)]
     pub extended_grants: bool,
+    /// Audit log file read by the Audit connector (P4-B): the MariaDB
+    /// `server_audit` log, or the Percona / MySQL Enterprise `audit_log` /
+    /// `audit_log_filter` JSON file, read locally through the file system,
+    /// never through SQL. Without it, Audit uses `performance_schema`
+    /// (Partial or Limited).
+    #[serde(default)]
+    pub audit_log: Option<MysqlAuditLogConfig>,
+}
+
+/// Format of a MySQL / MariaDB audit log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlLogFormat {
+    /// MariaDB `server_audit` plugin, `server_audit_output_type = file`.
+    ServerAudit,
+    /// Percona Server `audit_log` plugin (`audit_log_format = JSON`) or
+    /// the `audit_log_filter` component (`audit_log_filter.format = JSON`,
+    /// also MySQL Enterprise Audit JSON). The XML and CSV formats are not
+    /// supported.
+    Json,
+}
+
+/// Audit log file of a MySQL / MariaDB target.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MysqlAuditLogConfig {
+    /// Absolute path of the current log file (`server_audit_file_path`,
+    /// `audit_log_file`, `audit_log_filter.file`). Rotation by rename or
+    /// truncation is followed.
+    pub path: PathBuf,
+    /// File format.
+    pub format: MysqlLogFormat,
 }
 
 /// TLS mode of a MySQL / MariaDB target.
@@ -581,6 +613,8 @@ const KNOWN_KEYS: &[&str] = &[
     "format",
     "jsonlog",
     "csvlog",
+    "server_audit",
+    "json",
     // Values of closed enums (`engine`, `phone_region`) are listed too, so
     // that an "unknown variant" error can name the expected ones; they are
     // schema constants, never user data.
@@ -959,6 +993,11 @@ impl TargetConfig {
         }
         if my.ca_file.is_some() && my.tls != MysqlTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
+        }
+        if let Some(log) = &my.audit_log {
+            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
+                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
+            }
         }
         Ok(())
     }
@@ -1359,6 +1398,22 @@ targets:
             cfg.targets[0].mysql_settings().tls,
             MysqlTlsMode::DisableInsecure
         );
+        assert!(cfg.targets[0].mysql_settings().audit_log.is_none());
+        let cfg = parse(&with(
+            "    mysql:\n      audit_log: {path: /var/log/mysql/server_audit.log, format: server_audit}\n",
+        ))
+        .unwrap();
+        let log = cfg.targets[0].mysql_settings().audit_log.unwrap();
+        assert_eq!(log.format, MysqlLogFormat::ServerAudit);
+        assert_eq!(log.path, PathBuf::from("/var/log/mysql/server_audit.log"));
+        let cfg = parse(&with(
+            "    mysql: {audit_log: {path: /var/lib/mysql/audit.log, format: json}}\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.targets[0].mysql_settings().audit_log.unwrap().format,
+            MysqlLogFormat::Json
+        );
         for (block, expected) in [
             ("    mysql: {ca_file: ca.pem}\n", "mysql.ca_file"),
             (
@@ -1366,6 +1421,15 @@ targets:
                 "mysql.ca_file",
             ),
             ("    mysql: {tls: disable}\n", "mysql.tls"),
+            (
+                "    mysql: {audit_log: {path: audit.log, format: json}}\n",
+                "mysql.audit_log.path",
+            ),
+            (
+                "    mysql: {audit_log: {path: /a.log, format: xml}}\n",
+                "invalid value",
+            ),
+            ("    mysql: {audit_log: {format: json}}\n", "missing field"),
             ("    mysql: {tls: preferred}\n", "invalid value"),
             ("    mysql: {password: hunter2-SECRET}\n", "unknown field"),
             (

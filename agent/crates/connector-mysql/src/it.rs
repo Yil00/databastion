@@ -21,14 +21,17 @@
 //!
 //! `DATABASTION_TEST_REQUIRE` (comma-separated: `mysql`, `mariadb`,
 //! `mysql-admin`, `mariadb-admin`, `mysql-tls`, `mariadb-tls`, `federated`,
-//! `pam`, `network`, or `all`) turns the matching skips into failures: CI lists what
-//! each run must exercise.
+//! `pam`, `network`, the Audit keys of [`audit_it`] (`mariadb-audit`,
+//! `percona`, `percona-audit`, `mysqldump`), or `all`) turns the matching
+//! skips into failures: CI lists what each run must exercise.
 //!
 //! The tests are serialized. They live in the crate (not `tests/`) to reach
 //! the session layer for the kill and transaction probes.
 
 // Skip notices and the recall table (counts only, never a value).
 #![allow(clippy::print_stderr)]
+
+mod audit_it;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -282,12 +285,18 @@ fn agent_target(server: &Server) -> (TempDir, TargetConfig) {
     target(server, &server.url.user, &server.url.password)
 }
 
-/// An administrator session (no read-only default).
+/// An administrator session (no read-only default). The connector's
+/// session setup pins `wait_timeout` to 60 s; test fixtures keep their
+/// admin session open across long steps (a probe scan under a loaded CI
+/// runner takes longer), so the idle timeout is raised on this session
+/// only: otherwise the server closes it and the next query fails.
 async fn admin_session(server: &Server, admin: &Url) -> Session {
     let (_dir, t) = target(server, &admin.user, &admin.password);
-    Session::connect_admin(&t, Timeouts::new(Duration::from_secs(120)))
+    let mut s = Session::connect_admin(&t, Timeouts::new(Duration::from_secs(120)))
         .await
-        .unwrap()
+        .unwrap();
+    exec(&mut s, "SET SESSION wait_timeout = 3600").await;
+    s
 }
 
 async fn exec(s: &mut Session, statement: &str) {
@@ -422,6 +431,25 @@ async fn agent_connections(admin: &mut Session) -> Vec<String> {
 // ------------------------------------------------------------------ tests
 
 #[tokio::test]
+async fn admin_sessions_outlive_the_connector_idle_timeout() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        assert_eq!(
+            scalar(&mut a, "SELECT @@session.wait_timeout")
+                .await
+                .as_deref(),
+            Some("3600"),
+            "{}",
+            server.name
+        );
+    }
+}
+
+#[tokio::test]
 async fn check_reports_reachable_with_an_honest_audit_level() {
     let _serial = SERIAL.lock().await;
     for server in servers() {
@@ -429,25 +457,26 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         let health = MysqlConnector::new().check(&t).await;
         assert!(health.reachable, "{}: {health:?}", server.name);
         assert_eq!(health.failure, None);
-        // ADR-0018 minimal variant: no performance_schema grant before
-        // Audit (P4-B), so no audit source the account can read: None.
-        assert_eq!(
-            health.audit_level,
-            AuditLevel::None,
-            "{}: {health:?}",
-            server.name
-        );
         let detail = health.detail.unwrap();
         eprintln!("{} check: {detail}", server.name);
+        // ADR-0018 minimal variant: no performance_schema grant (the Audit
+        // tests use their own account) and no audit log on this target:
+        // no source the account can read.
+        assert_eq!(health.audit_level, AuditLevel::None, "{detail}");
         assert!(
             detail.contains("performance_schema not readable by the account"),
             "{detail}"
         );
+        assert!(detail.contains("no audit source"), "{detail}");
         // The dev account is not over-privileged.
         assert!(!detail.contains("over-privileged"), "{detail}");
         if server.name == "mariadb" {
             assert!(
                 detail.contains("server_audit active (logging ON, file output)"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("reading its log needs mysql.audit_log"),
                 "{detail}"
             );
         }
@@ -1087,8 +1116,15 @@ async fn probes() {
         assert!(health.reachable);
         assert_eq!(health.audit_level, AuditLevel::Partial);
         let detail = health.detail.unwrap();
+        // Its only over-privilege: performance_schema without Audit.
         assert!(
-            !detail.contains("over-privileged"),
+            detail.contains(
+                "over-privileged: SELECT on performance_schema without Audit enabled \
+                 (statement text of every session readable);"
+            ) || detail.ends_with(
+                "over-privileged: SELECT on performance_schema without Audit enabled \
+                 (statement text of every session readable)"
+            ),
             "{}: {detail}",
             server.name
         );

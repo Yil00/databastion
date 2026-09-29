@@ -216,7 +216,7 @@ from closed enums (`EventSource`, `EventAction`, `Signal`), an
 query text, parameters or returned values.
 
 The contract `Signal` is an open pattern (`signature.* | shape.* | volume.*`);
-this agent emits only the closed set below:
+this agent emits only the closed set below (`masking::Signal::ALL`):
 
 | Signal | Emitted when |
 |---|---|
@@ -225,7 +225,9 @@ this agent emits only the closed set below:
 | `signature.copy_to_program` | `COPY … TO PROGRAM` |
 | `shape.full_table_copy` | `COPY` out of a whole relation, or of a query without filter, aggregation or small limit |
 | `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit above 10 000 rows |
-| `volume.large_result` | more than 10 000 rows returned or affected by one statement (or one counter delta); on the pgaudit source only with `pgaudit.log_rows = on` |
+| `volume.large_result` | more than 10 000 rows returned or affected by one statement (or one counter delta); on the pgaudit source only with `pgaudit.log_rows = on`; on MySQL / MariaDB only from `performance_schema` (the audit log files carry no row count) |
+| `signature.mysqldump` | MySQL / MariaDB: the client's `program_name` is `mysqldump` / `mariadb-dump` (`performance_schema` only), or a whole-table read with `SQL_NO_CACHE` (`SELECT /*!40001 SQL_NO_CACHE */ … FROM t`), or one session reading whole tables after `SHOW CREATE TABLE` of the same table, after a consistent snapshot or global read lock, or of at least 3 distinct tables (P4-B) |
+| `signature.into_outfile` | MySQL / MariaDB `SELECT … INTO OUTFILE` / `INTO DUMPFILE`, also when the server refused it (P4-B) |
 
 The thresholds sit above the agent's own maximum sample (10 000 rows), so
 its Discovery never raises them. `shape.*` and `signature.*` are heuristics
@@ -248,6 +250,25 @@ comment, text over 1 MiB, possibly truncated text, or a backslash whose
 reading depends on `standard_conforming_strings` give no normalized text
 (and no shape or relations when ambiguous). Property tests:
 `tests/query_props.rs`.
+
+The MySQL / MariaDB dialect (`AnalyzeOptions::mysql()`, P4-B, ROADMAP P4-D)
+lexes backticks, `'…'` and `"…"` strings with `\` escapes, `N'…'`, `X'…'`,
+`B'…'`, `_charset'…'`, `0x…`, `#` and `-- ` comments, and executable
+comments (`/*! … */`, `/*M! … */`) as code. The `sql_mode` of a logged
+statement is unknown: the text is lexed with and without
+`NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, and kept only when every reading
+gives the same tokens. A `"…"` token is never a name. Version comments
+that a supported server may read as comments (a version from 5.7.0, which
+MariaDB skips, six digits, MariaDB's `/*M!`) are lexed both ways too. Text with a byte >= 0x80
+directly followed by `\` or a backtick (a trail byte in gbk, big5, sjis,
+cp932, gb18030), and raw text that is not UTF-8 (`query::analyze_raw`),
+keep only the statement kind, unless the source already transcoded it to
+UTF-8 (`AnalyzeOptions::transcoded`: `performance_schema`). `REPLACE` joins the
+DML allow-list; account statements, `SET PASSWORD`, `GRANT`, `CHANGE
+MASTER` / `CHANGE REPLICATION SOURCE`, `CREATE SERVER` and every other
+utility statement keep no text. Property tests: `tests/query_mysql_props.rs`
+(every literal and comment form, both `sql_mode` readings, password-bearing
+statements as clients write them and as the servers log them, truncation).
 
 ## Tests
 
