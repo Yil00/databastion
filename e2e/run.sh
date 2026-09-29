@@ -1119,6 +1119,13 @@ DCL_PRINCIPAL=e2e_admin
 # MariaDB half proves the source's masking only, not the agent's redaction.
 audit_client_pg_dcl_in_source() { printf all; }
 audit_client_my_dcl_in_source() { printf none; }
+# DCL statements the target's audit log records, so `dcl` events to wait for. pgaudit (`role`): both.
+# server_audit: CREATE USER only. Its QUERY_DCL class (plugin/server_audit/server_audit.c, MariaDB
+# 11.4) is CREATE/DROP/RENAME USER, CREATE/DROP ROLE, GRANT and REVOKE: ALTER USER is in no class
+# but QUERY (every statement), so a password change by ALTER USER is not in the log the agent reads
+# (engine limit, docs/08). The statement still runs: its password must not reach the console either.
+audit_client_pg_dcl_statements() { printf 2; }
+audit_client_my_dcl_statements() { printf 1; }
 # dcl_scan [i2_check.py scan options...] PATH...: the two DCL passwords searched by i2_check.py
 # (--secret-file: case-insensitive, whole, every 16-character window, base64 / base64url at the three
 # byte alignments and hex, in the raw, JSON, URL, HTML, SQL and LDIF views). Prints needle ids
@@ -1919,6 +1926,10 @@ audit_verify() {
             cat "$E2E_WORK_DIR/dcl-control.out" >&2
             fail "Audit ($target): a DCL password (or part of it) is in the target's own audit log, which should mask it (exit $rc)"
           fi
+          # Not vacuous: the masked statement is in the log (a filter change dropping DCL would
+          # otherwise pass). Both identifiers are safe to grep: no secret.
+          grep -qE "e2e_dcl_probe.*[*]{5}" "$E2E_WORK_DIR/target-audit.log" \
+            || fail "Audit ($target): no masked DCL statement of e2e_dcl_probe in the target's own audit log"
           log "Audit ($target): no DCL password in the target's own audit log (the source masks them: this half proves the source's masking only)" ;;
         *) fail "Audit ($target): audit_client_${client}_dcl_in_source is missing" ;;
       esac
@@ -1980,7 +1991,9 @@ while :; do
     ok=1
     [ "$n_sets" -ge "$("audit_client_${client}_object_sets")" ] \
       && [ "$n_stmts" -ge "$("audit_client_${client}_query_statements")" ] && [ "$n_inc" -ge 1 ] || ok=0
-    if has_dcl "$client"; then [ "$n_dcl" -ge 2 ] && [ "$n_dcl_inc" -ge 1 ] || ok=0; fi
+    if has_dcl "$client"; then
+      [ "$n_dcl" -ge "$("audit_client_${client}_dcl_statements")" ] && [ "$n_dcl_inc" -ge 1 ] || ok=0
+    fi
     [ "$ok" = 1 ] || waiting+="$target (object sets $n_sets/$("audit_client_${client}_object_sets"), read statements $n_stmts/$("audit_client_${client}_query_statements"), incidents $n_inc, DCL statements $n_dcl, DCL incidents $n_dcl_inc); "
   done
   pending="$(console_sql "SELECT (SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND evaluated_at IS NULL)
