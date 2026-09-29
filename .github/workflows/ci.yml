@@ -5,6 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,8 +24,13 @@ jobs:
       console: ${{ steps.detect.outputs.console }}
       agent: ${{ steps.detect.outputs.agent }}
       protocol: ${{ steps.detect.outputs.protocol }}
+      e2e: ${{ steps.e2e.outputs.e2e }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pull requests: the merge commit and its first parent (the base tip), for the diff below.
+          fetch-depth: 2
+          persist-credentials: false
       - id: detect
         run: |
           has() { [ -f "$1" ] && echo true || echo false; }
@@ -33,6 +39,30 @@ jobs:
             echo "agent=$(has agent/Cargo.toml)"
             echo "protocol=$(has shared/protocol/openapi.yaml)"
           } | tee -a "$GITHUB_OUTPUT"
+      # The E2E job (a few minutes of image builds) runs when something it exercises changed. When
+      # the changed files cannot be listed (new branch, force push, shallow history), it runs.
+      - id: e2e
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          changed=""
+          case "$EVENT" in
+            pull_request) changed="$(git diff --name-only HEAD^1 HEAD 2>/dev/null)" || changed="" ;;
+            push)
+              if [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+                  && git fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null; then
+                changed="$(git diff --name-only "$BEFORE" HEAD 2>/dev/null)" || changed=""
+              fi ;;
+          esac
+          if [ -z "$changed" ]; then
+            e2e=true
+          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e=true
+          else
+            e2e=false
+          fi
+          echo "e2e=$e2e" | tee -a "$GITHUB_OUTPUT"
 
   docs:
     name: Documentation
@@ -331,11 +361,51 @@ jobs:
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
 
+  # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
+  # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
+  # (in parallel), revocation < 60 s, and invariant I2: no ground-truth value in clear text in the
+  # console database, the logs or the findings page, for every engine. Required through ci-result.
+  e2e:
+    name: E2E (enrollment, Discovery, invariant I2)
+    needs: detect
+    if: needs.detect.outputs.e2e == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+      - name: Unit tests of the I2 leak scanner
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_*.py' -v
+      - name: Run e2e/run.sh
+        run: e2e/run.sh
+      # run.sh redacts every generated secret from the logs on exit, whatever the result (and
+      # masks them in the job log); the secrets are random, for this run only, and destroyed
+      # with the containers. If the invariant I2 check fails, the logs may hold seeded values:
+      # they are fake (dev/seed/generate.py) and already public in the repository; the job log
+      # itself only holds needle ids and file names.
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # Single status check required by branch protection.
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, protocol]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, protocol, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
