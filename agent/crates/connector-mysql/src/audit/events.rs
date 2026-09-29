@@ -26,7 +26,8 @@
 //!
 //! Objects come from the table-access records when the source has them
 //! (`server_audit` `TABLE` events, `audit_log_filter` `table_access`),
-//! otherwise from the statement text; an unqualified name is in the
+//! otherwise from the statement text (reads and writes only: DDL and DCL
+//! events take no name from text); an unqualified name is in the
 //! statement's current database. `information_schema`,
 //! `performance_schema`, `sys`, `DUAL` and MariaDB's internal statistics
 //! tables (`mysql.*_stats`) are not application data and are skipped; the
@@ -293,7 +294,11 @@ impl EventBuilder {
         let rw = matches!(action, EventAction::Read | EventAction::Write);
         let mut objects: Vec<(String, String)> = Vec::new();
         let mut unknown = false;
-        if a.tables.is_empty() {
+        if a.tables.is_empty() && rw {
+            // Names from the text for reads and writes only: DDL and DCL
+            // text can hold program bodies (MySQL JavaScript routines in
+            // `$$ … $$`) that the SQL lexer does not delimit, and their
+            // events need no object.
             let mut named_any = false;
             for p in parts {
                 for r in &p.relations {
@@ -776,6 +781,19 @@ mod tests {
         assert!(!show(&e).contains("jean"), "{}", show(&e));
         assert!(e.signals().contains(&Signal::LargeResult));
         assert!(e.ts() <= SystemTime::now());
+    }
+
+    #[test]
+    fn ddl_and_dcl_take_no_name_from_text() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                r#"20260929 09:41:34,h,app,10.0.0.5,37,1,QUERY,support,'CREATE FUNCTION f() RETURNS TEXT LANGUAGE JAVASCRIPT AS $$ let s = "a\' from jane_doe x"; return s $$',0"#,
+                r"20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'create table t2 as select * from tickets',0",
+            ]),
+        );
+        assert_eq!(out, ["ddl [] None []", "ddl [] None []"], "{out:#?}");
     }
 
     #[test]
