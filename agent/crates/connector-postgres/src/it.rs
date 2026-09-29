@@ -1654,6 +1654,11 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
     let (task, mut rx) = start_audit(&t, &state.0);
     // First poll: baseline.
     tokio::time::sleep(Duration::from_millis(2500)).await;
+    // A Discovery scan of the agent's own account: its per-transaction
+    // `set_config` calls and the stream's own text query are never
+    // events, nor charged to `*`.
+    let (discovery, _) = scan(&t, ScanParams::contract_defaults()).await;
+    discovery.unwrap();
     simulated_pg_dump(&adm).await;
     let a = admin(&adm, &adm.dbname).await;
     a.query(
@@ -1669,6 +1674,11 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
     .await;
     task.abort();
     let all: Vec<String> = events.iter().map(describe).collect();
+    assert!(
+        !all.iter()
+            .any(|d| d.contains(&format!("user={} ", u.user)) && d.contains("..*")),
+        "the agent's own table-less statements: {all:#?}"
+    );
     assert!(has(&events, "customers", "signature.pg_dump"), "{all:#?}");
     assert!(
         has(&events, "customers", "shape.full_table_copy"),

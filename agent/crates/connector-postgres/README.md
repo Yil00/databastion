@@ -54,7 +54,9 @@ is not loaded".
   client, so it is a server-side export (file or program).
 - **Objects not named by the log** (function or procedure bodies without
   `pgaudit.log_relation`, text that does not parse) are reported as `*` in
-  the database, never dropped.
+  the database, never dropped. Relations named by pgaudit itself
+  (`pgaudit.log_catalog`, `log_relation`) are skipped when they are
+  catalogs, like catalogs named by the text.
 - **The agent's own account.** Its statements are left out only when all
   hold: they come from its `application_name` (`databastion-agent`, pgaudit
   only) and from its own client address as the server sees it
@@ -77,6 +79,37 @@ is not loaded".
   does not reset them, but an **agent restart** does (they are not
   persisted), which gives a fresh budget per object. The agent's
   database credentials never leave its host (I3).
+- **The agent's own table-less statements.** The connector sends a few
+  statements that read no relation: the per-connection and
+  per-transaction `pg_catalog.set_config(…)` / `current_setting(…)`
+  (`SESSION_SETUP`, `SET_LOCAL_TIMEOUTS`: one per transaction, about 90 per
+  Discovery scan), `pg_catalog.host(pg_catalog.inet_client_addr())`, and,
+  in `pg_stat_statements` mode, its text query through the extension's
+  `pg_stat_statements(true)` function. They are a closed list
+  (`sql::OWN_TABLELESS`, plus the text query registered by the stream; a
+  unit test fails on any other connector statement that names no
+  relation). Such a statement of the agent's account is left out on the
+  same identity and signal rules as above, and is **not charged** to any
+  row budget; it is never reported. It is recognized by its exact text with
+  pgaudit (pgaudit logs the text as sent; bound parameter values are not
+  part of it) and by its normalized shape with `pg_stat_statements`
+  (constants, booleans included, are placeholders there). Anything else of
+  the agent's account whose objects are unknown (`*`: any other function
+  call, including `pg_catalog` ones that run SQL such as `query_to_xml`,
+  text that does not parse, several statements) is **always reported** and
+  never budgeted, so no traffic can use up a `*` budget. The same
+  statements from any other role, or from the agent's account under
+  another application or address, are reported against `*` as before.
+  Residuals: someone holding the agent's credentials who passes the
+  identity checks can run these exact statements unreported; they read no
+  row of any relation (`set_config` changes their own session only;
+  `current_setting` reads settings the role may read; the text query
+  returns statement texts, as a read of the view `pg_stat_statements`
+  does, which is skipped as statistics for every role). With
+  `pg_stat_statements`, where only the shape is visible, the settings read
+  by `current_setting(…)` are not checked. The text query is recognized in
+  pgaudit records written during a `pg_stat_statements` period only if the
+  agent did not restart in between.
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.
 - **`pg_stat_statements` mode** sees no client address, application name,

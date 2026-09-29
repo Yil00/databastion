@@ -99,14 +99,22 @@ pub(crate) async fn connect(
             continue;
         };
         let toplevel = session.server_version_num() >= 140_000;
+        let mut own = own
+            .take()
+            .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
+        // The text query reads `pg_stat_statements` through the
+        // extension's function (no relation named): one of the
+        // connector's own statements, like the view `pg_stat_statements*`
+        // skipped as statistics for every role.
+        let texts_sql = sql::pss_texts(&schema, toplevel)
+            .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
+        own.allow_statement(&texts_sql);
         return Ok((
             session,
             PssPoller {
                 schema,
                 toplevel,
-                own: own
-                    .take()
-                    .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?,
+                own,
                 snapshot: None,
                 analyses: HashMap::new(),
                 last_poll: SystemTime::now(),
