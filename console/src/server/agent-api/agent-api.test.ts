@@ -33,6 +33,7 @@ import {
 } from "@/test/helpers";
 
 import { ipBucket } from "@/server/request";
+import { CONSOLE_ACCEPTS } from "@/server/agent-api/capabilities";
 
 import {
   cheapFailuresPerIp,
@@ -700,6 +701,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(validateSchema("HeartbeatResponse", out).ok).toBe(true);
       expect(out.heartbeat_interval_s).toBe(30);
       expect(out.console_min_protocol).toBe(1);
+      expect(out.accepts).toEqual([...CONSOLE_ACCEPTS]);
       const targets = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
       expect(targets).toHaveLength((body as { targets: unknown[] }).targets.length);
       const [agent] = await getDb().select().from(agents).where(eq(agents.id, auth.agentId));

@@ -1,6 +1,7 @@
 // Builds the Ajv instance used by the contract tests: the `components.schemas` of openapi.yaml
-// as a JSON Schema 2020-12 document (`$defs`, refs rewritten, nothing else), plus the classifier
-// and signal registry schemas (classifiers.schema.json, signals.schema.json), which refer to it.
+// as a JSON Schema 2020-12 document (`$defs`, refs rewritten, nothing else), plus the classifier,
+// signal and target-note registry schemas (classifiers.schema.json, signals.schema.json,
+// target-notes.schema.json), which refer to it.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -13,6 +14,7 @@ export const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const ROOT_ID = "https://databastion.invalid/protocol/v1/schemas.json";
 export const REGISTRY_SCHEMA_ID = "https://databastion.invalid/protocol/v1/classifiers.schema.json";
 export const SIGNALS_SCHEMA_ID = "https://databastion.invalid/protocol/v1/signals.schema.json";
+export const TARGET_NOTES_SCHEMA_ID = "https://databastion.invalid/protocol/v1/target-notes.schema.json";
 
 const rewrite = (value) => {
   if (Array.isArray(value)) return value.map(rewrite);
@@ -36,5 +38,6 @@ export function buildAjv(doc) {
   ajv.addSchema({ $id: ROOT_ID, $defs: rewrite(doc.components.schemas) });
   ajv.addSchema(JSON.parse(readFileSync(join(root, "classifiers.schema.json"), "utf8")));
   ajv.addSchema(JSON.parse(readFileSync(join(root, "signals.schema.json"), "utf8")));
+  ajv.addSchema(JSON.parse(readFileSync(join(root, "target-notes.schema.json"), "utf8")));
   return ajv;
 }

@@ -27,5 +27,6 @@ An accepted ADR is not edited. A new ADR either supersedes it, or refines it (a 
 | [0019](0019-incident-reopen-cutoff.md) | "Seen after the resolution" decided on the scan job's first delivery (refines 0014) | Accepted |
 | [0020](0020-mysql-mariadb-connector-as-merged.md) | MySQL / MariaDB connector as merged: row estimates read after the engine check, `extended_grants` opt-in, parser property tests, dev accounts on the minimal variant (refines 0018) | Accepted |
 | [0021](0021-access-event-correlation.md) | Access-event correlation: insert-only event storage, owner-defined purge with a 7-day floor, volume × sensitivity score, capped EWMA baselines, per-hour dedup with coarse unknown principals, per-target hourly cap with severe-event bypass, fair draining and back-pressure (refines 0014) | Accepted |
+| [0022](0022-protocol-capability-negotiation.md) | Protocol capability negotiation: optional fields added after 0.1.0 sent only once announced (`HeartbeatResponse.accepts` for request fields, `HeartbeatRequest.accepts` for response and job fields); form-only registries need none (refines 0013) | Accepted |
 
 Template: copy [template.md](template.md).

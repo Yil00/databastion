@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://databastion.invalid/protocol/v1/signals.schema.json",
-  "title": "Signal registry",
-  "description": "signals.json: the access-event signal ids (`Signal`) that a conforming agent may emit, with their meaning and the engines whose connector emits them. Append-only: an id is never removed, renamed or given another meaning. Ids are sorted ascending (checked by scripts/id-registry.mjs).",
+  "$id": "https://databastion.invalid/protocol/v1/target-notes.schema.json",
+  "title": "Target-note registry",
+  "description": "target-notes.json: the `TargetNote` codes (`TargetNoteCode`) a conforming agent may send, with their meaning and the engines whose connector sends them. Append-only: a code is never removed, renamed or given another meaning. Codes are sorted ascending (checked by scripts/id-registry.mjs).",
   "type": "object",
   "minProperties": 1,
   "maxProperties": 256,
   "propertyNames": {
-    "$ref": "schemas.json#/$defs/Signal"
+    "$ref": "schemas.json#/$defs/TargetNoteCode"
   },
   "additionalProperties": {
     "type": "object",

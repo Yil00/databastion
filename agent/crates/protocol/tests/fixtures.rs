@@ -46,23 +46,22 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
     ("FindingsBatch.too-many-fingerprints.json", "maxItems"),
     ("FindingsBatch.too-many-masked-samples.json", "maxItems"),
     (
-        "HeartbeatRequest.detail-connection-string.json",
-        "not (TargetDetail)",
-    ),
-    (
-        "HeartbeatRequest.detail-user-at-host.json",
-        "not (TargetDetail)",
-    ),
-    (
         "HeartbeatRequest.detected-target-without-endpoint.json",
         "minProperties",
     ),
+    ("HeartbeatRequest.duplicate-note-labels.json", "uniqueItems"),
+    (
+        "HeartbeatRequest.note-negative-count.json",
+        "minimum on an integer newtype (Count)",
+    ),
     ("HeartbeatRequest.too-many-metrics.json", "maxProperties"),
+    ("HeartbeatRequest.too-many-notes.json", "maxItems"),
     ("HeartbeatRequest.too-many-targets.json", "maxItems"),
     (
         "HeartbeatResponse.interval-too-short.json",
         "minimum on an integer newtype",
     ),
+    ("HeartbeatResponse.too-many-capabilities.json", "maxItems"),
     ("JobList.empty.json", "minItems"),
     (
         "JobList.sample-rows-too-large.json",

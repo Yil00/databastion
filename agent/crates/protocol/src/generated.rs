@@ -11,9 +11,8 @@
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
-// - #/$defs/TargetDetail/not
 //
-// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 21.
+// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 22.
 //
 // `const: X` rewritten as `enum: [X]` (typify ignores string `const`):
 // - #/$defs/AgentConfigReloadJob/properties/type/const
@@ -47,7 +46,8 @@ pub struct AccessEvent {
     /**Size in bytes of the result returned (or of the data affected), when the source
 reports it; absent otherwise, never estimated. For a pre-aggregated event, the total
 of the merged events, as for `rows`. Not produced by the PostgreSQL connector:
-neither pgaudit nor `pg_stat_statements` reports a result size.
+neither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the
+latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub bytes: ::std::option::Option<Count>,
@@ -590,6 +590,97 @@ pub struct BatchAck {
     pub batch_id: crate::ids::UuidV7,
     ///`true` when this (`agent_id`, `batch_id`) had already been received with the same content; the batch was not processed again.
     pub duplicate: bool,
+}
+/**Name of an optional field or feature (ADR-0022): `<object>.<field>` in snake case, e.g.
+`access_event.bytes`, with up to two more segments for a revision
+(`target_status.note_labels.2026_10`). Form only: a party ignores tokens it does not know.
+*/
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct Capability(::std::string::String);
+impl ::std::ops::Deref for Capability {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<Capability> for ::std::string::String {
+    fn from(value: Capability) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for Capability {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 64usize {
+            return Err("longer than 64 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags(
+                    "^[\\s\\S]*?(?:^[a-z][a-z0-9_]{0,31}(\\.[a-z0-9_]{1,32}){1,3}$)",
+                    "u",
+                )
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^[a-z][a-z0-9_]{0,31}(\\.[a-z0-9_]{1,32}){1,3}$)\""
+                    .into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for Capability {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for Capability {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for Capability {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
+///Capability tokens (ADR-0022).
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct CapabilityList(pub ::std::vec::Vec<Capability>);
+impl ::std::ops::Deref for CapabilityList {
+    type Target = ::std::vec::Vec<Capability>;
+    fn deref(&self) -> &::std::vec::Vec<Capability> {
+        &self.0
+    }
+}
+impl ::std::convert::From<CapabilityList> for ::std::vec::Vec<Capability> {
+    fn from(value: CapabilityList) -> Self {
+        value.0
+    }
+}
+impl ::std::convert::From<::std::vec::Vec<Capability>> for CapabilityList {
+    fn from(value: ::std::vec::Vec<Capability>) -> Self {
+        Self(value)
+    }
 }
 /**Classifier identifier, e.g. `pii.email`, `pii.iban`, `secret.aws_key`. The valid ids of each
 `classifiers_version` are listed in the classifier registry `shared/protocol/classifiers.json`;
@@ -2084,6 +2175,14 @@ impl ::std::convert::TryFrom<String> for HeartbeatIntervalSeconds {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatRequest {
+    /**Optional **response and job** fields and features this agent build accepts
+(ADR-0022). Agents reject unknown fields in every console -> agent body, so the
+console sends a console -> agent field introduced after protocol 0.1.0 (in a response
+or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
+agent omits the list. Unknown tokens are ignored by the console.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub accepts: ::std::option::Option<CapabilityList>,
     pub agent_version: AgentVersion,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub classifiers_version: ::std::option::Option<ClassifiersVersion>,
@@ -2108,6 +2207,15 @@ console's configuration wizard. Never a target network address, never a process 
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatResponse {
+    /**Optional **request** fields and features this console accepts (ADR-0022), e.g.
+`target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps
+the list of the latest heartbeat response and sends an optional request field
+introduced after protocol 0.1.0 only when that list names it; before its first
+heartbeat response, and when the list is absent, it sends none of them. The console
+lists everything it accepts. Unknown tokens are ignored by the agent.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub accepts: ::std::option::Option<CapabilityList>,
     pub console_min_protocol: ProtocolMajor,
     pub heartbeat_interval_s: HeartbeatIntervalSeconds,
     pub server_time: Timestamp,
@@ -2395,7 +2503,9 @@ scope a scan covered: `objects_total - objects_done` objects were not reached (s
 stopped by its deadline, cancellation or the findings cap). Coverage counters are
 counts only, never a name; each is optional (absent: not reported; a `skipped_*`
 reason absent counts 0) and none is checked by the console. A new skip reason is a new
-optional `skipped_*` counter (compatible change).
+optional `skipped_*` counter (compatible change, negotiated like any new request
+field). `objects_sampled` and the `skipped_*` counters are sent only when the latest
+`HeartbeatResponse.accepts` lists `job_progress.coverage` (ADR-0022).
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub objects_sampled: ::std::option::Option<Count>,
@@ -3205,92 +3315,6 @@ pub struct SpoolStatus {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub oldest_age_s: ::std::option::Option<Count>,
 }
-/**Human-readable explanation of the target's status from the last `check()`, for the
-console's display: why the audit level is degraded, what is not covered, an insecure
-setting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2
-schema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:
-the console does not parse it and never derives a decision from it (`reachable`,
-`audit_level` and `last_error` are the machine-readable status).
-
-Built by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error
-numbers) and engine metadata names (privileges, roles, normalized object names). It
-**never** contains a sampled value, a credential, a connection string, a target host
-name or address, query text, or a driver or server message. At most 1024 characters, no
-control, format, private-use or line / paragraph separator character, no `://` and no
-`@` (the obvious forms of a URL, connection string or `user@host` account). The agent
-truncates it on a character boundary and omits it when it does not conform; the console
-escapes it on display.
-*/
-#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[serde(transparent)]
-pub struct TargetDetail(::std::string::String);
-impl ::std::ops::Deref for TargetDetail {
-    type Target = ::std::string::String;
-    fn deref(&self) -> &::std::string::String {
-        &self.0
-    }
-}
-impl ::std::convert::From<TargetDetail> for ::std::string::String {
-    fn from(value: TargetDetail) -> Self {
-        value.0
-    }
-}
-impl ::std::str::FromStr for TargetDetail {
-    type Err = self::error::ConversionError;
-    fn from_str(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
-        if value.chars().count() > 1024usize {
-            return Err("longer than 1024 characters".into());
-        }
-        if value.chars().count() < 1usize {
-            return Err("shorter than 1 characters".into());
-        }
-        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
-        {
-            ::regress::Regex::with_flags(
-                    "^[\\s\\S]*?(?:^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$)",
-                    "u",
-                )
-                .unwrap()
-        });
-        if PATTERN.find(value).is_none() {
-            return Err(
-                "doesn't match pattern \"^[\\s\\S]*?(?:^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$)\""
-                    .into(),
-            );
-        }
-        Ok(Self(value.to_string()))
-    }
-}
-impl ::std::convert::TryFrom<&str> for TargetDetail {
-    type Error = self::error::ConversionError;
-    fn try_from(
-        value: &str,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
-        value.parse()
-    }
-}
-impl ::std::convert::TryFrom<::std::string::String> for TargetDetail {
-    type Error = self::error::ConversionError;
-    fn try_from(
-        value: ::std::string::String,
-    ) -> ::std::result::Result<Self, self::error::ConversionError> {
-        value.parse()
-    }
-}
-impl<'de> ::serde::Deserialize<'de> for TargetDetail {
-    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
-    where
-        D: ::serde::Deserializer<'de>,
-    {
-        ::std::string::String::deserialize(deserializer)?
-            .parse()
-            .map_err(|e: self::error::ConversionError| {
-                <D::Error as ::serde::de::Error>::custom(e.to_string())
-            })
-    }
-}
 /**Identifier of a target, as declared in `agent.yaml` (ADR-0006). Unique per agent. A slug: it
 cannot contain a host name, address or credential.
 */
@@ -3364,6 +3388,605 @@ impl<'de> ::serde::Deserialize<'de> for TargetId {
             })
     }
 }
+/**One explanation of a target's status: a registered `code`, an optional `count` and
+optional closed `labels`. No free text, so no field can carry a sampled value, a
+credential, a connection string, a host name or address, query text or a driver
+message. The console renders a phrase for each code from its catalog, filling in `count`
+and `labels`; a code it does not know is shown as the raw code (with its count and
+labels), never rejected. E.g. `{"code": "audit.pgaudit_read_class_missing"}`,
+`{"code": "coverage.relations_rls_skipped", "count": 5}`,
+`{"code": "privilege.over_privileged", "labels": ["bypassrls", "pg_write_all_data"]}`.
+*/
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct TargetNote {
+    pub code: TargetNoteCode,
+    ///The number the note is about (relations, schemas, records, roles…), when it has one.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub count: ::std::option::Option<Count>,
+    ///Closed labels the note is about (privileges, role attributes, predefined roles…).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub labels: ::std::option::Option<::std::vec::Vec<TargetNoteLabel>>,
+}
+/**Code of a target note. The vocabulary is the registry `shared/protocol/target-notes.json`
+(append-only, like `signals.json`): a conforming agent sends only registered codes; the
+schema checks the form only, so an older console accepts a code registered later and
+shows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,
+`privilege.*` privileges of the agent's account, `security.*` insecure settings,
+`check.*` the check itself.
+*/
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct TargetNoteCode(::std::string::String);
+impl ::std::ops::Deref for TargetNoteCode {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<TargetNoteCode> for ::std::string::String {
+    fn from(value: TargetNoteCode) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for TargetNoteCode {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 64usize {
+            return Err("longer than 64 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags(
+                    "^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z0-9_]{1,48}$)",
+                    "u",
+                )
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z0-9_]{1,48}$)\""
+                    .into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for TargetNoteCode {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for TargetNoteCode {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for TargetNoteCode {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
+/**Closed label of a target note, in lower snake case: PostgreSQL role attributes and
+predefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`
+(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit
+collection states; check stages (`stage_*`). Anything the agent cannot map to this list
+is sent as `other`. A new value is a
+change of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`
+lists `target_status.note_labels.<revision>` for a revision that includes it (see
+ADR-0022), and sends `other` otherwise.
+*/
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum TargetNoteLabel {
+    #[serde(rename = "other")]
+    Other,
+    #[serde(rename = "superuser")]
+    Superuser,
+    #[serde(rename = "bypassrls")]
+    Bypassrls,
+    #[serde(rename = "replication")]
+    Replication,
+    #[serde(rename = "createrole")]
+    Createrole,
+    #[serde(rename = "createdb")]
+    Createdb,
+    #[serde(rename = "pg_checkpoint")]
+    PgCheckpoint,
+    #[serde(rename = "pg_create_subscription")]
+    PgCreateSubscription,
+    #[serde(rename = "pg_database_owner")]
+    PgDatabaseOwner,
+    #[serde(rename = "pg_execute_server_program")]
+    PgExecuteServerProgram,
+    #[serde(rename = "pg_maintain")]
+    PgMaintain,
+    #[serde(rename = "pg_monitor")]
+    PgMonitor,
+    #[serde(rename = "pg_read_all_data")]
+    PgReadAllData,
+    #[serde(rename = "pg_read_all_settings")]
+    PgReadAllSettings,
+    #[serde(rename = "pg_read_all_stats")]
+    PgReadAllStats,
+    #[serde(rename = "pg_read_server_files")]
+    PgReadServerFiles,
+    #[serde(rename = "pg_signal_autovacuum_worker")]
+    PgSignalAutovacuumWorker,
+    #[serde(rename = "pg_signal_backend")]
+    PgSignalBackend,
+    #[serde(rename = "pg_stat_scan_tables")]
+    PgStatScanTables,
+    #[serde(rename = "pg_use_reserved_connections")]
+    PgUseReservedConnections,
+    #[serde(rename = "pg_write_all_data")]
+    PgWriteAllData,
+    #[serde(rename = "pg_write_server_files")]
+    PgWriteServerFiles,
+    #[serde(rename = "alter")]
+    Alter,
+    #[serde(rename = "alter_routine")]
+    AlterRoutine,
+    #[serde(rename = "binlog_admin")]
+    BinlogAdmin,
+    #[serde(rename = "binlog_monitor")]
+    BinlogMonitor,
+    #[serde(rename = "binlog_replay")]
+    BinlogReplay,
+    #[serde(rename = "connection_admin")]
+    ConnectionAdmin,
+    #[serde(rename = "create")]
+    Create,
+    #[serde(rename = "create_role")]
+    CreateRole,
+    #[serde(rename = "create_routine")]
+    CreateRoutine,
+    #[serde(rename = "create_tablespace")]
+    CreateTablespace,
+    #[serde(rename = "create_temporary_tables")]
+    CreateTemporaryTables,
+    #[serde(rename = "create_user")]
+    CreateUser,
+    #[serde(rename = "create_view")]
+    CreateView,
+    #[serde(rename = "delete")]
+    Delete,
+    #[serde(rename = "delete_history")]
+    DeleteHistory,
+    #[serde(rename = "drop")]
+    Drop,
+    #[serde(rename = "drop_role")]
+    DropRole,
+    #[serde(rename = "event")]
+    Event,
+    #[serde(rename = "execute")]
+    Execute,
+    #[serde(rename = "federated_admin")]
+    FederatedAdmin,
+    #[serde(rename = "file")]
+    File,
+    #[serde(rename = "index")]
+    Index,
+    #[serde(rename = "insert")]
+    Insert,
+    #[serde(rename = "lock_tables")]
+    LockTables,
+    #[serde(rename = "process")]
+    Process,
+    #[serde(rename = "read_only_admin")]
+    ReadOnlyAdmin,
+    #[serde(rename = "references")]
+    References,
+    #[serde(rename = "reload")]
+    Reload,
+    #[serde(rename = "replica_monitor")]
+    ReplicaMonitor,
+    #[serde(rename = "replication_client")]
+    ReplicationClient,
+    #[serde(rename = "replication_master_admin")]
+    ReplicationMasterAdmin,
+    #[serde(rename = "replication_slave")]
+    ReplicationSlave,
+    #[serde(rename = "replication_slave_admin")]
+    ReplicationSlaveAdmin,
+    #[serde(rename = "select")]
+    Select,
+    #[serde(rename = "set_user")]
+    SetUser,
+    #[serde(rename = "show_create_routine")]
+    ShowCreateRoutine,
+    #[serde(rename = "show_databases")]
+    ShowDatabases,
+    #[serde(rename = "show_view")]
+    ShowView,
+    #[serde(rename = "shutdown")]
+    Shutdown,
+    #[serde(rename = "slave_monitor")]
+    SlaveMonitor,
+    #[serde(rename = "super")]
+    Super,
+    #[serde(rename = "trigger")]
+    Trigger,
+    #[serde(rename = "update")]
+    Update,
+    #[serde(rename = "application_password_admin")]
+    ApplicationPasswordAdmin,
+    #[serde(rename = "audit_abort_exempt")]
+    AuditAbortExempt,
+    #[serde(rename = "audit_admin")]
+    AuditAdmin,
+    #[serde(rename = "authentication_policy_admin")]
+    AuthenticationPolicyAdmin,
+    #[serde(rename = "backup_admin")]
+    BackupAdmin,
+    #[serde(rename = "binlog_encryption_admin")]
+    BinlogEncryptionAdmin,
+    #[serde(rename = "clone_admin")]
+    CloneAdmin,
+    #[serde(rename = "encryption_key_admin")]
+    EncryptionKeyAdmin,
+    #[serde(rename = "firewall_admin")]
+    FirewallAdmin,
+    #[serde(rename = "flush_optimizer_costs")]
+    FlushOptimizerCosts,
+    #[serde(rename = "flush_status")]
+    FlushStatus,
+    #[serde(rename = "flush_tables")]
+    FlushTables,
+    #[serde(rename = "flush_user_resources")]
+    FlushUserResources,
+    #[serde(rename = "group_replication_admin")]
+    GroupReplicationAdmin,
+    #[serde(rename = "innodb_redo_log_archive")]
+    InnodbRedoLogArchive,
+    #[serde(rename = "passwordless_user_admin")]
+    PasswordlessUserAdmin,
+    #[serde(rename = "persist_ro_variables_admin")]
+    PersistRoVariablesAdmin,
+    #[serde(rename = "replication_applier")]
+    ReplicationApplier,
+    #[serde(rename = "resource_group_admin")]
+    ResourceGroupAdmin,
+    #[serde(rename = "resource_group_user")]
+    ResourceGroupUser,
+    #[serde(rename = "role_admin")]
+    RoleAdmin,
+    #[serde(rename = "sensitive_variables_observer")]
+    SensitiveVariablesObserver,
+    #[serde(rename = "session_variables_admin")]
+    SessionVariablesAdmin,
+    #[serde(rename = "set_any_definer")]
+    SetAnyDefiner,
+    #[serde(rename = "set_user_id")]
+    SetUserId,
+    #[serde(rename = "show_routine")]
+    ShowRoutine,
+    #[serde(rename = "system_user")]
+    SystemUser,
+    #[serde(rename = "system_variables_admin")]
+    SystemVariablesAdmin,
+    #[serde(rename = "table_encryption_admin")]
+    TableEncryptionAdmin,
+    #[serde(rename = "xa_recover_admin")]
+    XaRecoverAdmin,
+    #[serde(rename = "logging_on")]
+    LoggingOn,
+    #[serde(rename = "logging_off")]
+    LoggingOff,
+    #[serde(rename = "file_output")]
+    FileOutput,
+    #[serde(rename = "non_file_output")]
+    NonFileOutput,
+    #[serde(rename = "stage_secret")]
+    StageSecret,
+    #[serde(rename = "stage_tls")]
+    StageTls,
+    #[serde(rename = "stage_connect")]
+    StageConnect,
+    #[serde(rename = "stage_auth")]
+    StageAuth,
+    #[serde(rename = "stage_session_setup")]
+    StageSessionSetup,
+    #[serde(rename = "stage_begin")]
+    StageBegin,
+    #[serde(rename = "stage_commit")]
+    StageCommit,
+    #[serde(rename = "stage_introspection")]
+    StageIntrospection,
+    #[serde(rename = "stage_columns")]
+    StageColumns,
+    #[serde(rename = "stage_sample")]
+    StageSample,
+    #[serde(rename = "stage_check")]
+    StageCheck,
+    #[serde(rename = "stage_audit")]
+    StageAudit,
+    #[serde(rename = "stage_kill")]
+    StageKill,
+}
+impl ::std::fmt::Display for TargetNoteLabel {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Other => f.write_str("other"),
+            Self::Superuser => f.write_str("superuser"),
+            Self::Bypassrls => f.write_str("bypassrls"),
+            Self::Replication => f.write_str("replication"),
+            Self::Createrole => f.write_str("createrole"),
+            Self::Createdb => f.write_str("createdb"),
+            Self::PgCheckpoint => f.write_str("pg_checkpoint"),
+            Self::PgCreateSubscription => f.write_str("pg_create_subscription"),
+            Self::PgDatabaseOwner => f.write_str("pg_database_owner"),
+            Self::PgExecuteServerProgram => f.write_str("pg_execute_server_program"),
+            Self::PgMaintain => f.write_str("pg_maintain"),
+            Self::PgMonitor => f.write_str("pg_monitor"),
+            Self::PgReadAllData => f.write_str("pg_read_all_data"),
+            Self::PgReadAllSettings => f.write_str("pg_read_all_settings"),
+            Self::PgReadAllStats => f.write_str("pg_read_all_stats"),
+            Self::PgReadServerFiles => f.write_str("pg_read_server_files"),
+            Self::PgSignalAutovacuumWorker => f.write_str("pg_signal_autovacuum_worker"),
+            Self::PgSignalBackend => f.write_str("pg_signal_backend"),
+            Self::PgStatScanTables => f.write_str("pg_stat_scan_tables"),
+            Self::PgUseReservedConnections => f.write_str("pg_use_reserved_connections"),
+            Self::PgWriteAllData => f.write_str("pg_write_all_data"),
+            Self::PgWriteServerFiles => f.write_str("pg_write_server_files"),
+            Self::Alter => f.write_str("alter"),
+            Self::AlterRoutine => f.write_str("alter_routine"),
+            Self::BinlogAdmin => f.write_str("binlog_admin"),
+            Self::BinlogMonitor => f.write_str("binlog_monitor"),
+            Self::BinlogReplay => f.write_str("binlog_replay"),
+            Self::ConnectionAdmin => f.write_str("connection_admin"),
+            Self::Create => f.write_str("create"),
+            Self::CreateRole => f.write_str("create_role"),
+            Self::CreateRoutine => f.write_str("create_routine"),
+            Self::CreateTablespace => f.write_str("create_tablespace"),
+            Self::CreateTemporaryTables => f.write_str("create_temporary_tables"),
+            Self::CreateUser => f.write_str("create_user"),
+            Self::CreateView => f.write_str("create_view"),
+            Self::Delete => f.write_str("delete"),
+            Self::DeleteHistory => f.write_str("delete_history"),
+            Self::Drop => f.write_str("drop"),
+            Self::DropRole => f.write_str("drop_role"),
+            Self::Event => f.write_str("event"),
+            Self::Execute => f.write_str("execute"),
+            Self::FederatedAdmin => f.write_str("federated_admin"),
+            Self::File => f.write_str("file"),
+            Self::Index => f.write_str("index"),
+            Self::Insert => f.write_str("insert"),
+            Self::LockTables => f.write_str("lock_tables"),
+            Self::Process => f.write_str("process"),
+            Self::ReadOnlyAdmin => f.write_str("read_only_admin"),
+            Self::References => f.write_str("references"),
+            Self::Reload => f.write_str("reload"),
+            Self::ReplicaMonitor => f.write_str("replica_monitor"),
+            Self::ReplicationClient => f.write_str("replication_client"),
+            Self::ReplicationMasterAdmin => f.write_str("replication_master_admin"),
+            Self::ReplicationSlave => f.write_str("replication_slave"),
+            Self::ReplicationSlaveAdmin => f.write_str("replication_slave_admin"),
+            Self::Select => f.write_str("select"),
+            Self::SetUser => f.write_str("set_user"),
+            Self::ShowCreateRoutine => f.write_str("show_create_routine"),
+            Self::ShowDatabases => f.write_str("show_databases"),
+            Self::ShowView => f.write_str("show_view"),
+            Self::Shutdown => f.write_str("shutdown"),
+            Self::SlaveMonitor => f.write_str("slave_monitor"),
+            Self::Super => f.write_str("super"),
+            Self::Trigger => f.write_str("trigger"),
+            Self::Update => f.write_str("update"),
+            Self::ApplicationPasswordAdmin => f.write_str("application_password_admin"),
+            Self::AuditAbortExempt => f.write_str("audit_abort_exempt"),
+            Self::AuditAdmin => f.write_str("audit_admin"),
+            Self::AuthenticationPolicyAdmin => f.write_str("authentication_policy_admin"),
+            Self::BackupAdmin => f.write_str("backup_admin"),
+            Self::BinlogEncryptionAdmin => f.write_str("binlog_encryption_admin"),
+            Self::CloneAdmin => f.write_str("clone_admin"),
+            Self::EncryptionKeyAdmin => f.write_str("encryption_key_admin"),
+            Self::FirewallAdmin => f.write_str("firewall_admin"),
+            Self::FlushOptimizerCosts => f.write_str("flush_optimizer_costs"),
+            Self::FlushStatus => f.write_str("flush_status"),
+            Self::FlushTables => f.write_str("flush_tables"),
+            Self::FlushUserResources => f.write_str("flush_user_resources"),
+            Self::GroupReplicationAdmin => f.write_str("group_replication_admin"),
+            Self::InnodbRedoLogArchive => f.write_str("innodb_redo_log_archive"),
+            Self::PasswordlessUserAdmin => f.write_str("passwordless_user_admin"),
+            Self::PersistRoVariablesAdmin => f.write_str("persist_ro_variables_admin"),
+            Self::ReplicationApplier => f.write_str("replication_applier"),
+            Self::ResourceGroupAdmin => f.write_str("resource_group_admin"),
+            Self::ResourceGroupUser => f.write_str("resource_group_user"),
+            Self::RoleAdmin => f.write_str("role_admin"),
+            Self::SensitiveVariablesObserver => {
+                f.write_str("sensitive_variables_observer")
+            }
+            Self::SessionVariablesAdmin => f.write_str("session_variables_admin"),
+            Self::SetAnyDefiner => f.write_str("set_any_definer"),
+            Self::SetUserId => f.write_str("set_user_id"),
+            Self::ShowRoutine => f.write_str("show_routine"),
+            Self::SystemUser => f.write_str("system_user"),
+            Self::SystemVariablesAdmin => f.write_str("system_variables_admin"),
+            Self::TableEncryptionAdmin => f.write_str("table_encryption_admin"),
+            Self::XaRecoverAdmin => f.write_str("xa_recover_admin"),
+            Self::LoggingOn => f.write_str("logging_on"),
+            Self::LoggingOff => f.write_str("logging_off"),
+            Self::FileOutput => f.write_str("file_output"),
+            Self::NonFileOutput => f.write_str("non_file_output"),
+            Self::StageSecret => f.write_str("stage_secret"),
+            Self::StageTls => f.write_str("stage_tls"),
+            Self::StageConnect => f.write_str("stage_connect"),
+            Self::StageAuth => f.write_str("stage_auth"),
+            Self::StageSessionSetup => f.write_str("stage_session_setup"),
+            Self::StageBegin => f.write_str("stage_begin"),
+            Self::StageCommit => f.write_str("stage_commit"),
+            Self::StageIntrospection => f.write_str("stage_introspection"),
+            Self::StageColumns => f.write_str("stage_columns"),
+            Self::StageSample => f.write_str("stage_sample"),
+            Self::StageCheck => f.write_str("stage_check"),
+            Self::StageAudit => f.write_str("stage_audit"),
+            Self::StageKill => f.write_str("stage_kill"),
+        }
+    }
+}
+impl ::std::str::FromStr for TargetNoteLabel {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "other" => Ok(Self::Other),
+            "superuser" => Ok(Self::Superuser),
+            "bypassrls" => Ok(Self::Bypassrls),
+            "replication" => Ok(Self::Replication),
+            "createrole" => Ok(Self::Createrole),
+            "createdb" => Ok(Self::Createdb),
+            "pg_checkpoint" => Ok(Self::PgCheckpoint),
+            "pg_create_subscription" => Ok(Self::PgCreateSubscription),
+            "pg_database_owner" => Ok(Self::PgDatabaseOwner),
+            "pg_execute_server_program" => Ok(Self::PgExecuteServerProgram),
+            "pg_maintain" => Ok(Self::PgMaintain),
+            "pg_monitor" => Ok(Self::PgMonitor),
+            "pg_read_all_data" => Ok(Self::PgReadAllData),
+            "pg_read_all_settings" => Ok(Self::PgReadAllSettings),
+            "pg_read_all_stats" => Ok(Self::PgReadAllStats),
+            "pg_read_server_files" => Ok(Self::PgReadServerFiles),
+            "pg_signal_autovacuum_worker" => Ok(Self::PgSignalAutovacuumWorker),
+            "pg_signal_backend" => Ok(Self::PgSignalBackend),
+            "pg_stat_scan_tables" => Ok(Self::PgStatScanTables),
+            "pg_use_reserved_connections" => Ok(Self::PgUseReservedConnections),
+            "pg_write_all_data" => Ok(Self::PgWriteAllData),
+            "pg_write_server_files" => Ok(Self::PgWriteServerFiles),
+            "alter" => Ok(Self::Alter),
+            "alter_routine" => Ok(Self::AlterRoutine),
+            "binlog_admin" => Ok(Self::BinlogAdmin),
+            "binlog_monitor" => Ok(Self::BinlogMonitor),
+            "binlog_replay" => Ok(Self::BinlogReplay),
+            "connection_admin" => Ok(Self::ConnectionAdmin),
+            "create" => Ok(Self::Create),
+            "create_role" => Ok(Self::CreateRole),
+            "create_routine" => Ok(Self::CreateRoutine),
+            "create_tablespace" => Ok(Self::CreateTablespace),
+            "create_temporary_tables" => Ok(Self::CreateTemporaryTables),
+            "create_user" => Ok(Self::CreateUser),
+            "create_view" => Ok(Self::CreateView),
+            "delete" => Ok(Self::Delete),
+            "delete_history" => Ok(Self::DeleteHistory),
+            "drop" => Ok(Self::Drop),
+            "drop_role" => Ok(Self::DropRole),
+            "event" => Ok(Self::Event),
+            "execute" => Ok(Self::Execute),
+            "federated_admin" => Ok(Self::FederatedAdmin),
+            "file" => Ok(Self::File),
+            "index" => Ok(Self::Index),
+            "insert" => Ok(Self::Insert),
+            "lock_tables" => Ok(Self::LockTables),
+            "process" => Ok(Self::Process),
+            "read_only_admin" => Ok(Self::ReadOnlyAdmin),
+            "references" => Ok(Self::References),
+            "reload" => Ok(Self::Reload),
+            "replica_monitor" => Ok(Self::ReplicaMonitor),
+            "replication_client" => Ok(Self::ReplicationClient),
+            "replication_master_admin" => Ok(Self::ReplicationMasterAdmin),
+            "replication_slave" => Ok(Self::ReplicationSlave),
+            "replication_slave_admin" => Ok(Self::ReplicationSlaveAdmin),
+            "select" => Ok(Self::Select),
+            "set_user" => Ok(Self::SetUser),
+            "show_create_routine" => Ok(Self::ShowCreateRoutine),
+            "show_databases" => Ok(Self::ShowDatabases),
+            "show_view" => Ok(Self::ShowView),
+            "shutdown" => Ok(Self::Shutdown),
+            "slave_monitor" => Ok(Self::SlaveMonitor),
+            "super" => Ok(Self::Super),
+            "trigger" => Ok(Self::Trigger),
+            "update" => Ok(Self::Update),
+            "application_password_admin" => Ok(Self::ApplicationPasswordAdmin),
+            "audit_abort_exempt" => Ok(Self::AuditAbortExempt),
+            "audit_admin" => Ok(Self::AuditAdmin),
+            "authentication_policy_admin" => Ok(Self::AuthenticationPolicyAdmin),
+            "backup_admin" => Ok(Self::BackupAdmin),
+            "binlog_encryption_admin" => Ok(Self::BinlogEncryptionAdmin),
+            "clone_admin" => Ok(Self::CloneAdmin),
+            "encryption_key_admin" => Ok(Self::EncryptionKeyAdmin),
+            "firewall_admin" => Ok(Self::FirewallAdmin),
+            "flush_optimizer_costs" => Ok(Self::FlushOptimizerCosts),
+            "flush_status" => Ok(Self::FlushStatus),
+            "flush_tables" => Ok(Self::FlushTables),
+            "flush_user_resources" => Ok(Self::FlushUserResources),
+            "group_replication_admin" => Ok(Self::GroupReplicationAdmin),
+            "innodb_redo_log_archive" => Ok(Self::InnodbRedoLogArchive),
+            "passwordless_user_admin" => Ok(Self::PasswordlessUserAdmin),
+            "persist_ro_variables_admin" => Ok(Self::PersistRoVariablesAdmin),
+            "replication_applier" => Ok(Self::ReplicationApplier),
+            "resource_group_admin" => Ok(Self::ResourceGroupAdmin),
+            "resource_group_user" => Ok(Self::ResourceGroupUser),
+            "role_admin" => Ok(Self::RoleAdmin),
+            "sensitive_variables_observer" => Ok(Self::SensitiveVariablesObserver),
+            "session_variables_admin" => Ok(Self::SessionVariablesAdmin),
+            "set_any_definer" => Ok(Self::SetAnyDefiner),
+            "set_user_id" => Ok(Self::SetUserId),
+            "show_routine" => Ok(Self::ShowRoutine),
+            "system_user" => Ok(Self::SystemUser),
+            "system_variables_admin" => Ok(Self::SystemVariablesAdmin),
+            "table_encryption_admin" => Ok(Self::TableEncryptionAdmin),
+            "xa_recover_admin" => Ok(Self::XaRecoverAdmin),
+            "logging_on" => Ok(Self::LoggingOn),
+            "logging_off" => Ok(Self::LoggingOff),
+            "file_output" => Ok(Self::FileOutput),
+            "non_file_output" => Ok(Self::NonFileOutput),
+            "stage_secret" => Ok(Self::StageSecret),
+            "stage_tls" => Ok(Self::StageTls),
+            "stage_connect" => Ok(Self::StageConnect),
+            "stage_auth" => Ok(Self::StageAuth),
+            "stage_session_setup" => Ok(Self::StageSessionSetup),
+            "stage_begin" => Ok(Self::StageBegin),
+            "stage_commit" => Ok(Self::StageCommit),
+            "stage_introspection" => Ok(Self::StageIntrospection),
+            "stage_columns" => Ok(Self::StageColumns),
+            "stage_sample" => Ok(Self::StageSample),
+            "stage_check" => Ok(Self::StageCheck),
+            "stage_audit" => Ok(Self::StageAudit),
+            "stage_kill" => Ok(Self::StageKill),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for TargetNoteLabel {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for TargetNoteLabel {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
 ///`TargetStatus`
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -3372,8 +3995,6 @@ pub struct TargetStatus {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub audit_source: ::std::option::Option<AuditSource>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
-    pub detail: ::std::option::Option<TargetDetail>,
-    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub edition: ::std::option::Option<Edition>,
     pub engine: Engine,
     ///Cause of the last failed `check()` or connection, if any.
@@ -3381,6 +4002,13 @@ pub struct TargetStatus {
     pub last_error: ::std::option::Option<FailureCode>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub metrics: ::std::option::Option<MetricsMap>,
+    /**Explanations of the target's status from the last `check()`: why the audit level is
+degraded, what is not covered, over-privilege, an insecure setting. Closed codes with
+bounded parameters, never free text; the console renders them (see `TargetNote`).
+Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
+*/
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub notes: ::std::vec::Vec<TargetNote>,
     ///Whether the last connection attempt with the configured read-only account succeeded.
     pub reachable: bool,
     /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted

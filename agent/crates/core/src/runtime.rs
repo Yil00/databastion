@@ -11,10 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 use databastion_classifiers::id::CLASSIFIERS_VERSION;
 use databastion_classifiers::masking::{HmacKey, MaskedFinding};
 use databastion_protocol::{
-    AgentVersion, ClassifiersVersion, Connector as ProtoConnector, ConnectorList, Count,
-    DetectedTarget, EnrollRequest, EnrollRequestArch, EnrollRequestOs, EnrollResponse,
-    EnrollmentToken, FailureCode, HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError,
-    JobStatusUpdate, MetricsMap, MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
+    AgentVersion, ClassifiersVersion, Connector as ProtoConnector, ConnectorList, DetectedTarget,
+    EnrollRequest, EnrollRequestArch, EnrollRequestOs, EnrollResponse, EnrollmentToken,
+    FailureCode, HeartbeatRequest, HeartbeatResponse, Hostname, Job, JobError, JobStatusUpdate,
+    MetricsMap, MetricsMapKey, TargetId, TargetStatus, Timestamp, Uuid,
 };
 use reqwest::Method;
 use tokio::sync::watch;
@@ -409,6 +409,8 @@ struct Runtime {
     host_root: PathBuf,
     /// Heartbeats refused with a fatal `401` since the last success.
     unauthorized_heartbeats: std::sync::atomic::AtomicU32,
+    /// Optional request fields the console accepts (ADR-0022).
+    console_caps: crate::capabilities::ConsoleCapabilities,
     /// Last local detection result and when it was computed.
     detection: Mutex<Option<(Instant, Vec<DetectedTarget>)>>,
     /// Result endpoints parked after a `501`.
@@ -576,6 +578,7 @@ impl Runtime {
             host_root: PathBuf::from("/"),
             detection: Mutex::new(None),
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
+            console_caps: crate::capabilities::ConsoleCapabilities::default(),
             parked: Mutex::new(Parked::default()),
             findings_cap: MAX_FINDINGS_PER_JOB,
             audits: Mutex::new(AuditTable::default()),
@@ -643,16 +646,17 @@ impl Runtime {
                 }),
                 _ => None,
             };
-            // `detail` (the connector's `TargetHealth::detail`) is not uplinked yet: it needs the
-            // `TargetDetail` sanitization first (ROADMAP P2-G).
+            // `notes` (closed codes from the connector's `check()`) are not produced yet
+            // (ROADMAP P2-G); when they are, they are sent only if the console accepts
+            // `target_status.notes` (ADR-0022, `capabilities`).
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
                 audit_source,
-                detail: None,
                 edition: None,
                 engine: proto_engine(target.engine),
                 last_error,
                 metrics: None,
+                notes: Vec::new(),
                 reachable,
                 server_version: None,
                 target_id,
@@ -748,10 +752,11 @@ impl Runtime {
     async fn build_heartbeat(&self) -> Result<HeartbeatRequest, AgentError> {
         let config = self.config();
         let engines: Vec<Engine> = self.connectors.iter().map(|c| c.engine()).collect();
-        let uptime = i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX);
         let spool = self.lock_spool().status();
         let detected_targets = self.detected_targets(&config).await;
         Ok(HeartbeatRequest {
+            // No console -> agent field needs negotiating yet (ADR-0022).
+            accepts: None,
             agent_version: agent_version()?,
             classifiers_version: classifiers_version(),
             connectors: connector_list(&engines),
@@ -761,7 +766,7 @@ impl Runtime {
             spool,
             targets: self.target_statuses(&config).await,
             ts: now(),
-            uptime_s: Count(uptime),
+            uptime_s: crate::sanitize::clamped_count(self.started.elapsed().as_secs()),
         })
     }
 
@@ -791,6 +796,7 @@ impl Runtime {
                 uplink::accept::heartbeat,
             )
             .await?;
+        self.console_caps.record(response.accepts.as_ref());
         let value = response.heartbeat_interval_s.0;
         let clamped = backoff::clamp_heartbeat_interval(value);
         if clamped.is_none() {
@@ -824,6 +830,14 @@ impl Runtime {
                 Err(e) => {
                     bump(&self.counters.heartbeat_failures, 1);
                     failures = failures.saturating_add(1);
+                    if matches!(
+                        e,
+                        CallError::Uplink(UplinkError::Rejected { status: 400, .. })
+                    ) {
+                        // The console may not accept a negotiated field any more
+                        // (rolled back): send none until a response lists them.
+                        self.console_caps.clear();
+                    }
                     self.on_call_error("heartbeat", &e, failures, interval)?
                 }
             };

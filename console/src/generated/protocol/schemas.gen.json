@@ -495,6 +495,10 @@
         },
         "metrics": {
           "$ref": "#/$defs/MetricsMap"
+        },
+        "accepts": {
+          "description": "Optional **response and job** fields and features this agent build accepts\n(ADR-0022). Agents reject unknown fields in every console -> agent body, so the\nconsole sends a console -> agent field introduced after protocol 0.1.0 (in a response\nor in a job) only when the agent's latest heartbeat listed it. None exists yet: the\nagent omits the list. Unknown tokens are ignored by the console.\n",
+          "$ref": "#/$defs/CapabilityList"
         }
       }
     },
@@ -537,25 +541,168 @@
           "description": "Cause of the last failed `check()` or connection, if any.",
           "$ref": "#/$defs/FailureCode"
         },
-        "detail": {
-          "$ref": "#/$defs/TargetDetail"
+        "notes": {
+          "description": "Explanations of the target's status from the last `check()`: why the audit level is\ndegraded, what is not covered, over-privilege, an insecure setting. Closed codes with\nbounded parameters, never free text; the console renders them (see `TargetNote`).\nSent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.\n",
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/TargetNote"
+          }
         },
         "metrics": {
           "$ref": "#/$defs/MetricsMap"
         }
       }
     },
-    "TargetDetail": {
-      "description": "Human-readable explanation of the target's status from the last `check()`, for the\nconsole's display: why the audit level is degraded, what is not covered, an insecure\nsetting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2\nschema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:\nthe console does not parse it and never derives a decision from it (`reachable`,\n`audit_level` and `last_error` are the machine-readable status).\n\nBuilt by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error\nnumbers) and engine metadata names (privileges, roles, normalized object names). It\n**never** contains a sampled value, a credential, a connection string, a target host\nname or address, query text, or a driver or server message. At most 1024 characters, no\ncontrol, format, private-use or line / paragraph separator character, no `://` and no\n`@` (the obvious forms of a URL, connection string or `user@host` account). The agent\ntruncates it on a character boundary and omits it when it does not conform; the console\nescapes it on display.\n",
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 1024,
-      "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+$",
-      "not": {
-        "description": "No URL or connection string (`://`), no `user@host` or e-mail form (`@`).",
-        "type": "string",
-        "pattern": "://|@"
+    "TargetNote": {
+      "description": "One explanation of a target's status: a registered `code`, an optional `count` and\noptional closed `labels`. No free text, so no field can carry a sampled value, a\ncredential, a connection string, a host name or address, query text or a driver\nmessage. The console renders a phrase for each code from its catalog, filling in `count`\nand `labels`; a code it does not know is shown as the raw code (with its count and\nlabels), never rejected. E.g. `{\"code\": \"audit.pgaudit_read_class_missing\"}`,\n`{\"code\": \"coverage.relations_rls_skipped\", \"count\": 5}`,\n`{\"code\": \"privilege.over_privileged\", \"labels\": [\"bypassrls\", \"pg_write_all_data\"]}`.\n",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/TargetNoteCode"
+        },
+        "count": {
+          "description": "The number the note is about (relations, schemas, records, roles…), when it has one.",
+          "$ref": "#/$defs/Count"
+        },
+        "labels": {
+          "description": "Closed labels the note is about (privileges, role attributes, predefined roles…).",
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/TargetNoteLabel"
+          }
+        }
       }
+    },
+    "TargetNoteCode": {
+      "description": "Code of a target note. The vocabulary is the registry `shared/protocol/target-notes.json`\n(append-only, like `signals.json`): a conforming agent sends only registered codes; the\nschema checks the form only, so an older console accepts a code registered later and\nshows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,\n`privilege.*` privileges of the agent's account, `security.*` insecure settings,\n`check.*` the check itself.\n",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(audit|coverage|privilege|security|check)\\.[a-z0-9_]{1,48}$"
+    },
+    "TargetNoteLabel": {
+      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n",
+      "type": "string",
+      "enum": [
+        "other",
+        "superuser",
+        "bypassrls",
+        "replication",
+        "createrole",
+        "createdb",
+        "pg_checkpoint",
+        "pg_create_subscription",
+        "pg_database_owner",
+        "pg_execute_server_program",
+        "pg_maintain",
+        "pg_monitor",
+        "pg_read_all_data",
+        "pg_read_all_settings",
+        "pg_read_all_stats",
+        "pg_read_server_files",
+        "pg_signal_autovacuum_worker",
+        "pg_signal_backend",
+        "pg_stat_scan_tables",
+        "pg_use_reserved_connections",
+        "pg_write_all_data",
+        "pg_write_server_files",
+        "alter",
+        "alter_routine",
+        "binlog_admin",
+        "binlog_monitor",
+        "binlog_replay",
+        "connection_admin",
+        "create",
+        "create_role",
+        "create_routine",
+        "create_tablespace",
+        "create_temporary_tables",
+        "create_user",
+        "create_view",
+        "delete",
+        "delete_history",
+        "drop",
+        "drop_role",
+        "event",
+        "execute",
+        "federated_admin",
+        "file",
+        "index",
+        "insert",
+        "lock_tables",
+        "process",
+        "read_only_admin",
+        "references",
+        "reload",
+        "replica_monitor",
+        "replication_client",
+        "replication_master_admin",
+        "replication_slave",
+        "replication_slave_admin",
+        "select",
+        "set_user",
+        "show_create_routine",
+        "show_databases",
+        "show_view",
+        "shutdown",
+        "slave_monitor",
+        "super",
+        "trigger",
+        "update",
+        "application_password_admin",
+        "audit_abort_exempt",
+        "audit_admin",
+        "authentication_policy_admin",
+        "backup_admin",
+        "binlog_encryption_admin",
+        "clone_admin",
+        "encryption_key_admin",
+        "firewall_admin",
+        "flush_optimizer_costs",
+        "flush_status",
+        "flush_tables",
+        "flush_user_resources",
+        "group_replication_admin",
+        "innodb_redo_log_archive",
+        "passwordless_user_admin",
+        "persist_ro_variables_admin",
+        "replication_applier",
+        "resource_group_admin",
+        "resource_group_user",
+        "role_admin",
+        "sensitive_variables_observer",
+        "session_variables_admin",
+        "set_any_definer",
+        "set_user_id",
+        "show_routine",
+        "system_user",
+        "system_variables_admin",
+        "table_encryption_admin",
+        "xa_recover_admin",
+        "logging_on",
+        "logging_off",
+        "file_output",
+        "non_file_output",
+        "stage_secret",
+        "stage_tls",
+        "stage_connect",
+        "stage_auth",
+        "stage_session_setup",
+        "stage_begin",
+        "stage_commit",
+        "stage_introspection",
+        "stage_columns",
+        "stage_sample",
+        "stage_check",
+        "stage_audit",
+        "stage_kill"
+      ]
     },
     "DetectedTarget": {
       "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\n",
@@ -623,6 +770,21 @@
         }
       }
     },
+    "Capability": {
+      "description": "Name of an optional field or feature (ADR-0022): `<object>.<field>` in snake case, e.g.\n`access_event.bytes`, with up to two more segments for a revision\n(`target_status.note_labels.2026_10`). Form only: a party ignores tokens it does not know.\n",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,31}(\\.[a-z0-9_]{1,32}){1,3}$"
+    },
+    "CapabilityList": {
+      "description": "Capability tokens (ADR-0022).",
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/Capability"
+      }
+    },
     "HeartbeatResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -640,6 +802,10 @@
         },
         "server_time": {
           "$ref": "#/$defs/Timestamp"
+        },
+        "accepts": {
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "$ref": "#/$defs/CapabilityList"
         }
       }
     },
@@ -1059,7 +1225,7 @@
           "$ref": "#/$defs/Count"
         },
         "objects_sampled": {
-          "description": "`discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually\nsampled so far. With the `skipped_*` counters below, `objects_total` (the objects\nlisted in the job's scope, after its filters, across all databases of the target) and\n`objects_done` (the objects processed, sampled or skipped), it tells how much of the\nscope a scan covered: `objects_total - objects_done` objects were not reached (scan\nstopped by its deadline, cancellation or the findings cap). Coverage counters are\ncounts only, never a name; each is optional (absent: not reported; a `skipped_*`\nreason absent counts 0) and none is checked by the console. A new skip reason is a new\noptional `skipped_*` counter (compatible change).\n",
+          "description": "`discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually\nsampled so far. With the `skipped_*` counters below, `objects_total` (the objects\nlisted in the job's scope, after its filters, across all databases of the target) and\n`objects_done` (the objects processed, sampled or skipped), it tells how much of the\nscope a scan covered: `objects_total - objects_done` objects were not reached (scan\nstopped by its deadline, cancellation or the findings cap). Coverage counters are\ncounts only, never a name; each is optional (absent: not reported; a `skipped_*`\nreason absent counts 0) and none is checked by the console. A new skip reason is a new\noptional `skipped_*` counter (compatible change, negotiated like any new request\nfield). `objects_sampled` and the `skipped_*` counters are sent only when the latest\n`HeartbeatResponse.accepts` lists `job_progress.coverage` (ADR-0022).\n",
           "$ref": "#/$defs/Count"
         },
         "skipped_not_readable": {
@@ -1316,7 +1482,7 @@
           "$ref": "#/$defs/Count"
         },
         "bytes": {
-          "description": "Size in bytes of the result returned (or of the data affected), when the source\nreports it; absent otherwise, never estimated. For a pre-aggregated event, the total\nof the merged events, as for `rows`. Not produced by the PostgreSQL connector:\nneither pgaudit nor `pg_stat_statements` reports a result size.\n",
+          "description": "Size in bytes of the result returned (or of the data affected), when the source\nreports it; absent otherwise, never estimated. For a pre-aggregated event, the total\nof the merged events, as for `rows`. Not produced by the PostgreSQL connector:\nneither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the\nlatest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).\n",
           "$ref": "#/$defs/Count"
         },
         "signals": {

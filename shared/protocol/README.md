@@ -5,7 +5,11 @@ The narrative design is in [docs/09-agent-protocol.md](../../docs/09-agent-proto
 
 Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.** A compatible change (e.g. an optional field) goes through a regular PR. An incompatible change needs a new ADR and a new version (`/api/agent/v2`).
 
-**Deployment order.** Closed schemas make a new optional field a `400` (`additionalProperties`) for any console built before it. The console must therefore be upgraded **before** the agents, and an agent populates a new optional request field only once the consoles accept it. For a heartbeat, the whole heartbeat is rejected. Today's agent logs the `400`, counts it in `heartbeat_failures_total` and retries at the normal interval while staying active. The console then shows the agent silent after 90 s and raises `agent.silent` after 10 intervals by default; it does not revoke or lock it, but target status stops updating and targets declared after the upgrade get `404` on their results. For batches, the items carrying the field are dropped, with an agent-integrity alert. Details: [docs/09-agent-protocol.md](../../docs/09-agent-protocol.md#deployment-order-for-compatible-changes).
+**Capability negotiation ([ADR-0022](../../docs/adr/0022-protocol-capability-negotiation.md)).** Closed schemas make a new optional field a `400` for any console built before it (and an undecodable reply for any agent built before a new response field). Optional fields added after protocol 0.1.0 are therefore sent only once announced:
+- **request fields**: the console lists the ones it accepts in `HeartbeatResponse.accepts` (a tested constant, `console/src/server/agent-api/capabilities.ts`), and the agent sends one only when its latest heartbeat response listed it (`ConsoleCapabilities::console_accepts`);
+- **response and job fields**: the agent lists the ones it accepts in `HeartbeatRequest.accepts`, and the console sends one only when the agent's latest heartbeat listed it.
+
+A new optional field therefore needs a `Capability` token, an entry in the console constant, and a gate in the agent producer. Without the gate, an unaccepted field loses the whole heartbeat: the agent is shown silent and alerted on, but not revoked. For batches, it loses the items that carry the field. Details: [docs/09-agent-protocol.md](../../docs/09-agent-protocol.md#compatible-changes-and-capability-negotiation).
 
 ## Layout
 | Path | Content |
@@ -16,17 +20,20 @@ Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.**
 | `classifiers.lock.json` | SHA-256 of each published version's sorted id list: published versions are immutable |
 | `signals.json` | Signal registry: the access-event signal ids a conforming agent emits, with their meaning and engines |
 | `signals.schema.json` | JSON Schema of the signal registry (keys `Signal`, engines `Engine`, from `openapi.yaml`) |
+| `target-notes.json` | Target-note registry: the `TargetNote` codes a conforming agent sends, with their phrase (`{count}`, `{labels}` placeholders) and engines |
+| `target-notes.schema.json` | JSON Schema of the target-note registry (keys `TargetNoteCode`, engines `Engine`) |
 | `fixtures/valid/<Schema>.<case>.json` | Bodies that must be accepted by `<Schema>` |
 | `fixtures/invalid/<Schema>.<case>.json` | Bodies that must be rejected by `<Schema>` |
 | `fixtures/invalid-expectations.json` | For each invalid fixture, the JSON Schema keyword it must fail on (so it fails for the intended reason) |
 | `scripts/schema-lint.mjs` | Closure / bounds lint of every schema (used by `validate-fixtures.mjs`) |
 | `scripts/schema-lint.test.mjs` | Self-test: the contract passes the lint, and known mutations (`{}`, `true`, nullable unbounded types, open objects…) are caught |
-| `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + classifier and signal registry checks |
+| `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + classifier, signal and target-note registry checks |
 | `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schemas) shared by the scripts |
 | `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, published versions unchanged (lock), valid fixtures only use ids registered for their `classifiers_version` |
 | `scripts/classifier-registry.test.mjs` | Self-test: the registry and lock pass, known mutations (bad id, duplicate, empty list, unsorted, id added / removed / renamed in a published version, version removed, new version not locked…) are caught |
-| `scripts/signal-registry.mjs` | Signal registry checks: schema, ids sorted, valid fixtures only use registered signals |
-| `scripts/signal-registry.test.mjs` | Self-test: the signal registry passes and holds the six PostgreSQL signals, an appended signal passes, known mutations are caught, and the `Signal` schema stays form-only (a signal registered later is accepted) |
+| `scripts/id-registry.mjs` | Shared checks of the id registries (`signals.json`, `target-notes.json`): schema, ids sorted, valid fixtures only use registered ids |
+| `scripts/id-registry.test.mjs` | Self-test, for each id registry: it passes and holds its seeded ids, an appended id passes, known mutations are caught, and the id schema stays form-only (an id registered later is accepted) |
+| `scripts/append-only.py` | Append-only check run by CI (every push and pull request): `classifiers.lock.json`, `signals.json` and `target-notes.json` compared with `origin/dev`, `origin/main` and, on push, the previous tip |
 | `redocly.yaml` | Redocly ruleset for local linting (`recommended-strict`) |
 
 `<Schema>` is a key of `components/schemas` in `openapi.yaml` (e.g. `FindingsBatch`, `HeartbeatRequest`). Fixture data is fake: `example.com` domains, documentation IP ranges (`192.0.2.0/24`, `198.51.100.0/24`, `2001:db8::/32`), secrets made of `EXAMPLE`.
@@ -47,7 +54,7 @@ The schemas sit in `components/schemas` rather than in separate `schemas/*.json`
 - Every fixture in `valid/` passes, every fixture in `invalid/` fails with its expected keyword.
 - Every request and response body schema has at least one valid and one invalid fixture.
 - `classifiers.json` conforms to `classifiers.schema.json`, its ids are sorted, every version pinned in `classifiers.lock.json` still has the same hash, every version is pinned, and every valid fixture that carries a `classifiers_version` only uses classifier ids registered for it.
-- `signals.json` conforms to `signals.schema.json`, its ids are sorted, and every signal of a valid fixture is registered.
+- `signals.json` and `target-notes.json` conform to their schemas, their ids are sorted, and every signal and note code of a valid fixture is registered.
 
 ## Classifier registry (`classifiers.json`)
 A map `classifiers_version -> [classifier ids]`, e.g. `{"2026.09.1": ["pii.birth_date", …]}`. The console rejects findings whose `classifiers_version` is not a key (`400`, `/classifiers_version`, `enum`) or whose `classifier` is not listed for that version (`400`, `/findings/<i>/classifier`, `enum`), and only issues `discovery.scan` jobs with a registered version. Rules:
@@ -61,7 +68,10 @@ A map `signal id -> {description, engines}`, e.g. `{"signature.pg_dump": {"descr
 - **append-only**: an id is never removed, renamed or given another meaning (a wording fix of its description is fine). A new signal (e.g. `signature.mysqldump` with the MySQL Audit connector) is a new entry, added by a compatible change (regular PR + `security-reviewer` review) in the same change as the connector that emits it;
 - a conforming agent emits only registered ids. The agent contract test `agent/crates/classifiers/tests/contract_signals.rs` checks that every `masking::Signal::ALL` id is registered, and that every registered signal of an engine with an implemented Audit connector (its `AUDIT_ENGINES` list, `postgres` today) can be emitted;
 - the `Signal` schema checks the **form** only (`^(signature|shape|volume)\.[a-z0-9_]+$`): an older console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`). Registration is checked on the fixtures, not by the console;
-- unlike `classifiers.lock.json`, there is no lock file: on pull requests, CI compares `signals.json` with the base branch (Protocol job, "Signal registry is append-only"). Every registered id must still be there, with at least its engines. New ids and engines may be added. A description may be reworded, which reviewers check keeps the meaning.
+- unlike `classifiers.lock.json`, there is no lock file: CI (Protocol job, "Registries are append-only", every push and pull request) compares `signals.json` with `dev`, `main` and, on push, the previous tip. Every registered id must still be there, with at least its engines. New ids and engines may be added. A description may be reworded, which reviewers check keeps the meaning.
+
+## Target-note registry (`target-notes.json`)
+The vocabulary of `TargetStatus.notes[].code` (see `TargetNote` in `openapi.yaml`). It has the same format, rules, scripts and CI check as the signal registry. Each description is also the console's rendering phrase: `{count}` stands for the note's `count` and `{labels}` for its labels. A code the console does not know is shown raw, never rejected; the `TargetNoteCode` schema checks the form only (`^(audit|coverage|privilege|security|check)\.[a-z0-9_]{1,48}$`). The codes are seeded from today's `check()` messages of the PostgreSQL and MySQL / MariaDB connectors. A new code is added in the same change as the connector code that sends it.
 
 ## Commands
 Run from `shared/protocol/`:

@@ -562,6 +562,14 @@ export interface components {
             running_jobs?: components["schemas"]["Uuid"][];
             spool: components["schemas"]["SpoolStatus"];
             metrics?: components["schemas"]["MetricsMap"];
+            /**
+             * @description Optional **response and job** fields and features this agent build accepts
+             *     (ADR-0022). Agents reject unknown fields in every console -> agent body, so the
+             *     console sends a console -> agent field introduced after protocol 0.1.0 (in a response
+             *     or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
+             *     agent omits the list. Unknown tokens are ignored by the console.
+             */
+            accepts?: components["schemas"]["CapabilityList"];
         };
         TargetStatus: {
             target_id: components["schemas"]["TargetId"];
@@ -578,27 +586,53 @@ export interface components {
             audit_source?: components["schemas"]["AuditSource"];
             /** @description Cause of the last failed `check()` or connection, if any. */
             last_error?: components["schemas"]["FailureCode"];
-            detail?: components["schemas"]["TargetDetail"];
+            /**
+             * @description Explanations of the target's status from the last `check()`: why the audit level is
+             *     degraded, what is not covered, over-privilege, an insecure setting. Closed codes with
+             *     bounded parameters, never free text; the console renders them (see `TargetNote`).
+             *     Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
+             */
+            notes?: components["schemas"]["TargetNote"][];
             metrics?: components["schemas"]["MetricsMap"];
         };
         /**
-         * @description Human-readable explanation of the target's status from the last `check()`, for the
-         *     console's display: why the audit level is degraded, what is not covered, an insecure
-         *     setting. E.g. `pgaudit not loaded; falling back to pg_stat_statements`, `not covered: 2
-         *     schema(s) without USAGE, 5 relation(s) skipped for row-level security`. Informational:
-         *     the console does not parse it and never derives a decision from it (`reachable`,
-         *     `audit_level` and `last_error` are the machine-readable status).
-         *
-         *     Built by the agent from fixed phrases, counts, closed codes (SQLSTATE, engine error
-         *     numbers) and engine metadata names (privileges, roles, normalized object names). It
-         *     **never** contains a sampled value, a credential, a connection string, a target host
-         *     name or address, query text, or a driver or server message. At most 1024 characters, no
-         *     control, format, private-use or line / paragraph separator character, no `://` and no
-         *     `@` (the obvious forms of a URL, connection string or `user@host` account). The agent
-         *     truncates it on a character boundary and omits it when it does not conform; the console
-         *     escapes it on display.
+         * @description One explanation of a target's status: a registered `code`, an optional `count` and
+         *     optional closed `labels`. No free text, so no field can carry a sampled value, a
+         *     credential, a connection string, a host name or address, query text or a driver
+         *     message. The console renders a phrase for each code from its catalog, filling in `count`
+         *     and `labels`; a code it does not know is shown as the raw code (with its count and
+         *     labels), never rejected. E.g. `{"code": "audit.pgaudit_read_class_missing"}`,
+         *     `{"code": "coverage.relations_rls_skipped", "count": 5}`,
+         *     `{"code": "privilege.over_privileged", "labels": ["bypassrls", "pg_write_all_data"]}`.
          */
-        TargetDetail: string;
+        TargetNote: {
+            code: components["schemas"]["TargetNoteCode"];
+            /** @description The number the note is about (relations, schemas, records, roles…), when it has one. */
+            count?: components["schemas"]["Count"];
+            /** @description Closed labels the note is about (privileges, role attributes, predefined roles…). */
+            labels?: components["schemas"]["TargetNoteLabel"][];
+        };
+        /**
+         * @description Code of a target note. The vocabulary is the registry `shared/protocol/target-notes.json`
+         *     (append-only, like `signals.json`): a conforming agent sends only registered codes; the
+         *     schema checks the form only, so an older console accepts a code registered later and
+         *     shows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,
+         *     `privilege.*` privileges of the agent's account, `security.*` insecure settings,
+         *     `check.*` the check itself.
+         */
+        TargetNoteCode: string;
+        /**
+         * @description Closed label of a target note, in lower snake case: PostgreSQL role attributes and
+         *     predefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`
+         *     (so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit
+         *     collection states; check stages (`stage_*`). Anything the agent cannot map to this list
+         *     is sent as `other`. A new value is a
+         *     change of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`
+         *     lists `target_status.note_labels.<revision>` for a revision that includes it (see
+         *     ADR-0022), and sends `other` otherwise.
+         * @enum {string}
+         */
+        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill";
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
@@ -625,10 +659,27 @@ export interface components {
             /** @description Individual findings / events dropped since start after a `400` or `404` pointing at them. */
             dropped_items?: components["schemas"]["Count"];
         };
+        /**
+         * @description Name of an optional field or feature (ADR-0022): `<object>.<field>` in snake case, e.g.
+         *     `access_event.bytes`, with up to two more segments for a revision
+         *     (`target_status.note_labels.2026_10`). Form only: a party ignores tokens it does not know.
+         */
+        Capability: string;
+        /** @description Capability tokens (ADR-0022). */
+        CapabilityList: components["schemas"]["Capability"][];
         HeartbeatResponse: {
             console_min_protocol: components["schemas"]["ProtocolMajor"];
             heartbeat_interval_s: components["schemas"]["HeartbeatIntervalSeconds"];
             server_time: components["schemas"]["Timestamp"];
+            /**
+             * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
+             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps
+             *     the list of the latest heartbeat response and sends an optional request field
+             *     introduced after protocol 0.1.0 only when that list names it; before its first
+             *     heartbeat response, and when the list is absent, it sends none of them. The console
+             *     lists everything it accepts. Unknown tokens are ignored by the agent.
+             */
+            accepts?: components["schemas"]["CapabilityList"];
         };
         JobList: {
             jobs: components["schemas"]["Job"][];
@@ -830,7 +881,9 @@ export interface components {
              *     stopped by its deadline, cancellation or the findings cap). Coverage counters are
              *     counts only, never a name; each is optional (absent: not reported; a `skipped_*`
              *     reason absent counts 0) and none is checked by the console. A new skip reason is a new
-             *     optional `skipped_*` counter (compatible change).
+             *     optional `skipped_*` counter (compatible change, negotiated like any new request
+             *     field). `objects_sampled` and the `skipped_*` counters are sent only when the latest
+             *     `HeartbeatResponse.accepts` lists `job_progress.coverage` (ADR-0022).
              */
             objects_sampled?: components["schemas"]["Count"];
             /** @description Objects not sampled because the agent's account cannot read them (e.g. no `SELECT` on any column). */
@@ -939,7 +992,8 @@ export interface components {
              * @description Size in bytes of the result returned (or of the data affected), when the source
              *     reports it; absent otherwise, never estimated. For a pre-aggregated event, the total
              *     of the merged events, as for `rows`. Not produced by the PostgreSQL connector:
-             *     neither pgaudit nor `pg_stat_statements` reports a result size.
+             *     neither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the
+             *     latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
              */
             bytes?: components["schemas"]["Count"];
             /** @description Signal ids of the registry `signals.json` (see `Signal`). */

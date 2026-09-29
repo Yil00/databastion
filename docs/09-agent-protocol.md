@@ -13,17 +13,31 @@
 - **Bounded everything**: every string, array and number has a bound. Free-text strings exclude control, format, private-use and line/paragraph separator characters.
 - **Size limits**: the console rejects bodies larger than **4 MiB** with `413`. The agent keeps every serialized findings or events batch under **1 MiB**, so a conforming agent never reaches the console limit.
 
-### Deployment order for compatible changes
-A compatible contract change adds **optional** fields. Because every schema is closed, a console built before the change answers `400` (`invalid_request`, keyword `additionalProperties`) to any body carrying one of the new fields. **Upgrade the console before the agents.** An agent must not populate a new optional request field until every console it talks to accepts it. Today the agent sends none of the fields added by that change: `TargetStatus.detail`, `AccessEvent.bytes` and the `skipped_*` / `objects_sampled` counters are always absent.
+### Compatible changes and capability negotiation
+A compatible contract change adds **optional** fields. Every schema is closed, in both directions:
+- a console built before a request field was added answers `400` (`invalid_request`, keyword `additionalProperties`) to any body that carries it;
+- an agent built before a response or job field was added cannot decode the reply.
 
-What an upgraded agent would hit against an older console, with today's behavior (not changed here):
-- **Heartbeat.** The whole heartbeat is rejected, not only the new field. The agent treats the `400` as a non-retryable rejection: it logs a warning, counts it in `heartbeat_failures_total`, and sends the next heartbeat at the normal interval (30 s). It stays active: job polling and result uploads go on. Every heartbeat is rejected the same way until the console is upgraded. On the console side:
-  - `last_seen_at` stops moving, so the agent is displayed **silent** after 90 s. An `agent.silent` alert is raised after `DATABASTION_SILENT_AGENT_INTERVALS` intervals (10 by default, i.e. 5 min) and notified.
+Optional fields added after protocol 0.1.0 are therefore **negotiated** ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). "Upgrade the console first" is not relied on; it would only ever hold for request fields.
+- **Request fields (agent → console).** Every heartbeat response carries `accepts`, the list of optional request fields the console accepts (`Capability` tokens such as `target_status.notes`, `access_event.bytes`, `job_progress.coverage`). The agent sends such a field only when its **latest** heartbeat response listed it:
+  - never before its first response, nor when the list is absent;
+  - after a heartbeat rejected with `400` (e.g. a console rolled back), it forgets the list, so its next heartbeat carries none of these fields.
+
+  In the agent, `ConsoleCapabilities::console_accepts(token)` is the only way a producer decides to send a gated field. The console lists every such field it accepts (a tested constant). "Accepts" means "does not reject": `access_event.bytes` is accepted but not stored yet.
+- **Response and job fields (console → agent).** The agent lists the ones it accepts in `HeartbeatRequest.accepts`. The console sends a console → agent field introduced after 0.1.0, in any response or job, only when the agent's latest heartbeat named it. None exists yet, so the agent omits the list.
+- **New enum values** in a request field (e.g. a new `TargetNoteLabel`) are negotiated with a revision token; until then the agent sends the fallback value (`other`).
+- **Form-only registries** (`signals.json`, `target-notes.json`) need no negotiation: an older console accepts a well-formed id it does not know.
+
+Today the agent populates none of the negotiated fields: `TargetStatus.notes`, `AccessEvent.bytes` and the `objects_sampled` / `skipped_*` counters are always absent.
+
+**Without negotiation** (a field sent that the console does not accept), today's behavior is as follows; it is why a producer must check `console_accepts`:
+- **Heartbeat.** The whole heartbeat is rejected, not only the new field. The agent treats the `400` as a non-retryable rejection: it logs a warning, counts it in `heartbeat_failures_total`, forgets the console's capabilities and sends the next heartbeat at the normal interval (30 s). It stays active: job polling and result uploads go on. On the console side:
+  - `last_seen_at` stops moving while heartbeats fail, so the agent is displayed **silent** after 90 s. An `agent.silent` alert is raised after `DATABASTION_SILENT_AGENT_INTERVALS` intervals (10 by default, i.e. 5 min) and notified.
   - The agent is **not** revoked or locked automatically: revocation is an administrator action.
-  - Target status, audit level, spool state and metrics stay frozen at the last accepted heartbeat. A target declared after the upgrade is never registered, so its findings and events get `404` (`notFound`, item pointers) and the agent drops them.
+  - Target status, audit level, spool state and metrics stay frozen at the last accepted heartbeat. A target declared meanwhile is not registered, so its findings and events get `404` (`notFound`, item pointers) and the agent drops them.
   - The rejected heartbeat raises no agent-integrity event, and its failure counter never reaches the console (it travels in the heartbeat).
 - **Findings and events.** An unknown field inside an item is reported on the item (`/events/<i>`), so the agent drops every item that carries it and resends the rest. If every item carries it, every item is dropped. Each rejection also raises an agent-integrity alert.
-- **Job status.** A status update carrying a new `progress` counter is rejected with `400` and not retried. The job keeps its previous status until its own timeouts apply.
+- **Job status.** A status update carrying an unaccepted `progress` counter is rejected with `400` and not retried. The job keeps its previous status until its own timeouts apply.
 
 ## Endpoints
 
@@ -185,7 +199,7 @@ A `discovery.scan` status update can report how much of its scope the scan cover
 - `objects_total`: objects (tables, collections, LDAP object classes) in the job's scope after its filters, across all databases of the target; `objects_done`: objects processed (sampled or skipped); `objects_sampled`: objects actually sampled;
 - `skipped_not_readable`, `skipped_row_level_security`, `skipped_remote`, `skipped_unsupported`, `skipped_limit`, `skipped_error`: objects not sampled, by reason (no read privilege; row-level security, ADR-0012; data held outside the target, I5; a kind the connector does not sample, such as views or merge tables; a structural bound such as the partition-leaf cap; a sampling failure after which the scan went on). An absent reason counts 0; a new reason is a new optional `skipped_*` counter.
 
-`objects_total - objects_done` objects were not reached (deadline, cancellation, findings cap). The counters are flat numbers so that the console stores `progress` as a numeric map. The connectors already compute these counts (`Coverage` in the PostgreSQL and MySQL connectors, today logged only); sending them is an agent follow-up.
+`objects_total - objects_done` objects were not reached (deadline, cancellation, findings cap). The counters are flat numbers so that the console stores `progress` as a numeric map. `objects_sampled` and `skipped_*` are sent only when the console accepts `job_progress.coverage` ([negotiation](#compatible-changes-and-capability-negotiation)). The connectors already compute these counts (`Coverage` in the PostgreSQL and MySQL connectors, today logged only); sending them is an agent follow-up.
 
 ## Result batches and idempotency
 `POST /findings` and `POST /events` share the same envelope rules:
@@ -278,7 +292,7 @@ Access events are masked in the agent before the uplink ([ADR-0007](adr/0007-mas
 - `action`: `connect`, `auth_failure`, `read`, `write`, `ddl`, `dcl`. `read` and `write` events name at least one object.
 - The agent **pre-aggregates** repetitive events (same principal, object set and action within the aggregation window, 60 s by default); `ts_last` and `aggregated_count` describe the merged events.
 - `signals` are computed by the agent from the raw data (ADR-0007), from the [signal registry](#signal-registry). The console does not rely on any `volume.*` signal for its baseline verdict: it computes its own per-principal baseline ([ADR-0021](adr/0021-access-event-correlation.md)).
-- `bytes` (optional): size of the result returned or of the data affected, when the source reports it; the total for a pre-aggregated event, as `rows`. Never estimated. The PostgreSQL connector does not produce it (neither pgaudit nor `pg_stat_statements` reports a result size), and the console does not use it yet (the score uses `rows`).
+- `bytes` (optional): size of the result returned or of the data affected, when the source reports it; the total for a pre-aggregated event, as `rows`. Never estimated. The PostgreSQL connector does not produce it (neither pgaudit nor `pg_stat_statements` reports a result size), and the console does not use it yet (the score uses `rows`). Sent only when the console accepts `access_event.bytes`.
 
 ### The object `*`
 An `objects[]` entry whose `object` is `*` means the agent does not name the object:
@@ -299,12 +313,12 @@ An `objects[]` entry whose `object` is `*` means the agent does not name the obj
 | `shape.full_table_read` | Read of whole relations: no filter, no aggregation, no or a large limit (heuristic) |
 | `volume.large_result` | Rows returned or affected above the agent's large-result threshold |
 
-The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z0-9_]+$`), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; on pull requests, CI rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
+The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z0-9_]+$`), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; CI (every push and pull request) compares the registry with `dev`, `main` and, on push, the previous tip, and rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
 
 ### Console-side checks on events
 *Implemented by the console in P4-C (#54); listed in `openapi.yaml` ("Console-side checks", `POST /events`).* In this order:
 1. **Request rate** (`429`): at most 300 authenticated requests per minute per agent, whatever their outcome, checked after authentication and before the body is read.
-2. **Body**: `413` above 4 MiB, then schema validation, then the batch-level checks (`400`, reported together): serialized size above 1 MiB (pointer `""`, `maxBytes`) and `ts_last` earlier than `ts` (`/events/<i>/ts_last`, `formatMinimum`).
+2. **Body**: `413` above 4 MiB, then schema validation (`400` with the first schema error only; the checks below then do not run), then the batch-level checks (`400`, reported together): serialized size above 1 MiB (pointer `""`, `maxBytes`) and `ts_last` earlier than `ts` (`/events/<i>/ts_last`, `formatMinimum`).
 3. **Back-pressure** (`429` + `Retry-After: 30`): while more than 20 000 events of the agent are not evaluated yet by the console.
 4. **Stored-batch rate** (`429`): at most 60 stored batches per minute per agent; a batch that turns out to be a duplicate or is rejected later does not count.
 5. **Duplicate check** on (`agent_id`, `batch_id`), as for findings (`202` `duplicate: true`, or `409` `batch_conflict`).
@@ -317,9 +331,27 @@ The registry is **append-only**: an id is never removed, renamed or given anothe
 A batch rejected with `400` for any other reason, a `batch_conflict`, a foreign target or a future timestamp is an agent-integrity event. `formatMinimum` is an `ErrorDetail.keyword` value; `keyword` is not frozen by [ADR-0013](adr/0013-frozen-error-codes.md), which covers `Error.code`.
 
 ## Heartbeat
-Request: `ts`, `agent_version`, `uptime_s`, `classifiers_version`, enabled `connectors`, the status of each declared target (`reachable`, honest `audit_level` and `audit_source`, `server_version`, `last_error` as a closed failure code, e.g. `unsupported` for a connector that is still a stub or `timeout` when `check()` exceeds 10 s, an optional `detail`, target metrics), `detected_targets` found on the local host only ([ADR-0006](adr/0006-target-discovery.md)), `running_jobs`, `spool` state (including dropped batches and items), and a numeric `metrics` map. Agent counters in that map include `batches_parked_total` (batches answered `501`), `jobs_unsupported_classifiers_total` (scans refused for their classifier set) and `scans_findings_capped_total` (scans stopped at the per-job cap) (#42).
+Request: `ts`, `agent_version`, `uptime_s`, `classifiers_version`, enabled `connectors`, the status of each declared target (`reachable`, honest `audit_level` and `audit_source`, `server_version`, `last_error` as a closed failure code, e.g. `unsupported` for a connector that is still a stub or `timeout` when `check()` exceeds 10 s, optional `notes`, target metrics), `detected_targets` found on the local host only ([ADR-0006](adr/0006-target-discovery.md)), `running_jobs`, `spool` state (including dropped batches and items), and a numeric `metrics` map. Agent counters in that map include `batches_parked_total` (batches answered `501`), `jobs_unsupported_classifiers_total` (scans refused for their classifier set) and `scans_findings_capped_total` (scans stopped at the per-job cap) (#42).
 
-**`detail`** (`TargetDetail`, optional): a human-readable explanation from the last `check()`, for display only, e.g. `pgaudit not loaded; falling back to pg_stat_statements` or `not covered: 2 schema(s) without USAGE, 5 relation(s) skipped for row-level security`. The agent builds it from fixed phrases, counts, closed codes (SQLSTATE, engine error numbers) and engine metadata names; it never contains a sampled value, a credential, a connection string, a target host name or address, query text, or a driver or server message. At most 1024 characters, no control / format / private-use / separator character, no `://` and no `@`; the agent truncates it on a character boundary and omits it when it does not conform, and the console escapes it on display and never derives a decision from it. The agent does not send it yet (ROADMAP P2-G: `TargetHealth.detail` uplink).
+**`notes`** (optional, at most 16): explanations of the target's status from the last `check()`, as **closed codes with bounded parameters, never free text**. Each note is `{code, count?, labels?}`:
+- `code` is a `TargetNoteCode`, registered in [`shared/protocol/target-notes.json`](../shared/protocol/target-notes.json) (append-only, like the signal registry);
+- `count` is a `Count`;
+- `labels` holds up to 16 closed `TargetNoteLabel` values: PostgreSQL role attributes and predefined roles, MySQL / MariaDB privilege names in lower snake case, audit collection states, `check()` stages; anything else is sent as `other`.
+
+No field can carry a sampled value, a credential, a connection string, a host name or address, query text or a driver message. The registry is seeded with the codes of today's `check()` messages, for example:
+
+```json
+"notes": [
+  { "code": "audit.pgaudit_log_not_configured" },
+  { "code": "coverage.relations_rls_skipped", "count": 5 },
+  { "code": "privilege.role_attributes", "labels": ["bypassrls", "createrole"] },
+  { "code": "security.tls_disabled" }
+]
+```
+
+**Rendering rule:** the console renders each note from a phrase catalog keyed by code (the registry's descriptions, with `{count}` and `{labels}` placeholders), escaping the labels. A code missing from the catalog, e.g. registered after the console was built, is shown as the raw code with its count and labels, never rejected; the schema checks its form only (`^(audit|coverage|privilege|security|check)\.[a-z0-9_]{1,48}$`). The console never derives a decision from notes: `reachable`, `audit_level` and `last_error` are the machine-readable status.
+
+Notes are sent only when the console accepts `target_status.notes`. The agent does not produce them yet: turning the connectors' `check()` messages into notes is ROADMAP P2-G.
 
 The targets reported in heartbeats are the agent's targets: results referencing another `target_id` are rejected with `404`. The agent sends a heartbeat before the first result of a newly declared target.
 
@@ -328,8 +360,10 @@ Response:
 {
   "console_min_protocol": 1,
   "heartbeat_interval_s": 30,
-  "server_time": "2026-09-28T14:02:00.412Z"
+  "server_time": "2026-09-28T14:02:00.412Z",
+  "accepts": ["access_event.bytes", "job_progress.coverage", "target_status.notes"]
 }
 ```
+`accepts` lists the optional request fields the console accepts ([ADR-0022](adr/0022-protocol-capability-negotiation.md)).
 
 Metrics are a bounded `name → number` map (max 128 entries, names `^[a-z][a-z0-9_]{0,63}$`). The console re-exposes them on its own `/metrics` endpoint under the prefix `databastion_agent_reported_`, with an `agent_id` label (and `target_id` for target metrics), so an agent can never shadow a console-computed metric; names on the console's reserved list (e.g. `last_seen_seconds`, `up`, `revoked`) are ignored ([ADR-0004](adr/0004-observability-via-console.md)).

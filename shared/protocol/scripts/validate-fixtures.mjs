@@ -12,8 +12,8 @@
 // 4. Classifier registry: classifiers.json conforms to classifiers.schema.json (ids sorted), its
 //    published versions are unchanged (classifiers.lock.json), and the classifier ids of the valid
 //    fixtures belong to their `classifiers_version`.
-// 5. Signal registry: signals.json conforms to signals.schema.json (ids sorted), and the valid
-//    fixtures only use registered signals.
+// 5. Id registries (scripts/id-registry.mjs): signals.json and target-notes.json conform to their
+//    schemas (ids sorted), and the valid fixtures only use registered signals and note codes.
 //
 // Fixture file name: `<SchemaName>.<case>.json`, where SchemaName is a key of components.schemas.
 // Usage: node scripts/validate-fixtures.mjs   (from shared/protocol/, or any directory)
@@ -22,7 +22,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
 import { fixtureRegistryProblems, lockProblems, registryProblems } from "./classifier-registry.mjs";
-import { fixtureSignalProblems, signalRegistryProblems } from "./signal-registry.mjs";
+import { ID_REGISTRIES, fixtureIdProblems, idRegistryProblems } from "./id-registry.mjs";
 import { ROOT_ID, buildAjv, root } from "./contract-ajv.mjs";
 import { lintDocument } from "./schema-lint.mjs";
 
@@ -44,8 +44,11 @@ const registry = JSON.parse(readFileSync(join(root, "classifiers.json"), "utf8")
 for (const problem of registryProblems(ajv, registry)) fail(problem);
 const lock = JSON.parse(readFileSync(join(root, "classifiers.lock.json"), "utf8"));
 for (const problem of lockProblems(registry, lock)) fail(problem);
-const signals = JSON.parse(readFileSync(join(root, "signals.json"), "utf8"));
-for (const problem of signalRegistryProblems(ajv, signals)) fail(problem);
+const idRegistries = {};
+for (const [kind, { file }] of Object.entries(ID_REGISTRIES)) {
+  idRegistries[kind] = JSON.parse(readFileSync(join(root, file), "utf8"));
+  for (const problem of idRegistryProblems(ajv, kind, idRegistries[kind])) fail(problem);
+}
 
 const validatorFor = (name) => {
   if (!schemas[name]) return undefined;
@@ -88,7 +91,9 @@ for (const kind of ["valid", "invalid"]) {
     const errors = validate.errors ?? [];
     if (kind === "valid") {
       for (const problem of fixtureRegistryProblems(data, registry, `fixtures/valid/${file}`)) fail(problem);
-      for (const problem of fixtureSignalProblems(data, signals, `fixtures/valid/${file}`)) fail(problem);
+      for (const [kind, reg] of Object.entries(idRegistries)) {
+        for (const problem of fixtureIdProblems(data, kind, reg, `fixtures/valid/${file}`)) fail(problem);
+      }
     }
     if (kind === "valid" && !ok) {
       fail(`fixtures/valid/${file}: rejected\n${ajv.errorsText(errors, { separator: "\n    ", dataVar: "" })}`);
@@ -144,5 +149,5 @@ console.log(
   `OK: ${Object.keys(schemas).length} schemas bound-checked, ${checked} fixtures ` +
     `(${covered.valid.size} schemas with valid, ${covered.invalid.size} with invalid cases), ` +
     `${bodySchemas.size} body schemas covered, ${Object.keys(registry).length} classifier set version(s), ` +
-    `${Object.keys(signals).length} signal(s).`,
+    `${Object.keys(idRegistries.signals).length} signal(s), ${Object.keys(idRegistries.targetNotes).length} target-note code(s).`,
 );
