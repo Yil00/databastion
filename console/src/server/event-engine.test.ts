@@ -525,6 +525,51 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(await incidentsOf(auth.agentId)).toHaveLength(5);
     });
 
+    it("ADR-0031: after a false positive, reads split below the judged score open an incident once their rows exceed it", async () => {
+      try {
+        const auth = await agentWithTargets();
+        await policy({ signals: ["shape.*"] });
+        // No finding: every score is 0, only the rows rule can tell a worse event.
+        const read = (i: number, user: string, rows: number) =>
+          dumpEvent({ ts: at(i * 1000), principal: { db_user: user }, rows, signals: ["shape.full_table_read"] });
+        await send(auth, [read(0, "splitter", 1000)]);
+        await drainPolicyWork(getDb());
+        const [judged] = await incidentsOf(auth.agentId);
+        expect(judged?.eventRows).toBe(1000);
+        await transitionIncident(getDb(), String(judged?.id), "false_positive", actor());
+        // 400 + 400 = 800 <= 1000: linked; the third read makes 1200 > 1000: a new incident.
+        await send(auth, [read(10, "splitter", 400), read(11, "splitter", 400)]);
+        await drainPolicyWork(getDb());
+        expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+        expect(await incidentEventCount(getDb(), String(judged?.id))).toBe(3);
+        await send(auth, [read(12, "splitter", 400)]);
+        await drainPolicyWork(getDb());
+        const list = await incidentsOf(auth.agentId);
+        expect(list).toHaveLength(2);
+        const [d] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(list[1]?.id)));
+        expect(d?.payload).toMatchObject({ incident: { reopened_from: judged?.id } });
+
+        // The same on a false-positive overflow incident (cap 1: other principals overflow).
+        process.env[EVENT_INCIDENTS_CAP_VAR] = "1";
+        await send(auth, [read(20, "other", 1000)]);
+        await drainPolicyWork(getDb());
+        const [ov] = (await incidentsOf(auth.agentId)).filter((x) => x.eventOverflow);
+        expect(ov?.eventRows).toBe(1000);
+        await transitionIncident(getDb(), String(ov?.id), "false_positive", actor());
+        await send(auth, [read(21, "third", 600)]);
+        await drainPolicyWork(getDb());
+        expect((await incidentsOf(auth.agentId)).filter((x) => x.eventOverflow)).toHaveLength(1);
+        await send(auth, [read(22, "fourth", 600)]);
+        await drainPolicyWork(getDb());
+        const overflows = (await incidentsOf(auth.agentId)).filter((x) => x.eventOverflow);
+        expect(overflows).toHaveLength(2);
+        const [od] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(overflows[1]?.id)));
+        expect(od?.payload).toMatchObject({ overflow: { limit_per_hour: 1 }, incident: { reopened_from: ov?.id } });
+      } finally {
+        delete process.env[EVENT_INCIDENTS_CAP_VAR];
+      }
+    });
+
     it("end-of-phase-6 M1: fingerprinted principals are keyed per fingerprint, never merged with each other", async () => {
       const auth = await agentWithTargets();
       await scanWith(auth, [finding("email", "pii.email", 1)]);

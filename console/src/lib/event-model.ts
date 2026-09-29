@@ -527,27 +527,36 @@ export function worseThanResolved(
 /**
  * After the incident of a scope was marked a false positive, a later event of the same scope opens
  * a new incident only when it is clearly worse than what was judged (ADR-0031 decision 2): a
- * `signature.*` signal (a dump or export tool) the incident did not have, or a strictly higher
- * score. A higher volume alone is only worse when it raises the score; the baseline verdict and
- * other signals do not count (the administrator judged this principal's activity on this
- * database). Otherwise the event is only linked to the false positive.
+ * `signature.*` signal (a dump or export tool) the incident did not have, a strictly higher score,
+ * or more rows in total than the incident had when it was judged: the rows of the events linked to
+ * it since it was marked a false positive, this event's included (`rowsSinceFalsePositive`), above
+ * its `eventRows` (so an extraction split into many small reads, each below the judged score,
+ * still opens an incident). The baseline verdict and `shape.*` / `volume.*` signals alone do not
+ * count (the administrator judged this principal's activity on this database). Otherwise the event
+ * is only linked to the false positive.
  */
 export function worseThanFalsePositive(
-  fp: { eventScore: number | null; eventSignals: readonly string[] | null },
+  fp: { eventScore: number | null; eventSignals: readonly string[] | null; eventRows?: number | null },
   e: { score: number; signals: readonly string[] },
+  rowsSinceFalsePositive = 0,
 ): boolean {
   if (e.score > (fp.eventScore ?? 0)) return true;
+  if (rowsSinceFalsePositive > 0 && rowsSinceFalsePositive > (fp.eventRows ?? 0)) return true;
   const known = new Set(fp.eventSignals ?? []);
   return e.signals.some((s) => s.startsWith("signature.") && !known.has(s));
 }
 
-/** Whether an event of a closed (resolved or false-positive) incident's scope opens a new incident. */
+/**
+ * Whether an event of a closed (resolved or false-positive) incident's scope opens a new incident.
+ * `rowsSinceFalsePositive`: see `worseThanFalsePositive` (this event's rows included).
+ */
 export function worseThanClosed(
-  closed: { status: string; eventScore: number | null; eventSignals: readonly string[] | null; eventAnomaly: boolean | null },
+  closed: { status: string; eventScore: number | null; eventSignals: readonly string[] | null; eventAnomaly: boolean | null; eventRows?: number | null },
   e: { score: number; anomaly: boolean; signals: readonly string[] },
+  rowsSinceFalsePositive = 0,
 ): boolean {
   if (closed.status === "resolved") return worseThanResolved(closed, e);
-  if (closed.status === "false_positive") return worseThanFalsePositive(closed, e);
+  if (closed.status === "false_positive") return worseThanFalsePositive(closed, e, rowsSinceFalsePositive);
   return false;
 }
 

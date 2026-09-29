@@ -311,6 +311,12 @@ interface LatestIncident {
   eventScore: number | null;
   eventSignals: string[] | null;
   eventAnomaly: boolean | null;
+  eventRows: number | null;
+  /**
+   * False positive only: rows of the events linked to it since it was marked (ADR-0031 decision
+   * 2, anti-splitting), kept up to date by `linkClosed` within the chunk.
+   */
+  rowsSinceFalsePositive: number;
 }
 
 /** Per-chunk state: incident lookups by dedup key, and new incidents per policy in this hour. */
@@ -331,13 +337,31 @@ async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<L
       eventScore: incidents.eventScore,
       eventSignals: incidents.eventSignals,
       eventAnomaly: incidents.eventAnomaly,
+      eventRows: incidents.eventRows,
+      // Table-qualified on purpose: an unqualified "id" in the subquery would resolve to ae.id.
+      rowsSinceFalsePositive: sql<number>`case when incidents.status = 'false_positive' then coalesce((
+          select sum(ae.rows) from incident_events ie join access_events ae on ae.id = ie.event_id
+          where ie.incident_id = incidents.id and ie.created_at >= incidents.false_positive_at), 0) else 0 end::double precision`,
     })
     .from(incidents)
     .where(eq(incidents.dedupKey, key))
     .orderBy(desc(incidents.createdAt), desc(incidents.id))
     .limit(1);
-  state.latest.set(key, row ?? null);
-  return row ?? null;
+  const latest = row ? { ...row, rowsSinceFalsePositive: Number(row.rowsSinceFalsePositive) } : null;
+  state.latest.set(key, latest);
+  return latest;
+}
+
+/** Whether `e` opens a new incident after the closed incident `closed` of its key (M1, ADR-0031). */
+function worseThanClosedIncident(closed: LatestIncident, e: PendingEvent, facts: EventFacts): boolean {
+  const rows = closed.status === "false_positive" ? closed.rowsSinceFalsePositive + (e.rows ?? 0) : 0;
+  return worseThanClosed(closed, facts, rows);
+}
+
+/** Links an event to a closed incident (not worse), counting its rows after a false positive. */
+async function linkClosed(tx: Tx, closed: LatestIncident, e: PendingEvent): Promise<void> {
+  if (closed.status === "false_positive") closed.rowsSinceFalsePositive += e.rows ?? 0;
+  await link(tx, closed.id, e.id);
 }
 
 const capKey = (policyId: string, e: Pick<PendingEvent, "agentId" | "targetId">) => [policyId, e.agentId, e.targetId].join(SEP);
@@ -386,6 +410,7 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
   latest.eventSignals = signals;
   latest.eventScore = Math.max(latest.eventScore ?? 0, facts.score);
   latest.eventAnomaly = latest.eventAnomaly === true || facts.anomaly;
+  latest.eventRows = (latest.eventRows ?? 0) + (e.rows ?? 0);
   await link(tx, latest.id, e.id);
 }
 
@@ -422,8 +447,8 @@ async function applyEventPolicy(
   }
   // M1: after a resolution or a false positive, only a clearly worse event opens a new incident
   // (`worseThanClosed`); otherwise the event is linked to the closed incident (visible there).
-  if (latest && !worseThanClosed(latest, facts)) {
-    await link(tx, latest.id, e.id);
+  if (latest && !worseThanClosedIncident(latest, e, facts)) {
+    await linkClosed(tx, latest, e);
     return "linked";
   }
   // H1 / N1: cap of new incidents per policy, target and hour; beyond, one overflow incident of
@@ -440,8 +465,8 @@ async function applyEventPolicy(
       }
       // A closed overflow incident: same rule as any closed incident (M1): only a worse event
       // opens a new one.
-      if (o && !worseThanClosed(o, facts)) {
-        await link(tx, o.id, e.id);
+      if (o && !worseThanClosedIncident(o, e, facts)) {
+        await linkClosed(tx, o, e);
         return "linked";
       }
       overflow = true;
@@ -483,6 +508,8 @@ async function applyEventPolicy(
     eventScore: facts.score,
     eventSignals: mergeSignals([], facts.signals),
     eventAnomaly: facts.anomaly,
+    eventRows: e.rows ?? 0,
+    rowsSinceFalsePositive: 0,
   });
   if (!overflow) state.created.set(capKey(policy.id, e), (state.created.get(capKey(policy.id, e)) ?? 0) + 1);
   await link(tx, row.id, e.id);

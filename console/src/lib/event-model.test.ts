@@ -303,6 +303,13 @@ describe("dedup scope", () => {
     expect(worseThanFalsePositive(fp, { ...e, score: 10.01 })).toBe(true);
     expect(worseThanFalsePositive(fp, { ...e, signals: ["signature.copy_to_program"] })).toBe(true);
     expect(worseThanFalsePositive({ eventScore: null, eventSignals: null }, { score: 0, signals: [] })).toBe(false);
+    // Anti-splitting: the rows linked since the false positive (this event's included) above the
+    // rows the incident had when judged.
+    const judged = { ...fp, eventRows: 1000 };
+    expect(worseThanFalsePositive(judged, { score: 1, signals: [] }, 1000)).toBe(false);
+    expect(worseThanFalsePositive(judged, { score: 1, signals: [] }, 1001)).toBe(true);
+    expect(worseThanFalsePositive({ ...fp, eventRows: null }, { score: 1, signals: [] }, 0)).toBe(false);
+    expect(worseThanClosed({ ...judged, eventAnomaly: false, status: "false_positive" }, { score: 1, anomaly: false, signals: [] }, 1500)).toBe(true);
     const closed = { ...fp, eventAnomaly: false };
     expect(worseThanClosed({ ...closed, status: "false_positive" }, e)).toBe(false);
     // A resolved incident keeps its wider rule (a new signal or the baseline verdict count).
