@@ -26,7 +26,7 @@ const ACCESS: AccessIncidentOpenedPayload = {
   agent_id: "01890a5d-ac96-774b-bcce-b302099a8058",
   target_id: "pg-prod-1",
   overflow: null,
-  principal: "backup",
+  principal: "=cmd|'/C calc'!A0\r\nBcc: x@example.com‮",
   principal_fingerprinted: false,
   database: "crm",
   hour: "2026-09-28T11:00:00.000Z",
@@ -69,6 +69,18 @@ describe("notification contents", () => {
     expect(renderEmail({ ...ACCESS, access: legacy }).text).toContain("signature.mysqldump (unregistered), shape.full_table_copy\n");
     const body = JSON.parse(webhookBody("d-2", ACCESS)) as { access: { unregistered_signals: string[] } };
     expect(body.access.unregistered_signals).toEqual(["signature.mysqldump"]);
+  });
+
+  it("access incident: db_user stays on one line in the subject and body (P1-A)", () => {
+    const { subject, text } = renderEmail(ACCESS);
+    expect(subject).not.toMatch(/[\r\n\u202e]/);
+    expect(subject).toContain("=cmd|'/C calc'!A0 Bcc: x@example.com");
+    const principalLine = text.split("\n").find((l) => l.startsWith("Principal:"));
+    expect(principalLine).toBe("Principal:  =cmd|'/C calc'!A0 Bcc: x@example.com");
+    expect(text).not.toMatch(/^Bcc:/m);
+    expect(text).not.toContain("\u202e");
+    // The webhook body is JSON: the name is a JSON string, escaped by the serializer.
+    expect((JSON.parse(webhookBody("d-3", ACCESS)) as { principal: string }).principal).toBe(ACCESS.principal);
   });
 
   it("suppression digest: counts only", () => {

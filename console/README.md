@@ -546,6 +546,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   requests and 60 stored batches (30 000 events) per minute (`429`), and `429` + `Retry-After: 30`
   while the agent has more than 20 000 events not evaluated yet (back-pressure, counted in
   `databastion_console_events_backpressure_total`). An accepted batch wakes the policy worker.
+- **Agent text on display and export** (P1-A): `db_user`, `application`, client addresses and
+  object names are rendered as React text nodes (escaped, never HTML) in the events, principal and
+  incident views. In `incident.opened` notifications the principal is a JSON string in the webhook
+  body and is kept on one line in the e-mail subject and body (control, format and line separator
+  characters replaced); `application` is not sent. The console has no CSV export, so there is no
+  spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
+  `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
+  and any printable character in `db_user`).
 - **Sensitivity** of an object: for each classifier found on it (any column, false positives
   excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
   is that of its most sensitive object; an event object without schema matches the findings of any
