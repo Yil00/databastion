@@ -3219,13 +3219,14 @@ pub struct SensitiveObject {
 /**Exfiltration indicator computed by the agent from the raw audit data (ADR-0007). The
 vocabulary is the **signal registry** `shared/protocol/signals.json` (next to this file,
 schema `signals.schema.json`), which describes each id: a conforming agent emits only
-registered ids. Registered today: `signature.pg_dump`, `signature.copy_to_file`,
-`signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
-`volume.large_result`. Families: `signature.*` a dump or export tool or command (the
-console treats it as severe), `shape.*` a query shape (heuristic, evadable), `volume.*` a
-volume threshold of the agent. The registry is **append-only**: a new signal (e.g.
-`signature.mysqldump` for a future connector) is a new entry added by a compatible
-contract change; an id is never removed, renamed or given another meaning.
+registered ids. Registered: `signature.pg_dump`, `signature.copy_to_file`,
+`signature.copy_to_program`, `signature.mysqldump`, `signature.into_outfile`,
+`signature.mongodump`, `signature.mongoexport`, `shape.full_table_copy`,
+`shape.full_table_read`, `volume.large_result`. Families: `signature.*` a dump or export
+tool or command (the console treats it as severe), `shape.*` a query shape (heuristic,
+evadable), `volume.*` a volume threshold of the agent. The registry is **append-only**: a
+new signal is a new entry added by a compatible contract change; an id is never removed,
+renamed or given another meaning.
 
 The name after the family is 1 to 6 words of 1 to 16 lowercase letters joined by `_`: no
 digit, so an id cannot carry a number (an account, card or phone number). This schema
