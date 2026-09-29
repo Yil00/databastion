@@ -22,7 +22,7 @@ const REGISTRY: &str = include_str!("../../../../shared/protocol/target-notes.js
 
 /// Engines (contract `Engine` values) whose connector produces notes. Add
 /// an engine here in the change that makes its connector produce notes.
-const NOTE_ENGINES: &[&str] = &["postgres", "mysql", "mariadb"];
+const NOTE_ENGINES: &[&str] = &["postgres", "mysql", "mariadb", "mongodb"];
 
 /// Registered engines and description of each code.
 fn registry() -> BTreeMap<String, (Vec<String>, String)> {

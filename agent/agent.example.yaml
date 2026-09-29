@@ -90,6 +90,24 @@ targets:
       #         (audit_log_filter.format=JSON); XML and CSV are not supported
       # Without it, Audit uses performance_schema (needs SELECT on it, ADR-0018).
       # audit_log: {path: /var/log/mysql/server_audit.log, format: server_audit}
+  - id: mongo-app
+    engine: mongodb
+    host: db3.internal         # one member (or a mongos); other replica-set members
+                               # are never contacted, mongodb+srv is not supported;
+                               # or `socket: /tmp/mongodb-27017.sock` (with tls: disable)
+    port: 27017
+    account: databastion       # find + listCollections role (ADR-0026, docs/05-security.md)
+    secret:
+      file: /etc/databastion/secrets/mongo-app   # 0600, owned by the agent user
+    # MongoDB settings (optional block).
+    mongodb:
+      # verify_full (default; rustls, certificate + host name, TLS from the first byte)
+      # disable: Unix socket or loopback IP literal only (required for a socket)
+      # disable_insecure: no TLS on a network, explicit opt-in (warned)
+      tls: verify_full
+      # ca_file: /etc/databastion/mongo-ca.pem   # only trusted root for this target
+      # Database holding the account (SCRAM-SHA-256 only). Default: admin.
+      auth_source: admin
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

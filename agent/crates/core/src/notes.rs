@@ -146,6 +146,8 @@ pub enum NoteCode {
     AuditServerAuditNotRead,
     /// `audit.statement_consumers_disabled`.
     AuditStatementConsumersDisabled,
+    /// `audit.stream_not_available`.
+    AuditStreamNotAvailable,
     /// `check.server_is_mariadb`.
     CheckServerIsMariadb,
     /// `check.server_is_mysql`.
@@ -164,10 +166,16 @@ pub enum NoteCode {
     CoverageRemoteEngineTables,
     /// `coverage.schemas_without_usage`.
     CoverageSchemasWithoutUsage,
+    /// `coverage.timeseries_not_readable`.
+    CoverageTimeseriesNotReadable,
     /// `coverage.views_not_sampled`.
     CoverageViewsNotSampled,
+    /// `privilege.any_database`.
+    PrivilegeAnyDatabase,
     /// `privilege.beyond_select`.
     PrivilegeBeyondSelect,
+    /// `privilege.cluster_actions`.
+    PrivilegeClusterActions,
     /// `privilege.extended_variant`.
     PrivilegeExtendedVariant,
     /// `privilege.global_privileges`.
@@ -188,12 +196,18 @@ pub enum NoteCode {
     PrivilegePerformanceSchemaWithoutAudit,
     /// `privilege.predefined_roles`.
     PrivilegePredefinedRoles,
+    /// `privilege.read_beyond_discovery`.
+    PrivilegeReadBeyondDiscovery,
     /// `privilege.role_attributes`.
     PrivilegeRoleAttributes,
     /// `privilege.roles_not_evaluated`.
     PrivilegeRolesNotEvaluated,
+    /// `privilege.system_collections`.
+    PrivilegeSystemCollections,
     /// `privilege.system_database_select`.
     PrivilegeSystemDatabaseSelect,
+    /// `privilege.write_actions`.
+    PrivilegeWriteActions,
     /// `privilege.write_on_relations`.
     PrivilegeWriteOnRelations,
     /// `security.init_connect`.
@@ -225,6 +239,7 @@ impl NoteCode {
         Self::AuditRecordsDroppedSeverity,
         Self::AuditServerAuditNotRead,
         Self::AuditStatementConsumersDisabled,
+        Self::AuditStreamNotAvailable,
         Self::CheckServerIsMariadb,
         Self::CheckServerIsMysql,
         Self::CheckStageFailed,
@@ -234,8 +249,11 @@ impl NoteCode {
         Self::CoverageRelationsWithoutSelect,
         Self::CoverageRemoteEngineTables,
         Self::CoverageSchemasWithoutUsage,
+        Self::CoverageTimeseriesNotReadable,
         Self::CoverageViewsNotSampled,
+        Self::PrivilegeAnyDatabase,
         Self::PrivilegeBeyondSelect,
+        Self::PrivilegeClusterActions,
         Self::PrivilegeExtendedVariant,
         Self::PrivilegeGlobalPrivileges,
         Self::PrivilegeGlobalSelect,
@@ -246,9 +264,12 @@ impl NoteCode {
         Self::PrivilegePerformanceSchemaUnused,
         Self::PrivilegePerformanceSchemaWithoutAudit,
         Self::PrivilegePredefinedRoles,
+        Self::PrivilegeReadBeyondDiscovery,
         Self::PrivilegeRoleAttributes,
         Self::PrivilegeRolesNotEvaluated,
+        Self::PrivilegeSystemCollections,
         Self::PrivilegeSystemDatabaseSelect,
+        Self::PrivilegeWriteActions,
         Self::PrivilegeWriteOnRelations,
         Self::SecurityInitConnect,
         Self::SecurityLoginEventTrigger,
@@ -277,6 +298,7 @@ impl NoteCode {
             Self::AuditRecordsDroppedSeverity => "audit.records_dropped_severity",
             Self::AuditServerAuditNotRead => "audit.server_audit_not_read",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
+            Self::AuditStreamNotAvailable => "audit.stream_not_available",
             Self::CheckServerIsMariadb => "check.server_is_mariadb",
             Self::CheckServerIsMysql => "check.server_is_mysql",
             Self::CheckStageFailed => "check.stage_failed",
@@ -286,8 +308,11 @@ impl NoteCode {
             Self::CoverageRelationsWithoutSelect => "coverage.relations_without_select",
             Self::CoverageRemoteEngineTables => "coverage.remote_engine_tables",
             Self::CoverageSchemasWithoutUsage => "coverage.schemas_without_usage",
+            Self::CoverageTimeseriesNotReadable => "coverage.timeseries_not_readable",
             Self::CoverageViewsNotSampled => "coverage.views_not_sampled",
+            Self::PrivilegeAnyDatabase => "privilege.any_database",
             Self::PrivilegeBeyondSelect => "privilege.beyond_select",
+            Self::PrivilegeClusterActions => "privilege.cluster_actions",
             Self::PrivilegeExtendedVariant => "privilege.extended_variant",
             Self::PrivilegeGlobalPrivileges => "privilege.global_privileges",
             Self::PrivilegeGlobalSelect => "privilege.global_select",
@@ -300,9 +325,12 @@ impl NoteCode {
                 "privilege.performance_schema_without_audit"
             }
             Self::PrivilegePredefinedRoles => "privilege.predefined_roles",
+            Self::PrivilegeReadBeyondDiscovery => "privilege.read_beyond_discovery",
             Self::PrivilegeRoleAttributes => "privilege.role_attributes",
             Self::PrivilegeRolesNotEvaluated => "privilege.roles_not_evaluated",
+            Self::PrivilegeSystemCollections => "privilege.system_collections",
             Self::PrivilegeSystemDatabaseSelect => "privilege.system_database_select",
+            Self::PrivilegeWriteActions => "privilege.write_actions",
             Self::PrivilegeWriteOnRelations => "privilege.write_on_relations",
             Self::SecurityInitConnect => "security.init_connect",
             Self::SecurityLoginEventTrigger => "security.login_event_trigger",

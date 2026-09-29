@@ -34,6 +34,8 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 
 > **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations (or all of them, at the cost of a level 2 profiler). A fast `mongodump` of a small collection can go unnoticed. **This must be stated clearly in the user documentation and in the console.**
 
+> **MongoDB, as implemented (P5-A #74; [ADR-0026](adr/0026-mongodb-connector.md))**: Discovery only. The three MongoDB rows above are the target levels of P5-B / P5-C, **not implemented yet**: every MongoDB target reports the audit level **None**, with the note `audit.stream_not_available`, whatever its edition. The connector does not report the level a server could provide before it reads an Audit source. See [MongoDB Discovery](#mongodb-discovery) below.
+
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
 ## PostgreSQL Audit
@@ -183,6 +185,43 @@ Behind a proxy every client has the proxy's address, and another process on the 
 - **Role privileges only partly visible on MariaDB.** `check()` evaluates the privileges held through roles, including a `performance_schema` grant held through a role, with the rules for direct grants (#70, [ADR-0025](adr/0025-mysql-mariadb-role-privileges-and-heartbeat-checks.md)). MySQL (8.0.19+) shows every applicable role. MariaDB shows a least-privilege account the grants of its current (default) role only: every other role is reported as `privilege.roles_not_evaluated`, and `PUBLIC` grants (10.11+) are not read.
 - **Level of a target whose check timed out.** Targets that share an account take turns within the heartbeat's 10 s deadline. A target whose `check()` did not finish in time, or waited for its turn behind a slow check of the same account, is reported unreachable (`timeout`, `check.timed_out`) with level None for that heartbeat. This does not mean its Audit stream stopped.
 - **Heuristic signals.** `shape.*` and `signature.*` are evadable by design; see [the classifiers README](../agent/crates/classifiers/README.md).
+
+## MongoDB Discovery
+
+What the MongoDB connector does, as merged in P5-A (#74, [ADR-0026](adr/0026-mongodb-connector.md)). The reference is [the connector README](../agent/crates/connector-mongodb/README.md); the account is in [05-security.md](05-security.md#recommended-database-accounts-read-only).
+
+### Scope
+- **One declared host**: a standalone, one replica-set member or a `mongos`, reached directly. The other replica-set members are never contacted and `mongodb+srv` is not supported: to scan a replica set, declare the member to read from (a secondary spares the primary). Reads carry `secondaryPreferred`. MongoDB 5.0 or later; SCRAM-SHA-256 accounts only.
+- **Databases and collections** the account holds privileges on (`authorizedDatabases`, `authorizedCollections`), at most 1024 databases and 4096 collections per database, filtered by the job's filters. `admin`, `local`, `config`, `system.*` and queryable-encryption state collections (`enxcol_.*`) are never read. Collections the account cannot see are not listed, so they cannot be reported as not covered.
+- **Views are not sampled** (their pipeline could read other collections or run JavaScript): counted as `skipped_unsupported`, with the note `coverage.views_not_sampled`. Data reachable only through a view is not covered.
+- **Time-series collections** are read through their view with `find` and a limit, without a size estimate. If the server refuses the read to the account, the collection is counted as `skipped_not_readable` and `check()` reports `coverage.timeseries_not_readable` with the count observed in the last scan; the fallback grant is in [05-security.md](05-security.md#recommended-database-accounts-read-only). Reading through the unpacking view costs more than reading a plain collection.
+
+### Sampling
+- The size estimate is a `count` without a filter (collection metadata), reported as the object's estimated rows; on a sharded cluster it may include orphaned documents.
+- Above 20 times `sample_rows` documents (and above 100), `$sample` picks `sample_rows` documents at random (random cursor, no collection scan). Otherwise the first `sample_rows` documents in natural (storage) order are read.
+- One reply per collection, at most 16 MiB + 64 KiB: a batch cut by the server gives a smaller sample, never a second read.
+- Per document: at most 20 levels of nesting, the first 16 elements of each array, 512 values. Per collection: at most 1024 distinct field paths and `sample_rows` values per path; values cut to 4096 bytes.
+- Values classified: strings; `int32` / `int64` as digits; integral doubles below 2^53; finite `Decimal128`; dates as `YYYY-MM-DD`; generic and user-defined binaries only when they are UTF-8 text. Never read: UUID, encrypted, compressed, sensitive and vector binaries, ObjectIds, booleans, JavaScript code, timestamps, non-integral doubles.
+
+### Field paths
+A finding's location is the database, the collection (`object`) and a normalized field path (`field`); there is no schema. `_id` is a field like any other.
+
+- An embedded document adds a key; an array adds `[]` (`orders[].items[].sku`, arrays of arrays included).
+- Keys that are digits only, contain a dot, or look like values (e-mail addresses, phone or card numbers, UUIDs…) become `*`: `contacts.*.phone`.
+- Object levels that the sample shows to be maps keyed by data (more than 16 distinct keys across the sampled documents, or at least 3 keys each seen in one document only, across at least 2 documents) have their keys replaced by `*`: `acl.*.role`. The collection's top-level fields are never collapsed.
+- The values of every raw path with the same normalized path are pooled before classification.
+- Limits of the key rule: a small map whose keys recur across the sampled documents (at most 16), a map with fewer than 3 keys, or a sample of one document can leave data-derived keys in the path when they do not look like values; conversely, a sub-document with more than 16 fields, or with optional fields each present in one sampled document, is reported as `parent.*`.
+
+### Coverage counters and notes
+| Counter | Meaning |
+|---------|---------|
+| `objects_sampled` | Collections read |
+| `skipped_not_readable` | Refused by the server (`Unauthorized`), including time-series collections |
+| `skipped_unsupported` | Views and collection types the connector does not know |
+| `skipped_limit` | Database or collection listing cut at its bound |
+| `skipped_error` | Any other failure on one collection (dropped since listed, `maxTimeMS` expired, reply over the limit, malformed document) |
+
+`check()` notes for MongoDB targets: `audit.stream_not_available`; `coverage.views_not_sampled`; `coverage.timeseries_not_readable`; the over-privilege notes `privilege.write_actions`, `privilege.read_beyond_discovery`, `privilege.cluster_actions`, `privilege.any_database`, `privilege.system_collections` and `privilege.not_evaluated`; `security.tls_disabled`; `check.stage_failed`, `check.timed_out`. The privilege and coverage report is recomputed at most every 10 minutes per target.
 
 ## Known export signatures
 | Tool | Observable signature | Engine |

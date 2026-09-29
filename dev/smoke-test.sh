@@ -94,6 +94,9 @@ echo "# MongoDB (Community: profiler + JSON logs)"
 MONGO='mongosh --quiet --norc "mongodb://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"'
 check "read-only account can read" ex mongo "$MONGO --eval 'if (db.users.countDocuments() < 1) quit(1)'"
 check "read-only account cannot write" must_fail ex mongo "$MONGO --eval 'db.users.insertOne({smoke: 1})'"
+# ADR-0026: find + listCollections on app only.
+check "agent account cannot see other sessions" must_fail ex mongo "$MONGO --eval 'db.adminCommand({currentOp: 1, \$all: true})'"
+check "agent account cannot read the profiler" must_fail ex mongo "$MONGO --eval 'db.system.profile.findOne()'"
 check "slow-operation JSON log mentions app.users" retry 15 ex mongo \
   "grep '\"Slow query\"' /var/log/databastion/mongod.log | grep -q '\"app.users\"'"
 

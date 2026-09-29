@@ -18,7 +18,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B), Audit (P4-A, [README](crates/connector-postgres/README.md)) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
-| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
+| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); no Audit yet |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
@@ -343,7 +343,70 @@ Target settings: the `mysql` block of a target in `agent.example.yaml`. Integrat
 set, and are skipped otherwise; protocol refusals are also tested against a scripted server over
 an in-memory stream (`src/fake.rs`).
 
-### Future database drivers (mongodb, ldap3)
+### MongoDB connector
+No driver crate ([ADR-0026](../docs/adr/0026-mongodb-connector.md) decision 1): the official
+`mongodb` crate pulls `webpki-roots` (CDLA-Permissive-2.0, outside `deny.toml`) as its only trust
+store without a CA file, needs Rust 1.88, compiles process spawning in, and follows the replica-set
+topology to hosts the server names (I5). The connector speaks a closed subset of the wire protocol
+itself (`crates/connector-mongodb/src/wire.rs`, `bson.rs`, `scram.rs`, `conn.rs`) over tokio and
+the same rustls crates:
+
+- `OP_MSG` only, one body section, no compression, no exhaust; the reply length is checked on the
+  header before the body is read (16 MiB + 64 KiB), and reply buffers are zeroized; BSON parsed by
+  a bounded reader that fails closed; error replies reduced to their numeric code (never `errmsg`);
+- one declared host or socket, direct connection: `hello`'s `hosts` are never followed, no
+  `mongodb+srv`; one connection per scan and per `check()`, no pool, no monitoring connection;
+- SCRAM-SHA-256 only (SASLprep, iteration count 4096 to 100 000, derived off the async runtime, the server nonce must extend
+  the client's, the server signature verified before any other command); SCRAM-SHA-1, `PLAIN`,
+  X.509, Kerberos, AWS and OIDC are not supported; `authSource` from `mongodb.auth_source`
+  (default `admin`);
+- TLS from the first byte: `verify_full` (default) against a pinned CA (`mongodb.ca_file`) or the
+  system store, host name or IP SAN checked; `disable` only on a Unix socket or a loopback
+  literal; `disable_insecure`, an explicit and warned opt-in, on a network.
+
+Behavior:
+
+- a closed set of commands built in code (`hello`, `saslStart`, `saslContinue`, `buildInfo`,
+  `connectionStatus`, `listDatabases`, `listCollections`, `count`, `find`, `aggregate` with
+  `[{$sample}]` only and `allowDiskUse: false`, `killCursors`); `maxTimeMS` (clamped job
+  parameter, never `0`) and `$readPreference: secondaryPreferred` on every read; a client-side
+  deadline on every exchange; no `getMore`: `find` uses `singleBatch`, `aggregate` a batch of
+  `n + 1`, and a reply with an open cursor is followed by `killCursors`; no session id, so no
+  server session or transaction; each collection is read by one command parsed whole before
+  `FindingSink::submit().await`;
+- scope: the databases and collections the account holds privileges on (`authorizedDatabases`,
+  `authorizedCollections`, `nameOnly`), never `admin`, `local`, `config`, `system.*` or
+  `enxcol_.*`; views are never read (their pipeline could read other collections or run
+  JavaScript); time-series collections are read through their view with `find`, `limit` and a batch of
+  `n + 1` (no `count`, and no `singleBatch`: the server's view conversion refuses it); one the
+  server refuses is counted as not readable and reported by `check()` as
+  `coverage.timeseries_not_readable` (observed in the last scan);
+- sampling: `count` (metadata) as the estimate; `$sample` of `sample_rows` documents above 20 times
+  that, natural order with `limit` otherwise; per document at most 20 levels, 16 elements per
+  array, 512 values; per collection 1024 normalized paths; values cut to 4096 bytes;
+- field paths: arrays as `[]`, keys through `names::normalize_field_path` (digit-only keys, keys
+  with a dot or that look like values become `*`), object levels that are maps keyed by data
+  (more than 16 distinct keys in the sample, or keys each in one document) collapsed to `*`,
+  values of every raw path with the same normalized path pooled; collection names through `names::normalize_path` (`fs.files`);
+- values: strings and symbols; `int32` / `int64` digits; integral doubles below 2^53; finite
+  `Decimal128`; dates as `YYYY-MM-DD`; generic and user binaries only when they are UTF-8 text;
+  UUID, encrypted, compressed, sensitive and vector binaries, ObjectIds, booleans, code and
+  timestamps are never read;
+- `check()`: reachability; audit level **None** with `audit.stream_not_available` (no Audit
+  stream in this build; P5-B, P5-C); version and edition from `buildInfo` in the log only;
+  over-privilege from `connectionStatus` (resolved privileges of every role): write or
+  administration actions, read actions beyond `find` / `listCollections`, cluster-wide actions,
+  privileges on every database, system collections or the `admin` / `local` / `config`
+  databases; views not sampled. Recomputed at most every 10 minutes per target.
+
+Target settings: the `mongodb` block of a target in `agent.example.yaml`. Integration tests
+(`src/it.rs`) run against the dev `mongo` service when `DATABASTION_TEST_MONGO_URL` (and
+`DATABASTION_TEST_MONGO_ADMIN_URL` for the probes) are set, and are skipped otherwise; the handshake,
+hostile SCRAM answers, cursor handling and a whole scan of the dev seed (checked against
+`dev/ground-truth.json`) also run against a scripted server over an in-memory stream
+(`src/fake.rs`).
+
+### Future database drivers (ldap3)
 Add them with `default-features = false` and rustls-only TLS features, and
 re-check `Cargo.lock` for OpenSSL. Every query gets a timeout and bounded
 sampling (I4). Driver errors can echo query text or values: map them to

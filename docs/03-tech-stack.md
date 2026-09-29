@@ -26,12 +26,15 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 | Async runtime | tokio | |
 | CLI / logs | clap, `tracing` + `tracing-subscriber` (JSON) | |
 | Protocol types | typify 0.8, run by the `databastion-protocol-codegen` developer tool (`cargo run -p databastion-protocol-codegen`) | Output committed in `crates/protocol/src/generated.rs` (crate `databastion-protocol`); the codegen tool is not shipped in the agent |
-| PostgreSQL + MySQL/MariaDB | sqlx | Not added yet (P2) |
-| MongoDB | official `mongodb` crate | Not added yet (phase 5) |
+| PostgreSQL | `tokio-postgres` + rustls | P2-B ([ADR-0015](adr/0015-postgresql-connector-decisions.md)) |
+| MySQL/MariaDB | Own client for the MySQL protocol + rustls, no driver crate | P2-C ([ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md) decision 3) |
+| MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A, #74 ([ADR-0026](adr/0026-mongodb-connector.md) decision 1); see below |
 | OpenLDAP | `ldap3` | Not added yet (phase 6) |
-| HTTP client | reqwest + rustls | Not added yet (P1-B). No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
+| HTTP client (uplink) | reqwest + rustls (`ring` provider, system trust store) | No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
 | Packaging | Distroless Docker image + `.deb` | |
 | Architectures | x86_64 + arm64 | |
+
+**MongoDB client.** The official `mongodb` crate was planned and rejected ([ADR-0026](adr/0026-mongodb-connector.md)): its rustls feature always pulls `webpki-roots` (license `CDLA-Permissive-2.0`, outside the `agent/deny.toml` allow-list) and uses that bundled root list as its only trust store when no CA file is given, so the system store cannot be used; its MSRV (1.88) is above the workspace's (1.85); it compiles tokio's `process` feature in (`mongocryptd` spawning); and it follows the replica-set topology to hosts named by the server, which are not declared targets (I5). The connector instead implements a closed subset of the wire protocol: `OP_MSG` only, a closed command set, SCRAM-SHA-256 only, replies bounded before they are read, over the same rustls crates as the other connectors. It adds no new license and no MSRV change (`hmac`, `sha2`, `stringprep`, `base64`, `getrandom`).
 
 A single binary, `databastion-agent`, with connectors enabled through Cargo *features* (`postgres`, `mysql`, `mongodb`, `openldap`, all on by default) ([ADR-0002](adr/0002-single-agent-connectors.md)). Every crate is named with the `databastion-` prefix.
 
