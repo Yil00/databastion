@@ -430,7 +430,7 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md), Proposed; `src/audit/`):
   `databastion-agent`, the address `whatsmyuri` returns, no signal, and the Discovery budget per
   collection and day, and only for reads (writes, DDL and DCL are always reported, for every
   engine); on the `auditLog`, only a `find` with a limit within the budget; its `count` without
-  filter and, on the profiler source, its exact profiler polls are not charged;
+  filter and, on the profiler source, its exact profiler polls (no more than it sent per database) are not charged;
 - `check()` counts `find` on `<db>.system.profile` as the Audit grant only while a stream reads
   the profiler (otherwise `privilege.system_collections`); notes `audit.auditlog_on_community`,
   `audit.authcheck_success_pending`, `audit.slow_operations_only`, `audit.source_not_configured`,

@@ -277,7 +277,7 @@ As for PostgreSQL and MySQL / MariaDB, an event of the agent's account is left o
 
 Not charged to the budget (same identity rules): the agent's `count` without a filter (it reads no document), and, **on the profiler source only**, the agent's own profiler polls with their exact shape: a `find` on `system.profile` with a one-key filter and `limit: 1000`, or the newest-entry probe with no filter and `limit: 1`. Any other read of `system.profile` with the agent's identity is charged like any read, and a read of it by any other account is reported.
 
-Limits of these rules: behind a proxy or NAT every client has the same address. Someone holding the agent's credentials on the agent host, spoofing its application name and reading at most the budget per collection and day stays unreported (on the `auditLog`, with `find`s whose limits add up to the budget); on the profiler source, the exact poll shape lets such a client read the latest 1000 profiler entries of a database per request unreported, as the agent itself does. The row counters are reset by an agent restart.
+Limits of these rules: behind a proxy or NAT every client has the same address. Someone holding the agent's credentials on the agent host, spoofing its application name and reading at most the budget per collection and day stays unreported (on the `auditLog`, with `find`s whose limits add up to the budget); on the profiler source, a read with the agent's exact poll shape is uncharged only up to the number of polls the agent actually sent to that database (unused credits capped at 64), so such a client can at most take the place of the agent's own polls before its reads are charged and reported. The row counters are reset by an agent restart.
 
 ### Notes
 

@@ -195,7 +195,10 @@ impl OwnAccount {
         client: ClientSeen,
         e: &MaskedEvent,
     ) -> bool {
-        user == self.account && self.identity(application, client) && e.signals().is_empty()
+        user == self.account
+            && matches!(e.action(), EventAction::Read | EventAction::Connect)
+            && self.identity(application, client)
+            && e.signals().is_empty()
     }
 
     /// The application (when logged) and the client address are the
@@ -250,6 +253,31 @@ mod tests {
             normalize_path("t"),
         ))
         .with_rows(rows)
+    }
+
+    #[test]
+    fn unbudgeted_routine_is_for_reads_and_connections_only() {
+        let o = own(Some("192.0.2.14"));
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        for (action, expected) in [
+            (EventAction::Read, true),
+            (EventAction::Connect, true),
+            (EventAction::Write, false),
+            (EventAction::Ddl, false),
+            (EventAction::Dcl, false),
+        ] {
+            let e = MaskedEvent::new(
+                EventSource::Pgaudit,
+                action,
+                EventPrincipal::account("databastion"),
+                SystemTime::UNIX_EPOCH,
+            );
+            assert_eq!(
+                o.routine_unbudgeted("databastion", Some("databastion-agent"), logged, &e),
+                expected,
+                "{action:?}"
+            );
+        }
     }
 
     #[test]

@@ -155,7 +155,15 @@ pub(crate) struct EventBuilder {
     /// (`limits.max_sample_rows`).
     budget: u64,
     conns: Conns,
+    /// Per database: profiler polls the stream sent whose own profiler
+    /// entry was not seen yet (at most [`MAX_POLL_CREDITS`]). Only that
+    /// many poll-shaped reads of `system.profile` are left out uncharged.
+    poll_credits: HashMap<String, u32>,
 }
+
+/// Unused poll credits kept per database: polls whose own entry is never
+/// seen (not profiled, overwritten) do not add up.
+pub(crate) const MAX_POLL_CREDITS: u32 = 64;
 
 /// The agent's own profiler polls (`audit::profiler`): a `find` on
 /// `system.profile` with a one-key filter on `ts` and the batch limit, or
@@ -180,6 +188,32 @@ impl EventBuilder {
             own_user,
             budget,
             conns: Conns::default(),
+            poll_credits: HashMap::new(),
+        }
+    }
+
+    /// The profiler stream is about to send one poll (or newest-entry
+    /// probe) to `db`: one poll-shaped read of its `system.profile` may be
+    /// left out uncharged.
+    pub(crate) fn grant_poll(&mut self, db: &str) {
+        if self.poll_credits.len() >= MAX_CONNECTIONS && !self.poll_credits.contains_key(db) {
+            return;
+        }
+        let c = self.poll_credits.entry(db.to_owned()).or_default();
+        *c = (*c + 1).min(MAX_POLL_CREDITS);
+    }
+
+    /// Uses one poll credit of the record's database.
+    fn take_poll_credit(&mut self, r: &Record) -> bool {
+        let Some((db, _)) = &r.ns else {
+            return false;
+        };
+        match self.poll_credits.get_mut(db) {
+            Some(c) if *c > 0 => {
+                *c -= 1;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -349,10 +383,15 @@ impl EventBuilder {
         let app = r.app.as_deref();
         // The agent's own reads that return no document of a collection:
         // its `count` without a filter, and its polls of the profiler (on
-        // the profiler source, with their exact shape).
-        let unbudgeted = (cmd == Cmd::Count && r.shape.filter.is_empty())
-            || (source == EventSource::MongodbProfiler && own_profiler_poll(cmd, r));
-        let routine = if unbudgeted {
+        // the profiler source, with their exact shape, and no more of them
+        // than the stream sent: any excess is charged like any read).
+        let own_poll = source == EventSource::MongodbProfiler
+            && own_profiler_poll(cmd, r)
+            && self.own.routine_unbudgeted(user, app, client, &e)
+            && self.take_poll_credit(r);
+        let routine = if own_poll {
+            true
+        } else if cmd == Cmd::Count && r.shape.filter.is_empty() {
             self.own.routine_unbudgeted(user, app, client, &e)
         } else if r.rows.is_some() {
             self.own.routine(user, app, client, &e, Instant::now())
@@ -614,6 +653,9 @@ mod tests {
             r.shape.limit = Some(limit);
             r
         };
+        for _ in 0..3 {
+            b.grant_poll("app");
+        }
         let own = vec![
             own_record(Cmd::Count, "customers", None, app),
             own_record(Cmd::Find, "customers", Some(200), app),
@@ -704,6 +746,56 @@ mod tests {
         let reads = vec![agg.clone(), agg];
         assert_eq!(
             b.convert(reads, EventSource::MongodbProfiler, SystemTime::now())
+                .len(),
+            1
+        );
+    }
+
+    /// Security review L3: no more uncharged poll-shaped reads of a
+    /// database's `system.profile` than polls the stream sent; the excess
+    /// is charged (and reported past the budget).
+    #[test]
+    fn uncharged_profiler_polls_are_limited_to_the_polls_sent() {
+        let app = Some("databastion-agent");
+        let poll = || {
+            let mut r = own_record(Cmd::Find, "system.profile", Some(1000), app);
+            r.shape.filter = Filter::Keys(1);
+            r.shape.limit = Some(crate::audit::profiler::BATCH);
+            r
+        };
+        let mut b = builder();
+        b.grant_poll("app");
+        b.grant_poll("app");
+        b.grant_poll("other");
+        let ev = b.convert(
+            vec![poll(), poll(), poll()],
+            EventSource::MongodbProfiler,
+            SystemTime::now(),
+        );
+        // Two credits for `app`: the third read is charged 1000 > 200.
+        assert_eq!(ev.len(), 1);
+        // Another identity never uses a credit.
+        let mut b = builder();
+        b.grant_poll("app");
+        let mut stolen = poll();
+        stolen.client = ClientAddr::parse("10.9.9.9");
+        assert_eq!(
+            b.convert(
+                vec![stolen, poll()],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+        // Credits do not pile up.
+        let mut b = builder();
+        for _ in 0..1000 {
+            b.grant_poll("app");
+        }
+        let polls: Vec<Record> = (0..=MAX_POLL_CREDITS).map(|_| poll()).collect();
+        assert_eq!(
+            b.convert(polls, EventSource::MongodbProfiler, SystemTime::now())
                 .len(),
             1
         );

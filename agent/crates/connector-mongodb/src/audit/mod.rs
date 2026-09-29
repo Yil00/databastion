@@ -630,6 +630,7 @@ async fn profiler_run(
         let session = st.session.as_mut().ok_or_else(internal)?;
         for db in dbs {
             if !st.cursors.contains_key(db) {
+                st.builder.grant_poll(db);
                 match profiler::newest(session, db).await {
                     Ok(ts) => {
                         st.cursors.insert(db.clone(), DbCursor::after(ts));
@@ -650,6 +651,7 @@ async fn profiler_run(
                 let Some(cursor) = st.cursors.get_mut(db) else {
                     break;
                 };
+                st.builder.grant_poll(db);
                 let polled = match profiler::poll(session, db, cursor).await {
                     Ok(p) => p,
                     Err(e) if !e.fatal => {
