@@ -33,7 +33,10 @@ export interface AccessIncidentOpenedPayload {
   source: "access_event";
   occurred_at: string;
   url: string | null;
-  /** `reopened_from`: the resolved incident of the same scope, when a worse event reopened it. */
+  /**
+   * `reopened_from`: the closed (resolved or false-positive) incident of the same scope, when a
+   * worse event opened this one.
+   */
   incident: { id: string; severity: string; status: "open"; reopened_from: string | null };
   policy: { id: string; name: string; revision: number };
   agent_id: string;
@@ -204,7 +207,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     p.overflow
       ? `The policy reached its limit of ${p.overflow.limit_per_hour} new incidents this hour: the further matches of the hour are counted in this incident. The event below is the first of them.`
       : p.incident.reopened_from
-        ? `A new incident was opened from database access events: a worse access than the one of the resolved incident ${p.incident.reopened_from}.`
+        ? `A new incident was opened from database access events: a worse access than the one of the closed incident ${p.incident.reopened_from} (resolved or marked a false positive).`
         : "A new incident was opened from database access events.",
     "",
     `Incident:   ${p.incident.id}`,

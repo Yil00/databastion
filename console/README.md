@@ -750,17 +750,24 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
   them.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
-  For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
-  the principal part is `unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64 (canonical
-  form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events from one network count as
-  one principal, so random account names or rotating addresses cannot open one incident each. The database is that
+  For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
+  /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
+  from one network count as one principal, so random account names or rotating addresses cannot
+  open one incident each. Any other event with a fingerprint instead of a name (a non-conforming
+  account name, an OpenLDAP DN not listed in `clear_principals`, an unidentified account) is keyed
+  `fp:<principal key>:<sha256 of the client network>` (end-of-phase-6 review M1): two
+  fingerprinted principals never share an incident, even on OpenLDAP where events have no client
+  address. The agent sends every unidentified account as the same fingerprint (of an empty name,
+  which the console cannot recognize), so these stay grouped per client network. The database is that
   of the most sensitive retained object. While the incident of a key is open or acknowledged,
   later events of the key are added to it (`match_count`, total rows, highest score, signals,
-  anomaly, and a link in `incident_events`). Once it is a **false positive**, the rest of that hour
-  is only linked to it. Once it is **resolved**, a later event of the hour opens a new incident
-  (`reopened_from` in the notification) only when it is worse: a higher score, above the baseline
-  while the incident was not, or a signal the incident did not have; otherwise it is linked to the
-  resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
+  anomaly, and a link in `incident_events`). Once it is a **false positive**, a later event of the
+  hour opens a new incident (`reopened_from` in the notification) only when it is clearly worse
+  than what was judged: a `signature.*` signal the incident did not have, or a strictly higher
+  score (end-of-phase-6 review M1); otherwise it is only linked to it. Once it is **resolved**, a
+  later event of the hour opens a new incident (`reopened_from`) only when it is worse: a higher
+  score, above the baseline while the incident was not, or a signal the incident did not have;
+  otherwise it is linked to the resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
   raises one incident per policy, principal, database and hour.
 - **Cap**: a policy opens at most `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` new incidents per
   clock hour **on one target** (default 50, 1 to 10 000), so noise on one target never affects the

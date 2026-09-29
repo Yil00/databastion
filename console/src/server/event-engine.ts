@@ -5,10 +5,10 @@ import { accessEvents, agentTargets, findings, incidentEvents, incidents, polici
 import {
   baselineEligible,
   baselineVerdict,
-  coarsePrincipal,
+  dedupPrincipal,
   eventOverflowKey,
   severeEvent,
-  worseThanResolved,
+  worseThanClosed,
   dedupObject,
   eventBucket,
   eventDedupKey,
@@ -403,12 +403,16 @@ async function applyEventPolicy(
   const oi = dedupObject(kept, ev.objectSensitivities);
   const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
-  const coarse = coarsePrincipal({ fingerprinted: e.dbUser === null, action: e.action });
   const key = eventDedupKey({
     policyId: policy.id,
     agentId: e.agentId,
     targetId: e.targetId,
-    principalKey: coarse ? `unknown:${sha256Hex(clientNetwork(e.clientAddr))}` : e.principalKey,
+    principalKey: dedupPrincipal({
+      fingerprinted: e.dbUser === null,
+      action: e.action,
+      principalKey: e.principalKey,
+      networkHash: sha256Hex(clientNetwork(e.clientAddr)),
+    }),
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
   });
@@ -417,9 +421,9 @@ async function applyEventPolicy(
     await rematch(tx, latest, e, facts);
     return "rematched";
   }
-  // M1: after a resolution, only a clearly worse event opens a new incident; otherwise the event
-  // is linked to the closed incident (visible there). A false positive is only linked.
-  if (latest && (latest.status !== "resolved" || !worseThanResolved(latest, facts))) {
+  // M1: after a resolution or a false positive, only a clearly worse event opens a new incident
+  // (`worseThanClosed`); otherwise the event is linked to the closed incident (visible there).
+  if (latest && !worseThanClosed(latest, facts)) {
     await link(tx, latest.id, e.id);
     return "linked";
   }
@@ -437,7 +441,7 @@ async function applyEventPolicy(
       }
       // A closed overflow incident: same rule as any closed incident (M1): only a worse event
       // opens a new one.
-      if (o && (o.status !== "resolved" || !worseThanResolved(o, facts))) {
+      if (o && !worseThanClosed(o, facts)) {
         await link(tx, o.id, e.id);
         return "linked";
       }
@@ -483,7 +487,7 @@ async function applyEventPolicy(
   });
   if (!overflow) state.created.set(capKey(policy.id, e), (state.created.get(capKey(policy.id, e)) ?? 0) + 1);
   await link(tx, row.id, e.id);
-  const reopenedFrom = overflow ? overflowReopenedFrom : latest?.status === "resolved" ? latest.id : null;
+  const reopenedFrom = overflow ? overflowReopenedFrom : latest && !(ACTIVE_STATUSES as readonly string[]).includes(latest.status) ? latest.id : null;
   await writeAudit(tx, {
     actorType: "system",
     action: "incident.create",

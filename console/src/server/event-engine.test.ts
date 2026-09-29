@@ -501,12 +501,72 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       await drainPolicyWork(getDb());
       list = await incidentsOf(auth.agentId);
       expect(list).toHaveLength(3);
-      // A false positive is never reopened within the hour.
+      // After a false positive (end-of-phase-6 M1): a similar event, even with a new non-signature
+      // signal, is only linked.
       await transitionIncident(getDb(), String(list[2]?.id), "false_positive", actor());
-      await send(auth, [dumpEvent({ ts: at(240_000), rows: 99_000_000, signals: ["signature.copy_to_file"] })]);
+      await send(auth, [dumpEvent({ ts: at(240_000), rows: 10, signals: ["signature.copy_to_program", "shape.full_table_read"] })]);
       await drainPolicyWork(getDb());
       expect(await incidentsOf(auth.agentId)).toHaveLength(3);
       expect(await incidentEventCount(getDb(), String(list[2]?.id))).toBe(2);
+      // A clearly worse one (a signature signal the false positive did not have) opens a new one.
+      await send(auth, [dumpEvent({ ts: at(300_000), rows: 10, signals: ["signature.copy_to_file"] })]);
+      await drainPolicyWork(getDb());
+      list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(4);
+      const [again] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(list[3]?.id)));
+      expect(again?.payload).toMatchObject({ incident: { reopened_from: list[2]?.id } });
+      // And so does a strictly higher score after that one is a false positive too.
+      await transitionIncident(getDb(), String(list[3]?.id), "false_positive", actor());
+      await send(auth, [dumpEvent({ ts: at(360_000), rows: 10, signals: ["signature.copy_to_file"] })]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(4);
+      await send(auth, [dumpEvent({ ts: at(420_000), rows: 99_000_000, signals: ["signature.copy_to_file"] })]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(5);
+    });
+
+    it("end-of-phase-6 M1: fingerprinted principals are keyed per fingerprint, never merged with each other", async () => {
+      const auth = await agentWithTargets();
+      await scanWith(auth, [finding("email", "pii.email", 1)]);
+      await policy({ signals: ["shape.*"] });
+      const alice = randomFp();
+      const bob = randomFp();
+      // As on OpenLDAP: fingerprinted principals, no client address.
+      const read = (i: number, fp: string, over: Record<string, unknown> = {}) =>
+        dumpEvent({ ts: at(i * 1000), principal: { db_user_fingerprint: fp }, rows: 20_000, signals: ["shape.full_table_read"], ...over });
+      await send(auth, [read(0, alice), read(1, bob), read(2, alice)]);
+      await drainPolicyWork(getDb());
+      let list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      const of = (fp: string) => list.find((x) => x.principal === fp);
+      expect(of(alice)?.matchCount).toBe(2);
+      expect(of(bob)?.matchCount).toBe(1);
+      expect(of(alice)?.dedupKey).toContain("|principal:fp:");
+      expect(of(alice)?.dedupKey).not.toContain(alice);
+      // A false positive on one principal does not suppress another's incident of the hour.
+      await transitionIncident(getDb(), String(of(alice)?.id), "false_positive", actor());
+      await transitionIncident(getDb(), String(of(bob)?.id), "resolved", actor());
+      const carol = randomFp();
+      await send(auth, [read(10, alice), read(11, carol)]);
+      await drainPolicyWork(getDb());
+      list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(3);
+      expect(list.filter((x) => x.principal === carol)).toHaveLength(1);
+      // The same fingerprint (e.g. every unidentified account of the agent) from two client
+      // networks: grouped per network, as the coarse key did.
+      const unidentified = randomFp();
+      await send(auth, [
+        read(20, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "192.0.2.10" } }),
+        read(21, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "192.0.2.99" } }),
+        read(22, unidentified, { principal: { db_user_fingerprint: unidentified, client_addr: "198.51.100.7" } }),
+      ]);
+      await drainPolicyWork(getDb());
+      expect(
+        (await incidentsOf(auth.agentId))
+          .filter((x) => x.principal === unidentified)
+          .map((x) => x.matchCount)
+          .sort(),
+      ).toEqual([1, 2]);
     });
 
     it("M2: one chunk takes at most a fair share of each agent's events", async () => {
