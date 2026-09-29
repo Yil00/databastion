@@ -155,6 +155,14 @@ export interface paths {
          *     action within the aggregation window, 60 s by default) and carry no query text. `404` when a
          *     `target_id` does not belong to this agent (`details[].pointer` designates the items).
          *
+         *     Time bounds (`400`, item pointers): `ts_last` earlier than `ts` (`formatMinimum` on
+         *     `/events/<i>/ts_last`), `ts` or `ts_last` more than 5 min in the future (`formatMaximum`),
+         *     `ts` older than the console's event retention (`formatMinimum` on `/events/<i>/ts`; not an
+         *     agent-integrity event). `429` for back-pressure (`Retry-After: 30`) and rate limits,
+         *     **before** the duplicate check: a batch answered `429` was not recorded, and its retry
+         *     under the same `batch_id` is processed as new. See "Console-side checks" in the
+         *     description of this contract for the order and the exact answers.
+         *
          *     A console that does not implement Audit yet (before phase 4) answers `501`
          *     (`NotImplemented`) without reading the body. The agent then parks `POST /events` only;
          *     `POST /findings` and every other endpoint keep working (see `NotImplemented`).
@@ -312,7 +320,25 @@ export interface components {
          *     version listed in the classifier registry `shared/protocol/classifiers.json` (`enum` otherwise).
          */
         ClassifiersVersion: string;
-        /** @description Exfiltration indicator, e.g. `signature.pg_dump`, `shape.full_table_copy`, `volume.above_baseline`. */
+        /**
+         * @description Exfiltration indicator computed by the agent from the raw audit data (ADR-0007). The
+         *     vocabulary is the **signal registry** `shared/protocol/signals.json` (next to this file,
+         *     schema `signals.schema.json`), which describes each id: a conforming agent emits only
+         *     registered ids. Registered today: `signature.pg_dump`, `signature.copy_to_file`,
+         *     `signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
+         *     `volume.large_result`. Families: `signature.*` a dump or export tool or command (the
+         *     console treats it as severe), `shape.*` a query shape (heuristic, evadable), `volume.*` a
+         *     volume threshold of the agent. The registry is **append-only**: a new signal (e.g.
+         *     `signature.mysqldump` for a future connector) is a new entry added by a compatible
+         *     contract change; an id is never removed, renamed or given another meaning.
+         *
+         *     The name after the family is 1 to 6 words of 1 to 16 lowercase letters joined by `_`: no
+         *     digit, so an id cannot carry a number (an account, card or phone number). This schema
+         *     checks the **form** only (pattern), not registration, so that a console
+         *     accepts a signal registered after it was built; it stores such a signal and matches it by
+         *     exact id or family (`signature.*`). The console computes its own baseline verdict and
+         *     does not rely on any `volume.*` signal for it (ADR-0021).
+         */
         Signal: string;
         /**
          * @description `HMAC-SHA256(agent_local_key, "databastion/fp/v1" 0x00 classifier_id 0x00 normalized_value)`,
@@ -444,7 +470,11 @@ export interface components {
              *       or a classifier id not registered for the batch's version or outside the job's
              *       `params.classifiers` (`/findings/<i>/classifier`);
              *     - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
-             *     - `formatMaximum`: a timestamp more than 5 min in the future;
+             *     - `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
+             *       update, `/events/<i>/ts`, `/events/<i>/ts_last`);
+             *     - `formatMinimum`: an access event's `ts_last` earlier than its `ts`
+             *       (`/events/<i>/ts_last`), or its `ts` older than the console's event retention
+             *       (`/events/<i>/ts`);
              *     - `maxBytes`, `maskRatio`, `falseSchema`, `invalid`: see `shared/protocol/README.md`.
              */
             keyword: string;
@@ -534,6 +564,14 @@ export interface components {
             running_jobs?: components["schemas"]["Uuid"][];
             spool: components["schemas"]["SpoolStatus"];
             metrics?: components["schemas"]["MetricsMap"];
+            /**
+             * @description Optional **response and job** fields and features this agent build accepts
+             *     (ADR-0022). Agents reject unknown fields in every console -> agent body, so the
+             *     console sends a console -> agent field introduced after protocol 0.1.0 (in a response
+             *     or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
+             *     agent omits the list. Unknown tokens are ignored by the console.
+             */
+            accepts?: components["schemas"]["CapabilityList"];
         };
         TargetStatus: {
             target_id: components["schemas"]["TargetId"];
@@ -550,8 +588,54 @@ export interface components {
             audit_source?: components["schemas"]["AuditSource"];
             /** @description Cause of the last failed `check()` or connection, if any. */
             last_error?: components["schemas"]["FailureCode"];
+            /**
+             * @description Explanations of the target's status from the last `check()`: why the audit level is
+             *     degraded, what is not covered, over-privilege, an insecure setting. Closed codes with
+             *     bounded parameters, never free text; the console renders them (see `TargetNote`).
+             *     Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
+             */
+            notes?: components["schemas"]["TargetNote"][];
             metrics?: components["schemas"]["MetricsMap"];
         };
+        /**
+         * @description One explanation of a target's status: a registered `code`, an optional `count` and
+         *     optional closed `labels`. No free text, so no field can carry a sampled value, a
+         *     credential, a connection string, a host name or address, query text or a driver
+         *     message. The console renders a phrase for each code from its catalog, filling in `count`
+         *     and `labels`; a code it does not know is shown as the raw code (with its count and
+         *     labels), never rejected. E.g. `{"code": "audit.pgaudit_read_class_missing"}`,
+         *     `{"code": "coverage.relations_rls_skipped", "count": 5}`,
+         *     `{"code": "privilege.over_privileged", "labels": ["bypassrls", "pg_write_all_data"]}`.
+         */
+        TargetNote: {
+            code: components["schemas"]["TargetNoteCode"];
+            /** @description The number the note is about (relations, schemas, records, roles…), when it has one. */
+            count?: components["schemas"]["Count"];
+            /** @description Closed labels the note is about (privileges, role attributes, predefined roles…). */
+            labels?: components["schemas"]["TargetNoteLabel"][];
+        };
+        /**
+         * @description Code of a target note. The vocabulary is the registry `shared/protocol/target-notes.json`
+         *     (append-only, like `signals.json`): a conforming agent sends only registered codes; the
+         *     schema checks the form only, so an older console accepts a code registered later and
+         *     shows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,
+         *     `privilege.*` privileges of the agent's account, `security.*` insecure settings,
+         *     `check.*` the check itself. The name after the family is 1 to 6 words of 1 to 16
+         *     lowercase letters joined by `_`: no digit, so a code cannot carry a number.
+         */
+        TargetNoteCode: string;
+        /**
+         * @description Closed label of a target note, in lower snake case: PostgreSQL role attributes and
+         *     predefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`
+         *     (so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit
+         *     collection states; check stages (`stage_*`). Anything the agent cannot map to this list
+         *     is sent as `other`. A new value is a
+         *     change of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`
+         *     lists `target_status.note_labels.<revision>` for a revision that includes it (see
+         *     ADR-0022), and sends `other` otherwise.
+         * @enum {string}
+         */
+        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill";
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
@@ -578,10 +662,27 @@ export interface components {
             /** @description Individual findings / events dropped since start after a `400` or `404` pointing at them. */
             dropped_items?: components["schemas"]["Count"];
         };
+        /**
+         * @description Name of an optional field or feature (ADR-0022): `<object>.<field>` in snake case, e.g.
+         *     `access_event.bytes`, with up to two more segments for a revision
+         *     (`target_status.note_labels.2026_10`). Form only: a party ignores tokens it does not know.
+         */
+        Capability: string;
+        /** @description Capability tokens (ADR-0022). */
+        CapabilityList: components["schemas"]["Capability"][];
         HeartbeatResponse: {
             console_min_protocol: components["schemas"]["ProtocolMajor"];
             heartbeat_interval_s: components["schemas"]["HeartbeatIntervalSeconds"];
             server_time: components["schemas"]["Timestamp"];
+            /**
+             * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
+             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps
+             *     the list of the latest heartbeat response and sends an optional request field
+             *     introduced after protocol 0.1.0 only when that list names it; before its first
+             *     heartbeat response, and when the list is absent, it sends none of them. The console
+             *     lists everything it accepts. Unknown tokens are ignored by the agent.
+             */
+            accepts?: components["schemas"]["CapabilityList"];
         };
         JobList: {
             jobs: components["schemas"]["Job"][];
@@ -760,7 +861,12 @@ export interface components {
         JobProgress: {
             /** @description Estimated completion, from 0 to 1. */
             ratio?: number;
+            /** @description Objects processed so far (sampled or skipped). */
             objects_done?: components["schemas"]["Count"];
+            /**
+             * @description Objects in the job's scope (`discovery.scan`: after its filters, across all databases
+             *     of the target).
+             */
             objects_total?: components["schemas"]["Count"];
             /** @description Findings reported so far for this job. */
             findings?: components["schemas"]["Count"];
@@ -769,6 +875,44 @@ export interface components {
              *     received all of them.
              */
             batches?: components["schemas"]["Count"];
+            /**
+             * @description `discovery.scan` coverage: objects (tables, collections, LDAP object classes) actually
+             *     sampled so far. With the `skipped_*` counters below, `objects_total` (the objects
+             *     listed in the job's scope, after its filters, across all databases of the target) and
+             *     `objects_done` (the objects processed, sampled or skipped), it tells how much of the
+             *     scope a scan covered: `objects_total - objects_done` objects were not reached (scan
+             *     stopped by its deadline, cancellation or the findings cap). Coverage counters are
+             *     counts only, never a name; each is optional (absent: not reported; a `skipped_*`
+             *     reason absent counts 0) and none is checked by the console. A new skip reason is a new
+             *     optional `skipped_*` counter (compatible change, negotiated like any new request
+             *     field). `objects_sampled` and the `skipped_*` counters are sent only when the latest
+             *     `HeartbeatResponse.accepts` lists `job_progress.coverage` (ADR-0022).
+             */
+            objects_sampled?: components["schemas"]["Count"];
+            /** @description Objects not sampled because the agent's account cannot read them (e.g. no `SELECT` on any column). */
+            skipped_not_readable?: components["schemas"]["Count"];
+            /**
+             * @description Objects not sampled because of row-level security (PostgreSQL: a policy depending on
+             *     user code or on another relation, or a row-level security ancestor; ADR-0012).
+             */
+            skipped_row_level_security?: components["schemas"]["Count"];
+            /** @description Objects whose data is held outside the target (foreign tables, remote-access engines); never read (I5). */
+            skipped_remote?: components["schemas"]["Count"];
+            /**
+             * @description Objects of a kind the connector does not sample (views, merge tables, sequences,
+             *     storage engines outside the connector's allow-list).
+             */
+            skipped_unsupported?: components["schemas"]["Count"];
+            /**
+             * @description Objects beyond a structural bound of the connector (partition leaves over the per-root
+             *     cap, a truncated catalog listing).
+             */
+            skipped_limit?: components["schemas"]["Count"];
+            /**
+             * @description Objects whose sampling failed (e.g. statement timeout, a privilege error at query
+             *     time), after which the scan went on with the next object.
+             */
+            skipped_error?: components["schemas"]["Count"];
         };
         JobError: {
             code: components["schemas"]["FailureCode"];
@@ -828,7 +972,9 @@ export interface components {
         /**
          * @description Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
          *     and no returned value: only who, what object, which action, how many rows, and signals.
-         *     `read` and `write` events name at least one object.
+         *     `read` and `write` events name at least one object: when the agent cannot tell which
+         *     objects a read or write reached, it reports the object `*` rather than dropping the
+         *     event (see `ObjectRef`).
          */
         AccessEvent: {
             target_id: components["schemas"]["TargetId"];
@@ -845,6 +991,15 @@ export interface components {
             objects: components["schemas"]["ObjectRef"][];
             /** @description Rows (documents, entries) returned or affected, when the source provides it. */
             rows?: components["schemas"]["Count"];
+            /**
+             * @description Size in bytes of the result returned (or of the data affected), when the source
+             *     reports it; absent otherwise, never estimated. For a pre-aggregated event, the total
+             *     of the merged events, as for `rows`. Not produced by the PostgreSQL connector:
+             *     neither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the
+             *     latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
+             */
+            bytes?: components["schemas"]["Count"];
+            /** @description Signal ids of the registry `signals.json` (see `Signal`). */
             signals?: components["schemas"]["Signal"][];
             source: components["schemas"]["AuditSource"];
             /** @description Number of raw events merged into this one. */
@@ -868,7 +1023,30 @@ export interface components {
              */
             application?: string;
         } & (unknown | unknown);
-        /** @description Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN. */
+        /**
+         * @description Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
+         *
+         *     **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
+         *     one of two reasons:
+         *     - **unknown object**: the source does not say which objects were reached and the agent
+         *       cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
+         *       it cannot parse). `database` is the session's database and `schema` is absent. Such a
+         *       read or write is reported against `*`, never dropped; the event may also list, next to
+         *       `*`, the objects the agent could tell;
+         *     - **masked name**: normalization replaced the name (a name matched by a classifier, or
+         *       one that does not conform to `Identifier`). This also applies to `database` and
+         *       `schema`.
+         *
+         *     In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+         *     The console compares it as the string `*` (ADR-0021): an `objects` condition or a
+         *     location exception selects it only when its glob matches the string `*` (the glob `*`,
+         *     or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its
+         *     sensitivity is that of the findings recorded under the same normalized name (any
+         *     schema when `schema` is absent), usually none, so its score is usually 0; the event
+         *     still matches conditions that do not depend on objects (signals, principals, rows,
+         *     anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
+         *     therefore does not see such accesses: signal, volume and anomaly conditions do.
+         */
         ObjectRef: {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
@@ -1246,7 +1424,22 @@ export interface operations {
             409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             426: components["responses"]["UpgradeRequired"];
-            429: components["responses"]["TooManyRequests"];
+            /**
+             * @description `rate_limited`, with `Retry-After` (seconds): back-pressure while more than 20 000 events
+             *     of the agent are not evaluated yet (`Retry-After: 30`), or a per-agent rate limit (300
+             *     requests or 60 stored batches per minute; the rest of the window, 1 to 60 s). Nothing
+             *     was recorded: the agent keeps the batch spooled and resends it unchanged, under the
+             *     same `batch_id`, after `Retry-After` plus jitter. Answered before the duplicate check.
+             */
+            429: {
+                headers: {
+                    "Retry-After": components["headers"]["RetryAfter"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             501: components["responses"]["NotImplemented"];
             503: components["responses"]["ServiceUnavailable"];
         };

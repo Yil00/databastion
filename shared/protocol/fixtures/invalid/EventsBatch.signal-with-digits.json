@@ -19,9 +19,7 @@
       ],
       "rows": 1250000,
       "signals": [
-        "signature.pg_dump",
-        "shape.full_table_copy",
-        "volume.large_result"
+        "volume.rows_1250000"
       ],
       "source": "pgaudit",
       "aggregated_count": 1

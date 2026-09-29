@@ -323,6 +323,45 @@ async fn heartbeat_sends_contract_headers_and_clamps_interval() {
 }
 
 #[tokio::test]
+async fn heartbeat_rejected_with_400_forgets_the_console_capabilities() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // First heartbeat: the console lists what it accepts (ADR-0022).
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "console_min_protocol": 1,
+            "heartbeat_interval_s": 30,
+            "server_time": "2026-09-28T14:02:00Z",
+            "accepts": [token::ACCESS_EVENT_BYTES, token::TARGET_STATUS_NOTES]
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Then it answers 400 (e.g. a console rolled back to a build that
+    // rejects a field the agent sent).
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(400, "invalid_request"))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    rt.heartbeat_once().await.unwrap();
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    let err = rt.heartbeat_once().await.unwrap_err();
+    assert!(matches!(
+        err,
+        CallError::Uplink(UplinkError::Rejected { status: 400, .. })
+    ));
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert!(!rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+}
+
+#[tokio::test]
 async fn unauthorized_with_current_secret_suspends_with_slow_retry() {
     let server = MockServer::start().await;
     let env = enrolled(&server).await;

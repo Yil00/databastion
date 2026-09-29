@@ -1,0 +1,26 @@
+{
+  "batch_id": "01920f63-6f4d-7e51-a233-8d4e5f607182",
+  "events": [
+    {
+      "target_id": "mongo-app",
+      "ts": "2026-09-28T14:20:00Z",
+      "ts_last": "2026-09-28T14:20:45Z",
+      "principal": {
+        "db_user": "app",
+        "client_addr": "198.51.100.40",
+        "application": "orders-service"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "shop",
+          "object": "orders"
+        }
+      ],
+      "rows": 3000,
+      "bytes": 1843200.5,
+      "source": "mongodb_profiler",
+      "aggregated_count": 30
+    }
+  ]
+}

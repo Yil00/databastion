@@ -174,6 +174,14 @@ fn count_ok(c: &Count) -> bool {
     (0..=MAX_COUNT).contains(&c.0)
 }
 
+/// A contract `Count` from an unbounded counter, saturated at [`MAX_COUNT`]
+/// (the JavaScript safe integer bound of the contract) rather than wrapped
+/// or dropped. For every `Count` the agent builds itself (uptime, spool
+/// state, and the `JobProgress` counters when they are produced).
+pub(crate) fn clamped_count(n: u64) -> Count {
+    Count(i64::try_from(n).map_or(MAX_COUNT, |v| v.min(MAX_COUNT)))
+}
+
 /// Validates and sanitizes a finding in place. `false`: drop it.
 pub(crate) fn check_finding(f: &mut Finding) -> bool {
     let l = &mut f.location;
@@ -231,6 +239,9 @@ pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
     if e.rows.as_ref().is_some_and(|c| !count_ok(c)) {
         e.rows = None;
     }
+    if e.bytes.as_ref().is_some_and(|c| !count_ok(c)) {
+        e.bytes = None;
+    }
     if let Some(signals) = e.signals.as_mut() {
         let mut seen = HashSet::new();
         signals.retain(|s| seen.insert(s.as_str().to_owned()));
@@ -282,6 +293,32 @@ pub(crate) mod tests {
             "source": "pgaudit", "aggregated_count": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn out_of_range_event_counts_are_dropped() {
+        for bad in [-1, MAX_COUNT + 1, i64::MAX] {
+            let mut e = event("read", 1);
+            e.rows = Some(Count(bad));
+            e.bytes = Some(Count(bad));
+            assert!(check_event(&mut e));
+            assert!(e.rows.is_none() && e.bytes.is_none(), "{bad}");
+        }
+        let mut e = event("read", 1);
+        e.rows = Some(Count(MAX_COUNT));
+        e.bytes = Some(Count(0));
+        assert!(check_event(&mut e));
+        assert_eq!(e.rows.map(|c| c.0), Some(MAX_COUNT));
+        assert_eq!(e.bytes.map(|c| c.0), Some(0));
+    }
+
+    #[test]
+    fn built_counts_saturate_at_the_contract_bound() {
+        assert_eq!(clamped_count(0).0, 0);
+        assert_eq!(clamped_count(42).0, 42);
+        assert_eq!(clamped_count(9_007_199_254_740_991).0, MAX_COUNT);
+        assert_eq!(clamped_count(9_007_199_254_740_992).0, MAX_COUNT);
+        assert_eq!(clamped_count(u64::MAX).0, MAX_COUNT);
     }
 
     #[test]

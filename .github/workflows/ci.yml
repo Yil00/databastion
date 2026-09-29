@@ -212,59 +212,44 @@ jobs:
       - name: cargo-deny dev-dependencies (licenses, sources)
         run: cargo deny --config deny-dev.toml --locked check licenses sources
 
+  # Always runs: the contract is the synchronization point, so a missing openapi.yaml fails the job
+  # instead of skipping it.
   protocol:
     name: Protocol
-    needs: detect
-    if: needs.detect.outputs.protocol == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The contract exists
+        run: |
+          if [ ! -f shared/protocol/openapi.yaml ]; then
+            echo "::error file=shared/protocol/openapi.yaml::the protocol contract is missing"
+            exit 1
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
-      # Published classifier sets are immutable (shared/protocol/README.md, "Classifier registry"):
-      # `npm test` checks the registry against the lock, but a PR could edit both together. Here the
-      # lock is compared with the base branch: existing entries must be unchanged, only new keys may
-      # be added. The PR checkout is the merge commit, so the base tip (depth 1) is all that is needed.
-      - name: Classifier lock is append-only (pull requests)
-        if: github.event_name == 'pull_request'
+      # The protocol registries are append-only (shared/protocol/README.md): classifiers.lock.json
+      # (published classifier sets are immutable), signals.json and target-notes.json (ids never
+      # removed or renamed, engines never dropped). `npm test` checks each registry on its own, but a
+      # change could edit a registry and its lock together, so the working tree is compared with dev
+      # and main whatever the base branch, and on push also with the previous tip. Every event runs
+      # it; only a push that creates the branch (all-zero `before`) skips that last comparison.
+      - name: Registries are append-only
         env:
-          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
-          git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-          python3 - <<'PY'
-          import json, os, subprocess, sys
-
-          path = "shared/protocol/classifiers.lock.json"
-          ref = "origin/" + os.environ["BASE_REF"]
-          subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref], check=True, stdout=subprocess.DEVNULL)
-          if subprocess.run(["git", "cat-file", "-e", f"{ref}:{path}"], stderr=subprocess.DEVNULL).returncode != 0:
-              print(f"{path} does not exist on {ref}: nothing to compare")
-              sys.exit(0)
-          show = subprocess.run(["git", "show", f"{ref}:{path}"], check=True, capture_output=True, text=True)
-          base = json.loads(show.stdout)
-          try:
-              with open(path, encoding="utf-8") as f:
-                  head = json.load(f)
-          except FileNotFoundError:
-              head = {}
-          if not isinstance(base, dict) or not isinstance(head, dict):
-              sys.exit(f"{path} must be a JSON object")
-          errors = []
-          for version, digest in base.items():
-              if version not in head:
-                  errors.append(f"published version {version} was removed")
-              elif head[version] != digest:
-                  errors.append(f"published version {version} was changed")
-          if errors:
-              for e in errors:
-                  print(f"::error file={path}::{e} (lock entries are append-only: add a new classifiers_version instead)")
-              sys.exit(1)
-          added = sorted(set(head) - set(base))
-          print(f"{len(base)} published version(s) unchanged; added: {', '.join(added) or 'none'}")
-          PY
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "+refs/heads/dev:refs/remotes/origin/dev" "+refs/heads/main:refs/remotes/origin/main"
+          refs=(origin/dev origin/main)
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            git fetch --no-tags --depth=1 origin "$BEFORE"
+            refs+=("$BEFORE")
+          fi
+          python3 shared/protocol/scripts/append-only.py "${refs[@]}"
       - name: Contract tests (schemas + fixtures)
         working-directory: shared/protocol
         run: |

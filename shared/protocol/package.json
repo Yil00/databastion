@@ -8,7 +8,7 @@
   "scripts": {
     "lint": "npx --yes @redocly/cli@2.54.3 lint --config redocly.yaml openapi.yaml",
     "test:schema-lint": "node --test scripts/schema-lint.test.mjs",
-    "test:registry": "node --test scripts/classifier-registry.test.mjs",
+    "test:registry": "node --test scripts/classifier-registry.test.mjs scripts/id-registry.test.mjs",
     "validate": "node scripts/validate-fixtures.mjs",
     "test": "npm run test:schema-lint && npm run test:registry && npm run validate",
     "check": "npm run lint && npm test"

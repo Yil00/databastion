@@ -1,0 +1,11 @@
+{
+  "status": "running",
+  "ts": "2026-09-28T14:05:00Z",
+  "progress": {
+    "ratio": 0.25,
+    "objects_done": 105,
+    "objects_total": 420,
+    "objects_sampled": 104,
+    "skipped_limit": 1
+  }
+}
