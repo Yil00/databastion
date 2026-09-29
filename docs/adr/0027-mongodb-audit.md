@@ -1,6 +1,6 @@
 # ADR-0027: MongoDB Audit: sources, levels, grants, normalization and dump signatures
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-29
 - **Refines**: [ADR-0026](0026-mongodb-connector.md) (which stays Accepted): decision 1 (closed command set, one command and one `find` shape added), decision 10 (audit level) and the "Audit grants are decided with P5-B / P5-C" part of decision 5; [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md) (which stays Accepted): decision 6 (the agent's own account), and the PostgreSQL own-account rule of P4-A ([docs/08](../08-engine-capabilities.md#the-agents-own-account)), whose exclusion now covers reads and connections only (decision 7)
 - **Context references**: P5-B, P5-C and the `mongodump` / `mongoexport` detection item of phase 5, branch `feat/p5-b-mongodb-audit` (`agent/crates/connector-mongodb/src/audit/`, `agent/crates/connector-mongodb/src/check.rs`, `agent/crates/core/src/config.rs`, `shared/protocol/signals.json`, `shared/protocol/target-notes.json`); the MongoDB counterpart of [ADR-0015](0015-postgresql-connector-decisions.md) decision 4 (PostgreSQL) and [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md) (MySQL / MariaDB); events follow [ADR-0007](0007-mask-access-events.md) and are correlated by the console as in [ADR-0021](0021-access-event-correlation.md)

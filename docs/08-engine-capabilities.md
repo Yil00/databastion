@@ -34,7 +34,7 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 
 > **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations only: those the server logs or profiles (slower than `slowms`, sampled by `slowOpSampleRate`; the profiler is also a ring buffer). A fast `mongodump` of a small collection can go unnoticed. The console shows the level Limited and the note `audit.slow_operations_only`.
 
-> **MongoDB, as implemented (P5-A #74; P5-B / P5-C #76, [ADR-0027](adr/0027-mongodb-audit.md), Proposed)**: see [MongoDB Audit](#mongodb-audit) below. **Full is never reported** for MongoDB: the `auditLog` has no document counts, and the server log and the profiler only hold the operations the server records.
+> **MongoDB, as implemented (P5-A #74; P5-B / P5-C #76, [ADR-0027](adr/0027-mongodb-audit.md))**: see [MongoDB Audit](#mongodb-audit) below. **Full is never reported** for MongoDB: the `auditLog` has no document counts, and the server log and the profiler only hold the operations the server records.
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
@@ -227,7 +227,7 @@ A finding's location is the database, the collection (`object`) and a normalized
 
 ## MongoDB Audit
 
-What the MongoDB connector does for Audit, as implemented in P5-B / P5-C (#76, not merged yet). Decisions in [ADR-0027](adr/0027-mongodb-audit.md) (Proposed); the reference is [the connector README](../agent/crates/connector-mongodb/README.md#audit).
+What the MongoDB connector does for Audit, as merged in P5-B / P5-C (#76). Decisions in [ADR-0027](adr/0027-mongodb-audit.md); the reference is [the connector README](../agent/crates/connector-mongodb/README.md#audit).
 
 ### Sources and level
 

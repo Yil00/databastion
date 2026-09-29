@@ -201,7 +201,7 @@ Requirements for every connector (acceptance criteria of P2-B and P2-C, in addit
 - RLS policy expressions (which may hold literals) are read into agent memory for the check.
 
 ## MongoDB connector
-*Discovery implemented in P5-A (#74), `agent/crates/connector-mongodb`; decisions in [ADR-0026](adr/0026-mongodb-connector.md). Audit implemented in P5-B / P5-C (#76, not merged yet); decisions in [ADR-0027](adr/0027-mongodb-audit.md) (Proposed); levels and limits in [08-engine-capabilities.md](08-engine-capabilities.md#mongodb-audit). Details in `agent/README.md` and the crate README.*
+*Discovery implemented in P5-A (#74), `agent/crates/connector-mongodb`; decisions in [ADR-0026](adr/0026-mongodb-connector.md). Audit implemented in P5-B / P5-C (#76); decisions in [ADR-0027](adr/0027-mongodb-audit.md); levels and limits in [08-engine-capabilities.md](08-engine-capabilities.md#mongodb-audit). Details in `agent/README.md` and the crate README.*
 
 - **Own client** (ADR-0026 decision 1): a closed subset of the wire protocol (`OP_MSG` only, no compression, no exhaust), a closed command set built in code (no write command, no `getMore`, no user-supplied filter or pipeline), the reply length checked on the header before the body is read (at most 16 MiB + 64 KiB), BSON parsed by a bounded reader that fails closed. Minimum server: MongoDB 5.0.
 - **One declared host, direct connection** (I5): a standalone, one replica-set member or a `mongos`. The hosts named by the server in `hello` are never contacted, `mongodb+srv` is not supported (no DNS SRV / TXT lookups), and there is no pool or monitoring connection. To scan a replica set, declare the member to read from.
