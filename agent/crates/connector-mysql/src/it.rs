@@ -66,6 +66,15 @@ const EXT_USER: &str = "databastion_it_ext";
 /// seeded database only, ADR-0018 minimal variant).
 const SCAN_USER: &str = "databastion_it_scan";
 const IT_PASSWORD: &str = "dev-only-it-account-FAKE";
+/// An account holding its privileges through roles (P4-D).
+const ROLE_USER: &str = "databastion_it_roles";
+/// Its roles: SELECT on the seeded database (default role); INSERT and
+/// UPDATE there, granted but not enabled; SELECT on `mysql`, through the
+/// previous role; DELETE, as a MySQL mandatory role.
+const ROLE_READ: &str = "databastion_it_r_read";
+const ROLE_WRITE: &str = "databastion_it_r_write";
+const ROLE_SYS: &str = "databastion_it_r_sys";
+const ROLE_MANDATORY: &str = "databastion_it_r_mand";
 
 #[derive(Debug, Clone)]
 struct Url {
@@ -1391,6 +1400,165 @@ async fn extended_variant_is_an_expected_warning_and_reads_no_system_table() {
         );
         exec(&mut a, &format!("DROP USER '{EXT_USER}'@'%'")).await;
         exec(&mut a, "DROP SERVER databastion_it_srv").await;
+    }
+}
+
+/// The `privilege.*` notes of a fresh `check()` (no cached report), with
+/// the detail and the logs it wrote.
+async fn privilege_check(t: &TargetConfig) -> (Vec<TargetNote>, String) {
+    let logs = Logs::default();
+    let health = {
+        let _guard = logs.capture();
+        MysqlConnector::new().check(t).await
+    };
+    assert!(health.reachable, "{health:?}");
+    let notes = health
+        .notes
+        .into_iter()
+        .filter(|n| n.code().as_str().starts_with("privilege."))
+        .collect();
+    (
+        notes,
+        format!("{}\n{}", health.detail.unwrap_or_default(), logs.text()),
+    )
+}
+
+/// The labels of a note, sorted by name.
+fn labels(n: &TargetNote) -> Vec<String> {
+    let mut v: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+    v.sort();
+    v
+}
+
+async fn drop_role_fixtures(a: &mut Session) {
+    exec(a, &format!("DROP USER IF EXISTS '{ROLE_USER}'@'%'")).await;
+    for role in [ROLE_READ, ROLE_WRITE, ROLE_SYS, ROLE_MANDATORY] {
+        exec(a, &format!("DROP ROLE IF EXISTS `{role}`")).await;
+    }
+}
+
+/// P4-D: privileges held through roles are evaluated like direct ones:
+/// the default role, a granted role that is not enabled, a role granted
+/// through a role, `WITH ADMIN OPTION`, and on MySQL a mandatory role.
+#[tokio::test]
+async fn role_privileges_are_evaluated() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let name = server.name;
+        let db = server.url.dbname.clone();
+        let mut a = admin_session(&server, &admin).await;
+        drop_role_fixtures(&mut a).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{ROLE_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        for role in [ROLE_READ, ROLE_WRITE, ROLE_SYS] {
+            exec(&mut a, &format!("CREATE ROLE `{role}`")).await;
+        }
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON `{db}`.* TO `{ROLE_READ}`"),
+        )
+        .await;
+        exec(&mut a, &format!("GRANT `{ROLE_READ}` TO '{ROLE_USER}'@'%'")).await;
+        let default_role = match server.flavor() {
+            Flavor::Mysql => format!("SET DEFAULT ROLE `{ROLE_READ}` TO '{ROLE_USER}'@'%'"),
+            Flavor::Mariadb => format!("SET DEFAULT ROLE `{ROLE_READ}` FOR '{ROLE_USER}'@'%'"),
+        };
+        exec(&mut a, &default_role).await;
+        let (_dir, t) = target(&server, ROLE_USER, IT_PASSWORD);
+
+        // SELECT on the application database through the default role:
+        // the minimal variant, nothing to report.
+        let (notes, output) = privilege_check(&t).await;
+        assert!(notes.is_empty(), "{name}: {notes:?}\n{output}");
+
+        // A role granted but not enabled, holding write privileges and,
+        // through another role, SELECT on the mysql database.
+        exec(
+            &mut a,
+            &format!("GRANT INSERT, UPDATE ON `{db}`.* TO `{ROLE_WRITE}`"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON `mysql`.* TO `{ROLE_SYS}`"),
+        )
+        .await;
+        exec(&mut a, &format!("GRANT `{ROLE_SYS}` TO `{ROLE_WRITE}`")).await;
+        exec(
+            &mut a,
+            &format!("GRANT `{ROLE_WRITE}` TO '{ROLE_USER}'@'%'"),
+        )
+        .await;
+        let (notes, output) = privilege_check(&t).await;
+        assert_registered_notes(server.flavor(), &notes);
+        let beyond = note(&notes, NoteCode::PrivilegeBeyondSelect);
+        assert_eq!(labels(beyond), ["insert", "update"], "{name}: {output}");
+        assert_eq!(beyond.count(), Some(2));
+        note(&notes, NoteCode::PrivilegeSystemDatabaseSelect);
+        for absent in [
+            NoteCode::PrivilegeRolesNotEvaluated,
+            NoteCode::PrivilegeGrantOption,
+        ] {
+            assert!(
+                !notes.iter().any(|n| n.code() == absent),
+                "{name}: {notes:?}\n{output}"
+            );
+        }
+
+        // WITH ADMIN OPTION: the account can grant the role to others.
+        exec(
+            &mut a,
+            &format!("GRANT `{ROLE_READ}` TO '{ROLE_USER}'@'%' WITH ADMIN OPTION"),
+        )
+        .await;
+        let (notes, _) = privilege_check(&t).await;
+        note(&notes, NoteCode::PrivilegeGrantOption);
+
+        // MySQL mandatory roles apply to every account.
+        if server.flavor() == Flavor::Mysql {
+            exec(&mut a, &format!("CREATE ROLE `{ROLE_MANDATORY}`")).await;
+            exec(
+                &mut a,
+                &format!("GRANT DELETE ON `{db}`.* TO `{ROLE_MANDATORY}`"),
+            )
+            .await;
+            let previous = scalar(&mut a, "SELECT @@GLOBAL.mandatory_roles")
+                .await
+                .unwrap_or_default();
+            exec(
+                &mut a,
+                &format!("SET GLOBAL mandatory_roles = '`{ROLE_MANDATORY}`@`%`'"),
+            )
+            .await;
+            let (notes, output) = privilege_check(&t).await;
+            let restore = format!(
+                "SET GLOBAL mandatory_roles = '{}'",
+                previous.replace('\'', "''")
+            );
+            exec(&mut a, &restore).await;
+            let beyond = note(&notes, NoteCode::PrivilegeBeyondSelect);
+            assert_eq!(
+                labels(beyond),
+                ["delete", "insert", "update"],
+                "{name}: {output}"
+            );
+        }
+
+        // Role and account names stay on the agent host: they are neither
+        // in the notes nor in the logs or the detail.
+        let (notes, output) = privilege_check(&t).await;
+        let text = format!("{notes:?}\n{output}");
+        for n in [ROLE_READ, ROLE_WRITE, ROLE_SYS, ROLE_MANDATORY, ROLE_USER] {
+            assert!(!text.contains(n), "{name}: {n} in {text}");
+        }
+
+        drop_role_fixtures(&mut a).await;
     }
 }
 

@@ -34,6 +34,7 @@ mod check;
 mod conn;
 mod discover;
 mod error;
+mod grants;
 mod net;
 mod proto;
 mod sql;

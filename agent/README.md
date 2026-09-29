@@ -298,7 +298,13 @@ Behavior:
   see [crates/connector-mysql/README.md](crates/connector-mysql/README.md));
   over-privilege (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`,
   `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, `SELECT` on `performance_schema` while no
-  Audit stream runs, roles), `init_connect`, and coverage (views, engines);
+  Audit stream runs), `init_connect`, and coverage (views, engines). The same rules apply to
+  the privileges held through roles (P4-D): every role in `information_schema.APPLICABLE_ROLES`
+  (granted directly or through a role, MySQL mandatory roles, the MariaDB default role; enabled
+  or not), read with `SHOW GRANTS FOR CURRENT_USER() USING …` (MySQL) or `SHOW GRANTS FOR
+  <role>` (MariaDB), at most 16 roles, names written into the statement only when they match
+  an allow-listed charset; `WITH ADMIN OPTION` counts as a grant option. A role whose grants
+  cannot be read or parsed is reported as `privilege.roles_not_evaluated`;
 - Audit (P4-B): access events from the `server_audit` log or the `audit_log` /
   `audit_log_filter` JSON file (`mysql.audit_log`, tailed by the core with a persisted cursor),
   or from `performance_schema` (`DIGEST_TEXT` first); statement text analyzed by the MySQL

@@ -253,3 +253,48 @@ fn the_harness_sees_a_password_sent_over_tls() {
     });
     assert!(sent.windows(PASSWORD.len()).any(|w| w == PASSWORD));
 }
+
+/// A backtick-quoted identifier holding any text (backticks doubled).
+fn quoted(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+proptest! {
+    /// `SHOW GRANTS` lines (P4-D role evaluation): arbitrary text never
+    /// panics the parser.
+    #[test]
+    fn grant_lines_never_panic(line in "\\PC{0,200}") {
+        let _ = crate::grants::parse_line(&line);
+    }
+
+    /// Names are data: whatever a quoted database, table, grantee or
+    /// column name holds (keywords, quotes, `;`), the line parses to the
+    /// same privileges and scope, and a grant option is never read from a
+    /// name.
+    #[test]
+    fn quoted_names_never_change_a_grant_line(
+        db in "\\PC{1,24}",
+        table in "\\PC{1,24}",
+        column in "\\PC{1,24}",
+        grantee in "\\PC{1,24}",
+        grantable in any::<bool>(),
+    ) {
+        use crate::grants::{Line, Scope};
+        let line = format!(
+            "GRANT SELECT ({}), INSERT ON {}.{} TO {}@`%`{}",
+            quoted(&column),
+            quoted(&db),
+            quoted(&table),
+            quoted(&grantee),
+            if grantable { " WITH GRANT OPTION" } else { "" }
+        );
+        prop_assert_eq!(
+            crate::grants::parse_line(&line),
+            Some(Line::Privileges {
+                privileges: vec!["SELECT".to_owned(), "INSERT".to_owned()],
+                scope: Scope::Database(db),
+                grantable,
+            })
+        );
+    }
+}
