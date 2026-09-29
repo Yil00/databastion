@@ -26,6 +26,9 @@ coverage/
 # Rust
 target/
 
+# Python (scripts/test_*.py, e2e/test_*.py)
+__pycache__/
+
 # Local agent state in dev
 dev/.state/
 
