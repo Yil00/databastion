@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 /**
  * Notification channels (P3-C, admin only): e-mail (SMTP) and HMAC-signed webhooks, referenced by
  * name from the policies' notify actions; channels flagged for console alerts also receive the
- * silent-agent and agent-integrity alerts. No secret is ever rendered here.
+ * silent-agent, agent-integrity and dropped-batches alerts. No secret is ever rendered here.
  */
 export default async function NotificationsPage() {
   const session = await requirePageSession();
@@ -32,7 +32,9 @@ export default async function NotificationsPage() {
           <p className="text-sm text-muted-foreground">
             A policy notifies the channels it names when it opens an incident. Notifications carry identifiers, counts,
             names and a link to the console, never a data value (masked or not). A name with no channel, or a disabled
-            channel, is recorded as skipped on the incident.
+            channel, is recorded as skipped on the incident. The names they carry, the database account (principal) above
+            all, can be chosen by database clients: webhook receivers and e-mail consumers must escape them wherever they
+            render them (see the console README, &quot;Alerting&quot;).
           </p>
           <ChannelsTable
             csrfToken={session.csrfToken}

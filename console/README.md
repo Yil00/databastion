@@ -141,6 +141,31 @@ Limitation: in a single-role setup (`DATABASE_URL` is the owner or a superuser, 
 the console could drop the trigger; the audit log is then append-only only against the application
 code, not against a compromised console process.
 
+### Constraints on large tables
+drizzle's migrator applies all pending migrations in one transaction, so a `CHECK` or foreign key
+added to an existing table scans it under an `ACCESS EXCLUSIVE` lock until the whole run commits,
+and a later migration of the same run cannot shorten that lock. Migration `0027` added the
+`access_events_bytes` CHECK that way; it has shipped and is not edited. `migrate`
+(`src/db/online-constraints.ts`) works around it:
+- an install whose last applied migration is `0026` (the only state in which `access_events` can
+  hold rows while `0027` is pending) gets `0027` applied by a pre-flight instead: the column and
+  the constraint `NOT VALID` in a short transaction that also records `0027` (hash of the unchanged
+  file) in drizzle's journal, then `VALIDATE CONSTRAINT` as a statement of its own, which only takes
+  `SHARE UPDATE EXCLUSIVE` (reads and writes go on). The migrator then applies `0028` onwards;
+- a fresh install runs `0027` as is (the table is created empty in the same run), and an install
+  that already applied it keeps its validated constraint: nothing to do;
+- every run validates, one statement each, the constraints of `DEFERRED_VALIDATIONS` still
+  `NOT VALID` (a run interrupted between the two steps above).
+
+Concurrent `migrate` runs are serialized: each run holds a session-level advisory lock
+(`MIGRATION_LOCK_KEY`, on a dedicated connection) from its first pre-flight to its last
+validation; a second run waits, then finds nothing pending. `DEFERRED_VALIDATIONS` accepts plain
+lower-case identifiers only.
+
+The final schema is the one of `0027`. Rule for new migrations: a constraint added to a table
+that may be large is written `NOT VALID` in a custom migration and listed in
+`DEFERRED_VALIDATIONS`, never validated in the migration itself.
+
 ### Upgrading an existing deployment
 Deployments created before the role split (single `POSTGRES_USER` role used by everything; the
 initdb script only runs on an empty data directory) switch as follows, once, as the superuser:
@@ -760,7 +785,7 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
 `src/server/notifications.ts`; senders: `src/server/senders/`; address policy:
 `src/server/net-guard.ts`; silent agents and integrity alerts: `src/server/system-alerts.ts`;
-contents: `src/lib/notification-render.ts`.*
+dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notification-render.ts`.*
 
 - **Channels** (admin only, CSRF, audited without secrets), referenced by `slug` from the policies'
   `notify` actions:
@@ -778,7 +803,7 @@ contents: `src/lib/notification-render.ts`.*
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -797,9 +822,28 @@ contents: `src/lib/notification-render.ts`.*
   reference. 2xx = delivered; redirects are never followed (3xx fails); 408, 425, 429, 5xx, network
   and TLS errors are retried; other 4xx fail. 5 s to connect, 15 s in total, response read up to 64 KiB
   and discarded.
+- **Rendering by receivers (escape the principal)**: the payload is JSON, so its strings are
+  JSON-escaped, but a receiver that renders them (HTML page, ticket, chat message in Markdown,
+  Slack `mrkdwn` or Teams cards, a SIEM dashboard, a shell command) must escape them for that
+  context, like any untrusted input. Above all `principal` (and the principal in an access-incident
+  e-mail): it is the database account name as the engine logged it, and **any client that can reach
+  the database port chooses it**, even without valid credentials (a failed login is an
+  `auth_failure` event). The contract only excludes control and format characters: it may hold up
+  to 256 characters such as `<`, `>`, `&`, `"`, `'`, backquotes, `*`, `_`, `[`, `]`, `@here` or
+  `<!channel>`, i.e. HTML or script, Markdown links and mentions. Never insert it into markup,
+  a template, a query or a command without escaping for that context; show it as text (a code span
+  whose delimiters are escaped, or a text node), and keep it on one line. The same holds, with a
+  narrower character set, for the other names in a payload: normalized database, schema and object
+  names (`location`, `access.objects`, `database`; created by whoever can create objects in the
+  database), `target_id`, the agent `name` / `hostname` of `agent.silent` / `agent.recovered`, and
+  the policy and channel names (set by console administrators). Do not turn console URLs into links
+  that you build from these fields: use the `url` field as sent.
 - **E-mail**: plain text, UTF-8 (base64 body, RFC 2047 subject), `Message-ID` derived from the
   delivery id, `Auto-Submitted: auto-generated`. 10 s to connect, 30 s per reply, 60 s in total. A 4xx
-  reply or a network / TLS error is retried; a 5xx reply fails.
+  reply or a network / TLS error is retried; a 5xx reply fails. The console keeps every value on one
+  line and bounded, but does not HTML-escape a plain-text body: a consumer that turns these e-mails
+  into HTML (a ticketing system, a mail-to-chat bridge, an HTML archive) must escape them, the
+  principal first (previous item).
 - **SSRF defense** (webhooks; outbound connections are made by the worker only): the host is resolved
   and **every** address checked; the socket connects to the vetted addresses only (no second
   resolution, so no DNS rebinding), in the resolver's order with a fallback to the next one on a
@@ -814,7 +858,7 @@ contents: `src/lib/notification-render.ts`.*
   transaction as the incident (policy engine) or the alert, one per (subject, event, channel) with a
   unique idempotency key, so retried or concurrent evaluations never notify twice. The worker queue
   `notifications.deliver` (pg-boss, `stately`, no payload: the outbox is the work) is woken after
-  new incidents, integrity events and tests, and scheduled every minute. Due rows are claimed with
+  new incidents, integrity events, dropped-batches alerts and tests, and scheduled every minute. Due rows are claimed with
   `FOR UPDATE SKIP LOCKED` and a 2-minute lease (a crashed worker's attempt is claimed again), sent
   outside any transaction, 10 in parallel, and recorded: `delivered`; `pending` again after 1, 2, 4,
   8, 16, 32 then 60 minutes; `failed` after 8 attempts or on a permanent error; `skipped` for a
@@ -853,6 +897,22 @@ contents: `src/lib/notification-render.ts`.*
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
   `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
   and hour per channel (the events themselves are all recorded, within their own budget).
+- **Dropped batches** (P7, end-of-phase-4 review M2): each heartbeat reports `spool.dropped_batches`,
+  the batches the agent dropped since it started (spool full, or rejected with a non-retryable
+  4xx): findings or access events that never reached the console, e.g. the signature batches of a
+  dump evicted by a failed-login flood. The heartbeat handler adds the rise of that counter since
+  the previous heartbeat (after a restart, seen as a lower uptime or counter, the whole counter; on
+  an agent's first heartbeat too) to `agents.dropped_batches_unalerted`, in the heartbeat
+  transaction. At most once per agent and hour (conditional update on
+  `agents.dropped_batches_alerted_at`, so concurrent heartbeats and workers alert once), the count
+  becomes a `security_events` row `agent.batches_dropped` (`medium`), an audit entry (system) and
+  an `agent.batches_dropped` notification to the system-alert channels, with `dropped_batches` (the
+  batches since `since`, the first unalerted drop seen), `min_interval_s` and the security event
+  id. Drops within the hour are counted in the next alert: raised by the next heartbeat after the
+  hour or, when the agent stops dropping, by the worker's minute schedule. Only console-computed
+  numbers, timestamps and ids: no agent-provided text (not even the host name). Revoked and locked
+  agents are not alerted. The agent page shows the spool counters of the latest heartbeat, the
+  last five alerts and the drops held back for the next one.
 
 ## Layout
 ```

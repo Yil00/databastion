@@ -4,7 +4,8 @@ import { wakeUp, type JobSender } from "./wake-up";
  * Wake-up of the notification delivery (P3-C). Like `policies.evaluate`, the pg-boss job
  * `notifications.deliver` carries no payload: the work is the outbox (`notification_deliveries`),
  * so a lost or repeated job loses or repeats nothing. It is sent after an incident is created
- * (worker, through its own pg-boss instance), after an agent-integrity event or a test request
+ * (worker, through its own pg-boss instance), after an agent-integrity event, a dropped-batches
+ * alert or a test request
  * (web, best effort, through the sender below), and scheduled every minute by the worker (retries
  * with backoff, the silent-agent check). `stately`: bursts coalesce.
  */
