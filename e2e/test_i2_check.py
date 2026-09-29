@@ -511,3 +511,102 @@ class PageTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NeedleFilterTest(Base):
+    def test_scan_restricted_to_the_given_needles(self) -> None:
+        # Another ground-truth value is present, but only L0.v0 (and its local part) is searched.
+        path = self.write("log.txt", "x LEFEVRE y manon.bernard z")
+        rc, out = self.scan(path, extra=["--needle", "L0.v0"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("LEAK L0.v0.local ", out)
+        self.assertNotIn("L1.v0", out)
+        self.assertIn("2 needles from 1 locations", out)
+        rc, out = self.scan(self.write("clean.txt", "x LEFEVRE y"), extra=["--needle", "L0.v0"])
+        self.assertEqual(rc, 0, out)
+
+    def test_unknown_or_excluded_needle_is_a_usage_error(self) -> None:
+        path = self.write("log.txt", "x")
+        for bad in ("L99.v0", "L1.v4"):  # L1.v4 = "Ava": excluded as too short
+            rc, out = self.scan(path, extra=["--needle", bad])
+            self.assertEqual(rc, 2, out)
+            self.assertIn(bad, out)
+
+
+class AuditTest(Base):
+    EVENTS = [
+        {"db_user": "e2e_exporter", "action": "read", "source": "pgaudit", "rows": 150,
+         "objects": [{"database": "shop", "schema": "crm", "object": "customers"}],
+         "signals": ["signature.pg_dump", "shape.full_table_copy"]},
+        {"db_user": "e2e_exporter", "action": "read", "source": "pgaudit", "rows": 1,
+         "objects": [{"database": "shop", "schema": "crm", "object": "*"}],
+         "signals": ["signature.pg_dump"]},
+        {"db_user": "e2e_analyst", "action": "read", "source": "pgaudit", "rows": 1,
+         "objects": [{"database": "shop", "schema": "crm", "object": "customers"}], "signals": []},
+    ]
+    INCIDENTS = [
+        {"policy_name": "e2e pg_dump", "principal": "e2e_exporter", "event_signals": ["signature.pg_dump"]},
+        {"policy_name": "e2e reads", "principal": "e2e_analyst", "event_signals": []},
+    ]
+
+    def check(self, events: list[dict], incidents: list[dict], extra: list[str] | None = None) -> tuple[int, str]:
+        ev = self.write("events.json", json.dumps(events))
+        inc = self.write("incidents.json", json.dumps(incidents))
+        return run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                    "--agent-account", "databastion_agent", "--events", ev, "--incidents", inc,
+                    *(extra or [])])
+
+    REQUIRED = ["--require-event", "e2e_exporter:signature.pg_dump", "--require-event", "e2e_analyst",
+                "--require-incident", "e2e pg_dump:e2e_exporter:signature.pg_dump",
+                "--require-incident", "e2e reads:e2e_analyst"]
+
+    def test_ok(self) -> None:
+        rc, out = self.check(self.EVENTS, self.INCIDENTS, self.REQUIRED)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("event objects named '*' (masked or unknown): 1", out)
+
+    def test_empty(self) -> None:
+        rc, out = self.check([], [])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no access event was stored", out)
+        self.assertIn("no incident was opened", out)
+
+    def test_agent_own_events_and_incidents(self) -> None:
+        own = {"db_user": "databastion_agent", "action": "read", "source": "pgaudit", "rows": 100,
+               "objects": [{"database": "shop", "schema": "crm", "object": "customers"}], "signals": []}
+        rc, out = self.check(self.EVENTS + [own], self.INCIDENTS)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 access event(s) of the agent's own account", out)
+        rc, out = self.check(self.EVENTS, self.INCIDENTS + [
+            {"policy_name": "e2e reads", "principal": "databastion_agent", "event_signals": []}])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 incident(s) attributed to the agent's own account", out)
+
+    def test_missing_requirements(self) -> None:
+        rc, out = self.check(self.EVENTS[2:], self.INCIDENTS[1:], self.REQUIRED)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no access event of principal 'e2e_exporter' with signature.pg_dump", out)
+        self.assertIn("no incident of policy 'e2e pg_dump', principal 'e2e_exporter', signal signature.pg_dump", out)
+        # The signal must be on the incident, not only somewhere else.
+        inc = [{"policy_name": "e2e pg_dump", "principal": "e2e_exporter", "event_signals": []}]
+        rc, out = self.check(self.EVENTS, inc, ["--require-incident", "e2e pg_dump:e2e_exporter:signature.pg_dump"])
+        self.assertEqual(rc, 1, out)
+
+    def test_raw_value_bearing_name_in_an_event_object(self) -> None:
+        for obj in ({"database": "shop", "schema": "crm", "object": "export_client_0639988384"},
+                    {"database": "shop", "schema": "crm", "object": "export_*_0639988384"},
+                    {"database": "shop", "schema": "crm", "object": "archive_lucas_*"}):
+            ev = [{"db_user": "e2e_exporter", "action": "read", "source": "pgaudit",
+                   "objects": [obj], "signals": []}]
+            rc, out = self.check(self.EVENTS + ev, self.INCIDENTS)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("hold the raw value-bearing name", out)
+            self.assertNotIn("0639988384", out)
+            self.assertNotIn("lucas", out)
+
+    def test_not_an_array(self) -> None:
+        ev = self.write("events.json", json.dumps({"events": []}))
+        inc = self.write("incidents.json", "[]")
+        rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                       "--agent-account", "a", "--events", ev, "--incidents", inc])
+        self.assertEqual(rc, 2, out)
