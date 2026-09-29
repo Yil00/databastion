@@ -192,7 +192,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.beyond_select": {
-    "description": "Privileges beyond SELECT on databases, tables or columns: {labels}.",
+    "description": "{count} privilege(s) beyond SELECT on databases, tables or columns; the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb"
@@ -207,7 +207,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.global_privileges": {
-    "description": "Global privileges other than SELECT and USAGE: {labels}.",
+    "description": "{count} global privilege(s) other than SELECT and USAGE; the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb"
