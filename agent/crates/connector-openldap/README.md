@@ -73,7 +73,8 @@ with `reqStart`, `reqDN` and `objectClass`). `olcAccessLogSuccess: FALSE`
 also logs failed binds. The level is Full once every naming context shows a
 search record from the last 24 h: `check()` looks for one and, when there is
 none, reads the context's root entry itself, so a server that logs reads
-proves it at the first check.
+proves it at the first check. A search record below a naming context nested
+in another one proves the nested context only.
 
 Principals: an entry DN usually names a person, so Audit events carry the
 DN in clear only for `anonymous`, the agent's own DN and the DNs listed in

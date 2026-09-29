@@ -438,3 +438,110 @@ async fn discovery_over_the_scripted_directory() {
             .all(|f| f.classifier().as_str() == "pii.email")
     );
 }
+
+/// `check()`'s audit proofs against a scripted `cn=accesslog`.
+mod proofs {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::check::{CheckState, prove};
+
+    const OUTER: &str = "dc=example,dc=org";
+    const NESTED: &str = "ou=nested,dc=example,dc=org";
+
+    fn contexts() -> Vec<(String, String)> {
+        [OUTER, NESTED]
+            .iter()
+            .map(|c| ((*c).to_owned(), (*c).to_owned()))
+            .collect()
+    }
+
+    /// A directory whose log holds successful searches below the nested
+    /// context only, and records the absent-entry probes while `failures`
+    /// is on.
+    fn log_server(failures: Arc<AtomicBool>, probes: Arc<Mutex<Vec<String>>>) -> Handler {
+        let logged: Arc<Mutex<HashSet<String>>> = Arc::default();
+        directory(AGENT, move |id, req| {
+            let Request::Search { base, filter, .. } = req else {
+                return vec![encode::done(id, 53)];
+            };
+            if base == "cn=accesslog" {
+                // The proof of a probe: its exact DN.
+                if let Some(rest) = filter.split("(reqDN=").nth(1) {
+                    let dn = rest.split(')').next().unwrap_or_default();
+                    if logged.lock().unwrap().contains(dn) {
+                        return vec![
+                            encode::entry(id, "reqStart=1,cn=accesslog", &[]),
+                            encode::done(id, 0),
+                        ];
+                    }
+                    return vec![encode::done(id, 0)];
+                }
+                // A proof of logged reads: the only records are below the
+                // nested context, so a search that leaves it out finds
+                // nothing.
+                let excludes_nested =
+                    filter.contains(&format!("(!(reqDN:dnSubtreeMatch:={NESTED}))"));
+                if filter.contains("(reqResult=0)") && !excludes_nested {
+                    return vec![
+                        encode::entry(id, "reqStart=2,cn=accesslog", &[]),
+                        encode::done(id, 0),
+                    ];
+                }
+                return vec![encode::done(id, 0)];
+            }
+            if base.starts_with(crate::check::ABSENT_RDN) {
+                probes.lock().unwrap().push(base.clone());
+                if failures.load(Ordering::SeqCst) {
+                    logged.lock().unwrap().insert(base.clone());
+                }
+                return vec![encode::done(id, 32)];
+            }
+            vec![encode::entry(id, base, &[]), encode::done(id, 0)]
+        })
+    }
+
+    /// #79 round-3 review L2: a context does not borrow the read proof of
+    /// a naming context nested in it.
+    #[tokio::test]
+    async fn a_context_never_borrows_a_nested_contexts_proof() {
+        let (s, seen) = session(log_server(Arc::default(), Arc::default())).await;
+        let mut s = s.unwrap();
+        let state = CheckState::default();
+        let t = target();
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert!(state.proven(&t.id, NESTED));
+        assert!(!state.proven(&t.id, OUTER));
+        // The outer context's proof searches leave the nested one out; the
+        // nested one's leave nothing out.
+        let filters: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                Request::Search { base, filter, .. } if base == "cn=accesslog" => {
+                    Some(filter.clone())
+                }
+                _ => None,
+            })
+            .filter(|f| f.contains("(reqResult=0)"))
+            .collect();
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.contains(&format!("(reqDN:dnSubtreeMatch:={OUTER})"))
+                    && f.contains(&format!("(!(reqDN:dnSubtreeMatch:={NESTED}))")))
+        );
+        assert!(
+            filters
+                .iter()
+                .filter(|f| f.contains(&format!("(reqDN:dnSubtreeMatch:={NESTED})"))
+                    && !f.contains("(!("))
+                .count()
+                >= 1
+        );
+    }
+}

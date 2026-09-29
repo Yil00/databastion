@@ -365,11 +365,14 @@ pub(crate) enum Outcome {
 }
 
 /// Whether `cn=accesslog` holds a search record of `context` from the last
-/// 24 h with the given outcome.
+/// 24 h with the given outcome. Records below one of `deeper` (naming
+/// contexts nested in `context`, raw DNs) do not count: a context never
+/// borrows the proof of another one (#79 round-3 review L2).
 pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     accesslog_base: &str,
     context: &str,
+    deeper: &[&str],
     outcome: Outcome,
 ) -> Result<bool, LdError> {
     let success = Filter::Eq("reqResult", "0".to_owned());
@@ -378,22 +381,30 @@ pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
         Outcome::Failed => Filter::Not(Box::new(success)),
     };
     let since = time::csn_at(SystemTime::now() - RECORD_FRESHNESS);
+    let mut and = vec![
+        Filter::Eq("objectClass", "auditSearch".to_owned()),
+        result,
+        Filter::Extensible {
+            rule: "dnSubtreeMatch",
+            attr: "reqDN",
+            value: context.to_owned(),
+        },
+        Filter::Ge("entryCSN", since),
+    ];
+    and.extend(deeper.iter().map(|d| {
+        Filter::Not(Box::new(Filter::Extensible {
+            rule: "dnSubtreeMatch",
+            attr: "reqDN",
+            value: (*d).to_owned(),
+        }))
+    }));
     let search = Search {
         base: accesslog_base,
         scope: Scope::One,
         size_limit: 1,
         time_limit: 0,
         types_only: false,
-        filter: Filter::And(vec![
-            Filter::Eq("objectClass", "auditSearch".to_owned()),
-            result,
-            Filter::Extensible {
-                rule: "dnSubtreeMatch",
-                attr: "reqDN",
-                value: context.to_owned(),
-            },
-            Filter::Ge("entryCSN", since),
-        ]),
+        filter: Filter::And(and),
         attributes: &["1.1"],
     };
     Ok(probe(s, &search, &mut |_: Entry| {})
@@ -443,9 +454,18 @@ async fn report<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(r)
 }
 
+/// The raw DNs of the naming contexts nested in `canon` (deeper ones).
+fn deeper_contexts<'a>(contexts: &'a [(String, String)], canon: &str) -> Vec<&'a str> {
+    contexts
+        .iter()
+        .filter(|(_, c)| c != canon && dn::is_within(c, canon))
+        .map(|(raw, _)| raw.as_str())
+        .collect()
+}
+
 /// Looks for a recent search record of each unproven context; when there
 /// is none, runs one base search of the context and looks again.
-async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
     state: &CheckState,
     target: &TargetConfig,
     s: &mut Session<S>,
@@ -457,12 +477,13 @@ async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|(_, c)| !state.proven(&target.id, c))
         .take(MAX_PROVEN_PER_REPORT)
     {
-        let mut found = search_record(s, accesslog_base, raw, Outcome::Succeeded).await?;
+        let deeper = deeper_contexts(contexts, canon);
+        let mut found = search_record(s, accesslog_base, raw, &deeper, Outcome::Succeeded).await?;
         if !found {
             // A read of the context itself: a server logging reads records
             // it at once.
             base_readable(s, raw).await?;
-            found = search_record(s, accesslog_base, raw, Outcome::Succeeded).await?;
+            found = search_record(s, accesslog_base, raw, &deeper, Outcome::Succeeded).await?;
         }
         if found {
             state.note_search(&target.id, canon);
@@ -477,13 +498,14 @@ async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|(_, c)| state.failures_logged(&target.id, c) != Some(true))
         .take(MAX_PROVEN_PER_REPORT)
     {
-        if search_record(s, accesslog_base, raw, Outcome::Failed).await? {
+        let deeper = deeper_contexts(contexts, canon);
+        if search_record(s, accesslog_base, raw, &deeper, Outcome::Failed).await? {
             state.note_failures_logged(&target.id, canon, true);
             continue;
         }
         let probe_dn = format!("{ABSENT_RDN},{raw}");
         base_readable(s, &probe_dn).await?;
-        let logged = search_record(s, accesslog_base, raw, Outcome::Failed).await?;
+        let logged = search_record(s, accesslog_base, raw, &deeper, Outcome::Failed).await?;
         state.note_failures_logged(&target.id, canon, logged);
     }
     Ok(())
