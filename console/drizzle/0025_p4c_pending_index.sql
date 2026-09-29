@@ -1,0 +1,2 @@
+DROP INDEX "access_events_pending_idx";--> statement-breakpoint
+CREATE INDEX "access_events_pending_idx" ON "access_events" USING btree ("agent_id","received_at","item_index","id") WHERE "access_events"."evaluated_at" is null;

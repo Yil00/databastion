@@ -3,12 +3,20 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { Logger } from "@/lib/logger";
 
+import * as events from "@/server/events";
 import * as incidents from "@/server/incidents";
 import * as notifications from "@/server/notifications";
 import * as systemAlerts from "@/server/system-alerts";
 import type { Database } from "@/db/client";
 
-import { createNoopHandler, createNotificationHandler, createPolicyHandler, NOOP_QUEUE, type NoopPayload } from "./queues";
+import {
+  createEventsPurgeHandler,
+  createNoopHandler,
+  createNotificationHandler,
+  createPolicyHandler,
+  NOOP_QUEUE,
+  type NoopPayload,
+} from "./queues";
 
 describe("noop queue handler", () => {
   it("acknowledges every job of the batch without throwing", async () => {
@@ -23,6 +31,7 @@ describe("noop queue handler", () => {
 });
 
 const stats = (over: Partial<incidents.DrainStats> = {}): incidents.DrainStats => ({
+  events: 0,
   findings: 0,
   policyPasses: 0,
   created: 0,
@@ -111,5 +120,32 @@ describe("notifications.deliver handler", () => {
   it("a failed check fails the job (pg-boss retries it; the outbox keeps the work)", async () => {
     vi.spyOn(systemAlerts, "checkSilentAgents").mockRejectedValue(new Error("db down"));
     await expect(createNotificationHandler(db, log, async () => "id")(jobs)).rejects.toThrow("db down");
+  });
+});
+
+describe("events.purge handler", () => {
+  const log = { info: vi.fn(), warn: vi.fn() } as unknown as Logger;
+  const db = () => ({}) as Database;
+  const jobs = [{ id: "a" }] as unknown as Job<Record<string, unknown>>[];
+
+  it("purges with the configured retention and re-queues only when rows remain", async () => {
+    const purge = vi
+      .spyOn(events, "purgeAccessEvents")
+      .mockResolvedValueOnce({ deleted: 3, more: false })
+      .mockResolvedValueOnce({ deleted: 10_000, more: true });
+    const requeue = vi.fn(async () => "id");
+    const handler = createEventsPurgeHandler(db, log, requeue, { retentionDays: () => 30, budgetMs: 5 });
+    await handler(jobs);
+    expect(purge).toHaveBeenCalledWith(expect.anything(), { retentionDays: 30, budgetMs: 5 });
+    expect(requeue).not.toHaveBeenCalled();
+    await handler(jobs);
+    expect(requeue).toHaveBeenCalledTimes(1);
+    await handler([]);
+    expect(purge).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failed purge fails the job (pg-boss retries it)", async () => {
+    vi.spyOn(events, "purgeAccessEvents").mockRejectedValue(new Error("db down"));
+    await expect(createEventsPurgeHandler(db, log, async () => "id")(jobs)).rejects.toThrow("db down");
   });
 });

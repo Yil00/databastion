@@ -2,7 +2,8 @@ import Link from "next/link";
 
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { FindingConditions, LocationPattern } from "@/lib/policy-model";
+import type { EventConditions, ObjectPattern } from "@/lib/event-model";
+import type { FindingConditions, LocationPattern, PolicyConditions, PolicySource } from "@/lib/policy-model";
 import type { ExceptionView, PolicyView } from "@/server/policies";
 
 import { SeverityBadge } from "./incidents-table";
@@ -20,8 +21,36 @@ export function locationPatternLabel(l: LocationPattern): string {
     .join(", ");
 }
 
+export function objectPatternLabel(o: ObjectPattern): string {
+  return (["database", "schema", "object"] as const)
+    .filter((p) => o[p] !== undefined)
+    .map((p) => `${p} ~ ${o[p]}`)
+    .join(", ");
+}
+
+/** One line per condition of an `access_event` policy, in reading order. */
+export function eventConditionLines(c: EventConditions): string[] {
+  const lines: string[] = [];
+  if (c.signals) lines.push(`signal in ${c.signals.join(", ")}`);
+  if (c.event_actions) lines.push(`action in ${c.event_actions.join(", ")}`);
+  if (c.anomaly) lines.push("volume above the principal's baseline");
+  if (c.min_score !== undefined) lines.push(`score >= ${c.min_score}`);
+  if (c.min_sensitivity !== undefined) lines.push(`sensitivity >= ${c.min_sensitivity}`);
+  if (c.min_rows !== undefined) lines.push(`rows >= ${c.min_rows}`);
+  if (c.principals) lines.push(`principal ~ ${c.principals.join(", ")}`);
+  if (c.exclude_principals) lines.push(`principal not ~ ${c.exclude_principals.join(", ")}`);
+  if (c.objects) lines.push(objectPatternLabel(c.objects));
+  if (c.sources) lines.push(`source in ${c.sources.join(", ")}`);
+  if (c.target_ids) lines.push(`target in ${c.target_ids.join(", ")}`);
+  if (c.engines) lines.push(`engine in ${c.engines.join(", ")}`);
+  if (c.agent_ids) lines.push(`agent in ${c.agent_ids.length} selected`);
+  return lines;
+}
+
 /** One line per condition, in reading order ("every finding" when empty). */
-export function conditionLines(c: FindingConditions): string[] {
+export function conditionLines(conditions: PolicyConditions, source: PolicySource = "finding"): string[] {
+  if (source === "access_event") return eventConditionLines(conditions as EventConditions);
+  const c = conditions as FindingConditions;
   const lines: string[] = [];
   if (c.classifiers) lines.push(`classifier in ${c.classifiers.join(", ")}`);
   if (c.target_ids) lines.push(`target in ${c.target_ids.join(", ")}`);
@@ -36,13 +65,38 @@ export function conditionLines(c: FindingConditions): string[] {
 
 /** Form values of an existing policy (the edit form's initial values). */
 export function policyFormValues(p: PolicyView): Record<string, string | boolean> {
-  const c = p.conditions;
-  return {
+  const common = {
+    source: p.source,
     name: p.name,
     description: p.description ?? "",
     enabled: p.enabled,
     severity: p.severity,
     notify: p.notifyChannels.join(", "),
+  };
+  if (p.source === "access_event") {
+    const e = p.conditions as EventConditions;
+    return {
+      ...common,
+      signals: e.signals?.join(", ") ?? "",
+      event_actions: e.event_actions?.join(", ") ?? "",
+      sources: e.sources?.join(", ") ?? "",
+      principals: e.principals?.join(", ") ?? "",
+      exclude_principals: e.exclude_principals?.join(", ") ?? "",
+      target_ids: e.target_ids?.join(", ") ?? "",
+      engines: e.engines?.join(", ") ?? "",
+      agent_ids: e.agent_ids?.join(", ") ?? "",
+      "objects.database": e.objects?.database ?? "",
+      "objects.schema": e.objects?.schema ?? "",
+      "objects.object": e.objects?.object ?? "",
+      min_rows: e.min_rows?.toString() ?? "",
+      min_score: e.min_score?.toString() ?? "",
+      min_sensitivity: e.min_sensitivity?.toString() ?? "",
+      anomaly: e.anomaly === true,
+    };
+  }
+  const c = p.conditions as FindingConditions;
+  return {
+    ...common,
     classifiers: c.classifiers?.join(", ") ?? "",
     target_ids: c.target_ids?.join(", ") ?? "",
     engines: c.engines?.join(", ") ?? "",
@@ -82,7 +136,8 @@ export function PoliciesTable({ policies, isAdmin, csrfToken }: { policies: Poli
             </TableCell>
             <TableCell className="max-w-80 whitespace-normal">
               <ul className="text-xs">
-                {conditionLines(p.conditions).map((line, i) => (
+                <li className="text-muted-foreground">{p.source === "access_event" ? "access events" : "findings"}</li>
+                {conditionLines(p.conditions, p.source).map((line, i) => (
                   <li key={i} className="break-all">
                     {line}
                   </li>

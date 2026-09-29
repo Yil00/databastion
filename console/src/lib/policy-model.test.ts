@@ -51,7 +51,7 @@ describe("globMatch", () => {
     expect(globMatch(pattern, value)).toBe(expected);
   });
 
-  it("runs in linear time on hostile inputs (no backtracking blow-up)", () => {
+  it("runs in bounded O(n x m) time on hostile inputs (no exponential backtracking)", () => {
     const start = performance.now();
     expect(globMatch(`${"*a".repeat(100)}b`, "a".repeat(256))).toBe(false);
     expect(performance.now() - start).toBeLessThan(200);
@@ -70,7 +70,7 @@ describe("parsePolicyConditions", () => {
       min_matched: 3,
       min_match_ratio: 0.1,
     });
-    expect(r.ok && r.value.classifiers).toEqual(["pii.email", "secret.*"]);
+    expect(r.ok && "classifiers" in r.value && r.value.classifiers).toEqual(["pii.email", "secret.*"]);
   });
 
   it("accepts an empty document (every finding)", () => {

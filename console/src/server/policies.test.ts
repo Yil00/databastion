@@ -253,7 +253,8 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       ["address as channel", { ...EMAIL_POLICY, actions: [{ type: "create_incident", severity: "low" }, { type: "notify", channel: "a@b.c" }] }, "actions.channel"],
       ["control characters in the name", { ...EMAIL_POLICY, name: "a‮b" }, "name"],
       ["missing name", { conditions: {}, actions: EMAIL_POLICY.actions }, "name"],
-      ["unknown source", { ...EMAIL_POLICY, source: "access_event" }, "source"],
+      ["unknown source", { ...EMAIL_POLICY, source: "heartbeat" }, "source"],
+      ["finding keys on an access_event policy", { ...EMAIL_POLICY, source: "access_event" }, "conditions"],
     ])("rejects %s (400 invalid_policy + field)", async (_name, body, field) => {
       const res = await create(body);
       expect(res.status).toBe(400);
@@ -398,6 +399,26 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       } finally {
         await boss.stop({ graceful: false, timeout: 2000 });
       }
+    });
+  });
+
+  describe("drain", () => {
+    it("evaluates every pending finding once, beyond one chunk, and leaves none pending (timestamp precision)", async () => {
+      const auth = await agentWithTargets();
+      await newPolicy();
+      const items = Array.from({ length: 250 }, (_, i) => finding({ location: { engine: "postgres", database: "crm", schema: "public", object: `t${i}`, field: "email" } }));
+      const jobId = await claimedScan(auth);
+      await sendBatch(auth, jobId, items.slice(0, 200));
+      await sendBatch(auth, jobId, items.slice(200));
+      const stats = await drainPolicyWork(getDb());
+      expect(stats.findings).toBe(250);
+      expect(stats.more).toBe(false);
+      expect(await incidentsOf(auth.agentId)).toHaveLength(250);
+      const [pending] = (
+        await getDb().execute<{ n: number }>(sql`select count(*)::int as n from findings where policy_evaluated_at is distinct from last_seen_at`)
+      ).rows;
+      expect(pending?.n).toBe(0);
+      expect((await drainPolicyWork(getDb())).findings).toBe(0);
     });
   });
 

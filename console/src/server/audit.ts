@@ -26,6 +26,7 @@ export type AuditAction =
   | "agent.batch_conflict"
   | "agent.foreign_target"
   | "discovery.scan_request"
+  | "audit.configure"
   | "finding.false_positive"
   | "finding.false_positive_reset"
   | "policy.create"

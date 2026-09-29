@@ -33,7 +33,12 @@ export function IncidentStatusBadge({ status }: { status: IncidentStatus }) {
   return <Badge variant={STATUS_VARIANT[status]}>{STATUS_LABEL[status]}</Badge>;
 }
 
-export function incidentLocation(i: Pick<IncidentView, "location">): string {
+export function incidentLocation(i: Pick<IncidentView, "location" | "access">): string {
+  if (i.access?.overflow) return "hourly limit of new incidents reached: further matches counted here";
+  if (i.access) {
+    const who = i.access.principal.startsWith("hmac-sha256:") ? "fingerprinted account" : i.access.principal;
+    return `${who} on ${i.access.database ?? "(no object)"}`;
+  }
   return i.location ? locationLabel(i.location) : "(finding no longer available)";
 }
 
@@ -81,7 +86,7 @@ export function IncidentsTable({ incidents, now }: { incidents: IncidentView[]; 
               )}
             </TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal">{incidentLocation(i)}</TableCell>
-            <TableCell>{i.classifier ?? ""}</TableCell>
+            <TableCell>{i.access ? `score ${i.access.score ?? 0}` : (i.classifier ?? "")}</TableCell>
             <TableCell>{formatAge(i.createdAt, now)}</TableCell>
             <TableCell>{i.matchCount}</TableCell>
           </TableRow>

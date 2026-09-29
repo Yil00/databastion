@@ -26,6 +26,7 @@ const incident = (over: Partial<IncidentView> = {}): IncidentView => ({
   policyName: "Emails",
   policyRevision: 1,
   source: "finding",
+  access: null,
   findingId: "01890a5d-ac96-774b-bcce-b302099a8050",
   agentId: "01890a5d-ac96-774b-bcce-b302099a8058",
   agentName: "db-host-1",
@@ -159,6 +160,7 @@ describe("policies view", () => {
       name: "Emails",
       description: "d",
       enabled: true,
+      source: "finding",
       conditions: p.conditions,
       actions: p.actions,
     });
@@ -169,6 +171,7 @@ describe("policies view", () => {
       name: "x",
       description: null,
       enabled: true,
+      source: "finding",
       conditions: {},
       actions: [{ type: "create_incident", severity: "low" }],
     });

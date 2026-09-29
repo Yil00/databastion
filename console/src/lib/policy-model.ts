@@ -1,9 +1,24 @@
 import { registeredClassifiers, registeredClassifiersVersions } from "@/lib/protocol/classifiers";
 import { validateSchema } from "@/lib/protocol/validate";
 
+import { parseEventConditions, type EventConditions } from "./event-model";
 import { SEVERITIES, type Severity } from "./incident-lifecycle";
+import {
+  ENGINES,
+  fail,
+  globMatch,
+  isGlob,
+  isPlainObject,
+  onlyKeys,
+  stringList,
+  TEXT,
+  UUID,
+  type Parsed,
+} from "./policy-common";
 
 export * from "./incident-lifecycle";
+export { globMatch, isGlob, isPlainObject, MAX_GLOB_LENGTH, MAX_LIST_ITEMS, type Parsed } from "./policy-common";
+export type { EventConditions } from "./event-model";
 
 /**
  * Policy model (P3-A): condition -> action documents, their strict validation, glob matching on
@@ -17,9 +32,8 @@ export * from "./incident-lifecycle";
  * - `location`: globs (`*`, `?`, `\` escapes, case-insensitive) on the normalized `database`,
  *   `schema`, `object`, `field` names;
  * - `min_confidence`, `min_match_ratio` (matched / sampled) in [0, 1], `min_matched` >= 0.
- * Phase 4 adds the `access_event` source with its own keys (e.g. `signals`: `signature.*`,
- * `shape.*`, `volume.*`); a document is validated against the keys of its policy's source, so an
- * old document never changes meaning.
+ * Source `access_event` (P4-C): see src/lib/event-model.ts. A document is validated against the
+ * keys of its policy's source, so an old document never changes meaning.
  *
  * Actions: exactly one `create_incident` (with a severity) and up to `MAX_NOTIFY` `notify` actions
  * naming a channel reference (stored only; delivery is P3-C).
@@ -27,11 +41,11 @@ export * from "./incident-lifecycle";
  * No document ever holds a sampled value: only identifiers, globs on normalized names and numbers.
  */
 
-export const POLICY_SOURCES = ["finding"] as const;
+export const POLICY_SOURCES = ["finding", "access_event"] as const;
 export type PolicySource = (typeof POLICY_SOURCES)[number];
 
 
-export const ENGINES = ["postgres", "mysql", "mariadb", "mongodb", "openldap"] as const;
+export { ENGINES } from "./policy-common";
 
 export const LOCATION_PARTS = ["database", "schema", "object", "field"] as const;
 export type LocationPart = (typeof LOCATION_PARTS)[number];
@@ -48,33 +62,20 @@ export interface FindingConditions {
   min_match_ratio?: number;
 }
 
+/** Condition document of a policy, per source. */
+export type PolicyConditions = FindingConditions | EventConditions;
+
 export type PolicyAction = { type: "create_incident"; severity: Severity } | { type: "notify"; channel: string };
 
-export const MAX_LIST_ITEMS = 50;
 export const MAX_NOTIFY = 5;
-export const MAX_GLOB_LENGTH = 256;
 export const NAME_MAX = 100;
 export const DESCRIPTION_MAX = 500;
 export const REASON_MAX = 500;
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Channel reference (P3-C resolves it to an SMTP or webhook channel): a slug, never an address. */
 export const CHANNEL_REF = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
-/** Free text typed by an administrator: no control / format / private-use / separator characters. */
-const TEXT = /^[^\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]*$/u;
 const CLASSIFIER_FAMILY = /^([a-z]+)\.\*$/;
 
-export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
-
-const fail = (error: string): { ok: false; error: string } => ({ ok: false, error });
-
-export function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-
-function onlyKeys(v: Record<string, unknown>, allowed: readonly string[]): string | null {
-  return Object.keys(v).find((k) => !allowed.includes(k)) ?? null;
-}
 
 /** Every classifier id of every registered classifier set. */
 function allRegisteredClassifiers(): Set<string> {
@@ -98,16 +99,6 @@ export function classifierSelected(selectors: readonly string[], classifier: str
   return selectors.some((s) => (s.endsWith(".*") ? classifier.startsWith(s.slice(0, -1)) : s === classifier));
 }
 
-function stringList(v: unknown, key: string, check: (s: string) => boolean): Parsed<string[]> {
-  if (!Array.isArray(v) || v.length < 1 || v.length > MAX_LIST_ITEMS) return fail(key);
-  if (!v.every((s): s is string => typeof s === "string" && check(s))) return fail(key);
-  return { ok: true, value: [...new Set(v)] };
-}
-
-/** A glob on a normalized name: bounded, printable, not empty. */
-export function isGlob(v: unknown): v is string {
-  return typeof v === "string" && v.length >= 1 && v.length <= MAX_GLOB_LENGTH && TEXT.test(v);
-}
 
 export function parseLocationPattern(v: unknown): Parsed<LocationPattern> {
   if (!isPlainObject(v)) return fail("location");
@@ -137,8 +128,14 @@ const FINDING_KEYS = [
 ] as const;
 
 /** Strict validation of a condition document for `source` (unknown keys rejected). */
-export function parsePolicyConditions(source: PolicySource, v: unknown): Parsed<FindingConditions> {
+export function parsePolicyConditions(source: PolicySource, v: unknown): Parsed<PolicyConditions> {
+  if (source === "access_event") return parseEventConditions(v);
   if (source !== "finding") return fail("source");
+  return parseFindingConditions(v);
+}
+
+/** Strict validation of a condition document of source `finding`. */
+export function parseFindingConditions(v: unknown): Parsed<FindingConditions> {
   if (!isPlainObject(v)) return fail("conditions");
   const unknown = onlyKeys(v, FINDING_KEYS);
   if (unknown !== null) return fail("conditions");
@@ -230,55 +227,6 @@ export function isPolicyName(v: unknown): v is string {
 
 export function isDescription(v: unknown, max = DESCRIPTION_MAX): v is string {
   return typeof v === "string" && v.length <= max && TEXT.test(v);
-}
-
-// ---------------------------------------------------------------------------- globs
-
-/**
- * Case-insensitive glob match (`*` any run, `?` one character, `\` escapes the next character),
- * in linear time and space (greedy two-pointer with single backtrack point: no regular expression,
- * so no catastrophic backtracking on hostile names or patterns).
- */
-export function globMatch(pattern: string, value: string): boolean {
-  const p = tokens(pattern.toLowerCase());
-  const s = [...value.toLowerCase()];
-  let pi = 0;
-  let si = 0;
-  let star = -1;
-  let mark = 0;
-  while (si < s.length) {
-    const t = p[pi];
-    if (t !== undefined && t.kind !== "star" && (t.kind === "any" || t.ch === s[si])) {
-      pi++;
-      si++;
-    } else if (t !== undefined && t.kind === "star") {
-      star = pi++;
-      mark = si;
-    } else if (star >= 0) {
-      pi = star + 1;
-      si = ++mark;
-    } else {
-      return false;
-    }
-  }
-  while (p[pi]?.kind === "star") pi++;
-  return pi === p.length;
-}
-
-type GlobToken = { kind: "star" } | { kind: "any" } | { kind: "char"; ch: string };
-
-function tokens(pattern: string): GlobToken[] {
-  const out: GlobToken[] = [];
-  const chars = [...pattern];
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i] as string;
-    if (c === "\\" && i + 1 < chars.length) out.push({ kind: "char", ch: chars[++i] as string });
-    else if (c === "*") {
-      if (out[out.length - 1]?.kind !== "star") out.push({ kind: "star" });
-    } else if (c === "?") out.push({ kind: "any" });
-    else out.push({ kind: "char", ch: c });
-  }
-  return out;
 }
 
 // ------------------------------------------------------------------------- matching

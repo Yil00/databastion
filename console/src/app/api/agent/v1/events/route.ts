@@ -1,9 +1,9 @@
-import { handleEventsNotImplemented } from "@/server/agent-api/handlers";
+import { handleEvents } from "@/server/agent-api/handlers";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-/** POST /api/agent/v1/events: Audit (phase 4). `501` with a contract `Error` body; body never read. */
-export function POST(): Response {
-  return handleEventsNotImplemented();
+/** POST /api/agent/v1/events (contract: shared/protocol/openapi.yaml, P4-C). */
+export function POST(req: Request): Promise<Response> {
+  return handleEvents(req);
 }

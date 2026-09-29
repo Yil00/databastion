@@ -18,10 +18,13 @@ import { POLICY_QUEUE } from "@/server/policy-queue";
 
 import {
   createNoopHandler,
+  EVENTS_PURGE_QUEUE,
   NOOP_QUEUE,
   pgBossOptions,
+  registerEventsPurgeQueue,
   registerNotificationQueue,
   registerPolicyQueue,
+  scheduleEventsPurgeQueue,
   scheduleNotificationQueue,
   schedulePolicyQueue,
   type NoopPayload,
@@ -78,8 +81,11 @@ async function main(): Promise<void> {
   // P3-C: notification delivery (outbound webhooks / SMTP happen in the worker only).
   await registerNotificationQueue(boss, getDb, log);
   await scheduleNotificationQueue(boss);
+  // P4-C: retention of access events.
+  await registerEventsPurgeQueue(boss, getDb, log);
+  await scheduleEventsPurgeQueue(boss);
 
-  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE] }, "worker started");
+  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE] }, "worker started");
 }
 
 main().catch((err: unknown) => {

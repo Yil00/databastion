@@ -19,6 +19,9 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
           <Link href="/findings" prefetch={false} className="hover:underline">
             Findings
           </Link>
+          <Link href="/events" prefetch={false} className="hover:underline">
+            Access events
+          </Link>
           <Link href="/incidents" prefetch={false} className="hover:underline">
             Incidents
           </Link>

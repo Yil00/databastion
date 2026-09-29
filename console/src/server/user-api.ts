@@ -31,6 +31,7 @@ import { requestNotificationDelivery } from "@/server/notification-queue";
 import { enqueueTestNotification } from "@/server/notifications";
 import type { ChannelView } from "@/lib/notification-model";
 import { buildScanParams, requestScan } from "@/server/scans";
+import { configureAudit, parseAuditConfigInput } from "@/server/audit-config";
 import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
 import {
@@ -66,6 +67,8 @@ import { clientIp, ipBucket, readJsonBody } from "@/server/request";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 const MAX_USER_BODY = 16 * 1024;
+/** Audit settings carry up to 1000 manual objects (contract `SensitiveObject`). */
+const MAX_AUDIT_BODY = 1024 * 1024;
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return Response.json(body, { status, headers: { ...NO_STORE, ...headers } });
@@ -459,6 +462,44 @@ export function handleRequestScan(req: Request, agentId: string, targetId: strin
       return error(status, code);
     }
     return json({ job_id: r.jobId }, 202);
+  });
+}
+
+/**
+ * Audit settings of one target (admin, CSRF; P4-C): body = `enabled`, optional
+ * `aggregation_window_s`, `poll_interval_s`, `min_rows`, `derive_from_findings` (default true),
+ * `manual_objects` (contract `SensitiveObject[]`) and `confirm`. Unknown keys rejected. A change
+ * that disables Audit, empties `sensitive_objects` or removes many objects answers
+ * `409 confirmation_required` with the counts and the `digest` to send back as `confirm`; nothing is
+ * queued until then. `202 {job_id, ...counts}` when the `audit.configure` job is queued. Audited.
+ */
+export function handleConfigureAudit(req: Request, agentId: string, targetId: string): Promise<Response> {
+  return guardedUser("audit.configure", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "audit.configure" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(agentId) || !validateSchema("TargetId", targetId).ok) return error(404, "not_found");
+    const body = await readJsonBody(req, MAX_AUDIT_BODY);
+    if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
+    const input = parseAuditConfigInput(body.value);
+    if (!input.ok) return json({ error: "invalid_audit_settings", field: input.error }, 400);
+    const r = await configureAudit(getDb(), agentId, targetId, input.value, { userId: g.session.user.id, ip: g.ip });
+    const counts = (c: { previousCount: number; nextCount: number; added: number; removed: number; warning: string | null }) => ({
+      warning: c.warning,
+      previous_objects: c.previousCount,
+      next_objects: c.nextCount,
+      added_objects: c.added,
+      removed_objects: c.removed,
+    });
+    switch (r.outcome) {
+      case "queued":
+        return json({ job_id: r.jobId, ...counts(r.change), truncated_objects: r.truncated }, 202);
+      case "confirmation_required":
+        return json({ error: "confirmation_required", ...counts(r.change), truncated_objects: r.truncated, digest: r.digest }, 409);
+      case "invalid":
+        return error(400, "invalid_params");
+      case "not_found":
+        return error(404, "not_found");
+    }
   });
 }
 
