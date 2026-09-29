@@ -1443,6 +1443,29 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let a = admin(&adm, &adm.dbname).await;
+    // The client address as the server sees this connection (behind Docker
+    // NAT in CI: the bridge gateway, not loopback).
+    let seen: Option<String> = a
+        .query_one("SELECT pg_catalog.host(pg_catalog.inet_client_addr())", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let expected_client = match seen {
+        Some(ip) => databastion_classifiers::masking::ClientAddr::parse(&ip),
+        None => Some(databastion_classifiers::masking::ClientAddr::Local),
+    };
+    assert!(expected_client.is_some());
+    // The agent reads its own address from the server too
+    // (`inet_client_addr()`), so it matches under NAT; its sessions take
+    // the same route as the test's here.
+    let (_d, own_t) = audit_target(&u, "pg-audit-own", None);
+    let pre = crate::check::prerequisites(&own_t, Timeouts::new(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(
+        pre.own_addr, expected_client,
+        "agent address as seen by the server"
+    );
     a.batch_execute(
         "DROP TABLE IF EXISTS crm.it_audit_big; \
          CREATE TABLE crm.it_audit_big AS SELECT g AS id, 'x' || g AS v FROM generate_series(1, 20000) g",
@@ -1537,12 +1560,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
             .unwrap();
         assert_eq!(big.rows(), Some(20_000), "pgaudit.log_rows");
         assert_eq!(big.principal().account_name(), adm.user);
-        assert_eq!(
-            big.principal().client(),
-            Some(databastion_classifiers::masking::ClientAddr::Ip(
-                adm.host.parse().unwrap()
-            ))
-        );
+        assert_eq!(big.principal().client(), expected_client);
         // The value-bearing table name of the seed never leaves as is.
         assert!(!all.iter().any(|d| d.contains("0639988384")), "{all:#?}");
         // No literal in any event.
