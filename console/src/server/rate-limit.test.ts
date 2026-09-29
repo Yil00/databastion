@@ -15,8 +15,13 @@ import {
   RateLimiter,
   rateLimitKeyHash,
   rateLimitStoreStats,
+  resetRateLimitBreakersForTests,
+  STORE_BREAKER,
   type RateLimitStore,
 } from "./rate-limit";
+
+// Each test starts with every circuit breaker closed (a failing store opens it for 1.5 s).
+beforeEach(() => resetRateLimitBreakersForTests());
 
 const down = () => Promise.reject(new Error("store down"));
 const failingStore: RateLimitStore = { hit: down, reserve: down, check: down, refund: down, reset: down };
@@ -74,14 +79,47 @@ describe("RateLimiter.shared: construction and store failures (no database)", ()
   it("logs a rate-limited warning without the key, and counts every failure", async () => {
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
     const rl = RateLimiter.shared(fresh(), 10, 60_000, "closed", { store: failingStore });
-    const before = rateLimitStoreStats.errors;
+    const before = { ...rateLimitStoreStats };
     for (let i = 0; i < 5; i++) await rl.reserveShared("admin|198.51.100.7");
-    expect(rateLimitStoreStats.errors - before).toBe(5);
+    // One real failure, then the circuit breaker answers without calling the store.
+    expect(rateLimitStoreStats.errors - before.errors).toBe(1);
+    expect(rateLimitStoreStats.shortCircuited - before.shortCircuited).toBe(4);
     expect(warn).toHaveBeenCalledTimes(1);
     const [fields, message] = warn.mock.calls[0] as [Record<string, unknown>, string];
     expect(fields).toMatchObject({ limiter: rl.name, onStoreError: "closed" });
     expect(message).toMatch(/fail closed/);
     expect(JSON.stringify(warn.mock.calls)).not.toContain("198.51.100.7");
+  });
+
+  it("L-A: after a failure, the circuit breaker applies the failure mode without calling the store", async () => {
+    vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    let fail = true;
+    const calls = { n: 0 };
+    const flaky: RateLimitStore = {
+      ...failingStore,
+      reserve: async () => {
+        calls.n++;
+        if (fail) throw new Error("connection timeout");
+        return { counted: true, window: { count: 1, windowStartMs: Date.now(), remainingMs: 60_000 } };
+      },
+    };
+    const closed = RateLimiter.shared(fresh(), 10, 60_000, "closed", { store: flaky });
+    const local = RateLimiter.shared(fresh(), 2, 60_000, "local", { store: flaky });
+    expect((await closed.reserveShared("k")).ok).toBe(false);
+    expect(calls.n).toBe(1);
+    // Open: every limiter on that store answers at once, closed ones refuse, local ones fall back.
+    const t0 = Date.now();
+    for (let i = 0; i < 100; i++) expect(await closed.reserveShared(`k${i}`)).toEqual({ ok: false, retryAfterS: FAIL_CLOSED_RETRY_AFTER_S });
+    expect((await local.reserveShared("k")).ok).toBe(true);
+    expect((await local.reserveShared("k")).ok).toBe(true);
+    expect((await local.reserveShared("k")).ok).toBe(false);
+    expect(calls.n).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(500);
+    // Half-open after `openMs`: the next call tries the store again.
+    fail = false;
+    await new Promise((r) => setTimeout(r, STORE_BREAKER.openMs + 100));
+    expect((await closed.reserveShared("k")).ok).toBe(true);
+    expect(calls.n).toBe(2);
   });
 
   it("the per-process pre-check rejects before any store round-trip", async () => {
@@ -545,6 +583,47 @@ describe.skipIf(!hasDb)("RateLimiter.shared (PostgreSQL)", () => {
       expect(unknownBudgetCalls()).toBe(3);
       // Known users gave their reservation back; the unknown one kept it.
       expect(await copy.mod.loginFailuresUnknownUser.countShared("global")).toBe(1);
+    });
+
+    it("M-A: prechecks from a limited /48 rotating agent ids and /64s make no store call", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      const { secret } = await enroll("m-a-host");
+      const copy = await freshCopyFor<typeof import("./agent-api/auth")>("./agent-api/auth");
+      const { ipBucket } = await import("./request");
+      const spies = (["check", "reserve", "hit", "refund"] as const).map((m) => vi.spyOn(copy.store.prototype, m));
+      for (let i = 0; i < copy.mod.cheapFailuresPerIp.limit; i++) {
+        copy.mod.cheapFailuresPerIp.hit(ipBucket("2001:db8:77::1", copy.mod.CHEAP_FAILURES_IPV6_PREFIX));
+      }
+      const hex = (n: number) => n.toString(16);
+      for (let i = 0; i < 1000; i++) {
+        const req = new Request("http://console.test/api/agent/v1/heartbeat", {
+          method: "POST",
+          headers: {
+            "X-DataBastion-Agent-Id": crypto.randomUUID(),
+            Authorization: `Bearer ${secret}`,
+            "X-Forwarded-For": `2001:db8:77:${hex(i)}::${hex(i + 1)}`,
+          },
+        });
+        const pre = await copy.mod.authPrecheck(req);
+        expect(pre.ok).toBe(false);
+        if (!pre.ok) expect(pre.response.status).toBe(429);
+      }
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("L-B: /enroll buckets IPv6 sources by /56", async () => {
+      process.env.DATABASTION_TRUST_PROXY = "1";
+      const copy = await freshCopyFor<typeof import("./agent-api/handlers")>("./agent-api/handlers");
+      expect(copy.mod.ENROLL_IPV6_PREFIX).toBe(56);
+      const enrollFrom = (ip: string) =>
+        copy.mod.handleEnroll(agentRequest("POST", "/enroll", { raw: "{}", headers: { "X-Forwarded-For": ip } }));
+      // Attempts from distinct /64s of one /56 share its budget (a hit reaching the limit is limited).
+      for (let i = 0; i < copy.mod.enrollPerIp.limit - 1; i++) {
+        expect((await enrollFrom(`2001:db8:5:3${i.toString(16).padStart(2, "0")}::1`)).status).not.toBe(429);
+      }
+      expect((await enrollFrom("2001:db8:5:3ff::9")).status).toBe(429);
+      // Another /56 of the same /48 is not held.
+      expect((await enrollFrom("2001:db8:5:400::1")).status).not.toBe(429);
     });
 
     it("L3: the cheap per-IP limit buckets IPv6 by /48", async () => {

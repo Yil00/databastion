@@ -43,6 +43,13 @@ import {
 
 /** `/enroll` attempts per source IP (successful or not); shared, fails closed (P4-D). */
 export const enrollPerIp = RateLimiter.shared("enroll.per_ip", 20, 10 * 60_000, "closed");
+/**
+ * IPv6 prefix of {@link enrollPerIp} (security review L-B): /56, the usual per-site allocation and
+ * the login bucket, so rotating /64s of one site does not multiply the budget (nor the store rows
+ * and statements it costs), while a large fleet rolled out from several sites of one /48 is not
+ * held by a single bucket. Enrollment tokens are 256-bit: the limit bounds work, not guessing.
+ */
+export const ENROLL_IPV6_PREFIX = 56;
 
 export function handleEnroll(req: Request): Promise<Response> {
   return guarded("enroll", async () => {
@@ -50,7 +57,7 @@ export function handleEnroll(req: Request): Promise<Response> {
     if (headers) return headers;
     const ip = clientIp(req);
     if (ip) {
-      const limit = await enrollPerIp.hitShared(ipBucket(ip));
+      const limit = await enrollPerIp.hitShared(ipBucket(ip, ENROLL_IPV6_PREFIX));
       if (limit.limited) return rateLimited(limit.retryAfterS);
     }
     const body = await readValidBody(req, "EnrollRequest");

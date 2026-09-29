@@ -114,7 +114,21 @@ export interface RateLimitStore {
 export const storeKeyId = (k: StoreKey) => `${k.limiter}\0${k.keyHash}`;
 
 /** Counters of this process (exported on `/metrics`). */
-export const rateLimitStoreStats = processGlobal("rateLimitStoreStats", () => ({ errors: 0 }));
+export const rateLimitStoreStats = processGlobal("rateLimitStoreStats", () => ({ errors: 0, shortCircuited: 0 }));
+
+/**
+ * Circuit breaker (security review L-A): after a store failure, the store is not called for
+ * `openMs`; every operation of every limiter on that store applies its failure mode at once. Sheds
+ * the waiters of the dedicated pool during an outage and bounds the latency of requests that hit
+ * several limiters in a row (a login would otherwise wait for each of them). Per process and store.
+ */
+export const STORE_BREAKER = { openMs: 1_500 };
+const breakers = processGlobal("rateLimitStoreBreakers", () => new Map<RateLimitStore, number>());
+
+/** Test hook: closes every circuit breaker of this process. */
+export function resetRateLimitBreakersForTests(): void {
+  breakers.clear();
+}
 const lastWarning = processGlobal("rateLimitStoreWarnings", () => new Map<string, number>());
 
 export const RATE_LIMIT_KEY_DOMAIN = "rate-limit-keys.v1";
@@ -430,11 +444,16 @@ export class RateLimiter {
   }
 
   /**
-   * `checkShared` of several (limiter, key) pairs with at most ONE store round-trip (the shared
-   * limiters among them must use the same store).
+   * "Is any of these (limiter, key) pairs over its limit?" with at most ONE store round-trip (the
+   * shared limiters among them must use the same store). When any pair is already limited in this
+   * process, nothing is sent to the store (security review M-A: a source over one limit, e.g. the
+   * cheap per-/48 limit, rotating the other keys costs no statement); the other decisions are then
+   * this process's only, so callers must only use "any limited" and the largest `Retry-After` of
+   * the limited ones (which may then be lower than the shared one).
    */
   static async checkAll(entries: readonly (readonly [RateLimiter, string])[]): Promise<RateLimitDecision[]> {
     const out: RateLimitDecision[] = entries.map(([rl, key]) => rl.check(key));
+    if (out.some((d) => d.limited)) return out;
     const pending: { i: number; key: string; rl: RateLimiter; cfg: SharedConfig; sk: StoreKey }[] = [];
     entries.forEach(([rl, key], i) => {
       const cfg = rl.activeShared();
@@ -593,10 +612,20 @@ export class RateLimiter {
   /** Runs a store operation under the timeout; never throws (FAILED, with a rate-limited warning). */
   private async storeCall<T>(op: () => Promise<T>): Promise<T | typeof FAILED> {
     const cfg = this.sharedConfig;
+    const store = cfg?.store;
+    const openUntil = store ? breakers.get(store) : undefined;
+    if (store && openUntil !== undefined) {
+      if (Date.now() < openUntil) {
+        rateLimitStoreStats.shortCircuited++;
+        return FAILED;
+      }
+      breakers.delete(store);
+    }
     try {
       return await withTimeout(op(), cfg?.timeoutMs ?? STORE_GUARD_MS);
     } catch (err) {
       rateLimitStoreStats.errors++;
+      if (store) breakers.set(store, Date.now() + STORE_BREAKER.openMs);
       const name = cfg?.name ?? "local";
       const now = Date.now();
       const last = lastWarning.get(name);
