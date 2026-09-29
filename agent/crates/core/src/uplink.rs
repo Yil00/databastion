@@ -739,7 +739,7 @@ fn event_item(
         bytes: None,
         objects,
         principal,
-        rows: e.rows().and_then(|r| i64::try_from(r).ok()).map(Count),
+        rows: e.rows().map(sanitize::clamped_count),
         signals: (!signals.is_empty()).then_some(signals),
         source,
         target_id: target_id.clone(),

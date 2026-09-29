@@ -24,7 +24,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use databastion_protocol::{Count, SpoolStatus};
+use databastion_protocol::SpoolStatus;
 
 use crate::config::SpoolConfig;
 use crate::fsutil;
@@ -428,7 +428,7 @@ impl Spool {
 
     /// Heartbeat `spool` section.
     pub(crate) fn status(&self) -> SpoolStatus {
-        let count = |n: u64| Count(i64::try_from(n).unwrap_or(i64::MAX));
+        let count = crate::sanitize::clamped_count;
         let oldest = self.entries.iter().map(|e| e.created).min().map(|t| {
             SystemTime::now()
                 .duration_since(t)
