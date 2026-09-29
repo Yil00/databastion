@@ -1882,8 +1882,24 @@ audit_verify() {
         AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
         AND ts < to_timestamp(${AUDIT_T0[$target]} / 1000.0)")" \
       || fail "cannot count the fingerprinted events of $target before its first client operation"
-    [ "$n" = 0 ] \
-      || fail "Audit ($target): $n fingerprinted event(s) before the first client operation: the agent's own activity surfaced as a fingerprint"
+    if [ "$n" != 0 ]; then
+      # Diagnostic without any value: action, delay before T0, and whose fingerprint it is (the
+      # exporter's: the one with a bulk search; the analyst's: the other one seen after T0).
+      console_sql "WITH pre AS (SELECT * FROM access_events WHERE agent_id = '${AGENT_ID}'
+            AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
+            AND ts < to_timestamp(${AUDIT_T0[$target]} / 1000.0)),
+          post AS (SELECT db_user_fingerprint AS fp, bool_or(signals ? 'shape.bulk_search') AS bulk
+            FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+              AND db_user_fingerprint IS NOT NULL AND ts >= to_timestamp(${AUDIT_T0[$target]} / 1000.0)
+            GROUP BY 1)
+        SELECT string_agg(pre.action || ' ' || round(${AUDIT_T0[$target]} - extract(epoch FROM pre.ts) * 1000)
+            || ' ms before T0, rows ' || coalesce(pre.rows::text, '-') || ', count '
+            || pre.aggregated_count || ', principal '
+            || CASE WHEN post.fp IS NULL THEN 'unknown (not a client after T0)'
+                    WHEN post.bulk THEN 'the exporter' ELSE 'the analyst' END, '; ')
+        FROM pre LEFT JOIN post ON post.fp = pre.db_user_fingerprint" >&2 || true
+      fail "Audit ($target): $n fingerprinted event(s) before the first client operation: the agent's own activity surfaced as a fingerprint"
+    fi
     log "Audit ($target): no fingerprinted event before the first client operation (the agent's own reads during the Discovery scan)"
   fi
 
