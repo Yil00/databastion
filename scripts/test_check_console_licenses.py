@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -77,6 +78,11 @@ def run(argv: list[str]) -> tuple[int, str]:
 
 class MainTest(unittest.TestCase):
     def setUp(self) -> None:
+        # The output format depends on GITHUB_ACTIONS (annotations in CI): pin it per test.
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("GITHUB_ACTIONS", None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.deny = self.write("deny.toml", '[licenses]\nallow = ["MIT", "Apache-2.0", "ISC"]\n')
@@ -113,6 +119,12 @@ class MainTest(unittest.TestCase):
                               "GPL-3.0-only": [self.pkg("evil", "GPL-3.0-only", "2.1.0")]})
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL evil@2.1.0: 'GPL-3.0-only'", out)
+
+    def test_violation_as_github_annotation(self) -> None:
+        os.environ["GITHUB_ACTIONS"] = "true"
+        rc, out = self.check({"GPL-3.0-only": [self.pkg("evil", "GPL-3.0-only", "2.1.0")]})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("::error::license check: evil@2.1.0: 'GPL-3.0-only'", out)
 
     def test_exception_matches_name_glob_and_exact_license(self) -> None:
         entries = [{"package": "@img/sharp-libvips-*", "license": "LGPL-3.0-or-later",
