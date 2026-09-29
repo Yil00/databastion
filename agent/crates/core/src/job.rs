@@ -20,6 +20,7 @@
 //! constructor, so a connector always gets clamped values. Connectors never
 //! see the generated protocol types.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -447,6 +448,14 @@ pub struct AuditParams {
     sensitive_objects: Vec<SensitiveObject>,
 }
 
+impl AuditParams {
+    /// Whether audit collection is requested.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 fn identifier(field: &'static str, id: &str) -> Result<String, ParamsError> {
     if violates_numeric_rule(id) {
         return Err(err(field, "violates the Identifier `not` rule"));
@@ -500,10 +509,12 @@ impl TryFrom<&AuditConfigureParams> for AuditParams {
 
 /// Audit configuration of a target (`audit.configure` job), clamped to the
 /// local limits. `AuditConfig::default()` (tests) is disabled, with the
-/// contract defaults and the default limits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// contract defaults and the default limits, and no target.
+#[derive(Clone)]
 pub struct AuditConfig {
     target_id: String,
+    target: Option<TargetConfig>,
+    state_dir: Option<PathBuf>,
     enabled: bool,
     aggregation_window: Duration,
     poll_interval: Duration,
@@ -512,11 +523,26 @@ pub struct AuditConfig {
     sensitive_objects: Vec<SensitiveObject>,
 }
 
+impl std::fmt::Debug for AuditConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditConfig")
+            .field("target_id", &self.target_id)
+            .field("enabled", &self.enabled)
+            .field("aggregation_window", &self.aggregation_window)
+            .field("poll_interval", &self.poll_interval)
+            .field("min_rows", &self.min_rows)
+            .field("sensitive_objects", &self.sensitive_objects.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         let limits = Limits::default();
         Self {
             target_id: String::new(),
+            target: None,
+            state_dir: None,
             enabled: false,
             aggregation_window: Duration::from_secs(60),
             poll_interval: Duration::from_secs(u64::from(limits.min_audit_poll_interval_s.max(10))),
@@ -535,6 +561,8 @@ impl AuditConfig {
     pub fn new(params: AuditParams, target: &TargetConfig, limits: &Limits) -> Self {
         Self {
             target_id: target.id.clone(),
+            target: Some(target.clone()),
+            state_dir: None,
             enabled: params.enabled,
             aggregation_window: Duration::from_secs(u64::from(params.aggregation_window_s)),
             poll_interval: Duration::from_secs(u64::from(
@@ -544,6 +572,50 @@ impl AuditConfig {
             min_rows: params.min_rows,
             sensitive_objects: params.sensitive_objects,
         }
+    }
+
+    /// Audit settings built locally (integration tests, tools): enabled,
+    /// contract defaults (60 s aggregation window, no `min_rows`, no
+    /// sensitive object), and `poll_interval_s` clamped exactly like a job's
+    /// (contract range, then the `min_audit_poll_interval_s` floor).
+    #[must_use]
+    pub fn local(target: &TargetConfig, poll_interval_s: u32, limits: &Limits) -> Self {
+        let poll = poll_interval_s.clamp(POLL_INTERVAL_S_RANGE.0, POLL_INTERVAL_S_RANGE.1);
+        Self::new(
+            AuditParams {
+                enabled: true,
+                aggregation_window_s: 60,
+                poll_interval_s: poll,
+                min_rows: None,
+                sensitive_objects: Vec::new(),
+            },
+            target,
+            limits,
+        )
+    }
+
+    /// Sets the directory where the connector keeps its audit cursors
+    /// (`<state_dir>/audit`, created `0700` by the core; see
+    /// [`Self::cursor`]).
+    #[must_use]
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
+    /// The declared target (connection settings, audit log path; never
+    /// sent to the console). `None` only for `AuditConfig::default()`.
+    #[must_use]
+    pub fn target(&self) -> Option<&TargetConfig> {
+        self.target.as_ref()
+    }
+
+    /// The persisted cursor `name` (`[a-z0-9_.-]`, e.g. `pgaudit`) of this
+    /// target's audit source: a `0600` file under `<state_dir>/audit/`.
+    /// `None` without a state directory (tests) or for an invalid name.
+    #[must_use]
+    pub fn cursor(&self, name: &str) -> Option<crate::audit::CursorStore> {
+        crate::audit::CursorStore::new(self.state_dir.as_deref()?, &self.target_id, name)
     }
 
     /// Target id.
@@ -586,6 +658,18 @@ impl AuditConfig {
     #[must_use]
     pub fn sensitive_objects(&self) -> &[SensitiveObject] {
         &self.sensitive_objects
+    }
+
+    /// Whether an object (normalized names, as sent in events) is listed
+    /// in `sensitive_objects`. A listed object without a schema matches
+    /// any schema.
+    #[must_use]
+    pub fn is_sensitive(&self, database: &str, schema: Option<&str>, object: &str) -> bool {
+        self.sensitive_objects.iter().any(|o| {
+            o.database == database
+                && o.object == object
+                && o.schema.as_deref().is_none_or(|s| Some(s) == schema)
+        })
     }
 }
 

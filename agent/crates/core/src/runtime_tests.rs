@@ -474,8 +474,9 @@ async fn jobs_are_parsed_individually_and_reported() {
     assert_eq!(find(reload)["status"], "succeeded");
     assert_eq!(find(unknown)["status"], "failed");
     assert_eq!(find(unknown)["error"]["code"], "unsupported");
+    // The fixture's target is not declared here.
     assert_eq!(find(audit)["status"], "failed");
-    assert_eq!(find(audit)["error"]["code"], "unsupported");
+    assert_eq!(find(audit)["error"]["code"], "unknown_target");
     assert_eq!(got.len(), 3);
     for (_, update) in &got {
         serde_json::from_value::<JobStatusUpdate>(update.clone()).unwrap();
@@ -2682,4 +2683,260 @@ async fn target_errors_end_the_scan_with_their_failure_code() {
     let status = &got.iter().find(|(i, _)| i == id).unwrap().1;
     assert_eq!(status["status"], "failed");
     assert_eq!(status["error"]["code"], "permission_denied");
+}
+
+// ------------------------------------------------------------------ audit
+
+/// An Audit connector: records the configuration it gets and submits
+/// `events` masked events (a read of `shop.crm.customers` by `backup`),
+/// then waits until dropped.
+struct FakeAudit {
+    events: usize,
+    seen: Arc<StdMutex<Vec<(String, Duration, bool)>>>,
+}
+
+fn fake_event(rows: u64) -> databastion_classifiers::masking::MaskedEvent {
+    use databastion_classifiers::masking::{
+        ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
+    };
+    use databastion_classifiers::names::normalize_path;
+    MaskedEvent::new(
+        EventSource::Pgaudit,
+        EventAction::Read,
+        EventPrincipal::account("backup")
+            .with_client(ClientAddr::parse("192.0.2.14"))
+            .with_application("pg_dump"),
+        SystemTime::now(),
+    )
+    .with_object(EventObject::new(
+        normalize_path("shop"),
+        Some(normalize_path("crm")),
+        normalize_path("customers"),
+    ))
+    .with_rows(Some(rows))
+    .with_signal(Signal::PgDump)
+}
+
+#[async_trait::async_trait]
+impl Connector for FakeAudit {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Full,
+            failure: None,
+            detail: None,
+        }
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+    async fn audit_stream(
+        &self,
+        cfg: &crate::AuditConfig,
+        sink: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        self.seen.lock().unwrap().push((
+            cfg.target_id().to_owned(),
+            cfg.poll_interval(),
+            cfg.cursor("fake").is_some(),
+        ));
+        for i in 0..self.events {
+            sink.submit(fake_event(10 + i as u64)).await?;
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+    fn supports_audit(&self) -> bool {
+        true
+    }
+    fn audit_source(
+        &self,
+        _: &crate::config::TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        Some(databastion_classifiers::masking::EventSource::Pgaudit)
+    }
+}
+
+fn audit_job(id: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": id, "type": "audit.configure", "created_at": "2026-09-28T14:00:00Z",
+        "target_id": "pg-main", "params": params
+    })
+}
+
+#[tokio::test]
+async fn audit_configure_streams_aggregated_events_and_persists_settings() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(FakeAudit {
+            events: 3,
+            seen: Arc::clone(&seen),
+        })],
+    )
+    .unwrap();
+    const ON: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f81";
+    const BAD: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f82";
+    let body = serde_json::json!({ "jobs": [
+        audit_job(ON, serde_json::json!({
+            "enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1,
+            "sensitive_objects": []})),
+        audit_job(BAD, serde_json::json!({"enabled": true, "aggregation_window_s": 301})),
+    ]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let got = statuses(&server).await;
+    let find = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    assert_eq!(find(ON)["status"], "succeeded");
+    assert_eq!(find(BAD)["error"]["code"], "invalid_params");
+    let settings = env.config.state_dir.join("audit/pg-main.settings.json");
+    let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    // The worker runs the stream; the three events of one group are merged
+    // into one event after the 1 s window, and spooled.
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.audit_loop(shutdown);
+    let driver = async {
+        for _ in 0..100 {
+            if rt.lock_spool().status().batches.0 > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0, "pg-main");
+        assert_eq!(
+            seen[0].1,
+            Duration::from_secs(5),
+            "min_audit_poll_interval_s floor"
+        );
+        assert!(seen[0].2, "a cursor store is provided");
+    }
+    assert_eq!(rt.counters.events_received.load(Ordering::Relaxed), 3);
+    let (_, batch) = rt.lock_spool().front_where(|_| true).unwrap();
+    assert_eq!(batch.path(), "/events");
+    let sent: databastion_protocol::EventsBatch = serde_json::from_slice(batch.bytes()).unwrap();
+    assert_eq!(sent.events.len(), 1);
+    let json = serde_json::to_value(&sent.events[0]).unwrap();
+    assert_eq!(json["aggregated_count"], 3);
+    assert_eq!(json["rows"], 33);
+    assert_eq!(json["principal"]["db_user"], "backup");
+    assert_eq!(json["principal"]["client_addr"], "192.0.2.14");
+    assert_eq!(json["signals"], serde_json::json!(["signature.pg_dump"]));
+    assert_eq!(json["objects"][0]["object"], "customers");
+    assert_eq!(json["source"], "pgaudit");
+
+    // The heartbeat reports the source of the level.
+    let statuses = rt.target_statuses(&env.config).await;
+    assert_eq!(
+        statuses[0].audit_source,
+        Some(databastion_protocol::AuditSource::Pgaudit)
+    );
+
+    // A restarted agent restores the saved settings; `enabled: false`
+    // removes them.
+    let rt2 = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(FakeAudit {
+            events: 0,
+            seen: Arc::clone(&seen),
+        })],
+    )
+    .unwrap();
+    rt2.restore_audits();
+    assert_eq!(rt2.lock_audits().snapshot().len(), 1);
+    const OFF: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f83";
+    let body =
+        serde_json::json!({ "jobs": [audit_job(OFF, serde_json::json!({"enabled": false}))] });
+    rt2.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert!(rt2.lock_audits().snapshot().is_empty());
+    assert!(!settings.exists());
+}
+
+#[tokio::test]
+async fn audit_events_are_held_while_events_is_parked() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(FakeAudit {
+            events: 5,
+            seen: Arc::clone(&seen),
+        })],
+    )
+    .unwrap();
+    let params: databastion_protocol::AuditConfigureParams =
+        serde_json::from_value(serde_json::json!({"enabled": true, "aggregation_window_s": 1}))
+            .unwrap();
+    rt.lock_audits()
+        .set("pg-main", Some(AuditParams::try_from(&params).unwrap()));
+    rt.lock_parked().events.until = Some(Instant::now() + Duration::from_secs(3600));
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.audit_loop(shutdown);
+    let driver = async {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // Nothing received nor spooled while parked.
+        assert_eq!(rt.counters.events_received.load(Ordering::Relaxed), 0);
+        assert_eq!(rt.lock_spool().status().batches.0, 0);
+        stop.send(true).unwrap();
+    };
+    let (r, ()) = tokio::join!(worker, driver);
+    r.unwrap();
+    // On stop, the events handed over are spooled (never dropped).
+    assert_eq!(rt.counters.events_received.load(Ordering::Relaxed), 5);
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+}
+
+#[tokio::test]
+async fn audit_configure_needs_an_audit_connector() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(TargetHealth::not_implemented(
+            Engine::Postgres,
+        )))],
+    )
+    .unwrap();
+    const ID: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f84";
+    let body = serde_json::json!({ "jobs": [audit_job(ID, serde_json::json!({"enabled": true}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let got = statuses(&server).await;
+    assert_eq!(got[0].1["error"]["code"], "unsupported");
+    assert!(rt.lock_audits().snapshot().is_empty());
 }
