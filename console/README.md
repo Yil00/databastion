@@ -817,9 +817,28 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   reference. 2xx = delivered; redirects are never followed (3xx fails); 408, 425, 429, 5xx, network
   and TLS errors are retried; other 4xx fail. 5 s to connect, 15 s in total, response read up to 64 KiB
   and discarded.
+- **Rendering by receivers (escape the principal)**: the payload is JSON, so its strings are
+  JSON-escaped, but a receiver that renders them (HTML page, ticket, chat message in Markdown,
+  Slack `mrkdwn` or Teams cards, a SIEM dashboard, a shell command) must escape them for that
+  context, like any untrusted input. Above all `principal` (and the principal in an access-incident
+  e-mail): it is the database account name as the engine logged it, and **any client that can reach
+  the database port chooses it**, even without valid credentials (a failed login is an
+  `auth_failure` event). The contract only excludes control and format characters: it may hold up
+  to 256 characters such as `<`, `>`, `&`, `"`, `'`, backquotes, `*`, `_`, `[`, `]`, `@here` or
+  `<!channel>`, i.e. HTML or script, Markdown links and mentions. Never insert it into markup,
+  a template, a query or a command without escaping for that context; show it as text (a code span
+  whose delimiters are escaped, or a text node), and keep it on one line. The same holds, with a
+  narrower character set, for the other names in a payload: normalized database, schema and object
+  names (`location`, `access.objects`, `database`; created by whoever can create objects in the
+  database), `target_id`, the agent `name` / `hostname` of `agent.silent` / `agent.recovered`, and
+  the policy and channel names (set by console administrators). Do not turn console URLs into links
+  that you build from these fields: use the `url` field as sent.
 - **E-mail**: plain text, UTF-8 (base64 body, RFC 2047 subject), `Message-ID` derived from the
   delivery id, `Auto-Submitted: auto-generated`. 10 s to connect, 30 s per reply, 60 s in total. A 4xx
-  reply or a network / TLS error is retried; a 5xx reply fails.
+  reply or a network / TLS error is retried; a 5xx reply fails. The console keeps every value on one
+  line and bounded, but does not HTML-escape a plain-text body: a consumer that turns these e-mails
+  into HTML (a ticketing system, a mail-to-chat bridge, an HTML archive) must escape them, the
+  principal first (previous item).
 - **SSRF defense** (webhooks; outbound connections are made by the worker only): the host is resolved
   and **every** address checked; the socket connects to the vetted addresses only (no second
   resolution, so no DNS rebinding), in the resolver's order with a fallback to the next one on a

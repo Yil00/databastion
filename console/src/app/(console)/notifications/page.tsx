@@ -32,7 +32,9 @@ export default async function NotificationsPage() {
           <p className="text-sm text-muted-foreground">
             A policy notifies the channels it names when it opens an incident. Notifications carry identifiers, counts,
             names and a link to the console, never a data value (masked or not). A name with no channel, or a disabled
-            channel, is recorded as skipped on the incident.
+            channel, is recorded as skipped on the incident. The names they carry, the database account (principal) above
+            all, can be chosen by database clients: webhook receivers and e-mail consumers must escape them wherever they
+            render them (see the console README, &quot;Alerting&quot;).
           </p>
           <ChannelsTable
             csrfToken={session.csrfToken}
