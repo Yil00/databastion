@@ -124,6 +124,12 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "audit.stream_not_available": {
+    "description": "The connector has no Audit stream in this agent build: the audit level is reported None, whatever the server logs or profiles.",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "check.server_is_mariadb": {
     "description": "The server is MariaDB while the target is declared as mysql.",
     "engines": [
@@ -141,7 +147,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "check.timed_out": {
@@ -149,7 +156,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "coverage.other_engine_tables": {
@@ -185,10 +193,17 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "coverage.views_not_sampled": {
-    "description": "{count} view(s) not sampled (their base tables are).",
+    "description": "{count} view(s) not sampled (their base tables or collections are).",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
+    ]
+  },
+  "privilege.any_database": {
+    "description": "A privilege applies to every database (for example readAnyDatabase, or a resource with an empty database name): databases created later are readable too.",
+    "engines": [
+      "mongodb"
     ]
   },
   "privilege.beyond_select": {
@@ -196,6 +211,12 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "privilege.cluster_actions": {
+    "description": "{count} cluster-wide action(s) (for example inprog, serverStatus, getCmdLineOpts): other sessions' operations and server settings are visible.",
+    "engines": [
+      "mongodb"
     ]
   },
   "privilege.extended_variant": {
@@ -266,6 +287,12 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres"
     ]
   },
+  "privilege.read_beyond_discovery": {
+    "description": "{count} read action(s) beyond find and listCollections (for example changeStream, which streams every future write, dbHash or listIndexes).",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "privilege.role_attributes": {
     "description": "Role attributes beyond the minimal grants: {labels}.",
     "engines": [
@@ -279,11 +306,23 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "privilege.system_collections": {
+    "description": "Access to system collections or to the admin, local or config databases: credentials, the oplog, other users' profiled queries or stored JavaScript may be readable.",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "privilege.system_database_select": {
     "description": "SELECT on the mysql or sys system database.",
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "privilege.write_actions": {
+    "description": "{count} write or administration action(s) (for example insert, update, remove, drop, index, user or role management).",
+    "engines": [
+      "mongodb"
     ]
   },
   "privilege.write_on_relations": {
@@ -310,7 +349,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   }
 } as const;
