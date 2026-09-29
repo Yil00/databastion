@@ -217,10 +217,11 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
      `performance_schema`, which the agent's account cannot read); mongod's log; `cn=accesslog`
      (exported with `slapcat` as root in the target: no LDAP operation), where the OpenLDAP
      clients' DNs must be found too. `E2E_PG_AUDIT=pss` has no such control. DCL passwords in the
-     target's own log (searched like on the console side, below): the pgaudit jsonlog must hold
-     both (positive control: the source carries them, so the agent's redaction is exercised; a
-     pgaudit that starts masking them fails the run), the `server_audit` log neither (it writes
-     `*****`: the MariaDB half proves the source's masking only).
+     target's own log (searched like on the console side, below): neither may be there, and the
+     masked statements must be (pgaudit writes `<REDACTED>` after the `password` token of CREATE /
+     ALTER ROLE, `server_audit` writes `*****`; `server_audit` logs CREATE USER only, not ALTER
+     USER). These prove the sources' masking; the agent's own redaction of DCL text is covered by
+     the classifier and connector tests.
    - After all targets: no event carries a `db_user_fingerprint` (but on the OpenLDAP target); every stored events batch woke
      the policy engine (as above, per batch received at `events_batches.received_at`); `web.log`
      holds no `wake-up not sent` warning. The agent's page, each Audit target's settings page and
@@ -314,7 +315,7 @@ The Audit steps are driven by `E2E_AUDIT_TARGETS` in [`run.sh`](run.sh), one lin
 `queries`, `target_log`), which hold everything engine-specific: the agent log line of a started
 stream, the expected level and source, the test roles, the dump tool, the literal queries and the
 target's own audit log (plus `object_sets`, `query_statements`, `query_signal`, `log_user_records`,
-`time`; optional: `dcl`, `has_dcl` and `dcl_in_source` for the DCL test, `forbidden_notes`,
+`time`; optional: `dcl`, `has_dcl`, `dcl_statements` and `dcl_masked` for the DCL test, `forbidden_notes`,
 `i2_args`). A principal `@fingerprint` stands for one the agent sends as a fingerprint (OpenLDAP
 entry DNs), `@fingerprint!<signal>` for the fingerprinted principal none of whose events carries
 that signal. A new target adds a line, a client

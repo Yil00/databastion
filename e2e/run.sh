@@ -277,7 +277,7 @@ chmod 0700 "$S"
 
 # Passwords of the password-bearing DCL statements of the Audit test (CREATE USER / ALTER ... PASSWORD
 # on target-pg and target-mariadb): a registry of their own. They are statement literals, so they do
-# reach the targets' own audit logs (pgaudit logs the statement text; server_audit masks it), which
+# reach the targets' statement text (pgaudit and server_audit mask them in their logs), which
 # the secret registry above must not hold; they must be nowhere on the console side nor in the
 # console / agent logs (checked with the I2 scans). Redacted from the uploaded logs like the others.
 DCLP="$E2E_WORK_DIR/dcl-patterns"
@@ -1111,14 +1111,16 @@ audit_client_my_dcl() {
 # has_dcl CLIENT: whether the client runs the DCL test.
 has_dcl() { declare -F "audit_client_${1}_dcl" >/dev/null && "audit_client_${1}_has_dcl"; }
 DCL_PRINCIPAL=e2e_admin
-# What the target's own audit log keeps of the DCL passwords (audit_verify). `all`: pgaudit logs the
-# statement text, so both passwords must be there (positive control: the source carries them, the
-# agent's redaction is exercised; a pgaudit release that starts masking them fails the run instead
-# of passing vacuously). `none`: server_audit replaces them by ***** (measured on MariaDB 11.4 for
-# every password form, agent/crates/connector-mysql/README.md), so neither may be there: the
-# MariaDB half proves the source's masking only, not the agent's redaction.
-audit_client_pg_dcl_in_source() { printf all; }
-audit_client_my_dcl_in_source() { printf none; }
+# What the target's own audit log keeps of the DCL passwords (audit_verify): both sources mask them,
+# so neither password (nor a window or an encoded form of it) may be there, and the masked statement
+# must be (not vacuous: a filter change dropping DCL would otherwise pass). pgaudit redacts all text
+# after the `password` token of CREATE/ALTER ROLE (pgaudit.c, TOKEN_REDACTED "<REDACTED>");
+# server_audit replaces the password by ***** (measured on MariaDB 11.4 for every password form,
+# agent/crates/connector-mysql/README.md). These halves prove the sources' masking only; the agent's
+# own redaction of DCL text is covered by the classifier and connector tests (a source that keeps
+# the password, e.g. pg_stat_statements, is a follow-up).
+audit_client_pg_dcl_masked() { printf '%s' 'e2e_dcl_probe.*<REDACTED>'; }
+audit_client_my_dcl_masked() { printf '%s' 'e2e_dcl_probe.*[*]{5}'; }
 # DCL statements the target's audit log records, so `dcl` events to wait for. pgaudit (`role`): both.
 # server_audit: CREATE USER only. Its QUERY_DCL class (plugin/server_audit/server_audit.c, MariaDB
 # 11.4) is CREATE/DROP/RENAME USER, CREATE/DROP ROLE, GRANT and REVOKE: ALTER USER is in no class
@@ -1823,7 +1825,7 @@ audit_state() {
 # positive controls in the target's own audit log.
 audit_verify() {
   local target="$1" engine="$2" client="$3" account="$4" signal="$5"
-  local dump_p query_p query_signal level source deadline notes code rc id ids n
+  local dump_p query_p query_signal level source deadline notes code rc id ids n masked
   local -a extra=() needles=()
   read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
   query_signal="$("audit_client_${client}_query_signal")"
@@ -1912,27 +1914,15 @@ audit_verify() {
       rc=0
       dcl_scan --label "$target target audit log (DCL passwords)" "$E2E_WORK_DIR/target-audit.log" \
         >"$E2E_WORK_DIR/dcl-control.out" 2>&1 || rc=$?
-      case "$(client_fn "$client" dcl_in_source)" in
-        all)
-          for n in 1 2; do
-            if [ "$rc" != 1 ] || ! grep -q "^LEAK S\.dcl_password_$n " "$E2E_WORK_DIR/dcl-control.out"; then
-              cat "$E2E_WORK_DIR/dcl-control.out" >&2
-              fail "Audit ($target): DCL password $n not in the target's own audit log (positive control: the source must carry it, exit $rc)"
-            fi
-          done
-          log "Audit ($target): both DCL passwords are in the target's own audit log (positive control: the agent's redaction is exercised)" ;;
-        none)
-          if [ "$rc" != 0 ]; then
-            cat "$E2E_WORK_DIR/dcl-control.out" >&2
-            fail "Audit ($target): a DCL password (or part of it) is in the target's own audit log, which should mask it (exit $rc)"
-          fi
-          # Not vacuous: the masked statement is in the log (a filter change dropping DCL would
-          # otherwise pass). Both identifiers are safe to grep: no secret.
-          grep -qE "e2e_dcl_probe.*[*]{5}" "$E2E_WORK_DIR/target-audit.log" \
-            || fail "Audit ($target): no masked DCL statement of e2e_dcl_probe in the target's own audit log"
-          log "Audit ($target): no DCL password in the target's own audit log (the source masks them: this half proves the source's masking only)" ;;
-        *) fail "Audit ($target): audit_client_${client}_dcl_in_source is missing" ;;
-      esac
+      if [ "$rc" != 0 ]; then
+        cat "$E2E_WORK_DIR/dcl-control.out" >&2
+        fail "Audit ($target): a DCL password (or part of it) is in the target's own audit log, which should mask it (exit $rc)"
+      fi
+      masked="$(client_fn "$client" dcl_masked)"
+      [ -n "$masked" ] || fail "Audit ($target): audit_client_${client}_dcl_masked is missing"
+      grep -qE "$masked" "$E2E_WORK_DIR/target-audit.log" \
+        || fail "Audit ($target): no masked DCL statement of e2e_dcl_probe in the target's own audit log"
+      log "Audit ($target): the DCL statements are in the target's own audit log, their passwords masked by the source"
     fi
   fi
   rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out" \
