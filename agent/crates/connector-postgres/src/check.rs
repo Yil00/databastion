@@ -189,6 +189,7 @@ pub(crate) struct CheckState {
     reports: Mutex<HashMap<(String, String), Cached>>,
     sources: Mutex<HashMap<String, EventSource>>,
     records: Mutex<HashMap<String, Instant>>,
+    severity_mismatches: Mutex<HashMap<String, u64>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -201,6 +202,26 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(target_id.to_owned(), Instant::now());
+    }
+
+    /// Records of `target_id` dropped for a severity other than
+    /// `pgaudit.log_level`.
+    pub(crate) fn note_severity_mismatch(&self, target_id: &str, n: u64) {
+        let mut map = self
+            .severity_mismatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let c = map.entry(target_id.to_owned()).or_insert(0);
+        *c = c.saturating_add(n);
+    }
+
+    fn severity_mismatches(&self, target_id: &str) -> u64 {
+        self.severity_mismatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether a pgaudit record of `target_id` was parsed recently.
@@ -379,6 +400,12 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 .to_owned(),
         );
     }
+    let mismatched = state.severity_mismatches(&target.id);
+    if mismatched > 0 {
+        notes.push(format!(
+            "{mismatched} pgaudit record(s) dropped: severity differs from pgaudit.log_level"
+        ));
+    }
     notes.sort();
     notes.dedup();
     TargetHealth {
@@ -487,6 +514,9 @@ fn log_report(target: &TargetConfig, database: &str, r: &Report) {
 pub(crate) struct Prerequisites {
     pub(crate) level: AuditLevel,
     pub(crate) severity: String,
+    /// Client address the server sees for the agent (`local` on a Unix
+    /// socket), `None` when unknown.
+    pub(crate) own_addr: Option<databastion_classifiers::masking::ClientAddr>,
 }
 
 pub(crate) async fn prerequisites(
@@ -496,8 +526,26 @@ pub(crate) async fn prerequisites(
     let log_readable = crate::audit::log_readable(target).await;
     let mut level = AuditLevel::None;
     let mut log_level: Option<String> = None;
+    let mut own_addr = None;
     for database in &target.postgres_settings().databases {
         let session = Session::connect(target, database, timeouts).await?;
+        if own_addr.is_none() {
+            own_addr = match probe(&session, timeouts, sql::OWN_CLIENT_ADDR).await {
+                Ok(rows) => {
+                    let addr: Option<String> = rows
+                        .first()
+                        .map(|r| col::<Option<String>>(r, 0))
+                        .transpose()?
+                        .flatten();
+                    match addr {
+                        Some(a) => databastion_classifiers::masking::ClientAddr::parse(&a),
+                        None => Some(databastion_classifiers::masking::ClientAddr::Local),
+                    }
+                }
+                Err(e) if e.fatal => return Err(e),
+                Err(_) => None,
+            };
+        }
         let probe = audit_probe(&session, timeouts).await?;
         level = level.max(probe.level(log_readable));
         if log_level.is_none() {
@@ -507,6 +555,7 @@ pub(crate) async fn prerequisites(
     Ok(Prerequisites {
         level,
         severity: crate::audit::records::expected_severity(log_level.as_deref()),
+        own_addr,
     })
 }
 

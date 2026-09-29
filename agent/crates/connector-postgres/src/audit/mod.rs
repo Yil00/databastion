@@ -32,7 +32,7 @@ use databastion_core::{AuditConfig, AuditLevel, ConnectorError, EventSink, Failu
 use crate::check::{self, CheckState};
 use crate::conn::Timeouts;
 use crate::error::{PgError, Stage};
-use records::{AuditRecord, Format, parse_record};
+use records::{AuditRecord, Format, Skip, parse_record_checked};
 use tail::{TailError, Tailer};
 
 /// Name of the pgaudit cursor in the core's cursor store.
@@ -79,6 +79,20 @@ pub(crate) fn source_for(level: AuditLevel) -> Source {
     }
 }
 
+/// The agent's own activity for this target (see `events::OwnAccount`).
+fn own_account(
+    cfg: &AuditConfig,
+    target: &TargetConfig,
+    pre: &check::Prerequisites,
+) -> events::OwnAccount {
+    events::OwnAccount::new(
+        &target.account,
+        pre.own_addr,
+        u64::from(cfg.max_sample_rows()),
+        cfg.aggregation_window(),
+    )
+}
+
 /// State kept across source re-evaluations.
 struct PgauditState {
     tailer: Option<Tailer>,
@@ -119,7 +133,7 @@ pub(crate) async fn audit_stream(
                                 format_of(log.format),
                                 cfg.cursor(CURSOR),
                             )),
-                            builder: events::PgauditEvents::new(&target.account),
+                            builder: events::PgauditEvents::new(own_account(cfg, target, &pre)),
                             reported_oversized: 0,
                         })
                     }
@@ -137,7 +151,7 @@ pub(crate) async fn audit_stream(
             Source::PgStatStatements => {
                 pgaudit = None;
                 if pss_session.is_none() {
-                    let conn = pss::connect(target, timeouts)
+                    let conn = pss::connect(target, timeouts, own_account(cfg, target, &pre))
                         .await
                         .map_err(PgError::into_connector_error)?;
                     tracing::info!(target_id = %target.id, "audit source: pg_stat_statements (Limited)");
@@ -178,21 +192,43 @@ async fn pgaudit_run(
         let (t, polled) = tokio::task::spawn_blocking(move || {
             let polled = t.poll().map(|p| {
                 let more = p.more;
-                let records: Vec<AuditRecord> = p
-                    .records
-                    .iter()
-                    .filter_map(|r| parse_record(format, r, &severity_owned))
-                    .collect();
-                (records, more)
+                let mut mismatched = 0u64;
+                let mut forged = 0u64;
+                let mut records: Vec<AuditRecord> = Vec::new();
+                for r in &p.records {
+                    match parse_record_checked(format, r, &severity_owned) {
+                        Ok(rec) => records.push(rec),
+                        Err(Skip::Severity) => mismatched += 1,
+                        Err(Skip::Context) => forged += 1,
+                        Err(Skip::NotAudit) => {}
+                    }
+                }
+                (records, more, mismatched, forged)
             });
             (t, polled)
         })
         .await
         .map_err(|_| internal())?;
-        let (records, more) = match polled {
+        let (records, more, mismatched, forged) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
         };
+        if mismatched > 0 {
+            state.note_severity_mismatch(&target.id, mismatched);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = mismatched,
+                "pgaudit records with another severity than pgaudit.log_level dropped \
+                 (check pgaudit.log_level per database and role)"
+            );
+        }
+        if forged > 0 {
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = forged,
+                "AUDIT records with an error context dropped (not written by pgaudit)"
+            );
+        }
         if !records.is_empty() {
             state.note_record(&target.id);
         }

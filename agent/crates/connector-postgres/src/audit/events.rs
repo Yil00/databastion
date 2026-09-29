@@ -31,11 +31,12 @@
 //! dropped; statements naming only catalogs (`pg_catalog`,
 //! `information_schema`, `pg_toast`, unqualified `pg_*`,
 //! `pg_stat_statements*`) are skipped. Events of the agent's own account
-//! are left out only when they come from its `application_name` and carry
-//! no signal.
+//! are left out only when they come from its `application_name` and client
+//! address, carry no signal, and stay within Discovery's row budget per
+//! object and window (`OwnAccount`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{
     ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
@@ -263,19 +264,87 @@ impl DumpTracker {
     }
 }
 
-/// Whether an event of the agent's own account may be left out: only
-/// what the agent itself does (its `application_name`) and only when it
-/// carries no signal. With stolen agent credentials, reads under another
-/// application name, or reads that look like exports, are still reported.
-fn own_routine(own_account: &str, user: &str, application: Option<&str>, e: &MaskedEvent) -> bool {
-    user == own_account
-        && application.is_none_or(|a| a == APPLICATION_NAME)
-        && e.signals().is_empty()
+/// The agent's own activity, which may be left out of the events.
+pub(crate) struct OwnAccount {
+    account: String,
+    /// Client address the server sees for the agent (`None`: unknown).
+    addr: Option<ClientAddr>,
+    /// Rows per object and window above which the agent's own reads are
+    /// reported anyway (`limits.max_sample_rows`: Discovery never reads
+    /// more per object).
+    budget: u64,
+    window: Duration,
+    opened: Option<Instant>,
+    rows: HashMap<String, u64>,
+}
+
+impl OwnAccount {
+    pub(crate) fn new(
+        account: &str,
+        addr: Option<ClientAddr>,
+        budget: u64,
+        window: Duration,
+    ) -> Self {
+        Self {
+            account: account.to_owned(),
+            addr,
+            budget,
+            window,
+            opened: None,
+            rows: HashMap::new(),
+        }
+    }
+
+    /// Whether an event may be left out: the agent's account, its
+    /// `application_name` (pgaudit), its own client address (when known),
+    /// no signal, and at most `budget` rows per object within the window.
+    /// With stolen agent credentials, reads from elsewhere, reads that
+    /// look like exports, and paging through a table beyond what Discovery
+    /// reads are still reported.
+    fn routine(
+        &mut self,
+        user: &str,
+        application: Option<&str>,
+        client: Option<ClientAddr>,
+        e: &MaskedEvent,
+        now: Instant,
+    ) -> bool {
+        if user != self.account {
+            return false;
+        }
+        if self
+            .opened
+            .is_none_or(|t| now.duration_since(t) >= self.window)
+        {
+            self.opened = Some(now);
+            self.rows.clear();
+        }
+        let mut over = false;
+        for o in e.objects() {
+            let key = format!(
+                "{}\u{0}{}\u{0}{}",
+                o.database().as_str(),
+                o.schema().map_or("", |s| s.as_str()),
+                o.object().as_str()
+            );
+            let n = self.rows.entry(key).or_insert(0);
+            *n = n.saturating_add(e.rows().unwrap_or(0));
+            over |= *n > self.budget;
+        }
+        let addr_ok = match (self.addr, client) {
+            (Some(own), Some(c)) => own == c,
+            _ => true,
+        };
+        application.is_none_or(|a| a == APPLICATION_NAME)
+            && addr_ok
+            && e.signals().is_empty()
+            && !over
+    }
 }
 
 /// Builds events from pgaudit records.
 pub(crate) struct PgauditEvents {
-    own_account: String,
+    own: OwnAccount,
     dumps: DumpTracker,
 }
 
@@ -291,9 +360,9 @@ struct ClassPart {
 }
 
 impl PgauditEvents {
-    pub(crate) fn new(own_account: &str) -> Self {
+    pub(crate) fn new(own: OwnAccount) -> Self {
         Self {
-            own_account: own_account.to_owned(),
+            own,
             dumps: DumpTracker::default(),
         }
     }
@@ -390,6 +459,15 @@ impl PgauditEvents {
             }
             if action == EventAction::Read {
                 part.signals.extend(statement_signals(&stmts, None));
+                // PL/pgSQL cannot COPY to the client: a COPY record whose
+                // text does not show the COPY (dynamic SQL, nested DO) is
+                // a server-side export.
+                if r.audit.command == "COPY"
+                    && analysis.kind() != StatementKind::Copy
+                    && !stmts.iter().any(|p| p.kind == StatementKind::Copy)
+                {
+                    part.signals.push(Signal::CopyToFile);
+                }
                 let copied = copied_to_client(&stmts);
                 if !copied.is_empty() && self.dumps.copied(&r.session, &copied) {
                     part.dump = true;
@@ -440,7 +518,14 @@ impl PgauditEvents {
             {
                 e = e.with_signal(Signal::PgDump);
             }
-            if own_routine(&self.own_account, &first.user, Some(&first.application), &e) {
+            let client = first.remote.as_deref().and_then(ClientAddr::parse);
+            if self.own.routine(
+                &first.user,
+                Some(&first.application),
+                client,
+                &e,
+                Instant::now(),
+            ) {
                 continue;
             }
             out.push(e);
@@ -465,7 +550,7 @@ pub(crate) struct StatementDelta<'a> {
 /// (the application name is not visible here).
 pub(crate) fn pss_events(
     deltas: &[StatementDelta<'_>],
-    own_account: &str,
+    own: &mut OwnAccount,
     from: SystemTime,
     to: SystemTime,
 ) -> Vec<MaskedEvent> {
@@ -536,7 +621,7 @@ pub(crate) fn pss_events(
         } else if d.rows > LARGE_ROWS {
             e = e.with_signal(Signal::LargeResult);
         }
-        if own_routine(own_account, d.user, None, &e) {
+        if own.routine(d.user, None, None, &e, Instant::now()) {
             continue;
         }
         out.push(e);
@@ -589,6 +674,15 @@ mod tests {
         }
     }
 
+    fn own() -> OwnAccount {
+        OwnAccount::new(
+            "databastion",
+            ClientAddr::parse("192.0.2.14"),
+            1000,
+            Duration::from_secs(60),
+        )
+    }
+
     fn json(e: &MaskedEvent) -> String {
         format!(
             "{:?} {:?} {:?} {:?}",
@@ -609,7 +703,7 @@ mod tests {
 
     #[test]
     fn pg_dump_copies_raise_signature_and_shape() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![
             rec(
                 "s1",
@@ -659,7 +753,7 @@ mod tests {
 
     #[test]
     fn dump_pattern_without_the_application_name() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs: Vec<_> = ["a", "b", "c", "d"]
             .iter()
             .enumerate()
@@ -687,7 +781,7 @@ mod tests {
 
     #[test]
     fn session_and_object_records_merge_and_rows_are_kept() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let text = "select * from crm.customers";
         let mut object = rec(
             "s3",
@@ -725,7 +819,7 @@ mod tests {
 
     #[test]
     fn copy_to_file_and_program_and_filtered_reads() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![
             rec(
                 "s4",
@@ -819,7 +913,7 @@ mod tests {
 
     #[test]
     fn own_account_is_reported_unless_routine() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![
             // The agent's Discovery sample: skipped.
             rec(
@@ -883,14 +977,92 @@ mod tests {
             },
         ];
         let t0 = SystemTime::UNIX_EPOCH;
-        let ev = pss_events(&deltas, "databastion", t0, t0);
+        let ev = pss_events(&deltas, &mut own(), t0, t0);
         assert_eq!(ev.len(), 1);
         assert!(ev[0].signals().contains(&Signal::FullTableRead));
     }
 
     #[test]
+    fn own_account_paging_and_other_addresses_are_reported() {
+        let page = |i: u64| {
+            rec(
+                "p1",
+                i,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1",
+                Some(600),
+                "databastion-agent",
+            )
+        };
+        let mut b = PgauditEvents::new(own());
+        // 600 rows: within Discovery's budget (1000); 1200: beyond.
+        assert!(b.convert(vec![page(1)], SystemTime::now()).is_empty());
+        assert_eq!(b.convert(vec![page(2)], SystemTime::now()).len(), 1);
+        // Another client address than the agent's.
+        let mut b = PgauditEvents::new(OwnAccount::new(
+            "databastion",
+            ClientAddr::parse("198.51.100.7"),
+            1000,
+            Duration::from_secs(60),
+        ));
+        assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
+        // pg_stat_statements: rows per object within the poll.
+        let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
+        let deltas = [StatementDelta {
+            user: "databastion",
+            database: "shop",
+            analysis: &routine,
+            calls: 3,
+            rows: 3000,
+        }];
+        let t0 = SystemTime::UNIX_EPOCH;
+        assert_eq!(pss_events(&deltas, &mut own(), t0, t0).len(), 1);
+    }
+
+    #[test]
+    fn copy_records_not_settled_by_their_text_are_server_side_exports() {
+        let mut b = PgauditEvents::new(own());
+        let recs = vec![rec(
+            "x1",
+            1,
+            2,
+            "READ",
+            "COPY",
+            "",
+            "DO $$ BEGIN EXECUTE format('COPY %I.%I TO %L', 'crm', 'customers', '/tmp/x'); END $$",
+            Some(0),
+            "psql",
+        )];
+        let events = b.convert(recs, SystemTime::now());
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].signals().contains(&Signal::CopyToFile),
+            "{}",
+            json(&events[0])
+        );
+        // A client COPY whose text shows it: no server-side signal.
+        let mut b = PgauditEvents::new(own());
+        let recs = vec![rec(
+            "x2",
+            1,
+            1,
+            "READ",
+            "COPY",
+            "",
+            "copy crm.t to stdout",
+            Some(0),
+            "psql",
+        )];
+        let events = b.convert(recs, SystemTime::now());
+        assert!(!events[0].signals().contains(&Signal::CopyToFile));
+    }
+
+    #[test]
     fn misc_classes_are_skipped() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![rec(
             "s5",
             1,
@@ -907,7 +1079,7 @@ mod tests {
 
     #[test]
     fn do_blocks_functions_and_procedures_are_reported() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![
             // DO block, inner COPY logged with the block's text (substatement 2).
             rec(
@@ -1016,7 +1188,7 @@ mod tests {
 
     #[test]
     fn statements_are_matched_by_command_tag() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let text = "select 1; copy crm.customers to program 'x'";
         let recs = vec![
             rec("m1", 5, 1, "READ", "SELECT", "", text, Some(1), "psql"),
@@ -1039,7 +1211,7 @@ mod tests {
 
     #[test]
     fn value_like_names_are_masked() {
-        let mut b = PgauditEvents::new("databastion");
+        let mut b = PgauditEvents::new(own());
         let recs = vec![rec(
             "s6",
             1,
@@ -1101,7 +1273,7 @@ mod tests {
         ];
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + std::time::Duration::from_secs(10);
-        let events = pss_events(&deltas, "databastion", t0, t1);
+        let events = pss_events(&deltas, &mut own(), t0, t1);
         assert_eq!(events.len(), 5);
         assert!(events[0].signals().contains(&Signal::PgDump));
         assert!(events[0].signals().contains(&Signal::FullTableCopy));

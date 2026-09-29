@@ -364,6 +364,10 @@ pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.role', true), \
        pg_catalog.current_setting('pgaudit.log_level', true)";
 
+/// Client address the server sees for this session (`NULL` on a Unix
+/// socket): tells the agent's own statements apart in the audit log.
+pub(crate) const OWN_CLIENT_ADDR: &str = "SELECT pg_catalog.host(pg_catalog.inet_client_addr())";
+
 /// Schema of the `pg_stat_statements(boolean)` function, if it is a member
 /// of the `pg_stat_statements` extension in its own schema (obligation 3).
 pub(crate) const PSS_FUNCTION_SCHEMA: &str = "SELECT n.nspname FROM pg_catalog.pg_extension e \
@@ -474,6 +478,7 @@ mod tests {
             AUDIT_PREREQUISITES.to_owned(),
             pss_probe("public").unwrap(),
             PGAUDIT_SETTINGS.to_owned(),
+            OWN_CLIENT_ADDR.to_owned(),
             PSS_FUNCTION_SCHEMA.to_owned(),
             pss_counters("public", true).unwrap(),
             pss_counters("public", false).unwrap(),
@@ -547,6 +552,8 @@ mod tests {
             "pg_partition_root(",
             "count(",
             "pg_get_userbyid(",
+            "inet_client_addr(",
+            "host(",
             "left(",
             "char_length(",
         ];

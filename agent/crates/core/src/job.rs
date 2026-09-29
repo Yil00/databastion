@@ -521,6 +521,7 @@ pub struct AuditConfig {
     statement_timeout: Duration,
     min_rows: Option<u64>,
     sensitive_objects: Vec<SensitiveObject>,
+    max_sample_rows: u32,
 }
 
 impl std::fmt::Debug for AuditConfig {
@@ -549,6 +550,7 @@ impl Default for AuditConfig {
             statement_timeout: limits.clamp_statement_timeout(0),
             min_rows: None,
             sensitive_objects: Vec::new(),
+            max_sample_rows: limits.max_sample_rows,
         }
     }
 }
@@ -571,7 +573,16 @@ impl AuditConfig {
             statement_timeout: limits.clamp_statement_timeout(0),
             min_rows: params.min_rows,
             sensitive_objects: params.sensitive_objects,
+            max_sample_rows: limits.max_sample_rows,
         }
+    }
+
+    /// `limits.max_sample_rows`: the most rows the agent's own Discovery
+    /// reads per object. Audit connectors report the agent's own account
+    /// once it reads more than this per object within a window.
+    #[must_use]
+    pub fn max_sample_rows(&self) -> u32 {
+        self.max_sample_rows
     }
 
     /// Audit settings built locally (integration tests, tools): enabled,

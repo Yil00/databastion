@@ -313,24 +313,56 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// `severity` (see [`expected_severity`]) or that carries a context (a
 /// `RAISE` always has one, `… at RAISE`) is dropped. What remains forgeable
 /// needs a role that can hide the context (`log_error_verbosity = terse`
-/// is superuser-only) or native code (C extensions, untrusted PLs).
+/// is superuser-only, but a server-wide `log_error_verbosity = terse`
+/// removes every context and with it this protection) or native code (C
+/// extensions, untrusted PLs).
+#[cfg(test)]
 pub(crate) fn parse_record(format: Format, record: &[u8], severity: &str) -> Option<AuditRecord> {
+    parse_record_checked(format, record, severity).ok()
+}
+
+/// Why a log record gives no pgaudit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Skip {
+    /// Not an `AUDIT:` record, or malformed.
+    NotAudit,
+    /// Carries an error context: forged (`RAISE`).
+    Context,
+    /// Well-formed, no context, but another severity than
+    /// `pgaudit.log_level`: likely genuine (the setting changed, or it
+    /// differs per database or role). Counted and warned.
+    Severity,
+}
+
+/// [`parse_record`] with the reason a record is dropped.
+pub(crate) fn parse_record_checked(
+    format: Format,
+    record: &[u8],
+    severity: &str,
+) -> Result<AuditRecord, Skip> {
+    let check = |sev: Option<&str>, has_context: bool| {
+        if has_context {
+            Err(Skip::Context)
+        } else if sev != Some(severity) {
+            Err(Skip::Severity)
+        } else {
+            Ok(())
+        }
+    };
     match format {
         Format::Jsonlog => {
             // Cheap pre-filter: other records are never deserialized.
             if !contains(record, b"\"message\":\"AUDIT: ") {
-                return None;
+                return Err(Skip::NotAudit);
             }
-            let line: JsonLine = serde_json::from_slice(record).ok()?;
-            if line.context.is_some() || line.error_severity.as_deref() != Some(severity) {
-                return None;
-            }
-            let message = Zeroizing::new(line.message?);
-            let audit = parse_pgaudit(&message)?;
-            Some(AuditRecord {
+            let line: JsonLine = serde_json::from_slice(record).map_err(|_| Skip::NotAudit)?;
+            let message = Zeroizing::new(line.message.ok_or(Skip::NotAudit)?);
+            let audit = parse_pgaudit(&message).ok_or(Skip::NotAudit)?;
+            check(line.error_severity.as_deref(), line.context.is_some())?;
+            Ok(AuditRecord {
                 ts: line.timestamp.as_deref().and_then(parse_log_time),
-                user: line.user?,
-                database: line.dbname?,
+                user: line.user.ok_or(Skip::NotAudit)?,
+                database: line.dbname.ok_or(Skip::NotAudit)?,
                 remote: line.remote_host,
                 application: line.application_name.unwrap_or_default(),
                 session: line.session_id.unwrap_or_default(),
@@ -339,18 +371,16 @@ pub(crate) fn parse_record(format: Format, record: &[u8], severity: &str) -> Opt
         }
         Format::Csvlog => {
             if !contains(record, b",\"AUDIT: ") {
-                return None;
+                return Err(Skip::NotAudit);
             }
-            let text = std::str::from_utf8(record).ok()?;
-            let f = parse_csv(text)?;
+            let text = std::str::from_utf8(record).map_err(|_| Skip::NotAudit)?;
+            let f = parse_csv(text).ok_or(Skip::NotAudit)?;
             if f.len() < 23 {
-                return None;
+                return Err(Skip::NotAudit);
             }
+            let audit = parse_pgaudit(&f[13]).ok_or(Skip::NotAudit)?;
             // error_severity (11), context (18).
-            if f[11].as_str() != severity || !f[18].is_empty() {
-                return None;
-            }
-            let audit = parse_pgaudit(&f[13])?;
+            check(Some(f[11].as_str()), !f[18].is_empty())?;
             // `connection_from` is `host:port` or `[local]`.
             let from = f[4].as_str();
             let remote = if from.is_empty() {
@@ -364,7 +394,7 @@ pub(crate) fn parse_record(format: Format, record: &[u8], severity: &str) -> Opt
                         .to_owned(),
                 )
             };
-            Some(AuditRecord {
+            Ok(AuditRecord {
                 ts: parse_log_time(&f[0]),
                 user: f[1].to_string(),
                 database: f[2].to_string(),
@@ -516,6 +546,14 @@ mod tests {
                 "WARNING"
             )
             .is_none()
+        );
+        assert_eq!(
+            parse_record_checked(Format::Jsonlog, raise.as_bytes(), "LOG").err(),
+            Some(Skip::Context)
+        );
+        assert_eq!(
+            parse_record_checked(Format::Jsonlog, notice.as_bytes(), "LOG").err(),
+            Some(Skip::Severity)
         );
         assert_eq!(expected_severity(Some("debug3")), "DEBUG");
         assert_eq!(expected_severity(Some("notice")), "NOTICE");

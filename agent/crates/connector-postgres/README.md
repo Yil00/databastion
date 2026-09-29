@@ -32,14 +32,30 @@ pgaudit source needs `pgaudit.log_rows = on`.
   is not `pgaudit.log_level` or that carry an error context (pgaudit hides
   its context; `RAISE` always has one). Still forgeable by roles that can
   hide the context (`log_error_verbosity = terse` is superuser-only) or run
-  native code (C extensions, untrusted PLs). A forged record can add false
-  events; it cannot remove real ones.
+  native code (C extensions, untrusted PLs). **A server-wide
+  `log_error_verbosity = terse` removes every context, and with it this
+  protection**: keep it at `default`. A forged record can add false
+  events; it cannot remove real ones. Records dropped because their
+  severity is not `pgaudit.log_level` (likely genuine: the setting differs
+  per database or role) are counted, logged, and noted in `check()`.
+- **Server-side exports hidden in dynamic SQL.** A `COPY` record whose text
+  does not show the `COPY` (dynamic `EXECUTE`, `format()`, nested `DO`) is
+  reported with `signature.copy_to_file`: PL/pgSQL cannot copy to the
+  client, so it is a server-side export (file or program).
 - **Objects not named by the log** (function or procedure bodies without
   `pgaudit.log_relation`, text that does not parse) are reported as `*` in
   the database, never dropped.
 - **The agent's own account.** Its statements are left out only when they
-  come from its `application_name` (`databastion-agent`) and carry no
-  signal; with `pg_stat_statements`, only when they carry no signal.
+  come from its `application_name` (`databastion-agent`) and from its own
+  client address (as the server sees it), carry no signal, and read at
+  most `limits.max_sample_rows` rows per object within the aggregation
+  window (per poll with `pg_stat_statements`, where application and
+  address are not visible). Residual: someone holding the agent's
+  credentials, on the agent host (same address), spoofing its
+  `application_name` and reading at most that many rows per object and
+  window with filtered queries stays unreported; without
+  `pgaudit.log_rows` the row budget cannot be applied (rows unknown count
+  as 0). The agent's database credentials never leave its host (I3).
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.
 - **`pg_stat_statements` mode** sees no client address, application name,

@@ -27,7 +27,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{StatementDelta, analyze_pss, pss_events};
+use super::events::{OwnAccount, StatementDelta, analyze_pss, pss_events};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -51,7 +51,7 @@ struct Counters {
 pub(crate) struct PssPoller {
     schema: String,
     toplevel: bool,
-    own_account: String,
+    own: OwnAccount,
     snapshot: Option<HashMap<Key, Counters>>,
     analyses: HashMap<Key, QueryAnalysis>,
     last_poll: SystemTime,
@@ -62,7 +62,9 @@ pub(crate) struct PssPoller {
 pub(crate) async fn connect(
     target: &TargetConfig,
     timeouts: Timeouts,
+    own: OwnAccount,
 ) -> Result<(Session, PssPoller), PgError> {
+    let mut own = Some(own);
     let settings = target.postgres_settings();
     let mut last = PgError::new(FailureCode::Unsupported, Stage::Audit);
     for database in &settings.databases {
@@ -102,7 +104,9 @@ pub(crate) async fn connect(
             PssPoller {
                 schema,
                 toplevel,
-                own_account: target.account.clone(),
+                own: own
+                    .take()
+                    .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?,
                 snapshot: None,
                 analyses: HashMap::new(),
                 last_poll: SystemTime::now(),
@@ -232,7 +236,7 @@ impl PssPoller {
                 })
             })
             .collect();
-        let events = pss_events(&deltas, &self.own_account, self.last_poll, now);
+        let events = pss_events(&deltas, &mut self.own, self.last_poll, now);
         drop(deltas);
         self.snapshot = Some(snapshot);
         self.last_poll = now;
