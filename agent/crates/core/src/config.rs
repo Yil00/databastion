@@ -289,6 +289,9 @@ pub struct TargetConfig {
     /// MySQL / MariaDB settings (`engine: mysql` or `mariadb` only).
     #[serde(default)]
     pub mysql: Option<MysqlTargetConfig>,
+    /// MongoDB settings (`engine: mongodb` only).
+    #[serde(default)]
+    pub mongodb: Option<MongodbTargetConfig>,
 }
 
 /// Maximum number of databases declared for one PostgreSQL target.
@@ -467,6 +470,69 @@ impl TargetConfig {
     }
 }
 
+/// Longest `mongodb.auth_source` (MongoDB database names are at most 64
+/// bytes).
+pub const MAX_MONGODB_AUTH_SOURCE: usize = 64;
+
+/// MongoDB settings of a target (ADR-0026). One connection to the declared
+/// host covers every database the account holds privileges on; the job's
+/// `databases` filter selects the ones scanned. The connector never
+/// connects to another member of a replica set (I5).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbTargetConfig {
+    /// TLS to the server. Default: `verify_full`.
+    #[serde(default)]
+    pub tls: MongodbTlsMode,
+    /// PEM CA file trusted for the server certificate (`verify_full`).
+    /// When set, it is the only trusted root; otherwise the system store.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Database holding the account's credentials (SCRAM `authSource`).
+    /// Default: `admin`.
+    #[serde(default = "default_mongodb_auth_source")]
+    pub auth_source: String,
+}
+
+fn default_mongodb_auth_source() -> String {
+    "admin".to_owned()
+}
+
+impl Default for MongodbTargetConfig {
+    fn default() -> Self {
+        Self {
+            tls: MongodbTlsMode::default(),
+            ca_file: None,
+            auth_source: default_mongodb_auth_source(),
+        }
+    }
+}
+
+/// TLS mode of a MongoDB target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MongodbTlsMode {
+    /// TLS required, certificate and host name verified (rustls).
+    #[default]
+    VerifyFull,
+    /// No TLS: a Unix socket or a loopback IP literal only (rejected for
+    /// any other host). Authentication is SCRAM-SHA-256 whatever the
+    /// transport; the password itself is never sent.
+    Disable,
+    /// No TLS on a network connection: explicit, insecure opt-in (e.g. an
+    /// isolated container network). Traffic is readable and alterable on
+    /// the path; warned at every connection and in `check()`.
+    DisableInsecure,
+}
+
+impl TargetConfig {
+    /// MongoDB settings, defaults when absent.
+    #[must_use]
+    pub fn mongodb_settings(&self) -> MongodbTargetConfig {
+        self.mongodb.clone().unwrap_or_default()
+    }
+}
+
 /// Phone region of a target (`agent.yaml`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -608,6 +674,7 @@ const KNOWN_KEYS: &[&str] = &[
     "disable",
     "disable_insecure",
     "extended_grants",
+    "auth_source",
     "audit_log",
     "path",
     "format",
@@ -928,6 +995,17 @@ impl TargetConfig {
                 tls == MysqlTlsMode::Disable,
             )?;
         }
+        if let Some(mongo) = &self.mongodb {
+            self.validate_mongodb(mongo, i)?;
+        }
+        if self.engine == TargetEngine::Mongodb {
+            let tls = self.mongodb_settings().tls;
+            self.validate_tls_placement(
+                format!("targets[{i}].mongodb.tls"),
+                tls == MongodbTlsMode::VerifyFull,
+                tls == MongodbTlsMode::Disable,
+            )?;
+        }
         match (&self.secret.env, &self.secret.file) {
             (Some(name), None) if !is_env_name(name) => Err(invalid(
                 f("secret.env"),
@@ -998,6 +1076,36 @@ impl TargetConfig {
             if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
                 return Err(invalid(f("audit_log.path"), "must be an absolute path"));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_mongodb(&self, mongo: &MongodbTargetConfig, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].mongodb.{name}");
+        if self.engine != TargetEngine::Mongodb {
+            return Err(invalid(
+                format!("targets[{i}].mongodb"),
+                "only for engine mongodb",
+            ));
+        }
+        if mongo.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            return Err(invalid(f("ca_file"), "must be an absolute path"));
+        }
+        if mongo.ca_file.is_some() && mongo.tls != MongodbTlsMode::VerifyFull {
+            return Err(invalid(f("ca_file"), "only with tls: verify_full"));
+        }
+        // A MongoDB database name: 1 to 64 bytes, none of `/\. "$`, no NUL
+        // or control character.
+        let a = &mongo.auth_source;
+        if a.is_empty()
+            || a.len() > MAX_MONGODB_AUTH_SOURCE
+            || a.chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | '.' | ' ' | '"' | '$'))
+        {
+            return Err(invalid(
+                f("auth_source"),
+                "must be a database name (1 to 64 bytes, none of / \\ . space \" $)",
+            ));
         }
         Ok(())
     }
@@ -1356,6 +1464,91 @@ targets:
             "      file: /etc/databastion/secrets/ldap\n    postgres:\n      databases: [x]\n",
         );
         assert!(err(&ldap).contains("targets[1].postgres"), "{}", err(&ldap));
+    }
+
+    #[test]
+    fn mongodb_settings() {
+        const MONGO: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: mongo
+    engine: mongodb
+    host: db3.internal
+    port: 27017
+    account: databastion
+    secret:
+      env: DATABASTION_MONGO_PASSWORD
+";
+        let cfg = parse(MONGO).unwrap();
+        let settings = cfg.targets[0].mongodb_settings();
+        assert_eq!(settings, MongodbTargetConfig::default());
+        assert_eq!(settings.tls, MongodbTlsMode::VerifyFull);
+        assert_eq!(settings.auth_source, "admin");
+        let with =
+            |block: &str| MONGO.replace("    port: 27017\n", &format!("    port: 27017\n{block}"));
+        let cfg = parse(&with(
+            "    mongodb:\n      ca_file: /etc/databastion/mongo-ca.pem\n      auth_source: appdb\n",
+        ))
+        .unwrap();
+        let settings = cfg.targets[0].mongodb_settings();
+        assert!(settings.ca_file.is_some());
+        assert_eq!(settings.auth_source, "appdb");
+        let cfg = parse(&with("    mongodb: {tls: disable_insecure}\n")).unwrap();
+        assert_eq!(
+            cfg.targets[0].mongodb_settings().tls,
+            MongodbTlsMode::DisableInsecure
+        );
+        // `disable` on a loopback literal.
+        let loopback = with("    mongodb: {tls: disable}\n").replace("db3.internal", "127.0.0.1");
+        assert_eq!(
+            parse(&loopback).unwrap().targets[0].mongodb_settings().tls,
+            MongodbTlsMode::Disable
+        );
+        for (block, expected) in [
+            ("    mongodb: {ca_file: ca.pem}\n", "mongodb.ca_file"),
+            (
+                "    mongodb: {tls: disable_insecure, ca_file: /etc/ca.pem}\n",
+                "mongodb.ca_file",
+            ),
+            ("    mongodb: {tls: disable}\n", "mongodb.tls"),
+            ("    mongodb: {tls: prefer}\n", "invalid value"),
+            ("    mongodb: {auth_source: \"\"}\n", "mongodb.auth_source"),
+            ("    mongodb: {auth_source: a.b}\n", "mongodb.auth_source"),
+            (
+                "    mongodb: {auth_source: \"a$b\"}\n",
+                "mongodb.auth_source",
+            ),
+            ("    mongodb: {password: hunter2-SECRET}\n", "unknown field"),
+        ] {
+            let e = err(&with(block));
+            assert!(e.contains(expected), "{block}: {e}");
+            assert!(!e.contains("SECRET"), "{e}");
+        }
+        let long = format!("    mongodb: {{auth_source: {}}}\n", "a".repeat(65));
+        assert!(err(&with(&long)).contains("mongodb.auth_source"));
+        // A Unix socket needs `disable`.
+        let socket = MONGO.replace(
+            "    host: db3.internal\n    port: 27017\n",
+            "    socket: /tmp/mongodb-27017.sock\n",
+        );
+        assert!(
+            err(&socket).contains("a Unix socket has no TLS"),
+            "{}",
+            err(&socket)
+        );
+        let socket = socket.replace(
+            "    socket: /tmp/mongodb-27017.sock\n",
+            "    socket: /tmp/mongodb-27017.sock\n    mongodb: {tls: disable}\n",
+        );
+        assert!(parse(&socket).is_ok());
+        // The block belongs to MongoDB targets only.
+        let pg = BASE.replace(
+            "    port: 5432\n",
+            "    port: 5432\n    mongodb: {tls: verify_full}\n",
+        );
+        assert!(err(&pg).contains("targets[0].mongodb"), "{}", err(&pg));
     }
 
     #[test]
