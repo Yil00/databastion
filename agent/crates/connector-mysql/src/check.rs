@@ -31,7 +31,9 @@
 //! through another role, as MySQL mandatory role or MariaDB default role),
 //! enabled or not, since the account can enable any of them itself. Their
 //! privileges come from `SHOW GRANTS` (see [`role_privileges`]); a role
-//! that cannot be evaluated is reported as such. `init_connect` (SQL run at
+//! that cannot be evaluated is reported as such (on MariaDB, every role
+//! but the default role: MariaDB shows no other role's grants to a
+//! least-privilege account). `init_connect` (SQL run at
 //! every login) is reported. Coverage: views and tables of engines that are
 //! not sampled.
 //!
@@ -71,8 +73,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
 pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 /// Most names listed in a log line.
 const MAX_LOGGED_NAMES: usize = 20;
-/// Most roles whose privileges are read per report (MariaDB: one
-/// statement each); the others are reported as not evaluated.
+/// Most roles named in the MySQL `SHOW GRANTS … USING` statement; with
+/// more, the roles are reported as not evaluated.
 const MAX_EVALUATED_ROLES: usize = 16;
 
 /// Audit prerequisites.
@@ -1053,15 +1055,16 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// - MySQL: `SHOW GRANTS FOR CURRENT_USER() USING <roles>` with the roles
 ///   granted to the account itself and the mandatory roles; the server
 ///   expands the roles those grant.
-/// - MariaDB: `SHOW GRANTS FOR <role>` for every applicable role
-///   (`APPLICABLE_ROLES` already lists the roles granted through roles).
+/// - MariaDB: `SHOW GRANTS FOR CURRENT_ROLE`, the only role whose grants
+///   MariaDB shows without `SELECT` on `mysql`: the default role enabled at
+///   login. Every other applicable role is reported as not evaluated.
 ///
 /// Read-only statements, bounded like every `check()` statement: at most
-/// [`MAX_EVALUATED_ROLES`] roles, rows and bytes capped by
+/// [`MAX_EVALUATED_ROLES`] roles (MySQL), rows and bytes capped by
 /// `Session::query`, cancelled with `KILL QUERY` when the `check()` bound
 /// drops them (MySQL's `max_execution_time` does not apply to `SHOW`).
 /// Role names are written into the statement only after an allow-list
-/// check (`sql::show_grants_*`). A role whose grants cannot be read (a
+/// check (`sql::show_grants_using`). A role whose grants cannot be read (a
 /// refused name, a server error, a line the parser does not understand) is
 /// counted in `roles_unevaluated`; on MySQL, where one statement covers
 /// every role, all of them are.
@@ -1121,19 +1124,22 @@ async fn mariadb_role_privileges(
         roles.insert(v(0));
     }
     grants.roles = roles.len() as u64;
-    for (i, role) in roles.iter().enumerate() {
-        let mut evaluated = false;
-        if i < MAX_EVALUATED_ROLES {
-            if let Some(statement) = sql::show_grants_for_role(role) {
-                if let Some(rows) = optional(session, &statement).await? {
-                    evaluated = merge_grant_lines(&rows, grants);
-                }
-            }
-        }
-        if !evaluated {
-            grants.roles_unevaluated += 1;
+    if roles.is_empty() {
+        return Ok(());
+    }
+    // Only the session's current role (the default role) is readable; the
+    // other applicable roles, including those it grants, are counted as not
+    // evaluated (never assumed harmless).
+    let current = optional(session, sql::CURRENT_ROLE)
+        .await?
+        .and_then(|r| cell(&r, 0, 0).map(str::to_owned));
+    let mut evaluated = false;
+    if current.as_ref().is_some_and(|c| roles.contains(c)) {
+        if let Some(rows) = optional(session, sql::SHOW_GRANTS_CURRENT_ROLE).await? {
+            evaluated = merge_grant_lines(&rows, grants);
         }
     }
+    grants.roles_unevaluated = grants.roles - u64::from(evaluated);
     Ok(())
 }
 

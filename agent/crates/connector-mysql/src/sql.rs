@@ -384,15 +384,16 @@ pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
     Some(out)
 }
 
-/// MariaDB: the privileges granted to a role applicable to the account
-/// (allowed without privilege for such a role). `None` for a name outside
-/// the allow-list.
-pub(crate) fn show_grants_for_role(role: &str) -> Option<String> {
-    if !role_part_ok(role, false) {
-        return None;
-    }
-    Some(format!("SHOW GRANTS FOR {}", quote_ident(role)?))
-}
+/// MariaDB: the role enabled in the session (the default role at login),
+/// or NULL.
+pub(crate) const CURRENT_ROLE: &str = "SELECT CURRENT_ROLE()";
+
+/// MariaDB: the privileges of the role enabled in the session. MariaDB
+/// shows a role's grants without `SELECT` on the `mysql` database only for
+/// the session's current role (`SHOW GRANTS FOR <other role>` is refused),
+/// and `SET ROLE` is not used (it would enable the role's privileges, write
+/// privileges included, on the agent's session).
+pub(crate) const SHOW_GRANTS_CURRENT_ROLE: &str = "SHOW GRANTS FOR CURRENT_ROLE";
 
 /// Whether `init_connect` is set (SQL run at every login of an account
 /// without `SUPER` / `CONNECTION_ADMIN`: user code at connection). The text
@@ -618,7 +619,8 @@ mod tests {
             APPLICABLE_ROLES_MYSQL.to_owned(),
             APPLICABLE_ROLES_MARIADB.to_owned(),
             show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
-            show_grants_for_role("app_read").unwrap(),
+            CURRENT_ROLE.to_owned(),
+            SHOW_GRANTS_CURRENT_ROLE.to_owned(),
             INIT_CONNECT.to_owned(),
             AUDIT_PLUGINS.to_owned(),
             SERVER_AUDIT_SETTINGS.to_owned(),
@@ -747,10 +749,6 @@ mod tests {
                  `ops`@`10.0.0.0/255.0.0.0`, `r`@``"
             )
         );
-        assert_eq!(
-            show_grants_for_role("app_read").as_deref(),
-            Some("SHOW GRANTS FOR `app_read`")
-        );
         assert_eq!(show_grants_using(&[]), None);
         for bad in [
             "",
@@ -762,7 +760,6 @@ mod tests {
             "caf\u{e9}",
             &"x".repeat(256),
         ] {
-            assert_eq!(show_grants_for_role(bad), None, "{bad}");
             assert_eq!(
                 show_grants_using(&[(bad.to_owned(), "%".to_owned())]),
                 None,

@@ -68,9 +68,9 @@ const SCAN_USER: &str = "databastion_it_scan";
 const IT_PASSWORD: &str = "dev-only-it-account-FAKE";
 /// An account holding its privileges through roles (P4-D).
 const ROLE_USER: &str = "databastion_it_roles";
-/// Its roles: SELECT on the seeded database (default role); INSERT and
-/// UPDATE there, granted but not enabled; SELECT on `mysql`, through the
-/// previous role; DELETE, as a MySQL mandatory role.
+/// Its roles: SELECT, then DELETE, on the seeded database (default role);
+/// INSERT and UPDATE there, granted but not enabled; SELECT on `mysql`,
+/// through the previous role; DROP, as a MySQL mandatory role.
 const ROLE_READ: &str = "databastion_it_r_read";
 const ROLE_WRITE: &str = "databastion_it_r_write";
 const ROLE_SYS: &str = "databastion_it_r_sys";
@@ -1437,9 +1437,35 @@ async fn drop_role_fixtures(a: &mut Session) {
     }
 }
 
-/// P4-D: privileges held through roles are evaluated like direct ones:
-/// the default role, a granted role that is not enabled, a role granted
-/// through a role, `WITH ADMIN OPTION`, and on MySQL a mandatory role.
+/// The note `code` of `server`'s check; the panic names the server.
+fn server_note<'a>(server: &str, notes: &'a [TargetNote], code: NoteCode) -> &'a TargetNote {
+    notes
+        .iter()
+        .find(|n| n.code() == code)
+        .unwrap_or_else(|| panic!("{server}: no {} note: {notes:?}", code.as_str()))
+}
+
+fn assert_no_note(server: &str, notes: &[TargetNote], code: NoteCode, output: &str) {
+    assert!(
+        !notes.iter().any(|n| n.code() == code),
+        "{server}: unexpected {} note: {notes:?}\n{output}",
+        code.as_str()
+    );
+}
+
+/// P4-D: privileges held through roles.
+///
+/// MySQL: every applicable role is evaluated (`SHOW GRANTS FOR
+/// CURRENT_USER() USING …`): the default role, a granted role that is not
+/// enabled, a role granted through a role, and a mandatory role.
+///
+/// MariaDB shows a role's grants to a least-privilege account only for the
+/// session's current role (the default role): its privileges are
+/// evaluated, every other applicable role is reported as not evaluated,
+/// never assumed harmless.
+///
+/// Both: `WITH ADMIN OPTION` is a grant option, and no role or account name
+/// leaves the check.
 #[tokio::test]
 async fn role_privileges_are_evaluated() {
     let _serial = SERIAL.lock().await;
@@ -1448,6 +1474,7 @@ async fn role_privileges_are_evaluated() {
             continue;
         };
         let name = server.name;
+        let mysql = server.flavor() == Flavor::Mysql;
         let db = server.url.dbname.clone();
         let mut a = admin_session(&server, &admin).await;
         drop_role_fixtures(&mut a).await;
@@ -1465,9 +1492,10 @@ async fn role_privileges_are_evaluated() {
         )
         .await;
         exec(&mut a, &format!("GRANT `{ROLE_READ}` TO '{ROLE_USER}'@'%'")).await;
-        let default_role = match server.flavor() {
-            Flavor::Mysql => format!("SET DEFAULT ROLE `{ROLE_READ}` TO '{ROLE_USER}'@'%'"),
-            Flavor::Mariadb => format!("SET DEFAULT ROLE `{ROLE_READ}` FOR '{ROLE_USER}'@'%'"),
+        let default_role = if mysql {
+            format!("SET DEFAULT ROLE `{ROLE_READ}` TO '{ROLE_USER}'@'%'")
+        } else {
+            format!("SET DEFAULT ROLE `{ROLE_READ}` FOR '{ROLE_USER}'@'%'")
         };
         exec(&mut a, &default_role).await;
         let (_dir, t) = target(&server, ROLE_USER, IT_PASSWORD);
@@ -1497,18 +1525,40 @@ async fn role_privileges_are_evaluated() {
         .await;
         let (notes, output) = privilege_check(&t).await;
         assert_registered_notes(server.flavor(), &notes);
-        let beyond = note(&notes, NoteCode::PrivilegeBeyondSelect);
-        assert_eq!(labels(beyond), ["insert", "update"], "{name}: {output}");
-        assert_eq!(beyond.count(), Some(2));
-        note(&notes, NoteCode::PrivilegeSystemDatabaseSelect);
-        for absent in [
-            NoteCode::PrivilegeRolesNotEvaluated,
-            NoteCode::PrivilegeGrantOption,
-        ] {
-            assert!(
-                !notes.iter().any(|n| n.code() == absent),
-                "{name}: {notes:?}\n{output}"
+        if mysql {
+            let beyond = server_note(name, &notes, NoteCode::PrivilegeBeyondSelect);
+            assert_eq!(labels(beyond), ["insert", "update"], "{name}: {output}");
+            assert_eq!(beyond.count(), Some(2), "{name}");
+            server_note(name, &notes, NoteCode::PrivilegeSystemDatabaseSelect);
+            assert_no_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated, &output);
+        } else {
+            // The two roles that are not the current role cannot be read:
+            // reported as such, and nothing is inferred from them.
+            let unevaluated = server_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated);
+            assert_eq!(unevaluated.count(), Some(2), "{name}: {output}");
+            assert_no_note(name, &notes, NoteCode::PrivilegeBeyondSelect, &output);
+        }
+        assert_no_note(name, &notes, NoteCode::PrivilegeGrantOption, &output);
+
+        // A write privilege on the default role: evaluated on both engines.
+        exec(
+            &mut a,
+            &format!("GRANT DELETE ON `{db}`.* TO `{ROLE_READ}`"),
+        )
+        .await;
+        let (notes, output) = privilege_check(&t).await;
+        let beyond = server_note(name, &notes, NoteCode::PrivilegeBeyondSelect);
+        if mysql {
+            assert_eq!(
+                labels(beyond),
+                ["delete", "insert", "update"],
+                "{name}: {output}"
             );
+            assert_no_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated, &output);
+        } else {
+            assert_eq!(labels(beyond), ["delete"], "{name}: {output}");
+            let unevaluated = server_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated);
+            assert_eq!(unevaluated.count(), Some(2), "{name}: {output}");
         }
 
         // WITH ADMIN OPTION: the account can grant the role to others.
@@ -1518,14 +1568,14 @@ async fn role_privileges_are_evaluated() {
         )
         .await;
         let (notes, _) = privilege_check(&t).await;
-        note(&notes, NoteCode::PrivilegeGrantOption);
+        server_note(name, &notes, NoteCode::PrivilegeGrantOption);
 
         // MySQL mandatory roles apply to every account.
-        if server.flavor() == Flavor::Mysql {
+        if mysql {
             exec(&mut a, &format!("CREATE ROLE `{ROLE_MANDATORY}`")).await;
             exec(
                 &mut a,
-                &format!("GRANT DELETE ON `{db}`.* TO `{ROLE_MANDATORY}`"),
+                &format!("GRANT DROP ON `{db}`.* TO `{ROLE_MANDATORY}`"),
             )
             .await;
             let previous = scalar(&mut a, "SELECT @@GLOBAL.mandatory_roles")
@@ -1542,10 +1592,10 @@ async fn role_privileges_are_evaluated() {
                 previous.replace('\'', "''")
             );
             exec(&mut a, &restore).await;
-            let beyond = note(&notes, NoteCode::PrivilegeBeyondSelect);
+            let beyond = server_note(name, &notes, NoteCode::PrivilegeBeyondSelect);
             assert_eq!(
                 labels(beyond),
-                ["delete", "insert", "update"],
+                ["delete", "drop", "insert", "update"],
                 "{name}: {output}"
             );
         }
