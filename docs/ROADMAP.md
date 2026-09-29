@@ -88,7 +88,7 @@ Items prefixed with **Gate** come from a security review: they block the complet
 **Status: exit criterion met in CI** (#66, E2E job of `ci.yml`): `pg_dump` on the PostgreSQL target (pgaudit) → incident in 69 s; `mariadb-dump` on the MariaDB target (`server_audit` log) → incident in 58 s; no event reported for the agent's own account. Phase 4 is not closed yet: the P4-D items still open (MySQL / MariaDB role privileges) and the P2-G items due before the phase 4 exit (findings flush before the terminal status, concurrent heartbeat target checks) are in progress; the held-out seed rotation is due with the first release (phase 7).
 
 ## Phase 5 – MongoDB
-[ ] Discovery (document sampling, nested fields) · [ ] Enterprise/Percona audit (`auditLog`) · [ ] Community audit (JSON logs + profiler, level shown as "Limited") · [ ] `mongodump` / `mongoexport` detection
+[~] Discovery (document sampling, nested fields) (in progress, branch `feat/p5-a-mongodb-discovery`, [ADR-0026](adr/0026-mongodb-connector.md) proposed) · [ ] Enterprise/Percona audit (`auditLog`) · [ ] Community audit (JSON logs + profiler, level shown as "Limited") · [ ] `mongodump` / `mongoexport` detection
 
 ## Phase 6 – OpenLDAP
 [ ] Discovery (sensitive attributes: `userPassword`, `mail`, `telephoneNumber`, custom attributes) · [ ] Audit via `cn=accesslog` · [ ] Bulk search detection
