@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use databastion_classifiers::query::{AnalyzeOptions, MAX_NORMALIZED_CHARS, analyze};
+use databastion_classifiers::query::{
+    AnalyzeOptions, MAX_NORMALIZED_CHARS, QueryAnalysis, analyze, analyze_raw,
+};
 use proptest::prelude::*;
 
 /// A secret marker: never an identifier of the generated statements.
@@ -197,6 +199,76 @@ proptest! {
     ) {
         let a = analyze(&format!("{head} {tail}"), AnalyzeOptions::mysql());
         prop_assert!(a.normalized().is_none());
+    }
+}
+
+/// A two-byte character whose trail byte is `\` (0x5c) or a backtick
+/// (0x60), as gbk / gb18030 (lead 0x81..=0xfe) and sjis / cp932 (lead
+/// 0x81..=0x9f or 0xe0..=0xfc) encode them.
+fn multibyte_char() -> impl Strategy<Value = Vec<u8>> {
+    (
+        prop_oneof![0x81u8..=0xfe, 0x81u8..=0x9f, 0xe0u8..=0xfc],
+        prop::sample::select(vec![0x5cu8, 0x60]),
+    )
+        .prop_map(|(lead, trail)| vec![lead, trail])
+}
+
+fn raw_leaks(a: &QueryAnalysis, m: &str) -> bool {
+    let m = m.to_ascii_lowercase();
+    a.relations()
+        .iter()
+        .chain(a.parts().iter().flat_map(|p| p.relations.iter()))
+        .any(|r| {
+            r.name.to_ascii_lowercase().contains(&m)
+                || r.schema
+                    .as_deref()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains(&m))
+        })
+        || a.parts()
+            .iter()
+            .any(|p| p.lead.iter().any(|w| w.contains(&m)))
+        || a.normalized()
+            .is_some_and(|n| n.as_str().to_ascii_lowercase().contains(&m))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// gbk / sjis texts where a trail byte would close or escape a quote
+    /// or a backtick for this lexer, but not for the server: the text after
+    /// it (the server's literal, holding the marker as a would-be name)
+    /// never becomes a name, whether analyzed from the raw bytes or from
+    /// the same character re-encoded as UTF-8.
+    #[test]
+    fn multibyte_trail_bytes_never_expose_names(
+        ch in multibyte_char(),
+        m in marker(),
+        template in prop::sample::select(vec![
+            ("select '", "' , 1 from t where x = ' from payroll.", " '"),
+            ("select `", "` from t where x = ` from payroll.", " `"),
+            ("select \"", "\" , 1 from t where x = \" from payroll.", " \""),
+            ("select * from t where a = '", "' or b = ' join ", " on 1 '"),
+        ]),
+    ) {
+        let (head, mid, tail) = template;
+        let mut raw = head.as_bytes().to_vec();
+        raw.extend_from_slice(&ch);
+        raw.extend_from_slice(mid.as_bytes());
+        raw.extend_from_slice(m.as_bytes());
+        raw.extend_from_slice(tail.as_bytes());
+        let a = analyze_raw(&raw, AnalyzeOptions::mysql());
+        prop_assert!(!raw_leaks(&a, &m), "{:?}", String::from_utf8_lossy(&raw));
+        // The same with the lead byte as a UTF-8 character (a server
+        // configured for utf8mb4 cannot hold it, but the text may be
+        // re-encoded on its way): a byte >= 0x80 before 0x5c / 0x60.
+        let mut utf8 = head.to_owned();
+        utf8.push('\u{e9}');
+        utf8.push(char::from(ch[1]));
+        utf8.push_str(mid);
+        utf8.push_str(&m);
+        utf8.push_str(tail);
+        let a = analyze(&utf8, AnalyzeOptions::mysql());
+        prop_assert!(!raw_leaks(&a, &m), "{utf8:?}");
     }
 }
 

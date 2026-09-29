@@ -52,7 +52,15 @@
 //! comments; `/* … */` comments do not nest; an executable comment
 //! (`/*! … */`, `/*!NNNNN … */`, MariaDB `/*M! … */`) is read as code,
 //! and its content must lex completely before its first `*/` (a literal
-//! running past it, or a nested comment, fails closed). Optimizer hints
+//! running past it, or a nested comment, fails closed). A version
+//! comment is only certain to run when it has no version or a five-digit
+//! version below 8.0.0 (every supported server runs it); otherwise (six
+//! digits, 8.0.0 and later, every MariaDB-only `/*M!`) the server may read
+//! it as a comment, so that reading is lexed too and must agree. Text with
+//! a byte >= 0x80 directly followed by `\` or a backtick (the trail byte
+//! of a two-byte character in gbk, big5, sjis, cp932 or gb18030) keeps
+//! only its kind, and so does text whose bytes are not UTF-8
+//! ([`analyze_raw`]). Optimizer hints
 //! (`/*+ … */`) are comments. The DML allow-list adds `REPLACE`; `CREATE`
 //! / `ALTER` / `DROP` / `RENAME` `USER` / `ROLE` and `SET PASSWORD` are
 //! DCL. `SELECT … INTO OUTFILE` / `INTO DUMPFILE` is reported
@@ -123,6 +131,27 @@ struct MyMode {
     backslash: bool,
     /// `ANSI_QUOTES`: `"…"` is an identifier.
     ansi_quotes: bool,
+    /// Version comments whose version may be above the server's
+    /// ([`version_always_executed`] false) are comments.
+    version_as_comment: bool,
+}
+
+/// Whether a version comment `/*!NNNNN` runs on every supported server:
+/// a five-digit MySQL version below 8.0.0 (the connector refuses MySQL
+/// before 8.0 and MariaDB before 10.6). `/*!` without a version always
+/// runs; MariaDB's `/*M!` runs only on MariaDB, so it is never "always".
+fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
+    if mariadb_only {
+        return false;
+    }
+    if digits.is_empty() {
+        return true;
+    }
+    digits.len() == 5
+        && std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| d.parse::<u32>().ok())
+            .is_some_and(|v| v < 80_000)
 }
 
 /// Longest version number of an executable comment (`/*!NNNNNN`).
@@ -210,7 +239,11 @@ fn lex_mysql_range(
                 {
                     j += 1;
                 }
-                lex_mysql_range(text, j.min(close), close, mode, true, out)?;
+                let mariadb_only = b.get(i + 2) == Some(&b'M');
+                let always = version_always_executed(mariadb_only, &b[digits_start..j]);
+                if always || !mode.version_as_comment {
+                    lex_mysql_range(text, j.min(close), close, mode, true, out)?;
+                }
             }
             i = close + 2;
             continue;
@@ -341,16 +374,34 @@ fn my_modes(text: &str) -> Vec<MyMode> {
     } else {
         &[false]
     };
+    let version: &[bool] = if text.contains("/*!") || text.contains("/*M!") {
+        &[false, true]
+    } else {
+        &[false]
+    };
     let mut out = Vec::new();
     for &bs in backslash {
         for &aq in ansi {
-            out.push(MyMode {
-                backslash: bs,
-                ansi_quotes: aq,
-            });
+            for &vc in version {
+                out.push(MyMode {
+                    backslash: bs,
+                    ansi_quotes: aq,
+                    version_as_comment: vc,
+                });
+            }
         }
     }
     out
+}
+
+/// Multibyte character sets (gbk, big5, sjis, cp932, gb18030) can have a
+/// `\` (0x5c) or a backtick (0x60) as the trail byte of a two-byte
+/// character, which the server reads as part of the character and this
+/// lexer as a quote or escape: text with a byte >= 0x80 directly followed
+/// by one of them cannot be lexed reliably.
+fn multibyte_hazard(b: &[u8]) -> bool {
+    b.windows(2)
+        .any(|w| w[0] >= 0x80 && (w[1] == b'\\' || w[1] == b'`'))
 }
 
 fn is_ident_cont(b: u8) -> bool {
@@ -909,6 +960,11 @@ pub struct AnalyzeOptions {
     pub large_limit: u64,
     /// Dialect of the text.
     pub dialect: Dialect,
+    /// The text cannot be trusted to lex like the server read it (bytes
+    /// that were not UTF-8, an escape the source's format does not
+    /// define): only the statement kind is kept, from the prefix before
+    /// the first quote or comment.
+    pub opaque: bool,
 }
 
 impl AnalyzeOptions {
@@ -921,7 +977,15 @@ impl AnalyzeOptions {
             possibly_truncated: false,
             large_limit: 10_001,
             dialect: Dialect::Postgres,
+            opaque: false,
         }
+    }
+
+    /// Marks the text as opaque (see [`AnalyzeOptions::opaque`]).
+    #[must_use]
+    pub fn opaque(mut self, opaque: bool) -> Self {
+        self.opaque = opaque;
+        self
     }
 
     /// Like [`new`](Self::new), for MySQL / MariaDB text.
@@ -946,6 +1010,9 @@ impl AnalyzeOptions {
 pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     if opts.dialect == Dialect::Mysql {
         return analyze_mysql(text, opts);
+    }
+    if opts.opaque {
+        return QueryAnalysis::unparsed(first_kind_prefix(text));
     }
     let Ok(tokens) = lex(text, true) else {
         return QueryAnalysis::unparsed(first_kind_prefix(text));
@@ -1017,9 +1084,27 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     }
 }
 
+/// [`analyze`] of statement text as raw bytes from its source: bytes that
+/// are not UTF-8 make the text opaque (only the statement kind is kept);
+/// the text is never decoded lossily for analysis.
+#[must_use]
+pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
+    match std::str::from_utf8(raw) {
+        Ok(text) => analyze(text, opts),
+        Err(e) => {
+            // The valid prefix only, for the kind.
+            let prefix = std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or("");
+            analyze(prefix, opts.opaque(true))
+        }
+    }
+}
+
 /// [`analyze`] for MySQL / MariaDB text: every `sql_mode` reading must
 /// give the same tokens.
 fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
+    if opts.opaque || multibyte_hazard(text.as_bytes()) {
+        return QueryAnalysis::unparsed(my_kind_prefix(text));
+    }
     let mut readings = my_modes(text).into_iter().map(|m| lex_mysql(text, m));
     let first = readings.next().unwrap_or(Err(LexError::Unterminated));
     let tokens = match first {
@@ -1116,6 +1201,7 @@ fn my_kind_prefix(text: &str) -> StatementKind {
     let mode = MyMode {
         backslash: true,
         ansi_quotes: false,
+        version_as_comment: true,
     };
     lex_mysql(prefix, mode).map_or(StatementKind::Other, |t| my_kind(&t))
 }
@@ -2404,9 +2490,26 @@ mod tests {
             vec![r(None, "employees")]
         );
         assert!(a.shape().unwrap().whole_relation(10_001));
+        // Always executed on a supported server: read as code.
         assert_eq!(
-            my_norm("select /*M!100500 'secret', */ a from t").unwrap(),
+            my_norm("select /*!50000 'secret', */ a from t").unwrap(),
             "select ? , a from t"
+        );
+        // Maybe a comment (MariaDB-only, or a version from 8.0.0): both
+        // readings must agree, otherwise only the kind is kept.
+        for q in [
+            "select /*M!100500 'secret', */ a from t",
+            "select a /*!80030 from Pa55word */ from t",
+            "select a /*!100500 , b */ from t",
+        ] {
+            let a = my(q);
+            assert!(a.normalized().is_none() && a.relations().is_empty(), "{q}");
+            assert_eq!(a.kind(), StatementKind::Select, "{q}");
+        }
+        assert_eq!(
+            my_rels("select a from t /*!80000 */"),
+            vec![r(None, "t")],
+            "an empty maybe-comment reads the same"
         );
         // A literal running past the end of the executable comment, a
         // nested comment or a line comment inside it: fail closed.
@@ -2442,6 +2545,31 @@ mod tests {
         assert!(a.normalized().is_none() && a.relations().is_empty());
         // A backslash that reads the same in every mode is fine.
         assert!(my("select 'a\\nb' from t").normalized().is_some());
+    }
+
+    #[test]
+    fn mysql_multibyte_trail_bytes_fail_closed() {
+        // gbk 0xBF 0x5C is one character on the server; here the 0x5C
+        // would escape the quote. Valid UTF-8 cannot carry the raw pair, so
+        // both the raw bytes and any such byte pair keep the kind only.
+        let raw = b"select '\xBF\x5C' , 1 from t where x = ' from payroll.S3cr3t '";
+        let a = analyze_raw(raw, AnalyzeOptions::mysql());
+        assert!(a.relations().is_empty() && a.parts().is_empty());
+        assert_eq!(a.kind(), StatementKind::Select);
+        let a = my("select '\u{e9}\\' , 1 from t where x = ' from payroll.S3cr3t '");
+        assert!(a.relations().is_empty() && a.parts().is_empty());
+        let a = my("select `\u{e9}` from t");
+        assert!(
+            a.relations().is_empty(),
+            "backtick after a multibyte character"
+        );
+        // Other non-ASCII text is fine.
+        assert_eq!(my_rels("select 'caf\u{e9}' from t"), vec![r(None, "t")]);
+        assert!(
+            analyze_raw(b"select 1 from \xFF", AnalyzeOptions::mysql())
+                .relations()
+                .is_empty()
+        );
     }
 
     #[test]
