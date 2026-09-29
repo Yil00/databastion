@@ -65,8 +65,8 @@ reported: they are not needed for Discovery.
 | Edition | Source (`audit_source`) | Level |
 |---|---|---|
 | Enterprise, Percona Server for MongoDB | `auditLog` JSON file (`mongodb_audit_log`) | Partial once a successful `authCheck` was read in the last 24 h, Limited before |
-| Any | structured JSON server log (`mongodb_log`) | Limited |
-| Any (not a `mongos`) | profiler, `system.profile` (`mongodb_profiler`) | Limited |
+| Any | structured JSON server log (`mongodb_log`) | Limited once a record was read in the last 24 h, None before |
+| Any (not a `mongos`) | profiler, `system.profile` (`mongodb_profiler`) | Limited once an entry was read in the last 24 h, None before |
 
 Full is never reported: the `auditLog` has no document counts, and the log
 and the profiler only hold the operations the server records (slower than
@@ -123,6 +123,7 @@ reports it as `privilege.system_collections` otherwise.
 | `audit.auditlog_on_community` | an `auditLog` is declared, but the server is Community: not used |
 | `audit.log_without_row_counts` | the `auditLog` has no document counts |
 | `audit.slow_operations_only` | server log or profiler: slow or sampled operations only |
+| `audit.limited_pending_first_record` | server log or profiler: nothing read in the last 24 h (None) |
 | `audit.source_not_configured` | no usable source (level None) |
 | `audit.log_not_readable` | the declared file cannot be read by the agent |
 | `audit.records_dropped` | records that did not parse, oversized or damaged, in the last 24 h |
@@ -132,7 +133,9 @@ application name, which a client declares itself), whole-collection reads
 (`shape.full_table_read`) and more than 10 000 documents in one operation
 (`volume.large_result`, log and profiler). The agent's own reads are left
 out only from its account, its address and its application name
-(`databastion-agent`), within its Discovery budget.
+(`databastion-agent`), within its Discovery budget, and only reads: writes,
+DDL and DCL with its identity are always reported. On the `auditLog` (no
+counts), only a `find` with a limit within the budget is left out.
 
 ## Target settings
 

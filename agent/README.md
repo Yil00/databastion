@@ -407,7 +407,9 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md), Proposed; `src/audit/`):
   **Partial** once a successful `authCheck` record was read in the last 24 h, which needs
   `auditAuthorizationSuccess`, Limited before; no document counts), the structured JSON server
   log (`format: server_log`; **Limited**), or, without a usable file, the profiler of the
-  databases whose `system.profile` the account can `find` (**Limited**; not on a `mongos`).
+  databases whose `system.profile` the account can `find` (**Limited**; not on a `mongos`); the
+  server log and the profiler report None (`audit.limited_pending_first_record`) until the stream
+  read a record of them in the last 24 h.
   **Full is never reported**;
 - files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
@@ -426,7 +428,9 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md), Proposed; `src/audit/`):
   10 000 documents; log and profiler only);
 - the agent's own reads are left out only for `account@auth_source`, `appName`
   `databastion-agent`, the address `whatsmyuri` returns, no signal, and the Discovery budget per
-  collection and day; its `count` without filter and its profiler polls are not charged;
+  collection and day, and only for reads (writes, DDL and DCL are always reported, for every
+  engine); on the `auditLog`, only a `find` with a limit within the budget; its `count` without
+  filter and, on the profiler source, its exact profiler polls are not charged;
 - `check()` counts `find` on `<db>.system.profile` as the Audit grant only while a stream reads
   the profiler (otherwise `privilege.system_collections`); notes `audit.auditlog_on_community`,
   `audit.authcheck_success_pending`, `audit.slow_operations_only`, `audit.source_not_configured`,
