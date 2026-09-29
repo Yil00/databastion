@@ -188,6 +188,12 @@
       "postgres"
     ]
   },
+  "coverage.timeseries_not_readable": {
+    "description": "{count} time-series collection(s) not read: the account has no find privilege on their bucket collections (system_buckets resource).",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "coverage.views_not_sampled": {
     "description": "{count} view(s) not sampled (their base tables or collections are).",
     "engines": [

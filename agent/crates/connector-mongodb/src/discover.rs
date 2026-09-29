@@ -351,6 +351,17 @@ where
                         }
                     });
                     totals.skipped += 1;
+                    let reason = match (unit.kind, not_readable) {
+                        // Reads of a time-series collection are authorized
+                        // on its bucket collection (`system.buckets.*`),
+                        // which `collection: ""` does not cover.
+                        (CollKind::Timeseries, true) => {
+                            "time-series collection: no find on its bucket collection \
+                             (optional system_buckets grant, ADR-0026)"
+                        }
+                        (_, true) => "no find privilege",
+                        _ => "read failed",
+                    };
                     tracing::warn!(
                         target_id = %target.id,
                         database = db_name.as_str(),
@@ -358,6 +369,7 @@ where
                         stage = e.stage.as_str(),
                         server_code = e.server_code,
                         code = %e.code,
+                        reason,
                         "object not covered"
                     );
                     continue;

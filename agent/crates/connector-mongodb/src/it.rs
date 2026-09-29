@@ -48,6 +48,10 @@ const MIN_USER: &str = "databastion_it_min";
 const OVER_USER: &str = "databastion_it_over";
 const SHA1_USER: &str = "databastion_it_sha1";
 const MIN_ROLE: &str = "databastion_it_discovery";
+/// The ADR-0026 role plus the optional time-series grant (`find` on the
+/// database's bucket collections).
+const BUCKETS_USER: &str = "databastion_it_buckets";
+const BUCKETS_ROLE: &str = "databastion_it_buckets";
 const IT_PASSWORD: &str = "dev-only-it-account-FAKE";
 /// Documents of the large probe collection: above 20 x 200 (the contract
 /// default `sample_rows`), so it is read with `$sample`.
@@ -381,10 +385,12 @@ async fn seed_recall_regression() {
 async fn probe_fixtures(a: &Url) {
     let mut s = admin_session(a).await;
     let _ = run(&mut s, PROBE_DB, DocBuf::new().i32("dropDatabase", 1)).await;
-    for user in [MIN_USER, OVER_USER, SHA1_USER] {
+    for user in [MIN_USER, OVER_USER, SHA1_USER, BUCKETS_USER] {
         let _ = run(&mut s, "admin", DocBuf::new().str("dropUser", user)).await;
     }
-    let _ = run(&mut s, "admin", DocBuf::new().str("dropRole", MIN_ROLE)).await;
+    for role in [MIN_ROLE, BUCKETS_ROLE] {
+        let _ = run(&mut s, "admin", DocBuf::new().str("dropRole", role)).await;
+    }
     // A large collection (read with `$sample`), a small one with values
     // in nested arrays, a view, a time-series collection, a deep document.
     // Insert in batches of 1000.
@@ -498,7 +504,35 @@ async fn probe_fixtures(a: &Url) {
     )
     .await
     .unwrap();
+    run(
+        &mut s,
+        "admin",
+        DocBuf::new()
+            .str("createRole", BUCKETS_ROLE)
+            .array(
+                "privileges",
+                vec![
+                    DocBuf::new()
+                        .doc(
+                            "resource",
+                            DocBuf::new().str("db", PROBE_DB).str("system_buckets", ""),
+                        )
+                        .array_str("actions", &["find"]),
+                ],
+            )
+            .array(
+                "roles",
+                vec![DocBuf::new().str("role", MIN_ROLE).str("db", "admin")],
+            ),
+    )
+    .await
+    .unwrap();
     for (user, roles, mechanism) in [
+        (
+            BUCKETS_USER,
+            vec![DocBuf::new().str("role", BUCKETS_ROLE).str("db", "admin")],
+            "SCRAM-SHA-256",
+        ),
         (
             MIN_USER,
             vec![DocBuf::new().str("role", MIN_ROLE).str("db", "admin")],
@@ -641,7 +675,18 @@ async fn probes() {
     };
     assert!(has("people", "email"), "{found:?}");
     assert!(has("nested", "profile.contacts[].mail"), "{found:?}");
-    assert!(has("metrics", "owner"), "{found:?}");
+    // MongoDB authorizes reads of a time-series collection on its bucket
+    // collection (`system.buckets.metrics`), which `collection: ""` does not
+    // cover: the minimal role cannot read it, and the scan says so.
+    assert!(!found.iter().any(|k| k.1 == "metrics"), "{found:?}");
+    let text = logs.text();
+    let metrics_lines: Vec<&str> = text.lines().filter(|l| l.contains("metrics")).collect();
+    assert!(
+        metrics_lines
+            .iter()
+            .any(|l| l.contains("no find on its bucket collection") && l.contains("server_code=13")),
+        "the time-series collection is not reported as not readable: {metrics_lines:?}"
+    );
     // The deep value is beyond the walk bound; the view is never read.
     assert!(!found.iter().any(|k| k.1 == "deep"), "{found:?}");
     assert!(!found.iter().any(|k| k.1 == "people_view"), "{found:?}");
@@ -651,7 +696,6 @@ async fn probes() {
         .unwrap();
     assert_eq!(people.estimated_rows(), Some(PEOPLE as u64));
     assert!(people.sampled() <= 200);
-    let text = logs.text();
     assert!(text.contains("view (runs its pipeline)"), "{text}");
     assert!(
         !text.contains("@example."),
@@ -717,13 +761,40 @@ async fn probes() {
             code.as_str()
         );
     }
-    // The minimal role is not.
+    // The minimal role is not; its unreadable time-series collection is
+    // reported as not covered.
     let (_dir, t) = target(&url, MIN_USER, IT_PASSWORD, "admin");
     let h = MongodbConnector::new().check(&t).await;
     assert!(
         codes(&h.notes).iter().all(|c| !c.starts_with("privilege.")),
         "{:?}",
         h.notes
+    );
+    let ts = h
+        .notes
+        .iter()
+        .find(|n| n.code() == NoteCode::CoverageTimeseriesNotReadable);
+    assert_eq!(ts.and_then(TargetNote::count), Some(1), "{:?}", h.notes);
+
+    // With the optional time-series grant, the time-series collection is
+    // read (through its view, `find` with a limit) and is no longer
+    // reported; the grant is not over-privilege.
+    let (_dir, t) = target(&url, BUCKETS_USER, IT_PASSWORD, "admin");
+    let (r, findings) = scan(&t).await;
+    r.unwrap();
+    let found = located(&findings);
+    assert!(
+        found
+            .iter()
+            .any(|k| k.0 == PROBE_DB && k.1 == "metrics" && k.2 == "owner" && k.3 == "pii.email"),
+        "{found:?}"
+    );
+    let h = MongodbConnector::new().check(&t).await;
+    let got = codes(&h.notes);
+    assert!(got.iter().all(|c| !c.starts_with("privilege.")), "{got:?}");
+    assert!(
+        !got.contains(&NoteCode::CoverageTimeseriesNotReadable.as_str()),
+        "{got:?}"
     );
 
     // An account without SCRAM-SHA-256 credentials cannot be used.

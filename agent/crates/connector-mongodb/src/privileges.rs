@@ -86,12 +86,25 @@ pub(crate) struct PrivilegeReport {
     pub(crate) cluster_actions: BTreeSet<String>,
     pub(crate) any_database: bool,
     pub(crate) system_collections: bool,
+    /// Databases whose time-series bucket collections the account can
+    /// `find` (`system_buckets` resources; `""` is every database), the
+    /// optional time-series grant of ADR-0026. Not over-privilege.
+    pub(crate) bucket_find: BTreeSet<String>,
+    /// `find` on every resource (`anyResource`).
+    pub(crate) bucket_find_any: bool,
 }
 
 enum Resource<'a> {
     Cluster,
     Any,
-    Namespace { db: &'a str, collection: &'a str },
+    Namespace {
+        db: &'a str,
+        collection: &'a str,
+    },
+    /// The bucket collections of a database's time-series collections.
+    Buckets {
+        db: &'a str,
+    },
 }
 
 fn resource<'a>(doc: Doc<'a>) -> Result<Option<Resource<'a>>, Malformed> {
@@ -106,8 +119,10 @@ fn resource<'a>(doc: Doc<'a>) -> Result<Option<Resource<'a>>, Malformed> {
     let buckets = doc.str("system_buckets")?;
     Ok(match (db, collection, buckets) {
         (Some(db), Some(collection), _) => Some(Resource::Namespace { db, collection }),
-        // Time-series buckets: the collection's own data.
-        (Some(db), None, Some(_)) => Some(Resource::Namespace { db, collection: "" }),
+        // Time-series buckets: the collections' own data. A privilege on
+        // the buckets of one named collection counts like one on all of
+        // them (the connector does not track them per collection).
+        (Some(db), None, Some(_)) => Some(Resource::Buckets { db }),
         _ => None,
     })
 }
@@ -212,6 +227,23 @@ impl PrivilegeReport {
                 Some(Resource::Any) | None => {
                     self.any_database = true;
                     self.system_collections = true;
+                    if *action == "find" && resource.is_some() {
+                        self.bucket_find_any = true;
+                    }
+                    if beyond {
+                        self.read_beyond.insert((*action).to_owned());
+                    }
+                }
+                Some(Resource::Buckets { db }) => {
+                    if db.is_empty() {
+                        self.any_database = true;
+                    }
+                    if is_system_database(db) {
+                        self.system_collections = true;
+                    }
+                    if *action == "find" {
+                        self.bucket_find.insert((*db).to_owned());
+                    }
                     if beyond {
                         self.read_beyond.insert((*action).to_owned());
                     }
@@ -231,9 +263,20 @@ impl PrivilegeReport {
         }
     }
 
-    /// Whether the account holds the Discovery grant only.
+    /// Whether the account holds the Discovery grant only (with or
+    /// without the optional time-series grant).
     pub(crate) fn is_minimal(&self) -> bool {
-        self == &Self::default()
+        self.write_actions.is_empty()
+            && self.read_beyond.is_empty()
+            && self.cluster_actions.is_empty()
+            && !self.any_database
+            && !self.system_collections
+    }
+
+    /// Whether the account can read the time-series collections of `db`
+    /// (`find` on their bucket collections).
+    pub(crate) fn can_read_buckets(&self, db: &str) -> bool {
+        self.bucket_find_any || self.bucket_find.contains("") || self.bucket_find.contains(db)
     }
 
     /// The report as closed notes (counts only).
@@ -411,6 +454,36 @@ mod tests {
         // Admin database access.
         let r = report(vec![privilege(ns("admin", ""), &["find"])]);
         assert_eq!(codes(&r), [("privilege.system_collections", None)]);
+    }
+
+    #[test]
+    fn the_time_series_grant_is_not_over_privilege() {
+        let buckets = |db: &str| DocBuf::new().str("db", db).str("system_buckets", "");
+        let r = report(vec![
+            privilege(ns("app", ""), &["find", "listCollections"]),
+            privilege(buckets("app"), &["find"]),
+        ]);
+        assert!(r.is_minimal(), "{r:?}");
+        assert!(r.notes().is_empty());
+        assert!(r.can_read_buckets("app") && !r.can_read_buckets("crm"));
+        // The Discovery role alone cannot read time-series collections.
+        let r = report(vec![privilege(ns("app", ""), &["find", "listCollections"])]);
+        assert!(!r.can_read_buckets("app"));
+        // Bucket privileges on every database, or other actions on them.
+        let r = report(vec![privilege(buckets(""), &["find", "changeStream"])]);
+        assert!(r.can_read_buckets("crm"));
+        assert_eq!(
+            codes(&r),
+            [
+                ("privilege.read_beyond_discovery", Some(1)),
+                ("privilege.any_database", None)
+            ]
+        );
+        let r = report(vec![privilege(
+            DocBuf::new().bool("anyResource", true),
+            &["find"],
+        )]);
+        assert!(r.can_read_buckets("app"));
     }
 
     #[test]

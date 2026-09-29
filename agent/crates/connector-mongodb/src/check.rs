@@ -51,6 +51,10 @@ pub(crate) struct Report {
     pub(crate) databases: usize,
     pub(crate) views: u64,
     pub(crate) other_kinds: u64,
+    /// Time-series collections the account cannot read (no `find` on
+    /// their bucket collections); counted only when the privileges are
+    /// known.
+    pub(crate) timeseries_unreadable: u64,
     /// Databases beyond [`MAX_CHECKED_DATABASES`], or listings cut.
     pub(crate) coverage_truncated: bool,
 }
@@ -61,6 +65,12 @@ impl Report {
         let mut out = self.privileges.notes();
         if self.views > 0 {
             out.push(TargetNote::new(NoteCode::CoverageViewsNotSampled).with_count(self.views));
+        }
+        if self.timeseries_unreadable > 0 {
+            out.push(
+                TargetNote::new(NoteCode::CoverageTimeseriesNotReadable)
+                    .with_count(self.timeseries_unreadable),
+            );
         }
         out
     }
@@ -77,6 +87,13 @@ impl Report {
         }
         if self.databases == 0 {
             out.push("the account holds privileges on no database: nothing to scan".to_owned());
+        }
+        if self.timeseries_unreadable > 0 {
+            out.push(format!(
+                "not covered: {} time-series collection(s) not readable (no find on their \
+                 bucket collections, the optional system_buckets grant of ADR-0026)",
+                self.timeseries_unreadable
+            ));
         }
         if self.views > 0 || self.other_kinds > 0 {
             out.push(format!(
@@ -258,6 +275,11 @@ pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(
                     match c.kind {
                         CollKind::View => r.views += 1,
                         CollKind::Other => r.other_kinds += 1,
+                        CollKind::Timeseries
+                            if r.privileges_known && !r.privileges.can_read_buckets(db) =>
+                        {
+                            r.timeseries_unreadable += 1;
+                        }
                         CollKind::Collection | CollKind::Timeseries => {}
                     }
                 }
@@ -398,6 +420,7 @@ mod tests {
             NoteCode::CheckTimedOut,
             NoteCode::SecurityTlsDisabled,
             NoteCode::CoverageViewsNotSampled,
+            NoteCode::CoverageTimeseriesNotReadable,
             NoteCode::PrivilegeWriteActions,
             NoteCode::PrivilegeReadBeyondDiscovery,
             NoteCode::PrivilegeClusterActions,

@@ -30,6 +30,16 @@ db.getSiblingDB("admin").createUser({
 });
 ```
 
+Time-series collections are read through their bucket collections
+(`system.buckets.*`), which `collection: ""` does not cover. To scan them,
+add this privilege to the role (it reads their own documents only, and is
+not reported as over-privilege); without it, they are counted as not
+readable and `check()` reports `coverage.timeseries_not_readable`:
+
+```js
+{ resource: { db: "app", system_buckets: "" }, actions: ["find"] }
+```
+
 `collection: ""` covers the database's collections except `system.*`. The
 connector needs nothing else: databases and collections are listed with
 `authorizedDatabases` / `authorizedCollections`, the size estimate is a
@@ -71,6 +81,7 @@ the primary); the connector never contacts the other members.
 
 - Views (their pipeline is never run), `system.*` and queryable-encryption
   state collections, and the `admin`, `local` and `config` databases.
+- Time-series collections without the optional `system_buckets` grant.
 - Collections the account holds no privilege on: with `authorizedCollections`
   they are not listed, so they cannot be counted as not covered.
 - Document parts beyond the walk bounds: nesting deeper than 20 levels,

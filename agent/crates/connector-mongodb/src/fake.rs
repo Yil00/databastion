@@ -995,3 +995,54 @@ async fn seed_recall_over_the_wire() {
         "findings outside the ground truth: {extra:?}"
     );
 }
+
+/// Time-series collections are read through their bucket collections: the
+/// Discovery role alone cannot read them, and `check()` reports them;
+/// with the optional `system_buckets` grant, they are not reported.
+#[tokio::test]
+async fn unreadable_time_series_collections_are_reported() {
+    let discovery = || {
+        DocBuf::new()
+            .doc(
+                "resource",
+                DocBuf::new().str("db", "app").str("collection", ""),
+            )
+            .array_str("actions", &["find", "listCollections"])
+            .finish()
+    };
+    let buckets = DocBuf::new()
+        .doc(
+            "resource",
+            DocBuf::new().str("db", "app").str("system_buckets", ""),
+        )
+        .array_str("actions", &["find"])
+        .finish();
+    for (privileges, expected) in [
+        (vec![discovery()], Some(1)),
+        (vec![discovery(), buckets], None),
+    ] {
+        let script = Script {
+            databases: vec![(
+                "app".to_owned(),
+                vec![
+                    FakeColl::new("users", Vec::new()),
+                    FakeColl {
+                        kind: "timeseries",
+                        ..FakeColl::new("metrics", Vec::new())
+                    },
+                ],
+            )],
+            privileges,
+            ..Script::default()
+        };
+        let (s, _) = session(script, PASSWORD).await;
+        let mut s = s.unwrap();
+        let r = crate::check::report(&mut s).await.unwrap();
+        assert!(r.privileges.is_minimal());
+        let note = r
+            .notes()
+            .into_iter()
+            .find(|n| n.code() == databastion_core::NoteCode::CoverageTimeseriesNotReadable);
+        assert_eq!(note.and_then(|n| n.count()), expected);
+    }
+}

@@ -166,6 +166,8 @@ pub enum NoteCode {
     CoverageRemoteEngineTables,
     /// `coverage.schemas_without_usage`.
     CoverageSchemasWithoutUsage,
+    /// `coverage.timeseries_not_readable`.
+    CoverageTimeseriesNotReadable,
     /// `coverage.views_not_sampled`.
     CoverageViewsNotSampled,
     /// `privilege.any_database`.
@@ -247,6 +249,7 @@ impl NoteCode {
         Self::CoverageRelationsWithoutSelect,
         Self::CoverageRemoteEngineTables,
         Self::CoverageSchemasWithoutUsage,
+        Self::CoverageTimeseriesNotReadable,
         Self::CoverageViewsNotSampled,
         Self::PrivilegeAnyDatabase,
         Self::PrivilegeBeyondSelect,
@@ -305,6 +308,7 @@ impl NoteCode {
             Self::CoverageRelationsWithoutSelect => "coverage.relations_without_select",
             Self::CoverageRemoteEngineTables => "coverage.remote_engine_tables",
             Self::CoverageSchemasWithoutUsage => "coverage.schemas_without_usage",
+            Self::CoverageTimeseriesNotReadable => "coverage.timeseries_not_readable",
             Self::CoverageViewsNotSampled => "coverage.views_not_sampled",
             Self::PrivilegeAnyDatabase => "privilege.any_database",
             Self::PrivilegeBeyondSelect => "privilege.beyond_select",
