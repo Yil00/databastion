@@ -14,6 +14,10 @@ import { enqueueSystemAlert } from "./notifications";
  * to the channels flagged `system_alerts` and are recorded in `security_events` (insert-only for
  * the runtime role: a compromised console cannot erase them), not in `incidents`, which only hold
  * what policies raise (ADR-0014: policy snapshot, dedup key, column grants).
+ *
+ * P7 (#75 review L4): besides the per-agent bounds below, every system alert is charged to a global
+ * budget per channel and hour (`enqueueSystemAlert`, `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR`); the
+ * overflow is summed up in one digest per channel and hour.
  */
 
 const log = logger.child({ component: "system-alerts" });

@@ -156,6 +156,16 @@ export const agents = pgTable(
     droppedBatchesUnalerted: integer("dropped_batches_unalerted").notNull().default(0),
     droppedBatchesSince: tsz("dropped_batches_since"),
     droppedBatchesAlertedAt: tsz("dropped_batches_alerted_at"),
+    /**
+     * P7 "Audit stream stopped" alert (ADR-0031 decision 3, end-of-phase-6 review M2): the highest
+     * number of targets reporting the note `audit.stream_stopped` in one heartbeat since the last
+     * alert (every heartbeat counts, not only the first: the alert is repeated every hour while a
+     * stream stays stopped); when the first of them was seen; when the last alert was raised (at
+     * most one per agent and hour, see `src/server/audit-stream-alerts.ts`).
+     */
+    auditStreamStopsUnalerted: integer("audit_stream_stops_unalerted").notNull().default(0),
+    auditStreamStopsSince: tsz("audit_stream_stops_since"),
+    auditStreamStopsAlertedAt: tsz("audit_stream_stops_alerted_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),
   },
@@ -658,6 +668,60 @@ export const notificationDeliveries = pgTable(
       .where(sql`${t.lastError} = 'rate_limited'`),
     check("notification_deliveries_attempts", sql`${t.attempts} >= 0`),
     check("notification_deliveries_last_error_format", sql`${t.lastError} ~ '^[a-z0-9_]{1,64}$'`),
+  ],
+);
+
+/**
+ * Global hourly budget of system alerts per channel (P7, #75 review L4): one row per (channel, UTC
+ * clock hour), `sent` = the system-alert deliveries queued to that channel in that hour. Counted
+ * by a conditional upsert in the transaction that queues the alert (`enqueueSystemAlert` in
+ * `src/server/notifications.ts`), so concurrent web and worker processes never exceed the budget.
+ * No agent data: a channel id, an hour and a count. Rows of past hours are pruned by the worker.
+ * The runtime role reads, inserts, updates and deletes them (migration `0033`).
+ */
+export const systemAlertBudgets = pgTable(
+  "system_alert_budgets",
+  {
+    channelId: uuid("channel_id")
+      .notNull()
+      .references(() => notificationChannels.id, { onDelete: "cascade" }),
+    windowStart: tsz("window_start").notNull(),
+    sent: integer("sent").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.channelId, t.windowStart] }),
+    index("system_alert_budgets_window_idx").on(t.windowStart),
+    check("system_alert_budgets_sent", sql`${t.sent} >= 0`),
+  ],
+);
+
+/**
+ * Per-agent share of the hourly budget of system alerts (P7, PR #81 security review M1): one row
+ * per (channel, agent, UTC clock hour), `sent` = the system alerts of that agent charged to the
+ * channel in that hour. An agent may use at most `max(2, ceil(limit / 4))` of a channel's budget, so
+ * one compromised or misbehaving agent cannot spend the budget of the others. Charged by the same
+ * conditional upsert as `system_alert_budgets`, before it, in the transaction that queues the
+ * alert. Pruned with it. Runtime role: SELECT, INSERT, UPDATE, DELETE (migration `0036`).
+ */
+export const systemAlertAgentBudgets = pgTable(
+  "system_alert_agent_budgets",
+  {
+    channelId: uuid("channel_id")
+      .notNull()
+      .references(() => notificationChannels.id, { onDelete: "cascade" }),
+    /**
+     * No foreign key on purpose: its check would take a KEY SHARE lock on the agent row after this
+     * row is inserted, and deadlock with a heartbeat that holds the agent row and charges the same
+     * row. Rows live two hours at most (pruned by the worker).
+     */
+    agentId: uuid("agent_id").notNull(),
+    windowStart: tsz("window_start").notNull(),
+    sent: integer("sent").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.channelId, t.agentId, t.windowStart] }),
+    index("system_alert_agent_budgets_window_idx").on(t.windowStart),
+    check("system_alert_agent_budgets_sent", sql`${t.sent} >= 0`),
   ],
 );
 

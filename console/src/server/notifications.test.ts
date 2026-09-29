@@ -195,6 +195,9 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
     channelTestsPerChannel.clear();
     process.env.DATABASTION_ALERTING_INSECURE_DEV = "1";
     process.env.DATABASTION_PUBLIC_URL = ORIGIN;
+    // The silent-agent checks at fake times also alert the agents of earlier tests: the global
+    // budget of system alerts is tested in system-alert-budget.test.ts, not here.
+    process.env.DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR = "10000";
     await getDb().delete(policies);
     await getDb().delete(notificationChannels);
     await drainPolicyWork(getDb());
@@ -204,6 +207,7 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
   afterEach(() => {
     notificationClock.now = null;
     delete process.env.DATABASTION_NOTIFY_MAX_PER_HOUR;
+    delete process.env.DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR;
     delete process.env.DATABASTION_ALERTING_INSECURE_DEV;
     delete process.env.DATABASTION_PUBLIC_URL;
   });

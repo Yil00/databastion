@@ -6,7 +6,8 @@ import { validateSchema } from "@/lib/protocol/validate";
  * closed labels, never free text. The console stores the notes of the latest heartbeat per target
  * and renders each one from the phrase catalog generated from `shared/protocol/target-notes.json`
  * (`TARGET_NOTE_REGISTRY`, descriptions with `{count}` and `{labels}` placeholders). The console
- * never derives a decision from notes.
+ * derives one decision from notes: the system alert on `audit.stream_stopped` (ADR-0031 decision
+ * 3, `src/server/audit-stream-alerts.ts`); nothing else.
  *
  * Rendering rules (docs/09-agent-protocol.md, "Heartbeat"):
  * - the template is looked up with `Object.hasOwn`, so `__proto__`, `constructor` or `toString`

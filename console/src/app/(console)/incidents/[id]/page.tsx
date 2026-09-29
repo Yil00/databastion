@@ -9,6 +9,7 @@ import { IncidentStatusBadge, SeverityBadge } from "@/components/console/inciden
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
+import { isFingerprint, locationPartLabels } from "@/lib/location-labels";
 import { incidentEventCount, incidentEventViews } from "@/server/events";
 import { getFindingView } from "@/server/findings";
 import { getIncident } from "@/server/incidents";
@@ -91,10 +92,10 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                   {access.overflow ? (
                     "several: the policy reached its hourly limit of new incidents, the further matches of the hour are counted here"
                   ) : (
-                    <PrincipalLabel principal={access.principal} fingerprinted={access.principal.startsWith("hmac-sha256:")} />
+                    <PrincipalLabel principal={access.principal} fingerprinted={isFingerprint(access.principal)} engine={incident.engine} />
                   )}
                 </dd>
-                <dt className="text-muted-foreground">Database</dt>
+                <dt className="text-muted-foreground first-letter:uppercase">{locationPartLabels(incident.engine).database}</dt>
                 <dd>
                   {access.database ?? "none"}{" "}
                   <span className="text-muted-foreground">

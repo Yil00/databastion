@@ -8,6 +8,7 @@ import {
   CLASSIFIER_WEIGHTS,
   classifierWeight,
   dedupObject,
+  dedupPrincipal,
   EMPTY_BASELINE,
   eventBucket,
   eventDedupKey,
@@ -21,6 +22,8 @@ import {
   SENSITIVITY_CAP,
   severeEvent,
   updateBaseline,
+  worseThanClosed,
+  worseThanFalsePositive,
   baselineVerdict,
   type BaselineState,
   type EventFacts,
@@ -283,6 +286,35 @@ describe("dedup scope", () => {
       bucket: new Date("2026-09-28T14:00:00Z"),
     });
     expect(key).toBe(`policy:p1|agent:${FACTS.agentId}|target:pg-prod-1|principal:${"a".repeat(64)}|database:-|hour:2026-09-28T14:00:00.000Z`);
+  });
+
+  it("principal part: coarse for failed logins only, else the principal key (ADR-0031 decision 1)", () => {
+    const net = "n".repeat(64);
+    const pk = "a".repeat(64);
+    expect(dedupPrincipal({ action: "auth_failure", principalKey: pk, networkHash: net })).toBe(`unknown:${net}`);
+    for (const action of ["read", "write", "connect", "ddl", "dcl"]) expect(dedupPrincipal({ action, principalKey: pk, networkHash: net })).toBe(pk);
+  });
+
+  it("after a false positive only a new signature signal or a strictly higher score is worse (end-of-phase-6 M1)", () => {
+    const fp = { eventScore: 10, eventSignals: ["signature.pg_dump", "shape.full_table_copy"] };
+    const e = { score: 10, anomaly: true, signals: ["signature.pg_dump", "shape.full_table_read"] };
+    // Same score, a new non-signature signal, above the baseline: still covered by the judgement.
+    expect(worseThanFalsePositive(fp, e)).toBe(false);
+    expect(worseThanFalsePositive(fp, { ...e, score: 10.01 })).toBe(true);
+    expect(worseThanFalsePositive(fp, { ...e, signals: ["signature.copy_to_program"] })).toBe(true);
+    expect(worseThanFalsePositive({ eventScore: null, eventSignals: null }, { score: 0, signals: [] })).toBe(false);
+    // Anti-splitting: the rows linked since the false positive (this event's included) above the
+    // rows the incident had when judged.
+    const judged = { ...fp, eventRows: 1000 };
+    expect(worseThanFalsePositive(judged, { score: 1, signals: [] }, 1000)).toBe(false);
+    expect(worseThanFalsePositive(judged, { score: 1, signals: [] }, 1001)).toBe(true);
+    expect(worseThanFalsePositive({ ...fp, eventRows: null }, { score: 1, signals: [] }, 0)).toBe(false);
+    expect(worseThanClosed({ ...judged, eventAnomaly: false, status: "false_positive" }, { score: 1, anomaly: false, signals: [] }, 1500)).toBe(true);
+    const closed = { ...fp, eventAnomaly: false };
+    expect(worseThanClosed({ ...closed, status: "false_positive" }, e)).toBe(false);
+    // A resolved incident keeps its wider rule (a new signal or the baseline verdict count).
+    expect(worseThanClosed({ ...closed, status: "resolved" }, e)).toBe(true);
+    expect(worseThanClosed({ ...closed, status: "open" }, { ...e, score: 1000 })).toBe(false);
   });
 
   it("picks the most sensitive retained object, the first on a tie", () => {
