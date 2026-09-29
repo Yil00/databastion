@@ -304,9 +304,18 @@ impl EventBuilder {
     /// The event of one statement, if any (see the module documentation).
     pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
         let opaque = a.opaque || a.text.is_some_and(|t| std::str::from_utf8(t).is_err());
-        let analysis: Option<QueryAnalysis> = a
-            .text
-            .map(|t| analyze_raw(t, analyze_opts(a.truncated).opaque(a.opaque)));
+        let analysis: Option<QueryAnalysis> = a.text.map(|t| {
+            // performance_schema texts come transcoded to utf8mb4 by the
+            // server: the multibyte trail-byte guard is for raw client
+            // bytes (audit log files) only.
+            let transcoded = a.source == EventSource::PerformanceSchema;
+            analyze_raw(
+                t,
+                analyze_opts(a.truncated)
+                    .opaque(a.opaque)
+                    .transcoded(transcoded),
+            )
+        });
         let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
         let parsed = !parts.is_empty();
         if let Some(app) = a.application {
@@ -320,8 +329,12 @@ impl EventBuilder {
         }
         let outfile = parts.iter().any(|p| p.outfile);
         // A failed statement is skipped only when it failed before reading
-        // anything (and sent no row); an INTO OUTFILE attempt is kept.
-        if a.status != 0 && a.rows.unwrap_or(0) == 0 {
+        // anything (and sent no row); an INTO OUTFILE attempt is kept. A
+        // statement with table read records read something whatever its
+        // error says (`SIGNAL … SET MYSQL_ERRNO = 1146` in a function after
+        // rows were sent): never skipped.
+        let read_records = a.tables.iter().any(|t| t.2 == TableOp::Read);
+        if a.status != 0 && a.rows.unwrap_or(0) == 0 && !read_records {
             let pre = PRE_EXECUTION_ERRORS.contains(&a.status) && !outfile;
             if PARSE_ERRORS.contains(&a.status) || pre {
                 self.failed += 1;
@@ -955,6 +968,65 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(ev.unwrap().rows(), Some(99));
+    }
+
+    #[test]
+    fn failed_statements_with_read_records_are_reported() {
+        // A function SIGNALs 1146 after rows were sent: the TABLE records
+        // show what was read.
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                "20260929 09:41:34,h,app,10.0.0.5,37,1,READ,hr,employees,",
+                "20260929 09:41:34,h,app,10.0.0.5,37,1,QUERY,hr,'select email, leak() from employees',1146",
+                // A genuine unknown table: no TABLE record, skipped.
+                "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,hr,'select * from nope',1146",
+            ]),
+        );
+        assert_eq!(
+            out,
+            ["read [\"hr.employees\"] None [\"shape.full_table_read\"]"],
+            "{out:#?}"
+        );
+        assert_eq!(b.failed, 1);
+    }
+
+    #[test]
+    fn transcoded_texts_keep_non_ascii_names() {
+        let mut b = EventBuilder::new(own());
+        let text = "SELECT * FROM `hr` . `\u{5ba2}\u{6237}`";
+        let access = |source| Access {
+            session: "t1".into(),
+            user: "app",
+            principal: EventPrincipal::account("app"),
+            client: ClientSeen::Logged(None),
+            application: None,
+            database: "hr",
+            text: Some(text.as_bytes()),
+            opaque: false,
+            truncated: false,
+            tables: Vec::new(),
+            rows: Some(3),
+            status: 0,
+            ts: SystemTime::now(),
+            source,
+        };
+        let ps = b
+            .statement(access(EventSource::PerformanceSchema), SystemTime::now())
+            .unwrap();
+        assert!(
+            ps.signals().contains(&Signal::FullTableRead),
+            "{}",
+            show(&ps)
+        );
+        assert!(!show(&ps).contains("hr.*"), "{}", show(&ps));
+        // The same bytes from an audit log file: kind only, against `*`.
+        let file_ev = b
+            .statement(access(EventSource::MariadbServerAudit), SystemTime::now())
+            .unwrap();
+        assert!(show(&file_ev).contains("hr.*"), "{}", show(&file_ev));
+        assert!(file_ev.signals().is_empty());
     }
 
     #[test]

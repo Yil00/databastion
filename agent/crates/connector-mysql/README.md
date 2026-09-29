@@ -95,7 +95,11 @@ backtick (0x60) can be the second byte of a two-byte character, which the
 server reads as part of the character and a byte-level lexer as an escape
 or a quote. Statement texts are kept as raw bytes: text that is not UTF-8,
 or that has a byte >= 0x80 directly followed by 0x5c or 0x60, keeps only
-its statement kind (the event names `*`), never names. A JSON record that
+its statement kind (the event names `*`), never names. The second rule
+does not apply to `performance_schema` texts, which the server has already
+transcoded to UTF-8 (read through a utf8mb4 connection), so non-ASCII
+identifiers stay readable there; on the audit log files it applies to any
+such pair, UTF-8 or not. A JSON record that
 is not UTF-8 (a latin1 client) is parsed from a lossy decoding with its
 text treated the same way, instead of being dropped.
 
@@ -118,7 +122,13 @@ another tool does not send); chunked reads
 statement padded past `server_audit_query_log_limit` or the
 `performance_schema` text limit (the cut text gives no shape). Volumes
 (`performance_schema`) and the console's volume × sensitivity score do not
-depend on these.
+depend on these. On the audit log files, a client can also strip every
+text-derived signal (`signature.*`, `shape.*`) from its statement by adding
+a non-ASCII character just before a backslash or a backtick (`` 1 AS `é` ``,
+`/* é\ */`): the statement keeps only its kind (the multibyte rule above),
+so it is still reported, against `*`, but without signals. The
+`server_audit` TABLE records still name the tables; the Percona
+`audit_log_filter` `table_access` records too.
 
 ## Known limits
 
@@ -181,11 +191,15 @@ depend on these.
   dropped (not parsable, oversized, damaged) are counted and shown by
   `check()` for 24 h.
 - **Failed statements** are skipped only when the server refused them
-  before reading anything and they sent no row: a syntax error (1064,
+  before reading anything, they sent no row, and (audit log files) the log
+  has no table read record for them: a syntax error (1064,
   1149; never an event), an unknown database, table or column (1049, 1051,
   1054, 1109, 1146), an ambiguous or duplicate name (1052, 1066), access
   denied (1044, 1142, 1143, 1227, 1370) or an unknown routine (1305);
-  `INTO OUTFILE` attempts are kept. Any other failure (a timeout or kill
+  `INTO OUTFILE` attempts are kept. The table-read condition closes an
+  evasion: a function can `SIGNAL SQLSTATE … SET MYSQL_ERRNO = 1146` after
+  rows were sent; the log's READ / `table_access` records show the read,
+  so the statement is reported (a genuine 1146 has no such record). Any other failure (a timeout or kill
   after rows were sent, 3024, 1317…), and on `performance_schema` any
   statement with `ROWS_SENT > 0`, is reported. Session state (snapshot,
   `SHOW CREATE TABLE`) is only recorded from statements that succeeded. Failed connections become `auth_failure` events with a
