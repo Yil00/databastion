@@ -188,12 +188,20 @@ review remain the primary controls.
   `<= 0` are ignored. The heartbeat runs the targets' `check()`
   concurrently under one 10 s deadline, so it waits at most 10 s for all of
   them (P2-G); targets reaching the same account (engine, host or socket,
-  port, account) are checked one at a time, to stay within the ADR-0018
-  `MAX_USER_CONNECTIONS` budget. A check still running or waiting for its
+  port, account) are checked one at a time, so an account holds at most one
+  check next to one scan; Audit streams hold their own connections outside
+  these turns (sizing in ADR-0025 decision 11). A check still running or waiting for its
   turn at the deadline is reported unreachable with `timeout` and the
   `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
+- Access event timestamps (`ts`, `ts_last`) come from the target's audit
+  records and are clamped to the agent clock when the events are spooled, so
+  a target clock running ahead cannot make the console reject a batch as
+  future-dated (`formatMaximum`). The agent clock itself must stay within
+  5 min of the console's: run NTP on the agent host. Batches spooled by an
+  older agent are resent unchanged; after an upgrade, their future-dated
+  items can still be rejected once (only those items are dropped).
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
   `deny.toml` sets `[graph] exclude-dev = true`: the hyper `server` feature
   it needs is never linked into the binary, and the bans stay strict for

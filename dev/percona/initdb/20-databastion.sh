@@ -13,7 +13,7 @@ databastion_percona() {
   "${mysql[@]}" < /usr/share/percona-server/audit_log_filter_linux_install.sql
   "${mysql[@]}" <<EOSQL
 CREATE USER 'databastion'@'%' IDENTIFIED WITH caching_sha2_password BY '${pw}'
-  REQUIRE SSL WITH MAX_USER_CONNECTIONS 4;
+  REQUIRE SSL WITH MAX_USER_CONNECTIONS 5;
 GRANT SELECT ON hr.* TO 'databastion'@'%';
 SELECT audit_log_filter_set_filter('log_all', '{"filter": {"log": true}}');
 SELECT audit_log_filter_set_filter('log_none', '{"filter": {"log": false}}');

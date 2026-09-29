@@ -556,7 +556,7 @@ role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-p
 # grant of pg_read_all_data / pg_monitor or of a write-capable role would otherwise pass
 # (default_transaction_read_only is only a session default). The role settings (every database)
 # must be exactly the four ADR-0012 defaults.
-expected_role="t,f,f,f,f,f,4,f,f,t,t,pg_read_all_stats"
+expected_role="t,f,f,f,f,f,5,f,f,t,t,pg_read_all_stats"
 expected_role+=",default_transaction_read_only=on+idle_in_transaction_session_timeout=60s"
 expected_role+="+lock_timeout=2s+statement_timeout=30s"
 [ "$role" = "$expected_role" ] || fail "databastion_agent has unexpected attributes: $role"
@@ -599,7 +599,7 @@ unset role expected_role ro grants
 # MySQL / MariaDB agent accounts: ADR-0018 minimal variant (dev/{mysql,mariadb}/initdb/
 # 20-databastion.sh; ADR-0020). Inspected as root, whose password is read inside the target from its
 # Docker secret (never on a command line). Exactly USAGE on *.* and SELECT on the application
-# database, REQUIRE SSL, MAX_USER_CONNECTIONS 4 (MariaDB: MAX_STATEMENT_TIME 30), no role, no other
+# database, REQUIRE SSL, MAX_USER_CONNECTIONS 5 (MariaDB: MAX_STATEMENT_TIME 30), no role, no other
 # account named `databastion`; a session without TLS is refused.
 # my_sql SERVICE CLIENT SQL: runs SQL as root in SERVICE, one row per line, tab-separated.
 my_sql() {
@@ -637,12 +637,12 @@ my_agent_login() {
     'MYSQL_PWD="$(cat /run/secrets/agent_password)" exec '"$2"' -h 127.0.0.1 -u databastion '"$3"' -N -e "SELECT 1"'
 }
 log "checking the agents' MySQL / MariaDB accounts (ADR-0018 minimal variant, read-only: I4)"
-check_my_account target-mysql mysql hr "ANY	4	0	0" \
+check_my_account target-mysql mysql hr "ANY	5	0	0" \
   "SELECT ssl_type, max_user_connections,
      (SELECT count(*) FROM mysql.user WHERE user = 'databastion') - 1,
      (SELECT count(*) FROM mysql.role_edges WHERE to_user = 'databastion')
    FROM mysql.user WHERE user = 'databastion' AND host = '%'" --ssl-mode=REQUIRED --ssl-mode=DISABLED
-check_my_account target-mariadb mariadb support "ANY	4	30.000000	0	0" \
+check_my_account target-mariadb mariadb support "ANY	5	30.000000	0	0" \
   "SELECT ssl_type, max_user_connections, max_statement_time,
      (SELECT count(*) FROM mysql.user WHERE user = 'databastion') - 1,
      (SELECT count(*) FROM mysql.roles_mapping WHERE user = 'databastion')

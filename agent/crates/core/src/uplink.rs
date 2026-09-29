@@ -791,10 +791,11 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             accept_bytes,
         } => {
             let mut dropped = 0u64;
+            let now = std::time::SystemTime::now();
             let items: Vec<AccessEvent> = events
                 .iter()
                 .filter_map(|e| {
-                    let item = event_item(target_id, e, fingerprints);
+                    let item = event_item(target_id, e, fingerprints, now);
                     if item.is_none() {
                         dropped += 1;
                     }
@@ -814,10 +815,17 @@ fn timestamp(t: std::time::SystemTime) -> databastion_protocol::Timestamp {
 
 /// Converts a masked event (the protocol type is built here only, from
 /// the closed enums and normalized names of `MaskedEvent`).
+///
+/// `ts` and `ts_last` come from the target's own clock (audit records)
+/// and are clamped to the agent's clock `now`: a target clock running
+/// ahead would otherwise make the console reject the whole batch as
+/// future-dated (`formatMaximum`) and record an integrity event, losing
+/// every event of that target, whatever the connector.
 fn event_item(
     target_id: &TargetId,
     e: &MaskedEvent,
     fingerprints: &dyn sanitize::Fingerprinter,
+    now: std::time::SystemTime,
 ) -> Option<AccessEvent> {
     use databastion_classifiers::masking::{ClientAddr, EventAction};
     use databastion_protocol::{AccessEventAction, AuditSource, ObjectRef, Signal};
@@ -873,11 +881,11 @@ fn event_item(
         signals: (!signals.is_empty()).then_some(signals),
         source,
         target_id: target_id.clone(),
-        ts: timestamp(e.ts()),
+        ts: timestamp(e.ts().min(now)),
         ts_last: e
             .ts_last()
             .filter(|_| e.aggregated_count() > 1)
-            .map(timestamp),
+            .map(|t| timestamp(t.min(now))),
     })
 }
 
@@ -1000,6 +1008,63 @@ fn pack_events(items: Vec<AccessEvent>, accept_bytes: bool) -> Built {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoFingerprints;
+    impl sanitize::Fingerprinter for NoFingerprints {
+        fn fingerprint(&self, _value: &str) -> Option<databastion_protocol::Fingerprint> {
+            None
+        }
+    }
+
+    #[test]
+    fn event_timestamps_are_clamped_to_the_agent_clock() {
+        use databastion_classifiers::masking::{
+            EventAction, EventObject, EventPrincipal, EventSource,
+        };
+        use databastion_classifiers::names::normalize_path;
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let target = TargetId::try_from("pg-main").unwrap();
+        let event = |ts: SystemTime| {
+            MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("backup"),
+                ts,
+            )
+            .with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path("customers"),
+            ))
+        };
+        let item = |e: &MaskedEvent| event_item(&target, e, &NoFingerprints, now).unwrap();
+        let at = |t: SystemTime| chrono::DateTime::<chrono::Utc>::from(t);
+
+        // Target clock 10 min ahead: both timestamps become the agent's now.
+        let ahead =
+            event(now + Duration::from_secs(600)).with_aggregate(3, now + Duration::from_secs(900));
+        let a = item(&ahead);
+        assert_eq!(a.ts.0, at(now));
+        assert_eq!(a.ts_last.map(|t| t.0), Some(at(now)));
+
+        // Only the last record is ahead: `ts` kept, `ts_last` clamped, never
+        // before `ts`.
+        let past = now - Duration::from_secs(60);
+        let partly = event(past).with_aggregate(3, now + Duration::from_secs(900));
+        let p = item(&partly);
+        assert_eq!(p.ts.0, at(past));
+        assert_eq!(p.ts_last.map(|t| t.0), Some(at(now)));
+
+        // Past timestamps are unchanged.
+        let normal = event(past).with_aggregate(2, past + Duration::from_secs(30));
+        let n = item(&normal);
+        assert_eq!(n.ts.0, at(past));
+        assert_eq!(
+            n.ts_last.map(|t| t.0),
+            Some(at(past + Duration::from_secs(30)))
+        );
+    }
 
     fn reply(status: u16, json: bool, body: &[u8]) -> Reply {
         Reply {

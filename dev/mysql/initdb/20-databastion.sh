@@ -12,7 +12,7 @@ databastion_agent_account() {
   pw="$(printf '%s' "$DATABASTION_DB_PASSWORD" | sed -e 's/\\/\\\\/g' -e "s/'/''/g")"
   docker_process_sql --database=mysql <<EOSQL
 CREATE USER 'databastion'@'%' IDENTIFIED WITH caching_sha2_password BY '${pw}'
-  REQUIRE SSL WITH MAX_USER_CONNECTIONS 4;
+  REQUIRE SSL WITH MAX_USER_CONNECTIONS 5;
 GRANT SELECT ON hr.* TO 'databastion'@'%';
 EOSQL
 }
