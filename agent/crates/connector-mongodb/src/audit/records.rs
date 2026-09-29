@@ -941,6 +941,10 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             Some(r)
         }
         t if AUDIT_DCL.contains(&t) => Some(base(Kind::Op(Cmd::Dcl))),
+        // An explicit logout, or (MongoDB 5.0+) the implicit one when the
+        // client disconnects: the endpoint's application name is
+        // forgotten (end-of-phase-5 review L4). No event.
+        "logout" => Some(base(Kind::Ended)),
         _ => None,
     })
 }
