@@ -38,6 +38,9 @@ const MARKER: &str = "needle-7Qz-FAKE";
 const COLLECTION: &str = "users";
 
 fn env_path(var: &str, key: &str) -> Option<PathBuf> {
+    // A dev log may belong to the test's own user (the tailer refuses it
+    // in production).
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
     match std::env::var(var) {
         Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
         _ => {

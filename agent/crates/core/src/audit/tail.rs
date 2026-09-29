@@ -18,6 +18,13 @@
 //! - Each poll reads at most [`MAX_POLL_BYTES`]; records are bounded by the
 //!   splitter. The path must be a regular file (checked before and after
 //!   opening, so a FIFO or a device is never read).
+//! - The file must **not be owned by the agent's own user** (effective
+//!   uid), checked on the opened handle, so after following symlinks
+//!   (end-of-phase-4 review L4): an audit log is written by the database
+//!   server; one the agent's user owns could have been written, or be
+//!   rewritten, by the agent's account itself, and would not be evidence
+//!   of what the server did. Such a file is refused like an unreadable one
+//!   (`PermissionDenied`: `audit.log_not_readable` in `check()`).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -294,10 +301,29 @@ pub struct Tailer {
     pub rotations: u64,
 }
 
+/// Test support only: accept log files owned by the agent's own user
+/// (every file a test creates is). Never set by the agent binary (checked
+/// by the architecture tests).
+static ALLOW_OWN_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test support only (see [`ALLOW_OWN_FILES`]): lets the tests of this
+/// crate and of the connectors tail files they created themselves.
+#[doc(hidden)]
+pub fn allow_agent_owned_logs_for_tests() {
+    ALLOW_OWN_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a file owned by `owner` is refused: it belongs to the agent's
+/// own (effective) user.
+fn owned_by_agent(owner: u32) -> bool {
+    owner == rustix::process::geteuid().as_raw()
+        && !ALLOW_OWN_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Opens the log without blocking (a FIFO or device planted at the path
 /// cannot block the open: `O_NONBLOCK`, `O_NOCTTY`), then checks the
-/// **handle** is a regular file (no stat-then-open race). Blocking I/O:
-/// call from a blocking thread.
+/// **handle** is a regular file (no stat-then-open race) not owned by the
+/// agent's own user. Blocking I/O: call from a blocking thread.
 fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailError> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
@@ -312,6 +338,13 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
         .map_err(|e| TailError::Unreadable(e.kind()))?;
     if !meta.file_type().is_file() {
         return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
+    }
+    if owned_by_agent(meta.uid()) {
+        tracing::warn!(
+            "audit log refused: the file is owned by the agent's own user; it must be written \
+             and owned by the database server (see the agent README, audit log files)"
+        );
+        return Err(TailError::Unreadable(std::io::ErrorKind::PermissionDenied));
     }
     Ok((file, meta.dev(), meta.ino(), meta.len()))
 }
@@ -520,6 +553,8 @@ mod tests {
     struct Dir(PathBuf);
     impl Dir {
         fn new(tag: &str) -> Self {
+            // The files of these tests are the test's own.
+            allow_agent_owned_logs_for_tests();
             let p = std::env::temp_dir().join(format!(
                 "databastion-tail-{tag}-{}-{}",
                 std::process::id(),

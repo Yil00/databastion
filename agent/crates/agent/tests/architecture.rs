@@ -342,3 +342,42 @@ fn only_core_depends_on_protocol_types() {
     }
     assert_eq!(dependents, ["databastion-core"]);
 }
+
+/// The tailer's test switch that accepts log files owned by the agent's
+/// own user (end-of-phase-4 review L4) is only called from test code: the
+/// connectors' integration-test modules (compiled under `#[cfg(test)]`)
+/// and the tests module of the tailer itself.
+#[test]
+fn agent_owned_logs_are_allowed_in_tests_only() {
+    const SWITCH: &str = "allow_agent_owned_logs_for_tests(";
+    const TEST_ONLY: [&str; 4] = [
+        "connector-postgres/src/it.rs",
+        "connector-mysql/src/it/audit_it.rs",
+        "connector-mongodb/src/it_audit.rs",
+        "core/tests/",
+    ];
+    for source in all_crate_sources() {
+        let text = fs::read_to_string(&source).unwrap();
+        let shown = source.display().to_string();
+        let calls: Vec<usize> = code_lines(&text)
+            .enumerate()
+            .filter(|(_, l)| l.contains(SWITCH) && !l.contains("fn "))
+            .map(|(i, _)| i)
+            .collect();
+        if calls.is_empty() {
+            continue;
+        }
+        if shown.ends_with("core/src/audit/tail.rs") {
+            // Only inside its `mod tests`.
+            let tests_at = code_lines(&text)
+                .position(|l| l.trim() == "mod tests {")
+                .expect("tail.rs has a tests module");
+            assert!(calls.iter().all(|i| *i > tests_at), "{shown}");
+            continue;
+        }
+        assert!(
+            TEST_ONLY.iter().any(|t| shown.contains(t)),
+            "{shown} calls {SWITCH}…) outside test code"
+        );
+    }
+}
