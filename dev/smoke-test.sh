@@ -58,6 +58,9 @@ check "agent account needs TLS" must_fail ex mariadb "$MARIADB --skip-ssl -e 'SE
 check "server_audit log records the query" retry 15 ex mariadb \
   "grep databastion /var/log/databastion/server_audit.log | grep -q tickets"
 check "audit log non-empty on the host" test -s .state/logs/mariadb/server_audit.log
+check "audit log readable on the host" test -r .state/logs/mariadb/server_audit.log
+check "performance_schema statement history active (events_statements_current on)" ex mariadb \
+  "MYSQL_PWD=\"\$MARIADB_ROOT_PASSWORD\" mariadb -u root -N -e \"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_statements_current'\" | grep -qx YES"
 
 echo "# MySQL + performance_schema"
 MYSQL='MYSQL_PWD="$DATABASTION_DB_PASSWORD" mysql -h 127.0.0.1 -u databastion -N'
@@ -66,11 +69,22 @@ check "read-only account cannot write" must_fail ex mysql "$MYSQL -e 'DELETE FRO
 check "agent account has no global privilege (mysql.user not readable)" \
   must_fail ex mysql "$MYSQL -e 'SELECT COUNT(*) FROM mysql.user'"
 check "agent account needs TLS" must_fail ex mysql "$MYSQL --ssl-mode=DISABLED -e 'SELECT 1'"
-# ADR-0018 minimal variant: the agent account has no performance_schema grant before Audit (P4-B);
-# the audit source itself is checked as root.
-MYSQL_ROOT='MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h 127.0.0.1 -u root -N'
-check "events_statements_history_long records the query" ex mysql \
-  "$MYSQL_ROOT -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE SQL_TEXT LIKE '%hr.employees%'\" | grep -Eq '^[1-9]'"
+# Audit (P4-B): MySQL Community's only source is performance_schema, granted to the agent account
+# for Audit (ADR-0018). The agent reads DIGEST_TEXT, never SQL_TEXT when a digest exists.
+check "agent account reads the statement digests (Audit grant)" ex mysql \
+  "$MYSQL -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE DIGEST_TEXT LIKE '%employees%'\" | grep -Eq '^[1-9]'"
+
+echo "# Percona Server + audit_log_filter (JSON)"
+PERCONA='MYSQL_PWD="$DATABASTION_DB_PASSWORD" mysql -h 127.0.0.1 -u databastion -N'
+check "read-only account can read" ex percona "$PERCONA -e 'SELECT COUNT(*) FROM hr.employees' | grep -Eq '^[1-9]'"
+check "read-only account cannot write" must_fail ex percona "$PERCONA -e 'DELETE FROM hr.employees WHERE id = -1'"
+check "agent account has no performance_schema grant" \
+  must_fail ex percona "$PERCONA -e 'SELECT COUNT(*) FROM performance_schema.events_statements_history_long'"
+check "agent account needs TLS" must_fail ex percona "$PERCONA --ssl-mode=DISABLED -e 'SELECT 1'"
+check "audit_log_filter writes JSON" ex percona "$PERCONA -e 'SELECT @@global.audit_log_filter.format' | grep -qx JSON"
+check "audit log records the query" retry 15 ex percona \
+  "grep -q 'FROM hr.employees' /var/log/databastion/audit_filter.log"
+check "audit log readable on the host" test -r .state/logs/percona/audit_filter.log
 
 echo "# MongoDB (Community: profiler + JSON logs)"
 MONGO='mongosh --quiet --norc "mongodb://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"'
