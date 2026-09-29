@@ -5,6 +5,8 @@ The narrative design is in [docs/09-agent-protocol.md](../../docs/09-agent-proto
 
 Owner: `agent-engineer`. **Every change requires a `security-reviewer` review.** A compatible change (e.g. an optional field) goes through a regular PR. An incompatible change needs a new ADR and a new version (`/api/agent/v2`).
 
+**Deployment order.** Closed schemas make a new optional field a `400` (`additionalProperties`) for any console built before it. The console must therefore be upgraded **before** the agents, and an agent populates a new optional request field only once the consoles accept it. For a heartbeat, the whole heartbeat is rejected. Today's agent logs the `400`, counts it in `heartbeat_failures_total` and retries at the normal interval while staying active. The console then shows the agent silent after 90 s and raises `agent.silent` after 10 intervals by default; it does not revoke or lock it, but target status stops updating and targets declared after the upgrade get `404` on their results. For batches, the items carrying the field are dropped, with an agent-integrity alert. Details: [docs/09-agent-protocol.md](../../docs/09-agent-protocol.md#deployment-order-for-compatible-changes).
+
 ## Layout
 | Path | Content |
 |------|---------|
@@ -57,9 +59,9 @@ A map `classifiers_version -> [classifier ids]`, e.g. `{"2026.09.1": ["pii.birth
 ## Signal registry (`signals.json`)
 A map `signal id -> {description, engines}`, e.g. `{"signature.pg_dump": {"description": "…", "engines": ["postgres"]}}`: the vocabulary of `AccessEvent.signals` (see `Signal` in `openapi.yaml`). Rules:
 - **append-only**: an id is never removed, renamed or given another meaning (a wording fix of its description is fine). A new signal (e.g. `signature.mysqldump` with the MySQL Audit connector) is a new entry, added by a compatible change (regular PR + `security-reviewer` review) in the same change as the connector that emits it;
-- a conforming agent emits only registered ids. The agent's signal enum (`classifiers::masking::Signal`, P4-A) must list exactly the registry's ids (agent contract test to add with P4-A, like `contract_registry.rs` for classifiers);
+- a conforming agent emits only registered ids. The agent contract test `agent/crates/classifiers/tests/contract_signals.rs` checks that every `masking::Signal::ALL` id is registered, and that every registered signal of an engine with an implemented Audit connector (its `AUDIT_ENGINES` list, `postgres` today) can be emitted;
 - the `Signal` schema checks the **form** only (`^(signature|shape|volume)\.[a-z0-9_]+$`): an older console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`). Registration is checked on the fixtures, not by the console;
-- unlike `classifiers.lock.json`, there is no lock file: CI does not yet compare `signals.json` with the base branch, so reviewers reject a diff that removes or renames an id.
+- unlike `classifiers.lock.json`, there is no lock file: on pull requests, CI compares `signals.json` with the base branch (Protocol job, "Signal registry is append-only"). Every registered id must still be there, with at least its engines. New ids and engines may be added. A description may be reworded, which reviewers check keeps the meaning.
 
 ## Commands
 Run from `shared/protocol/`:

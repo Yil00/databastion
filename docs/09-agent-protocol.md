@@ -13,6 +13,18 @@
 - **Bounded everything**: every string, array and number has a bound. Free-text strings exclude control, format, private-use and line/paragraph separator characters.
 - **Size limits**: the console rejects bodies larger than **4 MiB** with `413`. The agent keeps every serialized findings or events batch under **1 MiB**, so a conforming agent never reaches the console limit.
 
+### Deployment order for compatible changes
+A compatible contract change adds **optional** fields. Because every schema is closed, a console built before the change answers `400` (`invalid_request`, keyword `additionalProperties`) to any body carrying one of the new fields. **Upgrade the console before the agents.** An agent must not populate a new optional request field until every console it talks to accepts it. Today the agent sends none of the fields added by that change: `TargetStatus.detail`, `AccessEvent.bytes` and the `skipped_*` / `objects_sampled` counters are always absent.
+
+What an upgraded agent would hit against an older console, with today's behavior (not changed here):
+- **Heartbeat.** The whole heartbeat is rejected, not only the new field. The agent treats the `400` as a non-retryable rejection: it logs a warning, counts it in `heartbeat_failures_total`, and sends the next heartbeat at the normal interval (30 s). It stays active: job polling and result uploads go on. Every heartbeat is rejected the same way until the console is upgraded. On the console side:
+  - `last_seen_at` stops moving, so the agent is displayed **silent** after 90 s. An `agent.silent` alert is raised after `DATABASTION_SILENT_AGENT_INTERVALS` intervals (10 by default, i.e. 5 min) and notified.
+  - The agent is **not** revoked or locked automatically: revocation is an administrator action.
+  - Target status, audit level, spool state and metrics stay frozen at the last accepted heartbeat. A target declared after the upgrade is never registered, so its findings and events get `404` (`notFound`, item pointers) and the agent drops them.
+  - The rejected heartbeat raises no agent-integrity event, and its failure counter never reaches the console (it travels in the heartbeat).
+- **Findings and events.** An unknown field inside an item is reported on the item (`/events/<i>`), so the agent drops every item that carries it and resends the rest. If every item carries it, every item is dropped. Each rejection also raises an agent-integrity alert.
+- **Job status.** A status update carrying a new `progress` counter is rejected with `400` and not retried. The job keeps its previous status until its own timeouts apply.
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -287,7 +299,7 @@ An `objects[]` entry whose `object` is `*` means the agent does not name the obj
 | `shape.full_table_read` | Read of whole relations: no filter, no aggregation, no or a large limit (heuristic) |
 | `volume.large_result` | Rows returned or affected above the agent's large-result threshold |
 
-The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z0-9_]+$`), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids.
+The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z0-9_]+$`), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; on pull requests, CI rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
 
 ### Console-side checks on events
 *Implemented by the console in P4-C (#54); listed in `openapi.yaml` ("Console-side checks", `POST /events`).* In this order:
