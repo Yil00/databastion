@@ -228,7 +228,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.not_evaluated": {
-    "description": "Privileges not evaluated: the account name could not be matched.",
+    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped).",
     "engines": [
       "mysql",
       "mariadb"
