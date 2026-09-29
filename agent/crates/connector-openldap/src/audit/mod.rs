@@ -4,7 +4,9 @@
 //!
 //! - Incremental by `entryCSN` (commit order), with a 10 s overlap and the
 //!   CSNs already read, so log entries committed out of order are not
-//!   missed; the cursor (a CSN) is persisted by the core.
+//!   missed; the cursor (a CSN) and the CSNs read within the overlap are
+//!   persisted by the core, so the overlap holds across a restart too
+//!   (end-of-phase-6 review L3).
 //! - Each poll: one-level searches under the log base, `sizeLimit` 1000,
 //!   repeated while the server cuts the result (at most 16 per poll).
 //! - Only the attributes of [`records::LOG_ATTRIBUTES`] are requested;
@@ -52,6 +54,14 @@ const MAX_SEEN: usize = 65_536;
 const FIRST_START_BACK: Duration = Duration::from_secs(60);
 /// Name of the persisted cursor.
 pub(crate) const CURSOR: &str = "openldap_accesslog";
+/// CSNs of the overlap window persisted at most (the newest): the file
+/// stays well within the core's 64 KiB cursor bound. Past it, the newest
+/// CSN left out becomes the floor (read, not reported again).
+const MAX_PERSISTED_SEEN: usize = 1000;
+/// First line of the persisted position (the cursor, a floor, and the
+/// CSNs read within the overlap). A file without it is a bare CSN (the
+/// phase-6 format).
+const FORMAT_V2: &str = "v2";
 
 fn internal() -> ConnectorError {
     LdError::new(FailureCode::Internal, Stage::Audit).into_connector_error()
@@ -63,15 +73,21 @@ fn internal() -> ConnectorError {
 pub(crate) struct Position {
     pub(crate) cursor: Option<String>,
     seen: BTreeSet<String>,
-    /// The cursor persisted by a previous run: entries up to it were
-    /// handed over then, and are not reported again after a restart.
+    /// Entries up to this CSN were handed over by a previous run and are
+    /// not reported again after a restart: a cursor of the phase-6 format
+    /// (a bare CSN, without the CSNs read), or the newest CSN left out of
+    /// a persisted overlap past [`MAX_PERSISTED_SEEN`].
     floor: Option<String>,
 }
 
 impl Position {
-    /// From a persisted cursor (ignored unless it is a CSN).
+    /// From a persisted position (ignored unless its cursor is a CSN).
+    /// The CSNs read within the overlap come back with it, so after a
+    /// restart the overlap is read again and only the entries that were
+    /// not read (committed out of CSN order just before the restart) are
+    /// reported.
     pub(crate) fn load(store: Option<&CursorStore>) -> Self {
-        let cursor = store
+        let text = store
             .and_then(|s| match s.load() {
                 Ok(v) => v,
                 Err(e) => {
@@ -80,12 +96,67 @@ impl Position {
                 }
             })
             .and_then(|b| String::from_utf8(b).ok())
-            .filter(|c| time::valid_csn(c));
-        Self {
-            floor: cursor.clone(),
-            cursor,
-            seen: BTreeSet::new(),
+            .unwrap_or_default();
+        let mut lines = text.lines();
+        if lines.next() != Some(FORMAT_V2) {
+            // The phase-6 format: a bare CSN. What was read in the overlap
+            // is not known: nothing up to the cursor is reported again.
+            let cursor = Some(text.trim().to_owned()).filter(|c| time::valid_csn(c));
+            return Self {
+                floor: cursor.clone(),
+                cursor,
+                seen: BTreeSet::new(),
+            };
         }
+        let mut p = Self::default();
+        for line in lines {
+            let Some((key, csn)) = line.split_once(' ') else {
+                continue;
+            };
+            if !time::valid_csn(csn) {
+                continue;
+            }
+            match key {
+                "cursor" => p.cursor = Some(csn.to_owned()),
+                "floor" => p.floor = Some(csn.to_owned()),
+                "seen" if p.seen.len() < MAX_PERSISTED_SEEN => {
+                    p.seen.insert(csn.to_owned());
+                }
+                _ => {}
+            }
+        }
+        if p.cursor.is_none() {
+            return Self::default();
+        }
+        p
+    }
+
+    /// The persisted form: the cursor, the floor, and the CSNs read from
+    /// the start of the next overlap (at most [`MAX_PERSISTED_SEEN`], the
+    /// newest; the newest one left out becomes the floor).
+    pub(crate) fn encode(&self) -> Option<String> {
+        let cursor = self.cursor.as_deref()?;
+        let bound = time::csn_time(cursor)
+            .map(|t| time::csn_at(t.checked_sub(OVERLAP).unwrap_or(t)))
+            .unwrap_or_default();
+        let window: Vec<&String> = self.seen.range(bound.clone()..).collect();
+        let cut = window.len().saturating_sub(MAX_PERSISTED_SEEN);
+        let mut floor = self.floor.clone().filter(|f| *f >= bound);
+        if let Some(newest_left_out) = cut.checked_sub(1).and_then(|i| window.get(i)) {
+            if floor.as_ref().is_none_or(|f| *newest_left_out > f) {
+                floor = Some((*newest_left_out).clone());
+            }
+        }
+        let mut out = format!("{FORMAT_V2}\ncursor {cursor}\n");
+        if let Some(f) = floor {
+            out.push_str(&format!("floor {f}\n"));
+        }
+        for csn in window.iter().skip(cut) {
+            out.push_str("seen ");
+            out.push_str(csn);
+            out.push('\n');
+        }
+        Some(out)
     }
 
     /// Where the first search of a poll starts: the cursor minus the
@@ -332,7 +403,7 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         // Everything read so far was handed over: move the cursor.
         if let Some(max) = &polled.max_csn {
             position.advance(max);
-            if let (Some(store), Some(c)) = (store, position.cursor.as_deref()) {
+            if let (Some(store), Some(c)) = (store, position.encode()) {
                 if let Err(e) = store.save(c.as_bytes()) {
                     tracing::warn!(target_id = %target.id, error = %e, "audit cursor not saved");
                 }
@@ -383,6 +454,52 @@ mod tests {
         assert!(p.fresh(a));
     }
 
+    /// End-of-phase-6 review L3: after a restart, the overlap is read
+    /// again; the entries read before are not reported twice, and one
+    /// committed out of CSN order just before the restart is reported.
+    #[test]
+    fn the_overlap_holds_across_a_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("databastion-ldap-overlap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+        let a = "20260929202640.000000Z#000000#000#000000";
+        let b = "20260929202642.000000Z#000000#000#000000";
+        let late = "20260929202641.000000Z#000000#000#000000";
+        let mut p = Position::default();
+        assert!(p.fresh(a) && p.fresh(b));
+        p.advance(b);
+        store.save(p.encode().unwrap().as_bytes()).unwrap();
+        // Restart.
+        let mut p = Position::load(Some(&store));
+        assert_eq!(p.cursor.as_deref(), Some(b));
+        assert_eq!(
+            p.from(SystemTime::now()),
+            "20260929202632.000000Z#000000#000#000000"
+        );
+        assert!(!p.fresh(a) && !p.fresh(b));
+        assert!(p.fresh(late), "an entry committed out of order was lost");
+        // A long overlap: only the newest CSNs are kept, the newest one
+        // left out becomes the floor (never reported twice).
+        let mut p = Position::default();
+        let csns: Vec<String> = (0..MAX_PERSISTED_SEEN + 5)
+            .map(|i| format!("20260929202642.{i:06}Z#000000#000#000000"))
+            .collect();
+        for c in &csns {
+            assert!(p.fresh(c));
+        }
+        p.advance(csns.last().unwrap());
+        let encoded = p.encode().unwrap();
+        assert!(encoded.len() < 64 * 1024);
+        store.save(encoded.as_bytes()).unwrap();
+        let mut p = Position::load(Some(&store));
+        for c in &csns {
+            assert!(!p.fresh(c), "{c} reported twice");
+        }
+        assert!(p.fresh("20260929202642.999999Z#000000#000#000000"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn persisted_cursors_must_be_csns() {
         let dir =
@@ -391,13 +508,15 @@ mod tests {
         let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
         store.save(b"not a csn").unwrap();
         assert_eq!(Position::load(Some(&store)).cursor, None);
+        store.save(b"v2\ncursor not a csn\nseen x\n").unwrap();
+        assert_eq!(Position::load(Some(&store)).cursor, None);
         store
             .save(b"20260929202642.012954Z#000000#000#000000")
             .unwrap();
         let mut p = Position::load(Some(&store));
         assert!(p.cursor.is_some());
-        // After a restart, entries up to the persisted cursor (read again
-        // in the overlap) are not reported twice.
+        // A cursor of the phase-6 format: after a restart, entries up to
+        // it (read again in the overlap) are not reported twice.
         assert!(!p.fresh("20260929202642.012954Z#000000#000#000000"));
         assert!(!p.fresh("20260929202640.000000Z#000000#000#000000"));
         assert!(p.fresh("20260929202642.012955Z#000000#000#000000"));

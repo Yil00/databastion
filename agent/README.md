@@ -525,7 +525,9 @@ Audit (ADR-0029 decisions 7 to 10; `src/audit/`):
   (`audit.accesslog_not_readable`);
 - incremental by `entryCSN` (commit order; `reqStart` would skip long exports), with a 10 s
   overlap and the CSNs already read; `sizeLimit` 1000 per search, repeated while cut; cursor
-  persisted by the core, first start one minute back;
+  and the CSNs read within the overlap (at most 1000) persisted by the core, so an entry
+  committed out of CSN order just before a restart is still read after it; first start one
+  minute back;
 - read: `reqType`, `reqStart`, `reqSession`, `reqAuthzID`, `reqDN`, `reqResult`, `reqScope`,
   `reqFilter`, `reqAttr`, `reqAttrsOnly`, `reqEntries`, `reqSizeLimit`, `reqMethod`,
   `entryCSN`; never `reqMod`, `reqOld`, `reqAssertion`, `reqMessage` or the controls. The filter
