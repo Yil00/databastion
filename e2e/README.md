@@ -22,7 +22,7 @@ dump → incident time.
 | `migrate` | `console/Dockerfile` | One-shot migrations as the owner role |
 | `web`, `worker` | `console/Dockerfile` | Console processes (runtime role) |
 | `proxy` | Caddy | TLS 1.3 reverse proxy, certificate from a throwaway CA; `/metrics` answers `404` |
-| `mailpit` | Mailpit 1.31 | Mail sink of the incident notifications: SMTP on 2525 with STARTTLS required (certificate from the throwaway CA for `mailpit`, verified by the worker through `NODE_EXTRA_CA_CERTS`); its HTTP API is read from the web container, on `console-net` only |
+| `mailpit` | Mailpit 1.31 | Mail sink of the incident notifications: SMTP on 2525 with STARTTLS and SMTP AUTH required (a generated password, registered as a secret; certificate from the throwaway CA for `mailpit`, verified by the worker through `NODE_EXTRA_CA_CERTS`); its HTTP API is read from the web container, on `console-net` only |
 | `target-pg` | [`dev/postgres`](../dev/postgres/Dockerfile) (PostgreSQL 17 + pgaudit) | Declared target of the agent, database `shop` loaded with the committed dev seed [`dev/seed/out/postgres.sql`](../dev/seed/out/postgres.sql) (schemas `crm`, `billing`, `ops`, value-bearing table names included); [`target-initdb/`](target-initdb/) creates the agent's read-only role and its per-schema Discovery grants, then ([`30-audit.sh`](target-initdb/30-audit.sh)) the Audit setup of the dev image, per database: pgaudit `read, write` session audit, object audit of the seeded tables through `databastion_auditor`, `log_relation`, `log_rows`, no catalog, no parameters; `pg_stat_statements`; and the test client roles `e2e_exporter` / `e2e_analyst` (read-only on the seeded schemas). Its jsonlog goes to the `target-pg-log` volume (directory `0750`, files `0640`, owner `postgres` 999:999) |
 | `pg-client` | PostgreSQL 17 | One-shot database client of the Audit test (`tools` profile): `pg_dump` as `e2e_exporter`, queries as `e2e_analyst`; rows go to `/dev/null` inside the container |
 | `my-client` | MariaDB 11.4 | Same for `target-mariadb` (`tools` profile): `mariadb-dump` as `e2e_exporter`, queries as `e2e_analyst`, TLS verified against the target's dev CA |
@@ -85,8 +85,11 @@ lives in `tmpfs`) and `no-new-privileges`.
    (`starttls`, port 2525), two `access_event` policies, `e2e dump signature` (signal
    `signature.pg_dump` or `signature.mysqldump` on the Audit targets → **critical** incident +
    e-mail) and `e2e reads` (every `read` on the Audit targets → medium incident + e-mail). After
-   each policy creation, a `policies.evaluate` pg-boss job must be queued within 5 s (the web
-   process's wake-up, #63). Then `audit.configure` of `pg-e2e` and `mariadb-e2e`
+   each policy creation, the web process's wake-up (#63) must queue a `policies.evaluate` pg-boss
+   job within 5 s. Jobs the worker's schedule produced (sent while a `__pgboss__send-it` job of
+   that queue ran) do not count; a job already waiting at that time is accepted as a coalesced
+   wake-up (the queue is stately), but at least one wake-up per kind of action must be a job of
+   its own. Then `audit.configure` of `pg-e2e` and `mariadb-e2e`
    (enabled, contract defaults: aggregation 60 s, poll 10 s, no `min_rows`; sensitive objects
    derived from the findings, none yet). The harness waits for the job and for the agent's
    `audit source: pgaudit log` / `audit source: audit log file` line, **before** the Discovery
@@ -119,7 +122,10 @@ lives in `tmpfs`) and `no-new-privileges`.
    - **Exit criterion**: `pg_dump` of `shop` as `e2e_exporter` from the `pg-client` container (not
      the agent's account). The time from the start of the dump to the incident appearing on the
      console (the `Active: N critical` count of the incidents page, fetched with the session
-     through the proxy, polled every second) is printed and must be **under 120 s**.
+     through the proxy, polled every second) must rise, and the console must hold an incident of
+     this target, this principal and the dump policy, carrying the dump signal, with `created_at`
+     after the dump started. Both times (page, `created_at`) are printed and must be **under
+     120 s**.
      On MariaDB the same with `mariadb-dump --single-transaction --no-tablespaces support` from
      `my-client` (signal `signature.mysqldump`).
    - As `e2e_analyst` (PostgreSQL): `SELECT * FROM crm.customers WHERE email = '<ground-truth e-mail>'`,
@@ -127,27 +133,30 @@ lives in `tmpfs`) and `no-new-privileges`.
      and `COPY ops.app_credentials TO STDOUT`, fed on stdin (the literals are on no command line
      and in no log of the harness). MariaDB: `SELECT … FROM tickets WHERE requester_email = '<…>'`
      and `… WHERE requester_phone = '<…>'`, then `SELECT * FROM tickets INTO OUTFILE …`, which must
-     be refused (`ERROR 1045`, no `FILE` privilege) and still carry `signature.into_outfile`; and,
-     as root in the target, `CREATE USER 'e2e_probe'@'localhost' IDENTIFIED BY '<ground-truth
-     e-mail>'` (MariaDB `performance_schema` keeps passwords in clear, ADR-0023). The harness waits
-     (240 s at most) until the object sets read (PostgreSQL 3, MariaDB 1) are stored as events of
-     `e2e_analyst`, every event is evaluated, a `e2e reads` incident exists for `e2e_analyst` and no
-     notification is pending.
+     be refused (`ERROR 1045`, no `FILE` privilege) and still carry `signature.into_outfile`. The
+     harness waits (240 s at most) until the object sets read (PostgreSQL 3, MariaDB 1) and every
+     literal-bearing read statement (3 on each target, the sum of `aggregated_count` of the
+     `e2e_analyst` read events) are stored, every event is evaluated, a `e2e reads` incident exists
+     for `e2e_analyst` and no notification is pending. The grants of `e2e_exporter` /
+     `e2e_analyst` on MariaDB are checked to be exactly `USAGE` and `SELECT ON support.*` (step 5).
    - The heartbeat must report audit level `partial` or `full` with source `pgaudit`
      (PostgreSQL), `partial` with source `mariadb_server_audit` (MariaDB: never Full, ADR-0023).
    - Every notification to the channel is `delivered` and Mailpit holds the e-mail of the dump
-     incident.
+     incident; every message has a text part naming an Audit target or principal.
    - [`i2_check.py audit`](i2_check.py) on the target's events and incidents: an event of
      `e2e_exporter` with the dump signal, an event of `e2e_analyst` (MariaDB: with
      `signature.into_outfile`), the dump incident (policy, principal, signal) and the `e2e reads`
      incident of `e2e_analyst`; **no event and no incident of the agent's account**
      (`databastion_agent`, `databastion`: its own Discovery reads, which ran while Audit was on,
      must not surface); no stored event object holding a raw value-bearing name, even partially.
-   - Positive control of the literal search: every literal must be found on the source side, so
-     the queries did reach the target: the pgaudit log; the `server_audit` log plus, as root, the
-     `SQL_TEXT` of `performance_schema.events_statements_history_long` (the password).
-   - After all targets: every stored events batch must have queued a `policies.evaluate` job
-     within 5 s of its receipt, and `web.log` must hold no `wake-up not sent` warning.
+   - Positive control of the literal search: every literal must be found in the file the agent
+     reads, alone: the pgaudit jsonlog; the `server_audit` log and its rotations (not
+     `performance_schema`, which the agent's account cannot read). `E2E_PG_AUDIT=pss` has no such
+     control.
+   - After all targets: no event carries a `db_user_fingerprint`; every stored events batch woke
+     the policy engine (as above, per batch received at `events_batches.received_at`); `web.log`
+     holds no `wake-up not sent` warning. The agent's page, each Audit target's settings page and
+     `GET /api/agents` are fetched for the I2 scan.
 9. Revoke the agent through the user API; within 60 s the agent must log
    `console rejected the current secret (401)`; the measured latency is printed and the test
    fails at 60 s or more. The console must show `revoked`, and the proxy access log must show no
@@ -157,9 +166,13 @@ lives in `tmpfs`) and `no-new-privileges`.
    be found by the scan and redacted, then it is removed); fail if any generated secret
    (enrollment token, agent secret, admin password, session cookie, metrics token, database and
    target passwords, encryption key) appears in clear text.
-11. `pg_dump` the console database into the private temporary directory (never the log
-   directory) and fail if the agent secret, the enrollment token, the admin password or a
-   target password is stored in clear text.
+11. The targets' audit logs (pgaudit jsonlog, `server_audit` log and rotations), copied into the
+   private directory, must be non-empty and hold no registered secret; they must hold records of
+   the agent's own account since the Discovery scan started (positive control of "no own-account
+   event": the reads were seen and filtered, not missed; not in `pss` mode). Then `pg_dump` the
+   console database into the private temporary directory (never the log directory) and fail if
+   any registered secret (the whole registry, the Mailpit SMTP password included) is stored in
+   clear text.
 12. Invariant I2, for each engine (`postgresql`, `mysql`, `mariadb`):
     [`i2_check.py scan`](i2_check.py) searches the plain dump of the whole console database
     (every schema, `pgboss` included), every container log except the targets' own (`target-*.log`,
@@ -171,8 +184,9 @@ lives in `tmpfs`) and `no-new-privileges`.
     `access_events` (`objects`, `signals` included), `incidents`, `incident_events`,
     `notification_deliveries` (the notification payloads), `principal_baselines` and
     `audit_configs` (exported as JSON rows, each of the first three non-empty); the events page,
-    each principal page, the incidents page (all statuses), each Audit incident page and the
-    notifications page; the e-mails in Mailpit (summary, decoded text and HTML parts, raw source).
+    each principal page, the incidents page (all statuses), each Audit incident page, the
+    notifications page, the agent page, each Audit target's settings page and `GET /api/agents`;
+    the e-mails in Mailpit (summary, decoded text and HTML parts, raw source).
     Then the query literals of step 8 alone (`scan --needle`) on every console-side artifact above,
     the console database dump and the logs: they must be nowhere.
 
@@ -181,7 +195,9 @@ The definition is in the docstring of [`i2_check.py`](i2_check.py); unit tests i
 [`test_i2_check.py`](test_i2_check.py) (`python3 -m unittest discover -s e2e -p 'test_*.py'`),
 including pg_dump COPY-format and React Server Components payload excerpts with planted leaks.
 - Case-, accent- and NFC / NFD-insensitive substring search, on the file as is and after decoding
-  JSON `\uXXXX`, URL `%XX`, HTML character references and SQL doubled quotes.
+  JSON `\uXXXX`, URL `%XX`, HTML character references and SQL doubled quotes, and HTML as rendered
+  text (`html-text`: comments such as React's `<!-- -->` and inline tags removed, other tags
+  replaced by a space, character references decoded).
 - Values with fewer than 8 letters / digits must stand at word boundaries (`_` is a boundary:
   `archive_lucas_martin` matches `martin`, `Martinez` does not).
 - Phones, cards, IBANs, NIRs and digit names (at least 9 letters / digits, 6 of them digits) are

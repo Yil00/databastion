@@ -377,11 +377,12 @@ jobs:
 
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
-  # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit: a real
-  # pg_dump must open an incident in under 2 minutes, the agent's own reads none), revocation
+  # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit) and the
+  # MariaDB target (server_audit log): a real pg_dump / mariadb-dump must open an incident in under
+  # 2 minutes, the agent's own reads none, and the policy engine must be woken up; revocation
   # < 60 s, and invariant I2: no ground-truth value in clear text in the console database, the logs,
-  # the findings, events, incidents and notifications pages or the notification e-mails, for every
-  # engine. run.sh prints the phase timings and the dump -> incident time. Required through
+  # the console pages or the notification e-mails, for every engine; no secret in the targets'
+  # audit logs. run.sh prints the phase timings and the dump -> incident times. Required through
   # ci-result.
   e2e:
     name: E2E (enrollment, Discovery, Audit, invariant I2)

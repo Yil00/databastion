@@ -208,6 +208,7 @@ ADMIN_PASSWORD="$(rand_hex 24)"
 TARGET_PG_PASSWORD="$(rand_hex 24)"     # target superuser: stays in target-pg
 TARGET_AGENT_PASSWORD="$(rand_hex 24)"  # databastion_agent (least privilege, read-only)
 TARGET_CLIENT_PASSWORD="$(rand_hex 24)" # e2e_exporter / e2e_analyst (Audit test clients)
+MAILPIT_PASSWORD="$(rand_hex 24)"       # SMTP AUTH of the console's e-mail channel to Mailpit
 TARGET_MYSQL_PASSWORD="$(rand_hex 24)"         # MySQL root: stays in target-mysql
 TARGET_MYSQL_AGENT_PASSWORD="$(rand_hex 24)"   # MySQL `databastion` (ADR-0018 minimal)
 TARGET_MARIADB_PASSWORD="$(rand_hex 24)"       # MariaDB root: stays in target-mariadb
@@ -221,6 +222,7 @@ register_secret admin_password "$ADMIN_PASSWORD"
 register_secret target_pg_password "$TARGET_PG_PASSWORD"
 register_secret target_agent_password "$TARGET_AGENT_PASSWORD"
 register_secret target_client_password "$TARGET_CLIENT_PASSWORD"
+register_secret mailpit_password "$MAILPIT_PASSWORD"
 register_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
 register_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
 register_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
@@ -236,6 +238,8 @@ put_secret admin_password "$ADMIN_PASSWORD"
 put_secret target_pg_password "$TARGET_PG_PASSWORD"
 put_secret target_agent_password "$TARGET_AGENT_PASSWORD"
 put_secret target_client_password "$TARGET_CLIENT_PASSWORD"
+put_secret mailpit_auth "e2e-smtp:${MAILPIT_PASSWORD}"
+put_secret mailpit_password "$MAILPIT_PASSWORD"
 put_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
 put_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
 put_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
@@ -640,6 +644,19 @@ check_my_account target-mariadb mariadb support "ANY	4	30.000000	0	0" \
      (SELECT count(*) FROM mysql.user WHERE user = 'databastion') - 1,
      (SELECT count(*) FROM mysql.roles_mapping WHERE user = 'databastion')
    FROM mysql.user WHERE user = 'databastion' AND host = '%'" --ssl --skip-ssl
+# The Audit test accounts of target-mariadb (35-mariadb-clients.sh): exactly USAGE and SELECT on
+# support.* (not printed on failure: SHOW GRANTS holds the password hash).
+for u in e2e_exporter e2e_analyst; do
+  grants="$(my_sql target-mariadb mariadb "SHOW GRANTS FOR '$u'@'%'" | sort | tr '\n' '|')" \
+    || fail "target-mariadb: cannot read the grants of $u"
+  grants="${grants//\`/}"
+  case "$grants" in
+    "GRANT SELECT ON support.* TO $u@%|GRANT USAGE ON *.* TO $u@%"*"|") ;;
+    *) fail "target-mariadb: $u has unexpected grants" ;;
+  esac
+  [ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 2 ] || fail "target-mariadb: $u has extra grants"
+done
+unset grants
 
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
@@ -674,14 +691,18 @@ console_sql() {
 # audit_client_<c>_source         heartbeat audit source expected
 # audit_client_<c>_principals     "<dump principal> <query principal>" (test roles on the target)
 # audit_client_<c>_object_sets    distinct object sets the queries read (events to wait for)
+# audit_client_<c>_query_statements  read statements the queries run (sum of aggregated_count)
 # audit_client_<c>_query_signal   signal the query principal's events must carry, or empty
 # audit_client_<c>_dump           runs the dump tool on the whole seeded database, output discarded
 # audit_client_<c>_queries ENGINE queries whose text holds ground-truth literals (PostgreSQL: a
 #                                 filtered and a whole-table COPY too; MariaDB: a refused INTO
-#                                 OUTFILE and a CREATE USER whose password is a ground-truth value);
+#                                 OUTFILE);
 #                                 prints the needle ids of the literals
-# audit_client_<c>_target_log OUT copies the target's own audit log to OUT; returns 3 when the
-#                                 source keeps no statement text (no positive control possible)
+# audit_client_<c>_target_log OUT copies the target's own audit log (the file the agent reads,
+#                                 rotations included) to OUT; returns 3 when that source keeps no
+#                                 statement text (no literal positive control possible)
+# audit_client_<c>_log_user_records FILE ACCOUNT START  audit records of ACCOUNT since START
+# audit_client_<c>_time           current time in the log's timestamp format
 # Client output never reaches a log: result rows go to /dev/null in the container, and errors
 # (which may echo a statement holding a literal) to a private file; only exit codes are printed.
 
@@ -694,6 +715,7 @@ audit_client_pg_levels() { printf '%s' "$PG_AUDIT_LEVELS"; }
 audit_client_pg_source() { printf '%s' "$PG_AUDIT_SOURCE"; }
 audit_client_pg_principals() { printf 'e2e_exporter e2e_analyst'; }
 audit_client_pg_object_sets() { printf 3; }  # filtered SELECT, filtered COPY, whole-table COPY
+audit_client_pg_query_statements() { printf 3; }  # the same three statements
 audit_client_pg_query_signal() { printf ''; }
 audit_client_pg_dump() {
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
@@ -728,11 +750,17 @@ audit_client_pg_queries() {
   printf '%s %s' "$email_id" "$iban_id"
 }
 audit_client_pg_target_log() {
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
+    cat /var/log/databastion/postgresql.json >"$1" || return 1
   # pg_stat_statements normalizes the literals of a SELECT and keeps no per-execution text.
   [ "$E2E_PG_AUDIT" = pgaudit ] || return 3
-  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
-    cat /var/log/databastion/postgresql.json >"$1"
 }
+audit_client_pg_log_user_records() {
+  # pgaudit records (jsonlog) of ACCOUNT at or after START (YYYY-MM-DD HH:MM:SS, UTC).
+  jq -rc --arg u "$2" --arg t "$3" 'select(.user == $u and ((.message // "") | startswith("AUDIT:"))
+    and (.timestamp[0:19] >= $t))' "$1" 2>/dev/null | wc -l
+}
+audit_client_pg_time() { date -u +'%Y-%m-%d %H:%M:%S'; }
 
 # MariaDB (target-mariadb, server_audit log). The accounts e2e_exporter / e2e_analyst come from
 # target-initdb/35-mariadb-clients.sh; the client verifies the server's TLS certificate.
@@ -752,6 +780,7 @@ audit_client_my_levels() { printf 'partial'; }
 audit_client_my_source() { printf 'mariadb_server_audit'; }
 audit_client_my_principals() { printf 'e2e_exporter e2e_analyst'; }
 audit_client_my_object_sets() { printf 1; }  # support.tickets (filtered SELECTs, INTO OUTFILE)
+audit_client_my_query_statements() { printf 3; }  # two filtered SELECTs and the INTO OUTFILE
 audit_client_my_query_signal() { printf 'signature.into_outfile'; }
 audit_client_my_dump() {
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
@@ -759,12 +788,10 @@ audit_client_my_dump() {
     </dev/null >/dev/null 2>"$E2E_WORK_DIR/client.err"
 }
 audit_client_my_queries() {
-  local engine="$1" email phone secret email_id phone_id secret_id rc sql="$E2E_WORK_DIR/client.sql"
+  local engine="$1" email phone email_id phone_id rc sql="$E2E_WORK_DIR/client.sql"
   IFS=$'\t' read -r email_id email < <(gt_needle "$engine" - tickets requester_email 0)
   IFS=$'\t' read -r phone_id phone < <(gt_needle "$engine" - tickets requester_phone 0)
-  IFS=$'\t' read -r secret_id secret < <(gt_needle "$engine" - tickets requester_email 1)
-  [ -n "$email" ] && [ -n "$phone" ] && [ -n "$secret" ] \
-    || fail "no ground-truth e-mail / phone for the MariaDB literal queries"
+  [ -n "$email" ] && [ -n "$phone" ] || fail "no ground-truth e-mail / phone for the MariaDB literal queries"
   # Written to the private work directory, fed on stdin: the literals are on no command line.
   {
     printf "SELECT * FROM tickets WHERE requester_email = '%s';\n" "${email//\'/\'\'}"
@@ -779,25 +806,25 @@ audit_client_my_queries() {
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
   my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_analyst support' \
     <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || rc=$?
-  [ "$rc" = 1 ] && grep -qE '^ERROR [0-9]+ ' "$E2E_WORK_DIR/client.err" || return 2
-  # A password holding a ground-truth value, as root in the target: MariaDB performance_schema
-  # keeps it in clear in SQL_TEXT (server_audit logs no DCL with QUERY_DML, and masks it anyway).
-  printf "CREATE USER 'e2e_probe'@'localhost' IDENTIFIED BY '%s';\n" "${secret//\'/\'\'}" >"$sql"
-  my_root "$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 3
-  unset email phone secret
+  # ER_ACCESS_DENIED_ERROR: MariaDB's answer to INTO OUTFILE without the FILE privilege.
+  [ "$rc" = 1 ] && grep -qE '^ERROR 1045 ' "$E2E_WORK_DIR/client.err" || return 2
+  unset email phone
   rm -f -- "$sql"
-  printf '%s %s %s' "$email_id" "$phone_id" "$secret_id"
+  printf '%s %s' "$email_id" "$phone_id"
 }
+# The server_audit log and its rotations (server_audit_file_rotations, dev/mariadb), only: the
+# source the agent reads. Not performance_schema, which the agent's account cannot read.
 audit_client_my_target_log() {
-  local sql="$E2E_WORK_DIR/pfs.sql"
-  # The source side: the server_audit log (the WHERE literals) and, as root, the statement texts
-  # performance_schema keeps (the CREATE USER password, in clear on MariaDB).
   timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-mariadb \
-    cat /var/log/databastion/server_audit.log >"$1" || return 1
-  printf 'SELECT SQL_TEXT FROM performance_schema.events_statements_history_long;\n' >"$sql"
-  my_root "$sql" >>"$1" || return 1
-  rm -f -- "$sql"
+    sh -c 'cat /var/log/databastion/server_audit.log /var/log/databastion/server_audit.log.[0-9]* 2>/dev/null; test -s /var/log/databastion/server_audit.log' \
+    >"$1"
 }
+audit_client_my_log_user_records() {
+  # Records of ACCOUNT at or after START (YYYYMMDD HH:MM:SS, server time: UTC in the image). CSV:
+  # timestamp,serverhost,username,host,connectionid,queryid,operation,database,object,retcode.
+  awk -F, -v u="$2" -v t="$3" '$3 == u && substr($1, 1, 17) >= t' "$1" | wc -l
+}
+audit_client_my_time() { date -u +'%Y%m%d %H:%M:%S'; }
 
 # --------------------------------------------------------------------------- Audit setup (P4-D)
 # As a user would, through the user API (admin session + CSRF): an e-mail channel to Mailpit, two
@@ -875,33 +902,54 @@ wait_audit_stream() {
 }
 
 # Policy-engine wake-up (bug fixed in #63, ADR-0021 "wake-up and 2 s worker polling"): after a
-# policy change or an accepted events batch, the web process queues a `policies.evaluate` pg-boss
-# job. A wake-up is proven by a job created within [T - 3 s, T + 5 s] and not started before T (the
-# queue is stately: a job still queued at T takes the wake-up). The worker's one-minute schedule
-# could match by chance, so every policy creation and every events batch is checked, and web.log
-# must hold no "wake-up not sent" warning.
-WAKEUP_JOB_SQL="EXISTS (SELECT 1 FROM pgboss.job j WHERE j.name = 'policies.evaluate'
-  AND j.created_on BETWEEN %s - interval '3 seconds' AND %s + interval '5 seconds'
-  AND (j.started_on IS NULL OR j.started_on >= %s))"
+# policy change or an accepted events batch (action at database time T), the web process sends a
+# `policies.evaluate` pg-boss job. Per action, WAKEUP_STATUS_SQL answers:
+# - `sent`: a job created in (T, T + 5 s] that the worker's schedule did not produce. pg-boss sends
+#   scheduled jobs from a `__pgboss__send-it` job whose data names the queue; a policies.evaluate
+#   job created while such a job ran is the schedule's and is not counted;
+# - `coalesced`: none sent, but a job was already waiting at T (created before T, not started): the
+#   queue is stately (one waiting job), so the wake-up legitimately joined it;
+# - `lost` otherwise. Any `lost` fails; each kind of action must have at least one `sent`, and web.log
+#   must hold no "wake-up not sent" warning. (The worker's own start-up and budget re-queue sends
+#   are not told apart: they are rare and not near these actions.)
+WAKEUP_STATUS_SQL="CASE
+  WHEN EXISTS (SELECT 1 FROM pgboss.job j WHERE j.name = 'policies.evaluate'
+    AND j.created_on > @T@ AND j.created_on <= @T@ + interval '5 seconds'
+    AND NOT EXISTS (SELECT 1 FROM pgboss.job s WHERE s.name = '__pgboss__send-it'
+      AND s.data->>'name' = 'policies.evaluate'
+      AND j.created_on BETWEEN s.started_on AND coalesce(s.completed_on, now()))) THEN 'sent'
+  WHEN EXISTS (SELECT 1 FROM pgboss.job j WHERE j.name = 'policies.evaluate'
+    AND j.created_on <= @T@ AND (j.started_on IS NULL OR j.started_on > @T@)) THEN 'coalesced'
+  ELSE 'lost' END"
 db_now() { console_sql "SELECT now()"; }
-# assert_wakeup LABEL T: waits up to 6 s for a wake-up job for an action at DB time T.
+# assert_wakeup LABEL T: waits up to 6 s for the wake-up of an action at database time T.
 assert_wakeup() {
-  local label="$1" t="$2" cond deadline
-  # shellcheck disable=SC2059 # the format is the SQL template above
-  cond="$(printf "$WAKEUP_JOB_SQL" "'$t'::timestamptz" "'$t'::timestamptz" "'$t'::timestamptz")"
+  local label="$1" t="$2" st deadline
   deadline=$(( $(date +%s) + 6 ))
-  until [ "$(console_sql "SELECT $cond")" = t ]; do
-    [ "$(date +%s)" -lt "$deadline" ] \
-      || fail "no policies.evaluate job within 5 s of $label (policy-engine wake-up lost)"
+  while :; do
+    st="$(console_sql "SELECT ${WAKEUP_STATUS_SQL//@T@/\'$t\'::timestamptz}")" \
+      || fail "cannot read the pg-boss jobs"
+    [ "$st" = sent ] && break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      [ "$st" = coalesced ] && break
+      fail "no policies.evaluate job within 5 s of $label (policy-engine wake-up lost)"
+    fi
     sleep 1
   done
-  log "policy-engine wake-up after $label: job queued"
+  log "policy-engine wake-up after $label: $st"
+  WAKEUP_POLICY_STATUS+=" $st"
 }
+WAKEUP_POLICY_STATUS=""
 
-log "Audit: creating the e-mail channel ${AUDIT_CHANNEL} (Mailpit, STARTTLS verified against the test CA)"
-r="$(api_json POST /api/notification-channels "$(jq -nc --arg slug "$AUDIT_CHANNEL" '{slug: $slug,
+log "Audit: creating the e-mail channel ${AUDIT_CHANNEL} (Mailpit, STARTTLS verified against the test CA, SMTP AUTH)"
+# The SMTP password is read by jq from its secret file (never on a command line); the request body
+# stays in the private work directory.
+jq -nc --arg slug "$AUDIT_CHANNEL" --rawfile pw "$S/mailpit_password" '{slug: $slug,
   type: "email", config: {host: "mailpit", port: 2525, tls: "starttls",
-  from: "databastion@e2e.example", recipients: ["soc@e2e.example"]}}')")"
+  from: "databastion@e2e.example", recipients: ["soc@e2e.example"], username: "e2e-smtp"},
+  password: $pw}' >"$E2E_WORK_DIR/channel.json"
+r="$(api POST /api/notification-channels "$E2E_WORK_DIR/channel.json")"
+rm -f -- "$E2E_WORK_DIR/channel.json"
 [ "$(status_of "$r")" = 201 ] \
   || fail "channel: HTTP $(status_of "$r") ($(body_of "$r" | jq -c '{error, field}' 2>/dev/null || true))"
 
@@ -945,6 +993,13 @@ phase_done audit-setup
 printf '{"sample_rows":100,"max_duration_s":300,"statement_timeout_ms":5000}' \
   >"$E2E_WORK_DIR/scan-req.json"
 declare -A SCAN_JOB_IDS=()
+# Start of the Discovery scans, per Audit target, in its audit log's time format (own-account
+# positive control, below).
+declare -A SCAN_START=()
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ <<<"$at"
+  SCAN_START[$target]="$("audit_client_${client}_time")"
+done
 for t in "${E2E_TARGETS[@]}"; do
   read -r target _ _ <<<"$t"
   log "launching a discovery.scan of $target through the user API"
@@ -1078,7 +1133,13 @@ phase_done discovery
 declare -A AUDIT_LITERALS=()  # ground-truth engine -> needle ids of the literals put in query text
 AUDIT_LATENCIES=""
 AUDIT_DIR="$E2E_WORK_DIR/audit"  # private: may hold what the console stores and renders
-mkdir -p "$AUDIT_DIR"
+mkdir -p "$AUDIT_DIR/pages"
+# fetch_page NAME PATH: a console page (or user API answer) with the admin session, HTTP 200 required.
+fetch_page() {
+  local code
+  code="$("${CURL[@]}" -o "$AUDIT_DIR/pages/$1.html" -w '%{http_code}' "${BASE_URL}$2")" || code=000
+  [ "$code" = 200 ] || fail "page $2: HTTP $code"
+}
 
 # critical_incidents: the "Active: N critical" count of the incidents page (console UI, session,
 # through the TLS proxy). Only the dump policy opens critical incidents.
@@ -1110,9 +1171,11 @@ mailpit_fetch() {
 audit_run() {
   local target="$1" engine="$2" client="$3" account="$4" signal="$5"
   local dump_p query_p prev cover n_sent n_missing n0 n t0 t_dump t_inc latency ids deadline st
-  local n_sets n_pending n_inc n_notif level source rc min_sets query_signal
+  local n_sets n_pending n_inc n_notif level source rc min_sets query_signal min_stmts n_stmts
+  local inc_ms db_latency
   read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
   min_sets="$("audit_client_${client}_object_sets")"
+  min_stmts="$("audit_client_${client}_query_statements")"
   query_signal="$("audit_client_${client}_query_signal")"
 
   prev="$(agent_log_count "$("audit_client_${client}_started")" "$target")"
@@ -1138,19 +1201,32 @@ audit_run() {
   "audit_client_${client}_dump" || fail "the dump of $target failed (exit $?; client output kept private)"
   t_dump="$(now_ms)"
   log "Audit ($target): dump finished in $((t_dump - t0)) ms; waiting for its incident on the incidents page"
+  # The page count must rise AND the console must hold the incident of this target, this principal
+  # and the dump policy, opened after the dump started (the count alone could be another incident).
   t_inc=""
+  inc_ms=""
   deadline=$(( t0 + DUMP_INCIDENT_LIMIT_MS + 120000 ))  # past the limit: to print the actual time
   while [ "$(now_ms)" -lt "$deadline" ]; do
     n="$(critical_incidents || true)"
-    if [ -n "$n" ] && [ "$n" -gt "$n0" ]; then t_inc="$(now_ms)"; break; fi
+    if [ -n "$n" ] && [ "$n" -gt "$n0" ]; then
+      [ -n "$t_inc" ] || t_inc="$(now_ms)"
+      inc_ms="$(console_sql "SELECT floor(extract(epoch FROM min(created_at)) * 1000)::bigint
+        FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+          AND principal = '${dump_p}' AND policy_name = '${AUDIT_POLICY_DUMP}'
+          AND event_signals ? '${signal}' AND created_at >= to_timestamp(${t0} / 1000.0)")" \
+        || fail "cannot read the incidents of $target"
+      [ -n "$inc_ms" ] && break
+    fi
     sleep 1
   done
-  [ -n "$t_inc" ] || fail "Audit ($target): no incident on the console within $(( (deadline - t0) / 1000 )) s of the dump"
+  [ -n "$t_inc" ] && [ -n "$inc_ms" ] \
+    || fail "Audit ($target): no '${AUDIT_POLICY_DUMP}' incident of $dump_p with $signal on the console within $(( (deadline - t0) / 1000 )) s of the dump"
   latency=$((t_inc - t0))
-  log "Audit ($target): dump start -> incident on the console: ${latency} ms (limit ${DUMP_INCIDENT_LIMIT_MS} ms)"
-  AUDIT_LATENCIES+="$target ${latency} ms; "
-  [ "$latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] \
-    || fail "Audit ($target): dump -> incident took ${latency} ms, not under ${DUMP_INCIDENT_LIMIT_MS} ms"
+  db_latency=$((inc_ms - t0))
+  log "Audit ($target): dump start -> incident: ${latency} ms on the incidents page, ${db_latency} ms by incidents.created_at (limit ${DUMP_INCIDENT_LIMIT_MS} ms)"
+  AUDIT_LATENCIES+="$target ${latency} ms (created_at ${db_latency} ms); "
+  [ "$latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] && [ "$db_latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] \
+    || fail "Audit ($target): dump -> incident took ${latency} ms (page) / ${db_latency} ms (created_at), not under ${DUMP_INCIDENT_LIMIT_MS} ms"
 
   log "Audit ($target): queries with ground-truth literals as $query_p (see audit_client_${client}_queries)"
   ids="$("audit_client_${client}_queries" "$engine")" \
@@ -1164,17 +1240,22 @@ audit_run() {
     st="$(console_sql "SELECT concat_ws(',',
         (SELECT count(DISTINCT objects::text) FROM access_events
           WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${query_p}'),
+        (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
+          WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${query_p}'
+            AND action = 'read'),
         (SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND evaluated_at IS NULL),
         (SELECT count(*) FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
           AND principal = '${query_p}' AND policy_name = '${AUDIT_POLICY_READS}'),
         (SELECT count(*) FROM notification_deliveries WHERE status IN ('pending', 'sending')))")" \
       || fail "cannot read the Audit state of $target"
-    IFS=, read -r n_sets n_pending n_inc n_notif <<<"$st"
-    [ "$n_sets" -ge "$min_sets" ] && [ "$n_pending" = 0 ] && [ "$n_inc" -ge 1 ] && [ "$n_notif" = 0 ] && break
-    [ "$(date +%s)" -lt "$deadline" ] || fail "Audit ($target): events of $query_p not all stored, evaluated and notified within ${AUDIT_EVENTS_TIMEOUT_S} s (object sets $n_sets, not evaluated $n_pending, incidents $n_inc, notifications pending $n_notif)"
+    IFS=, read -r n_sets n_stmts n_pending n_inc n_notif <<<"$st"
+    # Every literal-bearing statement was ingested: the positive control below then shows the
+    # literals were in the source the agent read.
+    [ "$n_sets" -ge "$min_sets" ] && [ "$n_stmts" -ge "$min_stmts" ] && [ "$n_pending" = 0 ] && [ "$n_inc" -ge 1 ] && [ "$n_notif" = 0 ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || fail "Audit ($target): events of $query_p not all stored, evaluated and notified within ${AUDIT_EVENTS_TIMEOUT_S} s (object sets $n_sets/$min_sets, read statements $n_stmts/$min_stmts, not evaluated $n_pending, incidents $n_inc, notifications pending $n_notif)"
     sleep 2
   done
-  log "Audit ($target): $n_sets object set(s) read by $query_p stored and evaluated"
+  log "Audit ($target): $n_stmts read statement(s) on $n_sets object set(s) of $query_p stored and evaluated"
 
   # check() level and source, from a heartbeat (every 30 s) once the stream has read events.
   deadline=$(( $(date +%s) + 90 ))
@@ -1250,15 +1331,33 @@ for at in "${E2E_AUDIT_TARGETS[@]}"; do
   audit_run "$target" "$engine" "$client" "$account" "$signal"
 done
 log "Audit: dump -> incident latency: ${AUDIT_LATENCIES}"
+# Pages and user API answers that show the agent and its targets' Audit state (target notes, audit
+# level, settings), fetched while the agent is enrolled; scanned with the other pages (I2, below).
+fetch_page agent "/agents/${AGENT_ID}"
+fetch_page api-agents /api/agents
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ <<<"$at"
+  fetch_page "audit-settings-$target" "/agents/${AGENT_ID}/targets/${target}/audit"
+done
+# No event of this run carries a db_user_fingerprint (no failed or unknown login was made while
+# Audit ran: one would mean a principal the agent could not name).
+n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL")" \
+  || fail "cannot count the fingerprinted events"
+[ "$n" = 0 ] || fail "$n access event(s) carry a db_user_fingerprint"
 # Every accepted events batch woke the policy engine (see assert_wakeup).
-# shellcheck disable=SC2059 # the format is the SQL template above
-wake="$(console_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE NOT $(printf "$WAKEUP_JOB_SQL" \
-    b.received_at b.received_at b.received_at)) FROM events_batches b WHERE b.agent_id = '${AGENT_ID}'")" \
+wake="$(console_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE st = 'sent') || ',' ||
+    count(*) FILTER (WHERE st = 'lost') FROM (SELECT ${WAKEUP_STATUS_SQL//@T@/b.received_at} AS st
+    FROM events_batches b WHERE b.agent_id = '${AGENT_ID}') x")" \
   || fail "cannot check the wake-ups of the events batches"
-IFS=, read -r n_batches n_lost <<<"$wake"
+IFS=, read -r n_batches n_woke n_lost <<<"$wake"
 [ "$n_batches" -gt 0 ] || fail "no events batch stored: the wake-up check would prove nothing"
-[ "$n_lost" = 0 ] || fail "$n_lost of $n_batches events batch(es) queued no policies.evaluate job within 5 s (policy-engine wake-up lost)"
-log "policy-engine wake-up after each of the $n_batches events batch(es): job queued"
+[ "$n_lost" = 0 ] || fail "$n_lost of $n_batches events batch(es): no policies.evaluate job within 5 s (policy-engine wake-up lost)"
+[ "$n_woke" -gt 0 ] || fail "no events batch was followed by a wake-up job (all coalesced: nothing proven)"
+[[ "$WAKEUP_POLICY_STATUS" == *sent* ]] || fail "no policy creation was followed by a wake-up job (all coalesced: nothing proven)"
+n="$(console_sql "SELECT count(*) FROM pgboss.job WHERE name = '__pgboss__send-it' AND data->>'name' = 'policies.evaluate'")" \
+  || fail "cannot count the scheduled sends"
+[ "$n" -gt 0 ] || fail "no scheduled policies.evaluate send found: schedule jobs cannot be told apart from wake-ups"
+log "policy-engine wake-up: events batches $n_batches ($n_woke sent, $((n_batches - n_woke)) coalesced), policies:${WAKEUP_POLICY_STATUS}; $n scheduled send(s) excluded"
 lost="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" logs --no-color web 2>/dev/null \
   | grep -c 'wake-up not sent' || true)"
 [ "$lost" = 0 ] || fail "web.log shows $lost 'wake-up not sent' warning(s)"
@@ -1328,6 +1427,33 @@ fi
 
 # I3: the target passwords set by target-initdb/ are not in the statement texts that
 # pg_stat_statements keeps on target-pg (readable by the agent account through pg_read_all_stats).
+# I3 on the audit logs the agent reads (targets' side): no registered secret in them, and they are
+# not empty. Own-account positive control: they hold records of the agent's own account since the
+# Discovery scan started (so "no own-account event" above means filtered, not unseen).
+log "checking the targets' audit logs: no secret, and the agent's own reads recorded"
+mkdir -p "$E2E_WORK_DIR/target-logs"
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client account _ <<<"$at"
+  rc=0
+  "audit_client_${client}_target_log" "$E2E_WORK_DIR/target-logs/$target.log" || rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 3 ] || fail "cannot copy the audit log of $target"
+  [ -s "$E2E_WORK_DIR/target-logs/$target.log" ] || fail "the audit log of $target is empty"
+  if [ "$rc" = 3 ]; then
+    log "$target: the $E2E_PG_AUDIT source writes no audit record: no own-account positive control"
+  else
+    n="$("audit_client_${client}_log_user_records" "$E2E_WORK_DIR/target-logs/$target.log" "$account" \
+      "${SCAN_START[$target]}")"
+    [ "${n:-0}" -gt 0 ] \
+      || fail "$target: no audit record of the agent's account $account since the scan started (positive control)"
+    log "$target: $n audit record(s) of the agent's account $account since the scan started, none surfaced"
+  fi
+done
+if ! leaked="$(leak_scan "$E2E_WORK_DIR/target-logs" "$P")"; then
+  while IFS= read -r line; do log "LEAK: $line"; done <<<"$leaked"
+  fail "secret(s) found in the targets' audit logs"
+fi
+rm -rf -- "$E2E_WORK_DIR/target-logs"
+
 log "checking that no target password is in target-pg's pg_stat_statements"
 timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
   psql -XAt -v ON_ERROR_STOP=1 -U postgres -d shop -c "SELECT query FROM pg_stat_statements" \
@@ -1347,13 +1473,17 @@ timeout 120 docker compose -f "$HERE/docker-compose.yml" exec -T db \
   pg_dump -U postgres -d databastion >"$db_dump" 2>"$E2E_WORK_DIR/pg_dump.err" \
   || fail "pg_dump of the console database failed"
 grep -q '^CREATE TABLE ' "$db_dump" || fail "the console database dump holds no table"
-db_leaks=0
 for name in agent_secret enrollment_token admin_password target_pg_password target_agent_password \
     target_client_password target_mysql_password target_mysql_agent_password \
-    target_mariadb_password target_mariadb_agent_password; do
+    target_mariadb_password target_mariadb_agent_password mailpit_password; do
   [ -s "$P/$name" ] || fail "secret $name was never registered"
-  if LC_ALL=C grep -qFf "$P/$name" -- "$db_dump"; then
-    log "LEAK: $name stored in clear text in the console database"
+done
+# Every registered secret (the whole registry, not a list).
+db_leaks=0
+for f in "$P"/*; do
+  [ -s "$f" ] || continue
+  if LC_ALL=C grep -qFf "$f" -- "$db_dump"; then
+    log "LEAK: $(basename "$f") stored in clear text in the console database"
     db_leaks=$((db_leaks + 1))
   fi
 done
@@ -1402,7 +1532,7 @@ done
 # source). Then the literals the test put in query text are searched alone, on every console-side
 # artifact: they must be nowhere (their positive control ran on the target's own audit log).
 log "invariant I2 (Audit path): events, incidents, notifications, pages and e-mails"
-mkdir -p "$AUDIT_DIR/tables" "$AUDIT_DIR/pages"
+mkdir -p "$AUDIT_DIR/tables"
 for table in access_events incidents incident_events notification_deliveries principal_baselines \
     audit_configs; do
   # Every column, as the console stores it (row_to_json of the whole row).
@@ -1413,12 +1543,6 @@ for table in access_events incidents notification_deliveries; do
   [ "$(jq length "$AUDIT_DIR/tables/${table}.json")" -gt 0 ] \
     || fail "$table is empty: the I2 scan of the Audit path would prove nothing"
 done
-# fetch_page NAME PATH: a console page with the admin session, HTTP 200 required.
-fetch_page() {
-  local code
-  code="$("${CURL[@]}" -o "$AUDIT_DIR/pages/$1.html" -w '%{http_code}' "${BASE_URL}$2")" || code=000
-  [ "$code" = 200 ] || fail "page $2: HTTP $code"
-}
 fetch_page events /events
 fetch_page incidents "/incidents?status=all"
 fetch_page notifications /notifications
@@ -1444,6 +1568,14 @@ for at in "${E2E_AUDIT_TARGETS[@]}"; do
 done
 mailpit_fetch "$AUDIT_DIR/mail.json" || fail "cannot read the Mailpit messages"
 [ "$(jq length "$AUDIT_DIR/mail.json")" -gt 0 ] || fail "Mailpit holds no message: the I2 scan would prove nothing"
+# Every message is an incident e-mail of this run: a text part naming an Audit target or principal
+# (so the scan reads real notification bodies).
+AUDIT_WORDS="$(for at in "${E2E_AUDIT_TARGETS[@]}"; do
+    read -r t _ c _ <<<"$at"; printf '%s\n' "$t"; "audit_client_${c}_principals" | tr ' ' '\n'; echo
+  done | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
+jq -e --argjson w "$AUDIT_WORDS" 'all(.[]; (.message.Text // "") as $t
+    | ($t | length) > 0 and any($w[]; . as $x | $t | contains($x)))' "$AUDIT_DIR/mail.json" >/dev/null \
+  || fail "a Mailpit message has no text part naming an Audit target or principal"
 log "Audit path: $(find "$AUDIT_DIR/pages" -type f | wc -l) page(s), $(jq length "$AUDIT_DIR/mail.json") e-mail(s), 6 table export(s)"
 declare -A AUDIT_ENGINES=()
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
