@@ -559,6 +559,68 @@ impl ResultBatch {
         Ok((out.len > 0).then_some(out))
     }
 
+    /// Whether an item carries a field gated by capability negotiation
+    /// (ADR-0022): `AccessEvent.bytes`. Findings have none. `false` if the
+    /// bytes cannot be decoded.
+    pub(crate) fn carries_gated(&self) -> bool {
+        match Self::decode(self.findings, &self.bytes) {
+            Some(Parsed::Events(b)) => b.events.iter().any(event_carries_gated),
+            Some(Parsed::Findings(_)) | None => false,
+        }
+    }
+
+    /// The batch to send again after a `400` to a batch carrying gated
+    /// fields (ADR-0022 decision 9), under a **new** `batch_id`, with every
+    /// gated field of every item stripped. Of the items at `rejected`
+    /// (sorted), those that carried a gated field are kept (an older
+    /// console accepts them without it); the others were rejected for
+    /// another reason and are left out. Returns the batch (`None` if
+    /// nothing is left) and the number of items left out. The result
+    /// carries no gated field, so it is stripped at most once.
+    pub(crate) fn stripped(
+        &self,
+        rejected: &[usize],
+    ) -> Result<(Option<Self>, usize), Unserializable> {
+        let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
+        let mut left_out = 0usize;
+        let out = match parsed {
+            // No gated finding field exists: only the rejected items go.
+            Parsed::Findings(b) => {
+                let n = b.findings.len();
+                let findings: Vec<Finding> = b
+                    .findings
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| rejected.binary_search(i).is_err())
+                    .map(|(_, f)| f)
+                    .collect();
+                left_out = n - findings.len();
+                Parsed::Findings(FindingsBatch {
+                    batch_id: new_batch_id(),
+                    findings,
+                    ..b
+                })
+            }
+            Parsed::Events(b) => {
+                let mut events = Vec::with_capacity(b.events.len());
+                for (i, mut e) in b.events.into_iter().enumerate() {
+                    if rejected.binary_search(&i).is_ok() && !event_carries_gated(&e) {
+                        left_out += 1;
+                        continue;
+                    }
+                    strip_gated_event(&mut e);
+                    events.push(e);
+                }
+                Parsed::Events(EventsBatch {
+                    batch_id: new_batch_id(),
+                    events,
+                })
+            }
+        }
+        .into_batch()?;
+        Ok(((out.len > 0).then_some(out), left_out))
+    }
+
     /// Two halves, each under a new `batch_id` (`413`); `Ok(None)` for a
     /// single item, `Err` if a half could not be serialized or would be
     /// empty (`len` disagreeing with the decoded items).
@@ -577,6 +639,17 @@ impl ResultBatch {
             _ => Err(Unserializable),
         }
     }
+}
+
+/// Whether an event carries a gated field (ADR-0022).
+fn event_carries_gated(e: &AccessEvent) -> bool {
+    e.bytes.is_some()
+}
+
+/// Removes every gated field of an event (ADR-0022): `bytes`. A new gated
+/// `AccessEvent` field must be added here and in [`event_carries_gated`].
+fn strip_gated_event(e: &mut AccessEvent) {
+    e.bytes = None;
 }
 
 /// Batches built from masked results, and the items dropped on the way.
@@ -624,6 +697,9 @@ pub(crate) enum MaskedResults<'a> {
         target_id: &'a TargetId,
         events: &'a [MaskedEvent],
         fingerprints: &'a dyn sanitize::Fingerprinter,
+        /// The console listed `access_event.bytes` (ADR-0022): otherwise
+        /// `AccessEvent.bytes` is never sent.
+        accept_bytes: bool,
     },
 }
 
@@ -661,6 +737,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             target_id,
             events,
             fingerprints,
+            accept_bytes,
         } => {
             let mut dropped = 0u64;
             let items: Vec<AccessEvent> = events
@@ -673,7 +750,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
                     item
                 })
                 .collect();
-            let mut built = pack_events(items);
+            let mut built = pack_events(items, accept_bytes);
             built.dropped_items += dropped;
             built
         }
@@ -735,7 +812,9 @@ fn event_item(
             EventAction::Dcl => AccessEventAction::Dcl,
         },
         aggregated_count: std::num::NonZeroU64::new(e.aggregated_count())?,
-        // No connector reports a result size yet (the PostgreSQL sources have none).
+        // No connector reports a result size yet (the PostgreSQL sources
+        // have none). A gated field (ADR-0022): `pack_events` strips it
+        // unless the console listed `access_event.bytes`.
         bytes: None,
         objects,
         principal,
@@ -826,8 +905,10 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
     built
 }
 
-/// Packs sanitized events under the item and byte caps.
-fn pack_events(items: Vec<AccessEvent>) -> Built {
+/// Packs sanitized events under the item and byte caps. `accept_bytes`:
+/// the console accepts the gated `AccessEvent.bytes`; otherwise it is
+/// stripped from every event.
+fn pack_events(items: Vec<AccessEvent>, accept_bytes: bool) -> Built {
     let make = |events: Vec<AccessEvent>| EventsBatch {
         batch_id: new_batch_id(),
         events,
@@ -840,6 +921,9 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
         if !sanitize::check_event(&mut item) {
             built.dropped_items += 1;
             continue;
+        }
+        if !accept_bytes {
+            strip_gated_event(&mut item);
         }
         let Ok(len) = serde_json::to_vec(&item).map(|v| v.len() + 1) else {
             built.dropped_items += 1;
@@ -937,7 +1021,7 @@ mod tests {
 
     #[test]
     fn splitting_a_batch_whose_len_disagrees_with_its_items_is_an_error() {
-        let built = pack_events(vec![crate::sanitize::tests::event("read", 16)]);
+        let built = pack_events(vec![crate::sanitize::tests::event("read", 16)], false);
         let mut batch = built.batches.into_iter().next().unwrap();
         assert_eq!(batch.len(), 1);
         // Claims more items than it decodes to: one half ends up empty.
@@ -1069,7 +1153,7 @@ mod tests {
     fn event_packing_respects_the_byte_cap() {
         let event = crate::sanitize::tests::event("read", 16);
         let events: Vec<_> = (0..2000).map(|_| event.clone()).collect();
-        let built = pack_events(events);
+        let built = pack_events(events, false);
         assert!(built.batches.len() >= 4);
         for b in &built.batches {
             assert!(b.len() <= 500);
@@ -1077,7 +1161,7 @@ mod tests {
         }
         assert_eq!(built.dropped_items, 0);
         assert_eq!(
-            pack_events(vec![crate::sanitize::tests::event("read", 0)]).dropped_items,
+            pack_events(vec![crate::sanitize::tests::event("read", 0)], false).dropped_items,
             1
         );
         let target = TargetId::try_from("pg-main").unwrap();
@@ -1088,11 +1172,81 @@ mod tests {
                 target_id: &target,
                 events: &[],
                 fingerprints: &fps,
+                accept_bytes: true,
             })
             .batches
             .as_slice(),
             []
         ));
+    }
+
+    fn event_with_bytes(bytes: i64) -> AccessEvent {
+        let mut e = crate::sanitize::tests::event("read", 1);
+        e.bytes = Some(Count(bytes));
+        e
+    }
+
+    fn events_of(batch: &ResultBatch) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_slice(batch.bytes()).unwrap();
+        v["events"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn access_event_bytes_is_sent_only_when_accepted() {
+        let built = pack_events(vec![event_with_bytes(42)], false);
+        let batch = &built.batches[0];
+        assert!(events_of(batch)[0].get("bytes").is_none());
+        assert!(!batch.carries_gated());
+        let built = pack_events(vec![event_with_bytes(42)], true);
+        let batch = &built.batches[0];
+        assert_eq!(events_of(batch)[0]["bytes"], 42);
+        assert!(batch.carries_gated());
+    }
+
+    #[test]
+    fn stripping_keeps_gated_items_and_drops_other_rejected_ones() {
+        let plain = crate::sanitize::tests::event("read", 1);
+        let built = pack_events(
+            vec![
+                event_with_bytes(1),
+                plain.clone(),
+                event_with_bytes(3),
+                plain,
+            ],
+            true,
+        );
+        let batch = &built.batches[0];
+        assert!(batch.carries_gated());
+        // Items 0 (gated) and 1 (not gated) pointed at.
+        let (again, left_out) = batch.stripped(&[0, 1]).unwrap();
+        let again = again.unwrap();
+        assert_eq!(left_out, 1);
+        assert_eq!(again.len(), 3);
+        assert_ne!(again.batch_id(), batch.batch_id());
+        assert!(!again.carries_gated(), "every gated field is stripped");
+        assert!(events_of(&again).iter().all(|e| e.get("bytes").is_none()));
+        // Envelope rejection: everything kept, stripped.
+        let (all, left_out) = batch.stripped(&[]).unwrap();
+        assert_eq!((all.unwrap().len(), left_out), (4, 0));
+        // Nothing left.
+        let only = pack_events(vec![crate::sanitize::tests::event("read", 1)], true);
+        let (none, left_out) = only.batches[0].stripped(&[0]).unwrap();
+        assert!(none.is_none());
+        assert_eq!(left_out, 1);
+    }
+
+    #[test]
+    fn findings_carry_no_gated_field() {
+        let items = vec![crate::sanitize::tests::finding(); 3];
+        let built = pack_findings(
+            Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+            &ClassifiersVersion::try_from("2026.09.1").unwrap(),
+            items,
+        );
+        let batch = &built.batches[0];
+        assert!(!batch.carries_gated());
+        let (again, left_out) = batch.stripped(&[1]).unwrap();
+        assert_eq!((again.unwrap().len(), left_out), (2, 1));
     }
 
     /// End to end: raw column values -> classifier with the agent key ->

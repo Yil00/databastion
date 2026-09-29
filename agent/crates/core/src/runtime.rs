@@ -1158,6 +1158,17 @@ impl Runtime {
                 self.lock_spool().drop_batch(&key);
                 Ok(Flush::Progress)
             }
+            // ADR-0022 decision 9: a `400` to a batch that carried a gated
+            // field is more likely an older console than bad items.
+            Err(CallError::Uplink(UplinkError::ItemsRejected { status: 400, items }))
+                if batch.carries_gated() =>
+            {
+                Ok(self.resend_stripped(&key, &batch, &items, failures))
+            }
+            Err(CallError::Uplink(UplinkError::Rejected {
+                status: 400,
+                code: Some(_),
+            })) if batch.carries_gated() => Ok(self.resend_stripped(&key, &batch, &[], failures)),
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
                 tracing::warn!(
@@ -1235,6 +1246,44 @@ impl Runtime {
                 Ok(Flush::Retry(delay))
             }
         }
+    }
+
+    /// A batch carrying a gated field was rejected with `400` (ADR-0022
+    /// decision 9): the console may be an older replica or a rolled-back
+    /// build. Forget its capabilities (no new gated field until a heartbeat
+    /// response lists them again) and replace the batch with the same items
+    /// under a new `batch_id`, every gated field stripped, instead of
+    /// dropping them. Of the `rejected` items, only those without a gated
+    /// field are left out (they were rejected for another reason). The
+    /// replacement carries no gated field: it is never stripped again.
+    fn resend_stripped(
+        &self,
+        key: &[u64],
+        batch: &ResultBatch,
+        rejected: &[usize],
+        failures: u32,
+    ) -> Flush {
+        self.console_caps.clear();
+        bump(&self.counters.gated_fields_stripped, 1);
+        let (again, left_out) = match batch.stripped(rejected) {
+            Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
+            Err(uplink::Unserializable) => {
+                self.count_unserializable(1);
+                (Vec::new(), batch.len())
+            }
+        };
+        tracing::warn!(
+            path = batch.path(),
+            left_out,
+            "batch with gated fields rejected (400): console capabilities cleared, items sent \
+             again without them"
+        );
+        let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
+        if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
+            tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+            return Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
+        }
+        Flush::Progress
     }
 
     // ----------------------------------------------------------------- jobs
@@ -1588,6 +1637,9 @@ impl Runtime {
             target_id,
             events,
             fingerprints: &fingerprints,
+            accept_bytes: self
+                .console_caps
+                .console_accepts(crate::capabilities::token::ACCESS_EVENT_BYTES),
         });
         self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();

@@ -3328,3 +3328,159 @@ async fn a_400_without_gated_fields_keeps_the_capabilities() {
     assert_eq!(scan_statuses(&statuses(&server).await).len(), 1);
     assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
 }
+
+/// Spools one events batch of `n` events, those at `with_bytes` carrying
+/// the gated `bytes` (as built while the console listed
+/// `access_event.bytes`).
+fn spool_events_with_bytes(rt: &Runtime, n: usize, with_bytes: &[usize]) {
+    let events: Vec<databastion_protocol::AccessEvent> = (0..n)
+        .map(|i| {
+            let mut e = crate::sanitize::tests::event("read", 1);
+            if with_bytes.contains(&i) {
+                e.bytes = Some(databastion_protocol::Count(1000 + i as i64));
+            }
+            e
+        })
+        .collect();
+    let batch = databastion_protocol::EventsBatch {
+        batch_id: databastion_protocol::new_batch_id(),
+        events,
+    };
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&batch).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+}
+
+async fn sent_event_batches(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/events"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+async fn events_runtime(server: &MockServer, steps: Vec<Step>) -> (Env, Runtime) {
+    use crate::capabilities::token;
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[token::ACCESS_EVENT_BYTES, token::TARGET_STATUS_NOTES],
+    );
+    (env, rt)
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_by_pointer_are_resent_stripped_once() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 1 carries `bytes`, item 3 does not: both pointed at. Then the
+    // stripped batch is rejected again: it is handled as any batch (the
+    // pointed item dropped), never stripped a second time.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![
+            Step::Items(&["/events/1", "/events/3/objects/0"]),
+            Step::Items(&["/events/0"]),
+        ],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 5, &[1, 2]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    let ids: std::collections::HashSet<_> = sent.iter().map(|b| b["batch_id"].clone()).collect();
+    assert_eq!(ids.len(), 3, "every resend has a new batch_id");
+    let count_bytes = |b: &serde_json::Value| {
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e.get("bytes").is_some())
+            .count()
+    };
+    assert_eq!(count_bytes(&sent[0]), 2);
+    // Items 0, 1 (stripped), 2 (stripped), 4 resent; 3 left out.
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 4);
+    assert_eq!(count_bytes(&sent[1]), 0);
+    for b in &sent {
+        serde_json::from_value::<databastion_protocol::EventsBatch>(b.clone()).unwrap();
+    }
+    // Second 400: the ordinary item rule (one more item dropped).
+    assert_eq!(sent[2]["events"].as_array().unwrap().len(), 3);
+    assert!(!rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    assert_eq!(status.batches.0, 0);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_as_a_whole_are_resent_stripped() {
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/batch_id"])]).await;
+    spool_events_with_bytes(&rt, 3, &[0]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 3);
+    assert!(!sent[1].to_string().contains("\"bytes\""));
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 0);
+}
+
+#[tokio::test]
+async fn events_without_gated_fields_keep_the_ordinary_400_rules() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/events/1"])]).await;
+    spool_events_with_bytes(&rt, 3, &[]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 2);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+}
+
+#[tokio::test]
+async fn findings_carry_no_gated_field_so_a_400_keeps_the_capabilities() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/0"])], 3).await;
+    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+}
+
+#[tokio::test]
+async fn spooled_events_carry_bytes_only_while_accepted() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let target = TargetId::try_from("pg-main").unwrap();
+    // No producer sets `bytes` yet; whatever the capability, the built
+    // events conform and carry no `bytes` when it is not listed.
+    for accepted in [false, true] {
+        if accepted {
+            accept_tokens(&rt, &[token::ACCESS_EVENT_BYTES]);
+        }
+        rt.spool_events(&target, &[fake_event(10)]);
+    }
+    let mut spool = rt.lock_spool();
+    while let Some((key, batch)) = spool.front() {
+        assert!(!batch.carries_gated());
+        spool.remove(&key);
+    }
+}
