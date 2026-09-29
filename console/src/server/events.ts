@@ -4,6 +4,7 @@ import type { Database } from "@/db/client";
 import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
+import { auditSourceEngine } from "@/lib/location-labels";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
@@ -309,6 +310,11 @@ export interface EventView {
   application: string | null;
   action: string;
   objects: { database: string; schema?: string; object: string }[];
+  /**
+   * Engine of the event: from its audit source when the source tells it, else from the target as
+   * last reported by the agent; null when neither is known. Drives the LDAP labels (ADR-0029).
+   */
+  engine: string | null;
   rows: number | null;
   /** Contract `AccessEvent.bytes`, when the source reports it (not used by the score). */
   bytes: number | null;
@@ -370,6 +376,8 @@ const EVENT_COLUMNS = {
   score: accessEvents.score,
   anomaly: accessEvents.anomaly,
   baselineRows: accessEvents.baselineRows,
+  targetEngine: sql<string | null>`(select ${agentTargets.engine} from ${agentTargets}
+      where ${agentTargets.agentId} = ${accessEvents.agentId} and ${agentTargets.targetId} = ${accessEvents.targetId})`,
   incidentIds: sql<string[]>`coalesce((select array_agg(ie.incident_id::text order by ie.created_at) from (
       select incident_id, created_at from ${incidentEvents} where ${incidentEvents.eventId} = ${accessEvents.id}
       order by created_at limit 10) ie), '{}')`,
@@ -387,9 +395,10 @@ function selectEvents(db: Database, where: SQL | undefined, limit: number) {
     .limit(limit);
 }
 
-function toEventView({ dbUser, dbUserFingerprint, evaluatedAt, ...r }: EventRow): EventView {
+function toEventView({ dbUser, dbUserFingerprint, evaluatedAt, targetEngine, ...r }: EventRow): EventView {
   return {
     ...r,
+    engine: auditSourceEngine(r.source) ?? targetEngine ?? null,
     principal: principalLabel({ dbUser, dbUserFingerprint }),
     fingerprinted: dbUser === null,
     evaluated: evaluatedAt !== null,
@@ -429,6 +438,8 @@ export interface PrincipalView {
   principalKey: string;
   principal: string;
   fingerprinted: boolean;
+  /** Engine of the target as last reported by the agent (null: unknown). */
+  engine: string | null;
   /** Events with `rows` counted in the baseline. */
   events: number;
   warm: boolean;
@@ -449,6 +460,8 @@ const PRINCIPAL_COLUMNS = {
   principalKey: principalBaselines.principalKey,
   dbUser: principalBaselines.dbUser,
   dbUserFingerprint: principalBaselines.dbUserFingerprint,
+  engine: sql<string | null>`(select ${agentTargets.engine} from ${agentTargets}
+      where ${agentTargets.agentId} = ${principalBaselines.agentId} and ${agentTargets.targetId} = ${principalBaselines.targetId})`,
   events: principalBaselines.events,
   meanLogRows: principalBaselines.meanLogRows,
   varLogRows: principalBaselines.varLogRows,
@@ -489,6 +502,7 @@ function toPrincipalView(r: PrincipalRow): PrincipalView {
     principalKey: r.principalKey,
     principal: principalLabel(r),
     fingerprinted: r.dbUser === null,
+    engine: r.engine ?? null,
     events: r.events,
     warm: isWarm(state),
     baselineRows: verdict.baselineRows,

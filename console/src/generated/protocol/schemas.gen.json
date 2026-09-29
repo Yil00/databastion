@@ -1527,12 +1527,12 @@
       }
     },
     "Principal": {
-      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. The console escapes `db_user` and `application` on\ndisplay.\n",
+      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so\nthe agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN\nand the DNs listed in its `openldap.clear_principals`. The console escapes `db_user` and\n`application` on display.\n",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "db_user": {
-          "description": "Database account (or LDAP bind DN) as logged by the engine.",
+          "description": "Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of\n`openldap.clear_principals`) as logged by the engine.\n",
           "type": "string",
           "minLength": 1,
           "maxLength": 256,

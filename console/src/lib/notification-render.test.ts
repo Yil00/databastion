@@ -98,6 +98,42 @@ describe("notification contents", () => {
     expect(text).toContain("limit of 30 incident notifications per hour");
   });
 
+  it("system-alert digest: counts per event and number of agents only", () => {
+    const { subject, text } = renderEmail({
+      event: "system_alerts.suppressed",
+      occurred_at: "t",
+      url: "https://console.example.com/agents",
+      channel: "ops\nhook",
+      window_start: "2026-09-28T11:00:00.000Z",
+      window_end: "2026-09-28T12:00:00.000Z",
+      suppressed: 7,
+      by_event: { "agent.silent": 5, "agent.integrity": 2 },
+      agents: 6,
+      limit_per_hour: 20,
+    });
+    expect(subject).toBe("[DataBastion] 7 system alerts suppressed");
+    expect(text).toContain("channel ops hook reached its limit of 20 system alerts per hour");
+    expect(text).toContain("7 more alerts were not sent, concerning 6 agents");
+    expect(text).toMatch(/^ {2}Silent agents: +5$/m);
+    expect(text).toMatch(/^ {2}Agent-integrity events: +2$/m);
+    expect(text).not.toContain("Dropped batches");
+    expect(text).toContain("Open in the console: https://console.example.com/agents");
+    const single = renderEmail({
+      event: "system_alerts.suppressed",
+      occurred_at: "t",
+      url: null,
+      channel: "c",
+      window_start: "a",
+      window_end: "b",
+      suppressed: 1,
+      by_event: { "agent.batches_dropped": 1 },
+      agents: 1,
+      limit_per_hour: 1,
+    });
+    expect(single.subject).toBe("[DataBastion] 1 system alert suppressed");
+    expect(single.text).toContain("1 more alert was not sent, concerning 1 agent.");
+  });
+
   it("system alerts", () => {
     const agent = { id: "a-1", name: "db-host-1", hostname: "db-host-1.example" };
     expect(

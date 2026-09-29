@@ -5,10 +5,10 @@ import { accessEvents, agentTargets, findings, incidentEvents, incidents, polici
 import {
   baselineEligible,
   baselineVerdict,
-  coarsePrincipal,
+  dedupPrincipal,
   eventOverflowKey,
   severeEvent,
-  worseThanResolved,
+  worseThanClosed,
   dedupObject,
   eventBucket,
   eventDedupKey,
@@ -311,6 +311,12 @@ interface LatestIncident {
   eventScore: number | null;
   eventSignals: string[] | null;
   eventAnomaly: boolean | null;
+  eventRows: number | null;
+  /**
+   * False positive only: rows of the events linked to it since it was marked (ADR-0031 decision
+   * 2, anti-splitting), kept up to date by `linkClosed` within the chunk.
+   */
+  rowsSinceFalsePositive: number;
 }
 
 /** Per-chunk state: incident lookups by dedup key, and new incidents per policy in this hour. */
@@ -322,6 +328,16 @@ interface ChunkState {
   created: Map<string, number>;
 }
 
+/**
+ * Rows of the events linked to a false-positive incident since it was marked (0 for another
+ * status). Table-qualified on purpose: an unqualified "id" in the subquery would resolve to ae.id.
+ */
+function rowsSinceFalsePositiveSql() {
+  return sql<number>`case when incidents.status = 'false_positive' then coalesce((
+      select sum(ae.rows) from incident_events ie join access_events ae on ae.id = ie.event_id
+      where ie.incident_id = incidents.id and ie.created_at >= incidents.false_positive_at), 0) else 0 end::double precision`;
+}
+
 async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<LatestIncident | null> {
   if (state.latest.has(key)) return state.latest.get(key) ?? null;
   const [row] = await tx
@@ -331,13 +347,28 @@ async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<L
       eventScore: incidents.eventScore,
       eventSignals: incidents.eventSignals,
       eventAnomaly: incidents.eventAnomaly,
+      eventRows: incidents.eventRows,
+      rowsSinceFalsePositive: rowsSinceFalsePositiveSql(),
     })
     .from(incidents)
     .where(eq(incidents.dedupKey, key))
     .orderBy(desc(incidents.createdAt), desc(incidents.id))
     .limit(1);
-  state.latest.set(key, row ?? null);
-  return row ?? null;
+  const latest = row ? { ...row, rowsSinceFalsePositive: Number(row.rowsSinceFalsePositive) } : null;
+  state.latest.set(key, latest);
+  return latest;
+}
+
+/** Whether `e` opens a new incident after the closed incident `closed` of its key (M1, ADR-0031). */
+function worseThanClosedIncident(closed: LatestIncident, e: PendingEvent, facts: EventFacts): boolean {
+  const rows = closed.status === "false_positive" ? closed.rowsSinceFalsePositive + (e.rows ?? 0) : 0;
+  return worseThanClosed(closed, facts, rows);
+}
+
+/** Links an event to a closed incident (not worse), counting its rows after a false positive. */
+async function linkClosed(tx: Tx, closed: LatestIncident, e: PendingEvent): Promise<void> {
+  if (closed.status === "false_positive") closed.rowsSinceFalsePositive += e.rows ?? 0;
+  await link(tx, closed.id, e.id);
 }
 
 const capKey = (policyId: string, e: Pick<PendingEvent, "agentId" | "targetId">) => [policyId, e.agentId, e.targetId].join(SEP);
@@ -364,14 +395,25 @@ async function createdThisHour(tx: Tx, state: ChunkState, policyId: string, e: P
   return n;
 }
 
+/**
+ * Links an event to an incident. `created_at` is the wall clock of the insert, not the transaction
+ * start (`now()`): the rows linked after a false-positive mark are counted from it (ADR-0031
+ * decision 2), and a chunk transaction that started before a concurrent mark links after it (PR #81
+ * security review L1).
+ */
 async function link(tx: Tx, incidentId: string, eventId: string): Promise<void> {
-  await tx.insert(incidentEvents).values({ incidentId, eventId }).onConflictDoNothing();
+  await tx.insert(incidentEvents).values({ incidentId, eventId, createdAt: sql`clock_timestamp()` }).onConflictDoNothing();
 }
 
-/** Adds an event to an active incident. */
+/**
+ * Adds an event to an active incident. Only while it is still active (PR #81 security review L1):
+ * when a user closed it after the chunk read it (the update waits for that transaction, then
+ * re-checks the status), the event is only linked to it, as to any closed incident, and the
+ * cached state is refreshed for the next events of the chunk.
+ */
 async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: EventFacts): Promise<void> {
   const signals = mergeSignals(latest.eventSignals ?? [], facts.signals);
-  await tx
+  const updated = await tx
     .update(incidents)
     .set({
       matchCount: sql`${incidents.matchCount} + 1`,
@@ -382,10 +424,25 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
       lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
       updatedAt: sql`now()`,
     })
-    .where(eq(incidents.id, latest.id));
+    .where(and(eq(incidents.id, latest.id), inArray(incidents.status, ["open", "acknowledged"])))
+    .returning({ id: incidents.id });
+  if (updated.length === 0) {
+    const [now] = await tx
+      .select({
+        status: incidents.status,
+        rowsSinceFalsePositive: rowsSinceFalsePositiveSql(),
+      })
+      .from(incidents)
+      .where(eq(incidents.id, latest.id));
+    latest.status = now?.status ?? "resolved";
+    latest.rowsSinceFalsePositive = Number(now?.rowsSinceFalsePositive ?? 0);
+    await linkClosed(tx, latest, e);
+    return;
+  }
   latest.eventSignals = signals;
   latest.eventScore = Math.max(latest.eventScore ?? 0, facts.score);
   latest.eventAnomaly = latest.eventAnomaly === true || facts.anomaly;
+  latest.eventRows = (latest.eventRows ?? 0) + (e.rows ?? 0);
   await link(tx, latest.id, e.id);
 }
 
@@ -403,12 +460,15 @@ async function applyEventPolicy(
   const oi = dedupObject(kept, ev.objectSensitivities);
   const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
-  const coarse = coarsePrincipal({ fingerprinted: e.dbUser === null, action: e.action });
   const key = eventDedupKey({
     policyId: policy.id,
     agentId: e.agentId,
     targetId: e.targetId,
-    principalKey: coarse ? `unknown:${sha256Hex(clientNetwork(e.clientAddr))}` : e.principalKey,
+    principalKey: dedupPrincipal({
+      action: e.action,
+      principalKey: e.principalKey,
+      networkHash: sha256Hex(clientNetwork(e.clientAddr)),
+    }),
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
   });
@@ -417,10 +477,10 @@ async function applyEventPolicy(
     await rematch(tx, latest, e, facts);
     return "rematched";
   }
-  // M1: after a resolution, only a clearly worse event opens a new incident; otherwise the event
-  // is linked to the closed incident (visible there). A false positive is only linked.
-  if (latest && (latest.status !== "resolved" || !worseThanResolved(latest, facts))) {
-    await link(tx, latest.id, e.id);
+  // M1: after a resolution or a false positive, only a clearly worse event opens a new incident
+  // (`worseThanClosed`); otherwise the event is linked to the closed incident (visible there).
+  if (latest && !worseThanClosedIncident(latest, e, facts)) {
+    await linkClosed(tx, latest, e);
     return "linked";
   }
   // H1 / N1: cap of new incidents per policy, target and hour; beyond, one overflow incident of
@@ -437,8 +497,8 @@ async function applyEventPolicy(
       }
       // A closed overflow incident: same rule as any closed incident (M1): only a worse event
       // opens a new one.
-      if (o && (o.status !== "resolved" || !worseThanResolved(o, facts))) {
-        await link(tx, o.id, e.id);
+      if (o && !worseThanClosedIncident(o, e, facts)) {
+        await linkClosed(tx, o, e);
         return "linked";
       }
       overflow = true;
@@ -480,10 +540,12 @@ async function applyEventPolicy(
     eventScore: facts.score,
     eventSignals: mergeSignals([], facts.signals),
     eventAnomaly: facts.anomaly,
+    eventRows: e.rows ?? 0,
+    rowsSinceFalsePositive: 0,
   });
   if (!overflow) state.created.set(capKey(policy.id, e), (state.created.get(capKey(policy.id, e)) ?? 0) + 1);
   await link(tx, row.id, e.id);
-  const reopenedFrom = overflow ? overflowReopenedFrom : latest?.status === "resolved" ? latest.id : null;
+  const reopenedFrom = overflow ? overflowReopenedFrom : latest && !(ACTIVE_STATUSES as readonly string[]).includes(latest.status) ? latest.id : null;
   await writeAudit(tx, {
     actorType: "system",
     action: "incident.create",

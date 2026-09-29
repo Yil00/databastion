@@ -7,8 +7,9 @@ import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
 import { pruneRateLimitCounters } from "@/server/rate-limit";
-import { drainDeliveries, enqueueSuppressionDigests } from "@/server/notifications";
+import { drainDeliveries, enqueueSuppressionDigests, enqueueSystemAlertDigests } from "@/server/notifications";
 import { POLICY_QUEUE } from "@/server/policy-queue";
+import { flushAuditStreamStoppedAlerts } from "@/server/audit-stream-alerts";
 import { flushDroppedBatchAlerts } from "@/server/dropped-batches";
 import { checkSilentAgents } from "@/server/system-alerts";
 
@@ -104,7 +105,9 @@ export const NOTIFICATION_JOB_BUDGET_MS = 50_000;
 /**
  * `notifications.deliver`: the silent-agent check (no new silence alert during the first threshold
  * after the worker started, see `checkSilentAgents`), the dropped-batches alerts held back by the
- * per-agent interval (`flushDroppedBatchAlerts`), then the due deliveries. Re-queued when due
+ * per-agent interval (`flushDroppedBatchAlerts`) and the Audit-stream-stopped alerts likewise
+ * (`flushAuditStreamStoppedAlerts`), the digests of the notifications and system alerts
+ * suppressed by the hourly budgets of a closed hour, then the due deliveries. Re-queued when due
  * deliveries remain; a failure is retried by pg-boss, the outbox keeps the work.
  */
 export function createNotificationHandler(
@@ -120,7 +123,10 @@ export function createNotificationHandler(
     await checkSilentAgents(db(), { thresholdS, notBefore: new Date(startedAt.getTime() + thresholdS * 1000) });
     const dropped = await flushDroppedBatchAlerts(db());
     if (dropped > 0) log.info({ dropped }, "dropped-batches alerts");
+    const stopped = await flushAuditStreamStoppedAlerts(db());
+    if (stopped > 0) log.info({ stopped }, "audit-stream-stopped alerts");
     await enqueueSuppressionDigests(db());
+    await enqueueSystemAlertDigests(db());
     const stats = await drainDeliveries(db(), { budgetMs: opts.budgetMs ?? NOTIFICATION_JOB_BUDGET_MS });
     if (stats.attempted > 0) log.info({ ...stats }, "notifications");
     if (stats.more) {

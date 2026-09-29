@@ -2835,8 +2835,10 @@ pub struct ObjectRef {
 /**Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with
 an account that does not exist on the target (the attempted name may be a mistyped password), and
 for any account name that does not match the `db_user` pattern, the agent sends
-`db_user_fingerprint` instead of the name. The console escapes `db_user` and `application` on
-display.
+`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so
+the agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN
+and the DNs listed in its `openldap.clear_principals`. The console escapes `db_user` and
+`application` on display.
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(untagged, deny_unknown_fields)]
@@ -2849,7 +2851,9 @@ character outside `[A-Za-z0-9 ._:/+-]` with `_` and truncates to 64 characters.
         application: ::std::option::Option<PrincipalVariant0Application>,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         client_addr: ::std::option::Option<ClientAddress>,
-        ///Database account (or LDAP bind DN) as logged by the engine.
+        /**Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of
+`openldap.clear_principals`) as logged by the engine.
+*/
         db_user: PrincipalVariant0DbUser,
     },
     Variant1 {
@@ -2929,7 +2933,9 @@ impl<'de> ::serde::Deserialize<'de> for PrincipalVariant0Application {
             })
     }
 }
-///Database account (or LDAP bind DN) as logged by the engine.
+/**Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of
+`openldap.clear_principals`) as logged by the engine.
+*/
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct PrincipalVariant0DbUser(::std::string::String);

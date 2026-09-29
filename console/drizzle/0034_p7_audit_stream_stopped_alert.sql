@@ -1,0 +1,3 @@
+ALTER TABLE "agents" ADD COLUMN "audit_stream_stops_unalerted" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "agents" ADD COLUMN "audit_stream_stops_since" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "agents" ADD COLUMN "audit_stream_stops_alerted_at" timestamp with time zone;

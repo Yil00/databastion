@@ -60,6 +60,9 @@ services:
       # authorization.credentials_file = the metrics_token secret.
       DATABASTION_METRICS_PORT: "9464"
       DATABASTION_METRICS_HOST: 0.0.0.0
+      # System alerts per notification channel and hour, all agents together (default 20).
+      # Heartbeats and integrity events raise them here too: keep the worker's value.
+      # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key, metrics_token]
     user: "10001:10001"
@@ -94,6 +97,9 @@ services:
       # DATABASTION_SILENT_AGENT_INTERVALS: "10"
       # Audit access events are deleted after N days (default 90, 7 to 3650).
       # DATABASTION_EVENTS_RETENTION_DAYS: "90"
+      # System alerts per notification channel and hour, all agents together (default 20; same
+      # value as the console service). Beyond: one digest per channel and hour.
+      # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key]
     user: "10001:10001"

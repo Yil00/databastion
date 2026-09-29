@@ -1011,11 +1011,16 @@ export interface components {
          * @description Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with
          *     an account that does not exist on the target (the attempted name may be a mistyped password), and
          *     for any account name that does not match the `db_user` pattern, the agent sends
-         *     `db_user_fingerprint` instead of the name. The console escapes `db_user` and `application` on
-         *     display.
+         *     `db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so
+         *     the agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN
+         *     and the DNs listed in its `openldap.clear_principals`. The console escapes `db_user` and
+         *     `application` on display.
          */
         Principal: {
-            /** @description Database account (or LDAP bind DN) as logged by the engine. */
+            /**
+             * @description Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of
+             *     `openldap.clear_principals`) as logged by the engine.
+             */
             db_user?: string;
             db_user_fingerprint?: components["schemas"]["Fingerprint"];
             client_addr?: components["schemas"]["ClientAddress"];

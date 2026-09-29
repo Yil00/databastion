@@ -5,6 +5,7 @@ import { AgentActions } from "@/components/console/agent-actions";
 import { findingsHref } from "@/components/console/findings-table";
 import { ScanDialog } from "@/components/console/scan-dialog";
 import { StatusBadge } from "@/components/console/status-badge";
+import { Badge } from "@/components/ui/badge";
 import { TargetNotes } from "@/components/console/target-notes";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -14,6 +15,7 @@ import { auditWarningText } from "@/lib/audit-warning";
 import { eventsHref } from "@/lib/events-filter";
 import { getAgentDetail } from "@/server/agents";
 import { auditSummaries } from "@/server/audit-config";
+import { AUDIT_STREAM_ALERT_INTERVAL_S, streamStopped } from "@/server/audit-stream-alerts";
 import { DROPPED_BATCHES_ALERT_INTERVAL_S } from "@/server/dropped-batches";
 import { rotationBlocked } from "@/server/rotation";
 import { latestScans, scanStatusLabel } from "@/server/scans";
@@ -63,6 +65,8 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
   ];
   const dropped = agent.droppedAlerts;
   const heldBack = agent.droppedBatchesUnalerted;
+  const stoppedTargets = agent.targets.filter((t) => t.present && streamStopped(t.notes));
+  const stopAlerts = agent.streamStopAlerts;
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-wrap items-center gap-3">
@@ -137,6 +141,50 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
           </CardContent>
         </Card>
       )}
+      {(stoppedTargets.length > 0 || stopAlerts.length > 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Audit streams stopped</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm">
+            {stoppedTargets.length > 0 && (
+              <p role="alert" className="text-destructive">
+                The agent stopped the Audit stream of {stoppedTargets.map((t) => t.targetId).join(", ")} after repeated
+                internal errors: Audit of {stoppedTargets.length === 1 ? "this target" : "these targets"} is off until Audit is
+                reconfigured on the target or the agent restarts (the agent log names the code location).
+              </p>
+            )}
+            <p>
+              An alert goes to the system-alert channels at most once per agent every{" "}
+              {Math.round(AUDIT_STREAM_ALERT_INTERVAL_S / 60)} minutes, and is repeated while a stream stays stopped
+              {agent.auditStreamStopsUnalerted > 0 && agent.auditStreamStopsAlertedAt
+                ? `; the next one is due after ${new Date(agent.auditStreamStopsAlertedAt.getTime() + AUDIT_STREAM_ALERT_INTERVAL_S * 1000).toISOString()}`
+                : ""}
+              .
+            </p>
+            {stopAlerts.length > 0 && (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Alerted</TableHead>
+                    <TableHead>Targets stopped</TableHead>
+                    <TableHead>Since</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {stopAlerts.map((e) => (
+                    <TableRow key={e.id}>
+                      <TableCell>{e.at.toISOString()}</TableCell>
+                      <TableCell>{e.stoppedStreams ?? "unknown"}</TableCell>
+                      <TableCell>{e.since ?? ""}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Targets</CardTitle>
@@ -172,7 +220,14 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     <TableCell>{[t.engine, t.edition].filter(Boolean).join(" ")}</TableCell>
                     <TableCell>{t.serverVersion ?? ""}</TableCell>
                     <TableCell>{t.reachable ? "yes" : "no"}</TableCell>
-                    <TableCell>{t.auditLevel}</TableCell>
+                    <TableCell>
+                      {t.auditLevel}
+                      {streamStopped(t.notes) && (
+                        <Badge variant="destructive" className="ml-2">
+                          stream stopped
+                        </Badge>
+                      )}
+                    </TableCell>
                     <TableCell>{t.auditSource ?? ""}</TableCell>
                     <TableCell>{t.lastError ?? ""}</TableCell>
                     <TableCell className="max-w-80 whitespace-normal">

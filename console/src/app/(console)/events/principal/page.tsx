@@ -55,7 +55,7 @@ export default async function PrincipalPage({ searchParams }: { searchParams: Pr
           Access events
         </Link>
         <h1 className="text-2xl font-semibold tracking-tight break-all">
-          <PrincipalLabel principal={p.principal} fingerprinted={p.fingerprinted} />
+          <PrincipalLabel principal={p.principal} fingerprinted={p.fingerprinted} engine={p.engine} />
         </h1>
       </div>
       <Card>

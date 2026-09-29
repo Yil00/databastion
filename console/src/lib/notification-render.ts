@@ -1,3 +1,4 @@
+import { SYSTEM_ALERT_EVENTS, type SystemAlertEvent } from "@/lib/notification-model";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 
 /**
@@ -32,7 +33,10 @@ export interface AccessIncidentOpenedPayload {
   source: "access_event";
   occurred_at: string;
   url: string | null;
-  /** `reopened_from`: the resolved incident of the same scope, when a worse event reopened it. */
+  /**
+   * `reopened_from`: the closed (resolved or false-positive) incident of the same scope, when a
+   * worse event opened this one.
+   */
   incident: { id: string; severity: string; status: "open"; reopened_from: string | null };
   policy: { id: string; name: string; revision: number };
   agent_id: string;
@@ -117,6 +121,26 @@ export interface AgentBatchesDroppedPayload {
   security_event_id: string;
 }
 
+/**
+ * P7 (ADR-0031 decision 3, end-of-phase-6 review M2): the agent stopped the Audit stream of one or
+ * more targets after repeated internal errors (target note `audit.stream_stopped`): Audit of those
+ * targets is off until Audit is reconfigured or the agent restarts. Console-computed counts and
+ * timestamps only: no target id or other agent-provided text.
+ */
+export interface AgentAuditStreamStoppedPayload {
+  event: "agent.audit_stream_stopped";
+  occurred_at: string;
+  url: string | null;
+  agent_id: string;
+  /** Targets reported with a stopped Audit stream: the most in one heartbeat since `since`. */
+  stopped_streams: number;
+  /** First heartbeat reporting a stopped stream since the previous alert of the agent. */
+  since: string;
+  /** At most one alert per agent in this many seconds; later stops are counted in the next one. */
+  min_interval_s: number;
+  security_event_id: string;
+}
+
 export interface ChannelTestPayload {
   event: "channel.test";
   occurred_at: string;
@@ -136,14 +160,36 @@ export interface SuppressedPayload {
   limit_per_hour: number;
 }
 
+/**
+ * P7 (#75 review L4): system alerts of a channel suppressed by the global hourly budget of system
+ * alerts. Counts only: per event, and the number of distinct agents concerned; never an agent id,
+ * name or host name, nor any other agent-provided text.
+ */
+export interface SystemAlertsSuppressedPayload {
+  event: "system_alerts.suppressed";
+  occurred_at: string;
+  url: string | null;
+  channel: string;
+  window_start: string;
+  window_end: string;
+  suppressed: number;
+  /** Suppressed alerts per system-alert event (`SYSTEM_ALERT_EVENTS`); absent events are 0. */
+  by_event: Partial<Record<SystemAlertEvent, number>>;
+  /** Distinct agents of the suppressed alerts. */
+  agents: number;
+  limit_per_hour: number;
+}
+
 export type NotificationPayload =
   | SuppressedPayload
+  | SystemAlertsSuppressedPayload
   | IncidentOpenedPayload
   | AccessIncidentOpenedPayload
   | AgentSilentPayload
   | AgentRecoveredPayload
   | AgentIntegrityPayload
   | AgentBatchesDroppedPayload
+  | AgentAuditStreamStoppedPayload
   | ChannelTestPayload;
 
 /** Webhook body: the payload plus the format version and the delivery id. */
@@ -161,6 +207,14 @@ function locationText(l: IncidentOpenedPayload["location"]): string {
   return [l.database, l.schema, l.object, l.field].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
 }
 
+const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
+  "agent.silent": "Silent agents",
+  "agent.recovered": "Agents reporting again",
+  "agent.integrity": "Agent-integrity events",
+  "agent.batches_dropped": "Dropped batches",
+  "agent.audit_stream_stopped": "Audit streams stopped",
+};
+
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
 
 function objectText(o: AccessIncidentOpenedPayload["access"]["objects"][number]): string {
@@ -175,7 +229,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     p.overflow
       ? `The policy reached its limit of ${p.overflow.limit_per_hour} new incidents this hour: the further matches of the hour are counted in this incident. The event below is the first of them.`
       : p.incident.reopened_from
-        ? `A new incident was opened from database access events: a worse access than the one of the resolved incident ${p.incident.reopened_from}.`
+        ? `A new incident was opened from database access events: a worse access than the one of the closed incident ${p.incident.reopened_from} (resolved or marked a false positive).`
         : "A new incident was opened from database access events.",
     "",
     `Incident:   ${p.incident.id}`,
@@ -271,6 +325,35 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
       return {
         subject: `[DataBastion] ${p.suppressed} incident notification${p.suppressed > 1 ? "s" : ""} suppressed`,
         text: `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} incident notifications per hour between ${p.window_start} and ${p.window_end}: ${p.suppressed} more incident${p.suppressed > 1 ? "s were" : " was"} opened without a notification. See the incidents in the console.\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "agent.audit_stream_stopped": {
+      const p = payload;
+      const n = `${p.stopped_streams} target${p.stopped_streams === 1 ? "" : "s"}`;
+      return {
+        subject: `[DataBastion] Audit stopped on ${n}: agent ${p.agent_id}`,
+        text: [
+          `The agent ${p.agent_id} reports the Audit stream of ${n} stopped after repeated internal errors, since ${p.since} (security event ${p.security_event_id}).`,
+          "Audit of these targets is off (level None): database accesses there are not monitored until Audit is reconfigured on the target or the agent restarts. The agent log names the code location of the errors; the agent page shows which targets are concerned.",
+          `This alert is repeated every ${Math.round(p.min_interval_s / 60)} minutes while a stream stays stopped (at most one per agent in that time).`,
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "system_alerts.suppressed": {
+      const p = payload;
+      const s = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+      const lines = SYSTEM_ALERT_EVENTS.filter((e) => (p.by_event[e] ?? 0) > 0).map(
+        (e) => `  ${`${SYSTEM_ALERT_LABEL[e]}:`.padEnd(24)}${p.by_event[e] ?? 0}`,
+      );
+      return {
+        subject: `[DataBastion] ${s(p.suppressed, "system alert", "system alerts")} suppressed`,
+        text: [
+          `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} system alerts per hour between ${p.window_start} and ${p.window_end}: ${s(p.suppressed, "more alert was", "more alerts were")} not sent, concerning ${s(p.agents, "agent", "agents")}.`,
+          "",
+          ...lines,
+          "",
+          "Every one of them is recorded in the console: silences, integrity events, dropped batches and stopped Audit streams as security events on the agent, recoveries in the audit log.",
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
     case "channel.test": {

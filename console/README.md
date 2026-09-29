@@ -35,6 +35,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` | Worker: new incidents an `access_event` policy may open per clock hour, 1 to 10000, default 50; beyond, the matches go to one overflow incident of the policy. See "Audit correlation" |
 | `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
+| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -503,7 +504,8 @@ least N x 16 + 20 connections, plus PostgreSQL's reserved and administration con
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
 | Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
-
+| System-alert budgets (`system_alert_budgets`) | per (channel, UTC hour): the number of system alerts queued to the channel. No agent data. Past hours are pruned by the worker. Read, insert, update and delete for the runtime role (migration `0033`) |
+| Per-agent system-alert shares (`system_alert_agent_budgets`) | per (channel, agent id, UTC hour): the number of that agent's system alerts charged to the channel. No foreign key to `agents` (its lock would deadlock with heartbeats); past hours are pruned by the worker. Read, insert, update and delete for the runtime role (migration `0036`) |
 | Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1`, never in clear. Without a server key the username-derived limits are not stored at all (per process, see "Shared rate limits") and the other keys are a domain-separated SHA-256. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
 
 The argon2 concurrency caps and the 25 s verified-secret cache are in memory, per process (the
@@ -679,6 +681,15 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
   `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
   and any printable character in `db_user`).
+- **OpenLDAP labels and principal fingerprints** (P7, ADR-0029 decision 6): for an OpenLDAP
+  target (from the event's audit source `openldap_accesslog`, else the target's engine) the
+  findings, events and incident views name the location parts as LDAP does: `database` is the
+  **naming context**, `schema` the entry's **container**, `object` the **object class** and
+  `field` the **attribute** (event objects read "object class X in container Y"). A principal the
+  agent sent as `db_user_fingerprint` is never shown as a name: it is labelled "fingerprint" (on
+  OpenLDAP "LDAP principal fingerprint": the keyed HMAC of an entry DN not listed in
+  `openldap.clear_principals`), shortened to 12 hex digits in a monospace font, with what it is and
+  the full value in the tooltip; only the agent host can map it back to a DN.
 - **Sensitivity** of an object: for each classifier found on it (any column, false positives
   excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
   is that of its most sensitive object; an event object without schema matches the findings of any
@@ -740,17 +751,29 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
   them.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
-  For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
-  the principal part is `unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64 (canonical
-  form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events from one network count as
-  one principal, so random account names or rotating addresses cannot open one incident each. The database is that
+  For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
+  /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
+  from one network count as one principal, so random account names or rotating addresses cannot
+  open one incident each. Every other event is keyed by its principal key (the name, or the
+  fingerprint sent in its place: a non-conforming account name, an OpenLDAP DN not listed in
+  `clear_principals`, an unidentified account), ADR-0031
+  decision 1, end-of-phase-6 review M1: two fingerprinted principals never share an incident,
+  even on OpenLDAP where events have no client address. The console cannot recognize the
+  fingerprint of an unidentified account (the HMAC key never leaves the agent); the agent sends
+  every unidentified account of one agent as the same fingerprint, so they form one principal. The database is that
   of the most sensitive retained object. While the incident of a key is open or acknowledged,
   later events of the key are added to it (`match_count`, total rows, highest score, signals,
-  anomaly, and a link in `incident_events`). Once it is a **false positive**, the rest of that hour
-  is only linked to it. Once it is **resolved**, a later event of the hour opens a new incident
-  (`reopened_from` in the notification) only when it is worse: a higher score, above the baseline
-  while the incident was not, or a signal the incident did not have; otherwise it is linked to the
-  resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
+  anomaly, and a link in `incident_events`). Once it is a **false positive**, a later event of the
+  hour opens a new incident (`reopened_from` in the notification) only when it is clearly worse
+  than what was judged: a `signature.*` signal the incident did not have, a strictly higher
+  score, or more rows in total than the incident had when judged (the rows of the events linked
+  to it since it was marked, this one included, above its rows: an extraction split into small
+  reads still opens an incident); ADR-0031 decision 2. A new `shape.*` / `volume.*` signal alone,
+  or being above the baseline, does not count; otherwise the event is only linked to it. The same
+  holds for a false-positive overflow incident. Once it is **resolved**, a
+  later event of the hour opens a new incident (`reopened_from`) only when it is worse: a higher
+  score, above the baseline while the incident was not, or a signal the incident did not have;
+  otherwise it is linked to the resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
   raises one incident per policy, principal, database and hour.
 - **Cap**: a policy opens at most `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` new incidents per
   clock hour **on one target** (default 50, 1 to 10 000), so noise on one target never affects the
@@ -803,7 +826,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `agent.audit_stream_stopped`, `channel.test`,
+  `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -886,6 +910,35 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   once the hour is over, one `notifications.suppressed` digest per channel and hour reports how many
   were suppressed (counts only, link to the incidents list). System alerts, tests and digests are
   not counted.
+- **System-alert budget** (P7, #75 review L4): the per-agent bounds below (one silence alert per
+  episode, one integrity alert per agent, kind and hour, one dropped-batches alert per agent and
+  hour) do not bound a fleet: N misbehaving agents would send N alerts an hour to each channel.
+  So all system alerts (`agent.silent`, `agent.recovered`, `agent.integrity`,
+  `agent.batches_dropped`, `agent.audit_stream_stopped`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
+  20) per channel and UTC clock hour, whatever the agent. It is a hard limit, shared by every
+  console process: the count lives in `system_alert_budgets`, one row per (channel, hour), charged
+  by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <
+  limit`) in the transaction that records the alert, so concurrent heartbeats, web replicas and
+  workers are serialized on that row and never exceed it; no in-memory state. A repeated alert
+  (same idempotency key) is not charged, and an aborted transaction gives its charge back.
+  **Per-agent share** (PR #81 security review M1): one agent may use at most `max(2, ceil(limit /
+  4))` of a channel's hourly budget (5 of the default 20), counted the same way in
+  `system_alert_agent_budgets` (one row per channel, agent and hour, charged before the channel
+  budget; a charge the channel budget then refuses is given back), so one compromised or
+  misbehaving agent cannot spend the budget of the others. **Critical alerts are never held**:
+  an `agent.integrity` alert of severity `critical` (`agent.rotation_conflict`: another party may
+  hold the agent's secret) is neither charged to nor refused by either budget, like severe events
+  bypass the incident cap. Over a budget, the delivery is recorded as `skipped` (`rate_limited`); the security event, the audit
+  entry and the agent page are unaffected (every alert stays recorded). Once the hour is over
+  (worker, every minute), one `system_alerts.suppressed` digest per channel and hour reports
+  `suppressed` (total), `by_event` (count per event), `agents` (number of distinct agents) and
+  `limit_per_hour`, with a link to the agents list: counts only, never an agent id, name or host
+  name. Digests, tests and incident notifications are not charged. Residual risk: within an hour,
+  once the channel budget is spent (by at least `limit / share` agents, e.g. four agents failing
+  together, or a fleet-wide outage), a later non-critical alert (e.g. a silence) is only counted in
+  the digest, sent after the hour; the Agents page and the security events show it at once, and
+  critical alerts still go out. Budget rows of past hours are
+  pruned by the worker.
 - **Hardening (security review)**: moving an e-mail channel with a stored password to another host,
   port, TLS mode or user requires the password again (`400 password_required`); SMTP ports 25, 465,
   587 and 2525 only (any port with the dev flag); SMTP replies capped at 100 lines / 64 KiB; any
@@ -896,7 +949,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
 - **Agent-integrity alerts**: every `security_events` row written by the console
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
   `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
-  and hour per channel (the events themselves are all recorded, within their own budget).
+  and hour per channel (the events themselves are all recorded, within their own budget), and within
+  the system-alert budget above.
 - **Dropped batches** (P7, end-of-phase-4 review M2): each heartbeat reports `spool.dropped_batches`,
   the batches the agent dropped since it started (spool full, or rejected with a non-retryable
   4xx): findings or access events that never reached the console, e.g. the signature batches of a
@@ -913,6 +967,22 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   numbers, timestamps and ids: no agent-provided text (not even the host name). Revoked and locked
   agents are not alerted. The agent page shows the spool counters of the latest heartbeat, the
   last five alerts and the drops held back for the next one.
+- **Audit stream stopped** (P7, ADR-0031 decision 3, end-of-phase-6 review M2): an Audit stream
+  that panics 3 times in a row is stopped by the agent until Audit is reconfigured or the agent
+  restarts; its target reports level None with the note `audit.stream_stopped`. Each heartbeat
+  records, in its transaction, how many targets carry that note
+  (`agents.audit_stream_stops_unalerted`, the highest count since the last alert). At most once per
+  agent and hour (conditional update on `agents.audit_stream_stops_alerted_at`), this becomes a
+  `security_events` row `agent.audit_stream_stopped` (`medium`: monitoring of the target is lost,
+  as for a silent agent, but it is no evidence of an attack by itself), an audit entry (system)
+  and an `agent.audit_stream_stopped` notification to the system-alert channels, with
+  `stopped_streams`, `since`, `min_interval_s` and the security event id. The alert is **repeated
+  every hour while a stream stays stopped** (every heartbeat counts, not only the first); stops
+  seen within the hour are reported by the next alert, raised by the next heartbeat after the hour
+  or by the worker's minute schedule. No target id or other agent-provided text is copied into the
+  event, the audit entry or the notification; the agent page names the stopped targets (a "stream
+  stopped" badge on each, and a card with the last five alerts). Revoked and locked agents are not
+  alerted.
 
 ## Layout
 ```

@@ -6,6 +6,7 @@ import type { Schemas } from "@/lib/protocol/validate";
 import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
+import { raiseAuditStreamStoppedAlert, recordAuditStreamStops, stoppedStreams } from "./audit-stream-alerts";
 import { addDroppedBatches, droppedBatchesDelta, raiseDroppedBatchesAlert } from "./dropped-batches";
 import { requestNotificationDelivery } from "./notification-queue";
 import { purgeSecretCache } from "./agent-api/auth";
@@ -130,7 +131,12 @@ export async function recordHeartbeat(
   const alerted = await db.transaction(async (tx) => {
     // The previous spool counters, under the row lock (concurrent heartbeats count a rise once).
     const [previous] = await tx
-      .select({ spool: agents.spool, uptimeS: agents.uptimeS, unalerted: agents.droppedBatchesUnalerted })
+      .select({
+        spool: agents.spool,
+        uptimeS: agents.uptimeS,
+        unalerted: agents.droppedBatchesUnalerted,
+        stopsUnalerted: agents.auditStreamStopsUnalerted,
+      })
       .from(agents)
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
       .for("update");
@@ -181,8 +187,12 @@ export async function recordHeartbeat(
     if (!previous) return false;
     const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
     await addDroppedBatches(tx, agentId, delta);
-    if (previous.unalerted + delta === 0) return false;
-    return (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
+    const stops = stoppedStreams(hb.targets);
+    await recordAuditStreamStops(tx, agentId, stops);
+    let raised = false;
+    if (previous.unalerted + delta > 0) raised = (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
+    if (previous.stopsUnalerted + stops > 0) raised = (await raiseAuditStreamStoppedAlert(tx, agentId)) !== null || raised;
+    return raised;
   });
   if (alerted) void requestNotificationDelivery();
 }
@@ -316,6 +326,9 @@ export async function getAgentDetail(db: Database, agentId: string) {
       droppedBatchesUnalerted: agents.droppedBatchesUnalerted,
       droppedBatchesSince: agents.droppedBatchesSince,
       droppedBatchesAlertedAt: agents.droppedBatchesAlertedAt,
+      auditStreamStopsUnalerted: agents.auditStreamStopsUnalerted,
+      auditStreamStopsSince: agents.auditStreamStopsSince,
+      auditStreamStopsAlertedAt: agents.auditStreamStopsAlertedAt,
     })
     .from(agents)
     .where(eq(agents.id, agentId))
@@ -335,6 +348,20 @@ export async function getAgentDetail(db: Database, agentId: string) {
     droppedBatches: typeof e.details?.dropped_batches === "number" ? e.details.dropped_batches : null,
     since: typeof e.details?.since === "string" ? e.details.since : null,
   }));
+  // The latest Audit-stream-stopped alerts (P7, ADR-0031): console-computed counts and timestamps.
+  const streamStopAlerts = (
+    await db
+      .select({ id: securityEvents.id, at: securityEvents.at, details: securityEvents.details })
+      .from(securityEvents)
+      .where(and(eq(securityEvents.agentId, agentId), eq(securityEvents.kind, "agent.audit_stream_stopped")))
+      .orderBy(desc(securityEvents.at))
+      .limit(5)
+  ).map((e) => ({
+    id: e.id,
+    at: e.at,
+    stoppedStreams: typeof e.details?.stopped_streams === "number" ? e.details.stopped_streams : null,
+    since: typeof e.details?.since === "string" ? e.details.since : null,
+  }));
   const targets = await db
     .select({
       targetId: agentTargets.targetId,
@@ -352,5 +379,5 @@ export async function getAgentDetail(db: Database, agentId: string) {
     .from(agentTargets)
     .where(eq(agentTargets.agentId, agentId))
     .orderBy(agentTargets.targetId);
-  return { ...agent, droppedAlerts, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
+  return { ...agent, droppedAlerts, streamStopAlerts, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
 }
