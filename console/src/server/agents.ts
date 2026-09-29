@@ -91,14 +91,16 @@ export async function enrollAgent(
 }
 
 /**
- * Failed enrollments are audited (L3) within a process-wide budget, so that an unauthenticated
- * flood cannot turn into unbounded audit-log writes. Beyond the budget they are only counted.
+ * Failed enrollments are audited (L3) within a budget shared by every console process (P4-D), so
+ * that an unauthenticated flood cannot turn into unbounded audit-log writes. Beyond the budget they
+ * are only counted. Per-process fallback when the shared store fails (`local`): the audit rows go
+ * to the same database.
  */
-export const enrollFailureAuditBudget = new RateLimiter(60, 60_000);
+export const enrollFailureAuditBudget = RateLimiter.shared("enroll.failure_audit", 60, 60_000, "local");
 export const enrollFailureStats = { unaudited: 0 };
 
 async function auditEnrollFailure(db: Database, ip: string | null): Promise<void> {
-  if (enrollFailureAuditBudget.hit("global").limited) {
+  if ((await enrollFailureAuditBudget.hitShared("global")).limited) {
     enrollFailureStats.unaudited++;
     return;
   }

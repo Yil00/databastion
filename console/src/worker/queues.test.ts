@@ -6,6 +6,7 @@ import type { Logger } from "@/lib/logger";
 import * as events from "@/server/events";
 import * as incidents from "@/server/incidents";
 import * as notifications from "@/server/notifications";
+import * as rateLimit from "@/server/rate-limit";
 import * as systemAlerts from "@/server/system-alerts";
 import type { Database } from "@/db/client";
 
@@ -14,6 +15,7 @@ import {
   createNoopHandler,
   createNotificationHandler,
   createPolicyHandler,
+  createRateLimitsPruneHandler,
   NOOP_QUEUE,
   type NoopPayload,
 } from "./queues";
@@ -147,5 +149,29 @@ describe("events.purge handler", () => {
   it("a failed purge fails the job (pg-boss retries it)", async () => {
     vi.spyOn(events, "purgeAccessEvents").mockRejectedValue(new Error("db down"));
     await expect(createEventsPurgeHandler(db, log, async () => "id")(jobs)).rejects.toThrow("db down");
+  });
+});
+
+describe("rate_limits.prune handler", () => {
+  const log = { warn: vi.fn(), debug: vi.fn() } as unknown as Logger;
+  const db = () => ({}) as Database;
+  const jobs = [{ id: "a" }] as unknown as Job<Record<string, unknown>>[];
+
+  it("prunes once per batch and re-queues only when expired rows remain", async () => {
+    const prune = vi
+      .spyOn(rateLimit, "pruneRateLimitCounters")
+      .mockResolvedValueOnce({ deleted: 3, more: false })
+      .mockResolvedValueOnce({ deleted: rateLimit.PRUNE_CHUNK, more: true });
+    const requeue = vi.fn(async () => "id");
+    // Small statements: row locks held far below the limiters' 1.5 s lock_timeout (review L-2).
+    expect(rateLimit.PRUNE_CHUNK).toBe(1_000);
+    const handler = createRateLimitsPruneHandler(db, log, requeue, { budgetMs: 5 });
+    await handler(jobs);
+    expect(prune).toHaveBeenCalledWith(expect.anything(), { budgetMs: 5 });
+    expect(requeue).not.toHaveBeenCalled();
+    await handler(jobs);
+    expect(requeue).toHaveBeenCalledTimes(1);
+    await handler([]);
+    expect(prune).toHaveBeenCalledTimes(2);
   });
 });

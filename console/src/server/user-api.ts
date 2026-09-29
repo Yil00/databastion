@@ -136,11 +136,22 @@ async function requireUser(
  * and the argon2id pool, and its failures still count toward the global per-username cap.
  */
 export const LOGIN_IPV6_PREFIX = 56;
-export const loginFailuresPerIp = new RateLimiter(20, 15 * 60_000);
-export const loginFailuresPerUser = new RateLimiter(5, 15 * 60_000);
-export const loginFailuresPerUserGlobal = new RateLimiter(100, 15 * 60_000);
+/*
+ * Every login limiter is shared by all console processes (P4-D, `src/server/rate-limit.ts`) and
+ * fails closed: when the shared store fails, a limit is treated as reached (`429` for the per-IP
+ * and per-(username, IP) limits; the degraded path, never a refusal, where reaching the limit
+ * degrades the login).
+ */
+export const loginFailuresPerIp = RateLimiter.shared("login.failures_per_ip", 20, 15 * 60_000, "closed");
+/*
+ * The username-derived keys (`username|IP`, username) are shared only with a server key (HMAC):
+ * without one they stay per process, as before P4-D, rather than store an unkeyed hash of what was
+ * typed in the username field, possibly a password (review M1; `startupErrors` says so).
+ */
+export const loginFailuresPerUser = RateLimiter.shared("login.failures_per_user_ip", 5, 15 * 60_000, "closed", { requiresServerKey: true });
+export const loginFailuresPerUserGlobal = RateLimiter.shared("login.failures_per_user", 100, 15 * 60_000, "closed", { requiresServerKey: true });
 /** Failed logins per device cookie (nonce): beyond, the cookie gives no bypass (a stolen cookie). */
-export const loginFailuresPerDevice = new RateLimiter(5, 15 * 60_000);
+export const loginFailuresPerDevice = RateLimiter.shared("login.failures_per_device", 5, 15 * 60_000, "closed");
 /**
  * Delay before each verification of a degraded login. Unknown IP: `ms * 2^n` for the n-th failed
  * degraded attempt of the username in the window, at most `maxMs`. Test hooks: tests shorten the
@@ -152,18 +163,22 @@ export const loginSlowdown = {
   sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)),
 };
 /** Failed degraded logins per username with an unknown IP (drives the growing slow-down). */
-export const loginDegradedFailures = new RateLimiter(Number.MAX_SAFE_INTEGER, 15 * 60_000);
+export const loginDegradedFailures = RateLimiter.shared("login.degraded_failures", Number.MAX_SAFE_INTEGER, 15 * 60_000, "closed", {
+  requiresServerKey: true,
+});
 
-/** Slow-down before a degraded login of `userKey` (see {@link loginSlowdown}). */
-export function loginSlowdownMs(userKey: string, unknownIp: boolean): number {
+/**
+ * Slow-down before a degraded login of `userKey` (see {@link loginSlowdown}). `failures`: the
+ * username's failed degraded attempts (the login passes the shared count; default: this process's).
+ */
+export function loginSlowdownMs(userKey: string, unknownIp: boolean, failures = loginDegradedFailures.count(userKey)): number {
   if (!unknownIp) return loginSlowdown.ms;
-  const failures = Math.min(loginDegradedFailures.count(userKey), 30);
-  return Math.min(loginSlowdown.maxMs, loginSlowdown.ms * 2 ** failures);
+  return Math.min(loginSlowdown.maxMs, loginSlowdown.ms * 2 ** Math.min(failures, 30));
 }
 /** Usernames over their global cap with a (slowed-down) attempt in flight. */
 const degradedLoginsInFlight = new Set<string>();
-/** Process-wide budget of argon2id-backed failed logins on unknown usernames (slow refill). */
-export const loginFailuresUnknownUser = new RateLimiter(30, 5 * 60_000);
+/** Budget of argon2id-backed failed logins on unknown usernames, shared by all processes (slow refill). */
+export const loginFailuresUnknownUser = RateLimiter.shared("login.failures_unknown_user", 30, 5 * 60_000, "closed");
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -201,40 +216,43 @@ export function handleLogin(req: Request): Promise<Response> {
     const userIpKey = ipKey ? `${userKey}|${ipKey}` : userKey;
     const rateLimited = (...retries: number[]) =>
       error(429, "rate_limited", { "Retry-After": String(Math.max(1, ...retries)) });
-    // H1: attempts are reserved synchronously before argon2id and refunded on success, so
-    // concurrent requests cannot overrun the limits. H2: no per-IP limit when the IP is unknown.
-    const refundIp = ipKey ? loginFailuresPerIp.reserve(ipKey) : noop;
-    if (!refundIp) return rateLimited(ipKey ? loginFailuresPerIp.check(ipKey).retryAfterS : 1);
-    let refundUser = loginFailuresPerUser.reserve(userIpKey);
+    // H1: attempts are reserved (atomically, in the store shared by every console process) before
+    // argon2id and refunded on success, so concurrent requests cannot overrun the limits. H2: no
+    // per-IP limit when the IP is unknown.
+    const byIp = ipKey ? await loginFailuresPerIp.reserveShared(ipKey) : null;
+    if (byIp && !byIp.ok) return rateLimited(byIp.retryAfterS);
+    const refundIp = byIp?.refund ?? noop;
+    const byUser = await loginFailuresPerUser.reserveShared(userIpKey);
     // N2: with an unknown IP the per-username counter is shared by everyone: never a hard 429 on
     // it, the login degrades (slow-down, single slot) instead, unless a device cookie vouches.
-    const degradeUnknownIp = !refundUser && ipKey === null;
-    if (!refundUser) {
-      if (!degradeUnknownIp) {
-        refundIp();
-        return rateLimited(loginFailuresPerUser.check(userIpKey).retryAfterS);
-      }
-      refundUser = noop;
+    const degradeUnknownIp = !byUser.ok && ipKey === null;
+    if (!byUser.ok && !degradeUnknownIp) {
+      refundIp();
+      return rateLimited(byUser.retryAfterS);
     }
+    const refundUser = byUser.ok ? byUser.refund : noop;
     const baseRefunds = [refundIp, refundUser];
 
     // N1: a valid device cookie for this very username skips the global cap and the degraded slot.
     const device = readDeviceCookie(req);
-    if (device && !loginFailuresPerDevice.check(device.nonce).limited) {
+    if (device && !(await loginFailuresPerDevice.checkShared(device.nonce)).limited) {
       const user = await findLoginUser(getDb(), username);
       if (user && user.id === device.userId) {
-        const refundDevice = loginFailuresPerDevice.reserve(device.nonce) ?? noop;
+        const byDevice = await loginFailuresPerDevice.reserveShared(device.nonce);
+        const refundDevice = byDevice.ok ? byDevice.refund : noop;
         // Bypasses the global cap, but its failures still count toward it.
-        const refundGlobal = loginFailuresPerUserGlobal.charge(userKey);
+        const refundGlobal = await loginFailuresPerUserGlobal.chargeShared(userKey);
         return verifyLogin(req, username, password, ip, [...baseRefunds, refundDevice, refundGlobal], { user });
       }
     }
 
     // M2: global per-username cap. Beyond it (or N2 above): slow-down, one attempt in flight per
     // username; never a hard refusal (the correct password from a fresh IP still logs in).
-    const refundGlobal = degradeUnknownIp ? null : loginFailuresPerUserGlobal.reserve(userKey);
+    const byUserGlobal = degradeUnknownIp ? null : await loginFailuresPerUserGlobal.reserveShared(userKey);
+    const refundGlobal = byUserGlobal?.ok ? byUserGlobal.refund : null;
     if (!refundGlobal) {
-      const delayMs = loginSlowdownMs(userKey, degradeUnknownIp);
+      const failures = degradeUnknownIp ? await loginDegradedFailures.countShared(userKey) : 0;
+      const delayMs = loginSlowdownMs(userKey, degradeUnknownIp, failures);
       if (degradedLoginsInFlight.has(userKey)) {
         baseRefunds.forEach((refund) => refund());
         const retry = Math.max(1, Math.ceil(delayMs / 1000) + 1);
@@ -243,7 +261,7 @@ export function handleLogin(req: Request): Promise<Response> {
       degradedLoginsInFlight.add(userKey);
       try {
         // Counted before the delay (refunded on success), so the next attempt waits longer.
-        const refunds = degradeUnknownIp ? [...baseRefunds, loginDegradedFailures.charge(userKey)] : baseRefunds;
+        const refunds = degradeUnknownIp ? [...baseRefunds, await loginDegradedFailures.chargeShared(userKey)] : baseRefunds;
         await loginSlowdown.sleep(delayMs);
         return await verifyLogin(req, username, password, ip, refunds);
       } finally {
@@ -268,18 +286,24 @@ async function verifyLogin(
 ): Promise<Response> {
   const refundAll = () => refunds.forEach((refund) => refund());
   const db = getDb();
-  const user = preloaded ? preloaded.user : await findLoginUser(db, username);
-  // N1: failures on unknown usernames share one process-wide budget, so random-username
-  // floods (fresh per-username buckets, unknown IP) are bounded.
-  if (!user) {
-    const reserved = loginFailuresUnknownUser.reserve("global");
-    if (!reserved) {
+  // N1: failures on unknown usernames share one budget (all console processes), so random-username
+  // floods (fresh per-username buckets, unknown IP) are bounded. Review L1: the reservation runs for
+  // EVERY login, concurrently with the user lookup, so known and unknown usernames pay the same
+  // store latency (no timing oracle); a known user gives it back (or ignores a refusal).
+  const [user, reserved] = await Promise.all([
+    preloaded ? Promise.resolve(preloaded.user) : findLoginUser(db, username),
+    loginFailuresUnknownUser.reserveShared("global"),
+  ]);
+  if (user) {
+    if (reserved.ok) reserved.refund();
+  } else {
+    if (!reserved.ok) {
       // L2: same answer as a wrong password, after a delay close to an argon2id verification,
       // without running one (no username enumeration through 429 vs 401 during a flood).
       await new Promise((r) => setTimeout(r, argon2MedianMs()));
       return error(401, "invalid_credentials");
     }
-    refunds.push(reserved);
+    refunds.push(reserved.refund);
   }
   // Login has its own argon2id pool: it can never starve agent authentication (N1).
   const release = loginArgon2Gate.tryAcquire();
@@ -766,10 +790,11 @@ export function handleRotateChannelSecret(req: Request, id: string): Promise<Res
 
 /**
  * L3: test sends are bounded per administrator and per channel (a test is an outbound connection
- * chosen by the caller: no scanning through it). In memory, per web process.
+ * chosen by the caller: no scanning through it). Shared by every console process (P4-D, P3-D) and
+ * fail closed: when the shared store fails, test sends are refused (`429`).
  */
-export const channelTestsPerUser = new RateLimiter(10, 10 * 60_000);
-export const channelTestsPerChannel = new RateLimiter(3, 10 * 60_000);
+export const channelTestsPerUser = RateLimiter.shared("channel_test.per_user", 10, 10 * 60_000, "closed");
+export const channelTestsPerChannel = RateLimiter.shared("channel_test.per_channel", 3, 10 * 60_000, "closed");
 
 /** Queues a test notification on a channel (admin, CSRF, audited): `202`; `429` over the limits. */
 export function handleTestChannel(req: Request, id: string): Promise<Response> {
@@ -777,9 +802,14 @@ export function handleTestChannel(req: Request, id: string): Promise<Response> {
     const g = await requireUser(req, { admin: true, stateChanging: true, route: "notification_channel.test" });
     if (!g.ok) return g.response;
     if (!UUID.test(id)) return error(404, "not_found");
-    const byUser = channelTestsPerUser.check(g.session.user.id);
-    const byChannel = channelTestsPerChannel.check(id);
-    if (byUser.limited || byChannel.limited) {
+    // Both limits are checked and counted atomically; a refused test counts toward neither.
+    const [byUser, byChannel] = await Promise.all([
+      channelTestsPerUser.reserveShared(g.session.user.id),
+      channelTestsPerChannel.reserveShared(id),
+    ]);
+    if (!byUser.ok || !byChannel.ok) {
+      if (byUser.ok) byUser.refund();
+      if (byChannel.ok) byChannel.refund();
       await writeAudit(getDb(), {
         actorType: "user",
         actorId: g.session.user.id,
@@ -790,11 +820,9 @@ export function handleTestChannel(req: Request, id: string): Promise<Response> {
         sourceIp: g.ip,
         details: { reason: "rate_limited" },
       });
-      const retry = Math.max(byUser.limited ? byUser.retryAfterS : 1, byChannel.limited ? byChannel.retryAfterS : 1);
+      const retry = Math.max(byUser.ok ? 1 : byUser.retryAfterS, byChannel.ok ? 1 : byChannel.retryAfterS);
       return error(429, "rate_limited", { "Retry-After": String(retry) });
     }
-    channelTestsPerUser.hit(g.session.user.id);
-    channelTestsPerChannel.hit(id);
     const ok = await enqueueTestNotification(getDb(), id, { userId: g.session.user.id, ip: g.ip });
     if (!ok) return error(404, "not_found");
     void requestNotificationDelivery();

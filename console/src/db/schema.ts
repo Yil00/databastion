@@ -853,3 +853,31 @@ export const auditConfigs = pgTable(
     check("audit_configs_warning", sql`${t.warning} is null or ${t.warning} in ('emptied', 'shrunk', 'disabled')`),
   ],
 );
+
+/**
+ * Shared rate-limit counters (P4-D): one fixed window per (limiter, key), anchored at the first hit
+ * of the window like the in-memory limiter it backs (`src/server/rate-limit.ts`), so the limits
+ * hold across web processes. `key_hash` is an HMAC-SHA256 (server-key subkey `rate-limit-keys.v1`;
+ * plain SHA-256 without the server key) of the limiter key: source IPs, usernames as typed (possibly
+ * a password), device-cookie nonces and agent ids are never stored in clear. Rows past `expires_at`
+ * are dead (reset in place by the next hit) and pruned by the worker. The runtime role reads, inserts,
+ * updates and deletes them (migration `0030`).
+ */
+export const rateLimitCounters = pgTable(
+  "rate_limit_counters",
+  {
+    limiter: text("limiter").notNull(),
+    keyHash: text("key_hash").notNull(),
+    windowStart: tsz("window_start").notNull(),
+    expiresAt: tsz("expires_at").notNull(),
+    count: integer("count").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.limiter, t.keyHash] }),
+    index("rate_limit_counters_expires_idx").on(t.expiresAt),
+    check("rate_limit_counters_limiter_format", sql`${t.limiter} ~ '^[a-z0-9_.]{1,64}$'`),
+    check("rate_limit_counters_key_hash_format", sql`${t.keyHash} ~ '^[0-9a-f]{64}$'`),
+    check("rate_limit_counters_count", sql`${t.count} >= 0`),
+    check("rate_limit_counters_window", sql`${t.expiresAt} > ${t.windowStart}`),
+  ],
+);

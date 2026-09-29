@@ -170,6 +170,39 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
+  describe("0030: rate_limit_counters (P4-D shared rate limits)", () => {
+    it("the runtime role can select, insert, update and delete, nothing else", async () => {
+      const { url } = await createRuntimeRole();
+      await withClient(url, async (c) => {
+        await c.query(
+          `insert into rate_limit_counters (limiter, key_hash, window_start, expires_at, count)
+           values ('test.grants', $1, now(), now() + interval '1 minute', 1)
+           on conflict (limiter, key_hash) do update set count = rate_limit_counters.count + 1`,
+          ["a".repeat(64)],
+        );
+        await c.query("update rate_limit_counters set count = count - 1 where limiter = 'test.grants'");
+        const read = await c.query("select count from rate_limit_counters where limiter = 'test.grants'");
+        expect((read.rows[0] as { count: number }).count).toBe(0);
+        await c.query("delete from rate_limit_counters where limiter = 'test.grants'");
+        await expect(c.query("truncate rate_limit_counters")).rejects.toThrow(/permission denied/);
+        // The constraints bound what a compromised process can store: hashed keys, sane windows.
+        for (const [limiter, key, count] of [["test.grants", "admin|198.51.100.7", 1], ["Bad Name", "b".repeat(64), 1], ["test.grants", "c".repeat(64), -1]] as const) {
+          await expect(
+            c.query(
+              "insert into rate_limit_counters (limiter, key_hash, window_start, expires_at, count) values ($1, $2, now(), now() + interval '1 minute', $3)",
+              [limiter, key, count],
+            ),
+          ).rejects.toThrow(/violates check constraint/);
+        }
+      });
+      const privileges = await withClient(ownerUrl, (c) =>
+        c.query(`select privilege_type from information_schema.role_table_grants
+                 where grantee = 'databastion_app' and table_name = 'rate_limit_counters' order by 1`),
+      );
+      expect(privileges.rows.map((r) => (r as { privilege_type: string }).privilege_type)).toEqual(["DELETE", "INSERT", "SELECT", "UPDATE"]);
+    });
+  });
+
   describe("0009: refuses to run when pgboss is owned by another role", () => {
     const guardSql = readFileSync(path.join(MIGRATIONS_FOLDER, "0009_pgboss_owner_guard.sql"), "utf8");
 

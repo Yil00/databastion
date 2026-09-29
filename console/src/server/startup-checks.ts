@@ -69,7 +69,8 @@ export function startupErrors(env: NodeJS.ProcessEnv = process.env): string[] {
         "(1) agent known-good fingerprints: agents behind a shared (NAT / proxy) IP can be locked out by failure floods from that IP, " +
         "and any agent loses its lock-out exemption after 25 s; " +
         "(2) login device cookies: a distributed password-guessing attack on a username can keep its real user out; " +
-        "(3) masked samples: not stored (they are only kept encrypted at rest) nor displayed. " +
+        "(3) masked samples: not stored (they are only kept encrypted at rest) nor displayed; " +
+        "(4) login rate limits keyed by username are per process only (not shared across console processes). " +
         "Set DATABASTION_ENCRYPTION_KEY_FILE (e.g. openssl rand -base64 32).",
     );
   }
