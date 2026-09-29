@@ -63,6 +63,9 @@ fn internal() -> ConnectorError {
 pub(crate) struct Position {
     pub(crate) cursor: Option<String>,
     seen: BTreeSet<String>,
+    /// The cursor persisted by a previous run: entries up to it were
+    /// handed over then, and are not reported again after a restart.
+    floor: Option<String>,
 }
 
 impl Position {
@@ -79,6 +82,7 @@ impl Position {
             .and_then(|b| String::from_utf8(b).ok())
             .filter(|c| time::valid_csn(c));
         Self {
+            floor: cursor.clone(),
             cursor,
             seen: BTreeSet::new(),
         }
@@ -95,7 +99,7 @@ impl Position {
 
     /// Whether `csn` is new; marks it read.
     fn fresh(&mut self, csn: &str) -> bool {
-        if self.seen.contains(csn) {
+        if self.seen.contains(csn) || self.floor.as_deref().is_some_and(|f| csn <= f) {
             return false;
         }
         self.seen.insert(csn.to_owned());
@@ -381,7 +385,13 @@ mod tests {
         store
             .save(b"20260929202642.012954Z#000000#000#000000")
             .unwrap();
-        assert!(Position::load(Some(&store)).cursor.is_some());
+        let mut p = Position::load(Some(&store));
+        assert!(p.cursor.is_some());
+        // After a restart, entries up to the persisted cursor (read again
+        // in the overlap) are not reported twice.
+        assert!(!p.fresh("20260929202642.012954Z#000000#000#000000"));
+        assert!(!p.fresh("20260929202640.000000Z#000000#000#000000"));
+        assert!(p.fresh("20260929202642.012955Z#000000#000#000000"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
