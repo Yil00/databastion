@@ -258,11 +258,12 @@ comments (`/*! … */`, `/*M! … */`) as code. The `sql_mode` of a logged
 statement is unknown: the text is lexed with and without
 `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, and kept only when every reading
 gives the same tokens. A `"…"` token is never a name. Version comments
-that a supported server may read as comments (a version from 8.0.0, six
-digits, MariaDB's `/*M!`) are lexed both ways too. Text with a byte >= 0x80
+that a supported server may read as comments (a version from 5.7.0, which
+MariaDB skips, six digits, MariaDB's `/*M!`) are lexed both ways too. Text with a byte >= 0x80
 directly followed by `\` or a backtick (a trail byte in gbk, big5, sjis,
 cp932, gb18030), and raw text that is not UTF-8 (`query::analyze_raw`),
-keep only the statement kind. `REPLACE` joins the
+keep only the statement kind, unless the source already transcoded it to
+UTF-8 (`AnalyzeOptions::transcoded`: `performance_schema`). `REPLACE` joins the
 DML allow-list; account statements, `SET PASSWORD`, `GRANT`, `CHANGE
 MASTER` / `CHANGE REPLICATION SOURCE`, `CREATE SERVER` and every other
 utility statement keep no text. Property tests: `tests/query_mysql_props.rs`

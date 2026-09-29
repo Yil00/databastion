@@ -54,8 +54,9 @@
 //! and its content must lex completely before its first `*/` (a literal
 //! running past it, or a nested comment, fails closed). A version
 //! comment is only certain to run when it has no version or a five-digit
-//! version below 8.0.0 (every supported server runs it); otherwise (six
-//! digits, 8.0.0 and later, every MariaDB-only `/*M!`) the server may read
+//! version below 5.7.0 (every supported server runs it; MariaDB skips
+//! `/*!50700` to `/*!99999`); otherwise (six digits, 5.7.0 and later,
+//! every MariaDB-only `/*M!`) the server may read
 //! it as a comment, so that reading is lexed too and must agree. Text with
 //! a byte >= 0x80 directly followed by `\` or a backtick (the trail byte
 //! of a two-byte character in gbk, big5, sjis, cp932 or gb18030) keeps
@@ -137,9 +138,12 @@ struct MyMode {
 }
 
 /// Whether a version comment `/*!NNNNN` runs on every supported server:
-/// a five-digit MySQL version below 8.0.0 (the connector refuses MySQL
-/// before 8.0 and MariaDB before 10.6). `/*!` without a version always
-/// runs; MariaDB's `/*M!` runs only on MariaDB, so it is never "always".
+/// a five-digit version below 5.7.0 (50700). MySQL 8.0+ runs every
+/// five-digit version comment up to its own version, but MariaDB (10.6+)
+/// skips `/*!50700` to `/*!99999` (measured on MariaDB 11.4.13), so from
+/// 50700 up a supported server may read it as a comment. `/*!` without a
+/// version always runs; MariaDB's `/*M!` runs only on MariaDB, so it is
+/// never "always".
 fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
     if mariadb_only {
         return false;
@@ -151,7 +155,7 @@ fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
         && std::str::from_utf8(digits)
             .ok()
             .and_then(|d| d.parse::<u32>().ok())
-            .is_some_and(|v| v < 80_000)
+            .is_some_and(|v| v < 50_700)
 }
 
 /// Longest version number of an executable comment (`/*!NNNNNN`).
@@ -965,6 +969,12 @@ pub struct AnalyzeOptions {
     /// define): only the statement kind is kept, from the prefix before
     /// the first quote or comment.
     pub opaque: bool,
+    /// The source has already transcoded the text to UTF-8 on the server
+    /// (MySQL `performance_schema`, read through a utf8mb4 connection): its
+    /// bytes are characters, not the client's multibyte encoding, so the
+    /// gbk / sjis trail-byte guard does not apply. Bytes that are not UTF-8
+    /// still make the text opaque.
+    pub transcoded: bool,
 }
 
 impl AnalyzeOptions {
@@ -978,7 +988,16 @@ impl AnalyzeOptions {
             large_limit: 10_001,
             dialect: Dialect::Postgres,
             opaque: false,
+            transcoded: false,
         }
+    }
+
+    /// Marks the text as transcoded to UTF-8 by its source (see
+    /// [`AnalyzeOptions::transcoded`]).
+    #[must_use]
+    pub fn transcoded(mut self, transcoded: bool) -> Self {
+        self.transcoded = transcoded;
+        self
     }
 
     /// Marks the text as opaque (see [`AnalyzeOptions::opaque`]).
@@ -1102,7 +1121,7 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
 /// [`analyze`] for MySQL / MariaDB text: every `sql_mode` reading must
 /// give the same tokens.
 fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
-    if opts.opaque || multibyte_hazard(text.as_bytes()) {
+    if opts.opaque || (!opts.transcoded && multibyte_hazard(text.as_bytes())) {
         return QueryAnalysis::unparsed(my_kind_prefix(text));
     }
     let mut readings = my_modes(text).into_iter().map(|m| lex_mysql(text, m));
@@ -2495,19 +2514,32 @@ mod tests {
             my_norm("select /*!50000 'secret', */ a from t").unwrap(),
             "select ? , a from t"
         );
-        // Maybe a comment (MariaDB-only, or a version from 8.0.0): both
-        // readings must agree, otherwise only the kind is kept.
+        for q in [
+            "SELECT /*!40100 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!32311 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!40101 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!50699 SQL_NO_CACHE */ * FROM t",
+        ] {
+            assert_eq!(my(q).parts()[0].lead, ["select", "sql_no_cache"], "{q}");
+        }
+        // Maybe a comment (MariaDB-only, or a version from 5.7.0, which
+        // MariaDB skips): both readings must agree, otherwise only the kind
+        // is kept. A filter or a limit hidden there must not make a
+        // whole-table read look filtered.
         for q in [
             "select /*M!100500 'secret', */ a from t",
             "select a /*!80030 from Pa55word */ from t",
             "select a /*!100500 , b */ from t",
+            "SELECT * FROM customers /*!50700 WHERE 1=1 */",
+            "SELECT * FROM customers /*!57000 LIMIT 1 */",
+            "SELECT * FROM customers /*!79999 WHERE id = 3 */",
         ] {
             let a = my(q);
             assert!(a.normalized().is_none() && a.relations().is_empty(), "{q}");
             assert_eq!(a.kind(), StatementKind::Select, "{q}");
         }
         assert_eq!(
-            my_rels("select a from t /*!80000 */"),
+            my_rels("select a from t /*!50700 */"),
             vec![r(None, "t")],
             "an empty maybe-comment reads the same"
         );
@@ -2562,6 +2594,24 @@ mod tests {
         assert!(
             a.relations().is_empty(),
             "backtick after a multibyte character"
+        );
+        // A text the source transcoded to UTF-8 (performance_schema) is
+        // made of characters: a CJK identifier stays readable.
+        let cjk = "SELECT * FROM `hr` . `\u{5ba2}\u{6237}`";
+        assert!(my(cjk).relations().is_empty());
+        assert_eq!(
+            analyze(cjk, AnalyzeOptions::mysql().transcoded(true))
+                .relations()
+                .len(),
+            1
+        );
+        assert!(
+            analyze_raw(
+                b"select 1 from \xFF",
+                AnalyzeOptions::mysql().transcoded(true)
+            )
+            .relations()
+            .is_empty()
         );
         // Other non-ASCII text is fine.
         assert_eq!(my_rels("select 'caf\u{e9}' from t"), vec![r(None, "t")]);
