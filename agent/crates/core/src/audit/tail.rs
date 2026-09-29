@@ -344,6 +344,13 @@ impl Tailer {
         }
     }
 
+    /// Damaged records dropped by the splitter
+    /// ([`Framing::JsonObjects`]).
+    #[must_use]
+    pub fn malformed(&self) -> u64 {
+        self.splitter.malformed
+    }
+
     /// Framing of the log records.
     #[must_use]
     pub fn framing(&self) -> Framing {

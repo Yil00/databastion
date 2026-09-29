@@ -16,8 +16,8 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-agent` | `crates/agent` | Binary: CLI (`--config`), JSON logs, connector selection by Cargo feature |
 | `databastion-core` | `crates/core` | `Connector` trait, `Engine`, `AuditLevel`, `TargetHealth`, sinks, `agent.yaml`, enrollment, runtime (heartbeat / jobs), crate-private HTTPS uplink and session |
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
-| `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B); Audit is P4-A |
-| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C); Audit is P4-B |
+| `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B), Audit (P4-A, [README](crates/connector-postgres/README.md)) |
+| `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector (stub) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
@@ -282,13 +282,19 @@ Behavior:
   largest accepted packet (40 MiB); a table whose row is still too large is skipped and reported
   as not covered, the scan goes on; character, JSON, `int` / `bigint` / `decimal` and `date`
   columns only;
-- `check()`: reachability; audit level Partial with the `events_statements_history_long`
-  consumer readable, Limited with the per-thread consumers only, Full never before the audit
-  log path exists (P4-B; an active `server_audit` / `audit_log` is noted), None when the
-  account cannot read `performance_schema` (the ADR-0018 minimal variant before Audit);
+- `check()`: reachability; audit level and source with the Audit stream's rule (Partial from
+  a readable `server_audit` / `audit_log` JSON file once a record was read, or from the
+  `events_statements_history_long` consumer and those it depends on; Limited with the
+  per-thread consumers only; never Full: no source gives both every statement and its rows;
+  see [crates/connector-mysql/README.md](crates/connector-mysql/README.md));
   over-privilege (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`,
-  `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, roles), `init_connect`, and coverage (views,
-  engines). With `extended_grants: true` on the target (ADR-0018 extended variant), a global
+  `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, `SELECT` on `performance_schema` while no
+  Audit stream runs, roles), `init_connect`, and coverage (views, engines);
+- Audit (P4-B): access events from the `server_audit` log or the `audit_log` /
+  `audit_log_filter` JSON file (`mysql.audit_log`, tailed by the core with a persisted cursor),
+  or from `performance_schema` (`DIGEST_TEXT` first); statement text analyzed by the MySQL
+  dialect of the query normalizer only, never sent or logged; signals `signature.mysqldump`,
+  `signature.into_outfile`, `shape.full_table_read`, `volume.large_result`. With `extended_grants: true` on the target (ADR-0018 extended variant), a global
   `SELECT` is an expected warning instead of over-privilege; the system schemas are never read
   either way.
 

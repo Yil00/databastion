@@ -21,14 +21,17 @@
 //!
 //! `DATABASTION_TEST_REQUIRE` (comma-separated: `mysql`, `mariadb`,
 //! `mysql-admin`, `mariadb-admin`, `mysql-tls`, `mariadb-tls`, `federated`,
-//! `pam`, `network`, or `all`) turns the matching skips into failures: CI lists what
-//! each run must exercise.
+//! `pam`, `network`, the Audit keys of [`audit_it`] (`mariadb-audit`,
+//! `percona`, `percona-audit`, `mysqldump`), or `all`) turns the matching
+//! skips into failures: CI lists what each run must exercise.
 //!
 //! The tests are serialized. They live in the crate (not `tests/`) to reach
 //! the session layer for the kill and transaction probes.
 
 // Skip notices and the recall table (counts only, never a value).
 #![allow(clippy::print_stderr)]
+
+mod audit_it;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -429,25 +432,38 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         let health = MysqlConnector::new().check(&t).await;
         assert!(health.reachable, "{}: {health:?}", server.name);
         assert_eq!(health.failure, None);
-        // ADR-0018 minimal variant: no performance_schema grant before
-        // Audit (P4-B), so no audit source the account can read: None.
-        assert_eq!(
-            health.audit_level,
-            AuditLevel::None,
-            "{}: {health:?}",
-            server.name
-        );
         let detail = health.detail.unwrap();
         eprintln!("{} check: {detail}", server.name);
-        assert!(
-            detail.contains("performance_schema not readable by the account"),
-            "{detail}"
-        );
-        // The dev account is not over-privileged.
-        assert!(!detail.contains("over-privileged"), "{detail}");
-        if server.name == "mariadb" {
+        if server.name == "mysql" {
+            // The dev MySQL account has the Audit grant on
+            // performance_schema (MySQL Community's only source): Partial,
+            // and over-privilege while no Audit stream runs (ADR-0018).
+            assert_eq!(health.audit_level, AuditLevel::Partial, "{detail}");
+            assert!(
+                detail.contains(
+                    "over-privileged: SELECT on performance_schema without Audit enabled"
+                ),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("audit source: performance_schema.events_statements_history_long"),
+                "{detail}"
+            );
+        } else {
+            // MariaDB: the dev account has no performance_schema grant and
+            // this target no audit log: no source it can read.
+            assert_eq!(health.audit_level, AuditLevel::None, "{detail}");
+            assert!(
+                detail.contains("performance_schema not readable by the account"),
+                "{detail}"
+            );
+            assert!(!detail.contains("over-privileged"), "{detail}");
             assert!(
                 detail.contains("server_audit active (logging ON, file output)"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("reading its log needs mysql.audit_log"),
                 "{detail}"
             );
         }
@@ -1087,8 +1103,15 @@ async fn probes() {
         assert!(health.reachable);
         assert_eq!(health.audit_level, AuditLevel::Partial);
         let detail = health.detail.unwrap();
+        // Its only over-privilege: performance_schema without Audit.
         assert!(
-            !detail.contains("over-privileged"),
+            detail.contains(
+                "over-privileged: SELECT on performance_schema without Audit enabled \
+                 (statement text of every session readable);"
+            ) || detail.ends_with(
+                "over-privileged: SELECT on performance_schema without Audit enabled \
+                 (statement text of every session readable)"
+            ),
             "{}: {detail}",
             server.name
         );

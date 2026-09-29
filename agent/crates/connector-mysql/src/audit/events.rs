@@ -1,0 +1,794 @@
+//! From audit records and `performance_schema` rows to masked access
+//! events (ADR-0007): who, which objects (normalized names), which action,
+//! how many rows (`performance_schema` only), and the signals computed
+//! here from the raw text, which never leaves the agent.
+//!
+//! Signal heuristics (vocabulary: `classifiers::masking::Signal`):
+//! - `signature.mysqldump`: a whole-table read (the `shape.full_table_read`
+//!   rule below) by a client whose `program_name` is `mysqldump` /
+//!   `mariadb-dump` / `mysqlpump` / `mydumper` (`performance_schema`, or
+//!   the connect record of `audit_log_filter`), or carrying `SQL_NO_CACHE`
+//!   (`SELECT /*!40001 SQL_NO_CACHE */ … FROM t`, what these tools send),
+//!   or in a session that took a consistent snapshot (`START TRANSACTION
+//!   WITH CONSISTENT SNAPSHOT`), a global read lock (`FLUSH TABLES WITH
+//!   READ LOCK`) or `LOCK TABLES`, or of a table the session ran `SHOW
+//!   CREATE TABLE` on. The utility statements are only visible when the
+//!   source logs them (`audit_log`, `performance_schema`; not
+//!   `server_audit` with `QUERY_DML`).
+//! - `signature.into_outfile`: `SELECT … INTO OUTFILE` / `INTO DUMPFILE`,
+//!   also when the server refused it (an attempt).
+//! - `shape.full_table_read`: a read without top-level `WHERE`,
+//!   aggregation, derived table, and without a limit or with a limit above
+//!   [`LARGE_LIMIT`] rows.
+//! - `volume.large_result`: more than [`LARGE_ROWS`] rows returned or
+//!   affected by one statement (`performance_schema` only: the audit log
+//!   files carry no row count).
+//!
+//! Objects come from the table-access records when the source has them
+//! (`server_audit` `TABLE` events, `audit_log_filter` `table_access`),
+//! otherwise from the statement text; an unqualified name is in the
+//! statement's current database. `information_schema`,
+//! `performance_schema`, `sys`, `DUAL` and MariaDB's internal statistics
+//! tables (`mysql.*_stats`) are not application data and are skipped; the
+//! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
+//! access worth reporting). A read or write whose objects cannot be told
+//! (text that does not lex, `CALL`) is reported against `*`. Statements
+//! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
+//! server could not parse (error 1064 / 1149) never yields an event.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Instant, SystemTime};
+
+use databastion_classifiers::masking::{
+    EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
+};
+use databastion_classifiers::names::NormalizedName;
+use databastion_classifiers::query::{
+    AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze,
+};
+use databastion_core::audit::own::{ClientSeen, OwnAccount};
+
+use super::records::{FileRecord, Op, TableOp};
+use crate::discover::normalize;
+
+/// A limit above this many rows reads a whole table.
+pub(crate) const LARGE_LIMIT: u64 = 10_000;
+/// Rows above which `volume.large_result` is set. Both thresholds sit just
+/// above the agent's own maximum sample (`limits.max_sample_rows` is at
+/// most 10 000), so its Discovery statements never carry these signals.
+pub(crate) const LARGE_ROWS: u64 = 10_000;
+/// Sessions followed for the dump patterns (oldest forgotten first).
+const MAX_SESSIONS: usize = 4096;
+/// Tables remembered per session (`SHOW CREATE TABLE`).
+const MAX_SESSION_RELATIONS: usize = 256;
+/// Server errors of a statement it could not parse: the text is not SQL.
+const PARSE_ERRORS: [u32; 2] = [1064, 1149];
+
+fn analyze_opts(truncated: bool) -> AnalyzeOptions {
+    let mut o = AnalyzeOptions::mysql().truncated(truncated);
+    o.large_limit = LARGE_LIMIT + 1;
+    o
+}
+
+/// Schemas that hold no application data.
+pub(crate) fn is_system_schema(db: &str) -> bool {
+    ["information_schema", "performance_schema", "sys"]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(db))
+}
+
+/// MariaDB's engine-independent statistics, read by the server itself for
+/// many statements, and InnoDB's persistent statistics.
+fn is_internal_table(db: &str, table: &str) -> bool {
+    db.eq_ignore_ascii_case("mysql")
+        && [
+            "table_stats",
+            "column_stats",
+            "index_stats",
+            "innodb_table_stats",
+            "innodb_index_stats",
+        ]
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(table))
+}
+
+/// A relation named by a statement (unqualified: in `database`) that holds
+/// no application data: a system schema, an internal statistics table, or
+/// `DUAL`.
+fn is_system_relation(r: &RelationName, database: &str) -> bool {
+    let db = r.schema.as_deref().unwrap_or(database);
+    is_system_schema(db)
+        || is_internal_table(db, &r.name)
+        || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
+}
+
+/// Connection errors that are not authentication failures: bad handshake
+/// (1043), aborted or failed network reads and writes (1152 to 1161).
+fn is_network_error(status: u32) -> bool {
+    status == 1043 || (1152..=1161).contains(&status)
+}
+
+/// Client programs that export whole databases.
+pub(crate) fn is_dump_program(program: &str) -> bool {
+    let p = program.trim().to_ascii_lowercase();
+    let base = p.rsplit('/').next().unwrap_or(&p);
+    matches!(
+        base.strip_suffix(".exe").unwrap_or(base),
+        "mysqldump" | "mariadb-dump" | "mariadbdump" | "mysqlpump" | "mydumper"
+    )
+}
+
+/// What the agent remembers of one client session.
+#[derive(Default)]
+struct SessionState {
+    /// Consistent snapshot, global read lock or `LOCK TABLES` taken.
+    snapshot: bool,
+    /// Tables `SHOW CREATE TABLE` ran on.
+    shown: HashSet<RelationName>,
+    /// `program_name` from the connect record.
+    program: Option<String>,
+}
+
+/// Sessions followed for the dump patterns, bounded.
+#[derive(Default)]
+pub(crate) struct Sessions {
+    map: HashMap<String, SessionState>,
+    order: VecDeque<String>,
+}
+
+impl Sessions {
+    fn entry(&mut self, key: &str) -> &mut SessionState {
+        if !self.map.contains_key(key) {
+            if self.map.len() >= MAX_SESSIONS {
+                while let Some(old) = self.order.pop_front() {
+                    if self.map.remove(&old).is_some() {
+                        break;
+                    }
+                }
+            }
+            self.order.push_back(key.to_owned());
+        }
+        self.map.entry(key.to_owned()).or_default()
+    }
+
+    fn get(&self, key: &str) -> Option<&SessionState> {
+        self.map.get(key)
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.map.remove(key);
+    }
+}
+
+/// One statement to turn into an event.
+pub(crate) struct Access<'a> {
+    /// Session key (`c<connection id>`, `t<thread id>`).
+    pub(crate) session: String,
+    /// Login user (empty when unknown).
+    pub(crate) user: &'a str,
+    pub(crate) principal: EventPrincipal,
+    pub(crate) client: ClientSeen,
+    /// `program_name` of the client, when the source shows it.
+    pub(crate) application: Option<&'a str>,
+    /// Current database of the statement.
+    pub(crate) database: &'a str,
+    pub(crate) text: Option<&'a str>,
+    pub(crate) truncated: bool,
+    /// Table-access records of the statement.
+    pub(crate) tables: Vec<(&'a str, &'a str, TableOp)>,
+    pub(crate) rows: Option<u64>,
+    pub(crate) status: u32,
+    pub(crate) ts: SystemTime,
+    pub(crate) source: EventSource,
+}
+
+fn object(database: &str, name: &str) -> EventObject {
+    let db = if database.is_empty() {
+        NormalizedName::wildcard()
+    } else {
+        normalize(database)
+    };
+    EventObject::new(db, None, normalize(name))
+}
+
+/// An object the source does not name: the database, and `*`.
+fn unknown_object(database: &str) -> EventObject {
+    let db = if database.is_empty() {
+        NormalizedName::wildcard()
+    } else {
+        normalize(database)
+    };
+    EventObject::new(db, None, NormalizedName::wildcard())
+}
+
+/// Updates the session's dump state from its utility statements.
+fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
+    for p in parts {
+        let lead: Vec<&str> = p.lead.iter().map(String::as_str).collect();
+        match lead.as_slice() {
+            ["flush", rest @ ..] if rest.contains(&"lock") && rest.contains(&"read") => {
+                s.snapshot = true;
+            }
+            ["start", "transaction", rest @ ..] if rest.contains(&"consistent") => {
+                s.snapshot = true;
+            }
+            ["lock", "tables" | "table", ..] => s.snapshot = true,
+            ["show", "create", "table", ..] => {
+                for r in &p.relations {
+                    if s.shown.len() < MAX_SESSION_RELATIONS {
+                        s.shown.insert(r.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Builds events for one target and source.
+pub(crate) struct EventBuilder {
+    own: OwnAccount,
+    sessions: Sessions,
+    /// Failed statements skipped (no rows were read).
+    pub(crate) failed: u64,
+}
+
+impl EventBuilder {
+    pub(crate) fn new(own: OwnAccount) -> Self {
+        Self {
+            own,
+            sessions: Sessions::default(),
+            failed: 0,
+        }
+    }
+
+    /// The event of one statement, if any (see the module documentation).
+    pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
+        let analysis: Option<QueryAnalysis> = a.text.map(|t| analyze(t, analyze_opts(a.truncated)));
+        let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
+        let parsed = !parts.is_empty();
+        if let Some(app) = a.application {
+            let s = self.sessions.entry(&a.session);
+            if s.program.is_none() {
+                s.program = Some(app.to_owned());
+            }
+        }
+        note_utility(self.sessions.entry(&a.session), parts);
+        let outfile = parts.iter().any(|p| p.outfile);
+        if a.status != 0 && (PARSE_ERRORS.contains(&a.status) || !outfile) {
+            self.failed += 1;
+            return None;
+        }
+        let lead0 = parts
+            .first()
+            .and_then(|p| p.lead.first())
+            .map(String::as_str);
+        let table_action = if a.tables.iter().any(|t| t.2 == TableOp::Read) {
+            Some(EventAction::Read)
+        } else if a.tables.iter().any(|t| t.2 == TableOp::Write) {
+            Some(EventAction::Write)
+        } else if a.tables.iter().any(|t| t.2 == TableOp::Ddl) {
+            Some(EventAction::Ddl)
+        } else {
+            None
+        };
+        let kind = analysis
+            .as_ref()
+            .map_or(StatementKind::Other, QueryAnalysis::kind);
+        let call = lead0 == Some("call");
+        let action = match kind {
+            StatementKind::Select
+            | StatementKind::Table
+            | StatementKind::Values
+            | StatementKind::Handler => EventAction::Read,
+            StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge => EventAction::Write,
+            StatementKind::Ddl => EventAction::Ddl,
+            StatementKind::Dcl => EventAction::Dcl,
+            _ if call => EventAction::Read,
+            _ => table_action?,
+        };
+        let rw = matches!(action, EventAction::Read | EventAction::Write);
+        let mut objects: Vec<(String, String)> = Vec::new();
+        let mut unknown = false;
+        if a.tables.is_empty() {
+            let mut named_any = false;
+            for p in parts {
+                for r in &p.relations {
+                    named_any = true;
+                    if is_system_relation(r, a.database) {
+                        continue;
+                    }
+                    let db = r.schema.as_deref().unwrap_or(a.database);
+                    let o = (db.to_owned(), r.name.clone());
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
+            if !named_any && (!parsed || call) {
+                unknown = true;
+            }
+        } else {
+            for (db, table, _) in &a.tables {
+                let system = is_system_schema(db)
+                    || is_internal_table(db, table)
+                    || (!rw && db.eq_ignore_ascii_case("mysql"));
+                let o = ((*db).to_owned(), (*table).to_owned());
+                if !system && !objects.contains(&o) {
+                    objects.push(o);
+                }
+            }
+        }
+        if rw && objects.is_empty() && !unknown {
+            // Only system tables, or no table at all (`SELECT 1`).
+            return None;
+        }
+        let ts = a.ts.min(now);
+        let mut e = MaskedEvent::new(a.source, action, a.principal.clone(), ts).with_rows(a.rows);
+        for (db, name) in objects.iter().take(16) {
+            e = e.with_object(object(db, name));
+        }
+        if unknown {
+            e = e.with_object(unknown_object(a.database));
+        }
+        if action == EventAction::Read {
+            let session = self.sessions.get(&a.session);
+            let dumper = a
+                .application
+                .or_else(|| session.and_then(|s| s.program.as_deref()))
+                .is_some_and(is_dump_program);
+            for p in parts {
+                let user_relations: Vec<&RelationName> = p
+                    .relations
+                    .iter()
+                    .filter(|r| !is_system_relation(r, a.database))
+                    .collect();
+                if p.outfile {
+                    e = e.with_signal(Signal::IntoOutfile);
+                }
+                let whole = p.kind.is_read()
+                    && !user_relations.is_empty()
+                    && p.shape.is_some_and(|s| s.whole_relation(LARGE_LIMIT + 1));
+                if whole {
+                    e = e.with_signal(Signal::FullTableRead);
+                    let no_cache = p.lead.iter().skip(1).any(|w| w == "sql_no_cache");
+                    let pattern = session.is_some_and(|s| {
+                        s.snapshot || user_relations.iter().any(|r| s.shown.contains(*r))
+                    });
+                    if no_cache || dumper || pattern {
+                        e = e.with_signal(Signal::Mysqldump);
+                    }
+                }
+            }
+        }
+        if a.rows.is_some_and(|r| r > LARGE_ROWS) {
+            e = e.with_signal(Signal::LargeResult);
+        }
+        if self
+            .own
+            .routine(a.user, a.application, a.client, &e, Instant::now())
+        {
+            return None;
+        }
+        Some(e)
+    }
+
+    /// Converts audit log records (in file order): the table-access
+    /// records and the statement record of one statement are merged.
+    pub(crate) fn convert_file(
+        &mut self,
+        records: Vec<FileRecord>,
+        source: EventSource,
+        now: SystemTime,
+    ) -> Vec<MaskedEvent> {
+        let mut out = Vec::new();
+        let mut group: Vec<FileRecord> = Vec::new();
+        for r in records {
+            match r.op {
+                Op::Connect | Op::FailedConnect | Op::Disconnect => {
+                    self.flush(std::mem::take(&mut group), source, now, &mut out);
+                    if let Some(e) = self.connection(&r, source, now) {
+                        out.push(e);
+                    }
+                }
+                Op::Query | Op::Table(_) => {
+                    if group.last().is_some_and(|g| !same_statement(g, &r)) {
+                        self.flush(std::mem::take(&mut group), source, now, &mut out);
+                    }
+                    let ends = r.op == Op::Query;
+                    group.push(r);
+                    if ends {
+                        self.flush(std::mem::take(&mut group), source, now, &mut out);
+                    }
+                }
+            }
+        }
+        self.flush(group, source, now, &mut out);
+        out
+    }
+
+    fn connection(
+        &mut self,
+        r: &FileRecord,
+        source: EventSource,
+        now: SystemTime,
+    ) -> Option<MaskedEvent> {
+        let key = format!("c{}", r.connection);
+        let client = databastion_classifiers::masking::ClientAddr::parse(&r.host);
+        let ts = r.ts.unwrap_or(now).min(now);
+        match r.op {
+            Op::Disconnect => {
+                self.sessions.remove(&key);
+                None
+            }
+            // A client that dropped the connection during the handshake
+            // (a port probe, a health check): not an authentication
+            // failure.
+            Op::FailedConnect if is_network_error(r.status) => None,
+            Op::FailedConnect => Some(MaskedEvent::new(
+                source,
+                EventAction::AuthFailure,
+                EventPrincipal::failed_account(&r.user).with_client(client),
+                ts,
+            )),
+            _ => {
+                self.sessions.remove(&key);
+                let mut principal = EventPrincipal::account(&r.user).with_client(client);
+                if let Some(p) = &r.program {
+                    self.sessions.entry(&key).program = Some(p.clone());
+                    principal = principal.with_application(p);
+                }
+                let e = MaskedEvent::new(source, EventAction::Connect, principal, ts);
+                let routine = self.own.routine(
+                    &r.user,
+                    r.program.as_deref(),
+                    ClientSeen::Logged(client),
+                    &e,
+                    Instant::now(),
+                );
+                (!routine).then_some(e)
+            }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        group: Vec<FileRecord>,
+        source: EventSource,
+        now: SystemTime,
+        out: &mut Vec<MaskedEvent>,
+    ) {
+        let Some(first) = group.first() else {
+            return;
+        };
+        let query = group.iter().find(|r| r.op == Op::Query);
+        let text_record = query.or_else(|| group.iter().find(|r| r.text.is_some()));
+        let key = format!("c{}", first.connection);
+        let program = self.sessions.get(&key).and_then(|s| s.program.clone());
+        let client = databastion_classifiers::masking::ClientAddr::parse(&first.host);
+        let mut principal = EventPrincipal::account(&first.user).with_client(client);
+        if let Some(p) = &program {
+            principal = principal.with_application(p);
+        }
+        let tables: Vec<(&str, &str, TableOp)> = group
+            .iter()
+            .filter_map(|r| match (r.op, &r.table) {
+                (Op::Table(op), Some((db, t))) => Some((db.as_str(), t.as_str(), op)),
+                _ => None,
+            })
+            .collect();
+        let access = Access {
+            session: key.clone(),
+            user: &first.user,
+            principal,
+            client: ClientSeen::Logged(client),
+            application: program.as_deref(),
+            database: query.map_or(first.database.as_str(), |q| q.database.as_str()),
+            text: text_record.and_then(|r| r.text.as_deref().map(String::as_str)),
+            truncated: text_record.is_some_and(|r| r.truncated),
+            tables,
+            rows: None,
+            status: query.map_or(0, |q| q.status),
+            ts: first.ts.unwrap_or(now),
+            source,
+        };
+        if let Some(e) = self.statement(access, now) {
+            out.push(e);
+        }
+    }
+}
+
+/// Whether `r` belongs to the statement of `g` (same connection, and the
+/// same query id, or without query ids the same text).
+fn same_statement(g: &FileRecord, r: &FileRecord) -> bool {
+    g.connection == r.connection
+        && g.op != Op::Query
+        && match (g.query_id, r.query_id) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => match (&g.text, &r.text) {
+                (Some(a), Some(b)) => a.as_str() == b.as_str(),
+                _ => false,
+            },
+            _ => false,
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use databastion_classifiers::masking::ClientAddr;
+    use databastion_core::audit::own::SharedOwnUsage;
+
+    use super::*;
+    use crate::audit::records::{parse_json, parse_server_audit};
+
+    fn own() -> OwnAccount {
+        OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("172.18.0.1"),
+            1000,
+            SharedOwnUsage::default(),
+        )
+    }
+
+    fn show(e: &MaskedEvent) -> String {
+        format!(
+            "{} {:?} {:?} {:?}",
+            e.action().as_str(),
+            e.objects()
+                .iter()
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect::<Vec<_>>(),
+            e.rows(),
+            e.signals().iter().map(|s| s.as_str()).collect::<Vec<_>>()
+        )
+    }
+
+    fn sa(lines: &[&str]) -> Vec<FileRecord> {
+        lines
+            .iter()
+            .map(|l| parse_server_audit(l.as_bytes(), 0, 1024).unwrap())
+            .collect()
+    }
+
+    fn file(b: &mut EventBuilder, recs: Vec<FileRecord>) -> Vec<String> {
+        b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now())
+            .iter()
+            .map(show)
+            .collect()
+    }
+
+    #[test]
+    fn mariadb_dump_is_a_signature() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                "20260929 09:42:04,h,root,localhost,51,0,CONNECT,,,0",
+                r"20260929 09:42:04,h,root,localhost,51,155,QUERY,support,'SELECT engine, table_type FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = DATABASE() AND table_name = \'tickets\'',0",
+                "20260929 09:42:04,h,root,localhost,51,174,READ,support,tickets,",
+                "20260929 09:42:04,h,root,localhost,51,174,READ,mysql,table_stats,",
+                r"20260929 09:42:04,h,root,localhost,51,174,QUERY,support,'SELECT /*!40001 SQL_NO_CACHE */ `id`, `requester_email` FROM `tickets`',0",
+                "20260929 09:42:04,h,root,localhost,51,177,QUERY,support,'select @@collation_database',0",
+                "20260929 09:42:04,h,root,localhost,51,0,DISCONNECT,support,,0",
+            ]),
+        );
+        assert_eq!(
+            out,
+            [
+                "connect [] None []",
+                "read [\"support.tickets\"] None [\"shape.full_table_read\", \"signature.mysqldump\"]"
+            ],
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn outfile_attempts_and_failures() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                "20260929 09:41:34,h,app,10.0.0.5,37,109,READ,support,tickets,",
+                r"20260929 09:41:34,h,app,10.0.0.5,37,109,QUERY,mysql,'select * from support.tickets where 1=0 into outfile \'/tmp/x\'',1086",
+                r"20260929 09:41:34,h,app,10.0.0.5,37,110,QUERY,support,'select * from nope where a = \'x\'',1146",
+                r"20260929 09:41:34,h,app,10.0.0.5,37,111,QUERY,support,'selec * from tickets',1064",
+            ]),
+        );
+        assert_eq!(
+            out,
+            ["read [\"support.tickets\"] None [\"signature.into_outfile\"]"],
+            "{out:#?}"
+        );
+        assert_eq!(b.failed, 2);
+    }
+
+    #[test]
+    fn objects_from_table_events_or_text() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                // Filtered read, objects from the TABLE events.
+                "20260929 09:41:34,h,app,10.0.0.5,37,1,READ,support,tickets,",
+                "20260929 09:41:34,h,app,10.0.0.5,37,1,READ,support,escalations,",
+                r"20260929 09:41:34,h,app,10.0.0.5,37,1,QUERY,support,'select t.id from tickets t join escalations e on e.ticket_id = t.id where t.id = 3',0",
+                // Only information_schema: skipped.
+                "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'select count(*) from information_schema.tables',0",
+                // No table: skipped.
+                "20260929 09:41:34,h,app,10.0.0.5,37,3,QUERY,support,'select 1',0",
+                // Write, from TABLE events only (QUERY record filtered out).
+                "20260929 09:41:34,h,app,10.0.0.5,37,4,WRITE,support,tickets,",
+                // DDL on the mysql schema (a GRANT): no mysql object.
+                "20260929 09:41:34,h,app,10.0.0.5,37,5,WRITE,mysql,global_priv,",
+                r"20260929 09:41:34,h,app,10.0.0.5,37,5,QUERY,mysql,'GRANT SELECT ON support.* TO \'u\'@\'%\' IDENTIFIED BY *****',0",
+                // Reading mysql.user is reported.
+                "20260929 09:41:34,h,app,10.0.0.5,37,6,READ,mysql,user,",
+                "20260929 09:41:34,h,app,10.0.0.5,37,6,QUERY,support,'select authentication_string from mysql.user',0",
+                // A procedure: objects unknown.
+                "20260929 09:41:34,h,app,10.0.0.5,37,7,QUERY,support,'call report()',0",
+                // Truncated or unlexable text without TABLE events: `*`.
+                "20260929 09:41:34,h,app,10.0.0.5,37,8,QUERY,support,'select \\'open',0",
+            ]),
+        );
+        assert_eq!(
+            out,
+            [
+                "read [\"support.escalations\", \"support.tickets\"] None []",
+                "write [\"support.tickets\"] None []",
+                "dcl [] None []",
+                "read [\"mysql.user\"] None [\"shape.full_table_read\"]",
+                "read [\"support.*\"] None []",
+                "read [\"support.*\"] None []",
+            ],
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn auth_failures_are_fingerprinted_and_connects_reported() {
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa(&[
+                "20260929 09:40:35,h,Secr3t-typed-as-user,10.0.0.9,12,0,FAILED_CONNECT,,,1045",
+                // A bare TCP connect (health check): not an auth failure.
+                "20260929 09:40:35,h,,127.0.0.1,15,0,FAILED_CONNECT,,,1158",
+                "20260929 09:40:35,h,app,10.0.0.9,13,0,CONNECT,shop,,0",
+                // The agent's own connection, from its address.
+                "20260929 09:40:35,h,databastion,172.18.0.1,14,0,CONNECT,,,0",
+            ]),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].action(), EventAction::AuthFailure);
+        assert!(!ev[0].principal().send_name());
+        assert_eq!(ev[1].action(), EventAction::Connect);
+        assert_eq!(ev[1].principal().client(), ClientAddr::parse("10.0.0.9"));
+    }
+
+    #[test]
+    fn own_account_is_left_out_only_when_routine() {
+        let sample = r"20260929 09:40:35,h,databastion,172.18.0.1,20,{q},QUERY,support,'SELECT LEFT(`requester_email`, 4096) FROM `support`.`tickets` LIMIT 1000',0";
+        let line = |q: u64| sample.replace("{q}", &q.to_string());
+        let mut b = EventBuilder::new(own());
+        // Within the budget (unknown rows are charged the whole budget):
+        // the first sampling read is routine, the second is reported.
+        assert!(file(&mut b, sa(&[&line(1)])).is_empty());
+        assert_eq!(file(&mut b, sa(&[&line(2)])).len(), 1);
+        // Same account from another address, or a whole-table read: reported.
+        let mut b = EventBuilder::new(own());
+        let other = line(1).replace("172.18.0.1", "10.9.9.9");
+        assert_eq!(file(&mut b, sa(&[&other])).len(), 1);
+        let dump = r"20260929 09:40:35,h,databastion,172.18.0.1,20,3,QUERY,support,'select * from tickets',0";
+        assert_eq!(file(&mut b, sa(&[dump])).len(), 1);
+        // The agent's address is a host name: nothing is left out.
+        let mut b = EventBuilder::new(own());
+        let named = line(1).replace("172.18.0.1", "localhost");
+        assert_eq!(file(&mut b, sa(&[&named])).len(), 1);
+    }
+
+    #[test]
+    fn filter_json_groups_and_program_name() {
+        let recs = [
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"connection","event":"connect","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"connection_data":{"status":0,"db":"","connection_attributes":{"program_name":"mysqldump"}}}"#,
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"general_data":{"command":"Query","query":"show create table `t`","status":0}}"#,
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"table_access","event":"read","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"table_access_data":{"db":"hr","table":"t","query":"SELECT * FROM `t`"}}"#,
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"general_data":{"command":"Query","query":"SELECT * FROM `t`","status":0}}"#,
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"table_access","event":"read","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"table_access_data":{"db":"hr","table":"t","query":"SELECT * FROM `t`"}}"#,
+            r#"{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":22,"login":{"user":"root","ip":"10.1.2.3"},"general_data":{"command":"Query","query":"SELECT * FROM `t`","status":0}}"#,
+        ];
+        let recs: Vec<FileRecord> = recs
+            .iter()
+            .map(|r| parse_json(r.as_bytes()).unwrap())
+            .collect();
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        let all: Vec<String> = ev.iter().map(show).collect();
+        assert_eq!(all.len(), 3, "{all:#?}");
+        assert_eq!(ev[0].principal().application(), Some("mysqldump"));
+        for e in &ev[1..] {
+            assert_eq!(e.principal().application(), Some("mysqldump"));
+            assert!(e.signals().contains(&Signal::Mysqldump), "{}", show(e));
+        }
+    }
+
+    #[test]
+    fn session_patterns_without_the_program_name() {
+        let q = |id: u64, text: &str| {
+            format!(
+                "20260929 09:40:35,h,backup,10.0.0.7,30,{id},QUERY,hr,'{}',0",
+                text.replace('\'', "\\'")
+            )
+        };
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                &q(1, "select * from employees"),
+                &q(2, "SHOW CREATE TABLE `settings`"),
+                &q(3, "select * from `settings`"),
+                &q(4, "START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */"),
+                &q(5, "select id, email from bonus"),
+                &q(6, "select * from bonus where id = 1"),
+            ]),
+        );
+        assert_eq!(
+            out,
+            [
+                "read [\"hr.employees\"] None [\"shape.full_table_read\"]",
+                "read [\"hr.settings\"] None [\"shape.full_table_read\", \"signature.mysqldump\"]",
+                "read [\"hr.bonus\"] None [\"shape.full_table_read\", \"signature.mysqldump\"]",
+                "read [\"hr.bonus\"] None []",
+            ],
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn value_like_names_are_masked_and_times_clamped() {
+        let mut b = EventBuilder::new(own());
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let ev = b.statement(
+            Access {
+                session: "t1".into(),
+                user: "app",
+                principal: EventPrincipal::account("app"),
+                client: ClientSeen::Logged(None),
+                application: None,
+                database: "support",
+                text: Some("select a from `escalations_jean.richard@example.com` where x = 1"),
+                truncated: false,
+                tables: Vec::new(),
+                rows: Some(20_000),
+                status: 0,
+                ts: future,
+                source: EventSource::PerformanceSchema,
+            },
+            SystemTime::now(),
+        );
+        let e = ev.unwrap();
+        assert!(!show(&e).contains("jean"), "{}", show(&e));
+        assert!(e.signals().contains(&Signal::LargeResult));
+        assert!(e.ts() <= SystemTime::now());
+    }
+
+    #[test]
+    fn dump_programs() {
+        for p in [
+            "mysqldump",
+            "/usr/bin/mariadb-dump",
+            "MYSQLDUMP.EXE",
+            "mydumper",
+        ] {
+            assert!(is_dump_program(p), "{p}");
+        }
+        assert!(!is_dump_program("mysql"));
+        assert!(!is_dump_program("databastion-agent"));
+    }
+}
