@@ -10,7 +10,9 @@
 //!   (the detectors use an internal lexicon of given names, surnames, month
 //!   names and street types);
 //! - [`masking`]: masked samples, HMAC-SHA256 fingerprints, uplink types;
-//! - [`names`]: name normalization (ADR-0009).
+//! - [`names`]: name normalization (ADR-0009);
+//! - [`query`]: query text normalizer and shape analysis (ADR-0007, ADR-0012
+//!   obligation 5).
 //!
 //! See `README.md` for the classifier list and the masking formats.
 
@@ -23,4 +25,5 @@ pub mod id;
 mod lexicon;
 pub mod masking;
 pub mod names;
+pub mod query;
 pub mod validate;

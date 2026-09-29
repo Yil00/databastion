@@ -302,15 +302,22 @@ jobs:
           set -a; . ../dev/.env; set +a
           export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
           export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
-          export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit
+          # Audit (P4-A): the pgaudit jsonlog of the dev image (bind-mounted, 0644 in dev only).
+          export DATABASTION_TEST_PG_AUDIT_LOG="$PWD/../dev/.state/logs/postgres/postgresql.json"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
           cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
       - name: Connector integration tests (local cluster, TLS and weak authentication)
         run: |
           if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
             sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends postgresql
           fi
+          # pgaudit for the host cluster: jsonlog and csvlog Audit tests (P4-A).
+          major="$(ls /usr/lib/postgresql | sort -V | tail -n 1)"
+          if [ ! -f "/usr/lib/postgresql/$major/lib/pgaudit.so" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends "postgresql-$major-pgaudit"
+          fi
           eval "$(dev/postgres/local-cluster.sh start)"
-          export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls,pgaudit-log
           (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
           dev/postgres/local-cluster.sh stop
       - name: Service logs

@@ -20,16 +20,17 @@ use reqwest::Method;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
+use crate::audit::{self, Aggregator};
 use crate::backoff;
 use crate::config::{AgentConfig, ConfigError, TargetEngine};
 use crate::connector::Connector;
 use crate::detect;
 use crate::engine::{AuditLevel, Engine};
 use crate::identity::{Identity, IdentityError, StateDir};
-use crate::job::{ScanJob, ScanParams};
+use crate::job::{AuditConfig, AuditParams, ScanJob, ScanParams};
 use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
 use crate::session::{CallError, RotateOutcome, Session};
-use crate::sink::FindingSink;
+use crate::sink::{EventSink, FindingSink};
 use crate::spool::Spool;
 use crate::uplink::{self, Auth, ResultBatch, Uplink, UplinkError};
 
@@ -296,6 +297,65 @@ struct Counters {
     scans_findings_capped: AtomicU64,
     /// Scans refused: classifier set not supported by this build.
     jobs_unsupported_classifiers: AtomicU64,
+    /// Access events received from connectors (before aggregation).
+    events_received: AtomicU64,
+    /// Aggregated events not reported (`audit.configure` filter).
+    events_filtered: AtomicU64,
+    /// Aggregated events lost because they could not be spooled.
+    events_lost: AtomicU64,
+    /// Audit streams that ended with an error (restarted with backoff).
+    audit_stream_failures: AtomicU64,
+}
+
+/// Capacity of the event channel between a connector and the core.
+const EVENTS_CHANNEL: usize = 256;
+/// Longest backoff before restarting a failed audit stream.
+const AUDIT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Audit settings per target (`audit.configure`), with a generation that
+/// changes on every update so the audit worker restarts that stream.
+#[derive(Default)]
+struct AuditTable {
+    next_generation: u64,
+    entries: std::collections::HashMap<String, (u64, AuditParams)>,
+}
+
+impl AuditTable {
+    fn set(&mut self, target_id: &str, params: Option<AuditParams>) {
+        match params {
+            Some(p) => {
+                self.next_generation += 1;
+                self.entries
+                    .insert(target_id.to_owned(), (self.next_generation, p));
+            }
+            None => {
+                self.entries.remove(target_id);
+            }
+        }
+    }
+
+    /// Restarts every stream (configuration reloaded).
+    fn bump_all(&mut self) {
+        for entry in self.entries.values_mut() {
+            self.next_generation += 1;
+            entry.0 = self.next_generation;
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(String, u64, AuditParams)> {
+        self.entries
+            .iter()
+            .map(|(id, (g, p))| (id.clone(), *g, p.clone()))
+            .collect()
+    }
+}
+
+/// How an audit session ended.
+enum AuditEnd {
+    /// Stopped by the audit worker (disabled, reconfigured, shutdown).
+    Stopped,
+    /// The connector returned (an error, or unexpectedly).
+    Failed(Option<crate::ConnectorError>),
 }
 
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
@@ -356,6 +416,10 @@ struct Runtime {
     /// Findings emitted per job at most ([`MAX_FINDINGS_PER_JOB`]; lowered
     /// in tests).
     findings_cap: usize,
+    /// Audit settings per target.
+    audits: Mutex<AuditTable>,
+    /// Wakes the audit worker when `audits` changes.
+    audit_changed: tokio::sync::Notify,
 }
 
 /// A result endpoint parked after a `501` (not implemented by this
@@ -514,6 +578,8 @@ impl Runtime {
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
             parked: Mutex::new(Parked::default()),
             findings_cap: MAX_FINDINGS_PER_JOB,
+            audits: Mutex::new(AuditTable::default()),
+            audit_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -521,11 +587,13 @@ impl Runtime {
         let heartbeat = self.heartbeat_loop(shutdown.clone());
         let jobs = self.jobs_loop(shutdown.clone());
         let scans = self.scan_loop(shutdown.clone());
+        let audits = self.audit_loop(shutdown.clone());
         let spool = self.spool_loop(shutdown);
         tokio::select! {
             r = heartbeat => r,
             r = jobs => r,
             r = scans => r,
+            r = audits => r,
             r = spool => r,
         }
     }
@@ -566,9 +634,18 @@ impl Runtime {
                     }
                 }
             };
+            let audit_source = match connector {
+                Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
+                    serde_json::from_value::<databastion_protocol::AuditSource>(
+                        serde_json::Value::from(s.as_str()),
+                    )
+                    .ok()
+                }),
+                _ => None,
+            };
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
-                audit_source: None,
+                audit_source,
                 edition: None,
                 engine: proto_engine(target.engine),
                 last_error,
@@ -612,6 +689,10 @@ impl Runtime {
                 "batches_serialization_failed_total",
                 &c.batches_serialization_failed,
             ),
+            ("events_received_total", &c.events_received),
+            ("events_filtered_total", &c.events_filtered),
+            ("events_lost_total", &c.events_lost),
+            ("audit_stream_failures_total", &c.audit_stream_failures),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1253,14 +1334,7 @@ impl Runtime {
     async fn execute(&self, job: &Job, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         match job {
             Job::DiscoveryScanJob(scan) => Ok(self.queue_scan(scan, id)),
-            Job::AuditConfigureJob(audit) => {
-                // Gate now; audit collection lands in P4.
-                let outcome = match crate::job::AuditParams::try_from(&audit.params) {
-                    Ok(_) => Outcome::failed(FailureCode::Unsupported),
-                    Err(e) => self.invalid_params(id, &e),
-                };
-                Ok(Some(outcome))
-            }
+            Job::AuditConfigureJob(audit) => Ok(Some(self.configure_audit(audit, id))),
             Job::AgentConfigReloadJob(_) => Ok(Some(self.reload_config())),
             Job::AgentRotateSecretJob(_) => self.rotate_for_job(id).await,
         }
@@ -1333,6 +1407,363 @@ impl Runtime {
         drop(queue);
         self.scan_ready.notify_one();
         None
+    }
+
+    // ---------------------------------------------------------------- audit
+
+    fn lock_audits(&self) -> std::sync::MutexGuard<'_, AuditTable> {
+        self.audits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn audit_dir(config: &AgentConfig) -> PathBuf {
+        config.state_dir.join(audit::AUDIT_DIR)
+    }
+
+    /// `audit.configure`: contract gate, declared target, connector with
+    /// Audit support; then the settings replace the previous ones as a
+    /// whole, are saved (`<state_dir>/audit/<target>.settings.json`, `0600`)
+    /// so that collection resumes after a restart, and the audit worker
+    /// starts, restarts or stops the target's stream. The job succeeds once
+    /// the settings are installed; collection problems show in the logs,
+    /// the metrics and the heartbeat audit level.
+    fn configure_audit(&self, job: &databastion_protocol::AuditConfigureJob, id: Uuid) -> Outcome {
+        let params = match AuditParams::try_from(&job.params) {
+            Ok(p) => p,
+            Err(e) => return self.invalid_params(id, &e),
+        };
+        let config = self.config();
+        let Some(target) = config
+            .targets
+            .iter()
+            .find(|t| t.id == job.target_id.as_str())
+        else {
+            tracing::warn!(job_id = %id, "audit.configure for an undeclared target");
+            return Outcome::failed(FailureCode::UnknownTarget);
+        };
+        let supported = self
+            .connectors
+            .iter()
+            .any(|c| c.engine() == target.engine.connector() && c.supports_audit());
+        if !supported {
+            return Outcome::failed(FailureCode::Unsupported);
+        }
+        let dir = Self::audit_dir(&config);
+        let enabled = params.enabled();
+        if enabled {
+            match serde_json::to_vec(&job.params) {
+                Ok(json) => {
+                    if let Err(e) = audit::save_settings(&dir, &target.id, &json) {
+                        tracing::warn!(
+                            job_id = %id,
+                            kind = %e.kind(),
+                            "audit settings not saved: collection will not resume after a restart"
+                        );
+                    }
+                }
+                Err(_) => tracing::warn!(job_id = %id, "audit settings not saved"),
+            }
+        } else {
+            audit::remove_settings(&dir, &target.id);
+        }
+        let sensitive = params_sensitive_count(&job.params);
+        self.lock_audits()
+            .set(&target.id, enabled.then_some(params));
+        self.audit_changed.notify_one();
+        tracing::info!(
+            job_id = %id,
+            target_id = %target.id,
+            enabled,
+            sensitive_objects = sensitive,
+            "audit configured"
+        );
+        Outcome::SUCCEEDED
+    }
+
+    /// Reinstalls the saved settings of the declared targets (startup).
+    fn restore_audits(&self) {
+        let config = self.config();
+        let dir = Self::audit_dir(&config);
+        for target in &config.targets {
+            let supported = self
+                .connectors
+                .iter()
+                .any(|c| c.engine() == target.engine.connector() && c.supports_audit());
+            if !supported {
+                continue;
+            }
+            let Some(json) = audit::load_settings(&dir, &target.id) else {
+                continue;
+            };
+            let params =
+                serde_json::from_slice::<databastion_protocol::AuditConfigureParams>(&json)
+                    .ok()
+                    .and_then(|p| AuditParams::try_from(&p).ok());
+            match params {
+                Some(p) if p.enabled() => {
+                    tracing::info!(target_id = %target.id, "audit settings restored");
+                    self.lock_audits().set(&target.id, Some(p));
+                }
+                Some(_) => {}
+                None => tracing::warn!(
+                    target_id = %target.id,
+                    "saved audit settings are invalid; ignored until the next audit.configure"
+                ),
+            }
+        }
+    }
+
+    /// Whether new event batches may be produced: the agent is active and
+    /// `/events` is not parked after a `501`. Otherwise events are held
+    /// (bounded), and the connector is back-pressured on `submit()`.
+    fn events_can_emit(&self) -> bool {
+        *self.state.borrow() == RunState::Active && !self.endpoint_parked(false)
+    }
+
+    /// Converts and spools aggregated events of a target (the single
+    /// conversion in `uplink::to_batches`).
+    fn spool_events(
+        &self,
+        target_id: &TargetId,
+        events: &[databastion_classifiers::masking::MaskedEvent],
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        let fingerprints = crate::sanitize::HmacFingerprints(&self.hmac);
+        let built = uplink::to_batches(uplink::MaskedResults::Events {
+            target_id,
+            events,
+            fingerprints: &fingerprints,
+        });
+        self.count_unserializable(built.unserializable_batches);
+        let mut spool = self.lock_spool();
+        spool.counters.dropped_items += built.dropped_items;
+        if built.dropped_items > 0 {
+            tracing::warn!(
+                items = built.dropped_items,
+                "invalid events dropped before spooling"
+            );
+        }
+        for batch in &built.batches {
+            if let Err(e) = spool.push(batch) {
+                let lost = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                bump(&self.counters.events_lost, lost);
+                tracing::error!(
+                    target_id = target_id.as_str(),
+                    error = %e.kind(),
+                    lost,
+                    "cannot spool events"
+                );
+            }
+        }
+    }
+
+    /// Filters and spools what the aggregator holds.
+    fn flush_events(&self, cfg: &AuditConfig, target_id: &TargetId, agg: &mut Aggregator) {
+        let (keep, drop): (Vec<_>, Vec<_>) = agg
+            .drain()
+            .into_iter()
+            .partition(|e| audit::reportable(cfg, e));
+        bump(
+            &self.counters.events_filtered,
+            u64::try_from(drop.len()).unwrap_or(u64::MAX),
+        );
+        self.spool_events(target_id, &keep);
+    }
+
+    /// Audit worker: runs one stream per target with enabled settings,
+    /// restarts a stream whose settings (or the configuration) changed and
+    /// stops the others. A stopped stream flushes its held events first.
+    async fn audit_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        use futures_util::StreamExt as _;
+        self.restore_audits();
+        let mut running: std::collections::HashMap<String, (u64, watch::Sender<bool>)> =
+            std::collections::HashMap::new();
+        let mut tasks = futures_util::stream::FuturesUnordered::new();
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let wanted = self.lock_audits().snapshot();
+            running.retain(|id, (generation, stop)| {
+                let keep = wanted.iter().any(|(w, g, _)| w == id && g == generation);
+                if !keep {
+                    let _ = stop.send(true);
+                }
+                keep
+            });
+            for (id, generation, params) in wanted {
+                if running.contains_key(&id) {
+                    continue;
+                }
+                let (stop_tx, stop_rx) = watch::channel(false);
+                running.insert(id.clone(), (generation, stop_tx));
+                tasks.push(self.run_audit(id, params, stop_rx));
+            }
+            tokio::select! {
+                () = self.audit_changed.notified() => {}
+                Some(()) = tasks.next(), if !tasks.is_empty() => {}
+                _ = shutdown.changed() => {}
+            }
+        }
+        for (_, (_, stop)) in running.drain() {
+            let _ = stop.send(true);
+        }
+        // Let the streams flush their held events (bounded wait).
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while tasks.next().await.is_some() {}
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Runs the audit stream of a target until `stop`, restarting it with
+    /// backoff when the connector fails.
+    async fn run_audit(
+        &self,
+        target_id: String,
+        params: AuditParams,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        let mut failures: u32 = 0;
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let config = self.config();
+            let Some(target) = config.targets.iter().find(|t| t.id == target_id) else {
+                tracing::warn!(target_id, "audit target no longer declared; stream stopped");
+                return;
+            };
+            let Some(connector) = self
+                .connectors
+                .iter()
+                .find(|c| c.engine() == target.engine.connector() && c.supports_audit())
+            else {
+                return;
+            };
+            let Ok(tid) = TargetId::try_from(target.id.as_str()) else {
+                return;
+            };
+            let dir = Self::audit_dir(&config);
+            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits);
+            match crate::fsutil::ensure_private_dir(&dir) {
+                Ok(()) => cfg = cfg.with_state_dir(dir),
+                Err(e) => tracing::warn!(
+                    target_id,
+                    kind = %e.kind(),
+                    "audit state directory unusable: the read position is not persisted"
+                ),
+            }
+            tracing::info!(target_id, "audit stream started");
+            match self
+                .audit_session(connector.as_ref(), &cfg, &tid, &mut stop)
+                .await
+            {
+                AuditEnd::Stopped => {
+                    tracing::info!(target_id, "audit stream stopped");
+                    return;
+                }
+                AuditEnd::Failed(Some(crate::ConnectorError::NotImplemented { .. })) => {
+                    tracing::warn!(target_id, "audit is not implemented for this target");
+                    return;
+                }
+                AuditEnd::Failed(e) => {
+                    bump(&self.counters.audit_stream_failures, 1);
+                    failures = failures.saturating_add(1);
+                    let delay = backoff::Backoff::CONSOLE
+                        .delay(failures.saturating_sub(1), backoff::random_fraction())
+                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                    match &e {
+                        Some(crate::ConnectorError::Target {
+                            code, engine_code, ..
+                        }) => {
+                            tracing::warn!(
+                                target_id,
+                                code = %code,
+                                engine_code = engine_code.as_deref(),
+                                retry_s = delay.as_secs(),
+                                "audit stream failed; restarting"
+                            );
+                        }
+                        Some(other) => tracing::warn!(
+                            target_id,
+                            error = %other,
+                            retry_s = delay.as_secs(),
+                            "audit stream failed; restarting"
+                        ),
+                        None => tracing::warn!(
+                            target_id,
+                            retry_s = delay.as_secs(),
+                            "audit stream ended; restarting"
+                        ),
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = stop.wait_for(|s| *s) => return,
+                    }
+                }
+            }
+        }
+    }
+
+    /// One run of a connector's audit stream: events are pre-aggregated
+    /// over the aggregation window, filtered and spooled. While events
+    /// cannot be emitted (`/events` parked, agent suspended), nothing is
+    /// received: the bounded channel back-pressures the connector.
+    async fn audit_session(
+        &self,
+        connector: &dyn Connector,
+        cfg: &AuditConfig,
+        target_id: &TargetId,
+        stop: &mut watch::Receiver<bool>,
+    ) -> AuditEnd {
+        let (sink, mut rx) = EventSink::channel(EVENTS_CHANNEL);
+        let mut agg = Aggregator::new(cfg.aggregation_window());
+        let mut stream = Box::pin(connector.audit_stream(cfg, &sink));
+        let end = loop {
+            let can_emit = self.events_can_emit();
+            let deadline = agg.deadline();
+            let sleep_to = deadline.map_or_else(
+                || tokio::time::Instant::now() + Duration::from_secs(3600),
+                tokio::time::Instant::from_std,
+            );
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|s| *s) => break AuditEnd::Stopped,
+                r = &mut stream => {
+                    break AuditEnd::Failed(r.err());
+                }
+                ev = rx.recv(), if can_emit && !agg.is_full() => {
+                    if let Some(e) = ev {
+                        bump(&self.counters.events_received, 1);
+                        agg.push(e, Instant::now());
+                    }
+                }
+                () = tokio::time::sleep_until(sleep_to), if can_emit && deadline.is_some() => {
+                    self.flush_events(cfg, target_id, &mut agg);
+                }
+                () = tokio::time::sleep(Duration::from_secs(1)), if !can_emit => {}
+            }
+            if agg.is_full() && self.events_can_emit() {
+                self.flush_events(cfg, target_id, &mut agg);
+            }
+        };
+        // The connector future is dropped here (no more cursor updates);
+        // what it handed over is kept.
+        drop(stream);
+        drop(sink);
+        while let Ok(e) = rx.try_recv() {
+            bump(&self.counters.events_received, 1);
+            agg.push(e, Instant::now());
+            if agg.is_full() {
+                self.flush_events(cfg, target_id, &mut agg);
+            }
+        }
+        self.flush_events(cfg, target_id, &mut agg);
+        end
     }
 
     fn lock_scans(&self) -> std::sync::MutexGuard<'_, ScanQueue> {
@@ -1624,6 +2055,10 @@ impl Runtime {
                     return Outcome::failed(FailureCode::InvalidParams);
                 }
                 *current = new;
+                drop(current);
+                // Audit streams pick up the new target settings.
+                self.lock_audits().bump_all();
+                self.audit_changed.notify_one();
                 tracing::info!("configuration reloaded");
                 Outcome::SUCCEEDED
             }
@@ -1728,6 +2163,11 @@ impl Runtime {
         }
         false
     }
+}
+
+/// Number of `sensitive_objects` in audit settings (logged; never their names).
+fn params_sensitive_count(p: &databastion_protocol::AuditConfigureParams) -> usize {
+    p.sensitive_objects.len()
 }
 
 /// Why a `discovery.scan` cannot run with this build's classifier set:

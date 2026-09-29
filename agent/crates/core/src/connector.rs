@@ -1,6 +1,7 @@
 //! The [`Connector`] trait (ADR-0002).
 
 use async_trait::async_trait;
+use databastion_classifiers::masking::EventSource;
 
 use crate::config::TargetConfig;
 use crate::engine::{Engine, FailureCode, TargetHealth};
@@ -78,9 +79,29 @@ pub trait Connector: Send + Sync {
     /// statement timeout as the last bound.
     async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError>;
 
-    /// Streams normalized access events into `sink` until stopped.
+    /// Streams masked access events of `cfg.target()` into `sink` until
+    /// the core drops this future (audit disabled or reconfigured, agent
+    /// shutdown). Poll the source at `cfg.poll_interval()` at most, bound
+    /// every query with `cfg.statement_timeout()`, keep the read position
+    /// in `cfg.cursor(…)`, and advance it only after the events read before
+    /// it were submitted (the core back-pressures `submit()` while `/events`
+    /// is parked). Returning is treated as a failure: the core restarts the
+    /// stream after a backoff.
     async fn audit_stream(&self, cfg: &AuditConfig, sink: &EventSink)
     -> Result<(), ConnectorError>;
+
+    /// Whether [`audit_stream`](Self::audit_stream) is implemented: an
+    /// `audit.configure` job for another connector ends `unsupported`.
+    fn supports_audit(&self) -> bool {
+        false
+    }
+
+    /// Native audit source of the level last reported by
+    /// [`check`](Self::check) for `target` (heartbeat `audit_source`).
+    /// `None` when there is none or it is unknown.
+    fn audit_source(&self, _target: &TargetConfig) -> Option<EventSource> {
+        None
+    }
 }
 
 #[cfg(test)]

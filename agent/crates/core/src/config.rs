@@ -315,6 +315,35 @@ pub struct PostgresTargetConfig {
     /// over-privilege.
     #[serde(default)]
     pub extended_grants: bool,
+    /// pgaudit log read by the Audit connector (P4-A): the server log file
+    /// (`log_destination` `jsonlog` or `csvlog`), read locally through the
+    /// file system, never through SQL (ADR-0012 "Audit log files").
+    /// Without it, Audit uses `pg_stat_statements` (Limited).
+    #[serde(default)]
+    pub audit_log: Option<PgAuditLogConfig>,
+}
+
+/// Format of a PostgreSQL server log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PgLogFormat {
+    /// `log_destination = jsonlog` (PostgreSQL 15+), one JSON object per
+    /// line.
+    Jsonlog,
+    /// `log_destination = csvlog`.
+    Csvlog,
+}
+
+/// Server log file holding the pgaudit records of a PostgreSQL target.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PgAuditLogConfig {
+    /// Absolute path of the current log file (a fixed `log_filename`, e.g.
+    /// `/var/log/postgresql/postgresql.json`). Rotation by rename or
+    /// truncation is followed.
+    pub path: PathBuf,
+    /// File format.
+    pub format: PgLogFormat,
 }
 
 fn default_pg_databases() -> Vec<String> {
@@ -328,6 +357,7 @@ impl Default for PostgresTargetConfig {
             tls: PgTlsMode::default(),
             ca_file: None,
             extended_grants: false,
+            audit_log: None,
         }
     }
 }
@@ -546,6 +576,11 @@ const KNOWN_KEYS: &[&str] = &[
     "disable",
     "disable_insecure",
     "extended_grants",
+    "audit_log",
+    "path",
+    "format",
+    "jsonlog",
+    "csvlog",
     // Values of closed enums (`engine`, `phone_region`) are listed too, so
     // that an "unknown variant" error can name the expected ones; they are
     // schema constants, never user data.
@@ -954,6 +989,11 @@ impl TargetConfig {
         if pg.ca_file.is_some() && pg.tls != PgTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
+        if let Some(log) = &pg.audit_log {
+            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
+                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
+            }
+        }
         Ok(())
     }
 }
@@ -1201,7 +1241,30 @@ targets:
         assert_eq!(pg.databases, ["shop", "crm"]);
         assert_eq!(pg.tls, PgTlsMode::DisableInsecure);
         assert!(pg.extended_grants);
+        assert!(pg.audit_log.is_none());
+        let cfg = parse(&with(
+            "    postgres:\n      audit_log: {path: /var/log/postgresql/postgresql.json, format: jsonlog}\n",
+        ))
+        .unwrap();
+        let log = cfg.targets[0].postgres_settings().audit_log.unwrap();
+        assert_eq!(log.format, PgLogFormat::Jsonlog);
+        assert_eq!(
+            log.path,
+            PathBuf::from("/var/log/postgresql/postgresql.json")
+        );
         let cases = [
+            (
+                "    postgres:\n      audit_log: {path: pg.json, format: jsonlog}\n",
+                "postgres.audit_log.path",
+            ),
+            (
+                "    postgres:\n      audit_log: {path: /x.log, format: stderr}\n",
+                "invalid value",
+            ),
+            (
+                "    postgres:\n      audit_log: {format: csvlog}\n",
+                "missing field",
+            ),
             ("    postgres:\n      databases: []\n", "postgres.databases"),
             ("    postgres:\n      databases: [a, a]\n", "duplicate"),
             ("    postgres:\n      ca_file: ca.pem\n", "postgres.ca_file"),
