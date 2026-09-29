@@ -381,6 +381,8 @@ async fn discovery_over_the_scripted_directory() {
         Arc::new(HmacKey::new(&[7u8; 32]).unwrap()),
     );
     let (sink, mut rx) = FindingSink::channel(1024);
+    let logs = crate::i2::Logs::default();
+    let _guard = logs.capture();
     let r = crate::discover::scan(&job, &sink, &t, || async {
         let (client, _) = serve(directory(AGENT, tree));
         Session::establish(
@@ -437,6 +439,20 @@ async fn discovery_over_the_scripted_directory() {
             .iter()
             .all(|f| f.classifier().as_str() == "pii.email")
     );
+    // Interim I2 check (end-of-phase-6 review L2): none of the served
+    // values (nor of the dev ground truth) and no entry DN in the
+    // serialized findings nor in the logs.
+    let mut values = crate::i2::ground_truth_values(&crate::i2::ground_truth());
+    values.extend((0..30).map(|i| format!("person{i}@example.org")));
+    values.extend((0..10).map(|i| format!("team{i}@example.com")));
+    values.push("c2VjcmV0c2VjcmV0c2VjcmV0".to_owned());
+    crate::i2::assert_clean(
+        "serialized findings",
+        &crate::i2::findings_text(&findings),
+        &values,
+        &[],
+    );
+    crate::i2::assert_clean("scan logs", &logs.text(), &values, &[AGENT]);
 }
 
 /// `check()`'s audit proofs against a scripted `cn=accesslog`.
