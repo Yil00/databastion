@@ -20,7 +20,7 @@ export interface paths {
          *     its `agent_id` and `agent_secret`. The agent stores them in a `0600` file, then generates its
          *     local HMAC key, which is **never transmitted**. This is the only unauthenticated endpoint; it
          *     carries no `Authorization` nor `X-DataBastion-Agent-Id` header, and it is rate limited per
-         *     source IP. Its request and response bodies are excluded from every request, APM and error log on
+         *     source IP (IPv6 bucketed by /56). Its request and response bodies are excluded from every request, APM and error log on
          *     both sides.
          */
         post: operations["enrollAgent"];
