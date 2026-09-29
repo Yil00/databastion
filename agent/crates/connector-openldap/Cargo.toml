@@ -13,10 +13,28 @@ publish.workspace = true
 # no access to the uplink (checked by crates/agent/tests/architecture.rs).
 [dependencies]
 databastion-core.workspace = true
+databastion-classifiers.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Client for a closed subset of LDAPv3 (`ber`, `proto`, `conn`), no LDAP
+# library (ADR-0029 decision 1): bounded messages, no write operation, no
+# server text kept, referrals never followed.
+# TLS: rustls only, `ring` provider, system roots or a pinned CA file.
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+tracing-subscriber.workspace = true
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Property tests of the BER reader, the LDAP response parser, DNs and
+# filters (src/proptests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

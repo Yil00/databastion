@@ -3,6 +3,12 @@
 
 /** Registered access-event signal ids (contract signal registry), with their meaning and engines. */
 export const SIGNAL_REGISTRY = {
+  "shape.bulk_search": {
+    "description": "An LDAP search over a container or a subtree (scope one-level, subtree or children) whose filter selects no entry by value: presence tests and objectClass equality assertions only, such as (objectClass=*): the shape of an LDIF export or a bulk ldapsearch. Heuristic: evadable by design.",
+    "engines": [
+      "openldap"
+    ]
+  },
   "shape.full_table_copy": {
     "description": "A COPY out of the database of a whole relation, or of a query without filter, aggregation or small limit. Heuristic: evadable by design.",
     "engines": [
@@ -68,7 +74,8 @@ export const SIGNAL_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "openldap"
     ]
   }
 } as const;

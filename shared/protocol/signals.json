@@ -1,4 +1,8 @@
 {
+  "shape.bulk_search": {
+    "description": "An LDAP search over a container or a subtree (scope one-level, subtree or children) whose filter selects no entry by value: presence tests and objectClass equality assertions only, such as (objectClass=*): the shape of an LDIF export or a bulk ldapsearch. Heuristic: evadable by design.",
+    "engines": ["openldap"]
+  },
   "shape.full_table_copy": {
     "description": "A COPY out of the database of a whole relation, or of a query without filter, aggregation or small limit. Heuristic: evadable by design.",
     "engines": ["postgres"]
@@ -37,6 +41,6 @@
   },
   "volume.large_result": {
     "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it).",
-    "engines": ["postgres", "mysql", "mariadb", "mongodb"]
+    "engines": ["postgres", "mysql", "mariadb", "mongodb", "openldap"]
   }
 }

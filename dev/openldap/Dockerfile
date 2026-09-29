@@ -7,7 +7,7 @@ FROM debian:bookworm-20260918-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
-    apt-get install -y --no-install-recommends slapd ldap-utils; \
+    apt-get install -y --no-install-recommends slapd ldap-utils openssl; \
     rm -rf /var/lib/apt/lists/*; \
     # Drop the package's default configuration and database: the entrypoint builds ours on first start.
     rm -rf /etc/ldap/slapd.d/* /var/lib/ldap/*
@@ -15,5 +15,5 @@ RUN set -eux; \
 COPY config.ldif /usr/local/share/databastion/config.ldif
 COPY entrypoint.sh /usr/local/bin/databastion-ldap-entrypoint
 
-EXPOSE 389
+EXPOSE 389 636
 ENTRYPOINT ["bash", "/usr/local/bin/databastion-ldap-entrypoint"]

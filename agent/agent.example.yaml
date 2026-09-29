@@ -117,10 +117,31 @@ targets:
       # audit_log: {path: /var/log/mongodb/auditLog.json, format: audit_log}
   - id: ldap-main
     engine: openldap
-    socket: /run/slapd/ldapi
-    account: cn=databastion,dc=example,dc=com
+    host: ldap1.internal       # or `socket: /run/slapd/ldapi` (with tls: disable)
+    port: 636
+    account: cn=databastion,ou=services,dc=example,dc=com   # read-only service DN (ADR-0029)
     secret:
       file: /etc/databastion/secrets/ldap-main   # 0600, owned by the agent user
+    # OpenLDAP settings (optional block, ADR-0029).
+    openldap:
+      # verify_full (default): LDAPS, TLS from the first byte (port 636)
+      # start_tls: StartTLS on the LDAP port (389), then verified the same way;
+      #   no fallback to cleartext
+      # disable: ldapi:// socket or loopback IP literal only (required for a socket)
+      # There is no disable_insecure: a simple bind sends the password itself.
+      tls: verify_full
+      # ca_file: /etc/databastion/ldap-ca.pem   # only trusted root for this target
+      # simple (default): the service DN above and its password;
+      # sasl_external: SASL EXTERNAL over the ldapi:// socket (no secret; account
+      #   is the authorization DN slapd maps the agent's uid to)
+      bind: simple
+      # slapo-accesslog database read by Audit (olcAccessLogDB); never scanned
+      # by Discovery. The service DN needs read on it.
+      accesslog_base: cn=accesslog
+      # Audit events carry a principal's DN by name only for this list (service and
+      # administrator accounts, at most 64) and the agent's own DN; every other DN
+      # usually names a person and is sent as a keyed fingerprint (ADR-0029).
+      # clear_principals: ["cn=admin,dc=example,dc=com"]
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting

@@ -3,6 +3,12 @@
 
 /** Registered `TargetNote` codes: the phrase catalog (`{count}` and `{labels}` placeholders) and engines. */
 export const TARGET_NOTE_REGISTRY = {
+  "audit.accesslog_not_readable": {
+    "description": "cn=accesslog (openldap.accesslog_base) is not readable by the agent's service DN, or does not exist: no Audit source.",
+    "engines": [
+      "openldap"
+    ]
+  },
   "audit.audit_log_filter_not_read": {
     "description": "The audit_log_filter component is active, but its log file is not configured in agent.yaml (mysql.audit_log), so the agent does not read it.",
     "engines": [
@@ -25,6 +31,12 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "Partial once the Audit stream has read a successful authCheck record of the auditLog (auditAuthorizationSuccess enabled; none in the last 24 h): reported Limited until then.",
     "engines": [
       "mongodb"
+    ]
+  },
+  "audit.failed_operations_not_logged": {
+    "description": "{count} naming context(s) where no failed operation is proven to be logged in cn=accesslog in the last 24 h: the agent's read of a missing entry left no record (olcAccessLogSuccess: TRUE logs successful operations only), or it could not be checked yet. Capped or failed exports may go unseen; the level is at most Partial.",
+    "engines": [
+      "openldap"
     ]
   },
   "audit.full_pending_first_record": {
@@ -116,13 +128,20 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres"
     ]
   },
+  "audit.reads_not_logged": {
+    "description": "{count} naming context(s) with no search record in cn=accesslog in the last 24 h, even after a probe search by the agent: reads there are not logged (olcAccessLogOps without reads, no accesslog overlay on that database, or an olcAccessLogBase that excludes it).",
+    "engines": [
+      "openldap"
+    ]
+  },
   "audit.records_dropped": {
     "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "openldap"
     ]
   },
   "audit.records_dropped_severity": {
@@ -163,6 +182,16 @@ export const TARGET_NOTE_REGISTRY = {
       "mongodb"
     ]
   },
+  "audit.stream_stopped": {
+    "description": "The Audit stream stopped after {count} internal errors of the agent in a row (the agent log names the code location): the audit level is reported None until Audit is reconfigured or the agent restarts.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb",
+      "mongodb",
+      "openldap"
+    ]
+  },
   "check.server_is_mariadb": {
     "description": "The server is MariaDB while the target is declared as mysql.",
     "engines": [
@@ -181,7 +210,8 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "openldap"
     ]
   },
   "check.timed_out": {
@@ -190,7 +220,8 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "openldap"
     ]
   },
   "coverage.other_engine_tables": {
@@ -239,6 +270,12 @@ export const TARGET_NOTE_REGISTRY = {
       "mongodb"
     ]
   },
+  "privilege.accesslog_without_audit": {
+    "description": "cn=accesslog is readable while no Audit stream runs for the target: other users' search filters, compared values and old values are readable.",
+    "engines": [
+      "openldap"
+    ]
+  },
   "privilege.any_database": {
     "description": "A privilege applies to every database (for example readAnyDatabase, or a resource with an empty database name): databases created later are readable too.",
     "engines": [
@@ -256,6 +293,12 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "{count} cluster-wide action(s) (for example inprog, serverStatus, getCmdLineOpts): other sessions' operations and server settings are visible.",
     "engines": [
       "mongodb"
+    ]
+  },
+  "privilege.config_readable": {
+    "description": "cn=config is readable by the agent's service DN: the access control rules, the root password hashes and every server setting are visible.",
+    "engines": [
+      "openldap"
     ]
   },
   "privilege.extended_variant": {
@@ -305,6 +348,12 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "Owner of {count} object(s).",
     "engines": [
       "postgres"
+    ]
+  },
+  "privilege.password_attributes_readable": {
+    "description": "The agent's service DN can read userPassword or authPassword values (seen with an attributes-only search: the values were not read).",
+    "engines": [
+      "openldap"
     ]
   },
   "privilege.performance_schema_unused": {
@@ -363,6 +412,12 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "{count} write or administration action(s) (for example insert, update, remove, drop, index, user or role management).",
     "engines": [
       "mongodb"
+    ]
+  },
+  "privilege.write_not_evaluated": {
+    "description": "Write access of the service DN is not evaluated: OpenLDAP shows a read-only account neither its access control rules nor its effective rights. Check olcAccess (docs/05-security.md).",
+    "engines": [
+      "openldap"
     ]
   },
   "privilege.write_on_relations": {

@@ -1247,3 +1247,167 @@ member: uid=so-connor023,ou=people,dc=example,dc=org
 member: uid=ithomas024,ou=people,dc=example,dc=org
 member: uid=zroux025,ou=people,dc=example,dc=org
 
+dn: ou=contractors,dc=example,dc=org
+objectClass: organizationalUnit
+ou: contractors
+
+dn: cn=contractor-001,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-001
+databastionContractorNir: 2 61 11 67 613 460 96
+databastionContractorIban: FR76 9902 6216 8102 6336 6532 074
+databastionContractorCode: CTR-19897
+description: Contract record (fixed term)
+
+dn: cn=contractor-002,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-002
+databastionContractorNir: 1 55 02 73 405 157 81
+databastionContractorIban: FR76 9966 3160 2186 0290 8519 753
+databastionContractorCode: CTR-90300
+description: Contract record (fixed term)
+
+dn: cn=contractor-003,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-003
+databastionContractorNir: 1 61 12 10 718 786 68
+databastionContractorIban: FR76 9955 3648 1994 8279 1679 896
+databastionContractorCode: CTR-25575
+description: Contract record (fixed term)
+
+dn: cn=contractor-004,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-004
+databastionContractorNir: 1 00 08 73 517 880 50
+databastionContractorIban: DE84 9997 7484 4581 3013 90
+databastionContractorCode: CTR-98149
+description: Contract record (fixed term)
+
+dn: cn=contractor-005,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-005
+databastionContractorNir: 2 80 04 21 849 497 65
+databastionContractorIban: FR76 9962 4493 9191 8462 1674 115
+databastionContractorCode: CTR-74718
+description: Contract record (fixed term)
+
+dn: cn=contractor-006,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-006
+databastionContractorNir: 2 99 11 73 422 318 64
+databastionContractorIban: FR76 9902 2659 2462 8972 7164 471
+databastionContractorCode: CTR-57066
+description: Contract record (fixed term)
+
+dn: cn=contractor-007,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-007
+databastionContractorNir: 2 64 08 63 667 030 80
+databastionContractorIban: FR76 9911 7795 3117 7913 2686 341
+databastionContractorCode: CTR-34687
+description: Contract record (fixed term)
+
+dn: cn=contractor-008,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-008
+databastionContractorNir: 1 69 12 88 683 525 45
+databastionContractorIban: DE60 9990 8100 4209 9561 06
+databastionContractorCode: CTR-33581
+description: Contract record (fixed term)
+
+dn: cn=contractor-009,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-009
+databastionContractorNir: 2 74 08 05 560 156 69
+databastionContractorIban: FR76 9975 8647 2594 5748 7966 514
+databastionContractorCode: CTR-60647
+description: Contract record (fixed term)
+
+dn: cn=contractor-010,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-010
+databastionContractorNir: 1 98 04 91 257 121 56
+databastionContractorIban: FR76 9980 5433 6872 3897 7354 532
+databastionContractorCode: CTR-13571
+description: Contract record (fixed term)
+
+dn: cn=contractor-011,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-011
+databastionContractorNir: 1 98 08 55 906 602 56
+databastionContractorIban: FR76 9964 7988 9850 2005 0822 007
+databastionContractorCode: CTR-04858
+description: Contract record (fixed term)
+
+dn: cn=contractor-012,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-012
+databastionContractorNir: 1 90 07 90 532 671 65
+databastionContractorIban: DE70 9990 1952 8051 4597 97
+databastionContractorCode: CTR-80496
+description: Contract record (fixed term)
+
+dn: cn=contractor-013,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-013
+databastionContractorNir: 2 00 03 07 217 486 38
+databastionContractorIban: FR76 9941 2496 0774 7614 9559 090
+databastionContractorCode: CTR-16575
+description: Contract record (fixed term)
+
+dn: cn=contractor-014,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-014
+databastionContractorNir: 1 02 12 55 043 623 41
+databastionContractorIban: FR76 9902 0142 9117 8983 8629 852
+databastionContractorCode: CTR-21320
+description: Contract record (fixed term)
+
+dn: cn=contractor-015,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-015
+databastionContractorNir: 2 98 02 02 305 902 59
+databastionContractorIban: FR76 9942 2110 4499 9619 1825 955
+databastionContractorCode: CTR-35378
+description: Contract record (fixed term)
+
+dn: cn=contractor-016,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-016
+databastionContractorNir: 2 87 08 85 440 655 82
+databastionContractorIban: FR76 9923 6827 6057 6051 4414 814
+databastionContractorCode: CTR-41290
+description: Contract record (fixed term)
+
+dn: cn=contractor-017,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-017
+databastionContractorNir: 2 85 05 43 947 883 87
+databastionContractorIban: FR76 9990 6102 6414 7795 9417 275
+databastionContractorCode: CTR-65074
+description: Contract record (fixed term)
+
+dn: cn=contractor-018,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-018
+databastionContractorNir: 1 65 09 75 900 980 78
+databastionContractorIban: FR76 9959 7334 6449 2748 3842 630
+databastionContractorCode: CTR-83462
+description: Contract record (fixed term)
+
+dn: cn=contractor-019,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-019
+databastionContractorNir: 2 71 10 32 737 985 73
+databastionContractorIban: FR76 9958 8006 6690 6952 4034 219
+databastionContractorCode: CTR-54114
+description: Contract record (fixed term)
+
+dn: cn=contractor-020,ou=contractors,dc=example,dc=org
+objectClass: databastionContractor
+cn: contractor-020
+databastionContractorNir: 1 57 03 55 849 439 75
+databastionContractorIban: FR76 9966 3116 5960 1690 6770 646
+databastionContractorCode: CTR-78216
+description: Contract record (fixed term)
+

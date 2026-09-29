@@ -422,6 +422,47 @@ jobs:
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
 
+  agent-openldap:
+    name: Agent OpenLDAP integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev OpenLDAP service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 openldap
+      - name: Connector integration tests (dev image, all probes required)
+        run: |
+          set -a; . dev/.env; set +a
+          # ADR-0029: the service DN, the root DN for the over-privilege and export checks, the
+          # dev-only CA of the LDAPS / StartTLS listener, and a real paged ldapsearch export run
+          # inside the container.
+          docker compose -f dev/docker-compose.yml exec -T openldap cat /var/lib/ldap/tls/ca.pem > "$RUNNER_TEMP/ldap-ca.pem"
+          export DATABASTION_TEST_LDAP_URL="ldap://127.0.0.1:${LDAP_PORT}"
+          export DATABASTION_TEST_LDAP_PASSWORD="$DATABASTION_DB_PASSWORD"
+          export DATABASTION_TEST_LDAP_ADMIN_PASSWORD="$LDAP_ADMIN_PASSWORD"
+          export DATABASTION_TEST_LDAPS_URL="ldaps://localhost:${LDAPS_PORT}"
+          export DATABASTION_TEST_LDAP_CA_FILE="$RUNNER_TEMP/ldap-ca.pem"
+          export DATABASTION_TEST_LDAP_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapsearch -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}' -b dc=example,dc=org -E pr=20/noprompt '(objectClass=*)'"
+          export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls
+          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 openldap
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
   # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit) and the
@@ -471,7 +512,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, protocol, e2e]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, protocol, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

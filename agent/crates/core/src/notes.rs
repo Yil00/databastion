@@ -110,6 +110,8 @@ fn severity_rank(label: TargetNoteLabel) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum NoteCode {
+    /// `audit.accesslog_not_readable`.
+    AuditAccesslogNotReadable,
     /// `audit.audit_log_filter_not_read`.
     AuditAuditLogFilterNotRead,
     /// `audit.audit_log_plugin_not_read`.
@@ -118,6 +120,8 @@ pub enum NoteCode {
     AuditAuditlogOnCommunity,
     /// `audit.authcheck_success_pending`.
     AuditAuthcheckSuccessPending,
+    /// `audit.failed_operations_not_logged`.
+    AuditFailedOperationsNotLogged,
     /// `audit.full_pending_first_record`.
     AuditFullPendingFirstRecord,
     /// `audit.general_log_enabled`.
@@ -144,6 +148,8 @@ pub enum NoteCode {
     AuditPgauditNotLoaded,
     /// `audit.pgaudit_read_class_missing`.
     AuditPgauditReadClassMissing,
+    /// `audit.reads_not_logged`.
+    AuditReadsNotLogged,
     /// `audit.records_dropped`.
     AuditRecordsDropped,
     /// `audit.records_dropped_severity`.
@@ -158,6 +164,8 @@ pub enum NoteCode {
     AuditStatementConsumersDisabled,
     /// `audit.stream_not_available`.
     AuditStreamNotAvailable,
+    /// `audit.stream_stopped`.
+    AuditStreamStopped,
     /// `check.server_is_mariadb`.
     CheckServerIsMariadb,
     /// `check.server_is_mysql`.
@@ -180,12 +188,16 @@ pub enum NoteCode {
     CoverageTimeseriesNotReadable,
     /// `coverage.views_not_sampled`.
     CoverageViewsNotSampled,
+    /// `privilege.accesslog_without_audit`.
+    PrivilegeAccesslogWithoutAudit,
     /// `privilege.any_database`.
     PrivilegeAnyDatabase,
     /// `privilege.beyond_select`.
     PrivilegeBeyondSelect,
     /// `privilege.cluster_actions`.
     PrivilegeClusterActions,
+    /// `privilege.config_readable`.
+    PrivilegeConfigReadable,
     /// `privilege.extended_variant`.
     PrivilegeExtendedVariant,
     /// `privilege.global_privileges`.
@@ -200,6 +212,8 @@ pub enum NoteCode {
     PrivilegeOtherRoles,
     /// `privilege.owner_of_objects`.
     PrivilegeOwnerOfObjects,
+    /// `privilege.password_attributes_readable`.
+    PrivilegePasswordAttributesReadable,
     /// `privilege.performance_schema_unused`.
     PrivilegePerformanceSchemaUnused,
     /// `privilege.performance_schema_without_audit`.
@@ -218,6 +232,8 @@ pub enum NoteCode {
     PrivilegeSystemDatabaseSelect,
     /// `privilege.write_actions`.
     PrivilegeWriteActions,
+    /// `privilege.write_not_evaluated`.
+    PrivilegeWriteNotEvaluated,
     /// `privilege.write_on_relations`.
     PrivilegeWriteOnRelations,
     /// `security.init_connect`.
@@ -231,10 +247,12 @@ pub enum NoteCode {
 impl NoteCode {
     /// Every code, in registry order.
     pub const ALL: &'static [Self] = &[
+        Self::AuditAccesslogNotReadable,
         Self::AuditAuditLogFilterNotRead,
         Self::AuditAuditLogPluginNotRead,
         Self::AuditAuditlogOnCommunity,
         Self::AuditAuthcheckSuccessPending,
+        Self::AuditFailedOperationsNotLogged,
         Self::AuditFullPendingFirstRecord,
         Self::AuditGeneralLogEnabled,
         Self::AuditHistoryLongConsumerDisabled,
@@ -248,6 +266,7 @@ impl NoteCode {
         Self::AuditPgauditLogNotConfigured,
         Self::AuditPgauditNotLoaded,
         Self::AuditPgauditReadClassMissing,
+        Self::AuditReadsNotLogged,
         Self::AuditRecordsDropped,
         Self::AuditRecordsDroppedSeverity,
         Self::AuditServerAuditNotRead,
@@ -255,6 +274,7 @@ impl NoteCode {
         Self::AuditSourceNotConfigured,
         Self::AuditStatementConsumersDisabled,
         Self::AuditStreamNotAvailable,
+        Self::AuditStreamStopped,
         Self::CheckServerIsMariadb,
         Self::CheckServerIsMysql,
         Self::CheckStageFailed,
@@ -266,9 +286,11 @@ impl NoteCode {
         Self::CoverageSchemasWithoutUsage,
         Self::CoverageTimeseriesNotReadable,
         Self::CoverageViewsNotSampled,
+        Self::PrivilegeAccesslogWithoutAudit,
         Self::PrivilegeAnyDatabase,
         Self::PrivilegeBeyondSelect,
         Self::PrivilegeClusterActions,
+        Self::PrivilegeConfigReadable,
         Self::PrivilegeExtendedVariant,
         Self::PrivilegeGlobalPrivileges,
         Self::PrivilegeGlobalSelect,
@@ -276,6 +298,7 @@ impl NoteCode {
         Self::PrivilegeNotEvaluated,
         Self::PrivilegeOtherRoles,
         Self::PrivilegeOwnerOfObjects,
+        Self::PrivilegePasswordAttributesReadable,
         Self::PrivilegePerformanceSchemaUnused,
         Self::PrivilegePerformanceSchemaWithoutAudit,
         Self::PrivilegePredefinedRoles,
@@ -285,6 +308,7 @@ impl NoteCode {
         Self::PrivilegeSystemCollections,
         Self::PrivilegeSystemDatabaseSelect,
         Self::PrivilegeWriteActions,
+        Self::PrivilegeWriteNotEvaluated,
         Self::PrivilegeWriteOnRelations,
         Self::SecurityInitConnect,
         Self::SecurityLoginEventTrigger,
@@ -295,10 +319,12 @@ impl NoteCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AuditAccesslogNotReadable => "audit.accesslog_not_readable",
             Self::AuditAuditLogFilterNotRead => "audit.audit_log_filter_not_read",
             Self::AuditAuditLogPluginNotRead => "audit.audit_log_plugin_not_read",
             Self::AuditAuditlogOnCommunity => "audit.auditlog_on_community",
             Self::AuditAuthcheckSuccessPending => "audit.authcheck_success_pending",
+            Self::AuditFailedOperationsNotLogged => "audit.failed_operations_not_logged",
             Self::AuditFullPendingFirstRecord => "audit.full_pending_first_record",
             Self::AuditGeneralLogEnabled => "audit.general_log_enabled",
             Self::AuditHistoryLongConsumerDisabled => "audit.history_long_consumer_disabled",
@@ -312,6 +338,7 @@ impl NoteCode {
             Self::AuditPgauditLogNotConfigured => "audit.pgaudit_log_not_configured",
             Self::AuditPgauditNotLoaded => "audit.pgaudit_not_loaded",
             Self::AuditPgauditReadClassMissing => "audit.pgaudit_read_class_missing",
+            Self::AuditReadsNotLogged => "audit.reads_not_logged",
             Self::AuditRecordsDropped => "audit.records_dropped",
             Self::AuditRecordsDroppedSeverity => "audit.records_dropped_severity",
             Self::AuditServerAuditNotRead => "audit.server_audit_not_read",
@@ -319,6 +346,7 @@ impl NoteCode {
             Self::AuditSourceNotConfigured => "audit.source_not_configured",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
             Self::AuditStreamNotAvailable => "audit.stream_not_available",
+            Self::AuditStreamStopped => "audit.stream_stopped",
             Self::CheckServerIsMariadb => "check.server_is_mariadb",
             Self::CheckServerIsMysql => "check.server_is_mysql",
             Self::CheckStageFailed => "check.stage_failed",
@@ -330,9 +358,11 @@ impl NoteCode {
             Self::CoverageSchemasWithoutUsage => "coverage.schemas_without_usage",
             Self::CoverageTimeseriesNotReadable => "coverage.timeseries_not_readable",
             Self::CoverageViewsNotSampled => "coverage.views_not_sampled",
+            Self::PrivilegeAccesslogWithoutAudit => "privilege.accesslog_without_audit",
             Self::PrivilegeAnyDatabase => "privilege.any_database",
             Self::PrivilegeBeyondSelect => "privilege.beyond_select",
             Self::PrivilegeClusterActions => "privilege.cluster_actions",
+            Self::PrivilegeConfigReadable => "privilege.config_readable",
             Self::PrivilegeExtendedVariant => "privilege.extended_variant",
             Self::PrivilegeGlobalPrivileges => "privilege.global_privileges",
             Self::PrivilegeGlobalSelect => "privilege.global_select",
@@ -340,6 +370,7 @@ impl NoteCode {
             Self::PrivilegeNotEvaluated => "privilege.not_evaluated",
             Self::PrivilegeOtherRoles => "privilege.other_roles",
             Self::PrivilegeOwnerOfObjects => "privilege.owner_of_objects",
+            Self::PrivilegePasswordAttributesReadable => "privilege.password_attributes_readable",
             Self::PrivilegePerformanceSchemaUnused => "privilege.performance_schema_unused",
             Self::PrivilegePerformanceSchemaWithoutAudit => {
                 "privilege.performance_schema_without_audit"
@@ -351,6 +382,7 @@ impl NoteCode {
             Self::PrivilegeSystemCollections => "privilege.system_collections",
             Self::PrivilegeSystemDatabaseSelect => "privilege.system_database_select",
             Self::PrivilegeWriteActions => "privilege.write_actions",
+            Self::PrivilegeWriteNotEvaluated => "privilege.write_not_evaluated",
             Self::PrivilegeWriteOnRelations => "privilege.write_on_relations",
             Self::SecurityInitConnect => "security.init_connect",
             Self::SecurityLoginEventTrigger => "security.login_event_trigger",
