@@ -524,7 +524,23 @@ mod tests {
             .convert(vec![search(&root)], Instant::now())
             .pop()
             .unwrap();
-        assert_eq!(names(&e).len(), 2);
+        // The console's names come back exactly, so `sensitive_objects` and
+        // the console's per-object sensitivity match them.
+        assert_eq!(
+            names(&e),
+            vec![
+                (
+                    "dc=example,dc=org".to_owned(),
+                    Some("ou=*,ou=teams,dc=example,dc=org".to_owned()),
+                    "inetOrgPerson".to_owned()
+                ),
+                (
+                    "dc=example,dc=org".to_owned(),
+                    Some("ou=people,dc=example,dc=org".to_owned()),
+                    "inetOrgPerson".to_owned()
+                ),
+            ]
+        );
         // Nothing sensitive below: `*` with the container.
         let groups = S {
             base: "ou=groups,dc=example,dc=org",

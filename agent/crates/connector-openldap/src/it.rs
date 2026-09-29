@@ -23,9 +23,14 @@
 //!   signed its certificate, for the TLS tests (`verify_full`,
 //!   `start_tls`). Without them, those are skipped.
 //!
+//! - `DATABASTION_TEST_LDAPI_PATH` and `DATABASTION_TEST_LDAPI_DN`: an
+//!   `ldapi://` socket reachable from the test process and the DN slapd
+//!   maps the test's Unix uid to, for SASL `EXTERNAL` (not in CI: the dev
+//!   server's socket is inside its container).
+//!
 //! `DATABASTION_TEST_REQUIRE` (comma-separated: `ldap`, `ldap-admin`,
-//! `ldap-export`, `ldap-tls`, or `all`) turns the matching skips into
-//! failures.
+//! `ldap-export`, `ldap-tls`, `ldapi`, or `all`) turns the matching skips
+//! into failures.
 //!
 //! The tests are serialized.
 
@@ -601,4 +606,45 @@ async fn tls_verify_full_and_start_tls() {
     let h = OpenldapConnector::new().check(&t).await;
     assert!(!h.reachable);
     assert_eq!(h.notes[0].labels()[0].as_str(), "stage_tls");
+}
+
+/// SASL `EXTERNAL` over an `ldapi://` socket reachable from the test
+/// process (`DATABASTION_TEST_LDAPI_PATH`), authenticating the test's Unix
+/// uid as `DATABASTION_TEST_LDAPI_DN` (the DN slapd maps it to, e.g.
+/// `gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth`). Not run in
+/// CI (the dev server's socket is inside its container).
+#[tokio::test]
+async fn sasl_external_over_ldapi() {
+    let _serial = SERIAL.lock().await;
+    let (Ok(path), Ok(dn)) = (
+        std::env::var("DATABASTION_TEST_LDAPI_PATH"),
+        std::env::var("DATABASTION_TEST_LDAPI_DN"),
+    ) else {
+        skip(
+            "ldapi",
+            "DATABASTION_TEST_LDAPI_PATH / DATABASTION_TEST_LDAPI_DN are not set",
+        );
+        return;
+    };
+    let yaml = |account: &str| {
+        format!(
+            "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: ldapi-it\n    \
+             engine: openldap\n    socket: \"{path}\"\n    account: \"{account}\"\n    \
+             openldap: {{tls: disable, bind: sasl_external}}\n"
+        )
+    };
+    let t = databastion_core::AgentConfig::parse(&yaml(&dn))
+        .unwrap()
+        .targets[0]
+        .clone();
+    let h = OpenldapConnector::new().check(&t).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    // Another expected identity: refused after the bind.
+    let t = databastion_core::AgentConfig::parse(&yaml(SERVICE_DN))
+        .unwrap()
+        .targets[0]
+        .clone();
+    let h = OpenldapConnector::new().check(&t).await;
+    assert!(!h.reachable);
+    assert_eq!(h.failure, Some(FailureCode::AuthenticationFailed));
 }

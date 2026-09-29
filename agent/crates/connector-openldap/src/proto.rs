@@ -139,8 +139,10 @@ pub(crate) fn bind_simple(id: i32, dn: &str, password: &str) -> Enc {
     )
 }
 
-/// SASL `EXTERNAL` bind without an authorization identity (the server
-/// derives it from the transport).
+/// SASL `EXTERNAL` bind with an empty initial response (no authorization
+/// identity: the server derives it from the transport). Without the
+/// initial response, slapd answers `saslBindInProgress` (14) and waits for
+/// a second step (checked against slapd 2.6).
 pub(crate) fn bind_sasl_external(id: i32) -> Enc {
     message(
         id,
@@ -151,7 +153,10 @@ pub(crate) fn bind_sasl_external(id: i32) -> Enc {
                 Enc::octets(OCTET_STRING, b""),
                 Enc::constructed(
                     ber::ctx_constructed(3),
-                    &[Enc::octets(OCTET_STRING, b"EXTERNAL")],
+                    &[
+                        Enc::octets(OCTET_STRING, b"EXTERNAL"),
+                        Enc::octets(OCTET_STRING, b""),
+                    ],
                 ),
             ],
         ),
