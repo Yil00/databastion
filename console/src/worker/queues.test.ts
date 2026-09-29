@@ -161,8 +161,10 @@ describe("rate_limits.prune handler", () => {
     const prune = vi
       .spyOn(rateLimit, "pruneRateLimitCounters")
       .mockResolvedValueOnce({ deleted: 3, more: false })
-      .mockResolvedValueOnce({ deleted: 10_000, more: true });
+      .mockResolvedValueOnce({ deleted: rateLimit.PRUNE_CHUNK, more: true });
     const requeue = vi.fn(async () => "id");
+    // Small statements: row locks held far below the limiters' 1.5 s lock_timeout (review L-2).
+    expect(rateLimit.PRUNE_CHUNK).toBe(1_000);
     const handler = createRateLimitsPruneHandler(db, log, requeue, { budgetMs: 5 });
     await handler(jobs);
     expect(prune).toHaveBeenCalledWith(expect.anything(), { budgetMs: 5 });

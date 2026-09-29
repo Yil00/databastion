@@ -245,8 +245,12 @@ export class PgRateLimitStore implements RateLimitStore {
   }
 }
 
-/** Rows deleted per statement by {@link pruneRateLimitCounters}. */
-export const PRUNE_CHUNK = 10_000;
+/**
+ * Rows deleted per statement by {@link pruneRateLimitCounters}: small, so the row locks a prune
+ * statement holds stay far below the dedicated pool's `lock_timeout` (1.5 s) and pruning cannot
+ * make the limiters fail (and trip the circuit breaker) by itself (review L-2).
+ */
+export const PRUNE_CHUNK = 1_000;
 
 /**
  * Deletes expired windows (worker queue `rate_limits.prune`), in chunks, within `budgetMs`. Deleting

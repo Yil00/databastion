@@ -609,6 +609,16 @@ describe.skipIf(!hasDb)("RateLimiter.shared (PostgreSQL)", () => {
         if (!pre.ok) expect(pre.response.status).toBe(429);
       }
       for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      // Positive control: a precheck from a /48 that is not limited asks the store once.
+      const control = await copy.mod.authPrecheck(
+        new Request("http://console.test/api/agent/v1/heartbeat", {
+          method: "POST",
+          headers: { "X-DataBastion-Agent-Id": crypto.randomUUID(), Authorization: `Bearer ${secret}`, "X-Forwarded-For": "2001:db8:78::1" },
+        }),
+      );
+      expect(control.ok).toBe(true);
+      expect(spies[0]).toHaveBeenCalledTimes(1);
+      for (const spy of spies.slice(1)) expect(spy).not.toHaveBeenCalled();
     });
 
     it("L-B: /enroll buckets IPv6 sources by /56", async () => {

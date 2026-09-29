@@ -521,9 +521,12 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
   pool, and a statement the limiter gave up on is cancelled by the server, never committed late.
 - **Circuit breaker**: after a store failure (an error, a timeout, no free connection), the process
   does not call the store for 1.5 s; every limiter applies its failure mode at once (counted in
-  `databastion_console_rate_limit_store_short_circuits_total`). This sheds the queue of the
-  dedicated pool during an outage and bounds the latency of a login, which checks several limiters
-  in a row.
+  `databastion_console_rate_limit_store_short_circuits_total`). It stops new store calls, which
+  sheds the queue of the dedicated pool during an outage and bounds the latency of a login, which
+  checks several limiters in a row; operations already waiting for a connection when it opens can
+  still wait up to 2 s. Residual: one store failure makes every fail-closed limiter of the process
+  refuse for 1.5 s, and a burst that exhausts the pool can repeat this (about 1.75 times the refusal
+  time of plain pool saturation).
 - **IPv6 buckets**: `/enroll` per source IP buckets IPv6 by /56 (like logins: the usual per-site
   allocation, so rotating /64s of one site gains nothing, while a fleet enrolled from several sites
   of one /48 is not held by one bucket; enrollment tokens are 256-bit, so the limit bounds work,
@@ -552,7 +555,9 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
     same database, so failing closed would only make every agent back off on a limiter hiccup,
     and failing open would drop the bound. The late `/rotate` retries lock the agent when over
     their limit: failing closed would turn a transient store error into an irreversible lock.
-- **Pruning**: worker queue `rate_limits.prune`, every 5 minutes, in chunks of 10 000 rows.
+- **Pruning**: worker queue `rate_limits.prune`, every 5 minutes, in chunks of 1 000 rows per
+  statement within a 20 s budget (short row locks, far below the 1.5 s `lock_timeout`, so pruning
+  never makes the limiters fail by itself).
   Pruning changes no decision. The table holds at most one row per key seen in the last window
   (at most 15 minutes) plus the expired rows not pruned yet; its size is exported as
   `databastion_console_rate_limit_counters_rows`.
