@@ -29,11 +29,15 @@
 //! program …` logs two records). A read or write whose objects cannot be
 //! told (function bodies, unparsable text) is reported against `*`, never
 //! dropped; statements naming only catalogs (`pg_catalog`,
-//! `information_schema`, `pg_toast`, unqualified `pg_*`,
-//! `pg_stat_statements*`) are skipped. Events of the agent's own account
+//! `information_schema`, `pg_toast`, the `pg_stat_statements` relations
+//! in the extension's schema, unqualified `pg_*` under the rules of
+//! `CatalogRule`) are skipped. Events of the agent's own account
 //! are left out only when they come from its `application_name` and client
-//! address, carry no signal, and stay within Discovery's row budget per
-//! object and window (`OwnAccount`).
+//! address, carry no signal, and either are one of the connector's own
+//! statements that read no relation (exact text with pgaudit, normalized
+//! shape with `pg_stat_statements`; not charged) or stay within
+//! Discovery's row budget per named object and window (`PgOwn`). Any
+//! other event of the agent's account on `*` is reported.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime};
@@ -45,12 +49,13 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, QueryAnalysis, RelationName, StatementInfo, StatementKind,
-    analyze,
+    AnalyzeOptions, CopyEndpoint, NormalizedQuery, QueryAnalysis, RelationName, StatementInfo,
+    StatementKind, analyze,
 };
 
 use super::records::AuditRecord;
 use crate::discover::normalize;
+use crate::sql;
 
 /// A limit above this many rows reads a whole relation.
 pub(crate) const LARGE_LIMIT: u64 = 10_000;
@@ -72,16 +77,82 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
     o
 }
 
-fn is_catalog(r: &RelationName) -> bool {
-    // The agent's own probes read `pg_stat_statements*` in the extension's
-    // schema: statistics, not application data.
-    if r.name.starts_with("pg_stat_statements") {
-        return true;
+/// What tells a catalog apart in one database, from the probe of
+/// `check::prerequisites` (the agent's own session).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DbCatalog {
+    /// Schema of the `pg_stat_statements` extension, when installed.
+    pub(crate) pss_schema: Option<String>,
+    /// `pgaudit.log_catalog`, when pgaudit is loaded.
+    pub(crate) pgaudit_log_catalog: Option<bool>,
+}
+
+/// [`DbCatalog`] per database of the target (a database not listed has
+/// no extension schema and an unknown `pgaudit.log_catalog`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Catalogs {
+    dbs: HashMap<String, DbCatalog>,
+}
+
+impl Catalogs {
+    pub(crate) fn insert(&mut self, database: &str, c: DbCatalog) {
+        self.dbs.insert(database.to_owned(), c);
     }
+
+    fn get(&self, database: &str) -> Option<&DbCatalog> {
+        self.dbs.get(database)
+    }
+
+    /// The rule for a statement of `database`. `unqualified_pg`: whether an
+    /// unqualified `pg_*` name counts as a catalog without confirmation.
+    fn rule<'a>(
+        &'a self,
+        database: &str,
+        unqualified_pg: bool,
+        confirmed: &'a HashSet<String>,
+    ) -> CatalogRule<'a> {
+        CatalogRule {
+            pss_schema: self.get(database).and_then(|c| c.pss_schema.as_deref()),
+            unqualified_pg,
+            confirmed,
+        }
+    }
+}
+
+/// The extension's relations (`pg_stat_statements`: statistics, not
+/// application data; the agent's own probes read them).
+fn is_pss_relation(name: &str) -> bool {
+    matches!(name, "pg_stat_statements" | "pg_stat_statements_info")
+}
+
+/// Which relations count as catalogs for one statement.
+#[derive(Clone, Copy)]
+struct CatalogRule<'a> {
+    /// Schema of the `pg_stat_statements` extension in the statement's
+    /// database: only its two relations there count, not a
+    /// `pg_stat_statements*` name elsewhere (any role with `CREATE` can
+    /// make one).
+    pss_schema: Option<&'a str>,
+    /// An unqualified `pg_*` name is a catalog. With pgaudit and
+    /// `pgaudit.log_catalog = off`, statements on catalogs only are not
+    /// logged, so an unqualified `pg_*` name in a logged statement is a
+    /// catalog only when pgaudit names it in `pg_catalog`
+    /// (`confirmed`). `pg_stat_statements` sees no object names: a
+    /// residual (README).
+    unqualified_pg: bool,
+    /// Names pgaudit reported in `pg_catalog` within the statement.
+    confirmed: &'a HashSet<String>,
+}
+
+fn is_catalog(r: &RelationName, rule: CatalogRule<'_>) -> bool {
     match r.schema.as_deref() {
         Some("pg_catalog" | "information_schema" | "pg_toast") => true,
-        Some(s) => s.starts_with("pg_temp_") || s.starts_with("pg_toast_temp_"),
-        None => r.name.starts_with("pg_"),
+        Some(s) if s.starts_with("pg_temp_") || s.starts_with("pg_toast_temp_") => true,
+        Some(s) => rule.pss_schema == Some(s) && is_pss_relation(&r.name),
+        None if is_pss_relation(&r.name) => rule.pss_schema.is_some(),
+        None => {
+            r.name.starts_with("pg_") && (rule.unqualified_pg || rule.confirmed.contains(&r.name))
+        }
     }
 }
 
@@ -177,13 +248,13 @@ fn matching<'a>(a: &'a QueryAnalysis, command: Option<&str>) -> Vec<&'a Statemen
 
 /// Relations named by `parts`, catalogs excluded; the flag says whether
 /// any relation (catalogs included) was named.
-fn user_relations(parts: &[&StatementInfo]) -> (Vec<RelationName>, bool) {
+fn user_relations(parts: &[&StatementInfo], rule: CatalogRule<'_>) -> (Vec<RelationName>, bool) {
     let mut out = Vec::new();
     let mut any = false;
     for p in parts {
         for r in &p.relations {
             any = true;
-            if !is_catalog(r) && !out.contains(r) {
+            if !is_catalog(r, rule) && !out.contains(r) {
                 out.push(r.clone());
             }
         }
@@ -192,7 +263,11 @@ fn user_relations(parts: &[&StatementInfo]) -> (Vec<RelationName>, bool) {
 }
 
 /// Signals of statements from their analysis (not the session pattern).
-fn statement_signals(parts: &[&StatementInfo], rows: Option<u64>) -> Vec<Signal> {
+fn statement_signals(
+    parts: &[&StatementInfo],
+    rows: Option<u64>,
+    rule: CatalogRule<'_>,
+) -> Vec<Signal> {
     let mut out = Vec::new();
     for p in parts {
         if let Some(c) = p.copy {
@@ -208,7 +283,7 @@ fn statement_signals(parts: &[&StatementInfo], rows: Option<u64>) -> Vec<Signal>
             }
         }
         if p.kind.is_read()
-            && p.relations.iter().any(|r| !is_catalog(r))
+            && p.relations.iter().any(|r| !is_catalog(r, rule))
             && p.shape.is_some_and(|s| s.whole_relation(LARGE_LIMIT + 1))
         {
             out.push(Signal::FullTableRead);
@@ -221,13 +296,13 @@ fn statement_signals(parts: &[&StatementInfo], rows: Option<u64>) -> Vec<Signal>
 }
 
 /// Relations a statement copies whole to the client.
-fn copied_to_client(parts: &[&StatementInfo]) -> Vec<RelationName> {
+fn copied_to_client(parts: &[&StatementInfo], rule: CatalogRule<'_>) -> Vec<RelationName> {
     let mut out = Vec::new();
     for p in parts {
         if p.copy
             .is_some_and(|c| c.to && c.whole_relation && c.endpoint == CopyEndpoint::Client)
         {
-            out.extend(p.relations.iter().filter(|r| !is_catalog(r)).cloned());
+            out.extend(p.relations.iter().filter(|r| !is_catalog(r, rule)).cloned());
         }
     }
     out
@@ -265,11 +340,149 @@ impl DumpTracker {
     }
 }
 
+/// Most statements registered at run time ([`PgOwn::allow_statement`]).
+const OWN_MAX_EXTRA_STATEMENTS: usize = 8;
+
+/// Table-less statements registered at run time for a target (the
+/// `pg_stat_statements` text query, whose schema is only known then). Kept
+/// per target by the connector (`CheckState`), like the row budget, so
+/// that a pgaudit stream started after a `pg_stat_statements` period
+/// recognizes them in the records of that period. Not persisted.
+pub(crate) type SharedOwnStatements = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// What an event of the agent's account is about, for [`PgOwn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnKind {
+    /// One of the connector's own statements that read no relation.
+    Tableless,
+    /// A read or write whose objects the source does not tell (`*`).
+    Unknown,
+    /// Named relations.
+    Named,
+}
+
+/// Normalized text of a statement with `true` / `false` read as
+/// placeholders (`pg_stat_statements` replaces boolean constants too).
+fn statement_shape(n: &NormalizedQuery) -> String {
+    n.as_str()
+        .split(' ')
+        .map(|t| {
+            if matches!(t, "true" | "false") {
+                "?"
+            } else {
+                t
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The agent's own activity in the PostgreSQL sources: the core rule
+/// (`databastion_core::audit::own`: account, application, address, no
+/// signal, row budget per object) plus what is PostgreSQL-specific.
+///
+/// - The connector's own statements that name no relation (closed list:
+///   [`sql::OWN_TABLELESS`], and the `pg_stat_statements` text query
+///   registered by its stream) are left out on the core's identity and
+///   signal rules without being charged ([`OwnKind::Tableless`]): they read
+///   no row, and charging them used up the `*` budget within one scan.
+///   They are recognized as sent (pgaudit logs the text verbatim) and by
+///   normalized shape (`pg_stat_statements` replaces the constants).
+/// - Any other event of the agent's account on the unknown object `*`
+///   ([`OwnKind::Unknown`]: a function call, even in `pg_catalog`, e.g.
+///   `query_to_xml`; a text that does not parse) is reported and never
+///   budgeted: the connector names every relation it reads.
+pub(crate) struct PgOwn {
+    core: OwnAccount,
+    own_texts: Vec<String>,
+    own_shapes: Vec<String>,
+    registry: SharedOwnStatements,
+}
+
+impl PgOwn {
+    pub(crate) fn new(core: OwnAccount, registry: SharedOwnStatements) -> Self {
+        let extra = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut own = Self {
+            core,
+            own_texts: Vec::new(),
+            own_shapes: Vec::new(),
+            registry,
+        };
+        for text in sql::OWN_TABLELESS {
+            own.add_statement(text);
+        }
+        for text in &extra {
+            own.add_statement(text);
+        }
+        own
+    }
+
+    fn add_statement(&mut self, text: &str) {
+        if self.own_texts.iter().any(|t| t == text) {
+            return;
+        }
+        self.own_texts.push(text.to_owned());
+        if let Some(n) = analyze(text, analyze_opts(false)).normalized() {
+            self.own_shapes.push(statement_shape(n));
+        }
+    }
+
+    /// Adds a statement the connector sends that names no relation, and
+    /// keeps it for the target's later streams (at most
+    /// [`OWN_MAX_EXTRA_STATEMENTS`]; beyond, this stream only).
+    pub(crate) fn allow_statement(&mut self, text: &str) {
+        self.add_statement(text);
+        let mut guard = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.iter().any(|t| t == text) && guard.len() < OWN_MAX_EXTRA_STATEMENTS {
+            guard.push(text.to_owned());
+        }
+    }
+
+    /// `text` is exactly one of the connector's own table-less statements.
+    fn own_text(&self, text: &str) -> bool {
+        self.own_texts.iter().any(|t| t == text)
+    }
+
+    /// The normalized shape of `a` is one of the connector's own
+    /// table-less statements (no normalized text, e.g. a cut text: no).
+    fn own_shape(&self, a: &QueryAnalysis) -> bool {
+        a.normalized()
+            .is_some_and(|n| self.own_shapes.contains(&statement_shape(n)))
+    }
+
+    /// Whether an event may be left out (see the type documentation).
+    fn routine(
+        &mut self,
+        user: &str,
+        application: Option<&str>,
+        client: ClientSeen,
+        e: &MaskedEvent,
+        kind: OwnKind,
+        now: Instant,
+    ) -> bool {
+        match kind {
+            OwnKind::Tableless => self.core.routine_unbudgeted(user, application, client, e),
+            OwnKind::Unknown => false,
+            OwnKind::Named => self.core.routine(user, application, client, e, now),
+        }
+    }
+}
 /// Builds events from pgaudit records.
 pub(crate) struct PgauditEvents {
-    own: OwnAccount,
+    own: PgOwn,
     dumps: DumpTracker,
+    catalogs: Catalogs,
 }
+
+/// Statement text of a pgaudit record after the first one of its
+/// statement and substatement, with `pgaudit.log_statement_once = on`.
+const PREVIOUSLY_LOGGED: &str = "<previously logged>";
 
 /// Per class of a statement: objects, rows, signals, unknown objects.
 #[derive(Default)]
@@ -280,14 +493,23 @@ struct ClassPart {
     unknown: bool,
     catalog_only: bool,
     dump: bool,
+    /// A record of this class has a text other than one of the
+    /// connector's own table-less statements.
+    not_own_text: bool,
 }
 
 impl PgauditEvents {
-    pub(crate) fn new(own: OwnAccount) -> Self {
+    pub(crate) fn new(own: PgOwn) -> Self {
         Self {
             own,
             dumps: DumpTracker::default(),
+            catalogs: Catalogs::default(),
         }
+    }
+
+    /// Sets the per-database catalog facts (re-probed with the source).
+    pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
+        self.catalogs = catalogs;
     }
 
     /// Converts records (in log order) to events: one statement (same
@@ -321,6 +543,29 @@ impl PgauditEvents {
         };
         let mut parts: HashMap<EventAction, ClassPart> = HashMap::new();
         let mut seen_subs: HashSet<(u64, String, String)> = HashSet::new();
+        // Names pgaudit reports in `pg_catalog` for this statement, and
+        // the first text of each substatement (`log_statement_once`: later
+        // records carry `<previously logged>`).
+        let mut confirmed: HashSet<String> = HashSet::new();
+        let mut first_texts: HashMap<u64, &str> = HashMap::new();
+        for r in &group {
+            if let Some(rel) = split_object_name(&r.audit.object_name) {
+                if rel.schema.as_deref() == Some("pg_catalog") {
+                    confirmed.insert(rel.name);
+                }
+            }
+            let text: &str = &r.audit.statement;
+            if text != PREVIOUSLY_LOGGED {
+                first_texts.entry(r.audit.substatement_id).or_insert(text);
+            }
+        }
+        let log_catalog = self
+            .catalogs
+            .get(&first.database)
+            .and_then(|c| c.pgaudit_log_catalog);
+        let rule = self
+            .catalogs
+            .rule(&first.database, log_catalog != Some(false), &confirmed);
         // Each record is analyzed on its own text (a substatement of a
         // function or DO block logs its own text); consecutive records
         // with the same text reuse the analysis.
@@ -342,7 +587,15 @@ impl PgauditEvents {
             )) {
                 continue;
             }
-            let text: &str = &r.audit.statement;
+            let mut text: &str = &r.audit.statement;
+            if text == PREVIOUSLY_LOGGED {
+                // Without a first record (not in this read), the text
+                // stays unparsable: the objects are unknown (`*`).
+                text = first_texts
+                    .get(&r.audit.substatement_id)
+                    .copied()
+                    .unwrap_or(PREVIOUSLY_LOGGED);
+            }
             if cached.as_ref().is_none_or(|(t, _)| *t != text) {
                 cached = Some((text, analyze(text, analyze_opts(false))));
             }
@@ -350,13 +603,20 @@ impl PgauditEvents {
                 continue;
             };
             let stmts = matching(analysis, Some(r.audit.command.as_str()));
-            let (text_relations, named_any) = user_relations(&stmts);
+            let (text_relations, named_any) = user_relations(&stmts, rule);
+            let own_text = self.own.own_text(text);
             let part = parts.entry(action).or_default();
+            part.not_own_text |= !own_text;
             let mut named = false;
             if !r.audit.object_name.is_empty() && is_relation_type(&r.audit.object_type) {
                 if let Some(rel) = split_object_name(&r.audit.object_name) {
                     named = true;
-                    if !is_catalog(&rel) && !part.objects.contains(&rel) {
+                    if is_catalog(&rel, rule) {
+                        // A named catalog relation (`pgaudit.log_catalog`,
+                        // `pg_stat_statements_info`): not application
+                        // data, and not an unknown object either.
+                        part.catalog_only = true;
+                    } else if !part.objects.contains(&rel) {
                         part.objects.push(rel);
                     }
                 }
@@ -381,7 +641,7 @@ impl PgauditEvents {
                 part.rows = Some(part.rows.map_or(rows, |p| p.max(rows)));
             }
             if action == EventAction::Read {
-                part.signals.extend(statement_signals(&stmts, None));
+                part.signals.extend(statement_signals(&stmts, None, rule));
                 // PL/pgSQL cannot COPY to the client: a COPY record whose
                 // text does not show the COPY (dynamic SQL, nested DO) is
                 // a server-side export.
@@ -391,7 +651,7 @@ impl PgauditEvents {
                 {
                     part.signals.push(Signal::CopyToFile);
                 }
-                let copied = copied_to_client(&stmts);
+                let copied = copied_to_client(&stmts, rule);
                 if !copied.is_empty() && self.dumps.copied(&r.session, &copied) {
                     part.dump = true;
                 }
@@ -420,7 +680,8 @@ impl PgauditEvents {
             for o in part.objects.iter().take(16) {
                 e = e.with_object(object(&first.database, o));
             }
-            if rw && (part.objects.is_empty() || part.unknown) {
+            let unknown = rw && (part.objects.is_empty() || part.unknown);
+            if unknown {
                 // A read or write whose objects the log does not tell (a
                 // function or procedure body, a statement that does not
                 // parse): reported against `*` rather than dropped (the
@@ -442,11 +703,19 @@ impl PgauditEvents {
                 e = e.with_signal(Signal::PgDump);
             }
             let client = first.remote.as_deref().and_then(ClientAddr::parse);
+            let kind = if !part.not_own_text && part.objects.is_empty() {
+                OwnKind::Tableless
+            } else if unknown {
+                OwnKind::Unknown
+            } else {
+                OwnKind::Named
+            };
             if self.own.routine(
                 &first.user,
                 Some(&first.application),
                 ClientSeen::Logged(client),
                 &e,
+                kind,
                 Instant::now(),
             ) {
                 continue;
@@ -473,21 +742,26 @@ pub(crate) struct StatementDelta<'a> {
 /// (the application name is not visible here).
 pub(crate) fn pss_events(
     deltas: &[StatementDelta<'_>],
-    own: &mut OwnAccount,
+    own: &mut PgOwn,
+    catalogs: &Catalogs,
     from: SystemTime,
     to: SystemTime,
 ) -> Vec<MaskedEvent> {
     // The pg_dump pattern per role within the poll.
+    // No object names here: unqualified `pg_*` names stay catalogs.
+    let none = HashSet::new();
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
+        let rule = catalogs.rule(d.database, true, &none);
         let all: Vec<&StatementInfo> = d.analysis.parts().iter().collect();
-        let c = copied_to_client(&all);
+        let c = copied_to_client(&all, rule);
         if !c.is_empty() {
             copied.entry(d.user).or_default().extend(c);
         }
     }
     let mut out = Vec::new();
     for d in deltas {
+        let rule = catalogs.rule(d.database, true, &none);
         let a = d.analysis;
         let all: Vec<&StatementInfo> = a.parts().iter().collect();
         let action = match a.kind() {
@@ -509,7 +783,7 @@ pub(crate) fn pss_events(
             StatementKind::Dcl => EventAction::Dcl,
             _ => continue,
         };
-        let (objects, named_any) = user_relations(&all);
+        let (objects, named_any) = user_relations(&all, rule);
         let rw = matches!(action, EventAction::Read | EventAction::Write);
         if rw && objects.is_empty() && named_any {
             continue;
@@ -531,10 +805,10 @@ pub(crate) fn pss_events(
             e = e.with_object(unknown_object(d.database));
         }
         if action == EventAction::Read {
-            for s in statement_signals(&all, rows) {
+            for s in statement_signals(&all, rows, rule) {
                 e = e.with_signal(s);
             }
-            if !copied_to_client(&all).is_empty()
+            if !copied_to_client(&all, rule).is_empty()
                 && copied
                     .get(d.user)
                     .is_some_and(|s| s.len() >= DUMP_MIN_RELATIONS)
@@ -544,7 +818,21 @@ pub(crate) fn pss_events(
         } else if d.rows > LARGE_ROWS {
             e = e.with_signal(Signal::LargeResult);
         }
-        if own.routine(d.user, None, ClientSeen::NotVisible, &e, Instant::now()) {
+        let kind = if objects.is_empty() && !named_any && own.own_shape(a) {
+            OwnKind::Tableless
+        } else if rw && objects.is_empty() {
+            OwnKind::Unknown
+        } else {
+            OwnKind::Named
+        };
+        if own.routine(
+            d.user,
+            None,
+            ClientSeen::NotVisible,
+            &e,
+            kind,
+            Instant::now(),
+        ) {
             continue;
         }
         out.push(e);
@@ -597,12 +885,44 @@ mod tests {
         }
     }
 
+    /// `shop` with `pg_stat_statements` in `public`.
+    fn shop_catalogs(log_catalog: Option<bool>) -> Catalogs {
+        let mut c = Catalogs::default();
+        c.insert(
+            "shop",
+            DbCatalog {
+                pss_schema: Some("public".to_owned()),
+                pgaudit_log_catalog: log_catalog,
+            },
+        );
+        c
+    }
     use databastion_core::audit::own::SharedOwnUsage;
 
-    fn own() -> OwnAccount {
-        OwnAccount::new(
-            "databastion",
-            Some(crate::conn::APPLICATION_NAME),
+    fn own_shared(
+        addr: Option<ClientAddr>,
+        budget: u64,
+        usage: SharedOwnUsage,
+        statements: SharedOwnStatements,
+    ) -> PgOwn {
+        PgOwn::new(
+            OwnAccount::new(
+                "databastion",
+                Some(crate::conn::APPLICATION_NAME),
+                addr,
+                budget,
+                usage,
+            ),
+            statements,
+        )
+    }
+
+    fn own_with(addr: Option<ClientAddr>, budget: u64, usage: SharedOwnUsage) -> PgOwn {
+        own_shared(addr, budget, usage, SharedOwnStatements::default())
+    }
+
+    fn own() -> PgOwn {
+        own_with(
             ClientAddr::parse("192.0.2.14"),
             1000,
             SharedOwnUsage::default(),
@@ -903,7 +1223,7 @@ mod tests {
             },
         ];
         let t0 = SystemTime::UNIX_EPOCH;
-        let ev = pss_events(&deltas, &mut own(), t0, t0);
+        let ev = pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t0);
         assert_eq!(ev.len(), 1);
         assert!(ev[0].signals().contains(&Signal::FullTableRead));
     }
@@ -928,22 +1248,14 @@ mod tests {
         assert!(b.convert(vec![page(1)], SystemTime::now()).is_empty());
         assert_eq!(b.convert(vec![page(2)], SystemTime::now()).len(), 1);
         // Another client address than the agent's.
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
-            Some(crate::conn::APPLICATION_NAME),
+        let mut b = PgauditEvents::new(own_with(
             ClientAddr::parse("198.51.100.7"),
             1000,
             SharedOwnUsage::default(),
         ));
         assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
         // The agent's address could not be read: nothing is left out.
-        let mut b = PgauditEvents::new(OwnAccount::new(
-            "databastion",
-            Some(crate::conn::APPLICATION_NAME),
-            None,
-            1000,
-            SharedOwnUsage::default(),
-        ));
+        let mut b = PgauditEvents::new(own_with(None, 1000, SharedOwnUsage::default()));
         assert_eq!(b.convert(vec![page(1)], SystemTime::now()).len(), 1);
         // Unknown rows (pgaudit.log_rows off) are charged the whole budget:
         // the second statement on the same object is reported.
@@ -973,16 +1285,17 @@ mod tests {
             rows: 3000,
         }];
         let t0 = SystemTime::UNIX_EPOCH;
-        assert_eq!(pss_events(&deltas, &mut own(), t0, t0).len(), 1);
+        assert_eq!(
+            pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t0).len(),
+            1
+        );
     }
 
     #[test]
     fn own_budget_survives_stream_restarts_and_source_switches() {
         let shared = SharedOwnUsage::default();
         let own_on = |u: &SharedOwnUsage| {
-            OwnAccount::new(
-                "databastion",
-                Some(crate::conn::APPLICATION_NAME),
+            own_with(
                 ClientAddr::parse("192.0.2.14"),
                 1000,
                 std::sync::Arc::clone(u),
@@ -1014,9 +1327,390 @@ mod tests {
             rows: 600,
         }];
         let t0 = SystemTime::UNIX_EPOCH;
-        assert_eq!(pss_events(&deltas, &mut own_on(&shared), t0, t0).len(), 1);
+        assert_eq!(
+            pss_events(&deltas, &mut own_on(&shared), &Catalogs::default(), t0, t0).len(),
+            1
+        );
         // A fresh usage (what a per-stream counter did) would have skipped it.
-        assert!(pss_events(&deltas, &mut own_on(&SharedOwnUsage::default()), t0, t0).is_empty());
+        assert!(
+            pss_events(
+                &deltas,
+                &mut own_on(&SharedOwnUsage::default()),
+                &Catalogs::default(),
+                t0,
+                t0
+            )
+            .is_empty()
+        );
+    }
+
+    /// The per-transaction statements of one Discovery scan (about 90
+    /// transactions) and the check / stream probes, as the agent sends
+    /// them.
+    fn own_tableless_records(app: &str, n: u64) -> Vec<AuditRecord> {
+        let mut out = vec![rec(
+            "own1",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "",
+            sql::SESSION_SETUP,
+            Some(1),
+            app,
+        )];
+        for i in 0..n {
+            out.push(rec(
+                "own1",
+                2 + i,
+                1,
+                "READ",
+                "SELECT",
+                "",
+                sql::SET_LOCAL_TIMEOUTS,
+                Some(1),
+                app,
+            ));
+        }
+        out.push(rec(
+            "own1",
+            2 + n,
+            1,
+            "READ",
+            "SELECT",
+            "",
+            sql::OWN_CLIENT_ADDR,
+            Some(1),
+            app,
+        ));
+        out
+    }
+
+    fn charged_keys(u: &SharedOwnUsage) -> Vec<String> {
+        u.lock().unwrap().budgeted_objects()
+    }
+
+    #[test]
+    fn own_tableless_statements_are_skipped_and_not_charged() {
+        let usage = SharedOwnUsage::default();
+        // A small budget: one charge of the old rule would exceed it.
+        let acct = own_with(
+            ClientAddr::parse("192.0.2.14"),
+            10,
+            std::sync::Arc::clone(&usage),
+        );
+        let mut b = PgauditEvents::new(acct);
+        // pgaudit.log_rows off: unknown rows, charged the whole budget
+        // under the row rule.
+        let mut recs = own_tableless_records("databastion-agent", 5);
+        for r in &mut recs {
+            r.audit.rows = None;
+        }
+        recs.extend(own_tableless_records("databastion-agent", 5));
+        let events = b.convert(recs, SystemTime::now());
+        assert!(
+            events.is_empty(),
+            "{:?}",
+            events.iter().map(json).collect::<Vec<_>>()
+        );
+        assert!(
+            charged_keys(&usage).is_empty(),
+            "{:?}",
+            charged_keys(&usage)
+        );
+        // The same statements from the agent's account under another
+        // application, and from another role: reported against `*`.
+        for app in ["stolen", "psql"] {
+            let mut b = PgauditEvents::new(own());
+            let events = b.convert(own_tableless_records(app, 2), SystemTime::now());
+            assert_eq!(events.len(), 4, "{app}");
+            assert!(events.iter().all(|e| json(e).contains("shop..*")), "{app}");
+        }
+        // The agent's application and account from another address.
+        let mut b = PgauditEvents::new(own_with(
+            ClientAddr::parse("198.51.100.7"),
+            1000,
+            SharedOwnUsage::default(),
+        ));
+        let events = b.convert(
+            own_tableless_records("databastion-agent", 1),
+            SystemTime::now(),
+        );
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn own_account_other_tableless_statements_are_reported() {
+        let usage = SharedOwnUsage::default();
+        let mut b = PgauditEvents::new(own_with(
+            ClientAddr::parse("192.0.2.14"),
+            1000,
+            std::sync::Arc::clone(&usage),
+        ));
+        let texts = [
+            // A user-defined function: the connector never calls one.
+            "select crm.f()",
+            "SELECT crm.f($1)",
+            // pg_catalog functions that read relations or run SQL.
+            "SELECT pg_catalog.query_to_xml($1, true, false, '')",
+            "select pg_catalog.lo_get(16400)",
+            // An own statement with something appended or changed.
+            &format!("{} , crm.f()", sql::OWN_CLIENT_ADDR),
+            "SELECT pg_catalog.set_config('statement_timeout', $1, true)",
+            &sql::SET_LOCAL_TIMEOUTS.to_lowercase(),
+            // Several statements.
+            &format!("{}; select crm.f()", sql::OWN_CLIENT_ADDR),
+        ];
+        for (i, t) in texts.iter().enumerate() {
+            let r = rec(
+                "f1",
+                i as u64 + 1,
+                1,
+                "READ",
+                "SELECT",
+                "",
+                t,
+                Some(1),
+                "databastion-agent",
+            );
+            let events = b.convert(vec![r], SystemTime::now());
+            assert_eq!(events.len(), 1, "{t}");
+            assert!(json(&events[0]).contains("shop..*"), "{t}");
+        }
+        assert!(charged_keys(&usage).is_empty(), "`*` is never budgeted");
+        // One record of the statement is an own text, another is not: the
+        // event is not an own statement.
+        let recs = vec![
+            rec(
+                "f2",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "",
+                sql::OWN_CLIENT_ADDR,
+                Some(1),
+                "databastion-agent",
+            ),
+            rec(
+                "f2",
+                1,
+                2,
+                "READ",
+                "SELECT",
+                "",
+                "select crm.f()",
+                Some(1),
+                "databastion-agent",
+            ),
+        ];
+        assert_eq!(b.convert(recs, SystemTime::now()).len(), 1);
+    }
+
+    #[test]
+    fn own_reads_of_a_masked_name_stay_budgeted() {
+        // A value-like relation name normalizes to `*`: still a named
+        // relation, budgeted like any other (not the unknown object).
+        let text = "SELECT \"a\" FROM ONLY \"crm\".\"export_client_0639988384\" LIMIT $1";
+        let r = rec(
+            "v1",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "crm.export_client_0639988384",
+            text,
+            Some(10),
+            "databastion-agent",
+        );
+        let mut b = PgauditEvents::new(own());
+        assert!(b.convert(vec![r], SystemTime::now()).is_empty());
+        let a = analyze_pss(text, false);
+        let deltas = [StatementDelta {
+            user: "databastion",
+            database: "shop",
+            analysis: &a,
+            calls: 1,
+            rows: 10,
+        }];
+        let t0 = SystemTime::UNIX_EPOCH;
+        assert!(pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t0).is_empty());
+    }
+
+    #[test]
+    fn own_tableless_statements_with_a_signal_are_reported() {
+        let mut b = PgauditEvents::new(own());
+        let r = rec(
+            "g1",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "",
+            sql::SET_LOCAL_TIMEOUTS,
+            Some(LARGE_ROWS + 1),
+            "databastion-agent",
+        );
+        let events = b.convert(vec![r], SystemTime::now());
+        assert_eq!(events.len(), 1);
+        assert!(events[0].signals().contains(&Signal::LargeResult));
+        // pg_stat_statements: rows summed over the poll.
+        let a = analyze_pss(
+            "SELECT pg_catalog.set_config($4, $1, $5), pg_catalog.set_config($6, $2, $7), \
+             pg_catalog.set_config($8, $3, $9), pg_catalog.current_setting($10)",
+            false,
+        );
+        let deltas = [StatementDelta {
+            user: "databastion",
+            database: "shop",
+            analysis: &a,
+            calls: LARGE_ROWS + 1,
+            rows: LARGE_ROWS + 1,
+        }];
+        let t0 = SystemTime::UNIX_EPOCH;
+        let ev = pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t0);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].signals().contains(&Signal::LargeResult));
+    }
+
+    #[test]
+    fn own_tableless_statements_in_pg_stat_statements() {
+        // Texts as pg_stat_statements stores them (constants, booleans
+        // included, replaced by parameters; checked on PostgreSQL 16).
+        let set_local = analyze_pss(
+            "SELECT pg_catalog.set_config($4, $1, $5), pg_catalog.set_config($6, $2, $7), \
+             pg_catalog.set_config($8, $3, $9), pg_catalog.current_setting($10)",
+            false,
+        );
+        let setup = analyze_pss(
+            &sql::SESSION_SETUP
+                .replace("'search_path'", "$4")
+                .replace("''", "$5")
+                .replace("false", "$6"),
+            false,
+        );
+        let addr = analyze_pss(sql::OWN_CLIENT_ADDR, false);
+        let texts_sql = sql::pss_texts("public", true).unwrap();
+        let texts = analyze_pss(
+            &texts_sql
+                .replace("pg_stat_statements(true)", "pg_stat_statements($2)")
+                .replace("8192", "$3"),
+            false,
+        );
+        let cut = analyze_pss(sql::OWN_CLIENT_ADDR, true);
+        let other = analyze_pss("select crm.f($1)", false);
+        let delta = |user, analysis| StatementDelta {
+            user,
+            database: "shop",
+            analysis,
+            calls: 90,
+            rows: 90,
+        };
+        let own_account = own;
+        let usage = SharedOwnUsage::default();
+        let mut own = own_with(
+            ClientAddr::parse("192.0.2.14"),
+            10,
+            std::sync::Arc::clone(&usage),
+        );
+        own.allow_statement(&texts_sql);
+        let t0 = SystemTime::UNIX_EPOCH;
+        // Two polls' worth of a scan: nothing reported, nothing charged.
+        for _ in 0..2 {
+            let deltas = [
+                delta("databastion", &set_local),
+                delta("databastion", &setup),
+                delta("databastion", &addr),
+                delta("databastion", &texts),
+            ];
+            let ev = pss_events(&deltas, &mut own, &Catalogs::default(), t0, t0);
+            assert!(
+                ev.is_empty(),
+                "{:?}",
+                ev.iter().map(json).collect::<Vec<_>>()
+            );
+        }
+        assert!(charged_keys(&usage).is_empty());
+        // Another role, a cut text, another function: reported on `*`.
+        let deltas = [
+            delta("app", &set_local),
+            delta("app", &texts),
+            delta("databastion", &cut),
+            delta("databastion", &other),
+        ];
+        let ev = pss_events(&deltas, &mut own, &Catalogs::default(), t0, t0);
+        assert_eq!(ev.len(), 4);
+        assert!(ev.iter().all(|e| json(e).contains("shop..*")));
+        // Without the stream's registration, the text query is not one of
+        // the agent's statements.
+        let ev = pss_events(
+            &[delta("databastion", &texts)],
+            &mut own_account(),
+            &Catalogs::default(),
+            t0,
+            t0,
+        );
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn a_discovery_scan_leaves_no_own_event_and_no_wildcard_charge() {
+        // Every statement the connector sends, as pgaudit logs it
+        // (`pgaudit.log_rows` on, `log_relation` off), with about 90
+        // transactions of `set_config` calls; the sampling statements
+        // within the budget. The `pg_stat_statements` text queries were
+        // registered by an earlier `pg_stat_statements` stream of the
+        // target (source switch: the pgaudit stream reads the records of
+        // that period).
+        let usage = SharedOwnUsage::default();
+        let statements = SharedOwnStatements::default();
+        let mut pss = own_shared(
+            ClientAddr::parse("192.0.2.14"),
+            1000,
+            std::sync::Arc::clone(&usage),
+            std::sync::Arc::clone(&statements),
+        );
+        pss.allow_statement(&sql::pss_texts("public", true).unwrap());
+        pss.allow_statement(&sql::pss_texts("public", false).unwrap());
+        drop(pss);
+        let mut b = PgauditEvents::new(own_shared(
+            ClientAddr::parse("192.0.2.14"),
+            1000,
+            std::sync::Arc::clone(&usage),
+            statements,
+        ));
+        b.set_catalogs(shop_catalogs(Some(false)));
+        let mut recs = own_tableless_records("databastion-agent", 90);
+        for (i, text) in sql::all_statements().iter().enumerate() {
+            // Transaction control is logged in the MISC class.
+            let (class, command) = match text.split(' ').next() {
+                Some("BEGIN") => ("MISC", "BEGIN"),
+                Some("COMMIT") => ("MISC", "COMMIT"),
+                Some("ROLLBACK") => ("MISC", "ROLLBACK"),
+                _ => ("READ", "SELECT"),
+            };
+            recs.push(rec(
+                "scan",
+                i as u64 + 1,
+                1,
+                class,
+                command,
+                "",
+                text,
+                Some(100),
+                "databastion-agent",
+            ));
+        }
+        let events = b.convert(recs, SystemTime::now());
+        assert!(
+            events.is_empty(),
+            "{:?}",
+            events.iter().map(json).collect::<Vec<_>>()
+        );
+        let keys = charged_keys(&usage);
+        assert!(!keys.iter().any(|k| k.ends_with("\u{0}*")), "{keys:?}");
+        // Only the sampled relation (`s.t`) is budgeted.
+        assert_eq!(keys, ["shop\u{0}s\u{0}t"], "{keys:?}");
     }
 
     #[test]
@@ -1055,6 +1749,249 @@ mod tests {
         )];
         let events = b.convert(recs, SystemTime::now());
         assert!(!events[0].signals().contains(&Signal::CopyToFile));
+    }
+
+    #[test]
+    fn named_catalog_relations_are_skipped_not_wildcards() {
+        // `pgaudit.log_catalog` / `log_relation` name catalog relations.
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(None));
+        let recs = vec![
+            rec(
+                "c1",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "public.pg_stat_statements_info",
+                "SELECT 1 FROM \"public\".pg_stat_statements_info",
+                Some(1),
+                "psql",
+            ),
+            rec(
+                "c1",
+                2,
+                1,
+                "READ",
+                "SELECT",
+                "pg_catalog.pg_class",
+                "select relname from pg_class",
+                Some(1),
+                "psql",
+            ),
+            // A catalog and a user relation: the user relation only.
+            rec(
+                "c1",
+                3,
+                1,
+                "READ",
+                "SELECT",
+                "pg_catalog.pg_class",
+                "select * from pg_class, crm.t",
+                Some(1),
+                "psql",
+            ),
+            rec(
+                "c1",
+                3,
+                2,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "select * from pg_class, crm.t",
+                Some(1),
+                "psql",
+            ),
+        ];
+        let events = b.convert(recs, SystemTime::now());
+        let all: Vec<String> = events.iter().map(json).collect();
+        assert_eq!(events.len(), 1, "{all:?}");
+        assert!(
+            all[0].contains("shop.crm.t") && !all[0].contains("*\""),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn pg_stat_statements_names_count_only_in_the_extension_schema() {
+        let read = |i: u64, object: &str, text: &str| {
+            rec("k1", i, 1, "READ", "SELECT", object, text, Some(1), "psql")
+        };
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let recs = vec![
+            // The extension's relations in its schema: statistics.
+            read(
+                1,
+                "public.pg_stat_statements",
+                "select query from public.pg_stat_statements",
+            ),
+            read(
+                2,
+                "public.pg_stat_statements_info",
+                "select * from public.pg_stat_statements_info",
+            ),
+            // Look-alike names: a copy of data under a statistics name.
+            read(
+                3,
+                "myschema.pg_stat_statements_x",
+                "select * from myschema.pg_stat_statements_x",
+            ),
+            read(
+                4,
+                "public.pg_stat_statements_copy",
+                "select * from public.pg_stat_statements_copy",
+            ),
+            read(
+                5,
+                "myschema.pg_stat_statements",
+                "select * from myschema.pg_stat_statements",
+            ),
+            // Unnamed record: from the text.
+            read(6, "", "select * from myschema.pg_stat_statements_x"),
+        ];
+        let all: Vec<String> = b
+            .convert(recs, SystemTime::now())
+            .iter()
+            .map(json)
+            .collect();
+        assert_eq!(all.len(), 4, "{all:#?}");
+        assert!(all[0].contains("myschema.pg_stat_statements_x"), "{all:#?}");
+        assert!(
+            all[1].contains("public.pg_stat_statements_copy"),
+            "{all:#?}"
+        );
+        assert!(all[2].contains("myschema.pg_stat_statements\""), "{all:#?}");
+        assert!(all[3].contains("myschema.pg_stat_statements_x"), "{all:#?}");
+        // Without the extension in the database, no name counts.
+        let mut b = PgauditEvents::new(own());
+        let recs = vec![read(
+            1,
+            "public.pg_stat_statements",
+            "select query from public.pg_stat_statements",
+        )];
+        assert_eq!(b.convert(recs, SystemTime::now()).len(), 1);
+        // pg_stat_statements mode: the same rule on the text.
+        let copy = analyze_pss("select * from myschema.pg_stat_statements_x", false);
+        let view = analyze_pss("select query from public.pg_stat_statements", false);
+        let bare = analyze_pss("select query from pg_stat_statements", false);
+        let deltas = [
+            StatementDelta {
+                user: "app",
+                database: "shop",
+                analysis: &copy,
+                calls: 1,
+                rows: 1,
+            },
+            StatementDelta {
+                user: "app",
+                database: "shop",
+                analysis: &view,
+                calls: 1,
+                rows: 1,
+            },
+            StatementDelta {
+                user: "app",
+                database: "shop",
+                analysis: &bare,
+                calls: 1,
+                rows: 1,
+            },
+        ];
+        let t0 = SystemTime::UNIX_EPOCH;
+        let ev = pss_events(&deltas, &mut own(), &shop_catalogs(None), t0, t0);
+        assert_eq!(ev.len(), 1);
+        assert!(json(&ev[0]).contains("myschema.pg_stat_statements_x"));
+    }
+
+    #[test]
+    fn unqualified_pg_names_need_pgaudit_confirmation_without_log_catalog() {
+        let unnamed =
+            |sess: &str, text: &str| rec(sess, 1, 1, "READ", "SELECT", "", text, Some(1), "psql");
+        // `pgaudit.log_catalog = off`: a statement on catalogs only is not
+        // logged, so a logged one naming only `pg_*` read something else.
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(false)));
+        let ev = b.convert(
+            vec![unnamed("u1", "select * from pg_loot")],
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1);
+        assert!(json(&ev[0]).contains("shop..pg_loot"), "{}", json(&ev[0]));
+        // Confirmed by pgaudit as a `pg_catalog` relation: skipped.
+        let mut named = rec(
+            "u2",
+            1,
+            2,
+            "READ",
+            "SELECT",
+            "pg_catalog.pg_class",
+            "select * from pg_class",
+            Some(1),
+            "psql",
+        );
+        named.audit.object_audit = true;
+        let ev = b.convert(
+            vec![unnamed("u2", "select * from pg_class"), named],
+            SystemTime::now(),
+        );
+        assert!(
+            ev.is_empty(),
+            "{:?}",
+            ev.iter().map(json).collect::<Vec<_>>()
+        );
+        // `log_catalog` on or unknown: unqualified `pg_*` names stay
+        // catalogs (residual, README).
+        for c in [shop_catalogs(Some(true)), Catalogs::default()] {
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(c);
+            let ev = b.convert(
+                vec![unnamed("u3", "select * from pg_loot")],
+                SystemTime::now(),
+            );
+            assert!(ev.is_empty());
+        }
+    }
+
+    #[test]
+    fn previously_logged_records_reuse_their_first_text() {
+        // `pgaudit.log_statement_once = on`.
+        let mut b = PgauditEvents::new(own());
+        let text = "select * from crm.t, crm.u";
+        let recs = vec![
+            rec("o1", 1, 1, "READ", "SELECT", "crm.t", text, Some(3), "psql"),
+            rec(
+                "o1",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "crm.u",
+                PREVIOUSLY_LOGGED,
+                Some(3),
+                "psql",
+            ),
+            // A substatement whose first record was not read.
+            rec(
+                "o1",
+                1,
+                2,
+                "READ",
+                "SELECT",
+                "",
+                PREVIOUSLY_LOGGED,
+                Some(1),
+                "psql",
+            ),
+        ];
+        let ev = b.convert(recs, SystemTime::now());
+        assert_eq!(ev.len(), 1);
+        let e = json(&ev[0]);
+        assert!(
+            e.contains("shop.crm.t") && e.contains("shop.crm.u") && e.contains("shop..*"),
+            "{e}"
+        );
+        assert!(e.contains("shape.full_table_read"), "{e}");
     }
 
     #[test]
@@ -1270,7 +2207,7 @@ mod tests {
         ];
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + std::time::Duration::from_secs(10);
-        let events = pss_events(&deltas, &mut own(), t0, t1);
+        let events = pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t1);
         assert_eq!(events.len(), 5);
         assert!(events[0].signals().contains(&Signal::PgDump));
         assert!(events[0].signals().contains(&Signal::FullTableCopy));

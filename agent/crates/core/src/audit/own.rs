@@ -51,6 +51,15 @@ impl Default for OwnUsage {
     }
 }
 
+impl OwnUsage {
+    /// Keys of the objects with a charge (`database NUL schema NUL
+    /// object`), in no order: what the budget currently tracks.
+    #[must_use]
+    pub fn budgeted_objects(&self) -> Vec<String> {
+        self.usage.keys().cloned().collect()
+    }
+}
+
 /// Shared handle on a target's [`OwnUsage`].
 pub type SharedOwnUsage = std::sync::Arc<std::sync::Mutex<OwnUsage>>;
 
@@ -156,6 +165,7 @@ impl OwnAccount {
             return false;
         }
         let rows = e.rows().unwrap_or(self.budget);
+        let identity = self.identity(application, client);
         let mut over = false;
         for o in e.objects() {
             let key = format!(
@@ -166,6 +176,28 @@ impl OwnAccount {
             );
             over |= self.charge(key, rows, now);
         }
+        identity && e.signals().is_empty() && !over
+    }
+
+    /// Like [`OwnAccount::routine`] (account, application, address, no
+    /// signal) but without the row budget: nothing is charged. Only for
+    /// events a connector has established read no row of any relation
+    /// (a closed list of its own statements); a connector that has no
+    /// such list never calls it.
+    #[must_use]
+    pub fn routine_unbudgeted(
+        &self,
+        user: &str,
+        application: Option<&str>,
+        client: ClientSeen,
+        e: &MaskedEvent,
+    ) -> bool {
+        user == self.account && self.identity(application, client) && e.signals().is_empty()
+    }
+
+    /// The application (when logged) and the client address are the
+    /// agent's; the agent's own address must be known.
+    fn identity(&self, application: Option<&str>, client: ClientSeen) -> bool {
         let addr_ok = match (self.addr, client) {
             (None, _) => false,
             (Some(own), ClientSeen::Logged(Some(c))) => own == c,
@@ -176,7 +208,7 @@ impl OwnAccount {
             None => true,
             Some(a) => self.application.as_deref() == Some(a),
         };
-        app_ok && addr_ok && e.signals().is_empty() && !over
+        app_ok && addr_ok
     }
 }
 
@@ -229,6 +261,49 @@ mod tests {
         let mut o = own(Some("192.0.2.14"));
         assert!(!o.charge(key(), 600, t0));
         assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600)));
+    }
+
+    #[test]
+    fn unbudgeted_routine_has_the_same_identity_rules_and_charges_nothing() {
+        let addr = ClientAddr::parse("192.0.2.14");
+        let logged = ClientSeen::Logged(addr);
+        let usage = SharedOwnUsage::default();
+        let o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            addr,
+            1,
+            std::sync::Arc::clone(&usage),
+        );
+        for _ in 0..3 {
+            assert!(o.routine_unbudgeted(
+                "databastion",
+                Some("databastion-agent"),
+                logged,
+                &ev(None)
+            ));
+        }
+        assert!(usage.lock().unwrap().budgeted_objects().is_empty());
+        assert!(!o.routine_unbudgeted("other", None, logged, &ev(None)));
+        assert!(!o.routine_unbudgeted("databastion", Some("psql"), logged, &ev(None)));
+        assert!(!o.routine_unbudgeted(
+            "databastion",
+            None,
+            ClientSeen::Logged(ClientAddr::parse("198.51.100.7")),
+            &ev(None)
+        ));
+        assert!(!o.routine_unbudgeted(
+            "databastion",
+            None,
+            logged,
+            &ev(None).with_signal(Signal::LargeResult)
+        ));
+        assert!(!own(None).routine_unbudgeted(
+            "databastion",
+            None,
+            ClientSeen::NotVisible,
+            &ev(None)
+        ));
     }
 
     #[test]

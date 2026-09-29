@@ -64,10 +64,14 @@ pub(crate) struct AuditProbe {
     pub(crate) pss_loaded: bool,
     pub(crate) stats_visible: bool,
     pub(crate) pgaudit_installed: bool,
-    /// `pgaudit.log` is readable (pgaudit loaded) without
-    /// `pg_read_all_settings`: `Some(true)`; not loaded: `Some(false)`;
-    /// not readable: `None`.
+    /// The pgaudit library is loaded (its own `pgaudit.log_catalog`
+    /// setting is listed by `pg_settings`) and `pgaudit.log` is readable
+    /// without `pg_read_all_settings`: `Some(true)`; not loaded:
+    /// `Some(false)`; not readable: `None`.
     pub(crate) pgaudit_loaded: Option<bool>,
+    /// `pgaudit.*` settings are set while the library is not loaded
+    /// (placeholders): noted, and no pgaudit level.
+    pub(crate) pgaudit_placeholders: bool,
     /// `pgaudit.log` enables the `read` class in this database.
     pub(crate) pgaudit_reads: bool,
     /// `pgaudit.log_rows` is on.
@@ -76,6 +80,10 @@ pub(crate) struct AuditProbe {
     pub(crate) pgaudit_object_audit: bool,
     /// `pgaudit.log_level` (severity of the pgaudit records).
     pub(crate) pgaudit_log_level: Option<String>,
+    /// `pgaudit.log_catalog` (pgaudit loaded only).
+    pub(crate) pgaudit_log_catalog: Option<bool>,
+    /// Schema of the `pg_stat_statements` extension (its info view).
+    pub(crate) pss_schema: Option<String>,
 }
 
 /// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
@@ -195,6 +203,9 @@ pub(crate) struct CheckState {
     /// Per target: the agent's own reads, shared by every Audit stream of
     /// the target (see `databastion_core::audit::own::OwnUsage`).
     own_usage: Mutex<HashMap<String, databastion_core::audit::own::SharedOwnUsage>>,
+    /// Per target: the table-less statements registered by its streams
+    /// (see `audit::events::PgOwn`).
+    own_statements: Mutex<HashMap<String, crate::audit::events::SharedOwnStatements>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -217,6 +228,21 @@ impl CheckState {
     ) -> databastion_core::audit::own::SharedOwnUsage {
         std::sync::Arc::clone(
             self.own_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The table-less statements registered for `target_id`, kept for the
+    /// life of the connector.
+    pub(crate) fn own_statements(
+        &self,
+        target_id: &str,
+    ) -> crate::audit::events::SharedOwnStatements {
+        std::sync::Arc::clone(
+            self.own_statements
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(target_id.to_owned())
@@ -393,6 +419,13 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                     .to_owned(),
             );
         }
+        if probe.pgaudit_placeholders {
+            notes.push(
+                "pgaudit settings are set but the pgaudit library is not loaded \
+                 (shared_preload_libraries)"
+                    .to_owned(),
+            );
+        }
         if probe.pgaudit_loaded == Some(true) && !probe.pgaudit_reads {
             notes.push("pgaudit.log does not include the read class".to_owned());
         }
@@ -543,6 +576,9 @@ pub(crate) struct Prerequisites {
     /// Client address the server sees for the agent (`local` on a Unix
     /// socket), `None` when unknown.
     pub(crate) own_addr: Option<databastion_classifiers::masking::ClientAddr>,
+    /// Per database: the extension schema of `pg_stat_statements` and
+    /// `pgaudit.log_catalog` (what tells catalogs apart in the events).
+    pub(crate) catalogs: crate::audit::events::Catalogs,
 }
 
 pub(crate) async fn prerequisites(
@@ -553,6 +589,7 @@ pub(crate) async fn prerequisites(
     let mut level = AuditLevel::None;
     let mut log_level: Option<String> = None;
     let mut own_addr = None;
+    let mut catalogs = crate::audit::events::Catalogs::default();
     for database in &target.postgres_settings().databases {
         let session = Session::connect(target, database, timeouts).await?;
         if own_addr.is_none() {
@@ -574,6 +611,13 @@ pub(crate) async fn prerequisites(
         }
         let probe = audit_probe(&session, timeouts).await?;
         level = level.max(probe.level(log_readable));
+        catalogs.insert(
+            database,
+            crate::audit::events::DbCatalog {
+                pss_schema: probe.pss_schema.clone(),
+                pgaudit_log_catalog: probe.pgaudit_log_catalog,
+            },
+        );
         if log_level.is_none() {
             log_level = probe.pgaudit_log_level.clone();
         }
@@ -582,6 +626,7 @@ pub(crate) async fn prerequisites(
         level,
         severity: crate::audit::records::expected_severity(log_level.as_deref()),
         own_addr,
+        catalogs,
     })
 }
 
@@ -628,6 +673,7 @@ pub(crate) async fn audit_probe(
         ..AuditProbe::default()
     };
     let info_schema: Option<String> = col(row, 2)?;
+    p.pss_schema.clone_from(&info_schema);
     let superuser = probe(session, timeouts, sql::ROLE_ATTRIBUTES)
         .await?
         .first()
@@ -654,11 +700,24 @@ pub(crate) async fn audit_probe(
                     .flatten())
             };
             let log = setting(0)?;
-            p.pgaudit_loaded = Some(log.is_some());
+            // A `pgaudit.log` value alone may be a placeholder (the
+            // library not loaded): the level needs the library's own
+            // setting in `pg_settings` (`sql::PGAUDIT_SETTINGS`).
+            let library = rows
+                .first()
+                .map(|r| col::<Option<bool>>(r, 4))
+                .transpose()?
+                .flatten()
+                .unwrap_or(false);
+            p.pgaudit_loaded = Some(library && log.is_some());
+            p.pgaudit_placeholders = !library && log.is_some();
             p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
             p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
             p.pgaudit_log_level = setting(3)?;
+            if p.pgaudit_loaded == Some(true) {
+                p.pgaudit_log_catalog = setting(5)?.map(|v| v.eq_ignore_ascii_case("on"));
+            }
         }
         Err(e) if e.fatal => return Err(e),
         Err(_) => p.pgaudit_loaded = None,
@@ -847,10 +906,13 @@ mod tests {
             stats_visible: true,
             pgaudit_installed: true,
             pgaudit_loaded: Some(true),
+            pgaudit_placeholders: false,
             pgaudit_reads: true,
             pgaudit_rows: false,
             pgaudit_object_audit: false,
             pgaudit_log_level: None,
+            pgaudit_log_catalog: None,
+            pss_schema: None,
         };
         // Full needs the audit log to be readable (ADR-0015 decision 4).
         assert_eq!(full_prereqs.level(true), AuditLevel::Full);
