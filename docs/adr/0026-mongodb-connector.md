@@ -1,6 +1,6 @@
 # ADR-0026: MongoDB connector: client, grants, sampling and field paths
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-29
 - **Context references**: P5-A, branch `feat/p5-a-mongodb-discovery` (`agent/crates/connector-mongodb`, `agent/crates/core/src/config.rs`, `dev/mongo/initdb/`); the MongoDB counterpart of [ADR-0012](0012-postgresql-agent-grants.md) / [ADR-0015](0015-postgresql-connector-decisions.md) (PostgreSQL) and [ADR-0018](0018-mysql-mariadb-grants-and-connector.md) / [ADR-0020](0020-mysql-mariadb-connector-as-merged.md) (MySQL / MariaDB). Audit (P5-B, P5-C) is out of scope.
 

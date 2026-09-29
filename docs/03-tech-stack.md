@@ -28,7 +28,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 | Protocol types | typify 0.8, run by the `databastion-protocol-codegen` developer tool (`cargo run -p databastion-protocol-codegen`) | Output committed in `crates/protocol/src/generated.rs` (crate `databastion-protocol`); the codegen tool is not shipped in the agent |
 | PostgreSQL | `tokio-postgres` + rustls | P2-B ([ADR-0015](adr/0015-postgresql-connector-decisions.md)) |
 | MySQL/MariaDB | Own client for the MySQL protocol + rustls, no driver crate | P2-C ([ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md) decision 3) |
-| MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A ([ADR-0026](adr/0026-mongodb-connector.md) decision 1, Proposed); see below |
+| MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A, #74 ([ADR-0026](adr/0026-mongodb-connector.md) decision 1); see below |
 | OpenLDAP | `ldap3` | Not added yet (phase 6) |
 | HTTP client (uplink) | reqwest + rustls (`ring` provider, system trust store) | No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
 | Packaging | Distroless Docker image + `.deb` | |

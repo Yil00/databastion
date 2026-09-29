@@ -201,7 +201,7 @@ Requirements for every connector (acceptance criteria of P2-B and P2-C, in addit
 - RLS policy expressions (which may hold literals) are read into agent memory for the check.
 
 ## MongoDB connector
-*Implemented in P5-A (#74, in review), `agent/crates/connector-mongodb`; decisions in [ADR-0026](adr/0026-mongodb-connector.md) (Proposed); details in `agent/README.md` and the crate README. Discovery only: `check()` reports the audit level None.*
+*Implemented in P5-A (#74), `agent/crates/connector-mongodb`; decisions in [ADR-0026](adr/0026-mongodb-connector.md); details in `agent/README.md` and the crate README. Discovery only: `check()` reports the audit level None.*
 
 - **Own client** (ADR-0026 decision 1): a closed subset of the wire protocol (`OP_MSG` only, no compression, no exhaust), a closed command set built in code (no write command, no `getMore`, no user-supplied filter or pipeline), the reply length checked on the header before the body is read (at most 16 MiB + 64 KiB), BSON parsed by a bounded reader that fails closed. Minimum server: MongoDB 5.0.
 - **One declared host, direct connection** (I5): a standalone, one replica-set member or a `mongos`. The hosts named by the server in `hello` are never contacted, `mongodb+srv` is not supported (no DNS SRV / TXT lookups), and there is no pool or monitoring connection. To scan a replica set, declare the member to read from.

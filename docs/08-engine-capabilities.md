@@ -34,7 +34,7 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 
 > **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations (or all of them, at the cost of a level 2 profiler). A fast `mongodump` of a small collection can go unnoticed. **This must be stated clearly in the user documentation and in the console.**
 
-> **MongoDB, as implemented (P5-A #74, in review; [ADR-0026](adr/0026-mongodb-connector.md), Proposed)**: Discovery only. The three MongoDB rows above are the target levels of P5-B / P5-C, **not implemented yet**: every MongoDB target reports the audit level **None**, with the note `audit.stream_not_available`, whatever its edition. The connector does not report the level a server could provide before it reads an Audit source. See [MongoDB Discovery](#mongodb-discovery) below.
+> **MongoDB, as implemented (P5-A #74; [ADR-0026](adr/0026-mongodb-connector.md))**: Discovery only. The three MongoDB rows above are the target levels of P5-B / P5-C, **not implemented yet**: every MongoDB target reports the audit level **None**, with the note `audit.stream_not_available`, whatever its edition. The connector does not report the level a server could provide before it reads an Audit source. See [MongoDB Discovery](#mongodb-discovery) below.
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
@@ -188,7 +188,7 @@ Behind a proxy every client has the proxy's address, and another process on the 
 
 ## MongoDB Discovery
 
-What the MongoDB connector does, as proposed in P5-A (#74, [ADR-0026](adr/0026-mongodb-connector.md)). The reference is [the connector README](../agent/crates/connector-mongodb/README.md); the account is in [05-security.md](05-security.md#recommended-database-accounts-read-only).
+What the MongoDB connector does, as merged in P5-A (#74, [ADR-0026](adr/0026-mongodb-connector.md)). The reference is [the connector README](../agent/crates/connector-mongodb/README.md); the account is in [05-security.md](05-security.md#recommended-database-accounts-read-only).
 
 ### Scope
 - **One declared host**: a standalone, one replica-set member or a `mongos`, reached directly. The other replica-set members are never contacted and `mongodb+srv` is not supported: to scan a replica set, declare the member to read from (a secondary spares the primary). Reads carry `secondaryPreferred`. MongoDB 5.0 or later; SCRAM-SHA-256 accounts only.
