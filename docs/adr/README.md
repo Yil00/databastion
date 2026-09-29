@@ -25,5 +25,6 @@ An accepted ADR is not edited. A new ADR either supersedes it, or refines it (a 
 | [0017](0017-alerting.md) | Alerting: webhook signature, channel secrets, outbox delivery, skipped slugs, system alerts, SMTP client, SSRF model, volume bounds | Accepted |
 | [0018](0018-mysql-mariadb-grants-and-connector.md) | MySQL / MariaDB agent grants (minimal variant) and connector decisions: engine allow-list, own protocol client, authentication and TLS policy, audit level before P4-B | Accepted |
 | [0019](0019-incident-reopen-cutoff.md) | "Seen after the resolution" decided on the scan job's first delivery (refines 0014) | Accepted |
+| [0020](0020-mysql-mariadb-connector-as-merged.md) | MySQL / MariaDB connector as merged: row estimates read after the engine check, `extended_grants` opt-in, parser property tests, dev accounts on the minimal variant (refines 0018) | Accepted |
 
 Template: copy [template.md](template.md).
