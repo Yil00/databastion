@@ -1,8 +1,8 @@
 # ADR-0028: Constraints on large console tables are validated outside the migration transaction
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-29
-- **Context references**: P7 (ROADMAP item "Console migration `0027`: the `access_events_bytes` CHECK constraint should be added `NOT VALID` then `VALIDATE`d", from the P4-D review, Low), PR #75, commit 285594e: `console/src/db/online-constraints.ts`, `console/src/db/run-migrations.ts`, `console/src/db/migrations.test.ts`, `console/README.md` ("Constraints on large tables")
+- **Context references**: P7 (ROADMAP item "Console migration `0027`: the `access_events_bytes` CHECK constraint should be added `NOT VALID` then `VALIDATE`d", from the P4-D review, Low), PR #75, commits 285594e and 3da8ea9 (security review L1, L2): `console/src/db/online-constraints.ts`, `console/src/db/run-migrations.ts`, `console/src/db/migrations.test.ts`, `console/README.md` ("Constraints on large tables")
 
 ## Context
 The console schema changes only through versioned Drizzle migrations ([AGENTS.md](../../AGENTS.md), "Conventions – Console"), applied by `migrate` with drizzle's migrator.
@@ -24,7 +24,7 @@ Migrations `0021` (which creates `access_events`) to `0026` were merged together
 ## Decision
 1. **Pre-flight for `0027`.** Before drizzle's migrator runs, `migrate` (`applyAccessEventsBytesOnline` in `console/src/db/online-constraints.ts`) applies `0027` itself when, and only when, all of the following hold:
    - the migrations folder contains `0027` right after `0026`, and the file matches its journal entry;
-   - the last migration recorded in `drizzle.__drizzle_migrations` is `0026` (checked again after taking an `EXCLUSIVE` lock on that table, so two concurrent `migrate` runs do not both apply it);
+   - the last migration recorded in `drizzle.__drizzle_migrations` is `0026` (checked again after taking an `EXCLUSIVE` lock on that table, as a second guard behind the run lock of decision 6);
    - `access_events` exists and has no `bytes` column.
 
    It then runs:
@@ -33,13 +33,14 @@ Migrations `0021` (which creates `access_events`) to `0026` were merged together
 
    Drizzle's migrator then sees `0027` as applied and runs `0028` onwards. The statements are those of `0027`, word for word, except for `NOT VALID`. The final schema (column, constraint name and expression, validated) is the one of `0027`. Drizzle-kit's snapshots therefore stay exact, and a later `migrate` run makes no change.
 2. **Every other state keeps the plain `0027`.** A fresh install runs it as shipped (the table is created empty in the same run). An install that already applied it keeps its validated constraint. An install whose last migration is before `0021` has no `access_events` table yet.
-3. **`DEFERRED_VALIDATIONS`.** `migrate` validates, after drizzle's migrator and on every run, each constraint of the constant list `DEFERRED_VALIDATIONS` (`online-constraints.ts`) that exists and is still `NOT VALID`. Each constraint is validated in its own autocommit statement. This finishes a run interrupted between the two steps of decision 1. The list holds constant, owner-defined names only; never input.
+3. **`DEFERRED_VALIDATIONS`.** `migrate` validates, after drizzle's migrator and on every run, each constraint of the constant list `DEFERRED_VALIDATIONS` (`online-constraints.ts`) that exists and is still `NOT VALID`. Each constraint is validated in its own autocommit statement. This finishes a run interrupted between the two steps of decision 1. The list holds constant, owner-defined names only; never input. Every table and constraint name must be a plain lower-case identifier (`^[a-z_][a-z0-9_]{0,62}$`), checked for the whole list before any query; a name that does not match is a programming error and fails `migrate`.
 4. **Rule for new migrations.** A `CHECK` or foreign key added to a console table that may be large is written `NOT VALID` in a custom migration and listed in `DEFERRED_VALIDATIONS`. It is never validated inside the migration itself.
 5. **Precise exception to "schema only through versioned migrations".** The migrate runner may change the schema outside a migration SQL file in two cases only:
    - (a) applying `0027` as in decision 1: same statements with `NOT VALID`, recorded under `0027`'s real hash, only on an install at exactly `0026`;
    - (b) `VALIDATE CONSTRAINT` for the constraints of `DEFERRED_VALIDATIONS`.
 
    Neither case changes the final schema that the migration files define. Any other change outside a migration file needs a new ADR.
+6. **Concurrent `migrate` runs are serialized.** Each run holds a session-level PostgreSQL advisory lock (`MIGRATION_LOCK_KEY` in `console/src/db/run-migrations.ts`) on a dedicated connection for the whole run: the `pgboss` ownership pre-flight, the `0027` pre-flight, drizzle's migrator and the deferred validations. The lock is released in a `finally` block, and by the server if the connection drops. A second run waits for it, then finds nothing pending.
 
 ## Consequences
 - An upgrade from `0026` no longer blocks `access_events` for a full-table scan: the `ACCESS EXCLUSIVE` lock is held for milliseconds, and the validation scan lets the web and worker processes read and write.
@@ -50,6 +51,7 @@ Migrations `0021` (which creates `access_events`) to `0026` were merged together
 ## Limits
 - **Only installs at exactly `0026`** take the online path. The only other states in which `access_events` holds rows while `0027` is pending are builds from inside #54 (`0021` to `0025`). Those were never merged states, and they take the plain `0027` with its lock.
 - **Only `0027`** is covered by decision 1. Every other shipped migration that added a constraint to an existing table keeps its locking behaviour. Future ones follow decision 4.
+- A `migrate` run blocked on a long validation keeps any other `migrate` run waiting (decision 6); the web and worker processes are not affected.
 - The rule of decision 4 relies on review: no check fails a migration that adds a validated constraint to a large table.
 
 ## Rejected alternatives
