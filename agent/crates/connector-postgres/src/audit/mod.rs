@@ -141,6 +141,7 @@ pub(crate) async fn audit_stream(
                         })
                     }
                 };
+                st.builder.set_catalogs(pre.catalogs.clone());
                 if let Err(kind) = pgaudit_run(cfg, target, sink, state, st, &pre.severity).await? {
                     tracing::warn!(
                         target_id = %target.id,
@@ -162,6 +163,7 @@ pub(crate) async fn audit_stream(
                     pss_session = Some(conn);
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
+                    poller.set_catalogs(pre.catalogs.clone());
                     pss_run(cfg, target, sink, session, poller, timeouts).await?;
                 }
             }

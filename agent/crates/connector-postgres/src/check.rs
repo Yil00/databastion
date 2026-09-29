@@ -80,6 +80,10 @@ pub(crate) struct AuditProbe {
     pub(crate) pgaudit_object_audit: bool,
     /// `pgaudit.log_level` (severity of the pgaudit records).
     pub(crate) pgaudit_log_level: Option<String>,
+    /// `pgaudit.log_catalog` (pgaudit loaded only).
+    pub(crate) pgaudit_log_catalog: Option<bool>,
+    /// Schema of the `pg_stat_statements` extension (its info view).
+    pub(crate) pss_schema: Option<String>,
 }
 
 /// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
@@ -551,6 +555,9 @@ pub(crate) struct Prerequisites {
     /// Client address the server sees for the agent (`local` on a Unix
     /// socket), `None` when unknown.
     pub(crate) own_addr: Option<databastion_classifiers::masking::ClientAddr>,
+    /// Per database: the extension schema of `pg_stat_statements` and
+    /// `pgaudit.log_catalog` (what tells catalogs apart in the events).
+    pub(crate) catalogs: crate::audit::events::Catalogs,
 }
 
 pub(crate) async fn prerequisites(
@@ -561,6 +568,7 @@ pub(crate) async fn prerequisites(
     let mut level = AuditLevel::None;
     let mut log_level: Option<String> = None;
     let mut own_addr = None;
+    let mut catalogs = crate::audit::events::Catalogs::default();
     for database in &target.postgres_settings().databases {
         let session = Session::connect(target, database, timeouts).await?;
         if own_addr.is_none() {
@@ -582,6 +590,13 @@ pub(crate) async fn prerequisites(
         }
         let probe = audit_probe(&session, timeouts).await?;
         level = level.max(probe.level(log_readable));
+        catalogs.insert(
+            database,
+            crate::audit::events::DbCatalog {
+                pss_schema: probe.pss_schema.clone(),
+                pgaudit_log_catalog: probe.pgaudit_log_catalog,
+            },
+        );
         if log_level.is_none() {
             log_level = probe.pgaudit_log_level.clone();
         }
@@ -590,6 +605,7 @@ pub(crate) async fn prerequisites(
         level,
         severity: crate::audit::records::expected_severity(log_level.as_deref()),
         own_addr,
+        catalogs,
     })
 }
 
@@ -636,6 +652,7 @@ pub(crate) async fn audit_probe(
         ..AuditProbe::default()
     };
     let info_schema: Option<String> = col(row, 2)?;
+    p.pss_schema.clone_from(&info_schema);
     let superuser = probe(session, timeouts, sql::ROLE_ATTRIBUTES)
         .await?
         .first()
@@ -677,6 +694,9 @@ pub(crate) async fn audit_probe(
             p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
             p.pgaudit_log_level = setting(3)?;
+            if p.pgaudit_loaded == Some(true) {
+                p.pgaudit_log_catalog = setting(5)?.map(|v| v.eq_ignore_ascii_case("on"));
+            }
         }
         Err(e) if e.fatal => return Err(e),
         Err(_) => p.pgaudit_loaded = None,
@@ -870,6 +890,8 @@ mod tests {
             pgaudit_rows: false,
             pgaudit_object_audit: false,
             pgaudit_log_level: None,
+            pgaudit_log_catalog: None,
+            pss_schema: None,
         };
         // Full needs the audit log to be readable (ADR-0015 decision 4).
         assert_eq!(full_prereqs.level(true), AuditLevel::Full);

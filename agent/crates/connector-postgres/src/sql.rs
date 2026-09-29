@@ -356,7 +356,8 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
 
 /// pgaudit settings of this session's database: `pgaudit.log`,
 /// `pgaudit.log_rows`, `pgaudit.role`, `pgaudit.log_level` (`NULL` when
-/// not set), and whether the pgaudit library is loaded. Settings, not
+/// not set), whether the pgaudit library is loaded, and
+/// `pgaudit.log_catalog`. Settings, not
 /// data; readable without `pg_read_all_settings` (verified in P2-B).
 ///
 /// A `pgaudit.*` value alone does not prove the library is loaded: set in
@@ -373,7 +374,8 @@ pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.role', true), \
        pg_catalog.current_setting('pgaudit.log_level', true), \
        EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
-               WHERE s.name = 'pgaudit.log_catalog' AND s.vartype = 'bool')";
+               WHERE s.name = 'pgaudit.log_catalog' AND s.vartype = 'bool'), \
+       pg_catalog.current_setting('pgaudit.log_catalog', true)";
 
 /// Client address the server sees for this session (`NULL` on a Unix
 /// socket): tells the agent's own statements apart in the audit log.

@@ -27,7 +27,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{OwnAccount, StatementDelta, analyze_pss, pss_events};
+use super::events::{Catalogs, OwnAccount, StatementDelta, analyze_pss, pss_events};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -52,6 +52,7 @@ pub(crate) struct PssPoller {
     schema: String,
     toplevel: bool,
     own: OwnAccount,
+    catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
     analyses: HashMap<Key, QueryAnalysis>,
     last_poll: SystemTime,
@@ -115,6 +116,7 @@ pub(crate) async fn connect(
                 schema,
                 toplevel,
                 own,
+                catalogs: Catalogs::default(),
                 snapshot: None,
                 analyses: HashMap::new(),
                 last_poll: SystemTime::now(),
@@ -139,6 +141,11 @@ fn delta(now: Counters, prev: Option<Counters>, first: bool) -> Option<(u64, u64
 }
 
 impl PssPoller {
+    /// Sets the per-database catalog facts (re-probed with the source).
+    pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
+        self.catalogs = catalogs;
+    }
+
     /// One poll: reads the counters, fetches the texts of new statements,
     /// submits the events of the deltas.
     pub(crate) async fn poll(
@@ -244,7 +251,7 @@ impl PssPoller {
                 })
             })
             .collect();
-        let events = pss_events(&deltas, &mut self.own, self.last_poll, now);
+        let events = pss_events(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
         drop(deltas);
         self.snapshot = Some(snapshot);
         self.last_poll = now;

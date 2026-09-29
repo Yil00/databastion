@@ -28,6 +28,15 @@ placeholders). Settings without the library give no pgaudit level (at best
 Limited), with the note "pgaudit settings are set but the pgaudit library
 is not loaded".
 
+The proof, like every setting the probe reads, reflects **the agent's own
+session** in each monitored database. A library loaded for some roles or
+databases only (`session_preload_libraries`, `ALTER ROLE … SET
+session_preload_libraries`, `LOAD`) or `pgaudit.*` values set per role
+(`ALTER ROLE … SET pgaudit.log`) may differ for other roles: the level
+says what holds for the agent's session, not that every role is audited
+alike. pgaudit itself requires `shared_preload_libraries` (it refuses to
+load otherwise), so a server-wide load is the normal case.
+
 ## Known limits
 
 - **At-most-once delivery.** The log cursor advances once the events are
@@ -57,6 +66,39 @@ is not loaded".
   the database, never dropped. Relations named by pgaudit itself
   (`pgaudit.log_catalog`, `log_relation`) are skipped when they are
   catalogs, like catalogs named by the text.
+- **What counts as a catalog.** Relations in `pg_catalog`,
+  `information_schema`, `pg_toast` and the temporary schemas; and the two
+  relations of the `pg_stat_statements` extension
+  (`pg_stat_statements`, `pg_stat_statements_info`) **only in the
+  extension's schema** of that database, as probed from the agent's
+  session (a `pg_stat_statements_x` or a `pg_stat_statements` in another
+  schema is application data: any role with `CREATE` can make one). A
+  database the target does not list has no known extension schema. An
+  **unqualified** `pg_*` name (the text does not tell its schema):
+  - pgaudit with `pgaudit.log_catalog = off` (as the agent's session sees
+    it): statements on catalogs only are not logged, so an unqualified
+    `pg_*` name in a logged record without object name is a catalog only
+    when pgaudit names it in `pg_catalog` for the same statement;
+    otherwise it is reported as a relation without schema.
+  - pgaudit with `log_catalog` on (the pgaudit default) or unknown, and
+    `pg_stat_statements` (which names no object): it counts as a catalog.
+    **Residual:** a role that can create a relation named `pg_*` in a
+    schema of its search path (`CREATE TABLE public.pg_loot AS SELECT …`)
+    and reads it later by its unqualified name is not reported for that
+    later read (the copy itself reads the source relation and is
+    reported). With pgaudit, `pgaudit.log_relation = on` names every
+    relation with its schema and closes this; so does `log_catalog = off`.
+    An unqualified `pg_stat_statements` / `pg_stat_statements_info` counts
+    as a catalog when the extension is installed in the database (the same
+    residual for a shadowing relation earlier in the search path).
+- **`pgaudit.log_statement_once = on`.** Only the first record of a
+  statement and substatement carries the text; later ones carry
+  `<previously logged>`. The connector analyzes those with the first
+  record's text of the same substatement when it read it; when it did not
+  (the first record fell before the cursor, or in another read), the text
+  does not parse and the record's objects are unknown (`*`, fail safe).
+  Signals computed from the text then come from the records whose text is
+  known.
 - **The agent's own account.** Its statements are left out only when all
   hold: they come from its `application_name` (`databastion-agent`, pgaudit
   only) and from its own client address as the server sees it
