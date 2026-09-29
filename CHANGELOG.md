@@ -18,6 +18,7 @@ The project follows [semantic versioning](https://semver.org/).
 - Console: policy and notification wake-ups were not sent by the production build; process-wide state now lives in `processGlobal` / `processSlot`, and the build checks the wake-up functions (#63)
 - Agent: the PostgreSQL connector's own table-less statements are no longer reported as access events; other agent-account events on unknown objects are always reported; pgaudit counts as loaded only when its `pgaudit.log_catalog` setting is in `pg_settings`; `pg_stat_statements` counts as a catalog only in the extension's schema (#65)
 - Agent: a scan's terminal status no longer overtakes its findings: it waits up to 120 s for the console to answer the scan's findings batches (no wait for a cancelled scan, a parked `/findings` or a spool worker in backoff), otherwise it is counted in `scan_status_before_flush_total` (#70, ADR-0025)
+- Agent: access event `ts` / `ts_last` are clamped to the agent clock in the core, so a database server clock ahead of the agent no longer gets batches rejected with `400` (`formatMaximum`), raising an integrity event and losing the events; dev and E2E agent accounts raised to 5 connections (ADR-0025 decision 11) (#72)
 - Agent: heartbeat target checks run concurrently under one 10 s deadline instead of one after the other (N slow targets delayed the heartbeat by up to N × 10 s), taking turns per database account; a check that misses the deadline is reported `timeout` with `check.timed_out` (#70, ADR-0025)
 
 ### 🐛 Agent classifiers
