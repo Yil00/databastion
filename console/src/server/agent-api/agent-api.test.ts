@@ -44,6 +44,7 @@ import {
   expireVerifiedCacheForTests,
   failuresPerAgent,
   failuresPerIp,
+  holdUnrecognizedVerificationForTests,
 } from "./auth";
 import {
   enrollPerIp,
@@ -626,15 +627,25 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     it("allows one unrecognized verification in flight per agent id (L1)", async () => {
       const auth = await enroll();
       const wrong = (await enroll("l1-other")).secret;
-      const results = await Promise.all(
-        Array.from({ length: 6 }, () =>
-          handleHeartbeat(
-            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
-          ),
-        ),
-      );
-      expect(results.filter((r) => r.status === 401)).toHaveLength(1);
-      expect(results.filter((r) => r.status === 503)).toHaveLength(5);
+      const heartbeat = () =>
+        handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+      // Deterministic: while one verification of this agent id is in flight, every other unrecognized
+      // secret is turned away with 503 (the timing of 6 concurrent requests made this flaky: a fast
+      // verification could finish and free the slot before the next request reached the gate).
+      // Static import: the auth module instance the static handleHeartbeat uses (an earlier test
+      // resets the module registry, so a dynamic import would load another instance).
+      const release = holdUnrecognizedVerificationForTests(auth.agentId);
+      let held: Response[];
+      try {
+        held = await Promise.all(Array.from({ length: 5 }, heartbeat));
+      } finally {
+        release();
+      }
+      expect(held.map((r) => r.status)).toEqual([503, 503, 503, 503, 503]);
+      // Once the slot is free, the next one is verified (and fails: 401).
+      expect((await heartbeat()).status).toBe(401);
     });
 
     it("saturated login and wrong-secret pools never block a known-good agent", async () => {

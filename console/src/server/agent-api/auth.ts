@@ -299,6 +299,15 @@ function rememberHint(agent: AgentRow | undefined, agentId: string): void {
   });
 }
 
+/**
+ * Test hook: marks an unrecognized-secret verification of `agentId` as in flight (L1), as a slow
+ * argon2id verification would; returns the release. Makes the fair-allocation test deterministic.
+ */
+export function holdUnrecognizedVerificationForTests(agentId: string): () => void {
+  unrecognizedInFlight.add(agentId);
+  return () => unrecognizedInFlight.delete(agentId);
+}
+
 /** Test hook: simulates a restarted process (no known-good hints in memory). */
 export function clearKnownGoodHintsForTests(): void {
   knownGoodHints.clear();
