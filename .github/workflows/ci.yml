@@ -113,6 +113,13 @@ jobs:
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      # Invariant I7: production dependencies only under licenses of the agent/deny.toml allow-list
+      # (or a reasoned entry of scripts/console-license-exceptions.json).
+      - name: License gate (production dependencies)
+        run: |
+          timeout 60 python3 -m unittest discover -s ../scripts -p 'test_check_console_licenses.py'
+          pnpm licenses list --prod --json > "$RUNNER_TEMP/console-licenses.json"
+          python3 ../scripts/check_console_licenses.py "$RUNNER_TEMP/console-licenses.json"
       - run: pnpm lint
       - run: pnpm typecheck
       # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
