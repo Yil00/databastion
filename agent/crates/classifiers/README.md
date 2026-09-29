@@ -206,6 +206,42 @@ and addresses NFC-normalized, trimmed, whitespace collapsed, lowercased; keys an
 time) and the normalized values are zeroized on drop. Production callers must pass the agent key
 (`ColumnClassifier::with_key`); without it the sample order is random per call.
 
+## Access events and signals (ADR-0007, P4-A)
+
+`masking::MaskedEvent` is the only event type the uplink accepts. It is built
+from closed enums (`EventSource`, `EventAction`, `Signal`), an
+`EventPrincipal` (account name; application reduced to
+`[A-Za-z0-9 ._:/+-]{0,64}`; client address kept only as an IP literal or
+`local`) and `EventObject`s made of `NormalizedName`s. It has no field for
+query text, parameters or returned values.
+
+The contract `Signal` is an open pattern (`signature.* | shape.* | volume.*`);
+this agent emits only the closed set below:
+
+| Signal | Emitted when |
+|---|---|
+| `signature.pg_dump` | `application_name` is `pg_dump` / `pg_dumpall`, or one session (one role per `pg_stat_statements` poll) copied at least 3 distinct whole relations to the client |
+| `signature.copy_to_file` | `COPY … TO '<server file>'` |
+| `signature.copy_to_program` | `COPY … TO PROGRAM` |
+| `shape.full_table_copy` | `COPY` out of a whole relation, or of a query without filter, aggregation or small limit |
+| `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit of at least 10 000 rows |
+| `volume.large_result` | at least 10 000 rows returned or affected by one statement (or one counter delta) |
+
+## Query normalizer (ADR-0012 obligation 5)
+
+`query::analyze` lexes PostgreSQL statement text and keeps only
+literal-free tokens: statement kind, relation names (from identifier tokens,
+normalized before the uplink), `COPY` form, and shape (`*`, `WHERE`,
+aggregation, `LIMIT`). The normalized text (DML allow-list only: `SELECT`,
+`INSERT`, `UPDATE`, `DELETE`, `MERGE`, `VALUES`, `TABLE`, `WITH`) has every
+literal and parameter replaced by `?`, comments removed, identifiers
+normalized, at most 1024 characters; it is never sent (the contract has no
+field for it). Fail-closed rules: unterminated literal / identifier /
+comment, text over 1 MiB, possibly truncated text, or a backslash whose
+reading depends on `standard_conforming_strings` give no normalized text
+(and no shape or relations when ambiguous). Property tests:
+`tests/query_props.rs`.
+
 ## Tests
 
 - unit tests: positive / negative cases per detector, validator, hint and masking format;
