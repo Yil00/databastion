@@ -19,7 +19,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B), Audit (P4-A, [README](crates/connector-postgres/README.md)) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
-| `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
+| `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector: Discovery, `check()` and Audit through `cn=accesslog` (phase 6, [ADR-0029](../docs/adr/0029-openldap-connector.md), [README](crates/connector-openldap/README.md)) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
 
@@ -445,7 +445,88 @@ hostile SCRAM answers, cursor handling and a whole scan of the dev seed (checked
 `dev/ground-truth.json`) also run against a scripted server over an in-memory stream
 (`src/fake.rs`).
 
-### Future database drivers (ldap3)
+### OpenLDAP connector
+No LDAP library ([ADR-0029](../docs/adr/0029-openldap-connector.md) decision 1): `ldap3` 0.12
+builds without OpenSSL, but its codec buffers whatever length a server announces, its decoder
+panics on an empty `LDAPMessage`, its errors carry the server's `diagnosticMessage` and
+`matchedDN`, and the write operations are compiled in. The connector speaks a closed subset of
+LDAPv3 itself (`crates/connector-openldap/src/ber.rs`, `proto.rs`, `conn.rs`) over tokio and the
+same rustls crates:
+
+- encoders for `BindRequest` (simple, SASL `EXTERNAL`), `SearchRequest`, the StartTLS and Who am
+  I? extended requests and `UnbindRequest` only: no write operation, compare or other extended
+  operation can be sent (I4); filters built in code;
+- BER read by a bounded reader: definite lengths of at most 4 octets, low tag numbers, the
+  message length checked before the body (16 MiB), zeroized buffers, fail closed; results reduced
+  to their numeric code (never `diagnosticMessage`, `matchedDN` or referral URIs); a response to
+  another message id or an unsolicited notification ends the connection;
+- referrals and continuation references are never followed (I5), aliases never dereferenced;
+- TLS: `verify_full` (default, LDAPS on 636) or `start_tls` (StartTLS on 389, no fallback, and no
+  byte accepted between the StartTLS response and the handshake), against a pinned CA
+  (`openldap.ca_file`) or the system store, host name or IP SAN checked; `disable` only on an
+  `ldapi://` socket or a loopback literal; **no `disable_insecure`** (a simple bind sends the
+  password itself);
+- authentication: simple bind with the service DN (`account`) and its password (an empty
+  password is never sent: it would be an unauthenticated bind), or SASL `EXTERNAL` over `ldapi://`
+  (`openldap.bind: sasl_external`, no `secret`); then Who am I? must return a DN (never
+  anonymous), equal to `account` for `EXTERNAL`.
+
+Behavior:
+
+- every search has a size limit, a time limit (the job's statement timeout, at least 1 s) and a
+  client-side deadline, `derefAliases: never`, and an attribute list built in code; a search is
+  read to its end before any finding is submitted;
+- Discovery: the root DSE's naming contexts (at most 64; the `openldap.accesslog_base` database
+  never), the schema from the subschema subentry, then per naming context a subtree listing of
+  the containers (`organizationalUnit`, `organization`, `dcObject`, `domain`, `country`,
+  `locality`; DNs only, at most 1024) and one one-level search per container (`sizeLimit` =
+  `sample_rows`). Requested attributes: `userApplications` attributes of a text syntax (Directory,
+  IA5, Printable, Numeric and Country String, Telephone Number, Postal Address, Generalized Time,
+  Integer), custom ones included; **never** `userPassword`, `authPassword`, their subtypes or the
+  closed list of password-equivalent hashes, nor DN-valued, binary or unknown syntaxes;
+- locations: naming context (`database`), container (`schema`, the entry's parent reduced by
+  `names::normalize_ldap_dn`: `ou=<a person>` becomes `ou=*`), structural object class
+  (`object`), attribute (`field`, canonical name lowercased, options dropped); containers with
+  the same normalized name are pooled; entry DNs never leave the agent nor reach the logs;
+- `check()`: reachability; `cn=config` readable, password attributes disclosed to an
+  attributes-only search of the first 64 entries of each naming context (values never
+  transferred), `cn=accesslog` readable without a running Audit stream; write access is never
+  tested and always noted as not evaluated; recomputed at most every 10 minutes per target.
+
+Audit (ADR-0029 decisions 7 to 10; `src/audit/`):
+
+- source `cn=accesslog` (`slapo-accesslog`), read over LDAP with the same session settings:
+  **Full** when every naming context has a search record from the last 24 h (checked by
+  `check()`, after one base search of the context when none is found), Partial when some do,
+  Limited when none do (`audit.reads_not_logged`), None when the log is not readable
+  (`audit.accesslog_not_readable`);
+- incremental by `entryCSN` (commit order; `reqStart` would skip long exports), with a 10 s
+  overlap and the CSNs already read; `sizeLimit` 1000 per search, repeated while cut; cursor
+  persisted by the core, first start one minute back;
+- read: `reqType`, `reqStart`, `reqSession`, `reqAuthzID`, `reqDN`, `reqResult`, `reqScope`,
+  `reqFilter`, `reqAttr`, `reqAttrsOnly`, `reqEntries`, `reqSizeLimit`, `reqMethod`,
+  `entryCSN`; never `reqMod`, `reqOld`, `reqAssertion`, `reqMessage` or the controls. The filter
+  and the DN are reduced in memory to closed facts (unselective or not, the agent's own filter or
+  not; naming context, normalized container, a keyed hash for paged totals);
+- events: principal = authorization DN (bind DN for binds, fingerprinted on failure), no client
+  address (the log has none); objects = the naming context and the console's `sensitive_objects`
+  reachable from the base and scope, else `*` with the container; rows = `reqEntries`;
+- signals: `shape.bulk_search` (scope one-level, subtree or children with a filter of presence
+  tests and `objectClass` assertions only), `volume.large_result` (more than 10 000 entries by one
+  search or by the pages of one paged search: same connection, base and scope);
+- the agent's own reads and binds are left out for its Who am I? DN, without signal, within the
+  Discovery budget per object and day (`ClientSeen::NotRecorded`: no address rule); its exact
+  container listing and check probes are not charged; writes are always reported.
+
+Target settings: the `openldap` block of a target in `agent.example.yaml`. Integration tests
+(`src/it.rs`) run against the dev `openldap` service when `DATABASTION_TEST_LDAP_URL` and
+`DATABASTION_TEST_LDAP_PASSWORD` are set (`DATABASTION_TEST_LDAP_ADMIN_PASSWORD` for the
+over-privilege and Audit tests, `DATABASTION_TEST_LDAP_EXPORT_CMD` for a real paged `ldapsearch`,
+`DATABASTION_TEST_LDAPS_URL` / `DATABASTION_TEST_LDAP_CA_FILE` for TLS), and are skipped otherwise;
+the handshake, StartTLS injection, hostile responses and a scan also run against a scripted
+server over an in-memory stream (`src/fake.rs`); property tests in `src/proptests.rs`.
+
+### Future database drivers
 Add them with `default-features = false` and rustls-only TLS features, and
 re-check `Cargo.lock` for OpenSSL. Every query gets a timeout and bounded
 sampling (I4). Driver errors can echo query text or values: map them to
