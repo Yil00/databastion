@@ -342,13 +342,18 @@ pub(crate) const COLUMN_PRIVILEGES: &str = concat!(
 /// itself (`1`) rather than to one of its roles.
 pub(crate) const APPLICABLE_ROLES_MYSQL: &str = "SELECT r.ROLE_NAME, r.ROLE_HOST, r.IS_GRANTABLE, \
      r.IS_MANDATORY, r.GRANTEE = r.USER AND r.GRANTEE_HOST = r.HOST \
-     FROM information_schema.APPLICABLE_ROLES r LIMIT 1000";
+     FROM information_schema.APPLICABLE_ROLES r LIMIT 1001";
 
 /// Roles applicable to the account, MariaDB (granted directly or through
 /// another role, the default role included). Columns: role name,
 /// grantable (`WITH ADMIN OPTION`).
 pub(crate) const APPLICABLE_ROLES_MARIADB: &str =
-    "SELECT r.ROLE_NAME, r.IS_GRANTABLE FROM information_schema.APPLICABLE_ROLES r LIMIT 1000";
+    "SELECT r.ROLE_NAME, r.IS_GRANTABLE FROM information_schema.APPLICABLE_ROLES r LIMIT 1001";
+
+/// Rows of `APPLICABLE_ROLES_*` read at most: the statements ask for one
+/// more, and more rows than this means the list is cut (every role is
+/// then reported as not evaluated).
+pub(crate) const MAX_ROLE_ROWS: usize = 1000;
 
 /// Whether a role name or host from `APPLICABLE_ROLES` may be written into
 /// a statement: a short allow-listed charset, on top of the quoting, so a
@@ -377,9 +382,12 @@ pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&quote_ident(name)?);
+        // `'name'@'host'`: the account-name form of the MySQL manual
+        // ("Specifying Account Names"); an empty host is `''` (a quoted
+        // identifier cannot be empty).
+        out.push_str(&quote_str(name)?);
         out.push('@');
-        out.push_str(&quote_ident(host).unwrap_or_else(|| "``".to_owned()));
+        out.push_str(&quote_str(host)?);
     }
     Some(out)
 }
@@ -745,8 +753,8 @@ mod tests {
             ])
             .as_deref(),
             Some(
-                "SHOW GRANTS FOR CURRENT_USER() USING `app_read`@`%`, \
-                 `ops`@`10.0.0.0/255.0.0.0`, `r`@``"
+                "SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
+                 'ops'@'10.0.0.0/255.0.0.0', 'r'@''"
             )
         );
         assert_eq!(show_grants_using(&[]), None);

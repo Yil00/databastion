@@ -357,6 +357,50 @@ fn label(privilege: &str) -> String {
     }
 }
 
+/// Whether a database name from a grant covers the database `name`.
+///
+/// Database-level grants are stored as `LIKE` patterns: `_` and `%` are
+/// wildcards unless escaped with `\` (`performance\_schema`, `%`, `mysq_`
+/// and `m%` all cover a system database). The comparison is a `LIKE`
+/// match, case-insensitive, with `\` escapes; it over-reports on purpose
+/// for a name that is literal on the server (a table-level grant, or a
+/// database grant with `partial_revokes` ON), never under-reports.
+pub(crate) fn db_matches(pattern: &str, name: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum P {
+        Char(char),
+        One,
+        Any,
+    }
+    let mut p = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        p.push(match c {
+            '\\' => match chars.next() {
+                Some(e) => P::Char(e),
+                None => P::Char('\\'),
+            },
+            '_' => P::One,
+            '%' => P::Any,
+            c => P::Char(c),
+        });
+    }
+    let n: Vec<char> = name.chars().collect();
+    // `m[i][j]`: the first `i` pattern items match the first `j` chars.
+    let mut m = vec![vec![false; n.len() + 1]; p.len() + 1];
+    m[0][0] = true;
+    for i in 1..=p.len() {
+        for j in 0..=n.len() {
+            m[i][j] = match p[i - 1] {
+                P::Any => m[i - 1][j] || (j > 0 && m[i][j - 1]),
+                P::One => j > 0 && m[i - 1][j - 1],
+                P::Char(c) => j > 0 && m[i - 1][j - 1] && c.eq_ignore_ascii_case(&n[j - 1]),
+            };
+        }
+    }
+    m[p.len()][n.len()]
+}
+
 /// Evaluates over-privilege. Returns (over-privileged, expected) closed
 /// labels for the logs, and the same as closed notes; with the
 /// extended-variant flag, a global `SELECT` is expected.
@@ -415,10 +459,10 @@ pub(crate) fn evaluate_privileges(
         grantable |= *gr;
         let p = p.to_ascii_uppercase();
         if p == "SELECT" {
-            if db.eq_ignore_ascii_case("mysql") || db.eq_ignore_ascii_case("sys") {
+            if db_matches(db, "mysql") || db_matches(db, "sys") {
                 system_select = true;
             }
-            if db.eq_ignore_ascii_case("performance_schema") {
+            if db_matches(db, "performance_schema") {
                 ps_select = true;
             }
         } else {
@@ -879,7 +923,10 @@ fn summary(r: &Report) -> Vec<String> {
         out.push(format!("extended variant: {}", r.expected.join(", ")));
     }
     if r.privileges_unknown {
-        out.push("privileges not evaluated (account name not matched)".to_owned());
+        out.push(
+            "privileges not evaluated (account name not matched, or a privilege list incomplete)"
+                .to_owned(),
+        );
     }
     if r.init_connect {
         out.push("init_connect is set: SQL runs at every agent login".to_owned());
@@ -963,6 +1010,21 @@ async fn probe(session: &mut Session, statement: &str) -> Result<Rows, MyError> 
 async fn optional(session: &mut Session, statement: &str) -> Result<Option<Rows>, MyError> {
     match probe(session, statement).await {
         Ok(r) => Ok(Some(r)),
+        Err(e) if !e.fatal => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Like [`optional`], for reads that must see every row: `Some(None)`
+/// when a row was skipped (a value not UTF-8), so the caller treats the
+/// result as not understood.
+async fn optional_complete(
+    session: &mut Session,
+    statement: &str,
+) -> Result<Option<Option<Rows>>, MyError> {
+    match session.query_counted(Stage::Check, statement).await {
+        Ok((rows, 0)) => Ok(Some(Some(rows))),
+        Ok(_) => Ok(Some(None)),
         Err(e) if !e.fatal => Ok(None),
         Err(e) => Err(e),
     }
@@ -1077,9 +1139,12 @@ async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(
 
 async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
     // No such table before MySQL 8.0.19: the roles are not known.
-    let Some(rows) = optional(session, sql::APPLICABLE_ROLES_MYSQL).await? else {
+    let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MYSQL).await? else {
         return Ok(());
     };
+    // A row skipped or a list cut: some roles are unknown.
+    let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
+    let rows = read.unwrap_or_default();
     let mut all: BTreeSet<(String, String)> = BTreeSet::new();
     let mut using: BTreeSet<(String, String)> = BTreeSet::new();
     for row in &rows {
@@ -1092,6 +1157,12 @@ async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Re
         all.insert(role);
     }
     grants.roles = all.len() as u64;
+    if !complete {
+        // At least one role more than listed.
+        grants.roles += 1;
+        grants.roles_unevaluated = grants.roles;
+        return Ok(());
+    }
     if all.is_empty() {
         return Ok(());
     }
@@ -1099,7 +1170,7 @@ async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Re
     let mut evaluated = false;
     if using.len() <= MAX_EVALUATED_ROLES {
         if let Some(statement) = sql::show_grants_using(&using) {
-            if let Some(rows) = optional(session, &statement).await? {
+            if let Some(Some(rows)) = optional_complete(session, &statement).await? {
                 evaluated = merge_grant_lines(&rows, grants);
             }
         }
@@ -1114,9 +1185,12 @@ async fn mariadb_role_privileges(
     session: &mut Session,
     grants: &mut Grants,
 ) -> Result<(), MyError> {
-    let Some(rows) = optional(session, sql::APPLICABLE_ROLES_MARIADB).await? else {
+    let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MARIADB).await? else {
         return Ok(());
     };
+    // A row skipped or a list cut: some roles are unknown.
+    let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
+    let rows = read.unwrap_or_default();
     let mut roles: BTreeSet<String> = BTreeSet::new();
     for row in &rows {
         let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
@@ -1124,6 +1198,11 @@ async fn mariadb_role_privileges(
         roles.insert(v(0));
     }
     grants.roles = roles.len() as u64;
+    if !complete {
+        grants.roles += 1;
+        grants.roles_unevaluated = grants.roles;
+        return Ok(());
+    }
     if roles.is_empty() {
         return Ok(());
     }
@@ -1135,7 +1214,7 @@ async fn mariadb_role_privileges(
         .and_then(|r| cell(&r, 0, 0).map(str::to_owned));
     let mut evaluated = false;
     if current.as_ref().is_some_and(|c| roles.contains(c)) {
-        if let Some(rows) = optional(session, sql::SHOW_GRANTS_CURRENT_ROLE).await? {
+        if let Some(Some(rows)) = optional_complete(session, sql::SHOW_GRANTS_CURRENT_ROLE).await? {
             evaluated = merge_grant_lines(&rows, grants);
         }
     }
@@ -1186,19 +1265,25 @@ async fn report(
     let mut grants = Grants::default();
     let mut privileges_unknown = !matchable;
     if matchable {
-        let global = probe(session, sql::USER_PRIVILEGES).await?;
-        // Every account has at least `USAGE`: no row means no match.
-        privileges_unknown = global.is_empty();
+        let (global, skipped) = session
+            .query_counted(Stage::Check, sql::USER_PRIVILEGES)
+            .await?;
+        // Every account has at least `USAGE`: no row means no match. A row
+        // skipped (not UTF-8) or a list cut at its `LIMIT` leaves the
+        // privileges unknown (fail closed).
+        privileges_unknown = global.is_empty() || skipped > 0 || global.len() >= 1000;
         for row in &global {
             let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
             grants.global.push((v(0), v(1) == "YES"));
         }
-        for statement in [
-            sql::SCHEMA_PRIVILEGES,
-            sql::TABLE_PRIVILEGES,
-            sql::COLUMN_PRIVILEGES,
+        for (statement, limit) in [
+            (sql::SCHEMA_PRIVILEGES, 10_000),
+            (sql::TABLE_PRIVILEGES, 100_000),
+            (sql::COLUMN_PRIVILEGES, 100_000),
         ] {
-            for row in &probe(session, statement).await? {
+            let (rows, skipped) = session.query_counted(Stage::Check, statement).await?;
+            privileges_unknown |= skipped > 0 || rows.len() >= limit;
+            for row in &rows {
                 let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
                 grants.scoped.push((v(0), v(1), v(2) == "YES"));
             }
@@ -1532,6 +1617,80 @@ mod tests {
         assert!(
             !json.contains("secret") && !json.contains("SECRET"),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn database_patterns_cover_the_system_databases() {
+        for (pattern, name) in [
+            ("mysql", "mysql"),
+            ("MySQL", "mysql"),
+            ("performance\\_schema", "performance_schema"),
+            ("performance_schema", "performance_schema"),
+            ("%", "mysql"),
+            ("%", "sys"),
+            ("mysq_", "mysql"),
+            ("m%", "mysql"),
+            ("%_schema", "performance_schema"),
+            ("s_s", "sys"),
+            ("\\%", "%"),
+        ] {
+            assert!(db_matches(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("hr", "mysql"),
+            ("mysql\\_", "mysql"),
+            ("my\\%", "mysql"),
+            ("\\_ys", "sys"),
+            ("mysq", "mysql"),
+            ("mysql_", "mysql"),
+            ("", "sys"),
+            ("h%", "sys"),
+        ] {
+            assert!(!db_matches(pattern, name), "{pattern} {name}");
+        }
+    }
+
+    #[test]
+    fn select_through_a_database_pattern_is_reported() {
+        for (db, codes) in [
+            (
+                "%",
+                &[
+                    "privilege.system_database_select",
+                    "privilege.performance_schema_without_audit",
+                ][..],
+            ),
+            ("m%", &["privilege.system_database_select"]),
+            ("mysq_", &["privilege.system_database_select"]),
+            (
+                "performance\\_schema",
+                &["privilege.performance_schema_without_audit"],
+            ),
+            ("hr\\_%", &[]),
+        ] {
+            let grants = Grants {
+                scoped: vec![s(db, "SELECT")],
+                ..Grants::default()
+            };
+            let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+            assert_registered(&notes);
+            let got: Vec<&str> = notes.iter().map(|n| n.code().as_str()).collect();
+            assert_eq!(got, codes, "{db}");
+        }
+        // The same through a role's `SHOW GRANTS` line.
+        let mut grants = Grants {
+            roles: 1,
+            ..Grants::default()
+        };
+        assert!(merge_grant_lines(
+            &rows(&["GRANT SELECT ON `performance\\_schema`.* TO `r`"]),
+            &mut grants
+        ));
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.performance_schema_without_audit"}])
         );
     }
 

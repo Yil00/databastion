@@ -577,6 +577,19 @@ impl Session {
     /// that is not UTF-8 is dropped (the utf8mb4 results character set
     /// makes it unexpected).
     pub(crate) async fn query(&mut self, stage: Stage, statement: &str) -> Result<Rows, MyError> {
+        self.query_counted(stage, statement)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    /// Like [`query`](Self::query), with the number of rows skipped
+    /// because a value was not UTF-8: a caller that must see every row
+    /// (grant reads in `check()`) treats a skipped row as not understood.
+    pub(crate) async fn query_counted(
+        &mut self,
+        stage: Stage,
+        statement: &str,
+    ) -> Result<(Rows, usize), MyError> {
         let mut rows: Rows = Vec::new();
         let mut bytes = 0usize;
         let mut dropped = 0usize;
@@ -615,7 +628,7 @@ impl Session {
         if streamed == Streamed::Stopped {
             return Err(MyError::new(FailureCode::ResourceLimit, stage));
         }
-        Ok(rows)
+        Ok((rows, dropped))
     }
 
     /// Runs a statement and hands each row to `on_row`. The cancel guard
