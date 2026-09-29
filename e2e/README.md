@@ -87,7 +87,8 @@ lives in `tmpfs`) and `no-new-privileges`.
    e-mail) and `e2e reads` (every `read` on the Audit targets → medium incident + e-mail). After
    each policy creation, the web process's wake-up (#63) must queue a `policies.evaluate` pg-boss
    job within 5 s. Jobs the worker's schedule produced (sent while a `__pgboss__send-it` job of
-   that queue ran) do not count; a job already waiting at that time is accepted as a coalesced
+   that queue ran) do not count; a job not cancelled, created within the previous 60 s or the 5 s
+   after, and not started at that time (the schedule's included) is accepted as a coalesced
    wake-up (the queue is stately), but at least one wake-up per kind of action must be a job of
    its own. Then `audit.configure` of `pg-e2e` and `mariadb-e2e`
    (enabled, contract defaults: aggregation 60 s, poll 10 s, no `min_rows`; sensitive objects
@@ -167,12 +168,17 @@ lives in `tmpfs`) and `no-new-privileges`.
    (enrollment token, agent secret, admin password, session cookie, metrics token, database and
    target passwords, encryption key) appears in clear text.
 11. The targets' audit logs (pgaudit jsonlog, `server_audit` log and rotations), copied into the
-   private directory, must be non-empty and hold no registered secret; they must hold records of
-   the agent's own account since the Discovery scan started (positive control of "no own-account
-   event": the reads were seen and filtered, not missed; not in `pss` mode). Then `pg_dump` the
-   console database into the private temporary directory (never the log directory) and fail if
-   any registered secret (the whole registry, the Mailpit SMTP password included) is stored in
-   clear text.
+   private directory, must be non-empty and hold no registered secret; they must hold reads of
+   the seeded data by the agent's own account since the Discovery scan started (pgaudit `READ`
+   records of `databastion_agent` on a `crm.`, `billing.` or `ops.` relation; `server_audit`
+   `READ` / `QUERY` records of `databastion` on `support`): the positive control of "no
+   own-account event", the reads were seen and filtered, not missed (not in `pss` mode). Then
+   `pg_dump` the console database into the private temporary directory (never the log directory)
+   and fail if any registered secret (the whole registry: the Mailpit SMTP password and its
+   base64 AUTH PLAIN / AUTH LOGIN forms included) is stored in clear text. The registry also
+   holds the session cookie and the CSRF token; neither is expected in the database:
+   `console/src/server/auth/session.ts` stores only the SHA-256 of the session cookie
+   (`sessions.token_hash`) and derives the CSRF token as an HMAC of the cookie, never stored.
 12. Invariant I2, for each engine (`postgresql`, `mysql`, `mariadb`):
     [`i2_check.py scan`](i2_check.py) searches the plain dump of the whole console database
     (every schema, `pgboss` included), every container log except the targets' own (`target-*.log`,

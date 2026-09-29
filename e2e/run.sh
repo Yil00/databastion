@@ -223,6 +223,9 @@ register_secret target_pg_password "$TARGET_PG_PASSWORD"
 register_secret target_agent_password "$TARGET_AGENT_PASSWORD"
 register_secret target_client_password "$TARGET_CLIENT_PASSWORD"
 register_secret mailpit_password "$MAILPIT_PASSWORD"
+# As they cross the wire and could be logged: the AUTH PLAIN token and the AUTH LOGIN password.
+register_secret mailpit_auth_plain "$(printf '\0e2e-smtp\0%s' "$MAILPIT_PASSWORD" | base64 -w0)"
+register_secret mailpit_auth_login "$(printf '%s' "$MAILPIT_PASSWORD" | base64 -w0)"
 register_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
 register_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
 register_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
@@ -611,9 +614,9 @@ check_my_account() {
   grants="${grants//\`/}"
   case "$grants" in
     "GRANT SELECT ON ${db}.* TO databastion@%|GRANT USAGE ON *.* TO databastion@%"*"|") ;;
-    *) fail "$svc: databastion has unexpected grants: $grants" ;;
+    *) fail "$svc: databastion has unexpected grants (not printed: SHOW GRANTS holds the password hash)" ;;
   esac
-  [ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 2 ] || fail "$svc: databastion has extra grants: $grants"
+  [ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 2 ] || fail "$svc: databastion has extra grants (not printed)"
   opts="$(my_sql "$svc" "$client" "$5")" || fail "$svc: cannot read the options of databastion"
   [ "$opts" = "$expected_opts" ] || fail "$svc: databastion has unexpected account options: $opts"
   # The account logs in over TLS, and is refused without it (REQUIRE SSL: error 1045, the same
@@ -756,8 +759,11 @@ audit_client_pg_target_log() {
   [ "$E2E_PG_AUDIT" = pgaudit ] || return 3
 }
 audit_client_pg_log_user_records() {
-  # pgaudit records (jsonlog) of ACCOUNT at or after START (YYYY-MM-DD HH:MM:SS, UTC).
-  jq -rc --arg u "$2" --arg t "$3" 'select(.user == $u and ((.message // "") | startswith("AUDIT:"))
+  # pgaudit READ records (jsonlog) of ACCOUNT at or after START (YYYY-MM-DD HH:MM:SS, UTC) naming a
+  # relation of the seeded schemas: "AUDIT: SESSION|OBJECT,<n>,<n>,READ,<command>,<type>,<schema.rel>,…"
+  # (pgaudit.log_relation = on), so probes and catalog reads do not count.
+  jq -rc --arg u "$2" --arg t "$3" 'select(.user == $u and .dbname == "shop"
+    and ((.message // "") | test("^AUDIT: (SESSION|OBJECT),[0-9]+,[0-9]+,READ,[^,]*,[^,]*,\"?(crm|billing|ops)\\."))
     and (.timestamp[0:19] >= $t))' "$1" 2>/dev/null | wc -l
 }
 audit_client_pg_time() { date -u +'%Y-%m-%d %H:%M:%S'; }
@@ -820,9 +826,11 @@ audit_client_my_target_log() {
     >"$1"
 }
 audit_client_my_log_user_records() {
-  # Records of ACCOUNT at or after START (YYYYMMDD HH:MM:SS, server time: UTC in the image). CSV:
+  # READ (TABLE event) or QUERY records of ACCOUNT on the seeded database `support` at or after
+  # START (YYYYMMDD HH:MM:SS, server time: UTC in the image). CSV:
   # timestamp,serverhost,username,host,connectionid,queryid,operation,database,object,retcode.
-  awk -F, -v u="$2" -v t="$3" '$3 == u && substr($1, 1, 17) >= t' "$1" | wc -l
+  awk -F, -v u="$2" -v t="$3" '$3 == u && ($7 == "READ" || $7 == "QUERY") && $8 == "support" \
+    && substr($1, 1, 17) >= t' "$1" | wc -l
 }
 audit_client_my_time() { date -u +'%Y%m%d %H:%M:%S'; }
 
@@ -907,8 +915,9 @@ wait_audit_stream() {
 # - `sent`: a job created in (T, T + 5 s] that the worker's schedule did not produce. pg-boss sends
 #   scheduled jobs from a `__pgboss__send-it` job whose data names the queue; a policies.evaluate
 #   job created while such a job ran is the schedule's and is not counted;
-# - `coalesced`: none sent, but a job was already waiting at T (created before T, not started): the
-#   queue is stately (one waiting job), so the wake-up legitimately joined it;
+# - `coalesced`: none sent, but a job (not cancelled, created in (T - 60 s, T + 5 s], the schedule's
+#   included) was waiting at T or right after it (not started by T): the queue is stately (one
+#   waiting job), so the web's send legitimately joined it;
 # - `lost` otherwise. Any `lost` fails; each kind of action must have at least one `sent`, and web.log
 #   must hold no "wake-up not sent" warning. (The worker's own start-up and budget re-queue sends
 #   are not told apart: they are rare and not near these actions.)
@@ -919,7 +928,9 @@ WAKEUP_STATUS_SQL="CASE
       AND s.data->>'name' = 'policies.evaluate'
       AND j.created_on BETWEEN s.started_on AND coalesce(s.completed_on, now()))) THEN 'sent'
   WHEN EXISTS (SELECT 1 FROM pgboss.job j WHERE j.name = 'policies.evaluate'
-    AND j.created_on <= @T@ AND (j.started_on IS NULL OR j.started_on > @T@)) THEN 'coalesced'
+    AND j.state <> 'cancelled'
+    AND j.created_on > @T@ - interval '60 seconds' AND j.created_on <= @T@ + interval '5 seconds'
+    AND (j.started_on IS NULL OR j.started_on > @T@)) THEN 'coalesced'
   ELSE 'lost' END"
 db_now() { console_sql "SELECT now()"; }
 # assert_wakeup LABEL T: waits up to 6 s for the wake-up of an action at database time T.
