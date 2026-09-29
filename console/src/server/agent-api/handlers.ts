@@ -383,13 +383,19 @@ export const eventsPerAgent = new RateLimiter(60, 60_000);
 export const eventsRequestsPerAgent = new RateLimiter(300, 60_000);
 
 /**
- * `POST /events` (P4-C). Same pipeline as `/findings`: headers, authentication, body (4 MiB cap:
- * `413`), `validateSchema` then `checkSemantics` (`400`: unknown fields such as query text, names
- * and account names that fail the contract patterns, `ts_last < ts`, batch over 1 MiB), then
- * `ingestEvents`: idempotency on (`agent_id`, `batch_id`), target ownership (`404`, item pointers),
- * future timestamps (`400`), storage. A rejected batch, a `batch_conflict` and an event for a
- * target the agent does not own are agent-integrity events. Accepted batches wake the worker, which
- * scores the events and applies the `access_event` policies. The body is never logged.
+ * `POST /events` (P4-C), in the order of the contract ("Console-side checks", `POST /events`):
+ * headers and authentication; the request rate (`429`, 300 per minute, before the body is read);
+ * body (4 MiB cap: `413`), `validateSchema` then `checkSemantics` (`400`: unknown fields such as
+ * query text, names and account names that fail the contract patterns, `ts_last < ts`, batch over
+ * 1 MiB); back-pressure (`429` + `Retry-After: 30` while the agent has more than 20 000 events not
+ * evaluated yet); the stored-batch rate (`429`, 60 per minute); then `ingestEvents`: idempotency on
+ * (`agent_id`, `batch_id`), target ownership (`404`, item pointers), future timestamps and
+ * retention (`400`), storage. The three `429` answers come **before** the idempotency check: a
+ * throttled batch is never recorded, and even the replay of an accepted batch gets `429` until the
+ * throttle ends, then `202` with `duplicate: true`. A back-pressure `429` does not consume the
+ * stored-batch rate. A rejected batch, a `batch_conflict` and an event for a target the agent does
+ * not own are agent-integrity events. Accepted batches wake the worker, which scores the events and
+ * applies the `access_event` policies. The body is never logged.
  */
 export function handleEvents(req: Request): Promise<Response> {
   return guarded("events", async () => {

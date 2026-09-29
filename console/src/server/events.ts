@@ -127,9 +127,12 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
 }
 
 /**
- * Ingests a validated (schema + `checkSemantics`) events batch of `agentId`, atomically:
+ * Ingests a validated (schema + `checkSemantics`) events batch of `agentId`, atomically. The
+ * caller (`handleEvents`) has already applied the request rate, back-pressure and stored-batch
+ * rate limits: those answer `429` **before** this function runs, so while an agent is throttled
+ * even the replay of an accepted batch gets `429` (then `duplicate: true` once the throttle ends).
  * 1. idempotency on `(agent_id, batch_id)`: same content -> duplicate, other content -> conflict
- *    (before every other console-side check, so a replay is always acknowledged);
+ *    (before every check below, so a replay reaching this step is always acknowledged);
  * 2. every `target_id` was reported by the agent (`404`, item pointers `/events/<i>/target_id`);
  * 3. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
  * 4. storage of the events (pending evaluation by the worker) + the batch record.

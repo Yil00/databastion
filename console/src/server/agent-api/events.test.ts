@@ -277,6 +277,45 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect((await post(other, batch())).status).toBe(202);
     });
 
+    /** Fills the agent's backlog past the back-pressure threshold (events not evaluated yet). */
+    async function fillBacklog(agentId: string): Promise<void> {
+      await getDb().execute(sql`insert into access_events (agent_id, target_id, batch_id, item_index, ts, principal_key, db_user, action, objects, source, aggregated_count)
+        select ${agentId}, 'pg-prod-1', gen_random_uuid(), 0, now(), ${"3".repeat(64)}, 'x', 'connect', '[]'::jsonb, 'pgaudit', 1
+        from generate_series(1, ${MAX_PENDING_EVENTS_PER_AGENT})`);
+    }
+
+    it("answers 429 to the replay of an accepted batch under back-pressure, then duplicate once drained", async () => {
+      const auth = await agentWithTargets();
+      const b = batch();
+      expect((await post(auth, b)).status).toBe(202);
+      await fillBacklog(auth.agentId);
+      // Back-pressure runs before the duplicate check: even a replay (a lost 202) gets 429.
+      const throttled = await post(auth, b);
+      expect(throttled.status).toBe(429);
+      expect(throttled.headers.get("retry-after")).toBe("30");
+      expect((await expectConformingError(throttled, {})).code).toBe("rate_limited");
+      // The worker drains the backlog: the same batch is now acknowledged as a duplicate.
+      await getDb().execute(sql`update access_events set evaluated_at = now() where agent_id = ${auth.agentId}`);
+      const replay = await post(auth, b);
+      expect(replay.status).toBe(202);
+      expect(await replay.json()).toEqual({ batch_id: b.batch_id, duplicate: true });
+      expect(await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId))).toHaveLength(1);
+    });
+
+    it("a back-pressure 429 does not consume the per-minute stored-batch limit", async () => {
+      const auth = await agentWithTargets();
+      expect((await post(auth, batch())).status).toBe(202);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(1);
+      await fillBacklog(auth.agentId);
+      for (let i = 0; i < 5; i++) expect((await post(auth, batch())).status).toBe(429);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(1);
+      // Even with the stored-batch limit almost reached, the throttled batches were not counted.
+      for (let i = 1; i < eventsPerAgent.limit - 1; i++) eventsPerAgent.hit(auth.agentId);
+      await getDb().execute(sql`update access_events set evaluated_at = now() where agent_id = ${auth.agentId}`);
+      expect((await post(auth, batch())).status).toBe(202);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(eventsPerAgent.limit);
+    });
+
     it("stores AccessEvent.bytes when the source reports it, null otherwise", async () => {
       const auth = await agentWithTargets();
       const withBytes = { ...PG_DUMP, bytes: 9_007_199_254_740_991 };
