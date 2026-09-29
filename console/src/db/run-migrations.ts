@@ -5,6 +5,8 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
 
+import { applyAccessEventsBytesOnline, validateDeferredConstraints } from "./online-constraints";
+
 export const MIGRATIONS_FOLDER = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../drizzle",
@@ -44,9 +46,12 @@ export async function assertPgbossOwnership(pool: Pool): Promise<void> {
 
 /**
  * Applies the committed migrations with a dedicated pool, as the role of `url` (the owner), after
- * the `pgboss` ownership pre-flight.
+ * the `pgboss` ownership pre-flight. Around drizzle's migrator (one transaction for all pending
+ * migrations), the lock-friendly constraint steps of `online-constraints.ts`: `0027` applied with
+ * its CHECK `NOT VALID` then validated on its own when upgrading an install at `0026`, and the
+ * validation of any listed constraint still `NOT VALID`. `migrationsFolder`: tests only.
  */
-export async function runMigrations(url: string): Promise<void> {
+export async function runMigrations(url: string, migrationsFolder: string = MIGRATIONS_FOLDER): Promise<void> {
   const pool = new Pool({
     connectionString: url,
     application_name: "databastion-migrate",
@@ -55,7 +60,9 @@ export async function runMigrations(url: string): Promise<void> {
   });
   try {
     await assertPgbossOwnership(pool);
-    await migrate(drizzle(pool), { migrationsFolder: MIGRATIONS_FOLDER });
+    await applyAccessEventsBytesOnline(pool, migrationsFolder);
+    await migrate(drizzle(pool), { migrationsFolder });
+    await validateDeferredConstraints(pool);
   } finally {
     await pool.end();
   }

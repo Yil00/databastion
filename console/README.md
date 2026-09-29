@@ -141,6 +141,26 @@ Limitation: in a single-role setup (`DATABASE_URL` is the owner or a superuser, 
 the console could drop the trigger; the audit log is then append-only only against the application
 code, not against a compromised console process.
 
+### Constraints on large tables
+drizzle's migrator applies all pending migrations in one transaction, so a `CHECK` or foreign key
+added to an existing table scans it under an `ACCESS EXCLUSIVE` lock until the whole run commits,
+and a later migration of the same run cannot shorten that lock. Migration `0027` added the
+`access_events_bytes` CHECK that way; it has shipped and is not edited. `migrate`
+(`src/db/online-constraints.ts`) works around it:
+- an install whose last applied migration is `0026` (the only state in which `access_events` can
+  hold rows while `0027` is pending) gets `0027` applied by a pre-flight instead: the column and
+  the constraint `NOT VALID` in a short transaction that also records `0027` (hash of the unchanged
+  file) in drizzle's journal, then `VALIDATE CONSTRAINT` as a statement of its own, which only takes
+  `SHARE UPDATE EXCLUSIVE` (reads and writes go on). The migrator then applies `0028` onwards;
+- a fresh install runs `0027` as is (the table is created empty in the same run), and an install
+  that already applied it keeps its validated constraint: nothing to do;
+- every run validates, one statement each, the constraints of `DEFERRED_VALIDATIONS` still
+  `NOT VALID` (a run interrupted between the two steps above).
+
+The final schema is the one of `0027`. Rule for new migrations: a constraint added to a table
+that may be large is written `NOT VALID` in a custom migration and listed in
+`DEFERRED_VALIDATIONS`, never validated in the migration itself.
+
 ### Upgrading an existing deployment
 Deployments created before the role split (single `POSTGRES_USER` role used by everything; the
 initdb script only runs on an empty data directory) switch as follows, once, as the superuser:

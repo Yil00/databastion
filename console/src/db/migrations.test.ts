@@ -1,10 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { Client } from "pg";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+
+import { Client, Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { applyAccessEventsBytesOnline, ONLINE_0027_TAG, validateDeferredConstraints } from "@/db/online-constraints";
 import { MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
 import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
@@ -200,6 +204,141 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
                  where grantee = 'databastion_app' and table_name = 'rate_limit_counters' order by 1`),
       );
       expect(privileges.rows.map((r) => (r as { privilege_type: string }).privilege_type)).toEqual(["DELETE", "INSERT", "SELECT", "UPDATE"]);
+    });
+  });
+
+  describe("0027: access_events_bytes without a long lock (P7)", () => {
+    /** A copy of the migrations folder whose journal stops before `tag`. */
+    function folderBefore(tag: string): { folder: string; cleanup: () => void } {
+      const dir = mkdtempSync(path.join(tmpdir(), "databastion-migrations-"));
+      const folder = path.join(dir, "drizzle");
+      cpSync(MIGRATIONS_FOLDER, folder, { recursive: true });
+      const journalPath = path.join(folder, "meta", "_journal.json");
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { tag: string }[] };
+      const at = journal.entries.findIndex((e) => e.tag === tag);
+      expect(at).toBeGreaterThan(0);
+      journal.entries = journal.entries.slice(0, at);
+      writeFileSync(journalPath, JSON.stringify(journal));
+      return { folder, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+    }
+
+    const constraintSql = `
+      select pg_get_constraintdef(c.oid) as def, c.convalidated as validated
+        from pg_constraint c where c.conname = 'access_events_bytes' and c.conrelid = 'public.access_events'::regclass`;
+    const columnSql = `
+      select data_type, is_nullable, column_default from information_schema.columns
+       where table_schema = 'public' and table_name = 'access_events' and column_name = 'bytes'`;
+
+    async function seedEvents(c: Client, n: number): Promise<string> {
+      const agent = await c.query<{ id: string }>(
+        "insert into agents (name, hostname, version) values ('ae', 'ae', '0.1.0') returning id",
+      );
+      const agentId = String(agent.rows[0]?.id);
+      await c.query(
+        "insert into agent_targets (agent_id, target_id, engine, reachable, audit_level) values ($1, 'pg', 'postgres', true, 'full')",
+        [agentId],
+      );
+      await c.query(
+        `insert into access_events (agent_id, target_id, batch_id, item_index, ts, principal_key, db_user, action, objects, source, aggregated_count)
+         select $1, 'pg', gen_random_uuid(), i, now(), repeat('a', 64), 'app', 'read', '[]'::jsonb, 'pgaudit', 1
+           from generate_series(1, $2::int) i`,
+        [agentId, n],
+      );
+      return agentId;
+    }
+
+    it("an install at 0026 with events gets 0027 as NOT VALID + VALIDATE, recorded with the 0027 hash; same schema as a fresh install", async () => {
+      const suffix = randomBytes(6).toString("hex");
+      const db = `u_${suffix}`;
+      const owner = `uo_${suffix}`;
+      await adminQuery(`create role ${owner} login nosuperuser nocreatedb nocreaterole`);
+      await adminQuery(`create database ${db} owner ${owner}`);
+      const before = folderBefore(ONLINE_0027_TAG);
+      try {
+        const url = roleUrl(owner, db);
+        await runMigrations(url, before.folder);
+        await withClient(url, async (c) => {
+          expect((await c.query(columnSql)).rows).toEqual([]);
+          await seedEvents(c, 5000);
+        });
+        // The pre-flight of runMigrations, called directly to check that it took the online path.
+        const pool = new Pool({ connectionString: url, max: 1, options: "-c search_path=public" });
+        try {
+          await expect(applyAccessEventsBytesOnline(pool, before.folder)).resolves.toBe("not_needed");
+          await expect(applyAccessEventsBytesOnline(pool, MIGRATIONS_FOLDER)).resolves.toBe("applied");
+          await expect(applyAccessEventsBytesOnline(pool, MIGRATIONS_FOLDER)).resolves.toBe("not_needed");
+        } finally {
+          await pool.end();
+        }
+        await runMigrations(url);
+        const fresh = await withClient(ownerUrl, async (c) => ({
+          constraint: (await c.query(constraintSql)).rows,
+          column: (await c.query(columnSql)).rows,
+        }));
+        await withClient(url, async (c) => {
+          expect((await c.query(constraintSql)).rows).toEqual(fresh.constraint);
+          expect((await c.query(columnSql)).rows).toEqual(fresh.column);
+          expect(fresh.constraint).toEqual([{ def: "CHECK (((bytes IS NULL) OR (bytes >= 0)))", validated: true }]);
+          // Every migration recorded once, 0027 with the hash of its unchanged file.
+          const all = readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER });
+          const recorded = await c.query<{ hash: string; created_at: string }>(
+            "select hash, created_at from drizzle.__drizzle_migrations order by created_at",
+          );
+          expect(recorded.rows.map((r) => [r.hash, Number(r.created_at)])).toEqual(all.map((m) => [m.hash, m.folderMillis]));
+          const n = await c.query<{ n: number; with_bytes: number }>(
+            "select count(*)::int as n, count(bytes)::int as with_bytes from access_events",
+          );
+          expect(n.rows[0]).toEqual({ n: 5000, with_bytes: 0 });
+          await expect(c.query("update access_events set bytes = -1 where item_index = 1")).rejects.toThrow(/access_events_bytes/);
+        });
+        // A second run changes nothing; a fresh install never takes the online path.
+        await expect(runMigrations(url)).resolves.toBeUndefined();
+        const freshPool = new Pool({ connectionString: ownerUrl, max: 1 });
+        try {
+          await expect(applyAccessEventsBytesOnline(freshPool, MIGRATIONS_FOLDER)).resolves.toBe("not_needed");
+        } finally {
+          await freshPool.end();
+        }
+      } finally {
+        before.cleanup();
+        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminQuery(`drop role if exists ${owner}`);
+      }
+    });
+
+    it("a constraint left NOT VALID is validated on the next run, without blocking concurrent writes", async () => {
+      await withClient(ownerUrl, async (c) => {
+        await seedEvents(c, 100);
+        // State of a run interrupted between the two steps.
+        await c.query("alter table access_events drop constraint access_events_bytes");
+        await c.query(
+          'alter table access_events add constraint access_events_bytes check ("access_events"."bytes" is null or "access_events"."bytes" >= 0) not valid',
+        );
+        expect((await c.query(constraintSql)).rows[0]).toMatchObject({ validated: false });
+      });
+      // A writer holds an open transaction (ROW EXCLUSIVE on access_events): VALIDATE only takes
+      // SHARE UPDATE EXCLUSIVE, so it completes while the insert is still uncommitted.
+      const writer = new Client({ connectionString: ownerUrl });
+      await writer.connect();
+      const pool = new Pool({ connectionString: ownerUrl, max: 1, options: "-c lock_timeout=5000" });
+      try {
+        await writer.query("begin");
+        await writer.query(
+          `insert into access_events (agent_id, target_id, batch_id, item_index, ts, principal_key, db_user, action, objects, source, aggregated_count, bytes)
+           select agent_id, target_id, gen_random_uuid(), 0, now(), repeat('b', 64), 'app', 'read', '[]'::jsonb, 'pgaudit', 1, 42
+             from agent_targets limit 1`,
+        );
+        await expect(validateDeferredConstraints(pool)).resolves.toEqual(["access_events_bytes"]);
+        await writer.query("commit");
+        await expect(validateDeferredConstraints(pool)).resolves.toEqual([]);
+      } finally {
+        await writer.end();
+        await pool.end();
+      }
+      await withClient(ownerUrl, async (c) => {
+        expect((await c.query(constraintSql)).rows[0]).toEqual({ def: "CHECK (((bytes IS NULL) OR (bytes >= 0)))", validated: true });
+        await c.query("delete from agents where name = 'ae'");
+      });
     });
   });
 
