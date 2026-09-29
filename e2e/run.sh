@@ -512,10 +512,13 @@ files_agent() {
 # its log file 0600 when it does not exist: it is created here, 0640, and mongod appends to it
 # (--logappend).
 log "preparing the target-pg, target-mariadb and target-mongo log volumes (999:999, 0750)"
+# The file is created and checked before the directories change owner: agent-files only has
+# CAP_CHOWN, not CAP_DAC_OVERRIDE, so root can neither write into nor traverse a 999:999 0750
+# directory.
 # shellcheck disable=SC2016 # expanded by the container shell, on purpose
-files_root 'for d in /pglog /mylog /mongolog; do chmod 0750 "$d" && chown 999:999 "$d" && stat -c "%u:%g %a" "$d"; done
-  install -m 0640 -o 999 -g 999 /dev/null /mongolog/mongod.log && stat -c "%u:%g %a" /mongolog/mongod.log' \
-  | tr '\n' ' ' | grep -qx '999:999 750 999:999 750 999:999 750 999:999 640 ' \
+files_root 'install -m 0640 -o 999 -g 999 /dev/null /mongolog/mongod.log && stat -c "%u:%g %a" /mongolog/mongod.log
+  for d in /pglog /mylog /mongolog; do chmod 0750 "$d" && chown 999:999 "$d" && stat -c "%u:%g %a" "$d"; done' \
+  | tr '\n' ' ' | grep -qx '999:999 640 999:999 750 999:999 750 999:999 750 ' \
   || fail "cannot prepare the target log volumes"
 
 log "starting console DB, migrate, web, worker, TLS proxy, Mailpit and the target PostgreSQL, MySQL, MariaDB, MongoDB, OpenLDAP"
