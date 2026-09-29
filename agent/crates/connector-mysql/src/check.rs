@@ -33,6 +33,11 @@
 //! The detailed report is recomputed at most every [`REPORT_INTERVAL`] per
 //! target and logged when it changes; the reachability and the audit level
 //! are checked on every call.
+//!
+//! Every explanation is also reported as a closed note
+//! (`TargetHealth::notes`, `shared/protocol/target-notes.json`): a code, a
+//! count and closed labels (privilege names mapped to the contract enum,
+//! anything else `other`), never a name or any other text from the server.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -41,7 +46,9 @@ use std::time::{Duration, Instant};
 use databastion_classifiers::masking::EventSource;
 use databastion_core::audit::own::SharedOwnUsage;
 use databastion_core::config::{MysqlLogFormat, MysqlTlsMode, TargetConfig, TargetEngine};
-use databastion_core::{AuditLevel, FailureCode, TargetHealth};
+use databastion_core::{
+    AuditLevel, FailureCode, NoteCode, NoteLabel, Notes, TargetHealth, TargetNote,
+};
 
 use crate::audit::pfs::PsTable;
 use crate::catalog::{self, Coverage, EngineSkip};
@@ -157,8 +164,17 @@ impl AuditProbe {
         choose(self, None).0
     }
 
+    /// Explanations of the audit prerequisites, for the log detail.
+    #[cfg(test)]
     fn notes(&self, file: Option<FileState>) -> Vec<String> {
+        self.explain(file).0
+    }
+
+    /// Explanations of the audit prerequisites: the log detail, and the
+    /// same as closed notes.
+    fn explain(&self, file: Option<FileState>) -> (Vec<String>, Vec<TargetNote>) {
         let mut out = Vec::new();
+        let mut codes = Vec::new();
         if let Some(a) = self.server_audit {
             out.push(format!(
                 "server_audit active (logging {}, {} output{})",
@@ -170,6 +186,22 @@ impl AuditProbe {
                     ", no QUERY or TABLE events"
                 }
             ));
+            if file.is_none() {
+                codes.push(
+                    TargetNote::new(NoteCode::AuditServerAuditNotRead).with_labels([
+                        NoteLabel::parse(if a.logging {
+                            "logging_on"
+                        } else {
+                            "logging_off"
+                        }),
+                        NoteLabel::parse(if a.file {
+                            "file_output"
+                        } else {
+                            "non_file_output"
+                        }),
+                    ]),
+                );
+            }
         }
         if let Some((format, queries)) = &self.audit_log {
             out.push(format!(
@@ -181,12 +213,18 @@ impl AuditProbe {
                     ", policy logs no queries"
                 }
             ));
+            if file.is_none() {
+                codes.push(TargetNote::new(NoteCode::AuditAuditLogPluginNotRead));
+            }
         }
         if let Some(format) = &self.audit_log_filter {
             out.push(format!(
                 "audit_log_filter active (format {})",
                 label(&format.to_ascii_uppercase())
             ));
+            if file.is_none() {
+                codes.push(TargetNote::new(NoteCode::AuditAuditLogFilterNotRead));
+            }
         }
         let plugin = self.server_audit.is_some()
             || self.audit_log.is_some()
@@ -199,15 +237,19 @@ impl AuditProbe {
             None => {}
             Some(f) if !f.readable => {
                 out.push("the configured audit log is not readable by the agent".to_owned());
+                codes.push(TargetNote::new(NoteCode::AuditLogNotReadable));
             }
-            Some(f) if !self.file_plugin(f.format) => out.push(format!(
-                "the configured audit log ({}) has no matching active audit plugin logging \
-                 statements in a supported format",
-                match f.format {
-                    MysqlLogFormat::ServerAudit => "server_audit",
-                    MysqlLogFormat::Json => "json",
-                }
-            )),
+            Some(f) if !self.file_plugin(f.format) => {
+                out.push(format!(
+                    "the configured audit log ({}) has no matching active audit plugin logging \
+                     statements in a supported format",
+                    match f.format {
+                        MysqlLogFormat::ServerAudit => "server_audit",
+                        MysqlLogFormat::Json => "json",
+                    }
+                ));
+                codes.push(TargetNote::new(NoteCode::AuditLogPluginMismatch));
+            }
             Some(f) => {
                 if !f.recent {
                     out.push(
@@ -215,30 +257,37 @@ impl AuditProbe {
                          (none in the last 24 h)"
                             .to_owned(),
                     );
+                    codes.push(TargetNote::new(NoteCode::AuditPartialPendingFirstRecord));
                 }
                 out.push("the audit log carries no row counts (volumes unknown)".to_owned());
+                codes.push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
             }
         }
         if self.ps_enabled && !self.consumers_readable {
             out.push("performance_schema not readable by the account (no Audit grant)".to_owned());
+            codes.push(TargetNote::new(NoteCode::AuditPerformanceSchemaNotReadable));
         } else if self.ps_enabled && !(self.instrumentation && self.current_enabled) {
             out.push(
                 "performance_schema statement consumers inactive (global_instrumentation, \
                  thread_instrumentation and events_statements_current are needed)"
                     .to_owned(),
             );
+            codes.push(TargetNote::new(NoteCode::AuditStatementConsumersDisabled));
         } else if self.ps_enabled && !self.history_long_enabled {
             out.push(
                 "performance_schema events_statements_history_long consumer disabled".to_owned(),
             );
+            codes.push(TargetNote::new(NoteCode::AuditHistoryLongConsumerDisabled));
         }
         if self.history_long_enabled && self.consumers_readable && !self.history_long_readable {
             out.push("performance_schema statement history not readable by the account".to_owned());
+            codes.push(TargetNote::new(NoteCode::AuditHistoryNotReadable));
         }
         if self.general_log {
             out.push("general log enabled (not used as an audit source)".to_owned());
+            codes.push(TargetNote::new(NoteCode::AuditGeneralLogEnabled));
         }
-        out
+        (out, codes)
     }
 }
 
@@ -291,7 +340,8 @@ fn label(privilege: &str) -> String {
 }
 
 /// Evaluates over-privilege. Returns (over-privileged, expected) closed
-/// labels; with the extended-variant flag, a global `SELECT` is expected.
+/// labels for the logs, and the same as closed notes; with the
+/// extended-variant flag, a global `SELECT` is expected.
 /// `audit`: an Audit stream runs for the target, so `SELECT` on
 /// `performance_schema` is the documented Audit grant (ADR-0018), unless
 /// `file_source`: the audit log is the source, and the grant is unused.
@@ -300,9 +350,10 @@ pub(crate) fn evaluate_privileges(
     extended: bool,
     audit: bool,
     file_source: bool,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<TargetNote>) {
     let mut over = Vec::new();
     let mut expected = Vec::new();
+    let mut notes = Vec::new();
     let mut global: BTreeSet<String> = BTreeSet::new();
     let mut grantable = false;
     for (p, gr) in &g.global {
@@ -317,11 +368,20 @@ pub(crate) fn evaluate_privileges(
             .to_owned();
         if extended {
             expected.push(label);
+            notes.push(
+                TargetNote::new(NoteCode::PrivilegeExtendedVariant)
+                    .with_labels([NoteLabel::privilege("SELECT")]),
+            );
         } else {
             over.push(label);
+            notes.push(TargetNote::new(NoteCode::PrivilegeGlobalSelect));
         }
     }
     if !global.is_empty() {
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeGlobalPrivileges)
+                .with_labels(global.iter().map(|p| NoteLabel::privilege(p))),
+        );
         over.push(format!(
             "global privileges: {}",
             global.into_iter().collect::<Vec<_>>().join(", ")
@@ -346,6 +406,7 @@ pub(crate) fn evaluate_privileges(
     }
     if system_select {
         over.push("SELECT on the mysql or sys system database".to_owned());
+        notes.push(TargetNote::new(NoteCode::PrivilegeSystemDatabaseSelect));
     }
     if ps_select && !audit {
         over.push(
@@ -353,14 +414,22 @@ pub(crate) fn evaluate_privileges(
              session readable)"
                 .to_owned(),
         );
+        notes.push(TargetNote::new(
+            NoteCode::PrivilegePerformanceSchemaWithoutAudit,
+        ));
     } else if ps_select && file_source {
         over.push(
             "SELECT on performance_schema unused (the audit log is the source; statement text \
              of every session readable, clear-text passwords on MariaDB)"
                 .to_owned(),
         );
+        notes.push(TargetNote::new(NoteCode::PrivilegePerformanceSchemaUnused));
     }
     if !beyond_select.is_empty() {
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeBeyondSelect)
+                .with_labels(beyond_select.iter().map(|p| NoteLabel::privilege(p))),
+        );
         over.push(format!(
             "privileges beyond SELECT on databases / tables / columns: {}",
             beyond_select.into_iter().collect::<Vec<_>>().join(", ")
@@ -368,14 +437,19 @@ pub(crate) fn evaluate_privileges(
     }
     if grantable {
         over.push("WITH GRANT OPTION".to_owned());
+        notes.push(TargetNote::new(NoteCode::PrivilegeGrantOption));
     }
     if g.roles > 0 {
         over.push(format!(
             "granted {} role(s) (their privileges are not evaluated)",
             g.roles
         ));
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeRolesNotEvaluated)
+                .with_count(g.roles.unsigned_abs()),
+        );
     }
-    (over, expected)
+    (over, expected, notes)
 }
 
 /// Privileges and coverage of the account.
@@ -384,6 +458,8 @@ pub(crate) struct Report {
     pub(crate) over_privileged: Vec<String>,
     /// Expected with the extended-variant flag.
     pub(crate) expected: Vec<String>,
+    /// The same privileges as closed notes.
+    pub(crate) privilege_notes: Vec<TargetNote>,
     /// The account name cannot be matched in the privilege tables.
     pub(crate) privileges_unknown: bool,
     pub(crate) init_connect: bool,
@@ -591,7 +667,10 @@ fn unreachable(e: &MyError) -> TargetHealth {
             e.stage.as_str(),
             e.engine_code().unwrap_or_else(|| "none".to_owned())
         )),
-        notes: Vec::new(),
+        notes: vec![
+            TargetNote::new(NoteCode::CheckStageFailed)
+                .with_labels([NoteLabel::stage(e.stage.as_str())]),
+        ],
     }
 }
 
@@ -609,7 +688,7 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
                 audit_level: AuditLevel::None,
                 failure: Some(FailureCode::Timeout),
                 detail: Some("check timed out".to_owned()),
-                notes: Vec::new(),
+                notes: vec![TargetNote::new(NoteCode::CheckTimedOut)],
             }
         }
     }
@@ -633,7 +712,9 @@ pub(crate) async fn file_state(state: &CheckState, target: &TargetConfig) -> Opt
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth, Source) {
     let timeouts = Timeouts::new(CHECK_STATEMENT_TIMEOUT);
+    // `notes`: the local log detail; `codes`: the same as closed notes.
     let mut notes: Vec<String> = Vec::new();
+    let mut codes = Notes::default();
     if target.mysql_settings().tls == MysqlTlsMode::DisableInsecure {
         notes.push(
             "INSECURE: TLS disabled on a network connection (tls: disable_insecure): traffic \
@@ -641,6 +722,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
              brute force"
                 .to_owned(),
         );
+        codes.add(TargetNote::new(NoteCode::SecurityTlsDisabled));
     }
     let mut session = match Session::connect(target, timeouts).await {
         Ok(s) => s,
@@ -659,9 +741,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
     match (target.engine, session.flavor()) {
         (TargetEngine::Mysql, Flavor::Mariadb) => {
             notes.push("the server is MariaDB (target declared as mysql)".to_owned());
+            codes.add(TargetNote::new(NoteCode::CheckServerIsMariadb));
         }
         (TargetEngine::Mariadb, Flavor::Mysql) => {
             notes.push("the server is MySQL (target declared as mariadb)".to_owned());
+            codes.add(TargetNote::new(NoteCode::CheckServerIsMysql));
         }
         _ => {}
     }
@@ -671,7 +755,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
     };
     let file = file_state(state, target).await;
     let (level, source) = choose(&probe, file);
-    notes.extend(probe.notes(file));
+    let (text, probe_codes) = probe.explain(file);
+    notes.extend(text);
+    codes.extend(probe_codes);
     notes.push(match source {
         Source::File(MysqlLogFormat::ServerAudit) => "audit source: server_audit log".to_owned(),
         Source::File(MysqlLogFormat::Json) => "audit source: audit_log JSON file".to_owned(),
@@ -684,6 +770,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
             "{dropped} audit log record(s) dropped in the last 24 h (not parsable, oversized or \
              damaged)"
         ));
+        codes.add(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(dropped));
     }
     if state.due(&target.id) && !session.is_poisoned() {
         match report(
@@ -710,6 +797,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
     }
     if let Some(r) = state.cached(&target.id) {
         notes.extend(summary(&r));
+        codes.extend(report_notes(&r));
     }
     session.close().await;
     notes.sort();
@@ -724,10 +812,41 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
                 if notes.is_empty() { "" } else { "; " },
                 notes.join("; ")
             )),
-            notes: Vec::new(),
+            notes: codes.into_vec(),
         },
         source,
     )
+}
+
+/// The report's explanations as closed notes: privileges, `init_connect`
+/// and coverage (counts only, never a name).
+fn report_notes(r: &Report) -> Vec<TargetNote> {
+    let mut out = r.privilege_notes.clone();
+    if r.privileges_unknown {
+        out.push(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+    }
+    if r.init_connect {
+        out.push(TargetNote::new(NoteCode::SecurityInitConnect));
+    }
+    let c = &r.coverage;
+    let remote = c
+        .engines
+        .iter()
+        .filter(|(_, _, k)| *k == EngineSkip::Remote)
+        .count();
+    for (code, n) in [
+        (NoteCode::CoverageViewsNotSampled, c.views.len()),
+        (NoteCode::CoverageRemoteEngineTables, remote),
+        (
+            NoteCode::CoverageOtherEngineTables,
+            c.engines.len() - remote,
+        ),
+    ] {
+        if n > 0 {
+            out.push(TargetNote::new(code).with_count(n as u64));
+        }
+    }
+    out
 }
 
 fn summary(r: &Report) -> Vec<String> {
@@ -960,10 +1079,12 @@ async fn report(
         }
     };
     let (_, coverage) = catalog::plan(&tables, |_, _| true);
-    let (over_privileged, expected) = evaluate_privileges(&grants, extended, audit, file_source);
+    let (over_privileged, expected, privilege_notes) =
+        evaluate_privileges(&grants, extended, audit, file_source);
     Ok(Report {
         over_privileged,
         expected,
+        privilege_notes,
         privileges_unknown,
         init_connect,
         coverage,
@@ -992,16 +1113,24 @@ mod tests {
         // performance_schema is the Audit grant while Audit runs...
         assert_eq!(
             evaluate_privileges(&grants, false, true, false),
-            (vec![], vec![])
+            (vec![], vec![], vec![])
         );
         // ...and over-privilege otherwise (ADR-0018).
-        let (over, _) = evaluate_privileges(&grants, false, false, false);
+        let (over, _, notes) = evaluate_privileges(&grants, false, false, false);
         assert_eq!(over.len(), 1, "{over:?}");
         assert!(over[0].starts_with("SELECT on performance_schema without Audit"));
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.performance_schema_without_audit"}])
+        );
         // With an audit log as the source, the grant is unused.
-        let (over, _) = evaluate_privileges(&grants, false, true, true);
+        let (over, _, notes) = evaluate_privileges(&grants, false, true, true);
         assert_eq!(over.len(), 1, "{over:?}");
         assert!(over[0].starts_with("SELECT on performance_schema unused"));
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.performance_schema_unused"}])
+        );
         let hr_only = Grants {
             global: vec![g("USAGE")],
             scoped: vec![s("hr", "SELECT")],
@@ -1009,7 +1138,7 @@ mod tests {
         };
         assert_eq!(
             evaluate_privileges(&hr_only, false, false, false),
-            (vec![], vec![])
+            (vec![], vec![], vec![])
         );
     }
 
@@ -1021,15 +1150,29 @@ mod tests {
             scoped: vec![s("performance_schema", "SELECT")],
             roles: 0,
         };
-        let (over, expected) = evaluate_privileges(&grants, false, true, false);
+        let (over, expected, notes) = evaluate_privileges(&grants, false, true, false);
         assert_eq!(over.len(), 2, "{over:?}");
         assert!(expected.is_empty());
         assert!(over[0].starts_with("global SELECT"));
         assert_eq!(over[1], "global privileges: PROCESS, SHOW VIEW");
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "privilege.global_select"},
+                {"code": "privilege.global_privileges", "labels": ["process", "show_view"]}
+            ])
+        );
         // Extended variant: global SELECT expected, PROCESS / SHOW VIEW not.
-        let (over, expected) = evaluate_privileges(&grants, true, true, false);
+        let (over, expected, notes) = evaluate_privileges(&grants, true, true, false);
         assert_eq!(over, ["global privileges: PROCESS, SHOW VIEW"]);
         assert!(expected[0].starts_with("global SELECT"));
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "privilege.extended_variant", "labels": ["select"]},
+                {"code": "privilege.global_privileges", "labels": ["process", "show_view"]}
+            ])
+        );
     }
 
     #[test]
@@ -1044,7 +1187,20 @@ mod tests {
             ],
             roles: 2,
         };
-        let (over, _) = evaluate_privileges(&grants, true, true, false);
+        let (over, _, notes) = evaluate_privileges(&grants, true, true, false);
+        assert_registered(&notes);
+        let json = notes_json(&notes);
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"code": "privilege.global_privileges", "labels": ["file", "super"]},
+                {"code": "privilege.system_database_select"},
+                {"code": "privilege.beyond_select", "labels": ["other", "execute", "insert"]},
+                {"code": "privilege.grant_option"},
+                {"code": "privilege.roles_not_evaluated", "count": 2}
+            ])
+        );
+        assert!(!json.to_string().contains("SECRET") && !json.to_string().contains("weird"));
         for label in [
             "global privileges: FILE, SUPER",
             "SELECT on the mysql or sys system database",
@@ -1055,6 +1211,215 @@ mod tests {
             assert!(over.iter().any(|o| o == label), "{label}: {over:?}");
         }
         assert!(!over.iter().any(|o| o.contains("SECRET")));
+    }
+
+    /// A note as the console receives it: `code`, `count`, `labels` only.
+    fn note_json(n: &TargetNote) -> serde_json::Value {
+        let mut v = serde_json::json!({"code": n.code().as_str()});
+        if let Some(c) = n.count() {
+            v["count"] = c.into();
+        }
+        if !n.labels().is_empty() {
+            v["labels"] = n.labels().iter().map(|l| l.as_str()).collect();
+        }
+        v
+    }
+
+    fn notes_json(notes: &[TargetNote]) -> serde_json::Value {
+        notes.iter().map(note_json).collect()
+    }
+
+    /// Every note is registered for both `mysql` and `mariadb`, or for the
+    /// engine it is specific to (`check.server_is_*`, the MySQL-only
+    /// `audit_log` plugin and `audit_log_filter` component).
+    fn assert_registered(notes: &[TargetNote]) {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../shared/protocol/target-notes.json"
+        ))
+        .unwrap();
+        for n in notes {
+            let code = n.code().as_str();
+            let engines: Vec<&str> = v[code]["engines"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{code} is not registered"))
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            let expected: &[&str] = match n.code() {
+                NoteCode::CheckServerIsMariadb
+                | NoteCode::AuditAuditLogPluginNotRead
+                | NoteCode::AuditAuditLogFilterNotRead => &["mysql"],
+                NoteCode::CheckServerIsMysql => &["mariadb"],
+                _ => &["mysql", "mariadb"],
+            };
+            for e in expected {
+                assert!(engines.contains(e), "{code} is not registered for {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn audit_notes_follow_the_log_detail() {
+        let sa = |logging, file| AuditProbe {
+            server_audit: Some(ServerAudit {
+                logging,
+                file,
+                statements: true,
+            }),
+            audit_log: Some(("JSON".to_owned(), true)),
+            audit_log_filter: Some("JSON".to_owned()),
+            general_log: true,
+            ..ps_probe()
+        };
+        // No audit log configured: each active plugin is noted with its state.
+        let (text, notes) = sa(false, true).explain(None);
+        assert_registered(&notes);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "audit.server_audit_not_read", "labels": ["logging_off", "file_output"]},
+                {"code": "audit.audit_log_plugin_not_read"},
+                {"code": "audit.audit_log_filter_not_read"},
+                {"code": "audit.general_log_enabled"}
+            ])
+        );
+        assert!(text.len() > notes.len());
+        let file = |readable, recent, format| {
+            Some(FileState {
+                format,
+                readable,
+                recent,
+            })
+        };
+        let cases = [
+            (
+                file(false, false, MysqlLogFormat::ServerAudit),
+                vec!["audit.log_not_readable"],
+            ),
+            (
+                file(true, true, MysqlLogFormat::ServerAudit),
+                vec!["audit.log_plugin_mismatch"],
+            ),
+            (
+                file(true, false, MysqlLogFormat::Json),
+                vec![
+                    "audit.partial_pending_first_record",
+                    "audit.log_without_row_counts",
+                ],
+            ),
+            (
+                file(true, true, MysqlLogFormat::Json),
+                vec!["audit.log_without_row_counts"],
+            ),
+        ];
+        for (f, expected) in cases {
+            let (_, notes) = sa(false, true).explain(f);
+            assert_registered(&notes);
+            let codes: Vec<&str> = notes
+                .iter()
+                .map(|n| n.code().as_str())
+                .filter(|c| *c != "audit.general_log_enabled")
+                .collect();
+            assert_eq!(codes, expected, "{f:?}");
+        }
+        // performance_schema states.
+        for (probe, code) in [
+            (
+                AuditProbe {
+                    consumers_readable: false,
+                    ..ps_probe()
+                },
+                "audit.performance_schema_not_readable",
+            ),
+            (
+                AuditProbe {
+                    current_enabled: false,
+                    ..ps_probe()
+                },
+                "audit.statement_consumers_disabled",
+            ),
+            (
+                AuditProbe {
+                    history_long_enabled: false,
+                    ..ps_probe()
+                },
+                "audit.history_long_consumer_disabled",
+            ),
+            (
+                AuditProbe {
+                    history_long_readable: false,
+                    ..ps_probe()
+                },
+                "audit.history_not_readable",
+            ),
+        ] {
+            let (_, notes) = probe.explain(None);
+            assert_registered(&notes);
+            assert_eq!(notes_json(&notes), serde_json::json!([{"code": code}]));
+        }
+        assert!(ps_probe().explain(None).1.is_empty());
+    }
+
+    #[test]
+    fn report_notes_are_counts_and_codes_only() {
+        let r = Report {
+            privileges_unknown: true,
+            init_connect: true,
+            coverage: Coverage {
+                views: vec![("hr".to_owned(), "v_secret_view".to_owned()); 2],
+                engines: vec![
+                    ("hr".to_owned(), "fed".to_owned(), EngineSkip::Remote),
+                    ("hr".to_owned(), "m".to_owned(), EngineSkip::Merge),
+                    ("hr".to_owned(), "x".to_owned(), EngineSkip::Other),
+                ],
+                ..Coverage::default()
+            },
+            ..Report::default()
+        };
+        let notes = report_notes(&r);
+        assert_registered(&notes);
+        let json = notes_json(&notes);
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"code": "privilege.not_evaluated"},
+                {"code": "security.init_connect"},
+                {"code": "coverage.views_not_sampled", "count": 2},
+                {"code": "coverage.remote_engine_tables", "count": 1},
+                {"code": "coverage.other_engine_tables", "count": 2}
+            ])
+        );
+        assert!(!json.to_string().contains("secret"));
+        assert!(report_notes(&Report::default()).is_empty());
+    }
+
+    #[test]
+    fn check_failures_are_noted_with_their_stage_only() {
+        let mut e = MyError::new(FailureCode::TargetUnreachable, Stage::Auth);
+        e.errno = Some(1045);
+        let health = unreachable(&e);
+        assert_registered(&health.notes);
+        assert_eq!(
+            notes_json(&health.notes),
+            serde_json::json!([{"code": "check.stage_failed", "labels": ["stage_auth"]}])
+        );
+        for stage in [
+            Stage::Secret,
+            Stage::Tls,
+            Stage::Connect,
+            Stage::Auth,
+            Stage::SessionSetup,
+            Stage::Begin,
+            Stage::Commit,
+            Stage::Introspection,
+            Stage::Columns,
+            Stage::Sample,
+            Stage::Check,
+            Stage::Kill,
+            Stage::Audit,
+        ] {
+            assert!(!NoteLabel::stage(stage.as_str()).is_other(), "{stage:?}");
+        }
     }
 
     fn ps_probe() -> AuditProbe {

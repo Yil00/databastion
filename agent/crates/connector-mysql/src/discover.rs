@@ -18,9 +18,9 @@
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FailureCode, FindingSink, ScanJob};
+use databastion_core::{ConnectorError, FailureCode, FindingSink, ScanCoverage, ScanJob};
 
-use crate::catalog::{self, Coverage, Table};
+use crate::catalog::{self, Coverage, EngineSkip, Table};
 use crate::conn::{Flow, ReadTx, Session, Streamed, Timeouts};
 use crate::error::{MyError, Stage};
 use crate::sql::{self, Sampled};
@@ -102,6 +102,7 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         job.includes_database(schema) && job.includes_object(name)
     });
     log_coverage(target, &coverage);
+    sink.add_coverage(planned_coverage(&coverage));
     let mut session = Some(first);
     let mut skipped = 0usize;
     let mut not_readable = 0usize;
@@ -131,6 +132,10 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
             Ok(s) => s,
             Err(e) if !e.fatal && e.code == FailureCode::ResourceLimit => {
                 skipped += 1;
+                sink.add_coverage(ScanCoverage {
+                    limit: 1,
+                    ..ScanCoverage::default()
+                });
                 tracing::warn!(
                     target_id = %target.id,
                     database = db.as_str(),
@@ -142,6 +147,10 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
             }
             Err(e) if !e.fatal => {
                 skipped += 1;
+                sink.add_coverage(ScanCoverage {
+                    error: 1,
+                    ..ScanCoverage::default()
+                });
                 tracing::warn!(
                     target_id = %target.id,
                     database = db.as_str(),
@@ -157,6 +166,10 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         };
         if !sample.readable {
             not_readable += 1;
+            sink.add_coverage(ScanCoverage {
+                not_readable: 1,
+                ..ScanCoverage::default()
+            });
             tracing::warn!(
                 target_id = %target.id,
                 database = db.as_str(),
@@ -175,6 +188,10 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                 "virtual generated columns not sampled (computed on read)"
             );
         }
+        sink.add_coverage(ScanCoverage {
+            sampled: 1,
+            ..ScanCoverage::default()
+        });
         // No transaction is open from here on.
         for (column, values) in &sample.columns {
             let samples: Vec<RawSample<'_>> = values.iter().map(RawValue::as_sample).collect();
@@ -216,6 +233,26 @@ fn fail(target: &TargetConfig, e: MyError) -> ConnectorError {
         "scan failed"
     );
     e.into_connector_error()
+}
+
+/// The objects of the job's scope skipped by the plan, as coverage
+/// counters (`JobProgress` `skipped_*`): tables on a remote-access engine
+/// are remote (never read, I5); views, sequences, other object kinds and
+/// tables on an engine outside the allow-list (merge tables included:
+/// their tables are sampled directly) are kinds the connector does not
+/// sample. Counts only, never a name.
+pub(crate) fn planned_coverage(c: &Coverage) -> ScanCoverage {
+    let remote = c
+        .engines
+        .iter()
+        .filter(|(_, _, k)| *k == EngineSkip::Remote)
+        .count();
+    let unsupported = c.views.len() + (c.engines.len() - remote) + c.sequences + c.other;
+    ScanCoverage {
+        remote: remote as u64,
+        unsupported: unsupported as u64,
+        ..ScanCoverage::default()
+    }
 }
 
 pub(crate) fn log_coverage(target: &TargetConfig, c: &Coverage) {
@@ -463,6 +500,41 @@ async fn read_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_coverage_counts_each_skip_reason() {
+        let pair = || ("secret_db".to_owned(), "t".to_owned());
+        let engine = |k| ("secret_db".to_owned(), "t".to_owned(), k);
+        let c = Coverage {
+            views: vec![pair(); 2],
+            engines: vec![
+                engine(EngineSkip::Remote),
+                engine(EngineSkip::Remote),
+                engine(EngineSkip::Remote),
+                engine(EngineSkip::Merge),
+                engine(EngineSkip::Other),
+            ],
+            sequences: 4,
+            other: 1,
+            truncated: true,
+        };
+        assert_eq!(
+            planned_coverage(&c),
+            ScanCoverage {
+                sampled: 0,
+                not_readable: 0,
+                row_level_security: 0,
+                remote: 3,
+                unsupported: 2 + 2 + 4 + 1,
+                limit: 0,
+                error: 0,
+            }
+        );
+        assert_eq!(
+            planned_coverage(&Coverage::default()),
+            ScanCoverage::default()
+        );
+    }
 
     #[test]
     fn value_bearing_names_are_normalized() {

@@ -43,7 +43,8 @@ use databastion_classifiers::id::ClassifierId;
 use databastion_classifiers::masking::{HmacKey, MaskedFinding};
 use databastion_core::config::{Limits, TargetConfig};
 use databastion_core::{
-    AuditLevel, Connector, ConnectorError, FailureCode, FindingSink, ScanJob, ScanParams,
+    AuditLevel, Connector, ConnectorError, FailureCode, FindingSink, NoteCode, ScanJob, ScanParams,
+    TargetNote,
 };
 
 use crate::MysqlConnector;
@@ -470,6 +471,18 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         assert!(detail.contains("no audit source"), "{detail}");
         // The dev account is not over-privileged.
         assert!(!detail.contains("over-privileged"), "{detail}");
+        // The same as closed notes, every one registered for the engine.
+        assert_registered_notes(server.flavor(), &health.notes);
+        note(&health.notes, NoteCode::AuditPerformanceSchemaNotReadable);
+        assert!(
+            !health
+                .notes
+                .iter()
+                .any(|n| n.code().as_str().starts_with("privilege.")),
+            "{}: {:?}",
+            server.name,
+            health.notes
+        );
         if server.name == "mariadb" {
             assert!(
                 detail.contains("server_audit active (logging ON, file output)"),
@@ -479,6 +492,9 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
                 detail.contains("reading its log needs mysql.audit_log"),
                 "{detail}"
             );
+            let n = note(&health.notes, NoteCode::AuditServerAuditNotRead);
+            let labels: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+            assert_eq!(labels, ["logging_on", "file_output"]);
         }
 
         // Wrong password: authentication_failed, no server text.
@@ -486,12 +502,43 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         let health = MysqlConnector::new().check(&bad).await;
         assert!(!health.reachable);
         assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+        assert_eq!(health.notes.len(), 1, "{:?}", health.notes);
+        assert_eq!(health.notes[0].code(), NoteCode::CheckStageFailed);
+        assert!(!health.notes[0].labels()[0].is_other());
         let detail = health.detail.unwrap();
         assert!(
             !detail.contains("denied") && !detail.contains("databastion"),
             "{detail}"
         );
     }
+}
+
+/// Every note is registered in the contract registry for the server's
+/// engine (`check.server_is_*` for the declared one).
+fn assert_registered_notes(flavor: Flavor, notes: &[TargetNote]) {
+    let registry: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/target-notes.json"
+    ))
+    .unwrap();
+    let engine = match flavor {
+        Flavor::Mysql => "mysql",
+        Flavor::Mariadb => "mariadb",
+    };
+    for n in notes {
+        let engines = registry[n.code().as_str()]["engines"].as_array();
+        assert!(
+            engines.is_some_and(|e| e.iter().any(|x| x == engine)),
+            "{} not registered for {engine}",
+            n.code().as_str()
+        );
+    }
+}
+
+fn note(notes: &[TargetNote], code: NoteCode) -> &TargetNote {
+    notes
+        .iter()
+        .find(|n| n.code() == code)
+        .unwrap_or_else(|| panic!("no {} note: {notes:?}", code.as_str()))
 }
 
 #[tokio::test]
@@ -1111,6 +1158,13 @@ async fn probes() {
             "{}: {detail}",
             server.name
         );
+        assert_registered_notes(server.flavor(), &health.notes);
+        let labels: Vec<String> = note(&health.notes, NoteCode::PrivilegeBeyondSelect)
+            .labels()
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        assert_eq!(labels, ["execute", "insert"], "{}", server.name);
         let (_dir, min) = target(&server, MIN_USER, IT_PASSWORD);
         let health = MysqlConnector::new().check(&min).await;
         assert!(health.reachable);
@@ -1127,6 +1181,10 @@ async fn probes() {
             ),
             "{}: {detail}",
             server.name
+        );
+        note(
+            &health.notes,
+            NoteCode::PrivilegePerformanceSchemaWithoutAudit,
         );
         // It only sees (and samples) its table.
         let (r, findings) = scan(&min).await;
