@@ -356,7 +356,7 @@ Read from each record: `reqType`, `reqStart`, `reqSession`, `reqAuthzID`, `reqDN
 
 - **Actions**: search and compare are `read` (`rows` = `reqEntries` for a search); add, modify (password changes included), delete and modrdn are `write`; bind is `connect`, or `auth_failure` when it failed. Unbind, abandon and extended operations give no event. A failed search that returned entries is reported; other failed operations are not.
 - **Principal**: the authorization DN (`reqAuthzID`), `anonymous` when empty; the bind DN for a bind. Sent in clear only for `anonymous`, the agent's own DN and the DNs listed in `openldap.clear_principals`; **every other principal is a keyed fingerprint** (an entry DN usually names a person). Failed binds are always fingerprinted.
-- **Objects**: the naming context of `reqDN`, and the console's `sensitive_objects` of that context the operation could reach (from the base's container, and for a subtree search every container below it, at most 16). With none, the object is `*` with the container as `schema`: the log does not give the object class of the entries a search returned.
+- **Objects**: the naming context of `reqDN`, and the console's `sensitive_objects` of that context the operation could reach (from the base's container, and for a subtree search every container below it; at most 16, the first ones in the console's most-sensitive-first order, [ADR-0031](adr/0031-openldap-principals-dedup-and-stream-alerts.md) decision 4). With none, the object is `*` with the container as `schema`: the log does not give the object class of the entries a search returned.
 - **Missing from the log**: the client address (events carry none) and the application name.
 
 ### Signals
@@ -382,11 +382,14 @@ Limit: someone holding the agent's DN and password can bind from anywhere unrepo
 
 ### Known limits
 
-- **No client address** in the log: principals carry none, and fingerprinted principals are grouped by the console per policy, database and hour.
+- **No client address** in the log: principals carry none.
+- **One incident key for every fingerprinted user** (end-of-phase-6 review M1): the console groups fingerprinted principals by client network, so today every fingerprinted OpenLDAP user shares one incident key per policy, database and hour. A false positive on one user's incident suppresses the other users' incidents of that hour, and a second user's dump joins the first user's open incident. [ADR-0031](adr/0031-openldap-principals-dedup-and-stream-alerts.md) (Proposed, a v0.1.0 release gate) keys them by fingerprint. Until then, list the application and service DNs in `openldap.clear_principals`.
+- **Records committed out of CSN order across a restart** (review L3): after an agent restart or a caught panic, the stream skips records at or below its persisted cursor; a record with an older CSN written after the cursor was saved is lost. The 10 s overlap covers this within a run only.
+- **Container names** (review L4): the normalized container (`schema`) keeps `ou`, `o`, `dc`, `c`, `l` and `st` values that do not look like data; a container named after a person or a customer that the normalization does not recognize reaches the console.
 - **Log gaps**: records purged by `olcAccessLogPurge` before the agent read them (agent stopped longer than the purge age) are lost; on first start, a server clock behind the agent's by more than 60 s skips records until it catches up.
 - **`slapcat` and other offline exports** are not visible.
 - **Heuristic signals** and **own-account residuals** (above).
-- **Delivery**: at most once, as for the other engines; after a caught internal error (panic), the stream restarts from its persisted cursor and the events of at most one search round may be sent twice. After 3 such errors in a row the stream stops (`audit.stream_stopped`, level None) until Audit is reconfigured or the agent restarts.
+- **Delivery**: at most once, as for the other engines; after a caught internal error (panic), the stream restarts from its persisted cursor and the events of at most one search round may be sent twice. After 3 such errors in a row (for instance a panic that repeats on the same record) the stream stops (`audit.stream_stopped`, level None) until Audit is reconfigured or the agent restarts. This applies to every engine, and the console raises **no alert** for it yet: only the target shows the note ([ADR-0031](adr/0031-openldap-principals-dedup-and-stream-alerts.md) decision 3, a v0.1.0 release gate).
 
 ## Known export signatures
 | Tool | Observable signature | Engine |
