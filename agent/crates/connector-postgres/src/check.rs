@@ -192,6 +192,9 @@ pub(crate) struct CheckState {
     /// Per target: records dropped for their severity, and when the
     /// count started (reported for 24 h, then reset).
     severity_mismatches: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Per target: the agent's own reads, shared by every Audit stream of
+    /// the target (see `audit::events::OwnUsage`).
+    own_usage: Mutex<HashMap<String, crate::audit::events::SharedOwnUsage>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -204,6 +207,18 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(target_id.to_owned(), Instant::now());
+    }
+
+    /// The agent's own-read counters of `target_id`, created once and kept
+    /// for the life of the connector.
+    pub(crate) fn own_usage(&self, target_id: &str) -> crate::audit::events::SharedOwnUsage {
+        std::sync::Arc::clone(
+            self.own_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
     }
 
     /// Records of `target_id` dropped for a severity other than
@@ -787,6 +802,19 @@ mod tests {
             evaluate_privileges(RoleAttributes::default(), &memberships, 0, 0, false);
         assert_eq!(over.len(), 2);
         assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn own_usage_is_one_per_target() {
+        let state = CheckState::default();
+        assert!(std::sync::Arc::ptr_eq(
+            &state.own_usage("t"),
+            &state.own_usage("t")
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &state.own_usage("t"),
+            &state.own_usage("u")
+        ));
     }
 
     #[test]

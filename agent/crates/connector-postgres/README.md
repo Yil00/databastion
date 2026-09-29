@@ -61,7 +61,11 @@ pgaudit source needs `pgaudit.log_rows = on`.
   check only separates remote clients. Residual: someone holding the
   agent's credentials on the agent host (or behind the same pooler),
   spoofing its `application_name` and reading at most that many rows per
-  object and day with filtered queries stays unreported. The agent's
+  object and day with filtered queries stays unreported. The counters are
+  kept per target for the life of the agent process: restarting a stream
+  (a failure, a source switch, the agent's sessions terminated on purpose)
+  does not reset them, but an **agent restart** does (they are not
+  persisted), which gives a fresh budget per object. The agent's
   database credentials never leave its host (I3).
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.

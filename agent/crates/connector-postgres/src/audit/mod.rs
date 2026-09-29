@@ -84,11 +84,13 @@ fn own_account(
     cfg: &AuditConfig,
     target: &TargetConfig,
     pre: &check::Prerequisites,
+    state: &CheckState,
 ) -> events::OwnAccount {
     events::OwnAccount::new(
         &target.account,
         pre.own_addr,
         u64::from(cfg.max_sample_rows()),
+        state.own_usage(&target.id),
     )
 }
 
@@ -132,7 +134,9 @@ pub(crate) async fn audit_stream(
                                 format_of(log.format),
                                 cfg.cursor(CURSOR),
                             )),
-                            builder: events::PgauditEvents::new(own_account(cfg, target, &pre)),
+                            builder: events::PgauditEvents::new(own_account(
+                                cfg, target, &pre, state,
+                            )),
                             reported_oversized: 0,
                         })
                     }
@@ -150,9 +154,10 @@ pub(crate) async fn audit_stream(
             Source::PgStatStatements => {
                 pgaudit = None;
                 if pss_session.is_none() {
-                    let conn = pss::connect(target, timeouts, own_account(cfg, target, &pre))
-                        .await
-                        .map_err(PgError::into_connector_error)?;
+                    let conn =
+                        pss::connect(target, timeouts, own_account(cfg, target, &pre, state))
+                            .await
+                            .map_err(PgError::into_connector_error)?;
                     tracing::info!(target_id = %target.id, "audit source: pg_stat_statements (Limited)");
                     pss_session = Some(conn);
                 }
