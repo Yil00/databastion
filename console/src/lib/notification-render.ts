@@ -1,3 +1,4 @@
+import { SYSTEM_ALERT_EVENTS, type SystemAlertEvent } from "@/lib/notification-model";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 
 /**
@@ -136,8 +137,29 @@ export interface SuppressedPayload {
   limit_per_hour: number;
 }
 
+/**
+ * P7 (#75 review L4): system alerts of a channel suppressed by the global hourly budget of system
+ * alerts. Counts only: per event, and the number of distinct agents concerned; never an agent id,
+ * name or host name, nor any other agent-provided text.
+ */
+export interface SystemAlertsSuppressedPayload {
+  event: "system_alerts.suppressed";
+  occurred_at: string;
+  url: string | null;
+  channel: string;
+  window_start: string;
+  window_end: string;
+  suppressed: number;
+  /** Suppressed alerts per event (`agent.silent`, `agent.recovered`, `agent.integrity`, `agent.batches_dropped`); absent events are 0. */
+  by_event: Partial<Record<SystemAlertEvent, number>>;
+  /** Distinct agents of the suppressed alerts. */
+  agents: number;
+  limit_per_hour: number;
+}
+
 export type NotificationPayload =
   | SuppressedPayload
+  | SystemAlertsSuppressedPayload
   | IncidentOpenedPayload
   | AccessIncidentOpenedPayload
   | AgentSilentPayload
@@ -160,6 +182,13 @@ function one(v: string, max = 200): string {
 function locationText(l: IncidentOpenedPayload["location"]): string {
   return [l.database, l.schema, l.object, l.field].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
 }
+
+const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
+  "agent.silent": "Silent agents",
+  "agent.recovered": "Agents reporting again",
+  "agent.integrity": "Agent-integrity events",
+  "agent.batches_dropped": "Dropped batches",
+};
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
 
@@ -271,6 +300,23 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
       return {
         subject: `[DataBastion] ${p.suppressed} incident notification${p.suppressed > 1 ? "s" : ""} suppressed`,
         text: `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} incident notifications per hour between ${p.window_start} and ${p.window_end}: ${p.suppressed} more incident${p.suppressed > 1 ? "s were" : " was"} opened without a notification. See the incidents in the console.\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "system_alerts.suppressed": {
+      const p = payload;
+      const s = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+      const lines = SYSTEM_ALERT_EVENTS.filter((e) => (p.by_event[e] ?? 0) > 0).map(
+        (e) => `  ${`${SYSTEM_ALERT_LABEL[e]}:`.padEnd(24)}${p.by_event[e] ?? 0}`,
+      );
+      return {
+        subject: `[DataBastion] ${s(p.suppressed, "system alert", "system alerts")} suppressed`,
+        text: [
+          `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} system alerts per hour between ${p.window_start} and ${p.window_end}: ${s(p.suppressed, "more alert was", "more alerts were")} not sent, concerning ${s(p.agents, "agent", "agents")}.`,
+          "",
+          ...lines,
+          "",
+          "Every one of them is recorded: see the agents and their security events in the console.",
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
     case "channel.test": {

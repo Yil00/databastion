@@ -661,6 +661,30 @@ export const notificationDeliveries = pgTable(
   ],
 );
 
+/**
+ * Global hourly budget of system alerts per channel (P7, #75 review L4): one row per (channel, UTC
+ * clock hour), `sent` = the system-alert deliveries queued to that channel in that hour. Counted
+ * by a conditional upsert in the transaction that queues the alert (`enqueueSystemAlert` in
+ * `src/server/notifications.ts`), so concurrent web and worker processes never exceed the budget.
+ * No agent data: a channel id, an hour and a count. Rows of past hours are pruned by the worker.
+ * The runtime role reads, inserts, updates and deletes them (migration `0033`).
+ */
+export const systemAlertBudgets = pgTable(
+  "system_alert_budgets",
+  {
+    channelId: uuid("channel_id")
+      .notNull()
+      .references(() => notificationChannels.id, { onDelete: "cascade" }),
+    windowStart: tsz("window_start").notNull(),
+    sent: integer("sent").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.channelId, t.windowStart] }),
+    index("system_alert_budgets_window_idx").on(t.windowStart),
+    check("system_alert_budgets_sent", sql`${t.sent} >= 0`),
+  ],
+);
+
 // ------------------------------------------------------------------- Audit (P4-C)
 
 /**

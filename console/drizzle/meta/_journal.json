@@ -225,6 +225,20 @@
       "when": 1790707851101,
       "tag": "0031_p7_dropped_batches_alert",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790721073734,
+      "tag": "0032_p7_system_alert_budgets",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790721075087,
+      "tag": "0033_p7_system_alert_budget_grants",
+      "breakpoints": true
     }
   ]
 }

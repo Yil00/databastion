@@ -35,6 +35,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` | Worker: new incidents an `access_event` policy may open per clock hour, 1 to 10000, default 50; beyond, the matches go to one overflow incident of the policy. See "Audit correlation" |
 | `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
+| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -503,7 +504,7 @@ least N x 16 + 20 connections, plus PostgreSQL's reserved and administration con
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
 | Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
-
+| System-alert budgets (`system_alert_budgets`) | per (channel, UTC hour): the number of system alerts queued to the channel. No agent data. Past hours are pruned by the worker. Read, insert, update and delete for the runtime role (migration `0033`) |
 | Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1`, never in clear. Without a server key the username-derived limits are not stored at all (per process, see "Shared rate limits") and the other keys are a domain-separated SHA-256. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
 
 The argon2 concurrency caps and the 25 s verified-secret cache are in memory, per process (the
@@ -803,7 +804,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`,
+  `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -886,6 +888,26 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   once the hour is over, one `notifications.suppressed` digest per channel and hour reports how many
   were suppressed (counts only, link to the incidents list). System alerts, tests and digests are
   not counted.
+- **System-alert budget** (P7, #75 review L4): the per-agent bounds below (one silence alert per
+  episode, one integrity alert per agent, kind and hour, one dropped-batches alert per agent and
+  hour) do not bound a fleet: N misbehaving agents would send N alerts an hour to each channel.
+  So all system alerts (`agent.silent`, `agent.recovered`, `agent.integrity`,
+  `agent.batches_dropped`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
+  20) per channel and UTC clock hour, whatever the agent. It is a hard limit, shared by every
+  console process: the count lives in `system_alert_budgets`, one row per (channel, hour), charged
+  by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <
+  limit`) in the transaction that records the alert, so concurrent heartbeats, web replicas and
+  workers are serialized on that row and never exceed it; no in-memory state. A repeated alert
+  (same idempotency key) is not charged, and an aborted transaction gives its charge back. Over the
+  budget, the delivery is recorded as `skipped` (`rate_limited`); the security event, the audit
+  entry and the agent page are unaffected (every alert stays recorded). Once the hour is over
+  (worker, every minute), one `system_alerts.suppressed` digest per channel and hour reports
+  `suppressed` (total), `by_event` (count per event), `agents` (number of distinct agents) and
+  `limit_per_hour`, with a link to the agents list: counts only, never an agent id, name or host
+  name. Digests, tests and incident notifications are not charged. Limit: within an hour, once the
+  budget is spent, a later alert (e.g. a silence) is only counted in the digest, sent after the
+  hour; the Agents page and the security events show it at once. Budget rows of past hours are
+  pruned by the worker.
 - **Hardening (security review)**: moving an e-mail channel with a stored password to another host,
   port, TLS mode or user requires the password again (`400 password_required`); SMTP ports 25, 465,
   587 and 2525 only (any port with the dev flag); SMTP replies capped at 100 lines / 64 KiB; any
@@ -896,7 +918,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
 - **Agent-integrity alerts**: every `security_events` row written by the console
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
   `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
-  and hour per channel (the events themselves are all recorded, within their own budget).
+  and hour per channel (the events themselves are all recorded, within their own budget), and within
+  the system-alert budget above.
 - **Dropped batches** (P7, end-of-phase-4 review M2): each heartbeat reports `spool.dropped_batches`,
   the batches the agent dropped since it started (spool full, or rejected with a non-retryable
   4xx): findings or access events that never reached the console, e.g. the signature batches of a

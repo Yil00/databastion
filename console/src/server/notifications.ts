@@ -5,10 +5,10 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { notificationChannels, notificationDeliveries } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
-import type { DeliveryStatus } from "@/lib/notification-model";
+import { SYSTEM_ALERT_EVENTS, type DeliveryStatus, type SystemAlertEvent } from "@/lib/notification-model";
 import { renderEmail, webhookBody, type NotificationPayload } from "@/lib/notification-render";
 
-import { consoleUrl, insecureDevAllowed, notifyMaxPerHour } from "./alerting-config";
+import { consoleUrl, insecureDevAllowed, notifyMaxPerHour, systemAlertsMaxPerHour } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { loadChannelForDelivery } from "./channels";
 import type { Tx } from "./findings";
@@ -74,8 +74,14 @@ interface NewDelivery {
 }
 
 async function insertDeliveries(db: Exec, rows: NewDelivery[]): Promise<number> {
-  if (rows.length === 0) return 0;
-  const inserted = await db
+  const inserted = await insertDeliveryRows(db, rows);
+  return inserted.filter((r) => r.status === "pending").length;
+}
+
+/** The rows actually inserted (a repeated idempotency key inserts nothing). */
+async function insertDeliveryRows(db: Exec, rows: NewDelivery[]): Promise<{ id: string; channelId: string | null; status: DeliveryStatus }[]> {
+  if (rows.length === 0) return [];
+  return db
     .insert(notificationDeliveries)
     .values(
       rows.map((r) => ({
@@ -93,8 +99,7 @@ async function insertDeliveries(db: Exec, rows: NewDelivery[]): Promise<number> 
       })),
     )
     .onConflictDoNothing({ target: notificationDeliveries.idempotencyKey })
-    .returning({ id: notificationDeliveries.id, status: notificationDeliveries.status });
-  return inserted.filter((r) => r.status === "pending").length;
+    .returning({ id: notificationDeliveries.id, channelId: notificationDeliveries.channelId, status: notificationDeliveries.status });
 }
 
 /**
@@ -153,20 +158,59 @@ export async function enqueueIncidentNotifications(
   );
 }
 
+/** Start of the UTC clock hour of the budget clock (`notificationClock`, else the database clock). */
+function hourSql() {
+  return sql`date_trunc('hour', ${clockSql()}, 'UTC')`;
+}
+
 /**
- * A console alert (silent agent, agent-integrity event) to every enabled channel flagged
- * `system_alerts`. `subjectKey` identifies the alert (e.g. the silence episode); with no such
- * channel nothing is queued (the security event row remains). Returns the number of rows queued.
+ * P7 (#75 review L4): charges one system alert to the hourly budget of each channel, in the
+ * caller's transaction. One conditional upsert per channel on `system_alert_budgets`: the row of
+ * (channel, hour) is created at 1, or incremented only while below the limit. The row lock is held
+ * until the transaction ends, so concurrent transactions of any process are serialized on it and
+ * never exceed the limit; an aborted transaction gives its charge back. Channels are charged in
+ * sorted order, so two transactions charging the same channels cannot deadlock. Callers take the
+ * budget rows last (after their agent row), never the other way round. Returns the channels whose
+ * budget of the hour is spent.
+ */
+async function chargeSystemAlertBudget(tx: Exec, channelIds: readonly string[]): Promise<Set<string>> {
+  const limit = systemAlertsMaxPerHour();
+  const refused = new Set<string>();
+  for (const id of [...new Set(channelIds)].sort()) {
+    const res = await tx.execute<{ sent: number }>(sql`
+      insert into system_alert_budgets as b (channel_id, window_start, sent)
+      values (${id}, ${hourSql()}, 1)
+      on conflict (channel_id, window_start) do update set sent = b.sent + 1 where b.sent < ${limit}
+      returning b.sent`);
+    if (res.rows.length === 0) refused.add(id);
+  }
+  return refused;
+}
+
+/**
+ * A console alert (silent agent and recovery, agent-integrity event, dropped batches) to every
+ * enabled channel flagged `system_alerts`. `subjectKey` identifies the alert (e.g. the silence
+ * episode); with no such channel nothing is queued (the security event row remains). Returns the
+ * number of rows queued as pending.
+ *
+ * P7 (#75 review L4): besides the per-agent bounds of each alert, a global budget of
+ * `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` system alerts per channel and UTC clock hour holds for
+ * all agents together (N misbehaving agents no longer send N alerts per hour to each channel).
+ * Over it, the delivery is recorded as `skipped` (`rate_limited`) and counted in the hour's
+ * `system_alerts.suppressed` digest (`enqueueSystemAlertDigests`). Only new deliveries are
+ * charged: a repeated alert (same idempotency key) costs nothing.
  */
 export async function enqueueSystemAlert(
   tx: Exec,
-  alert: { subjectKey: string; agentId: string | null; securityEventId: string | null; payload: NotificationPayload },
+  alert: { subjectKey: string; agentId: string | null; securityEventId: string | null; payload: NotificationPayload & { event: SystemAlertEvent } },
 ): Promise<number> {
   const channels = await tx
     .select({ id: notificationChannels.id, slug: notificationChannels.slug })
     .from(notificationChannels)
-    .where(and(eq(notificationChannels.systemAlerts, true), eq(notificationChannels.enabled, true)));
-  return insertDeliveries(
+    .where(and(eq(notificationChannels.systemAlerts, true), eq(notificationChannels.enabled, true)))
+    // One order for every writer: concurrent inserts of the same keys cannot deadlock.
+    .orderBy(notificationChannels.id);
+  const inserted = await insertDeliveryRows(
     tx,
     channels.map((ch) => ({
       key: `${alert.subjectKey}|${alert.payload.event}|channel:${ch.id}`,
@@ -179,6 +223,21 @@ export async function enqueueSystemAlert(
       status: "pending",
     })),
   );
+  const fresh = inserted.filter((r): r is typeof r & { channelId: string } => r.status === "pending" && r.channelId !== null);
+  if (fresh.length === 0) return 0;
+  const refused = await chargeSystemAlertBudget(
+    tx,
+    fresh.map((r) => r.channelId),
+  );
+  const over = fresh.filter((r) => refused.has(r.channelId)).map((r) => r.id);
+  if (over.length > 0) {
+    await tx
+      .update(notificationDeliveries)
+      .set({ status: "skipped", lastError: "rate_limited" })
+      .where(inArray(notificationDeliveries.id, over));
+    log.debug({ event: alert.payload.event, channels: over.length }, "system alert over the channel's hourly budget: counted in the digest");
+  }
+  return fresh.length - over.length;
 }
 
 /**
@@ -218,6 +277,74 @@ export async function enqueueSuppressionDigests(db: Database): Promise<number> {
       },
     ]);
   }
+  return queued;
+}
+
+/** Past hours of `system_alert_budgets` kept before pruning (only the current hour is charged). */
+const SYSTEM_ALERT_BUDGET_KEEP_HOURS = 2;
+
+/**
+ * P7 (#75 review L4): one `system_alerts.suppressed` digest per channel and closed UTC clock hour
+ * in which system alerts were suppressed by the global hourly budget (last 2 days; idempotent, so
+ * every worker run may call it). Counts only: per event, and the number of distinct agents; never
+ * an agent id or any agent-provided text. Digests are not charged to the budget. Also prunes the
+ * budget rows of past hours. Returns the number of digests queued.
+ */
+export async function enqueueSystemAlertDigests(db: Database): Promise<number> {
+  const now = clockSql();
+  const events = sql.join(
+    SYSTEM_ALERT_EVENTS.map((e) => sql`${e}`),
+    sql`, `,
+  );
+  const res = await db.execute<{ channel_id: string; channel_slug: string; window_start: Date | string; n: number; agents: number; by_event: Record<string, number> }>(sql`
+    with s as (
+      select channel_id, channel_slug, date_trunc('hour', created_at, 'UTC') as window_start, event, agent_id
+      from notification_deliveries
+      where last_error = 'rate_limited' and event in (${events}) and channel_id is not null
+        and created_at >= ${now} - interval '2 days' and created_at < date_trunc('hour', ${now}, 'UTC')
+    )
+    select channel_id, max(channel_slug) as channel_slug, window_start, count(*)::int as n,
+      count(distinct agent_id)::int as agents,
+      (select jsonb_object_agg(e.event, e.n) from (
+         select s2.event, count(*)::int as n from s s2
+         where s2.channel_id = s.channel_id and s2.window_start = s.window_start group by s2.event) e) as by_event
+    from s
+    group by channel_id, window_start`);
+  const limit = systemAlertsMaxPerHour();
+  let queued = 0;
+  for (const r of res.rows) {
+    const start = new Date(r.window_start);
+    const end = new Date(start.getTime() + 3600_000);
+    const byEvent: Partial<Record<SystemAlertEvent, number>> = {};
+    for (const e of SYSTEM_ALERT_EVENTS) {
+      const n = Number(r.by_event?.[e] ?? 0);
+      if (n > 0) byEvent[e] = n;
+    }
+    queued += await insertDeliveries(db, [
+      {
+        key: `system-digest:${r.channel_id}|${start.toISOString()}|system_alerts.suppressed|channel:${r.channel_id}`,
+        event: "system_alerts.suppressed",
+        channelId: r.channel_id,
+        channelSlug: r.channel_slug,
+        payload: {
+          event: "system_alerts.suppressed",
+          occurred_at: end.toISOString(),
+          url: consoleUrl("/agents"),
+          channel: r.channel_slug,
+          window_start: start.toISOString(),
+          window_end: end.toISOString(),
+          suppressed: r.n,
+          by_event: byEvent,
+          agents: r.agents,
+          limit_per_hour: limit,
+        },
+        status: "pending",
+      },
+    ]);
+  }
+  await db.execute(
+    sql`delete from system_alert_budgets where window_start < date_trunc('hour', ${now}, 'UTC') - make_interval(hours => ${SYSTEM_ALERT_BUDGET_KEEP_HOURS})`,
+  );
   return queued;
 }
 

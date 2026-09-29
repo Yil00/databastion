@@ -68,6 +68,23 @@ export function notifyMaxPerHour(env: Env = process.env): number {
   return Number.isInteger(n) && n >= 1 && n <= 10_000 ? n : DEFAULT_NOTIFY_MAX_PER_HOUR;
 }
 
+/**
+ * P7 (#75 review L4): system alerts (silent agents and their recovery, agent-integrity events,
+ * dropped batches) per channel and UTC clock hour, all agents together
+ * (`DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR`, default 20, accepted 1 to 10000; other values fall back
+ * to the default, with a startup warning). Beyond, they are recorded as skipped (`rate_limited`)
+ * and one digest per channel and hour reports them (counts per event and number of agents only).
+ */
+export const SYSTEM_ALERTS_MAX_PER_HOUR_VAR = "DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR";
+export const DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR = 20;
+
+export function systemAlertsMaxPerHour(env: Env = process.env): number {
+  const raw = env[SYSTEM_ALERTS_MAX_PER_HOUR_VAR];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 10_000 ? n : DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR;
+}
+
 export function silentAgentThresholdS(env: Env = process.env): number {
   return silentAgentIntervals(env) * HEARTBEAT_INTERVAL_S;
 }
@@ -99,6 +116,15 @@ export function alertingWarnings(env: Env = process.env): string[] {
   const raw = env[SILENT_AGENT_INTERVALS_VAR];
   if (raw !== undefined && raw.trim() !== "" && silentAgentIntervals(env) === DEFAULT_SILENT_AGENT_INTERVALS && raw.trim() !== String(DEFAULT_SILENT_AGENT_INTERVALS)) {
     out.push(`${SILENT_AGENT_INTERVALS_VAR} must be an integer from 3 to 2880: the default (${DEFAULT_SILENT_AGENT_INTERVALS}) is used.`);
+  }
+  const budget = env[SYSTEM_ALERTS_MAX_PER_HOUR_VAR];
+  if (
+    budget !== undefined &&
+    budget.trim() !== "" &&
+    systemAlertsMaxPerHour(env) === DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR &&
+    budget.trim() !== String(DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR)
+  ) {
+    out.push(`${SYSTEM_ALERTS_MAX_PER_HOUR_VAR} must be an integer from 1 to 10000: the default (${DEFAULT_SYSTEM_ALERTS_MAX_PER_HOUR}) is used.`);
   }
   return out;
 }

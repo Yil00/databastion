@@ -104,6 +104,7 @@ describe("notifications.deliver handler", () => {
     const check = vi.spyOn(systemAlerts, "checkSilentAgents").mockResolvedValue({ silent: 0, recovered: 0 });
     const flush = vi.spyOn(droppedBatches, "flushDroppedBatchAlerts").mockResolvedValue(0);
     const digests = vi.spyOn(notifications, "enqueueSuppressionDigests").mockResolvedValue(0);
+    const systemDigests = vi.spyOn(notifications, "enqueueSystemAlertDigests").mockResolvedValue(0);
     const drain = vi
       .spyOn(notifications, "drainDeliveries")
       .mockResolvedValueOnce(delivery({ attempted: 1, delivered: 1 }))
@@ -119,6 +120,7 @@ describe("notifications.deliver handler", () => {
     await handler([]);
     expect(drain).toHaveBeenCalledTimes(2);
     expect(digests).toHaveBeenCalledTimes(2);
+    expect(systemDigests).toHaveBeenCalledTimes(2);
     expect(flush).toHaveBeenCalledTimes(2);
   });
 
