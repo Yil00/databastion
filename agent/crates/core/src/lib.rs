@@ -45,6 +45,7 @@ pub mod identity;
 pub mod job;
 mod jobs;
 pub mod notes;
+pub(crate) mod panics;
 pub mod runtime;
 mod sanitize;
 mod session;

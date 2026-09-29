@@ -2872,6 +2872,111 @@ async fn target_errors_end_the_scan_with_their_failure_code() {
     assert_eq!(status["error"]["code"], "permission_denied");
 }
 
+/// A connector that panics in every call (a parser bug on server input).
+struct Panicky;
+
+#[async_trait::async_trait]
+impl Connector for Panicky {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    #[allow(clippy::panic)]
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        panic!("check panicked on SECRET-VALUE")
+    }
+
+    #[allow(clippy::panic)]
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        panic!("discover panicked on SECRET-VALUE")
+    }
+
+    #[allow(clippy::panic)]
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        panic!("audit panicked on SECRET-VALUE")
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+}
+
+/// Security review H1 of #79 (defence in depth): a connector panic fails
+/// that call only; a stream that panics again and again is stopped, never
+/// restarted in a loop, and reported.
+#[tokio::test]
+async fn connector_panics_fail_the_call_not_the_agent() {
+    let server = MockServer::start().await;
+    let mut env = enrolled(&server).await;
+    env.config.limits.min_audit_poll_interval_s = 1;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Panicky)],
+    )
+    .unwrap();
+    // check(): unreachable, internal, with the stage.
+    let statuses_now = rt.target_statuses(&env.config).await;
+    let pg = &statuses_now[0];
+    assert!(!pg.reachable);
+    assert_eq!(pg.last_error, Some(FailureCode::Internal));
+    // discover(): the scan fails `internal`.
+    let id = "01920f5f-0c30-7e6f-a043-2b3c4d5e6fa1";
+    let body = serde_json::json!({ "jobs": [scan_job(id, "2026.09.1", serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    let got = statuses(&server).await;
+    let status = &got.iter().find(|(i, _)| i == id).unwrap().1;
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error"]["code"], "internal");
+    // audit_stream(): restarted with backoff, then stopped after
+    // AUDIT_MAX_PANICS panics in a row.
+    let body = serde_json::json!({ "jobs": [audit_job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6fa2",
+        serde_json::json!({"enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1}),
+    )]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (_, params) = {
+        let snapshot = rt.lock_audits().snapshot();
+        let (_, generation, params) = snapshot.into_iter().next().unwrap();
+        (generation, params)
+    };
+    let (_stop, stop_rx) = watch::channel(false);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        rt.run_audit("pg-main".to_owned(), params, stop_rx),
+    )
+    .await
+    .expect("the stream is stopped, not restarted forever");
+    assert_eq!(
+        rt.counters.connector_panics.load(Ordering::Relaxed),
+        2 + u64::from(AUDIT_MAX_PANICS)
+    );
+    // Reported (as `audit.stream_stopped`, when the console lists target
+    // notes) until Audit is reconfigured.
+    assert_eq!(
+        rt.lock_audit_parked().get("pg-main"),
+        Some(&AUDIT_MAX_PANICS)
+    );
+}
+
 // ------------------------------------------------------------------ audit
 
 /// An Audit connector: records the configuration it gets and submits

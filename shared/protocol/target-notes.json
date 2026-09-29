@@ -172,6 +172,16 @@
       "mongodb"
     ]
   },
+  "audit.stream_stopped": {
+    "description": "The Audit stream stopped after {count} internal errors of the agent in a row (the agent log names the code location): the audit level is reported None until Audit is reconfigured or the agent restarts.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb",
+      "mongodb",
+      "openldap"
+    ]
+  },
   "check.server_is_mariadb": {
     "description": "The server is MariaDB while the target is declared as mysql.",
     "engines": [

@@ -306,6 +306,9 @@ struct Counters {
     events_lost: AtomicU64,
     /// Audit streams that ended with an error (restarted with backoff).
     audit_stream_failures: AtomicU64,
+    /// Connector calls (`check`, `discover`, `audit_stream`) that panicked
+    /// and were turned into a failure of that call.
+    connector_panics: AtomicU64,
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
@@ -364,7 +367,17 @@ enum AuditEnd {
     Stopped,
     /// The connector returned (an error, or unexpectedly).
     Failed(Option<crate::ConnectorError>),
+    /// The connector panicked (caught, see `crate::panics`).
+    Panicked,
 }
+
+/// Panics in a row after which a target's audit stream is stopped until
+/// Audit is reconfigured or the agent restarts (the stream would read the
+/// same log record again: a restart loop).
+const AUDIT_MAX_PANICS: u32 = 3;
+/// A session that ran this long resets the panic count (the next panic is
+/// likely on another record).
+const AUDIT_PANIC_RESET: Duration = Duration::from_secs(600);
 
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
 struct PreparedScan {
@@ -442,6 +455,9 @@ struct Runtime {
     check_timeout: Duration,
     /// Audit settings per target.
     audits: Mutex<AuditTable>,
+    /// Targets whose audit stream was stopped after [`AUDIT_MAX_PANICS`]
+    /// panics in a row, with that count (reported as a target note).
+    audit_parked: Mutex<std::collections::HashMap<String, u32>>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
     /// Longest wait for a scan's findings to be acknowledged before its
@@ -569,6 +585,7 @@ pub async fn run(
     // stops the agent here with the pattern name, never silently disabling
     // a detector during a scan.
     databastion_classifiers::detect::check_patterns();
+    crate::panics::install_hook();
     let config = AgentConfig::load(config_path)?;
     let runtime = Runtime::new(config_path, config, connectors)?;
     runtime.run(shutdown).await
@@ -620,6 +637,7 @@ impl Runtime {
             findings_cap: MAX_FINDINGS_PER_JOB,
             check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
+            audit_parked: Mutex::new(std::collections::HashMap::new()),
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
             spool_worker: std::sync::atomic::AtomicBool::new(false),
@@ -730,11 +748,24 @@ impl Runtime {
             ),
             Some(c) => match tokio::time::timeout_at(deadline, async {
                 let _turn = turn.lock().await;
-                c.check(target).await
+                crate::panics::guard(c.check(target)).await
             })
             .await
             {
-                Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
+                Ok(Ok(h)) => (h.reachable, h.audit_level, h.failure, h.notes),
+                Ok(Err(crate::panics::Panicked)) => {
+                    bump(&self.counters.connector_panics, 1);
+                    tracing::error!(target_id = %target.id, "target check failed: internal error");
+                    (
+                        false,
+                        AuditLevel::None,
+                        Some(FailureCode::Internal),
+                        vec![
+                            TargetNote::new(NoteCode::CheckStageFailed)
+                                .with_labels([crate::notes::NoteLabel::stage("check")]),
+                        ],
+                    )
+                }
                 Err(_) => (
                     false,
                     AuditLevel::None,
@@ -742,6 +773,16 @@ impl Runtime {
                     vec![TargetNote::new(NoteCode::CheckTimedOut)],
                 ),
             },
+        };
+        // A stream stopped after repeated panics: no audit, whatever the
+        // source could give.
+        let (level, notes) = match self.lock_audit_parked().get(&target.id) {
+            Some(n) => {
+                let mut notes = notes;
+                notes.push(TargetNote::new(NoteCode::AuditStreamStopped).with_count(u64::from(*n)));
+                (AuditLevel::None, notes)
+            }
+            None => (level, notes),
         };
         let audit_source = match connector {
             Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
@@ -812,6 +853,7 @@ impl Runtime {
             ("events_filtered_total", &c.events_filtered),
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
+            ("connector_panics_total", &c.connector_panics),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
             (
                 "scan_status_before_flush_total",
@@ -1634,6 +1676,14 @@ impl Runtime {
 
     // ---------------------------------------------------------------- audit
 
+    fn lock_audit_parked(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, u32>> {
+        self.audit_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn lock_audits(&self) -> std::sync::MutexGuard<'_, AuditTable> {
         self.audits
             .lock()
@@ -1856,6 +1906,10 @@ impl Runtime {
         mut stop: watch::Receiver<bool>,
     ) {
         let mut failures: u32 = 0;
+        let mut panics: u32 = 0;
+        // New settings (or an agent restart) give a stopped stream another
+        // chance.
+        self.lock_audit_parked().remove(&target_id);
         loop {
             if *stop.borrow() {
                 return;
@@ -1886,6 +1940,7 @@ impl Runtime {
                 ),
             }
             tracing::info!(target_id, "audit stream started");
+            let began = Instant::now();
             match self
                 .audit_session(connector.as_ref(), &cfg, &tid, &mut stop)
                 .await
@@ -1897,6 +1952,38 @@ impl Runtime {
                 AuditEnd::Failed(Some(crate::ConnectorError::NotImplemented { .. })) => {
                     tracing::warn!(target_id, "audit is not implemented for this target");
                     return;
+                }
+                AuditEnd::Panicked => {
+                    bump(&self.counters.connector_panics, 1);
+                    bump(&self.counters.audit_stream_failures, 1);
+                    panics = if began.elapsed() >= AUDIT_PANIC_RESET {
+                        1
+                    } else {
+                        panics.saturating_add(1)
+                    };
+                    if panics >= AUDIT_MAX_PANICS {
+                        tracing::error!(
+                            target_id,
+                            panics,
+                            "audit stream stopped after repeated internal errors: reconfigure \
+                             Audit or restart the agent"
+                        );
+                        self.lock_audit_parked().insert(target_id.clone(), panics);
+                        return;
+                    }
+                    failures = failures.saturating_add(1);
+                    let delay = backoff::Backoff::CONSOLE
+                        .delay(failures.saturating_sub(1), backoff::random_fraction())
+                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                    tracing::error!(
+                        target_id,
+                        retry_s = delay.as_secs(),
+                        "audit stream failed: internal error; restarting"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = stop.wait_for(|s| *s) => return,
+                    }
                 }
                 AuditEnd::Failed(e) => {
                     bump(&self.counters.audit_stream_failures, 1);
@@ -1950,7 +2037,7 @@ impl Runtime {
     ) -> AuditEnd {
         let (sink, mut rx) = EventSink::channel(EVENTS_CHANNEL);
         let mut agg = Aggregator::new(cfg.aggregation_window());
-        let mut stream = Box::pin(connector.audit_stream(cfg, &sink));
+        let mut stream = Box::pin(crate::panics::guard(connector.audit_stream(cfg, &sink)));
         let end = loop {
             let can_emit = self.events_can_emit();
             let deadline = agg.deadline();
@@ -1962,7 +2049,10 @@ impl Runtime {
                 biased;
                 _ = stop.wait_for(|s| *s) => break AuditEnd::Stopped,
                 r = &mut stream => {
-                    break AuditEnd::Failed(r.err());
+                    break match r {
+                        Ok(r) => AuditEnd::Failed(r.err()),
+                        Err(crate::panics::Panicked) => AuditEnd::Panicked,
+                    };
                 }
                 ev = rx.recv(), if can_emit && !agg.is_full() => {
                     if let Some(e) = ev {
@@ -2238,7 +2328,17 @@ impl Runtime {
         let (done_tx, done_rx) = watch::channel(false);
         let outcome = {
             let run = async {
-                let r = connector.discover(&scan, &sink).await;
+                let r = match crate::panics::guard(connector.discover(&scan, &sink)).await {
+                    Ok(r) => r,
+                    Err(crate::panics::Panicked) => {
+                        bump(&self.counters.connector_panics, 1);
+                        Err(crate::ConnectorError::Target {
+                            engine: connector.engine(),
+                            code: FailureCode::Internal,
+                            engine_code: None,
+                        })
+                    }
+                };
                 drop(sink);
                 let _ = done_tx.send(true);
                 r

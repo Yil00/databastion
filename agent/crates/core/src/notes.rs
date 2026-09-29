@@ -162,6 +162,8 @@ pub enum NoteCode {
     AuditStatementConsumersDisabled,
     /// `audit.stream_not_available`.
     AuditStreamNotAvailable,
+    /// `audit.stream_stopped`.
+    AuditStreamStopped,
     /// `check.server_is_mariadb`.
     CheckServerIsMariadb,
     /// `check.server_is_mysql`.
@@ -269,6 +271,7 @@ impl NoteCode {
         Self::AuditSourceNotConfigured,
         Self::AuditStatementConsumersDisabled,
         Self::AuditStreamNotAvailable,
+        Self::AuditStreamStopped,
         Self::CheckServerIsMariadb,
         Self::CheckServerIsMysql,
         Self::CheckStageFailed,
@@ -339,6 +342,7 @@ impl NoteCode {
             Self::AuditSourceNotConfigured => "audit.source_not_configured",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
             Self::AuditStreamNotAvailable => "audit.stream_not_available",
+            Self::AuditStreamStopped => "audit.stream_stopped",
             Self::CheckServerIsMariadb => "check.server_is_mariadb",
             Self::CheckServerIsMysql => "check.server_is_mysql",
             Self::CheckStageFailed => "check.stage_failed",
