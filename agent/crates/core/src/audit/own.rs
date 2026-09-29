@@ -2,7 +2,8 @@
 //!
 //! The agent's Discovery scans read the monitored tables with the agent's
 //! own account. Those reads are left out of the access events only when
-//! all of these hold ([`OwnAccount::routine`]): the account is the agent's,
+//! all of these hold ([`OwnAccount::routine`]): the event is a read (or a
+//! connection; writes, DDL and DCL are always reported), the account is the agent's,
 //! the application name (when the source logs one) is the agent's, the
 //! client address (when the source logs one) is the agent's own address as
 //! the server sees it, the event carries no signal, and the agent's reads
@@ -14,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use databastion_classifiers::masking::{ClientAddr, MaskedEvent};
+use databastion_classifiers::masking::{ClientAddr, EventAction, MaskedEvent};
 
 /// Period over which the agent's own reads of one object are budgeted.
 const OWN_PERIOD_HOURS: u64 = 24;
@@ -161,7 +162,9 @@ impl OwnAccount {
         e: &MaskedEvent,
         now: Instant,
     ) -> bool {
-        if user != self.account {
+        // The agent only reads (I4): a write, DDL or DCL with its identity
+        // is someone else using it, and is always reported.
+        if user != self.account || !matches!(e.action(), EventAction::Read | EventAction::Connect) {
             return false;
         }
         let rows = e.rows().unwrap_or(self.budget);
@@ -247,6 +250,40 @@ mod tests {
             normalize_path("t"),
         ))
         .with_rows(rows)
+    }
+
+    #[test]
+    fn own_writes_ddl_and_dcl_are_never_routine() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        for action in [EventAction::Write, EventAction::Ddl, EventAction::Dcl] {
+            let e = MaskedEvent::new(
+                EventSource::Pgaudit,
+                action,
+                EventPrincipal::account("databastion"),
+                SystemTime::UNIX_EPOCH,
+            );
+            assert!(!own(Some("192.0.2.14")).routine(
+                "databastion",
+                Some("databastion-agent"),
+                logged,
+                &e,
+                now
+            ));
+        }
+        let connect = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Connect,
+            EventPrincipal::account("databastion"),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(own(Some("192.0.2.14")).routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &connect,
+            now
+        ));
     }
 
     #[test]
