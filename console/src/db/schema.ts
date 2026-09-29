@@ -701,6 +701,12 @@ export const accessEvents = pgTable(
     /** Contract `ObjectRef[]` (normalized names), at most 16. */
     objects: jsonb("objects").$type<{ database: string; schema?: string; object: string }[]>().notNull(),
     rows: bigint("rows", { mode: "number" }),
+    /**
+     * Contract `AccessEvent.bytes` (P4-D): size of the result returned or of the data affected, when
+     * the source reports it (the total for a pre-aggregated event); null otherwise. Stored and
+     * shown, not used by the score (ADR-0021: volume is rows only).
+     */
+    bytes: bigint("bytes", { mode: "number" }),
     signals: jsonb("signals").$type<string[]>().notNull().default([]),
     source: text("source").notNull(),
     aggregatedCount: integer("aggregated_count").notNull(),
@@ -738,6 +744,7 @@ export const accessEvents = pgTable(
     check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
     check("access_events_action", sql`${t.action} in ('connect', 'auth_failure', 'read', 'write', 'ddl', 'dcl')`),
     check("access_events_counts", sql`${t.aggregatedCount} >= 1 and (${t.rows} is null or ${t.rows} >= 0)`),
+    check("access_events_bytes", sql`${t.bytes} is null or ${t.bytes} >= 0`),
   ],
 );
 

@@ -22,6 +22,19 @@ export function formatCount(n: number | null): string {
   return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} M` : n >= 10_000 ? `${Math.round(n / 1000)} k` : String(Math.round(n));
 }
 
+/** Size in bytes, binary units (contract `AccessEvent.bytes`); empty when not reported. */
+export function formatBytes(n: number | null): string {
+  if (n === null) return "";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  return u === 0 ? `${n} B` : `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
+
 export function PrincipalLabel({ principal, fingerprinted }: { principal: string; fingerprinted: boolean }) {
   if (!fingerprinted) return <span className="break-all">{principal}</span>;
   return (
@@ -43,7 +56,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
           <TableHead>Client</TableHead>
           <TableHead>Action</TableHead>
           <TableHead>Objects</TableHead>
-          <TableHead>Rows</TableHead>
+          <TableHead>Rows / bytes</TableHead>
           <TableHead>Signals</TableHead>
           <TableHead>Score</TableHead>
           <TableHead>Incidents</TableHead>
@@ -73,7 +86,14 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
             </TableCell>
             <TableCell>{e.action}</TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal text-xs">{objectsLabel(e.objects)}</TableCell>
-            <TableCell>{formatCount(e.rows)}</TableCell>
+            <TableCell>
+              {formatCount(e.rows)}
+              {e.bytes !== null && (
+                <div className="text-xs text-muted-foreground" title={`${e.bytes} bytes, as reported by the source`}>
+                  {formatBytes(e.bytes)}
+                </div>
+              )}
+            </TableCell>
             <TableCell className="max-w-48 whitespace-normal">
               <div className="flex flex-wrap gap-1">
                 {e.signals.map((s) => (

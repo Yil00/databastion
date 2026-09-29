@@ -118,6 +118,7 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
     // Only the contract fields of each object, in a fixed shape.
     objects: e.objects.map((o) => (o.schema !== undefined ? { database: o.database, schema: o.schema, object: o.object } : { database: o.database, object: o.object })),
     rows: e.rows ?? null,
+    bytes: e.bytes ?? null,
     signals: [...(e.signals ?? [])],
     source: e.source,
     aggregatedCount: e.aggregated_count,
@@ -283,6 +284,8 @@ export interface EventView {
   action: string;
   objects: { database: string; schema?: string; object: string }[];
   rows: number | null;
+  /** Contract `AccessEvent.bytes`, when the source reports it (not used by the score). */
+  bytes: number | null;
   signals: string[];
   source: string;
   aggregatedCount: number;
@@ -331,6 +334,7 @@ const EVENT_COLUMNS = {
   action: accessEvents.action,
   objects: accessEvents.objects,
   rows: accessEvents.rows,
+  bytes: accessEvents.bytes,
   signals: accessEvents.signals,
   source: accessEvents.source,
   aggregatedCount: accessEvents.aggregatedCount,

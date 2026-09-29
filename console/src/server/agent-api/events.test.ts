@@ -131,6 +131,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         expect(r.objects).toEqual(e.objects);
         expect(r.signals).toEqual(e.signals ?? []);
         expect(r.rows).toBe(e.rows ?? null);
+        expect(r.bytes).toBe((e as { bytes?: number }).bytes ?? null);
         expect(r.evaluatedAt).toBeNull();
       });
       const [record] = await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId));
@@ -276,6 +277,13 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect((await post(other, batch())).status).toBe(202);
     });
 
+    it("stores AccessEvent.bytes when the source reports it, null otherwise", async () => {
+      const auth = await agentWithTargets();
+      const withBytes = { ...PG_DUMP, bytes: 9_007_199_254_740_991 };
+      expect((await post(auth, batch([withBytes, PG_DUMP, { ...PG_DUMP, bytes: 0 }]))).status).toBe(202);
+      expect((await storedEvents(auth.agentId)).map((r) => r.bytes)).toEqual([9_007_199_254_740_991, null, 0]);
+    });
+
     it("the replay of an accepted batch is acknowledged before the other checks", async () => {
       const auth = await agentWithTargets();
       const b = batch();
@@ -352,6 +360,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
                has_column_privilege('databastion_app', 'public.access_events', 'db_user', 'UPDATE') as user_upd,
                has_column_privilege('databastion_app', 'public.access_events', 'objects', 'UPDATE') as objects_upd,
                has_column_privilege('databastion_app', 'public.access_events', 'rows', 'UPDATE') as rows_upd,
+               has_column_privilege('databastion_app', 'public.access_events', 'bytes', 'UPDATE') as bytes_upd,
                has_table_privilege('databastion_app', 'public.events_batches', 'UPDATE') as batch_upd,
                has_table_privilege('databastion_app', 'public.events_batches', 'DELETE') as batch_del,
                has_table_privilege('databastion_app', 'public.incident_events', 'DELETE') as link_del,
@@ -370,6 +379,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         user_upd: false,
         objects_upd: false,
         rows_upd: false,
+        bytes_upd: false,
         batch_upd: false,
         batch_del: false,
         link_del: false,

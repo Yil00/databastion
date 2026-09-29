@@ -1,0 +1,2 @@
+ALTER TABLE "access_events" ADD COLUMN "bytes" bigint;--> statement-breakpoint
+ALTER TABLE "access_events" ADD CONSTRAINT "access_events_bytes" CHECK ("access_events"."bytes" is null or "access_events"."bytes" >= 0);

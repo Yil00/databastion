@@ -9,7 +9,7 @@ import type { IncidentView } from "@/server/incidents";
 import type { PolicyView } from "@/server/policies";
 
 import { AuditForm, confirmationText, formatManualObjects, parseManualObjects } from "./audit-form";
-import { EventsTable, formatCount, objectsLabel, PrincipalsTable } from "./events-table";
+import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalsTable } from "./events-table";
 import { IncidentsTable } from "./incidents-table";
 import { conditionLines, PoliciesTable, policyFormValues } from "./policies-table";
 import { PolicyForm, policyErrorMessage, policyRequestBody } from "./policy-form";
@@ -38,6 +38,7 @@ const event = (over: Partial<EventView> = {}): EventView => ({
   action: "read",
   objects: [{ database: "crm", schema: "public", object: "clients" }],
   rows: 1_250_000,
+  bytes: null,
   signals: ["signature.pg_dump"],
   source: "pgaudit",
   aggregatedCount: 1,
@@ -71,6 +72,21 @@ describe("access events view", () => {
     expect(html).toContain("fingerprint 5a5a5a5a5a5a");
     expect(html).toContain("pending");
     expect(html).toContain("1.3 M");
+  });
+
+  it("shows AccessEvent.bytes when the source reports it", () => {
+    const html = renderToStaticMarkup(<EventsTable events={[event({ bytes: 1536 }), event({ id: "c" })]} now={NOW} />);
+    expect(html).toContain("1.5 KiB");
+    expect(html).toContain('title="1536 bytes, as reported by the source"');
+    expect(html.match(/bytes, as reported by the source/g)).toHaveLength(1);
+    expect([formatBytes(null), formatBytes(0), formatBytes(1023), formatBytes(1024), formatBytes(5 * 1024 ** 3), formatBytes(Number.MAX_SAFE_INTEGER)]).toEqual([
+      "",
+      "0 B",
+      "1023 B",
+      "1.0 KiB",
+      "5.0 GiB",
+      "8.0 PiB",
+    ]);
   });
 
   it("renders principals with their baseline state", () => {
