@@ -396,6 +396,16 @@ pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
 /// or NULL.
 pub(crate) const CURRENT_ROLE: &str = "SELECT CURRENT_ROLE()";
 
+/// The account's own grants, role grant lines included (both servers),
+/// read when `APPLICABLE_ROLES` cannot be (MySQL before 8.0.19, or an
+/// error): the roles are counted, their privileges not evaluated.
+pub(crate) const SHOW_GRANTS_OWN: &str = "SHOW GRANTS FOR CURRENT_USER()";
+
+/// MySQL: the roles every account holds (`mandatory_roles`, 8.0.2 and
+/// later; no privilege needed). Only whether it is empty and how many
+/// roles it names are used.
+pub(crate) const MANDATORY_ROLES: &str = "SELECT @@GLOBAL.mandatory_roles";
+
 /// MariaDB: the privileges of the role enabled in the session. MariaDB
 /// shows a role's grants without `SELECT` on the `mysql` database only for
 /// the session's current role (`SHOW GRANTS FOR <other role>` is refused),
@@ -629,6 +639,8 @@ mod tests {
             show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
             CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_CURRENT_ROLE.to_owned(),
+            SHOW_GRANTS_OWN.to_owned(),
+            MANDATORY_ROLES.to_owned(),
             INIT_CONNECT.to_owned(),
             AUDIT_PLUGINS.to_owned(),
             SERVER_AUDIT_SETTINGS.to_owned(),

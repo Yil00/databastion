@@ -322,7 +322,11 @@ Behavior:
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as
-  `privilege.roles_not_evaluated`;
+  `privilege.roles_not_evaluated`. When `APPLICABLE_ROLES` cannot be read (MySQL before
+  8.0.19, or any error), the roles are counted from the role lines of the account's own
+  `SHOW GRANTS FOR CURRENT_USER()` (and MySQL's `mandatory_roles`), all as not evaluated; when
+  that cannot be read or has a line the parser does not understand, the privileges are reported
+  as `privilege.not_evaluated` (fail closed);
 - Audit (P4-B): access events from the `server_audit` log or the `audit_log` /
   `audit_log_filter` JSON file (`mysql.audit_log`, tailed by the core with a persisted cursor),
   or from `performance_schema` (`DIGEST_TEXT` first); statement text analyzed by the MySQL

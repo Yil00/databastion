@@ -1130,17 +1130,70 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// refused name, a server error, a line the parser does not understand) is
 /// counted in `roles_unevaluated`; on MySQL, where one statement covers
 /// every role, all of them are.
-async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
-    match session.flavor() {
-        Flavor::Mysql => mysql_role_privileges(session, grants).await,
-        Flavor::Mariadb => mariadb_role_privileges(session, grants).await,
+///
+/// Fail closed (end-of-phase-4 review L2): when `APPLICABLE_ROLES` cannot
+/// be read (no such table before MySQL 8.0.19, or any non-fatal error),
+/// the roles are counted from the role grant lines of the account's own
+/// `SHOW GRANTS` (and MySQL's `mandatory_roles`), all of them as not
+/// evaluated. `Ok(false)` when that cannot be read either: the privileges
+/// are then reported as not evaluated (`privilege.not_evaluated`).
+async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<bool, MyError> {
+    let listed = match session.flavor() {
+        Flavor::Mysql => mysql_role_privileges(session, grants).await?,
+        Flavor::Mariadb => mariadb_role_privileges(session, grants).await?,
+    };
+    if listed {
+        return Ok(true);
     }
+    let Some(Some(rows)) = optional_complete(session, sql::SHOW_GRANTS_OWN).await? else {
+        return Ok(false);
+    };
+    let mandatory = match session.flavor() {
+        Flavor::Mysql => optional(session, sql::MANDATORY_ROLES)
+            .await?
+            .and_then(|r| cell(&r, 0, 0).map(str::to_owned)),
+        Flavor::Mariadb => None,
+    };
+    Ok(roles_from_grant_lines(&rows, mandatory.as_deref(), grants))
 }
 
-async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
-    // No such table before MySQL 8.0.19: the roles are not known.
+/// Counts the roles of the account's own `SHOW GRANTS` role lines, and of
+/// `mandatory_roles` (a comma-separated list), all as not evaluated;
+/// `false` when a line is not understood (it may grant a role).
+fn roles_from_grant_lines(rows: &Rows, mandatory: Option<&str>, grants: &mut Grants) -> bool {
+    let mut roles = 0u64;
+    for row in rows {
+        match row
+            .first()
+            .and_then(|v| v.as_deref())
+            .and_then(grant_lines::parse_line)
+        {
+            None => return false,
+            Some(Line::Roles { grantable, count }) => {
+                grants.other_grantable |= grantable;
+                roles = roles.saturating_add(count);
+            }
+            Some(Line::Ignored | Line::Privileges { .. }) => {}
+        }
+    }
+    if let Some(m) = mandatory.map(str::trim).filter(|m| !m.is_empty()) {
+        roles = roles.saturating_add(m.split(',').filter(|r| !r.trim().is_empty()).count() as u64);
+    }
+    grants.roles = grants.roles.saturating_add(roles);
+    grants.roles_unevaluated = grants.roles_unevaluated.saturating_add(roles);
+    true
+}
+
+/// `Ok(false)`: `APPLICABLE_ROLES` could not be read (see
+/// [`role_privileges`]).
+async fn mysql_role_privileges(
+    session: &mut Session,
+    grants: &mut Grants,
+) -> Result<bool, MyError> {
+    // No such table before MySQL 8.0.19, or an error: the roles are not
+    // known from here.
     let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MYSQL).await? else {
-        return Ok(());
+        return Ok(false);
     };
     // A row skipped or a list cut: some roles are unknown.
     let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
@@ -1161,10 +1214,10 @@ async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Re
         // At least one role more than listed.
         grants.roles += 1;
         grants.roles_unevaluated = grants.roles;
-        return Ok(());
+        return Ok(true);
     }
     if all.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let using: Vec<(String, String)> = using.into_iter().collect();
     let mut evaluated = false;
@@ -1178,15 +1231,17 @@ async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Re
     if !evaluated {
         grants.roles_unevaluated = grants.roles;
     }
-    Ok(())
+    Ok(true)
 }
 
+/// `Ok(false)`: `APPLICABLE_ROLES` could not be read (see
+/// [`role_privileges`]).
 async fn mariadb_role_privileges(
     session: &mut Session,
     grants: &mut Grants,
-) -> Result<(), MyError> {
+) -> Result<bool, MyError> {
     let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MARIADB).await? else {
-        return Ok(());
+        return Ok(false);
     };
     // A row skipped or a list cut: some roles are unknown.
     let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
@@ -1201,10 +1256,10 @@ async fn mariadb_role_privileges(
     if !complete {
         grants.roles += 1;
         grants.roles_unevaluated = grants.roles;
-        return Ok(());
+        return Ok(true);
     }
     if roles.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     // Only the session's current role (the default role) is readable; the
     // other applicable roles, including those it grants, are counted as not
@@ -1219,7 +1274,7 @@ async fn mariadb_role_privileges(
         }
     }
     grants.roles_unevaluated = grants.roles - u64::from(evaluated);
-    Ok(())
+    Ok(true)
 }
 
 /// Adds the privileges of `SHOW GRANTS` rows to `grants`; `false` when a
@@ -1231,7 +1286,7 @@ fn merge_grant_lines(rows: &Rows, grants: &mut Grants) -> bool {
         match line.and_then(grant_lines::parse_line) {
             None => understood = false,
             Some(Line::Ignored) => {}
-            Some(Line::Roles { grantable }) => grants.other_grantable |= grantable,
+            Some(Line::Roles { grantable, .. }) => grants.other_grantable |= grantable,
             Some(Line::Privileges {
                 privileges,
                 scope,
@@ -1289,7 +1344,7 @@ async fn report(
             }
         }
     }
-    role_privileges(session, &mut grants).await?;
+    privileges_unknown |= !role_privileges(session, &mut grants).await?;
     let init_connect = optional(session, sql::INIT_CONNECT)
         .await?
         .is_some_and(|r| truthy(cell(&r, 0, 0)));
@@ -1488,6 +1543,58 @@ mod tests {
 
     fn rows(lines: &[&str]) -> Rows {
         lines.iter().map(|l| vec![Some((*l).to_owned())]).collect()
+    }
+
+    /// End-of-phase-4 review L2: without `APPLICABLE_ROLES`, the role
+    /// lines of `SHOW GRANTS` (and MySQL's mandatory roles) are counted as
+    /// not evaluated; a line not understood leaves the privileges unknown.
+    #[test]
+    fn roles_fall_back_to_show_grants_lines() {
+        let mut grants = Grants::default();
+        assert!(roles_from_grant_lines(
+            &rows(&[
+                "GRANT USAGE ON *.* TO `databastion`@`%`",
+                "GRANT SELECT ON `hr`.* TO `databastion`@`%`",
+                "GRANT `app_read`@`%`,`app_write`@`%` TO `databastion`@`%`",
+                "GRANT `admin_role`@`%` TO `databastion`@`%` WITH ADMIN OPTION",
+            ]),
+            Some("`audit_all`@`%`, `ro`@`%`"),
+            &mut grants
+        ));
+        assert_eq!((grants.roles, grants.roles_unevaluated), (5, 5));
+        assert!(grants.other_grantable);
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert!(
+            notes_json(&notes).as_array().unwrap().contains(
+                &serde_json::json!({"code": "privilege.roles_not_evaluated", "count": 5})
+            )
+        );
+        // No role line, no mandatory role: no role.
+        let mut grants = Grants::default();
+        assert!(roles_from_grant_lines(
+            &rows(&["GRANT SELECT ON `hr`.* TO `databastion`@`%`"]),
+            Some(""),
+            &mut grants
+        ));
+        assert_eq!((grants.roles, grants.roles_unevaluated), (0, 0));
+        // MariaDB lines.
+        let mut grants = Grants::default();
+        assert!(roles_from_grant_lines(
+            &rows(&[
+                "GRANT `app_read` TO `databastion`@`%`",
+                "SET DEFAULT ROLE `app_read` FOR `databastion`@`%`",
+            ]),
+            None,
+            &mut grants
+        ));
+        assert_eq!(grants.roles_unevaluated, 1);
+        // A line not understood: not evaluated.
+        let mut grants = Grants::default();
+        assert!(!roles_from_grant_lines(
+            &rows(&["GRANT SOMETHING ODD"]),
+            None,
+            &mut grants
+        ));
     }
 
     #[test]
