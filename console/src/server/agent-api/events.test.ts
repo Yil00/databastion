@@ -19,6 +19,7 @@ import {
   purgeAccessEvents,
 } from "@/server/events";
 import { integrityWriteBudget } from "@/server/integrity";
+import { collectMetrics } from "@/server/metrics";
 import { setPolicyJobSender } from "@/server/policy-queue";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
@@ -131,6 +132,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         expect(r.objects).toEqual(e.objects);
         expect(r.signals).toEqual(e.signals ?? []);
         expect(r.rows).toBe(e.rows ?? null);
+        expect(r.bytes).toBe((e as { bytes?: number }).bytes ?? null);
         expect(r.evaluatedAt).toBeNull();
       });
       const [record] = await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId));
@@ -276,6 +278,93 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect((await post(other, batch())).status).toBe(202);
     });
 
+    /** Fills the agent's backlog past the back-pressure threshold (events not evaluated yet). */
+    async function fillBacklog(agentId: string): Promise<void> {
+      await getDb().execute(sql`insert into access_events (agent_id, target_id, batch_id, item_index, ts, principal_key, db_user, action, objects, source, aggregated_count)
+        select ${agentId}, 'pg-prod-1', gen_random_uuid(), 0, now(), ${"3".repeat(64)}, 'x', 'connect', '[]'::jsonb, 'pgaudit', 1
+        from generate_series(1, ${MAX_PENDING_EVENTS_PER_AGENT})`);
+    }
+
+    it("answers 429 to the replay of an accepted batch under back-pressure, then duplicate once drained", async () => {
+      const auth = await agentWithTargets();
+      const b = batch();
+      expect((await post(auth, b)).status).toBe(202);
+      await fillBacklog(auth.agentId);
+      // Back-pressure runs before the duplicate check: even a replay (a lost 202) gets 429.
+      const throttled = await post(auth, b);
+      expect(throttled.status).toBe(429);
+      expect(throttled.headers.get("retry-after")).toBe("30");
+      expect((await expectConformingError(throttled, {})).code).toBe("rate_limited");
+      // The worker drains the backlog: the same batch is now acknowledged as a duplicate.
+      await getDb().execute(sql`update access_events set evaluated_at = now() where agent_id = ${auth.agentId}`);
+      const replay = await post(auth, b);
+      expect(replay.status).toBe(202);
+      expect(await replay.json()).toEqual({ batch_id: b.batch_id, duplicate: true });
+      expect(await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId))).toHaveLength(1);
+    });
+
+    it("a back-pressure 429 does not consume the per-minute stored-batch limit", async () => {
+      const auth = await agentWithTargets();
+      expect((await post(auth, batch())).status).toBe(202);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(1);
+      await fillBacklog(auth.agentId);
+      for (let i = 0; i < 5; i++) expect((await post(auth, batch())).status).toBe(429);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(1);
+      // Even with the stored-batch limit almost reached, the throttled batches were not counted.
+      for (let i = 1; i < eventsPerAgent.limit - 1; i++) eventsPerAgent.hit(auth.agentId);
+      await getDb().execute(sql`update access_events set evaluated_at = now() where agent_id = ${auth.agentId}`);
+      expect((await post(auth, batch())).status).toBe(202);
+      expect(eventsPerAgent.count(auth.agentId)).toBe(eventsPerAgent.limit);
+    });
+
+    it("stores unregistered signal ids and counts them on /metrics", async () => {
+      const auth = await agentWithTargets();
+      const before = eventStats.unregisteredSignals;
+      const unknown = { ...PG_DUMP, signals: ["signature.mysqldump", "signature.pg_dump", "volume.huge_result"] };
+      expect((await post(auth, batch([unknown, PG_DUMP]))).status).toBe(202);
+      expect((await storedEvents(auth.agentId)).map((r) => r.signals)).toEqual([unknown.signals, PG_DUMP.signals]);
+      expect(eventStats.unregisteredSignals - before).toBe(2);
+      const text = await collectMetrics(getDb());
+      expect(text).toContain("# TYPE databastion_console_events_unregistered_signals_total counter");
+      expect(text).toMatch(new RegExp(`^databastion_console_events_unregistered_signals_total ${eventStats.unregisteredSignals}$`, "m"));
+    });
+
+    it("counts unexpected targets and unregistered signals after the commit only (duplicate, aborted)", async () => {
+      const auth = await agentWithTargets();
+      await getDb().execute(sql`update agent_targets set present = false where agent_id = ${auth.agentId} and target_id = 'mysql-crm'`);
+      const odd = { ...PG_DUMP, target_id: "mysql-crm", signals: ["signature.mysqldump"] };
+      const counters = () => ({ unexpected: eventStats.unexpectedTarget, unregistered: eventStats.unregisteredSignals });
+      const b = batch([odd]);
+      const before = counters();
+      expect((await post(auth, b)).status).toBe(202);
+      expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+      // A replay is a duplicate: nothing stored, nothing counted.
+      expect(await (await post(auth, b)).json()).toEqual({ batch_id: b.batch_id, duplicate: true });
+      expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+      // An aborted transaction (the batch record insert fails after the events insert) counts nothing.
+      await getDb().execute(sql.raw(`
+        create function public.test_fail_events_batch() returns trigger language plpgsql as $$
+        begin raise exception 'forced abort'; end $$`));
+      await getDb().execute(sql.raw(`create trigger test_fail_events_batch before insert on public.events_batches
+        for each row when (new.agent_id = '${auth.agentId}') execute function public.test_fail_events_batch()`));
+      try {
+        const aborted = batch([odd]);
+        await expect(ingestEvents(getDb(), auth.agentId, aborted as never)).rejects.toThrow();
+        expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+        expect(await storedEvents(auth.agentId)).toHaveLength(1);
+      } finally {
+        await getDb().execute(sql.raw("drop trigger if exists test_fail_events_batch on public.events_batches"));
+        await getDb().execute(sql.raw("drop function if exists public.test_fail_events_batch()"));
+      }
+    });
+
+    it("stores AccessEvent.bytes when the source reports it, null otherwise", async () => {
+      const auth = await agentWithTargets();
+      const withBytes = { ...PG_DUMP, bytes: 9_007_199_254_740_991 };
+      expect((await post(auth, batch([withBytes, PG_DUMP, { ...PG_DUMP, bytes: 0 }]))).status).toBe(202);
+      expect((await storedEvents(auth.agentId)).map((r) => r.bytes)).toEqual([9_007_199_254_740_991, null, 0]);
+    });
+
     it("the replay of an accepted batch is acknowledged before the other checks", async () => {
       const auth = await agentWithTargets();
       const b = batch();
@@ -352,6 +441,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
                has_column_privilege('databastion_app', 'public.access_events', 'db_user', 'UPDATE') as user_upd,
                has_column_privilege('databastion_app', 'public.access_events', 'objects', 'UPDATE') as objects_upd,
                has_column_privilege('databastion_app', 'public.access_events', 'rows', 'UPDATE') as rows_upd,
+               has_column_privilege('databastion_app', 'public.access_events', 'bytes', 'UPDATE') as bytes_upd,
                has_table_privilege('databastion_app', 'public.events_batches', 'UPDATE') as batch_upd,
                has_table_privilege('databastion_app', 'public.events_batches', 'DELETE') as batch_del,
                has_table_privilege('databastion_app', 'public.incident_events', 'DELETE') as link_del,
@@ -370,6 +460,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         user_upd: false,
         objects_upd: false,
         rows_upd: false,
+        bytes_upd: false,
         batch_upd: false,
         batch_del: false,
         link_del: false,

@@ -8,7 +8,9 @@
  *
  * Rule: a token is listed here in the same change that makes the console accept the field (its
  * schema regenerated). "Accepts" means schema-valid and not rejected; the console may still
- * ignore the value (e.g. `access_event.bytes` is not stored yet).
+ * ignore the value. Today `access_event.bytes` is stored and shown (not scored),
+ * `target_status.notes` is stored for the latest heartbeat and rendered, and the
+ * `job_progress.coverage` counters are accepted but not stored.
  */
 export const CONSOLE_ACCEPTS = ["access_event.bytes", "job_progress.coverage", "target_status.notes"] as const;
 

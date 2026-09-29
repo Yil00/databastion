@@ -6,6 +6,7 @@ import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { SEVERITIES } from "@/lib/incident-lifecycle";
+import { REGISTERED_SIGNALS } from "@/lib/protocol/signals";
 
 import { userApi } from "./client-api";
 
@@ -139,7 +140,7 @@ export const POLICY_FIELD_ERRORS: Record<string, string> = {
   min_confidence: "Minimum confidence: a number from 0 to 1.",
   min_match_ratio: "Minimum ratio: a number from 0 to 1.",
   min_matched: "Minimum matched: a whole number from 0 to 10000.",
-  signals: "Signals: ids such as signature.pg_dump, signature.copy_to_file, signature.copy_to_program, shape.full_table_copy, shape.full_table_read, volume.large_result, or families signature.*, shape.*, volume.*.",
+  signals: `Signals: registered ids (${REGISTERED_SIGNALS.join(", ")}), other ids of 1 to 6 lowercase words without digits, or families signature.*, shape.*, volume.*.`,
   event_actions: "Actions: connect, auth_failure, read, write, ddl or dcl.",
   sources: "Audit sources: pgaudit, pg_stat_statements, performance_schema, mariadb_server_audit...",
   principals: "Principals: printable globs.",

@@ -170,13 +170,25 @@ export const agentTargets = pgTable(
     auditLevel: auditLevel("audit_level").notNull(),
     auditSource: text("audit_source"),
     lastError: text("last_error"),
+    /**
+     * Contract `TargetStatus.notes` of the latest heartbeat (P4-D): closed codes with a bounded
+     * count and closed labels, never free text; null when that heartbeat carried none. Bounded
+     * (at most 16 notes, 16 KiB serialized; see src/lib/target-notes.ts).
+     */
+    notes: jsonb("notes").$type<{ code: string; count?: number; labels?: string[] }[]>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
     /** false when the target was absent from the last heartbeat (removed from agent.yaml). */
     present: boolean("present").notNull().default(true),
     firstSeenAt: tsz("first_seen_at").notNull().defaultNow(),
     lastReportedAt: tsz("last_reported_at").notNull().defaultNow(),
   },
-  (t) => [primaryKey({ columns: [t.agentId, t.targetId] })],
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.targetId] }),
+    check(
+      "agent_targets_notes_bounded",
+      sql`${t.notes} is null or (jsonb_typeof(${t.notes}) = 'array' and jsonb_array_length(${t.notes}) <= 16 and octet_length(${t.notes}::text) <= 16384)`,
+    ),
+  ],
 );
 
 export const enrollmentTokens = pgTable(
@@ -701,6 +713,12 @@ export const accessEvents = pgTable(
     /** Contract `ObjectRef[]` (normalized names), at most 16. */
     objects: jsonb("objects").$type<{ database: string; schema?: string; object: string }[]>().notNull(),
     rows: bigint("rows", { mode: "number" }),
+    /**
+     * Contract `AccessEvent.bytes` (P4-D): size of the result returned or of the data affected, when
+     * the source reports it (the total for a pre-aggregated event); null otherwise. Stored and
+     * shown, not used by the score (ADR-0021: volume is rows only).
+     */
+    bytes: bigint("bytes", { mode: "number" }),
     signals: jsonb("signals").$type<string[]>().notNull().default([]),
     source: text("source").notNull(),
     aggregatedCount: integer("aggregated_count").notNull(),
@@ -738,6 +756,7 @@ export const accessEvents = pgTable(
     check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
     check("access_events_action", sql`${t.action} in ('connect', 'auth_failure', 'read', 'write', 'ddl', 'dcl')`),
     check("access_events_counts", sql`${t.aggregatedCount} >= 1 and (${t.rows} is null or ${t.rows} >= 0)`),
+    check("access_events_bytes", sql`${t.bytes} is null or ${t.bytes} >= 0`),
   ],
 );
 
