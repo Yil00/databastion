@@ -226,8 +226,18 @@ async function chargeSystemAlertBudget(tx: Exec, channelIds: readonly string[], 
  * rotation conflict locks the agent).
  */
 export function criticalSystemAlert(payload: NotificationPayload): boolean {
-  return payload.event === "agent.integrity" && payload.severity === "critical";
+  // An explicit allowlist of kinds, not the severity alone (PR #81 re-review Low-1): a future caller
+  // passing a severity derived from agent data must not skip the budgets.
+  return (
+    payload.event === "agent.integrity" &&
+    typeof payload.kind === "string" &&
+    CRITICAL_SYSTEM_ALERT_KINDS.has(payload.kind) &&
+    payload.severity === "critical"
+  );
 }
+
+/** The only alert kinds that bypass the budgets: each one is bounded by its own cause. */
+const CRITICAL_SYSTEM_ALERT_KINDS: ReadonlySet<string> = new Set(["agent.rotation_conflict"]);
 
 /**
  * A console alert (silent agent and recovery, agent-integrity event, dropped batches, stopped Audit

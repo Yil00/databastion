@@ -165,6 +165,10 @@ describe.skipIf(!hasDb)("global hourly budget of system alerts per channel (Post
     const critical = integrityAlert(d, "2026-09-27T16", "agent.rotation_conflict");
     critical.payload.severity = "critical";
     expect(criticalSystemAlert(critical.payload)).toBe(true);
+    // Only allowlisted kinds bypass the budgets, whatever their severity.
+    const other = integrityAlert(d, "2026-09-27T16", "agent.schema_rejected");
+    other.payload.severity = "critical";
+    expect(criticalSystemAlert(other.payload)).toBe(false);
     expect(await getDb().transaction((tx) => enqueueSystemAlert(tx, critical))).toBe(2);
     const rows = (await rowsOf([d])).filter((r) => (r.payload as { kind: string }).kind === "agent.rotation_conflict");
     expect(rows.map((r) => r.status)).toEqual(["pending", "pending"]);
