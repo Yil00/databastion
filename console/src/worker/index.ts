@@ -21,12 +21,15 @@ import {
   EVENTS_PURGE_QUEUE,
   NOOP_QUEUE,
   pgBossOptions,
+  RATE_LIMITS_PRUNE_QUEUE,
   registerEventsPurgeQueue,
   registerNotificationQueue,
   registerPolicyQueue,
+  registerRateLimitsPruneQueue,
   scheduleEventsPurgeQueue,
   scheduleNotificationQueue,
   schedulePolicyQueue,
+  scheduleRateLimitsPruneQueue,
   type NoopPayload,
 } from "./queues";
 
@@ -84,8 +87,11 @@ async function main(): Promise<void> {
   // P4-C: retention of access events.
   await registerEventsPurgeQueue(boss, getDb, log);
   await scheduleEventsPurgeQueue(boss);
+  // P4-D: expired shared rate-limit windows.
+  await registerRateLimitsPruneQueue(boss, getDb, log);
+  await scheduleRateLimitsPruneQueue(boss);
 
-  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE] }, "worker started");
+  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE, RATE_LIMITS_PRUNE_QUEUE] }, "worker started");
 }
 
 main().catch((err: unknown) => {

@@ -41,8 +41,8 @@ import {
  * body; `/enroll` bodies and responses are never logged at all.
  */
 
-/** `/enroll` attempts per source IP (successful or not). */
-export const enrollPerIp = new RateLimiter(20, 10 * 60_000);
+/** `/enroll` attempts per source IP (successful or not); shared, fails closed (P4-D). */
+export const enrollPerIp = RateLimiter.shared("enroll.per_ip", 20, 10 * 60_000, "closed");
 
 export function handleEnroll(req: Request): Promise<Response> {
   return guarded("enroll", async () => {
@@ -50,7 +50,7 @@ export function handleEnroll(req: Request): Promise<Response> {
     if (headers) return headers;
     const ip = clientIp(req);
     if (ip) {
-      const limit = enrollPerIp.hit(ipBucket(ip));
+      const limit = await enrollPerIp.hitShared(ipBucket(ip));
       if (limit.limited) return rateLimited(limit.retryAfterS);
     }
     const body = await readValidBody(req, "EnrollRequest");
@@ -225,7 +225,7 @@ export function handleRotate(req: Request): Promise<Response> {
     // no per-agent attempt, and never a lock (a slow network is not a rotation conflict). It counts
     // against the per-IP failure limit so trickled bodies cannot hold handlers without a cost.
     if (!raw.ok && raw.timedOut) {
-      countTimedOutBody(pre.ipKey);
+      await countTimedOutBody(pre.ipKey);
       return invalidRequest();
     }
     const auth = await preamble(req, { allowPrevious: true, staleCandidate: rotateCandidate(raw) });
@@ -247,7 +247,7 @@ export function handleRotate(req: Request): Promise<Response> {
       if (outcome.kind === "duplicate") auth.refundAttempt?.();
       return rotateResponse(outcome);
     }
-    const limit = rotatePerAgent.hit(auth.agent.id);
+    const limit = await rotatePerAgent.hitShared(auth.agent.id);
     if (limit.limited) return rateLimited(limit.retryAfterS);
     const body = validateBody(raw, "RotateRequest");
     if (!body.ok) {
@@ -301,17 +301,22 @@ async function errorDetails(res: Response): Promise<{ pointer: string; keyword: 
 }
 
 /**
- * Findings batches per agent per minute (M1), per process (in memory, like the other limiters: one
- * web process in the MVP). Counted before ingestion and given back when the batch is not stored
- * (duplicate, rejected), so only stored batches consume it; beyond: `429` + `Retry-After`.
+ * Findings batches per agent per minute (M1), shared by every console process (P4-D). Counted
+ * before ingestion and given back when the batch is not stored (duplicate, rejected, exception), so
+ * only stored batches consume it; beyond: `429` + `Retry-After`.
+ *
+ * The ingest limiters fall back to their per-process counters when the shared store fails
+ * (`local`): the ingestion itself needs the same database, so failing closed would only turn a
+ * store hiccup into `429`s for every agent, while failing open would drop the bound; the fallback
+ * keeps the pre-P4-D per-process bound.
  */
-export const findingsPerAgent = new RateLimiter(60, 60_000);
+export const findingsPerAgent = RateLimiter.shared("findings.batches_per_agent", 60, 60_000, "local");
 /**
  * Every authenticated `POST /findings` request of an agent, whatever its outcome (malformed,
  * rejected, not found, duplicate, stored): 300 per minute, beyond `429` + `Retry-After`. Looser
  * than {@link findingsPerAgent}; bounds the validation and database work of rejected batches.
  */
-export const findingsRequestsPerAgent = new RateLimiter(300, 60_000);
+export const findingsRequestsPerAgent = RateLimiter.shared("findings.requests_per_agent", 300, 60_000, "local");
 
 /**
  * `POST /findings` (P2-D). Pipeline: headers, authentication, body (4 MiB cap: `413`),
@@ -326,9 +331,8 @@ export function handleFindings(req: Request): Promise<Response> {
     if (!auth.ok) return auth.response;
     const agentId = auth.agent.id;
     // Counted before the body is read, never refunded.
-    if (!findingsRequestsPerAgent.reserve(agentId)) {
-      return rateLimited(findingsRequestsPerAgent.check(agentId).retryAfterS);
-    }
+    const request = await findingsRequestsPerAgent.reserveShared(agentId);
+    if (!request.ok) return rateLimited(request.retryAfterS);
     const ip = clientIp(req);
     const integrity = (kind: "batch_rejected" | "batch_conflict" | "foreign_target", status: number, details?: ValidationDetail[]) =>
       recordIntegrityEvent(getDb(), { agentId, kind, endpoint: "findings", status, details, ip });
@@ -339,8 +343,9 @@ export function handleFindings(req: Request): Promise<Response> {
       }
       return body.response;
     }
-    const refund = findingsPerAgent.reserve(agentId);
-    if (!refund) return rateLimited(findingsPerAgent.check(agentId).retryAfterS);
+    const stored = await findingsPerAgent.reserveShared(agentId);
+    if (!stored.ok) return rateLimited(stored.retryAfterS);
+    const refund = stored.refund;
     let outcome: Awaited<ReturnType<typeof ingestFindings>>;
     try {
       outcome = await ingestFindings(getDb(), agentId, body.value);
@@ -375,12 +380,13 @@ export function handleFindings(req: Request): Promise<Response> {
 }
 
 /**
- * Events batches per agent per minute, per process, counted like {@link findingsPerAgent} (only
- * stored batches consume it): at most 60 x 500 = 30 000 events per agent and minute.
+ * Events batches per agent per minute, shared by every console process and counted like
+ * {@link findingsPerAgent} (only stored batches consume it; per-process fallback when the shared
+ * store fails): at most 60 x 500 = 30 000 events per agent and minute.
  */
-export const eventsPerAgent = new RateLimiter(60, 60_000);
+export const eventsPerAgent = RateLimiter.shared("events.batches_per_agent", 60, 60_000, "local");
 /** Every authenticated `POST /events` request of an agent, whatever its outcome: 300 per minute. */
-export const eventsRequestsPerAgent = new RateLimiter(300, 60_000);
+export const eventsRequestsPerAgent = RateLimiter.shared("events.requests_per_agent", 300, 60_000, "local");
 
 /**
  * `POST /events` (P4-C), in the order of the contract ("Console-side checks", `POST /events`):
@@ -402,9 +408,8 @@ export function handleEvents(req: Request): Promise<Response> {
     const auth = await preamble(req);
     if (!auth.ok) return auth.response;
     const agentId = auth.agent.id;
-    if (!eventsRequestsPerAgent.reserve(agentId)) {
-      return rateLimited(eventsRequestsPerAgent.check(agentId).retryAfterS);
-    }
+    const request = await eventsRequestsPerAgent.reserveShared(agentId);
+    if (!request.ok) return rateLimited(request.retryAfterS);
     const ip = clientIp(req);
     const integrity = (kind: "batch_rejected" | "batch_conflict" | "foreign_target", status: number, details?: ValidationDetail[]) =>
       recordIntegrityEvent(getDb(), { agentId, kind, endpoint: "events", status, details, ip });
@@ -420,8 +425,9 @@ export function handleEvents(req: Request): Promise<Response> {
       eventStats.backpressure++;
       return rateLimited(BACKPRESSURE_RETRY_AFTER_S);
     }
-    const refund = eventsPerAgent.reserve(agentId);
-    if (!refund) return rateLimited(eventsPerAgent.check(agentId).retryAfterS);
+    const stored = await eventsPerAgent.reserveShared(agentId);
+    if (!stored.ok) return rateLimited(stored.retryAfterS);
+    const refund = stored.refund;
     let outcome: Awaited<ReturnType<typeof ingestEvents>>;
     try {
       outcome = await ingestEvents(getDb(), agentId, body.value);

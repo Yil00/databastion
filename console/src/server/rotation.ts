@@ -32,8 +32,8 @@ import { notifyIntegrityEvent } from "./system-alerts";
  */
 
 export const ROTATION_GRACE_S = 300;
-/** `/rotate` calls per agent (registrations and retries alike). */
-export const rotatePerAgent = new RateLimiter(10, 5 * 60_000);
+/** `/rotate` calls per agent (registrations and retries alike); shared, fails closed (P4-D). */
+export const rotatePerAgent = RateLimiter.shared("rotate.per_agent", 10, 5 * 60_000, "closed");
 
 export type RotateOutcome =
   | { kind: "registered" | "duplicate"; graceExpiresAt: Date }
@@ -332,7 +332,11 @@ export function rotationBlocked(
  * bounded pools, and a busy rotate pool neither confirms `S0` with a `503` nor locks a legitimate
  * late retry.
  */
-export const staleRetriesPerAgent = new RateLimiter(10, 5 * 60_000);
+export const staleRetriesPerAgent = RateLimiter.shared("rotate.stale_retries_per_agent", 10, 5 * 60_000, "local");
+// Shared (P4-D), but falls back to its per-process counters when the shared store fails, instead of
+// failing closed: over this limit the agent is LOCKED (revocation and re-enrollment to recover), so
+// failing closed would turn a transient store error into an irreversible lock. The path is only
+// reached with a verified `S0`; the per-process fallback still bounds the retries.
 
 export async function staleRotateRetry(
   db: Database,
@@ -352,8 +356,8 @@ export async function staleRotateRetry(
     return { kind: "conflict" };
   };
   if (body === null || isLowEntropySecret(body.new_secret)) return conflict();
-  if (staleRetriesPerAgent.check(auth.agentId).limited) return conflict();
-  staleRetriesPerAgent.hit(auth.agentId);
+  // Check and count in one atomic step (shared by every console process).
+  if (!(await staleRetriesPerAgent.reserveShared(auth.agentId)).ok) return conflict();
   if (body.job_id !== undefined) {
     const [job] = await db
       .select({ id: jobs.id })

@@ -10,6 +10,7 @@ import { errorSummary, logger } from "@/lib/logger";
 
 import { argon2Stats } from "./crypto";
 import { eventStats } from "./events";
+import { rateLimitStoreStats } from "./rate-limit";
 
 /**
  * Prometheus `/metrics` (ADR-0004): console metrics plus the agent metrics received in heartbeats.
@@ -31,6 +32,7 @@ import { eventStats } from "./events";
  * Console (whole installation):
  * - `databastion_agents{status}`, `databastion_jobs{status}`, `databastion_enrollment_tokens_active`,
  *   `databastion_security_events`, `databastion_console_argon2_operations_total` (this process),
+ *   `databastion_console_rate_limit_store_errors_total` (this process),
  *   `databastion_metrics_series_dropped` (series dropped by the caps of the last scrape).
  *
  * Agent-provided names are restricted by the contract to `^[a-z][a-z0-9_]{0,63}$` (values: numbers).
@@ -234,6 +236,7 @@ export async function collectMetrics(db: Database): Promise<string> {
   x.add("databastion_console_events_backpressure_total", "counter", "POST /events answered 429 because the agent's backlog was not evaluated yet (this process).", eventStats.backpressure);
   x.add("databastion_console_events_unregistered_signals_total", "counter", "Signal ids of stored access events missing from this console's signal registry, one per id and event (this process).", eventStats.unregisteredSignals);
   x.add("databastion_console_argon2_operations_total", "counter", "argon2id operations started by this process.", argon2Stats.started);
+  x.add("databastion_console_rate_limit_store_errors_total", "counter", "Shared rate-limit store operations that failed or timed out (this process); each one applied the limiter's failure mode.", rateLimitStoreStats.errors);
   x.add("databastion_metrics_series_dropped", "gauge", "Series dropped by the cardinality caps in this scrape.", dropped);
   return x.render();
 }

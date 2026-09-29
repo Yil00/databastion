@@ -204,6 +204,20 @@
       "when": 1790678689541,
       "tag": "0028_p4d_target_notes",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790690722244,
+      "tag": "0029_p4d_rate_limit_counters",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790690723967,
+      "tag": "0030_p4d_rate_limit_grants",
+      "breakpoints": true
     }
   ]
 }

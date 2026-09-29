@@ -6,6 +6,7 @@ import { silentAgentThresholdS } from "@/server/alerting-config";
 import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
+import { pruneRateLimitCounters } from "@/server/rate-limit";
 import { drainDeliveries, enqueueSuppressionDigests } from "@/server/notifications";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 import { checkSilentAgents } from "@/server/system-alerts";
@@ -13,8 +14,9 @@ import { checkSilentAgents } from "@/server/system-alerts";
 /**
  * Queues handled by the worker: `console.noop` (wiring check), `policies.evaluate` (P3-A, see
  * src/server/policy-queue.ts) and `notifications.deliver` (P3-C, see
- * src/server/notification-queue.ts) and `events.purge` (P4-C: retention of access events). The
- * correlation of access events runs in `policies.evaluate` (src/server/event-engine.ts).
+ * src/server/notification-queue.ts), `events.purge` (P4-C: retention of access events) and
+ * `rate_limits.prune` (P4-D: expired shared rate-limit windows). The correlation of access events
+ * runs in `policies.evaluate` (src/server/event-engine.ts).
  */
 export const NOOP_QUEUE = "console.noop";
 /** Catch-up schedule of the policy engine (lost wake-ups, restarts, exception expiries). */
@@ -182,4 +184,46 @@ export async function registerEventsPurgeQueue(boss: PgBoss, db: () => Database,
 export async function scheduleEventsPurgeQueue(boss: PgBoss): Promise<void> {
   await boss.schedule(EVENTS_PURGE_QUEUE, EVENTS_PURGE_CRON, {});
   await boss.send(EVENTS_PURGE_QUEUE, {});
+}
+
+/** Expired shared rate-limit windows (P4-D, src/server/rate-limit.ts): every 5 minutes. */
+export const RATE_LIMITS_PRUNE_QUEUE = "rate_limits.prune";
+export const RATE_LIMITS_PRUNE_CRON = "*/5 * * * *";
+export const RATE_LIMITS_PRUNE_BUDGET_MS = 20_000;
+
+/**
+ * `rate_limits.prune`: deletes the expired windows of `rate_limit_counters` in chunks. Pruning
+ * changes no rate-limit decision (an expired window is reset by the next hit of its key); it only
+ * bounds the table. Re-queued when expired rows remain after the time budget.
+ */
+export function createRateLimitsPruneHandler(
+  db: () => Database,
+  log: Logger,
+  requeue: () => Promise<unknown>,
+  opts: { budgetMs?: number } = {},
+) {
+  return async (jobs: Job<Record<string, unknown>>[]): Promise<void> => {
+    if (jobs.length === 0) return;
+    const stats = await pruneRateLimitCounters(db(), { budgetMs: opts.budgetMs ?? RATE_LIMITS_PRUNE_BUDGET_MS });
+    if (stats.deleted > 0) log.debug({ queue: RATE_LIMITS_PRUNE_QUEUE, deleted: stats.deleted }, "rate-limit windows pruned");
+    if (stats.more) {
+      await requeue().catch((err: unknown) =>
+        log.warn({ queue: RATE_LIMITS_PRUNE_QUEUE, error: errorSummary(err) }, "rate-limit prune re-queue failed"),
+      );
+    }
+  };
+}
+
+export async function registerRateLimitsPruneQueue(boss: PgBoss, db: () => Database, log: Logger): Promise<void> {
+  await boss.createQueue(RATE_LIMITS_PRUNE_QUEUE, { policy: "stately" });
+  await boss.work(
+    RATE_LIMITS_PRUNE_QUEUE,
+    { pollingIntervalSeconds: 30 },
+    createRateLimitsPruneHandler(db, log, () => boss.send(RATE_LIMITS_PRUNE_QUEUE, {})),
+  );
+}
+
+export async function scheduleRateLimitsPruneQueue(boss: PgBoss): Promise<void> {
+  await boss.schedule(RATE_LIMITS_PRUNE_QUEUE, RATE_LIMITS_PRUNE_CRON, {});
+  await boss.send(RATE_LIMITS_PRUNE_QUEUE, {});
 }
