@@ -38,6 +38,14 @@ export const DEFERRED_VALIDATIONS: readonly { table: string; constraint: string 
   { table: "access_events", constraint: "access_events_bytes" },
 ];
 
+const PLAIN_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/** Quotes a plain lower-case identifier; anything else is a programming error (security review L2). */
+export function quotePlainIdentifier(name: string): string {
+  if (!PLAIN_NAME.test(name)) throw new Error(`not a plain identifier: ${JSON.stringify(name)}`);
+  return `"${name}"`;
+}
+
 export const ONLINE_0027_TAG = "0027_p4d_access_events_bytes";
 
 /** The statements of `0027`, with the constraint added `NOT VALID` (validated separately). */
@@ -125,6 +133,10 @@ export async function applyAccessEventsBytesOnline(pool: Pool, migrationsFolder:
 export async function validateDeferredConstraints(pool: Pool): Promise<string[]> {
   const done: string[] = [];
   for (const { table, constraint } of DEFERRED_VALIDATIONS) {
+    quotePlainIdentifier(table);
+    quotePlainIdentifier(constraint);
+  }
+  for (const { table, constraint } of DEFERRED_VALIDATIONS) {
     const { rows } = await pool.query<{ pending: boolean }>(
       `select not c.convalidated as pending
          from pg_catalog.pg_constraint c
@@ -134,8 +146,8 @@ export async function validateDeferredConstraints(pool: Pool): Promise<string[]>
       [table, constraint],
     );
     if (!rows[0]?.pending) continue;
-    // Names come from the constant list above, never from input.
-    await pool.query(`ALTER TABLE public."${table}" VALIDATE CONSTRAINT "${constraint}"`);
+    // Names come from the constant list above, never from input, and are checked anyway.
+    await pool.query(`ALTER TABLE public.${quotePlainIdentifier(table)} VALIDATE CONSTRAINT ${quotePlainIdentifier(constraint)}`);
     done.push(constraint);
   }
   return done;

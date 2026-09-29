@@ -157,6 +157,11 @@ and a later migration of the same run cannot shorten that lock. Migration `0027`
 - every run validates, one statement each, the constraints of `DEFERRED_VALIDATIONS` still
   `NOT VALID` (a run interrupted between the two steps above).
 
+Concurrent `migrate` runs are serialized: each run holds a session-level advisory lock
+(`MIGRATION_LOCK_KEY`, on a dedicated connection) from its first pre-flight to its last
+validation; a second run waits, then finds nothing pending. `DEFERRED_VALIDATIONS` accepts plain
+lower-case identifiers only.
+
 The final schema is the one of `0027`. Rule for new migrations: a constraint added to a table
 that may be large is written `NOT VALID` in a custom migration and listed in
 `DEFERRED_VALIDATIONS`, never validated in the migration itself.

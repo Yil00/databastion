@@ -167,6 +167,22 @@ describe.skipIf(!hasDb)("dropped-batches alert (PostgreSQL)", () => {
     expect(evs.map((e) => (e.details as { dropped_batches: number }).dropped_batches)).toEqual([3, 3, 8]);
   });
 
+  it("a heartbeat and the worker raising concurrently give exactly one alert (security review L5)", async () => {
+    for (let round = 0; round < 5; round++) {
+      const auth = await enroll(`race-host-${round}`);
+      await heartbeat(auth, 0, 10);
+      await getDb().execute(
+        sql`update agents set dropped_batches_unalerted = 2, dropped_batches_since = now(), dropped_batches_alerted_at = now() - interval '2 hours' where id = ${auth.agentId}`,
+      );
+      await Promise.all([heartbeat(auth, 1, 20), flushDroppedBatchAlerts(getDb())]);
+      const evs = await events(auth.agentId);
+      expect(evs).toHaveLength(1);
+      // Every drop is either in that alert or still held for the next one.
+      const alerted = (evs[0]?.details as { dropped_batches: number }).dropped_batches;
+      expect(alerted + Number((await state(auth.agentId))?.unalerted)).toBe(3);
+    }
+  });
+
   it("the first heartbeat counts the drops since the agent started; revoked and locked agents are not alerted", async () => {
     const first = await enroll("first-host");
     await heartbeat(first, 4, 60);

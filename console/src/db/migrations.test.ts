@@ -8,8 +8,8 @@ import { readMigrationFiles } from "drizzle-orm/migrator";
 import { Client, Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { applyAccessEventsBytesOnline, ONLINE_0027_TAG, validateDeferredConstraints } from "@/db/online-constraints";
-import { MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
+import { applyAccessEventsBytesOnline, ONLINE_0027_TAG, quotePlainIdentifier, validateDeferredConstraints } from "@/db/online-constraints";
+import { MIGRATION_LOCK_KEY, MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
 import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
 async function withClient<T>(url: string, fn: (c: Client) => Promise<T>): Promise<T> {
@@ -28,6 +28,15 @@ async function adminInDb(db: string, sql: string): Promise<void> {
   url.pathname = `/${db}`;
   await withClient(url.toString(), (c) => c.query(sql));
 }
+
+describe("deferred validation names (security review L2)", () => {
+  it("only plain lower-case identifiers are quoted; anything else throws", () => {
+    expect(quotePlainIdentifier("access_events_bytes")).toBe('"access_events_bytes"');
+    for (const bad of ['a"; drop table x; --', "Access", "1abc", "", "a b", "a".repeat(64)]) {
+      expect(() => quotePlainIdentifier(bad), bad).toThrow(/not a plain identifier/);
+    }
+  });
+});
 
 describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
   let teardown: () => Promise<void>;
@@ -204,6 +213,45 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
                  where grantee = 'databastion_app' and table_name = 'rate_limit_counters' order by 1`),
       );
       expect(privileges.rows.map((r) => (r as { privilege_type: string }).privilege_type)).toEqual(["DELETE", "INSERT", "SELECT", "UPDATE"]);
+    });
+  });
+
+  describe("concurrent migrate runs are serialized (security review L1)", () => {
+    it("two concurrent runs on a fresh database both succeed, each migration applied once; a run waits for the lock", async () => {
+      const suffix = randomBytes(6).toString("hex");
+      const db = `c_${suffix}`;
+      const owner = `co_${suffix}`;
+      await adminQuery(`create role ${owner} login nosuperuser nocreatedb nocreaterole`);
+      await adminQuery(`create database ${db} owner ${owner}`);
+      try {
+        const url = roleUrl(owner, db);
+        await Promise.all([runMigrations(url), runMigrations(url)]);
+        await withClient(url, async (c) => {
+          const { rows } = await c.query<{ n: number; distinct_n: number }>(
+            "select count(*)::int as n, count(distinct created_at)::int as distinct_n from drizzle.__drizzle_migrations",
+          );
+          const total = readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER }).length;
+          expect(rows[0]).toEqual({ n: total, distinct_n: total });
+        });
+        // Another session holds the lock: the run waits until it is released.
+        await withClient(url, async (holder) => {
+          await holder.query("select pg_advisory_lock($1::bigint)", [MIGRATION_LOCK_KEY]);
+          let done = false;
+          const run = runMigrations(url).then(() => (done = true));
+          await new Promise((r) => setTimeout(r, 300));
+          expect(done).toBe(false);
+          const waiting = await holder.query(
+            "select count(*)::int as n from pg_locks l join pg_stat_activity a on a.pid = l.pid where l.locktype = 'advisory' and not l.granted and a.application_name = 'databastion-migrate-lock'",
+          );
+          expect((waiting.rows[0] as { n: number }).n).toBe(1);
+          await holder.query("select pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]);
+          await run;
+          expect(done).toBe(true);
+        });
+      } finally {
+        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminQuery(`drop role if exists ${owner}`);
+      }
     });
   });
 
