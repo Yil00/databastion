@@ -18,6 +18,16 @@ documentation (docs/08) builds on.
 The source is re-evaluated every 5 minutes. `volume.large_result` on the
 pgaudit source needs `pgaudit.log_rows = on`.
 
+"pgaudit loaded" is proven, not assumed: a `pgaudit.*` value set in
+`postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` without pgaudit in
+`shared_preload_libraries` is a placeholder that `current_setting()` still
+returns. `shared_preload_libraries` is not readable without
+`pg_read_all_settings`, so the probe requires the library's own
+`pgaudit.log_catalog` setting, typed `bool`, in `pg_settings` (which hides
+placeholders). Settings without the library give no pgaudit level (at best
+Limited), with the note "pgaudit settings are set but the pgaudit library
+is not loaded".
+
 ## Known limits
 
 - **At-most-once delivery.** The log cursor advances once the events are

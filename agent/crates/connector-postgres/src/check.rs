@@ -64,10 +64,14 @@ pub(crate) struct AuditProbe {
     pub(crate) pss_loaded: bool,
     pub(crate) stats_visible: bool,
     pub(crate) pgaudit_installed: bool,
-    /// `pgaudit.log` is readable (pgaudit loaded) without
-    /// `pg_read_all_settings`: `Some(true)`; not loaded: `Some(false)`;
-    /// not readable: `None`.
+    /// The pgaudit library is loaded (its own `pgaudit.log_catalog`
+    /// setting is listed by `pg_settings`) and `pgaudit.log` is readable
+    /// without `pg_read_all_settings`: `Some(true)`; not loaded:
+    /// `Some(false)`; not readable: `None`.
     pub(crate) pgaudit_loaded: Option<bool>,
+    /// `pgaudit.*` settings are set while the library is not loaded
+    /// (placeholders): noted, and no pgaudit level.
+    pub(crate) pgaudit_placeholders: bool,
     /// `pgaudit.log` enables the `read` class in this database.
     pub(crate) pgaudit_reads: bool,
     /// `pgaudit.log_rows` is on.
@@ -390,6 +394,13 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                     .to_owned(),
             );
         }
+        if probe.pgaudit_placeholders {
+            notes.push(
+                "pgaudit settings are set but the pgaudit library is not loaded \
+                 (shared_preload_libraries)"
+                    .to_owned(),
+            );
+        }
         if probe.pgaudit_loaded == Some(true) && !probe.pgaudit_reads {
             notes.push("pgaudit.log does not include the read class".to_owned());
         }
@@ -651,7 +662,17 @@ pub(crate) async fn audit_probe(
                     .flatten())
             };
             let log = setting(0)?;
-            p.pgaudit_loaded = Some(log.is_some());
+            // A `pgaudit.log` value alone may be a placeholder (the
+            // library not loaded): the level needs the library's own
+            // setting in `pg_settings` (`sql::PGAUDIT_SETTINGS`).
+            let library = rows
+                .first()
+                .map(|r| col::<Option<bool>>(r, 4))
+                .transpose()?
+                .flatten()
+                .unwrap_or(false);
+            p.pgaudit_loaded = Some(library && log.is_some());
+            p.pgaudit_placeholders = !library && log.is_some();
             p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
             p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
@@ -844,6 +865,7 @@ mod tests {
             stats_visible: true,
             pgaudit_installed: true,
             pgaudit_loaded: Some(true),
+            pgaudit_placeholders: false,
             pgaudit_reads: true,
             pgaudit_rows: false,
             pgaudit_object_audit: false,

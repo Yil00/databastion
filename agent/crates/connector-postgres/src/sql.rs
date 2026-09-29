@@ -354,15 +354,26 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
     ))
 }
 
-/// pgaudit settings of this session's database (`NULL` when pgaudit is not
-/// loaded): `pgaudit.log`, `pgaudit.log_rows`, `pgaudit.role`,
-/// `pgaudit.log_level`. Settings,
-/// not data; readable without `pg_read_all_settings` (verified in P2-B).
+/// pgaudit settings of this session's database: `pgaudit.log`,
+/// `pgaudit.log_rows`, `pgaudit.role`, `pgaudit.log_level` (`NULL` when
+/// not set), and whether the pgaudit library is loaded. Settings, not
+/// data; readable without `pg_read_all_settings` (verified in P2-B).
+///
+/// A `pgaudit.*` value alone does not prove the library is loaded: set in
+/// `postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` without the library
+/// in `shared_preload_libraries`, it is a placeholder that
+/// `current_setting` still returns. `shared_preload_libraries` itself is
+/// not readable without `pg_read_all_settings`. `pg_settings` (readable by
+/// every role) hides placeholders and shows a string type for them; the
+/// library defines `pgaudit.log_catalog` as a boolean: that row is the
+/// proof.
 pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.log', true), \
        pg_catalog.current_setting('pgaudit.log_rows', true), \
        pg_catalog.current_setting('pgaudit.role', true), \
-       pg_catalog.current_setting('pgaudit.log_level', true)";
+       pg_catalog.current_setting('pgaudit.log_level', true), \
+       EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
+               WHERE s.name = 'pgaudit.log_catalog' AND s.vartype = 'bool')";
 
 /// Client address the server sees for this session (`NULL` on a Unix
 /// socket): tells the agent's own statements apart in the audit log.

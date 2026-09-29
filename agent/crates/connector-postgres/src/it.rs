@@ -992,9 +992,25 @@ async fn adr_0012_probes() {
             Some(true),
             "pgaudit.log not readable: {probe:?}"
         );
+        assert!(!probe.pgaudit_placeholders, "{probe:?}");
         eprintln!("pgaudit loaded; pgaudit.log readable without pg_read_all_settings");
     } else {
         assert_eq!(probe.pgaudit_loaded, Some(false));
+        // A `pgaudit.log` value without the library (a placeholder) is
+        // not taken for a loaded pgaudit.
+        a.batch_execute(&format!(
+            "ALTER DATABASE {PROBE_DB} SET pgaudit.log = 'read'"
+        ))
+        .await
+        .unwrap();
+        let session = Session::connect(&t, PROBE_DB, timeouts).await.unwrap();
+        let probe = crate::check::audit_probe(&session, timeouts).await;
+        a.batch_execute(&format!("ALTER DATABASE {PROBE_DB} RESET pgaudit.log"))
+            .await
+            .unwrap();
+        let probe = probe.unwrap();
+        assert_eq!(probe.pgaudit_loaded, Some(false), "{probe:?}");
+        assert!(probe.pgaudit_placeholders, "{probe:?}");
         skip(
             "pgaudit",
             "pgaudit is not loaded on this server (pgaudit.log probe)",
