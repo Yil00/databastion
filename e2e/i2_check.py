@@ -38,7 +38,9 @@ What "in clear" means (a *needle* is one ground-truth value or value-bearing nam
   recomposed, so NFC / NFD, case and accent variants of a value match ("Lefèvre", "LEFEVRE",
   "Lefèvre").
   Views: each file is searched as is and, when it holds such escapes, after decoding JSON
-  \\uXXXX escapes, URL %XX escapes, HTML character references and SQL doubled quotes.
+  \\uXXXX escapes, URL %XX escapes, HTML character references and SQL doubled quotes; HTML is also
+  searched as rendered text (`html-text`: comments such as React's `<!-- -->` and inline tags
+  removed, other tags replaced by a space, character references decoded).
   Plain form: the folded needle is a substring of a folded view. Needles with fewer than
   BOUNDED_BELOW letters / digits must also stand at word boundaries (no letter or digit right
   before or after; `_` and punctuation are boundaries), so that "Martin" matches in
@@ -247,6 +249,21 @@ def _json_unescape(text: str) -> str:
     return _JSON_U.sub(rep, text)
 
 
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_HTML_TAG = re.compile(r"<[^<>]*>")
+_INLINE_TAG = re.compile(r"</?(?:span|b|i|em|strong|code|a|mark|small|sub|sup|wbr)\b[^<>]*>", re.I)
+
+
+def html_text(text: str) -> str:
+    """Rendered text of an HTML page: comments (React's `<!-- -->` text-node separators) and inline
+    tags removed without a gap, other tags replaced by a space (cells stay apart), then character
+    references decoded."""
+    text = _HTML_COMMENT.sub("", text)
+    text = _INLINE_TAG.sub("", text)
+    text = _HTML_TAG.sub(" ", text)
+    return html.unescape(text)
+
+
 def views(text: str) -> Iterator[tuple[str, str]]:
     """(name, folded text) of every decoded view of a file."""
     yield "raw", fold(text)
@@ -258,6 +275,8 @@ def views(text: str) -> Iterator[tuple[str, str]]:
         yield "html-entities", fold(html.unescape(text))
     if "''" in text:
         yield "sql-quotes", fold(text.replace("''", "'"))
+    if "<" in text and ">" in text:
+        yield "html-text", fold(html_text(text))
 
 
 def projection(folded: str) -> str:

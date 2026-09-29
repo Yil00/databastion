@@ -509,10 +509,6 @@ class PageTest(Base):
         self.assertEqual(rc, 2, out)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class NeedleFilterTest(Base):
     def test_scan_restricted_to_the_given_needles(self) -> None:
         # Another ground-truth value is present, but only L0.v0 (and its local part) is searched.
@@ -610,3 +606,24 @@ class AuditTest(Base):
         rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
                        "--agent-account", "a", "--events", ev, "--incidents", inc])
         self.assertEqual(rc, 2, out)
+
+
+class HtmlTextViewTest(Base):
+    def test_value_split_by_react_comments_and_tags(self) -> None:
+        # React text nodes separated by <!-- -->, a value across inline tags, entities.
+        for text in ("<td>manon.bernard<!-- -->@example.com</td>",
+                     "<td>Lef<!-- -->&#xE8;vre</td>",
+                     "<td><span>manon.bernard</span>@<b>example.com</b></td>"):
+            path = self.write("page.html", text)
+            rc, out = self.scan(path)
+            self.assertEqual(rc, 1, (text, out))
+            self.assertIn("view=html-text", out)
+
+    def test_tags_do_not_join_adjacent_cells(self) -> None:
+        path = self.write("page.html", "<td>Lef</td><td>evre</td>")
+        rc, out = self.scan(path)
+        self.assertEqual(rc, 0, out)
+
+
+if __name__ == "__main__":
+    unittest.main()
