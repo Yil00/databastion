@@ -492,6 +492,35 @@ pub struct MongodbTargetConfig {
     /// Default: `admin`.
     #[serde(default = "default_mongodb_auth_source")]
     pub auth_source: String,
+    /// Log file read by the Audit connector (P5-B, P5-C, ADR-0027): the
+    /// Enterprise / Percona `auditLog` JSON file, or the structured JSON
+    /// server log, read locally through the file system. Without it, Audit
+    /// uses the profiler when the account can read `system.profile`.
+    #[serde(default)]
+    pub audit_log: Option<MongodbAuditLogConfig>,
+}
+
+/// Format of a MongoDB log file read by the Audit connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MongodbLogFormat {
+    /// MongoDB Enterprise / Percona Server for MongoDB `auditLog` with
+    /// `destination: file`, `format: JSON` (schema `mongo`). BSON and OCSF
+    /// are not supported.
+    AuditLog,
+    /// The structured JSON server log (`systemLog.destination: file`).
+    ServerLog,
+}
+
+/// Log file of a MongoDB target.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbAuditLogConfig {
+    /// Absolute path of the current log file (`auditLog.path`,
+    /// `systemLog.path`). Rotation by rename or truncation is followed.
+    pub path: PathBuf,
+    /// File format.
+    pub format: MongodbLogFormat,
 }
 
 fn default_mongodb_auth_source() -> String {
@@ -504,6 +533,7 @@ impl Default for MongodbTargetConfig {
             tls: MongodbTlsMode::default(),
             ca_file: None,
             auth_source: default_mongodb_auth_source(),
+            audit_log: None,
         }
     }
 }
@@ -682,6 +712,7 @@ const KNOWN_KEYS: &[&str] = &[
     "csvlog",
     "server_audit",
     "json",
+    "server_log",
     // Values of closed enums (`engine`, `phone_region`) are listed too, so
     // that an "unknown variant" error can name the expected ones; they are
     // schema constants, never user data.
@@ -1094,6 +1125,11 @@ impl TargetConfig {
         if mongo.ca_file.is_some() && mongo.tls != MongodbTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
+        if let Some(log) = &mongo.audit_log {
+            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
+                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
+            }
+        }
         // A MongoDB database name: 1 to 64 bytes, none of `/\. "$`, no NUL
         // or control character.
         let a = &mongo.auth_source;
@@ -1495,6 +1531,21 @@ targets:
         let settings = cfg.targets[0].mongodb_settings();
         assert!(settings.ca_file.is_some());
         assert_eq!(settings.auth_source, "appdb");
+        let cfg = parse(&with(
+            "    mongodb:\n      audit_log: {path: /var/log/mongodb/mongod.log, format: server_log}\n",
+        ))
+        .unwrap();
+        let log = cfg.targets[0].mongodb_settings().audit_log.unwrap();
+        assert_eq!(log.format, MongodbLogFormat::ServerLog);
+        assert_eq!(log.path, PathBuf::from("/var/log/mongodb/mongod.log"));
+        let cfg = parse(&with(
+            "    mongodb: {audit_log: {path: /var/log/mongodb/audit.json, format: audit_log}}\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.targets[0].mongodb_settings().audit_log.unwrap().format,
+            MongodbLogFormat::AuditLog
+        );
         let cfg = parse(&with("    mongodb: {tls: disable_insecure}\n")).unwrap();
         assert_eq!(
             cfg.targets[0].mongodb_settings().tls,
@@ -1521,6 +1572,18 @@ targets:
                 "mongodb.auth_source",
             ),
             ("    mongodb: {password: hunter2-SECRET}\n", "unknown field"),
+            (
+                "    mongodb: {audit_log: {path: audit.json, format: audit_log}}\n",
+                "mongodb.audit_log.path",
+            ),
+            (
+                "    mongodb: {audit_log: {path: /a.bson, format: bson}}\n",
+                "invalid value",
+            ),
+            (
+                "    mongodb: {audit_log: {path: /a.json}}\n",
+                "missing field",
+            ),
         ] {
             let e = err(&with(block));
             assert!(e.contains(expected), "{block}: {e}");
