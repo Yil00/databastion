@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { eventsHref, principalHref } from "@/lib/events-filter";
+import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
 
 /**
@@ -20,6 +21,43 @@ export function objectsLabel(objects: EventView["objects"], max = 3): string {
 export function formatCount(n: number | null): string {
   if (n === null) return "";
   return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} M` : n >= 10_000 ? `${Math.round(n / 1000)} k` : String(Math.round(n));
+}
+
+/** Size in bytes, binary units (contract `AccessEvent.bytes`); empty when not reported. */
+export function formatBytes(n: number | null): string {
+  if (n === null) return "";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  return u === 0 ? `${n} B` : `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
+
+export const UNREGISTERED_SIGNAL_TITLE =
+  "Not in this console's signal registry: registered after this console was built, or sent by a non-conforming agent. Stored and matched like the others; a signature.* id is still treated as severe.";
+
+/**
+ * A signal id: registered ids carry their meaning as a tooltip; ids missing from the registry
+ * (`shared/protocol/signals.json` as built into this console) are flagged "unregistered".
+ */
+export function SignalBadge({ signal }: { signal: string }) {
+  const description = signalDescription(signal);
+  if (description !== null) {
+    return (
+      <Badge variant="outline" title={description}>
+        {signal}
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="border-dashed" title={UNREGISTERED_SIGNAL_TITLE}>
+      {signal}
+      <span className="ml-1 text-muted-foreground">unregistered</span>
+    </Badge>
+  );
 }
 
 export function PrincipalLabel({ principal, fingerprinted }: { principal: string; fingerprinted: boolean }) {
@@ -43,7 +81,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
           <TableHead>Client</TableHead>
           <TableHead>Action</TableHead>
           <TableHead>Objects</TableHead>
-          <TableHead>Rows</TableHead>
+          <TableHead>Rows / bytes</TableHead>
           <TableHead>Signals</TableHead>
           <TableHead>Score</TableHead>
           <TableHead>Incidents</TableHead>
@@ -73,12 +111,19 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
             </TableCell>
             <TableCell>{e.action}</TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal text-xs">{objectsLabel(e.objects)}</TableCell>
-            <TableCell>{formatCount(e.rows)}</TableCell>
+            <TableCell>
+              {formatCount(e.rows)}
+              {e.bytes !== null && (
+                <div className="text-xs text-muted-foreground" title={`${e.bytes} bytes, as reported by the source`}>
+                  {formatBytes(e.bytes)}
+                </div>
+              )}
+            </TableCell>
             <TableCell className="max-w-48 whitespace-normal">
               <div className="flex flex-wrap gap-1">
                 {e.signals.map((s) => (
                   <Link key={s} prefetch={false} href={eventsHref({ signal: s })}>
-                    <Badge variant="outline">{s}</Badge>
+                    <SignalBadge signal={s} />
                   </Link>
                 ))}
                 {e.anomaly && <Badge variant="destructive">above baseline</Badge>}

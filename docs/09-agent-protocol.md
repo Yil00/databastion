@@ -205,7 +205,7 @@ A `discovery.scan` status update can report how much of its scope the scan cover
 - `objects_total`: objects (tables, collections, LDAP object classes) in the job's scope after its filters, across all databases of the target; `objects_done`: objects processed (sampled or skipped); `objects_sampled`: objects actually sampled;
 - `skipped_not_readable`, `skipped_row_level_security`, `skipped_remote`, `skipped_unsupported`, `skipped_limit`, `skipped_error`: objects not sampled, by reason (no read privilege; row-level security, ADR-0012; data held outside the target, I5; a kind the connector does not sample, such as views or merge tables; a structural bound such as the partition-leaf cap; a sampling failure after which the scan went on). An absent reason counts 0; a new reason is a new optional `skipped_*` counter.
 
-`objects_total - objects_done` objects were not reached (deadline, cancellation, findings cap). The counters are flat numbers so that the console stores `progress` as a numeric map. `objects_sampled` and `skipped_*` are sent only when the console accepts `job_progress.coverage` ([negotiation](#compatible-changes-and-capability-negotiation)). The connectors already compute these counts (`Coverage` in the PostgreSQL and MySQL connectors, today logged only); sending them is an agent follow-up.
+`objects_total - objects_done` objects were not reached (deadline, cancellation, findings cap). The counters are flat numbers so that the console stores `progress` as a numeric map. `objects_sampled` and `skipped_*` are sent only when the console accepts `job_progress.coverage` ([negotiation](#compatible-changes-and-capability-negotiation)). The connectors already compute these counts (`Coverage` in the PostgreSQL and MySQL connectors, today logged only); sending them is ROADMAP P4-D.
 
 ## Result batches and idempotency
 `POST /findings` and `POST /events` share the same envelope rules:
@@ -357,7 +357,7 @@ No field can carry a sampled value, a credential, a connection string, a host na
 
 **Rendering rule:** the console renders each note from a phrase catalog keyed by code (the registry's descriptions, with `{count}` and `{labels}` placeholders), escaping the labels. A code missing from the catalog, e.g. registered after the console was built, is shown as the raw code with its count and labels, never rejected; the schema checks its form only (`^(audit|coverage|privilege|security|check)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`, no digit). The console never derives a decision from notes: `reachable`, `audit_level` and `last_error` are the machine-readable status.
 
-Notes are sent only when the console accepts `target_status.notes`. The agent does not produce them yet: turning the connectors' `check()` messages into notes is ROADMAP P2-G.
+Notes are sent only when the console accepts `target_status.notes`. The agent does not produce them yet: turning the connectors' `check()` messages into notes is ROADMAP P4-D.
 
 The targets reported in heartbeats are the agent's targets: results referencing another `target_id` are rejected with `404`. The agent sends a heartbeat before the first result of a newly declared target.
 

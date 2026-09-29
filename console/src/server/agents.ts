@@ -3,6 +3,7 @@ import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { agents, agentTargets, enrollmentTokens, jobs } from "@/db/schema";
 import type { Schemas } from "@/lib/protocol/validate";
+import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
 import { purgeSecretCache } from "./agent-api/auth";
@@ -144,6 +145,8 @@ export async function recordHeartbeat(
         auditLevel: t.audit_level,
         auditSource: t.audit_source ?? null,
         lastError: t.last_error ?? null,
+        // The notes of the latest heartbeat only: absent -> cleared.
+        notes: notesToStore(t.notes),
         metrics: t.metrics ?? null,
         present: true,
         lastReportedAt: sql`now()`,
@@ -260,6 +263,7 @@ export async function listAgents(db: Database) {
         auditLevel: t.auditLevel,
         auditSource: t.auditSource,
         lastError: t.lastError,
+        notes: parseStoredNotes(t.notes),
         present: t.present,
         lastReportedAt: t.lastReportedAt,
       })),
@@ -303,11 +307,12 @@ export async function getAgentDetail(db: Database, agentId: string) {
       auditLevel: agentTargets.auditLevel,
       auditSource: agentTargets.auditSource,
       lastError: agentTargets.lastError,
+      notes: agentTargets.notes,
       present: agentTargets.present,
       lastReportedAt: agentTargets.lastReportedAt,
     })
     .from(agentTargets)
     .where(eq(agentTargets.agentId, agentId))
     .orderBy(agentTargets.targetId);
-  return { ...agent, targets };
+  return { ...agent, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
 }

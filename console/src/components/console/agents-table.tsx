@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { displayStatus, formatAge } from "@/lib/agent-status";
+import { renderTargetNote, type StoredTargetNote } from "@/lib/target-notes";
 
 import { StatusBadge } from "./status-badge";
 
@@ -15,12 +16,13 @@ export interface AgentListItem {
   lastSeenAt: Date | null;
   revokedAt: Date | null;
   lockedAt: Date | null;
-  targets: { targetId: string; auditLevel: string; present: boolean }[];
+  targets: { targetId: string; auditLevel: string; present: boolean; notes?: readonly StoredTargetNote[] }[];
 }
 
 /**
- * Agents list. Every agent-reported string (name, hostname, version, target ids) is rendered as a
- * React text node: escaped, never interpreted as HTML.
+ * Agents list. Every agent-reported string (name, hostname, version, target ids, rendered target
+ * notes) is rendered as a React text node or attribute: escaped, never interpreted as HTML. The
+ * full notes are on the agent's page.
  */
 export function AgentsTable({ agents, now }: { agents: AgentListItem[]; now: number }) {
   if (agents.length === 0) {
@@ -57,8 +59,17 @@ export function AgentsTable({ agents, now }: { agents: AgentListItem[]; now: num
               {a.targets
                 .filter((t) => t.present)
                 .map((t) => (
-                  <Badge key={t.targetId} variant="outline">
+                  <Badge
+                    key={t.targetId}
+                    variant="outline"
+                    title={t.notes && t.notes.length > 0 ? t.notes.map((n) => renderTargetNote(n).text).join("\n") : undefined}
+                  >
                     {t.targetId}: {t.auditLevel}
+                    {t.notes && t.notes.length > 0 && (
+                      <span className="ml-1 text-muted-foreground">
+                        ({t.notes.length} note{t.notes.length > 1 ? "s" : ""})
+                      </span>
+                    )}
                   </Badge>
                 ))}
             </TableCell>

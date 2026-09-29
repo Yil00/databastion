@@ -4,12 +4,14 @@ import type { Database } from "@/db/client";
 import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
+import { unregisteredSignals } from "@/lib/protocol/signals";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
 import { ipv6Groups, mappedIPv4 } from "./net-guard";
 import { sha256Hex } from "./crypto";
 import { canonicalJson } from "./findings";
+import { processGlobal } from "./process-global";
 
 /**
  * Audit access events (P4-C): ingestion of `POST /events` batches, retention, and the views.
@@ -25,7 +27,12 @@ type EventsBatch = Schemas["EventsBatch"];
 type AccessEvent = Schemas["AccessEvent"];
 
 export type EventsIngestOutcome =
-  | { kind: "accepted"; duplicate: boolean; stored: number }
+  /**
+   * `unexpectedTarget` / `unregisteredSignals`: counts of the stored events, for the process
+   * counters. The caller adds them only after the commit (0 for a duplicate), so an aborted
+   * transaction never over-counts.
+   */
+  | { kind: "accepted"; duplicate: boolean; stored: number; unexpectedTarget: number; unregisteredSignals: number }
   | { kind: "batch_conflict" }
   /** `target_id` not reported by this agent: pointers `/events/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
@@ -38,8 +45,19 @@ export type EventsIngestOutcome =
    */
   | { kind: "expired"; details: ValidationDetail[] };
 
-/** Process counters of `/events` (exported on `/metrics`). */
-export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0 };
+/**
+ * Process counters of `/events` (exported on `/metrics`). `unregisteredSignals`: signal ids of
+ * stored events that are not in this console's signal registry (one per id and event). The
+ * ingestion counters are added by `handleEvents` after the commit only. Process-wide (globalThis):
+ * incremented by the route handlers, read by the dedicated `/metrics` listener that the startup
+ * hook runs from another bundled copy of this module (see process-global.ts).
+ */
+export const eventStats = processGlobal("eventStats", () => ({
+  unexpectedTarget: 0,
+  expired: 0,
+  backpressure: 0,
+  unregisteredSignals: 0,
+}));
 
 /** SHA-256 of the validated batch in canonical JSON (same rule as `/findings`). */
 export function eventsBatchSha256(batch: EventsBatch): string {
@@ -118,6 +136,7 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
     // Only the contract fields of each object, in a fixed shape.
     objects: e.objects.map((o) => (o.schema !== undefined ? { database: o.database, schema: o.schema, object: o.object } : { database: o.database, object: o.object })),
     rows: e.rows ?? null,
+    bytes: e.bytes ?? null,
     signals: [...(e.signals ?? [])],
     source: e.source,
     aggregatedCount: e.aggregated_count,
@@ -126,9 +145,12 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
 }
 
 /**
- * Ingests a validated (schema + `checkSemantics`) events batch of `agentId`, atomically:
+ * Ingests a validated (schema + `checkSemantics`) events batch of `agentId`, atomically. The
+ * caller (`handleEvents`) has already applied the request rate, back-pressure and stored-batch
+ * rate limits: those answer `429` **before** this function runs, so while an agent is throttled
+ * even the replay of an accepted batch gets `429` (then `duplicate: true` once the throttle ends).
  * 1. idempotency on `(agent_id, batch_id)`: same content -> duplicate, other content -> conflict
- *    (before every other console-side check, so a replay is always acknowledged);
+ *    (before every check below, so a replay reaching this step is always acknowledged);
  * 2. every `target_id` was reported by the agent (`404`, item pointers `/events/<i>/target_id`);
  * 3. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
  * 4. storage of the events (pending evaluation by the worker) + the batch record.
@@ -151,7 +173,7 @@ export async function ingestEvents(
       .limit(1);
     if (previous) {
       return previous.bodySha256 === bodySha256
-        ? { kind: "accepted" as const, duplicate: true, stored: 0 }
+        ? { kind: "accepted" as const, duplicate: true, stored: 0, unexpectedTarget: 0, unregisteredSignals: 0 }
         : { kind: "batch_conflict" as const };
     }
 
@@ -180,9 +202,14 @@ export async function ingestEvents(
     await tx
       .insert(accessEvents)
       .values(batch.events.map((e, i) => eventRow(agentId, batch.batch_id, e, i, unexpected.has(e.target_id))));
-    eventStats.unexpectedTarget += batch.events.filter((e) => unexpected.has(e.target_id)).length;
     await tx.insert(eventsBatches).values({ agentId, batchId: batch.batch_id, bodySha256, eventsCount: batch.events.length });
-    return { kind: "accepted" as const, duplicate: false, stored: batch.events.length };
+    return {
+      kind: "accepted" as const,
+      duplicate: false,
+      stored: batch.events.length,
+      unexpectedTarget: batch.events.filter((e) => unexpected.has(e.target_id)).length,
+      unregisteredSignals: batch.events.reduce((n, e) => n + unregisteredSignals(e.signals ?? []).length, 0),
+    };
   });
 }
 
@@ -283,6 +310,8 @@ export interface EventView {
   action: string;
   objects: { database: string; schema?: string; object: string }[];
   rows: number | null;
+  /** Contract `AccessEvent.bytes`, when the source reports it (not used by the score). */
+  bytes: number | null;
   signals: string[];
   source: string;
   aggregatedCount: number;
@@ -331,6 +360,7 @@ const EVENT_COLUMNS = {
   action: accessEvents.action,
   objects: accessEvents.objects,
   rows: accessEvents.rows,
+  bytes: accessEvents.bytes,
   signals: accessEvents.signals,
   source: accessEvents.source,
   aggregatedCount: accessEvents.aggregatedCount,

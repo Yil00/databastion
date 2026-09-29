@@ -70,7 +70,8 @@ database credentials (invariant I3).
 |---------|--------------|
 | `pnpm install --frozen-lockfile` | Install the pinned dependencies |
 | `pnpm dev` | Web process in development mode (http://localhost:3000) |
-| `pnpm build` | Production build (also type-checks) |
+| `pnpm build` | Production build (also type-checks), then `pnpm check:build` |
+| `pnpm check:build` | Fails when the built wake-up functions (`requestPolicyEvaluation`, `requestNotificationDelivery` and their setters) are compiled to empty functions (`scripts/check-build-wakeups.mjs`) |
 | `pnpm start` | Serve the production build (web process) |
 | `pnpm worker` | Worker process (pg-boss); stops gracefully on `SIGTERM` / `SIGINT` |
 | `pnpm lint` | ESLint, zero warnings allowed |
@@ -204,7 +205,8 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
-90 s) / revoked / locked, last seen, targets with audit level), `/agents/{id}` (targets; admin:
+90 s) / revoked / locked, last seen, targets with audit level and their number of notes),
+`/agents/{id}` (targets with their notes, see "Target notes"; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
 `dbe_…` token is shown once with a copy button; list; revoke), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
@@ -417,6 +419,18 @@ at agent level, starting with `target_` are ignored, so an agent cannot shadow a
 Cardinality caps: 1000 agents (applied in SQL, targets joined to those agents), 50 000 agent-driven series per scrape (agent-reported and per-target series) (the contract already caps
 128 metrics per map and 64 targets per agent).
 
+## Target notes
+The notes of the **latest** heartbeat of each target (contract `TargetStatus.notes`, P4-D) are
+stored in `agent_targets.notes` (migration `0028`): contract fields only (`code`, `count`,
+`labels`), at most 16 notes and 16 KiB serialized (also a database check); a heartbeat without
+notes clears them. The agent page renders each note from the phrase catalog generated from
+`shared/protocol/target-notes.json` (`src/generated/protocol/target-notes.gen.ts`, renderer
+`src/lib/target-notes.ts`): templates looked up with `Object.hasOwn`, `{count}` replaced by the
+integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQL role attributes
+and MySQL / MariaDB privileges in upper case, the other labels as sent), in one non-recursive pass;
+a code this console does not know is shown raw with its count and labels. Everything is rendered as
+text (escaped). The console never derives a decision from notes.
+
 ## Docker image
 [`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,
 base image and Dockerfile syntax frontend pinned by tag and digest, `next build` with
@@ -482,7 +496,11 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   (`policy_exception.create`).
 - **Execution** (worker, pg-boss queue `policies.evaluate`, `stately`, no payload): the web process
   sends a wake-up after the commit of an accepted findings batch and after a policy or exception
-  change; the worker also schedules it every minute. The work itself is recorded in the tables, so a
+  change (through a send-only pg-boss instance installed at startup and kept process-wide on
+  `globalThis`, because the startup hook and the route handlers run separate bundled copies of
+  the server modules: `src/server/process-global.ts`; without a sender, a production process logs
+  `wake-up not sent: no job sender installed` at most every 10 minutes per queue); the worker also
+  schedules it every minute. The work itself is recorded in the tables, so a
   lost or repeated job loses or repeats nothing: a finding is pending while
   `findings.policy_evaluated_at` differs from `last_seen_at` (every rescan, and unmarking a false
   positive, makes it pending); a policy gets a full pass over the existing findings while
@@ -519,11 +537,16 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - **Ingestion** (`POST /api/agent/v1/events`): same pipeline and bounds as `/findings`
   (authentication, 4 MiB body cap `413`, schema then `checkSemantics`: unknown fields such as query
   text, names or account names failing the contract patterns, a batch over 1 MiB (`maxBytes`) and
-  `ts_last < ts` (`/events/<i>/ts_last`, `formatMinimum`) are `400`). Then, in one transaction
+  `ts_last < ts` (`/events/<i>/ts_last`, `formatMinimum`) are `400`). The request rate,
+  back-pressure and stored-batch rate limits below answer `429` **before** the idempotency check:
+  a throttled batch is never recorded, and even the replay of an accepted batch gets `429` until
+  the throttle ends, then `202 duplicate: true`; a back-pressure `429` does not consume the
+  stored-batch rate. Then, in one transaction
   serialized per agent: the idempotency check on (`agent_id`, `batch_id`) over the canonical JSON
   (replay `202 duplicate: true`, other content `409 batch_conflict`), target ownership (`404`,
   `/events/<i>/target_id`, `notFound`), timestamps at most 5 min ahead (`/events/<i>/ts` or
-  `ts_last`, `formatMaximum`), storage. Rejected batches, conflicts and foreign targets are
+  `ts_last`, `formatMaximum`), storage of exactly the contract fields (`bytes` included, migration
+  `0027`: shown next to the rows, not used by the score). Rejected batches, conflicts and foreign targets are
   agent-integrity events (endpoint `events`). Events whose `ts` is older than the retention period
   are refused (`400`, `/events/<i>/ts`, `formatMinimum`; possible from a conforming agent with an
   old spool, so counted in `databastion_console_events_expired_total`, not an integrity event).
@@ -533,6 +556,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   requests and 60 stored batches (30 000 events) per minute (`429`), and `429` + `Retry-After: 30`
   while the agent has more than 20 000 events not evaluated yet (back-pressure, counted in
   `databastion_console_events_backpressure_total`). An accepted batch wakes the policy worker.
+- **Agent text on display and export** (P1-A): `db_user`, `application`, client addresses and
+  object names are rendered as React text nodes (escaped, never HTML) in the events, principal and
+  incident views. In `incident.opened` notifications the principal is a JSON string in the webhook
+  body and is kept on one line in the e-mail subject and body (control, format and line separator
+  characters replaced); `application` is not sent. The console has no CSV export, so there is no
+  spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
+  `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
+  and any printable character in `db_user`).
 - **Sensitivity** of an object: for each classifier found on it (any column, false positives
   excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
   is that of its most sensitive object; an event object without schema matches the findings of any
@@ -581,7 +612,18 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   event. Signals are the agent's (P4-A emits `signature.pg_dump`, `signature.copy_to_file`,
   `signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
   `volume.large_result`; any contract-valid id is accepted). The console's own baseline verdict
-  is the `anomaly` condition, not a signal.
+  is the `anomaly` condition, not a signal. A new or changed policy must use the contract `Signal`
+  form (1 to 6 words of 1 to 16 lowercase letters, no digit, ADR-0022) or a family; policies
+  stored earlier with the former, wider selector keep being evaluated.
+- **Signal registry** (`shared/protocol/signals.json`, generated into
+  `src/generated/protocol/signals.gen.ts`, lookups in `src/lib/protocol/signals.ts`): an id
+  missing from it (registered after this console was built, or sent by a non-conforming agent) is
+  stored and matched like the others, flagged **unregistered** in the events and incident views and
+  in `incident.opened` notifications (`access.unregistered_signals` in the webhook payload, marked
+  in the e-mail), and counted in `databastion_console_events_unregistered_signals_total` (one per id
+  and stored event, this process). Every `signature.*` id stays severe (cap bypass), registered or
+  not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
+  them.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
   For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
   the principal part is `unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64 (canonical
@@ -652,7 +694,8 @@ contents: `src/lib/notification-render.ts`.*
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
   has `source: "access_event"` and, instead of the classifier, location and counts: `principal`,
   `principal_fingerprinted`, `database`, `hour` and `access` (the first event's `ts`, action,
-  source, rows, score, sensitivity, anomaly flag, signals and objects); receivers should switch on
+  source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
+  missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
   finding, and access events carry none.
 - **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:

@@ -232,6 +232,7 @@ export async function collectMetrics(db: Database): Promise<string> {
   x.add("databastion_console_events_unexpected_target_total", "counter", "Access events received for a target not reported anymore or with Audit disabled (this process).", eventStats.unexpectedTarget);
   x.add("databastion_console_events_expired_total", "counter", "Access events refused as older than the retention period (this process).", eventStats.expired);
   x.add("databastion_console_events_backpressure_total", "counter", "POST /events answered 429 because the agent's backlog was not evaluated yet (this process).", eventStats.backpressure);
+  x.add("databastion_console_events_unregistered_signals_total", "counter", "Signal ids of stored access events missing from this console's signal registry, one per id and event (this process).", eventStats.unregisteredSignals);
   x.add("databastion_console_argon2_operations_total", "counter", "argon2id operations started by this process.", argon2Stats.started);
   x.add("databastion_metrics_series_dropped", "gauge", "Series dropped by the cardinality caps in this scrape.", dropped);
   return x.render();

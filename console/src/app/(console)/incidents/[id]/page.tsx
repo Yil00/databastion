@@ -2,7 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { DeliveriesTable } from "@/components/console/deliveries-table";
-import { EventsTable, PrincipalLabel } from "@/components/console/events-table";
+import { EventsTable, PrincipalLabel, SignalBadge } from "@/components/console/events-table";
 import { FindingsTable } from "@/components/console/findings-table";
 import { IncidentActions } from "@/components/console/incident-actions";
 import { IncidentStatusBadge, SeverityBadge } from "@/components/console/incidents-table";
@@ -107,8 +107,8 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                   {access.score ?? 0}
                 </dd>
                 <dt className="text-muted-foreground">Signals</dt>
-                <dd>
-                  {access.signals.length > 0 ? access.signals.join(", ") : "none"}
+                <dd className="flex flex-wrap items-center gap-1">
+                  {access.signals.length > 0 ? access.signals.map((s) => <SignalBadge key={s} signal={s} />) : "none"}
                   {access.anomaly ? " (and a volume above the principal's baseline)" : ""}
                 </dd>
               </>
