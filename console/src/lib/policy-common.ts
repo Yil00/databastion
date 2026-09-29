@@ -39,12 +39,15 @@ export function isGlob(v: unknown): v is string {
 }
 
 /**
- * Case-insensitive glob match (`*` any run, `?` one character, `\` escapes the next character),
- * in linear time and space (greedy two-pointer with single backtrack point: no regular expression,
- * so no catastrophic backtracking on hostile names or patterns).
+ * Case-insensitive glob match (`*` any run, `?` one character, `\` escapes the next character).
+ * Greedy two-pointer matcher with a single backtrack point and no regular expression: worst case
+ * O(n x m) time for a name of n characters and a pattern of m tokens, O(n + m) space, with no
+ * catastrophic (exponential) backtracking. Both sides are bounded (names 256 characters by the
+ * contract, patterns `MAX_GLOB_LENGTH`), so a match costs at most ~65 000 steps. Tokenized
+ * patterns are cached (policies reuse the same few patterns for every event or finding).
  */
 export function globMatch(pattern: string, value: string): boolean {
-  const p = tokens(pattern.toLowerCase());
+  const p = compiled(pattern);
   const s = [...value.toLowerCase()];
   let pi = 0;
   let si = 0;
@@ -70,6 +73,19 @@ export function globMatch(pattern: string, value: string): boolean {
 }
 
 type GlobToken = { kind: "star" } | { kind: "any" } | { kind: "char"; ch: string };
+
+const GLOB_CACHE_MAX = 1000;
+const globCache = new Map<string, GlobToken[]>();
+
+function compiled(pattern: string): GlobToken[] {
+  let t = globCache.get(pattern);
+  if (!t) {
+    if (globCache.size >= GLOB_CACHE_MAX) globCache.clear();
+    t = tokens(pattern.toLowerCase());
+    globCache.set(pattern, t);
+  }
+  return t;
+}
 
 function tokens(pattern: string): GlobToken[] {
   const out: GlobToken[] = [];

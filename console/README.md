@@ -32,6 +32,8 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_PUBLIC_URL` | Public origin of the console (e.g. `https://console.example.com`). State-changing user requests must come from this origin; unset: the request's own origin. The worker also uses it for the links in notifications (unset: notifications carry ids only) |
 | `DATABASTION_SILENT_AGENT_INTERVALS` | Worker: "silent agent" alert after this many heartbeat intervals (30 s) without a heartbeat; integer 3 to 2880, default 10 (5 minutes). See "Alerting" |
 | `DATABASTION_EVENTS_RETENTION_DAYS` | Worker: Audit access events older than this many days (event `ts`) are deleted every hour; integer 7 to 3650, default 90; other values fall back to the default. Baselines and incidents are kept. See "Audit correlation" |
+| `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` | Worker: new incidents an `access_event` policy may open per clock hour, 1 to 10000, default 50; beyond, the matches go to one overflow incident of the policy. See "Audit correlation" |
+| `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
@@ -108,7 +110,11 @@ evaluation columns `evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_
 `audit_configs`: no `DELETE`, `TRUNCATE`; `incidents`: `UPDATE` also on the event re-match columns
 `event_score`, `event_rows`, `event_signals`, `last_event_at`; `EXECUTE` on the owner-defined
 `SECURITY DEFINER` function `databastion_purge_access_events(retention_days, max_rows)`, the only
-way for the runtime role to delete events: never those younger than 7 days)
+way for the runtime role to delete events: never those younger than 7 days) and
+`0024_p4c_review_purge.sql` (the purge function also keeps unevaluated events, keeps the batch
+records 30 more days and purges idle baselines; `EXECUTE` on
+`databastion_evict_principal_baselines(agent_id, target_id, n)`, a bounded delete of a target's
+least recently updated baselines; `UPDATE (event_anomaly)` on `incidents`)
 (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
@@ -458,8 +464,9 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - **Conditions** (source `finding`; source `access_event`: see "Audit correlation"; every key
   optional, all present keys must hold, the values of a list are alternatives): `classifiers` (registered ids of any classifier set, or families such as
   `pii.*`), `agent_ids`, `target_ids`, `engines`, `location` (`database`, `schema`, `object`,
-  `field` globs on the normalized names: `*`, `?`, `\` escape, case-insensitive, matched in linear
-  time), `min_confidence`, `min_match_ratio` (matched / sampled), `min_matched`. Unknown keys are
+  `field` globs on the normalized names: `*`, `?`, `\` escape, case-insensitive, matched without
+  regular expression in O(n x m) worst case on bounded names and patterns, no exponential
+  backtracking), `min_confidence`, `min_match_ratio` (matched / sampled), `min_matched`. Unknown keys are
   rejected. A document is validated against its policy's source (fixed at creation), so existing
   policies keep their meaning.
 - **Actions**: exactly one `{"type": "create_incident", "severity": "low|medium|high|critical"}`,
@@ -516,8 +523,15 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   (replay `202 duplicate: true`, other content `409 batch_conflict`), target ownership (`404`,
   `/events/<i>/target_id`, `notFound`), timestamps at most 5 min ahead (`/events/<i>/ts` or
   `ts_last`, `formatMaximum`), storage. Rejected batches, conflicts and foreign targets are
-  agent-integrity events (endpoint `events`). Limits per agent and process: 300 requests and 60
-  stored batches (30 000 events) per minute (`429`). An accepted batch wakes the policy worker.
+  agent-integrity events (endpoint `events`). Events whose `ts` is older than the retention period
+  are refused (`400`, `/events/<i>/ts`, `formatMinimum`; possible from a conforming agent with an
+  old spool, so counted in `databastion_console_events_expired_total`, not an integrity event).
+  Events of a target the agent no longer reports, or whose Audit settings are disabled, are stored
+  with `unexpected_target` set (shown in the view, counted in
+  `databastion_console_events_unexpected_target_total`). Limits per agent and process: 300
+  requests and 60 stored batches (30 000 events) per minute (`429`), and `429` + `Retry-After: 30`
+  while the agent has more than 20 000 events not evaluated yet (back-pressure, counted in
+  `databastion_console_events_backpressure_total`). An accepted batch wakes the policy worker.
 - **Sensitivity** of an object: for each classifier found on it (any column, false positives
   excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
   is that of its most sensitive object; an event object without schema matches the findings of any
@@ -534,16 +548,23 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   Unlisted ids: 8 for `secret.*`, 2 for `pii.*`, 1 otherwise.
 - **Score** = sensitivity x log10(1 + rows), 0 when the source reports no `rows` or no object is
   sensitive. For an event pre-aggregated by the agent, `rows` is the total of the merged events.
-- **Baselines** per (agent, target, principal), over the events that report `rows`: exponentially
+- **Baselines** per (agent, target, principal), over the events that report `rows` (never
+  `connect` nor `auth_failure`, so failed logins with random account names create none): exponentially
   weighted mean and variance of `ln(1 + rows)`, weight `max(0.05, 1/n)` (the plain mean for the first
   20 events, then about the last 20). Warm after 20 events. A warm baseline flags an event as an
   **anomaly** when `rows >= 1000` and `ln(1 + rows) > mean + max(ln 10, 3 sd)` (ten times the
   typical volume, and three standard deviations). The verdict uses the baseline before the event;
   the event then updates it, capped at that threshold, so one dump does not raise the baseline
-  while a lasting change is learnt gradually. The same statistics on `ln(1 + score)` are shown.
+  while a lasting change is learnt gradually. The same statistics on `ln(1 + score)` are shown. A
+  target keeps at most `DATABASTION_BASELINES_PER_TARGET` baselines (default 10 000, 10 to
+  1 000 000): past it, the least recently updated ones are evicted (owner-defined function); new
+  principals beyond the cap within one chunk get no baseline. Baselines not updated for longer
+  than the retention period are purged.
 - **Evaluation** runs first in `policies.evaluate` (before the findings, so an exfiltration never
-  waits behind a full pass), in chunks of 200 events in arrival order, serialized by an advisory
-  lock. Each event gets its sensitivity, score, anomaly flag and baseline snapshot, then every
+  waits behind a full pass), within 60 % of the run's time budget; the finding work always runs
+  after it. Chunks hold at most 200 events and at most 50 per agent, agents interleaved, so a busy
+  agent never delays the others; each agent's events are taken in arrival order (batch, then
+  position in the batch). Serialized by an advisory lock. Each event gets its sensitivity, score, anomaly flag and baseline snapshot, then every
   enabled `access_event` policy is applied. A policy applies to the events evaluated after its
   creation or change, never to past ones.
 - **Conditions** (source `access_event`; all present keys must hold, the values of a list are
@@ -555,13 +576,26 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   `object` globs; one object of the event matches), `min_rows`, `min_score`, `min_sensitivity`,
   `anomaly: true`. Exceptions apply by agent, target and location (`database` / `schema` /
   `object` globs covering every retained object); a classifier-scoped exception never covers an
-  event. The `volume.*` signals are the agent's; the console's own baseline verdict is `anomaly`.
+  event. Signals are the agent's (P4-A emits `signature.pg_dump`, `signature.copy_to_file`,
+  `signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
+  `volume.large_result`; any contract-valid id is accepted). The console's own baseline verdict
+  is the `anomaly` condition, not a signal.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
-  The database is that of the most sensitive retained object. While the incident of a key is open or
-  acknowledged, later events of the key are added to it (`match_count`, total rows, highest score,
-  signals, and a link in `incident_events`); once it is resolved or a false positive, the rest of
-  that hour opens nothing; the next hour opens a new incident. A `pg_dump` (one event per table)
-  thus raises one incident per policy, principal, database and hour. Incident creation is audited
+  For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
+  the principal part is `unknown:<sha256 of client_addr>`: all such events from one client count
+  as one principal, so random account names cannot open one incident each. The database is that
+  of the most sensitive retained object. While the incident of a key is open or acknowledged,
+  later events of the key are added to it (`match_count`, total rows, highest score, signals,
+  anomaly, and a link in `incident_events`). Once it is a **false positive**, the rest of that hour
+  is only linked to it. Once it is **resolved**, a later event of the hour opens a new incident
+  (`reopened_from` in the notification) only when it is worse: a higher score, above the baseline
+  while the incident was not, or a signal the incident did not have; otherwise it is linked to the
+  resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
+  raises one incident per policy, principal, database and hour.
+- **Cap**: a policy opens at most `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` new incidents per
+  clock hour (default 50, 1 to 10 000). Beyond, the matches of the hour go to one **overflow**
+  incident of the policy (no agent, target or principal; `event_overflow` set; `match_count` and the
+  links count them), notified once, so a flood cannot bury the other incidents. Incident creation is audited
   (`incident.create`, source `access_event`) and notified through the outbox: `incident.opened`
   with `source: "access_event"`, the principal, database, hour and the first event's action,
   source, rows, score, sensitivity, anomaly flag, signals and objects (no value).
@@ -569,8 +603,10 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   (polling every 2 s); a lost wake-up is caught up by the one-minute schedule.
 - **Retention**: `events.purge` (hourly, and at worker start) deletes the events whose `ts` is older
   than `DATABASTION_EVENTS_RETENTION_DAYS` (default 90) through the owner-defined purge function,
-  10 000 at a time within a 50 s budget; the events batches received before that bound go too.
-  Incidents keep their counts; their event list shows what is left.
+  10 000 at a time within a 50 s budget, never an event not evaluated yet. The events batches
+  (replay records) are kept 30 days longer, so a late replay is still recognized. Baselines idle
+  for longer than the retention are purged too. Incidents keep their counts; their event list
+  shows what is left.
 - **Audit settings** (`audit.configure`, admin): enabled, aggregation window, polling interval,
   `min_rows`, sensitive objects derived from the findings (objects with a finding that is not a
   false positive, with their classifiers) and / or added by hand; at most 1000 objects, manual

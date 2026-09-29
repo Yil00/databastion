@@ -36,7 +36,7 @@ export const THRESHOLD_FIELDS = [
 
 /** Source `access_event` (P4-C): conditions on Audit access events. */
 export const EVENT_LIST_FIELDS = [
-  { name: "signals", label: "Signals (ids or families such as signature.*; any when empty)" },
+  { name: "signals", label: "Signals, e.g. signature.pg_dump, signature.copy_to_file, shape.full_table_copy, volume.large_result, or families such as signature.* (any when empty)" },
   { name: "event_actions", label: "Actions: connect, auth_failure, read, write, ddl, dcl (any when empty)" },
   { name: "principals", label: "Principals, globs (any when empty)" },
   { name: "exclude_principals", label: "Except principals, globs" },
@@ -139,7 +139,7 @@ export const POLICY_FIELD_ERRORS: Record<string, string> = {
   min_confidence: "Minimum confidence: a number from 0 to 1.",
   min_match_ratio: "Minimum ratio: a number from 0 to 1.",
   min_matched: "Minimum matched: a whole number from 0 to 10000.",
-  signals: "Signals: ids such as signature.pg_dump, or families signature.*, shape.*, volume.*.",
+  signals: "Signals: ids such as signature.pg_dump, signature.copy_to_file, signature.copy_to_program, shape.full_table_copy, shape.full_table_read, volume.large_result, or families signature.*, shape.*, volume.*.",
   event_actions: "Actions: connect, auth_failure, read, write, ddl or dcl.",
   sources: "Audit sources: pgaudit, pg_stat_statements, performance_schema, mariadb_server_audit...",
   principals: "Principals: printable globs.",
