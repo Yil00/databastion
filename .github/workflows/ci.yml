@@ -375,6 +375,45 @@ jobs:
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
 
+  # MongoDB connector integration tests (P5-A, ADR-0026) against the dev image (MongoDB 8.0
+  # Community, seeded `app` database, profiler level 1 with slowms 0), with the ADR-0026 account of
+  # dev/mongo/initdb/10-seed.js (find + listCollections on app, SCRAM-SHA-256 only). Every probe is
+  # required: seed recall against dev/ground-truth.json, $sample on a large collection, views never
+  # read, time-series collections, maxTimeMS on every read (from the profiler), no cursor left open,
+  # over-privilege notes, the SCRAM-SHA-1-only account refused.
+  agent-mongodb:
+    name: Agent MongoDB integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev MongoDB service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 mongo
+      - name: Connector integration tests (dev image, all probes required)
+        run: |
+          set -a; . dev/.env; set +a
+          export DATABASTION_TEST_MONGO_URL="mongodb://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MONGO_PORT}/app?authSource=admin"
+          export DATABASTION_TEST_MONGO_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${MONGO_PORT}/?authSource=admin"
+          export DATABASTION_TEST_REQUIRE=mongo,mongo-admin
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mongo
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
   # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit) and the
@@ -424,7 +463,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, protocol, e2e]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, protocol, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

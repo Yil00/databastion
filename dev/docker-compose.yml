@@ -164,12 +164,16 @@ services:
       - ./seed/out/mongo.json:/seed/mongo.json:ro
       - ./mongo/initdb/10-seed.js:/docker-entrypoint-initdb.d/10-seed.js:ro
     healthcheck:
-      # Healthy only once the final server runs with --auth (the init server runs without it).
+      # Healthy only once the final server runs with --auth (the init server runs without it) and
+      # the agent account exists. getCmdLineOpts needs a cluster privilege that the agent account
+      # does not hold (ADR-0026): the administrator runs it.
       test:
         - CMD-SHELL
         - >-
-          mongosh --quiet --norc "mongodb://databastion:$$DATABASTION_DB_PASSWORD@127.0.0.1:27017/admin"
+          mongosh --quiet --norc "mongodb://root:$$MONGO_INITDB_ROOT_PASSWORD@127.0.0.1:27017/admin"
           --eval 'if (!db.adminCommand({getCmdLineOpts: 1}).argv.includes("--auth")) quit(1)'
+          && mongosh --quiet --norc "mongodb://databastion:$$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"
+          --eval 'db.runCommand({ping: 1})'
       <<: *healthcheck
 
   openldap:

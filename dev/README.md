@@ -47,7 +47,7 @@ Dev-only values in [.env.example](.env.example), copied to `dev/.env` (git-ignor
 |--------|---------|--------|
 | PostgreSQL | `databastion` | [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) minimal variant: `CONNECTION LIMIT 4`, no superuser / createdb / createrole / replication / bypassrls; `CONNECT`, `USAGE` + `SELECT` on `crm`, `billing`, `ops` (+ default privileges `FOR ROLE postgres`), `pg_read_all_stats`; role defaults `default_transaction_read_only=on`, `statement_timeout=30s`, `lock_timeout=2s`, `idle_in_transaction_session_timeout=60s` |
 | MariaDB / MySQL / Percona | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`, no `performance_schema` grant: MariaDB and Percona Audit reads their log files; on MySQL (whose only source is `performance_schema`), the Audit tests create their own account with that grant (ADR-0018 gives it only with Audit, and `check()` reports it as over-privilege while no Audit stream runs) |
-| MongoDB | `databastion` (auth db `admin`) | `read` on `app`, `clusterMonitor` |
+| MongoDB | `databastion` (auth db `admin`) | [ADR-0026](../docs/adr/0026-mongodb-connector.md): custom role `databastionDiscovery` with `find` and `listCollections` on `app` only, SCRAM-SHA-256 credentials only. No `read` role (change streams, `system.js`), no `clusterMonitor` (other sessions' operations, `system.profile`). As a dev-only deviation, no `authenticationRestrictions` (the agent connects through the published port). The container healthcheck runs `getCmdLineOpts` as `root`, since the agent account cannot |
 | OpenLDAP | `cn=databastion,ou=services,dc=example,dc=org` | read on the tree (except `userPassword`) and on `cn=accesslog` |
 
 PostgreSQL: no `pg_read_all_data` / `pg_monitor` (they expose `pg_authid`, `pg_user_mapping`, `pg_subscription`, large objects and raw statistics, ADR-0012); a schema added to the seed needs its own `USAGE` / `SELECT` grants in [postgres/initdb/20-databastion.sh](postgres/initdb/20-databastion.sh). `make dev-smoke` checks that the account cannot read `pg_authid` nor `pg_user_mapping`.
@@ -152,6 +152,24 @@ export DATABASTION_TEST_PERCONA_DUMP_CMD="$C -e MYSQL_PWD=$PERCONA_ROOT_PASSWORD
 Audit keys of `DATABASTION_TEST_REQUIRE`: `mariadb-audit`, `percona`, `percona-audit`,
 `mysqldump`. The `performance_schema` test runs on MySQL and MariaDB with a test account
 (`databastion_it_pfs`) granted `SELECT` on the application database and on `performance_schema`.
+
+The MongoDB connector tests (`agent/crates/connector-mongodb/src/it.rs`, P5-A) run against the
+`mongo` service. It has no TLS: the tests connect with `tls: disable` on the loopback address (TLS
+and the SCRAM-SHA-256 exchange, including hostile server answers, are covered by the scripted server
+of `src/fake.rs`, which also scans the dev seed against the ground truth without a server). The
+admin URL is for the probe fixtures (database `databastion_probe`, role `databastion_it_discovery`,
+accounts `databastion_it_*`); the probes read the probe database's profiler (`--profile 1`, `slowms`
+0 in dev) to check that every agent read carries `maxTimeMS` and that no cursor is left open:
+
+```sh
+set -a; . dev/.env; set +a
+export DATABASTION_TEST_MONGO_URL="mongodb://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:${MONGO_PORT:-27017}/app?authSource=admin"
+export DATABASTION_TEST_MONGO_ADMIN_URL="mongodb://root:$MONGO_ROOT_PASSWORD@127.0.0.1:${MONGO_PORT:-27017}/?authSource=admin"
+(cd agent && cargo test -p databastion-connector-mongodb -- --nocapture)
+```
+
+`DATABASTION_TEST_REQUIRE` accepts `mongo` and `mongo-admin` for these tests. On volumes created
+before ADR-0026, run `make dev-reset dev` first: the init script creates the account only once.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
