@@ -73,15 +73,25 @@ pub(crate) enum UplinkError {
     #[error("console error ({status})")]
     Server { status: u16 },
     /// Non-retryable `4xx` (other than 401 / 426 / 429).
+    /// `unknown_field`: a `details[].keyword` is `additionalProperties`,
+    /// what a console built before an optional field answers to a body
+    /// carrying it (docs/09, ADR-0022).
     #[error("request rejected ({status}, code {code:?})")]
     Rejected {
         status: u16,
         code: Option<ErrorCode>,
+        unknown_field: bool,
     },
     /// `400` / `404` on `/findings` or `/events` whose `details` all point at
-    /// items: the (deduplicated, sorted) indices of the rejected items.
+    /// items: the (deduplicated, sorted) indices of the rejected items, and
+    /// among them those pointed at with the keyword `additionalProperties`
+    /// (`unknown_field`, sorted).
     #[error("batch items rejected ({status}, {} items)", items.len())]
-    ItemsRejected { status: u16, items: Vec<usize> },
+    ItemsRejected {
+        status: u16,
+        items: Vec<usize>,
+        unknown_field: Vec<usize>,
+    },
     /// Unexpected status or undecodable body.
     #[error("unexpected response ({status})")]
     UnexpectedResponse { status: u16 },
@@ -323,10 +333,24 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, Uplink
     Ok(body)
 }
 
+/// The keyword a closed schema reports for a field it does not know: what
+/// a console built before an optional field answers (docs/09).
+const UNKNOWN_FIELD_KEYWORD: &str = "additionalProperties";
+
+/// Whether a detail reports an unknown field.
+fn is_unknown_field(d: &databastion_protocol::ErrorDetail) -> bool {
+    d.keyword.as_str() == UNKNOWN_FIELD_KEYWORD
+}
+
 /// Indices of the items designated by every `details[].pointer`, when all
-/// of them point inside `/findings/<i>` or `/events/<i>` (docs/09). `None`
-/// if any pointer targets the envelope, or if there is no detail.
-fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<usize>> {
+/// of them point inside `/findings/<i>` or `/events/<i>` (docs/09), and
+/// those of them pointed at with the keyword `additionalProperties` (both
+/// sorted, deduplicated). `None` if any pointer targets the envelope, or
+/// if there is no detail.
+fn item_pointers(
+    path: &str,
+    error: &databastion_protocol::Error,
+) -> Option<(Vec<usize>, Vec<usize>)> {
     let prefix = match path {
         "/findings" => "/findings/",
         "/events" => "/events/",
@@ -336,14 +360,21 @@ fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<
         return None;
     }
     let mut items = Vec::with_capacity(error.details.len());
+    let mut unknown = Vec::new();
     for d in &error.details {
         let rest = d.pointer.as_str().strip_prefix(prefix)?;
         let index = rest.split('/').next()?;
-        items.push(index.parse::<usize>().ok()?);
+        let index = index.parse::<usize>().ok()?;
+        items.push(index);
+        if is_unknown_field(d) {
+            unknown.push(index);
+        }
     }
-    items.sort_unstable();
-    items.dedup();
-    Some(items)
+    for v in [&mut items, &mut unknown] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Some((items, unknown))
 }
 
 /// The result endpoints, which a `501` parks.
@@ -361,6 +392,9 @@ fn classify(
 ) -> UplinkError {
     let error = serde_json::from_slice::<databastion_protocol::Error>(body).ok();
     let code = error.as_ref().map(|e| e.code);
+    let unknown_field = error
+        .as_ref()
+        .is_some_and(|e| e.details.iter().any(is_unknown_field));
     if let Some(error) = &error {
         let details: Vec<String> = error
             .details
@@ -401,10 +435,22 @@ fn classify(
         },
         500..=599 => UplinkError::Server { status },
         400 | 404 => match error.as_ref().and_then(|e| item_pointers(path, e)) {
-            Some(items) => UplinkError::ItemsRejected { status, items },
-            None => UplinkError::Rejected { status, code },
+            Some((items, unknown_field)) => UplinkError::ItemsRejected {
+                status,
+                items,
+                unknown_field,
+            },
+            None => UplinkError::Rejected {
+                status,
+                code,
+                unknown_field,
+            },
         },
-        400..=499 => UplinkError::Rejected { status, code },
+        400..=499 => UplinkError::Rejected {
+            status,
+            code,
+            unknown_field,
+        },
         _ => UplinkError::UnexpectedResponse { status },
     }
 }
@@ -569,17 +615,20 @@ impl ResultBatch {
         }
     }
 
-    /// The batch to send again after a `400` to a batch carrying gated
-    /// fields (ADR-0022 decision 9), under a **new** `batch_id`, with every
-    /// gated field of every item stripped. Of the items at `rejected`
-    /// (sorted), those that carried a gated field are kept (an older
-    /// console accepts them without it); the others were rejected for
-    /// another reason and are left out. Returns the batch (`None` if
-    /// nothing is left) and the number of items left out. The result
-    /// carries no gated field, so it is stripped at most once.
+    /// The batch to send again after a `400` reporting an unknown field
+    /// (`additionalProperties`) to a batch carrying gated fields (ADR-0022
+    /// decision 9), under a **new** `batch_id`, with every gated field of
+    /// every item stripped. Of the items at `rejected` (sorted), those
+    /// pointed at with `additionalProperties` (`unknown`, sorted) that
+    /// carried a gated field are kept (an older console accepts them
+    /// without it); the others were rejected for another reason and are
+    /// left out. Returns the batch (`None` if nothing is left) and the
+    /// number of items left out. The result carries no gated field, so it
+    /// is stripped at most once.
     pub(crate) fn stripped(
         &self,
         rejected: &[usize],
+        unknown: &[usize],
     ) -> Result<(Option<Self>, usize), Unserializable> {
         let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
         let mut left_out = 0usize;
@@ -604,7 +653,9 @@ impl ResultBatch {
             Parsed::Events(b) => {
                 let mut events = Vec::with_capacity(b.events.len());
                 for (i, mut e) in b.events.into_iter().enumerate() {
-                    if rejected.binary_search(&i).is_ok() && !event_carries_gated(&e) {
+                    if rejected.binary_search(&i).is_ok()
+                        && (unknown.binary_search(&i).is_err() || !event_carries_gated(&e))
+                    {
                         left_out += 1;
                         continue;
                     }
@@ -1061,7 +1112,8 @@ mod tests {
             classify("/rotate", StatusCode::CONFLICT, None, body),
             UplinkError::Rejected {
                 status: 409,
-                code: Some(ErrorCode::RotationConflict)
+                code: Some(ErrorCode::RotationConflict),
+                unknown_field: false,
             }
         );
         assert!(classify("/x", StatusCode::BAD_GATEWAY, None, b"").is_retryable());
@@ -1217,20 +1269,24 @@ mod tests {
         );
         let batch = &built.batches[0];
         assert!(batch.carries_gated());
-        // Items 0 (gated) and 1 (not gated) pointed at.
-        let (again, left_out) = batch.stripped(&[0, 1]).unwrap();
+        // Items 0 (gated) and 1 (not gated) pointed at as unknown fields.
+        let (again, left_out) = batch.stripped(&[0, 1], &[0, 1]).unwrap();
         let again = again.unwrap();
         assert_eq!(left_out, 1);
         assert_eq!(again.len(), 3);
         assert_ne!(again.batch_id(), batch.batch_id());
         assert!(!again.carries_gated(), "every gated field is stripped");
         assert!(events_of(&again).iter().all(|e| e.get("bytes").is_none()));
+        // Item 2 (gated) pointed at for another keyword only (e.g.
+        // `formatMinimum`): rejected for another reason, left out as well.
+        let (again, left_out) = batch.stripped(&[0, 2], &[0]).unwrap();
+        assert_eq!((again.unwrap().len(), left_out), (3, 1));
         // Envelope rejection: everything kept, stripped.
-        let (all, left_out) = batch.stripped(&[]).unwrap();
+        let (all, left_out) = batch.stripped(&[], &[]).unwrap();
         assert_eq!((all.unwrap().len(), left_out), (4, 0));
         // Nothing left.
         let only = pack_events(vec![crate::sanitize::tests::event("read", 1)], true);
-        let (none, left_out) = only.batches[0].stripped(&[0]).unwrap();
+        let (none, left_out) = only.batches[0].stripped(&[0], &[0]).unwrap();
         assert!(none.is_none());
         assert_eq!(left_out, 1);
     }
@@ -1245,8 +1301,71 @@ mod tests {
         );
         let batch = &built.batches[0];
         assert!(!batch.carries_gated());
-        let (again, left_out) = batch.stripped(&[1]).unwrap();
+        let (again, left_out) = batch.stripped(&[1], &[1]).unwrap();
         assert_eq!((again.unwrap().len(), left_out), (2, 1));
+    }
+
+    #[test]
+    fn classify_reports_unknown_field_details() {
+        let body = |details: &str| {
+            format!(r#"{{"code":"invalid_request","message":"Invalid.","details":[{details}]}}"#)
+        };
+        let d = |pointer: &str, keyword: &str| {
+            format!(r#"{{"pointer":"{pointer}","keyword":"{keyword}"}}"#)
+        };
+        let items = body(
+            &[
+                d("/events/2", "additionalProperties"),
+                d("/events/0", "formatMinimum"),
+                d("/events/2/ts", "formatMinimum"),
+            ]
+            .join(","),
+        );
+        assert_eq!(
+            classify("/events", StatusCode::BAD_REQUEST, None, items.as_bytes()),
+            UplinkError::ItemsRejected {
+                status: 400,
+                items: vec![0, 2],
+                unknown_field: vec![2],
+            }
+        );
+        let other = body(&d("/events/1", "formatMinimum"));
+        assert_eq!(
+            classify("/events", StatusCode::BAD_REQUEST, None, other.as_bytes()),
+            UplinkError::ItemsRejected {
+                status: 400,
+                items: vec![1],
+                unknown_field: vec![],
+            }
+        );
+        let status = body(&d("/progress", "additionalProperties"));
+        assert_eq!(
+            classify(
+                "/jobs/x/status",
+                StatusCode::BAD_REQUEST,
+                None,
+                status.as_bytes()
+            ),
+            UplinkError::Rejected {
+                status: 400,
+                code: Some(ErrorCode::InvalidRequest),
+                unknown_field: true,
+            }
+        );
+        let status = body(&d("/ts", "formatMaximum"));
+        assert_eq!(
+            classify(
+                "/jobs/x/status",
+                StatusCode::BAD_REQUEST,
+                None,
+                status.as_bytes()
+            ),
+            UplinkError::Rejected {
+                status: 400,
+                code: Some(ErrorCode::InvalidRequest),
+                unknown_field: false,
+            }
+        );
     }
 
     /// End to end: raw column values -> classifier with the agent key ->

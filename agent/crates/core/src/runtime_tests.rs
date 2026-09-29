@@ -1200,12 +1200,27 @@ async fn immediate_204_does_not_hot_loop() {
 /// Scripted `/findings` responses, in order; then plain acks.
 enum Step {
     Ack(bool),
+    /// `400`, keyword `maximum` on every pointer.
     Items(&'static [&'static str]),
+    /// `400`, keyword `additionalProperties` (an unknown field) on every
+    /// pointer: what an older console answers.
+    Unknown(&'static [&'static str]),
+    /// `400` with these (pointer, keyword) details.
+    Details(&'static [(&'static str, &'static str)]),
     TooLarge,
     Conflict,
 }
 
 struct Script(std::sync::Mutex<std::collections::VecDeque<Step>>);
+
+fn details_400<'a>(details: impl Iterator<Item = (&'a str, &'a str)>) -> ResponseTemplate {
+    let details: Vec<_> = details
+        .map(|(p, k)| serde_json::json!({"pointer": p, "keyword": k}))
+        .collect();
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "code": "invalid_request", "message": "Invalid.", "details": details
+    }))
+}
 
 impl wiremock::Respond for Script {
     fn respond(&self, request: &Request) -> ResponseTemplate {
@@ -1217,15 +1232,11 @@ impl wiremock::Respond for Script {
         match self.0.lock().unwrap().pop_front() {
             None | Some(Step::Ack(false)) => ack(false),
             Some(Step::Ack(true)) => ack(true),
-            Some(Step::Items(pointers)) => {
-                let details: Vec<_> = pointers
-                    .iter()
-                    .map(|p| serde_json::json!({"pointer": p, "keyword": "maximum"}))
-                    .collect();
-                ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                    "code": "invalid_request", "message": "Invalid.", "details": details
-                }))
+            Some(Step::Items(pointers)) => details_400(pointers.iter().map(|p| (*p, "maximum"))),
+            Some(Step::Unknown(pointers)) => {
+                details_400(pointers.iter().map(|p| (*p, "additionalProperties")))
             }
+            Some(Step::Details(details)) => details_400(details.iter().copied()),
             Some(Step::TooLarge) => error_body(413, "payload_too_large"),
             Some(Step::Conflict) => error_body(409, "batch_conflict"),
         }
@@ -3147,10 +3158,7 @@ fn accept_tokens(rt: &Runtime, tokens: &[&str]) {
 }
 
 fn rejected_400(pointer: &str) -> ResponseTemplate {
-    ResponseTemplate::new(400).set_body_json(serde_json::json!({
-        "code": "invalid_request", "message": "Invalid.",
-        "details": [{"pointer": pointer, "keyword": "additionalProperties"}]
-    }))
+    details_400([(pointer, "additionalProperties")].into_iter())
 }
 
 /// Reports coverage counters as a connector does while it scans.
@@ -3317,6 +3325,30 @@ async fn status_rejected_with_coverage_is_resent_once_without_it() {
 }
 
 #[tokio::test]
+async fn status_with_coverage_rejected_for_another_keyword_is_not_stripped() {
+    use crate::capabilities::token;
+    // e.g. `ts` in the future: not an older console, so nothing is
+    // stripped, the status is not resent and the capabilities are kept.
+    let (server, rt, _env) = covered_scan(
+        seq(
+            vec![details_400([("/ts", "formatMaximum")].into_iter())],
+            ResponseTemplate::new(204),
+        ),
+        &[token::JOB_PROGRESS_COVERAGE, token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].get("progress").is_some());
+    assert!(
+        rt.console_caps
+            .console_accepts(token::JOB_PROGRESS_COVERAGE)
+    );
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+}
+
+#[tokio::test]
 async fn a_400_without_gated_fields_keeps_the_capabilities() {
     use crate::capabilities::token;
     let (server, rt, _env) = covered_scan(
@@ -3387,7 +3419,7 @@ async fn events_with_gated_fields_rejected_by_pointer_are_resent_stripped_once()
     let (_env, rt) = events_runtime(
         &server,
         vec![
-            Step::Items(&["/events/1", "/events/3/objects/0"]),
+            Step::Unknown(&["/events/1", "/events/3/objects/0"]),
             Step::Items(&["/events/0"]),
         ],
     )
@@ -3426,7 +3458,7 @@ async fn events_with_gated_fields_rejected_by_pointer_are_resent_stripped_once()
 #[tokio::test]
 async fn events_with_gated_fields_rejected_as_a_whole_are_resent_stripped() {
     let server = MockServer::start().await;
-    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/batch_id"])]).await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Unknown(&["/batch_id"])]).await;
     spool_events_with_bytes(&rt, 3, &[0]);
     drain(&rt).await;
     let sent = sent_event_batches(&server).await;
@@ -3434,6 +3466,71 @@ async fn events_with_gated_fields_rejected_as_a_whole_are_resent_stripped() {
     assert_eq!(sent[1]["events"].as_array().unwrap().len(), 3);
     assert!(!sent[1].to_string().contains("\"bytes\""));
     assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 0);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_for_another_keyword_keep_the_ordinary_rules() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 1 carries `bytes` but is rejected for `formatMinimum` (e.g. too
+    // old for the retention): dropped as before, nothing stripped, the
+    // capabilities kept.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[("/events/1/ts", "formatMinimum")])],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 3, &[0, 1]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let rest = sent[1]["events"].as_array().unwrap();
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest[0]["bytes"], 1000, "not stripped");
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn events_mixed_rejection_keeps_only_the_unknown_field_items() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 0: unknown field (kept, stripped); item 2: gated too, but
+    // rejected for another keyword (left out).
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[
+            ("/events/0", "additionalProperties"),
+            ("/events/2/ts", "formatMinimum"),
+        ])],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 4, &[0, 2]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 3);
+    assert!(!sent[1].to_string().contains("\"bytes\""));
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert!(!rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_as_a_whole_for_another_keyword_are_dropped() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/batch_id"])]).await;
+    spool_events_with_bytes(&rt, 3, &[0]);
+    drain(&rt).await;
+    // Envelope rejected for `maximum`: dropped as before, not stripped.
+    assert_eq!(sent_event_batches(&server).await.len(), 1);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
 }
 
 #[tokio::test]

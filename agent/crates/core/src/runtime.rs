@@ -1158,17 +1158,25 @@ impl Runtime {
                 self.lock_spool().drop_batch(&key);
                 Ok(Flush::Progress)
             }
-            // ADR-0022 decision 9: a `400` to a batch that carried a gated
-            // field is more likely an older console than bad items.
-            Err(CallError::Uplink(UplinkError::ItemsRejected { status: 400, items }))
-                if batch.carries_gated() =>
-            {
-                Ok(self.resend_stripped(&key, &batch, &items, failures))
+            // ADR-0022 decision 9: a `400` reporting an unknown field
+            // (`additionalProperties`) to a batch that carried a gated field
+            // is more likely an older console than bad items. Any other
+            // keyword (`formatMinimum`, retention…) keeps the ordinary rules
+            // and the capabilities.
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                status: 400,
+                items,
+                unknown_field,
+            })) if !unknown_field.is_empty() && batch.carries_gated() => {
+                Ok(self.resend_stripped(&key, &batch, &items, &unknown_field, failures))
             }
             Err(CallError::Uplink(UplinkError::Rejected {
                 status: 400,
                 code: Some(_),
-            })) if batch.carries_gated() => Ok(self.resend_stripped(&key, &batch, &[], failures)),
+                unknown_field: true,
+            })) if batch.carries_gated() => {
+                Ok(self.resend_stripped(&key, &batch, &[], &[], failures))
+            }
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
                 tracing::warn!(
@@ -1216,6 +1224,7 @@ impl Runtime {
             Err(CallError::Uplink(UplinkError::Rejected {
                 status,
                 code: Some(code),
+                ..
             })) => {
                 if code == databastion_protocol::ErrorCode::BatchConflict {
                     bump(&self.counters.batch_conflicts, 1);
@@ -1231,7 +1240,9 @@ impl Runtime {
                 Ok(Flush::Progress)
             }
             Err(CallError::Uplink(
-                UplinkError::Rejected { status, code: None }
+                UplinkError::Rejected {
+                    status, code: None, ..
+                }
                 | UplinkError::UnexpectedResponse { status },
             )) => {
                 bump(&self.counters.batches_unexpected_response, 1);
@@ -1248,24 +1259,27 @@ impl Runtime {
         }
     }
 
-    /// A batch carrying a gated field was rejected with `400` (ADR-0022
-    /// decision 9): the console may be an older replica or a rolled-back
-    /// build. Forget its capabilities (no new gated field until a heartbeat
-    /// response lists them again) and replace the batch with the same items
-    /// under a new `batch_id`, every gated field stripped, instead of
-    /// dropping them. Of the `rejected` items, only those without a gated
-    /// field are left out (they were rejected for another reason). The
-    /// replacement carries no gated field: it is never stripped again.
+    /// A batch carrying a gated field was rejected with `400` for an
+    /// unknown field (`additionalProperties`, ADR-0022 decision 9): the
+    /// console may be an older replica or a rolled-back build. Forget its
+    /// capabilities (no new gated field until a heartbeat response lists
+    /// them again) and replace the batch with the same items under a new
+    /// `batch_id`, every gated field stripped, instead of dropping them. Of
+    /// the `rejected` items, only those pointed at as an unknown field
+    /// (`unknown`) that carried a gated field are kept; the others were
+    /// rejected for another reason and are left out. The replacement
+    /// carries no gated field: it is never stripped again.
     fn resend_stripped(
         &self,
         key: &[u64],
         batch: &ResultBatch,
         rejected: &[usize],
+        unknown: &[usize],
         failures: u32,
     ) -> Flush {
         self.console_caps.clear();
         bump(&self.counters.gated_fields_stripped, 1);
-        let (again, left_out) = match batch.stripped(rejected) {
+        let (again, left_out) = match batch.stripped(rejected, unknown) {
             Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
             Err(uplink::Unserializable) => {
                 self.count_unserializable(1);
@@ -2233,10 +2247,12 @@ impl Runtime {
 
     /// Reports a terminal status. The coverage counters of a scan are
     /// gated fields (ADR-0022): sent only when the console's latest
-    /// heartbeat response listed `job_progress.coverage`. A `400` to a body
-    /// that carried them clears the capabilities (the console may be an
-    /// older replica or a rolled-back build) and the status is sent again
-    /// once without them, instead of being lost (decision 9).
+    /// heartbeat response listed `job_progress.coverage`. A `400` reporting
+    /// an unknown field (`additionalProperties`) to a body that carried
+    /// them clears the capabilities (the console may be an older replica or
+    /// a rolled-back build) and the status is sent again once without them,
+    /// instead of being lost (decision 9). Any other `400` is not retried
+    /// and keeps the capabilities.
     async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
         let ts = now();
         let mut progress = outcome.coverage.and_then(|c| {
@@ -2276,12 +2292,15 @@ impl Runtime {
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
                 })) => return true,
-                // A gated field was sent: forget the capabilities and send
-                // the status once more without it (never a loop: the
-                // stripped body carries no gated field).
-                Err(CallError::Uplink(UplinkError::Rejected { status: 400, .. }))
-                    if progress.is_some() =>
-                {
+                // A gated field was sent and the console does not know a
+                // field: forget the capabilities and send the status once
+                // more without it (never a loop: the stripped body carries
+                // no gated field).
+                Err(CallError::Uplink(UplinkError::Rejected {
+                    status: 400,
+                    unknown_field: true,
+                    ..
+                })) if progress.is_some() => {
                     self.console_caps.clear();
                     bump(&self.counters.gated_fields_stripped, 1);
                     tracing::warn!(
