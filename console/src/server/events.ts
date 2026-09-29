@@ -7,6 +7,7 @@ import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
+import { ipv6Groups, mappedIPv4 } from "./net-guard";
 import { sha256Hex } from "./crypto";
 import { canonicalJson } from "./findings";
 
@@ -51,6 +52,21 @@ export function eventsBatchSha256(batch: EventsBatch): string {
  */
 export function principalKey(p: { db_user?: string; db_user_fingerprint?: string }): string {
   return p.db_user !== undefined ? sha256Hex(`u\u0000${p.db_user}`) : sha256Hex(`f\u0000${p.db_user_fingerprint ?? ""}`);
+}
+
+/**
+ * Client network of the coarse dedup scope (re-review N2): IPv4 -> its /24, IPv6 -> its /64 in
+ * canonical form, IPv4-mapped IPv6 -> the IPv4 /24, `local` kept, absent -> `-`. Addresses are
+ * contract `ClientAddress` literals (IPv4, IPv6 or `local`); anything else is kept as is.
+ */
+export function clientNetwork(addr: string | null): string {
+  if (addr === null) return "-";
+  if (addr === "local") return "local";
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(addr) ?? /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(mappedIPv4(addr) ?? "");
+  if (v4) return `${Number(v4[1])}.${Number(v4[2])}.${Number(v4[3])}.0/24`;
+  const g = ipv6Groups(addr);
+  if (g) return `${g.slice(0, 4).map((x) => x.toString(16)).join(":")}::/64`;
+  return addr;
 }
 
 /** Principal as displayed and matched by policies: `db_user`, or its fingerprint. */

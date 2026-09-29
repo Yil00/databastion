@@ -7,6 +7,7 @@ import {
   baselineVerdict,
   coarsePrincipal,
   eventOverflowKey,
+  severeEvent,
   worseThanResolved,
   dedupObject,
   eventBucket,
@@ -38,7 +39,7 @@ import {
 import { consoleUrl } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
-import { baselinesPerTarget, eventIncidentsPerPolicyHour, principalLabel } from "./events";
+import { baselinesPerTarget, clientNetwork, eventIncidentsPerPolicyHour, principalLabel } from "./events";
 import type { Tx } from "./findings";
 import { enqueueIncidentNotifications } from "./notifications";
 
@@ -244,30 +245,24 @@ async function loadBaselines(tx: Tx, events: readonly PendingEvent[]): Promise<M
         .set({ updatedAt: sql`now()` })
         .where(and(eq(principalBaselines.agentId, agentId), eq(principalBaselines.targetId, targetId), eq(principalBaselines.principalKey, pk)));
     }
-    const create: PendingEvent[] = [];
-    for (const list of byTarget.values()) {
-      const [{ agentId, targetId }] = list as [PendingEvent];
-      const [{ n } = { n: 0 }] = await tx
-        .select({ n: sql<number>`count(*)::int` })
-        .from(principalBaselines)
-        .where(and(eq(principalBaselines.agentId, agentId), eq(principalBaselines.targetId, targetId)));
-      const keep = list.slice(0, cap);
-      let excess = n + keep.length - cap;
-      while (excess > 0) {
-        const res = await tx.execute<{ d: number }>(
-          sql`select public.databastion_evict_principal_baselines(${agentId}::uuid, ${targetId}, ${Math.min(excess, 1000)}::int) as d`,
-        );
-        const d = Number(res.rows[0]?.d ?? 0);
-        if (d === 0) break;
-        excess -= d;
-      }
-      create.push(...keep);
-    }
+    // New principals beyond the cap within one chunk get no baseline; the others are inserted,
+    // then the target is brought back to the cap by evicting its least recently updated
+    // baselines (N4: the function deletes only the rows beyond the cap it is given).
+    const create = [...byTarget.values()].flatMap((list) => list.slice(0, cap));
     if (create.length > 0) {
       await tx
         .insert(principalBaselines)
         .values(create.map((e) => ({ agentId: e.agentId, targetId: e.targetId, principalKey: e.principalKey, dbUser: e.dbUser, dbUserFingerprint: e.dbUserFingerprint })))
         .onConflictDoNothing();
+    }
+    for (const list of byTarget.values()) {
+      const [{ agentId, targetId }] = list as [PendingEvent];
+      for (let i = 0; i < 1000; i++) {
+        const res = await tx.execute<{ d: number }>(
+          sql`select public.databastion_evict_principal_baselines(${agentId}::uuid, ${targetId}, ${cap}::int) as d`,
+        );
+        if (Number(res.rows[0]?.d ?? 0) === 0) break;
+      }
     }
   }
   for (const r of await select()) {
@@ -344,9 +339,12 @@ async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<L
   return row ?? null;
 }
 
-/** New (non-overflow) incidents of the policy since the start of the current hour. */
-async function createdThisHour(tx: Tx, state: ChunkState, policyId: string): Promise<number> {
-  const known = state.created.get(policyId);
+const capKey = (policyId: string, e: Pick<PendingEvent, "agentId" | "targetId">) => [policyId, e.agentId, e.targetId].join(SEP);
+
+/** New (non-overflow) incidents of the policy on the event's target since the start of the hour. */
+async function createdThisHour(tx: Tx, state: ChunkState, policyId: string, e: PendingEvent): Promise<number> {
+  const key = capKey(policyId, e);
+  const known = state.created.get(key);
   if (known !== undefined) return known;
   const [{ n } = { n: 0 }] = await tx
     .select({ n: sql<number>`count(*)::int` })
@@ -354,12 +352,14 @@ async function createdThisHour(tx: Tx, state: ChunkState, policyId: string): Pro
     .where(
       and(
         eq(incidents.policyId, policyId),
+        eq(incidents.agentId, e.agentId),
+        eq(incidents.targetId, e.targetId),
         eq(incidents.source, "access_event"),
         eq(incidents.eventOverflow, false),
         sql`${incidents.createdAt} >= ${state.hour.toISOString()}::timestamptz`,
       ),
     );
-  state.created.set(policyId, n);
+  state.created.set(key, n);
   return n;
 }
 
@@ -407,7 +407,7 @@ async function applyEventPolicy(
     policyId: policy.id,
     agentId: e.agentId,
     targetId: e.targetId,
-    principalKey: coarse ? `unknown:${sha256Hex(e.clientAddr ?? "-")}` : e.principalKey,
+    principalKey: coarse ? `unknown:${sha256Hex(clientNetwork(e.clientAddr))}` : e.principalKey,
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
   });
@@ -422,20 +422,29 @@ async function applyEventPolicy(
     await link(tx, latest.id, e.id);
     return "linked";
   }
-  // H1: cap of new incidents per policy and hour; beyond, one overflow incident counts the rest.
-  const overflow = (await createdThisHour(tx, state, policy.id)) >= state.cap;
-  const incidentKey = overflow ? eventOverflowKey(policy.id, state.hour) : key;
-  if (overflow) {
-    const o = await latestIncident(tx, state, incidentKey);
-    if (o && (ACTIVE_STATUSES as readonly string[]).includes(o.status)) {
-      await rematch(tx, o, e, facts);
-      return "overflow";
-    }
-    if (o) {
-      await link(tx, o.id, e.id);
-      return "linked";
+  // H1 / N1: cap of new incidents per policy, target and hour; beyond, one overflow incident of
+  // the policy on that target counts the rest, except severe events, which always open their own.
+  let overflow = false;
+  let overflowReopenedFrom: string | null = null;
+  const overflowKey = eventOverflowKey(policy.id, e.agentId, e.targetId, state.hour);
+  if ((await createdThisHour(tx, state, policy.id, e)) >= state.cap) {
+    const o = await latestIncident(tx, state, overflowKey);
+    if (!severeEvent(facts, o?.eventScore ?? null)) {
+      if (o && (ACTIVE_STATUSES as readonly string[]).includes(o.status)) {
+        await rematch(tx, o, e, facts);
+        return "overflow";
+      }
+      // A closed overflow incident: same rule as any closed incident (M1): only a worse event
+      // opens a new one.
+      if (o && (o.status !== "resolved" || !worseThanResolved(o, facts))) {
+        await link(tx, o.id, e.id);
+        return "linked";
+      }
+      overflow = true;
+      overflowReopenedFrom = o?.id ?? null;
     }
   }
+  const incidentKey = overflow ? overflowKey : key;
   const principal = overflow ? null : principalLabel(e);
   const inserted = await tx
     .insert(incidents)
@@ -447,8 +456,8 @@ async function applyEventPolicy(
       policyRevision: policy.revision,
       severity: policy.severity,
       notifyChannels: policy.notifyChannels,
-      agentId: overflow ? null : e.agentId,
-      targetId: overflow ? null : e.targetId,
+      agentId: e.agentId,
+      targetId: e.targetId,
       accessEventId: e.id,
       principal,
       eventDatabase: overflow ? null : database,
@@ -471,9 +480,9 @@ async function applyEventPolicy(
     eventSignals: mergeSignals([], facts.signals),
     eventAnomaly: facts.anomaly,
   });
-  if (!overflow) state.created.set(policy.id, (state.created.get(policy.id) ?? 0) + 1);
+  if (!overflow) state.created.set(capKey(policy.id, e), (state.created.get(capKey(policy.id, e)) ?? 0) + 1);
   await link(tx, row.id, e.id);
-  const reopenedFrom = latest?.status === "resolved" ? latest.id : null;
+  const reopenedFrom = overflow ? overflowReopenedFrom : latest?.status === "resolved" ? latest.id : null;
   await writeAudit(tx, {
     actorType: "system",
     action: "incident.create",
@@ -536,12 +545,25 @@ export interface EventDrainStats {
  * share `received_at`), which keeps each principal's events in order for its baseline.
  */
 async function pendingChunk(tx: Tx): Promise<PendingEvent[]> {
+  // N5: the agents with pending events (loose index scan of `access_events_pending_idx`), then at
+  // most EVENT_CHUNK_PER_AGENT events of each in arrival order (one index range per agent), never
+  // a sort of the whole backlog.
   const picked = await tx.execute<{ id: string }>(sql`
-    select id from (
-      select id, received_at, item_index, row_number() over (partition by agent_id order by received_at, item_index, id) as rn
-      from ${accessEvents} where ${accessEvents.evaluatedAt} is null) x
-    where rn <= ${EVENT_CHUNK_PER_AGENT}
-    order by rn, received_at, item_index, id
+    with recursive pending_agents(agent_id) as (
+      (select agent_id from access_events where evaluated_at is null order by agent_id limit 1)
+      union all
+      select (select a.agent_id from access_events a
+              where a.evaluated_at is null and a.agent_id > p.agent_id order by a.agent_id limit 1)
+      from pending_agents p where p.agent_id is not null)
+    select e.id from pending_agents p
+    cross join lateral (
+      select x.id, x.received_at, x.item_index, row_number() over (order by x.received_at, x.item_index, x.id) as rn from (
+        select id, received_at, item_index from access_events
+        where agent_id = p.agent_id and evaluated_at is null
+        order by received_at, item_index, id
+        limit ${EVENT_CHUNK_PER_AGENT}) x) e
+    where p.agent_id is not null
+    order by e.rn, e.received_at, e.item_index, e.id
     limit ${EVENT_CHUNK}`);
   const ids = picked.rows.map((r) => r.id);
   if (ids.length === 0) return [];

@@ -12,12 +12,14 @@ import {
   eventBucket,
   eventDedupKey,
   eventMatches,
+  eventOverflowKey,
   eventScore,
   exceptionCoversEvent,
   mergeSignals,
   objectSensitivity,
   parseEventConditions,
   SENSITIVITY_CAP,
+  severeEvent,
   updateBaseline,
   baselineVerdict,
   type BaselineState,
@@ -237,6 +239,18 @@ describe("access_event conditions", () => {
     expect(exceptionCoversEvent({ ...base, location: { object: "*", field: "email" } }, "p", FACTS, [0], now)).toBe(false);
     expect(exceptionCoversEvent({ ...base, location: { database: "crm", field: "*" } }, "p", FACTS, [0, 1], now)).toBe(true);
     expect(exceptionCoversEvent({ ...base, location: { database: "*" } }, "p", { ...FACTS, objects: [] }, [], now)).toBe(false);
+  });
+});
+
+describe("severe events (N1)", () => {
+  it("a signature signal, an anomaly or a score above the overflow's maximum", () => {
+    const base = { signals: ["shape.full_table_read"], anomaly: false, score: 5 };
+    expect(severeEvent(base, null)).toBe(false);
+    expect(severeEvent(base, 5)).toBe(false);
+    expect(severeEvent(base, 4.99)).toBe(true);
+    expect(severeEvent({ ...base, signals: ["signature.copy_to_program"] }, 100)).toBe(true);
+    expect(severeEvent({ ...base, anomaly: true }, 100)).toBe(true);
+    expect(eventOverflowKey("p", "a", "t", new Date("2026-09-28T14:00:00Z"))).toBe("policy:p|agent:a|target:t|overflow|hour:2026-09-28T14:00:00.000Z");
   });
 });
 

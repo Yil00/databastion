@@ -414,9 +414,11 @@ export function exceptionCoversEvent(
  * principal, database and UTC hour of the event `ts`. The principal part is coarse for events
  * whose account is unknown (a fingerprint sent instead of the name) and for failed
  * authentications: all of them from one client address count as one principal
- * (`unknown:<sha256 of client_addr>`), so random account names cannot open one incident each
- * (security review H1). On top of that, a policy opens at most a configured number of incidents
- * per hour; the further matches of that hour go to one overflow incident of the policy. The database is the one of the most sensitive
+ * (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
+ * `local` kept), so random account names or rotating addresses cannot open one incident each
+ * (security review H1, re-review N2). On top of that, a policy opens at most a configured number
+ * of incidents per hour on one target; the further matches go to one overflow incident of the
+ * policy on that target, except severe events (`severeEvent`). The database is the one of the most sensitive
  * retained object (the first on a tie), none for an event without object. While that incident is
  * open or acknowledged, the later events of the scope are added to it (`match_count`, rows, highest
  * score, signals). Once it is a false positive, the later events of the scope in that hour are
@@ -449,9 +451,24 @@ export function eventDedupKey(k: {
   return `policy:${k.policyId}|agent:${k.agentId}|target:${k.targetId}|principal:${k.principalKey}|database:${k.databaseKey}|hour:${k.bucket.toISOString()}`;
 }
 
-/** Key of the per-policy overflow incident of an hour (console clock). */
-export function eventOverflowKey(policyId: string, hour: Date): string {
-  return `policy:${policyId}|overflow|hour:${hour.toISOString()}`;
+/**
+ * Key of the overflow incident of a policy on one target for an hour (console clock). The cap and
+ * the overflow are per (policy, agent, target), so noise on one target never pushes the incidents
+ * of another target into an overflow (re-review N1).
+ */
+export function eventOverflowKey(policyId: string, agentId: string, targetId: string, hour: Date): string {
+  return `policy:${policyId}|agent:${agentId}|target:${targetId}|overflow|hour:${hour.toISOString()}`;
+}
+
+/**
+ * A severe event opens its own incident even when the hourly cap is reached (re-review N1): it
+ * carries a `signature.*` signal (a dump or export tool), is above its principal's baseline, or
+ * scores higher than anything the overflow incident of its scope has counted so far.
+ */
+export function severeEvent(e: { signals: readonly string[]; anomaly: boolean; score: number }, overflowMaxScore: number | null): boolean {
+  if (e.signals.some((s) => s.startsWith("signature."))) return true;
+  if (e.anomaly) return true;
+  return overflowMaxScore !== null && e.score > overflowMaxScore;
 }
 
 /**

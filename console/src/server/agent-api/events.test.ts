@@ -447,6 +447,33 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect(await storedEvents(auth.agentId)).toHaveLength(1);
     });
 
+    it("N4: the eviction function only deletes the baselines beyond the cap, never below 10", async () => {
+      const auth = await agentWithTargets();
+      await getDb().execute(sql`insert into principal_baselines (agent_id, target_id, principal_key, db_user, updated_at)
+        select ${auth.agentId}, 'pg-prod-1', lpad(to_hex(i), 64, '0'), 'u' || i, now() - make_interval(secs => 100 - i)
+        from generate_series(1, 25) i`);
+      const { url } = await createRuntimeRole();
+      const client = new Client({ connectionString: url });
+      await client.connect();
+      const count = async () =>
+        Number((await client.query<{ n: number }>("select count(*)::int as n from principal_baselines where agent_id = $1", [auth.agentId])).rows[0]?.n);
+      try {
+        const evict = (cap: number) =>
+          client.query<{ d: number }>("select public.databastion_evict_principal_baselines($1, 'pg-prod-1', $2) as d", [auth.agentId, cap]);
+        expect((await evict(30)).rows[0]?.d).toBe(0);
+        expect((await evict(20)).rows[0]?.d).toBe(5);
+        expect(await count()).toBe(20);
+        // A cap below 10 (or 0) is raised to 10.
+        expect((await evict(0)).rows[0]?.d).toBe(10);
+        expect(await count()).toBe(10);
+        // The most recently updated ones are kept.
+        const kept = await client.query<{ db_user: string }>("select db_user from principal_baselines where agent_id = $1 order by db_user", [auth.agentId]);
+        expect(kept.rows.map((r) => Number(r.db_user.slice(1))).sort((a, b) => a - b)).toEqual([16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+      } finally {
+        await client.end();
+      }
+    });
+
     it("reads the retention from the environment, within [7, 3650] days", () => {
       expect(eventsRetentionDays({})).toBe(DEFAULT_EVENTS_RETENTION_DAYS);
       expect(eventsRetentionDays({ DATABASTION_EVENTS_RETENTION_DAYS: "30" })).toBe(30);

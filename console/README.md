@@ -113,8 +113,9 @@ evaluation columns `evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_
 way for the runtime role to delete events: never those younger than 7 days) and
 `0024_p4c_review_purge.sql` (the purge function also keeps unevaluated events, keeps the batch
 records 30 more days and purges idle baselines; `EXECUTE` on
-`databastion_evict_principal_baselines(agent_id, target_id, n)`, a bounded delete of a target's
-least recently updated baselines; `UPDATE (event_anomaly)` on `incidents`)
+the baseline eviction function, replaced by `0026_p4c_evict_by_cap.sql` with
+`databastion_evict_principal_baselines(agent_id, target_id, cap)`, which deletes only a target's
+least recently updated baselines beyond `cap` (clamped to at least 10); `UPDATE (event_anomaly)` on `incidents`)
 (custom, every name schema-qualified). Migration
 `0009_pgboss_owner_guard.sql` refuses to run (the whole `migrate` run is rolled back) when schema
 `pgboss` exists and is owned by a role other than the migration role: fix the ownership as the
@@ -564,7 +565,8 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   waits behind a full pass), within 60 % of the run's time budget; the finding work always runs
   after it. Chunks hold at most 200 events and at most 50 per agent, agents interleaved, so a busy
   agent never delays the others; each agent's events are taken in arrival order (batch, then
-  position in the batch). Serialized by an advisory lock. Each event gets its sensitivity, score, anomaly flag and baseline snapshot, then every
+  position in the batch), one index range per agent (`access_events_pending_idx`, migration
+  `0025`), never a sort of the whole backlog. Serialized by an advisory lock. Each event gets its sensitivity, score, anomaly flag and baseline snapshot, then every
   enabled `access_event` policy is applied. A policy applies to the events evaluated after its
   creation or change, never to past ones.
 - **Conditions** (source `access_event`; all present keys must hold, the values of a list are
@@ -582,8 +584,9 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   is the `anomaly` condition, not a signal.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
   For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
-  the principal part is `unknown:<sha256 of client_addr>`: all such events from one client count
-  as one principal, so random account names cannot open one incident each. The database is that
+  the principal part is `unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64 (canonical
+  form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events from one network count as
+  one principal, so random account names or rotating addresses cannot open one incident each. The database is that
   of the most sensitive retained object. While the incident of a key is open or acknowledged,
   later events of the key are added to it (`match_count`, total rows, highest score, signals,
   anomaly, and a link in `incident_events`). Once it is a **false positive**, the rest of that hour
@@ -593,9 +596,13 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
   raises one incident per policy, principal, database and hour.
 - **Cap**: a policy opens at most `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` new incidents per
-  clock hour (default 50, 1 to 10 000). Beyond, the matches of the hour go to one **overflow**
-  incident of the policy (no agent, target or principal; `event_overflow` set; `match_count` and the
-  links count them), notified once, so a flood cannot bury the other incidents. Incident creation is audited
+  clock hour **on one target** (default 50, 1 to 10 000), so noise on one target never affects the
+  others. Beyond, the matches of the hour on that target go to one **overflow** incident of the
+  policy and target (no principal; `event_overflow` set; `match_count` and the links count them),
+  notified once. **Severe events bypass the cap** and open their own incident: a `signature.*`
+  signal, a volume above the principal's baseline, or a score above the overflow incident's
+  highest. A resolved overflow incident follows the same rule as any resolved incident: a worse
+  event opens a new one, others are linked to it. Incident creation is audited
   (`incident.create`, source `access_event`) and notified through the outbox: `incident.opened`
   with `source: "access_event"`, the principal, database, hour and the first event's action,
   source, rows, score, sensitivity, anomaly flag, signals and objects (no value).

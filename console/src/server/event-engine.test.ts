@@ -372,33 +372,107 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       process.env[BASELINES_CAP_VAR] = "20";
       try {
         const auth = await agentWithTargets();
-        const pid = await policy({ signals: ["signature.pg_dump"] });
+        const pid = await policy({ signals: ["shape.*"] });
         const n = 400;
+        // Not severe (no signature, no baseline, no sensitivity): subject to the cap.
         const flood = Array.from({ length: n }, (_, i) =>
-          dumpEvent({ ts: at(i * 1000), principal: { db_user: `user${i}`, client_addr: ip(i) }, rows: 10 + i }),
+          dumpEvent({ ts: at(i * 1000), principal: { db_user: `user${i}`, client_addr: ip(i) }, rows: 10 + i, signals: ["shape.full_table_read"] }),
         );
         await send(auth, flood.slice(0, 200));
         await send(auth, flood.slice(200));
         await drainPolicyWork(getDb());
-        const list = await incidentsOf(auth.agentId);
+        const list = (await incidentsOf(auth.agentId)).filter((i) => !i.eventOverflow);
         const overflow = await getDb().select().from(incidents).where(and(eq(incidents.policyId, pid), eq(incidents.eventOverflow, true)));
-        // The overflow incident carries no agent (it spans the policy), so it is not in `list`.
         expect(list).toHaveLength(5);
         expect(overflow).toHaveLength(1);
+        expect(overflow[0]).toMatchObject({ agentId: auth.agentId, targetId: "pg-prod-1" });
         expect(overflow[0]?.matchCount).toBe(n - 5);
         expect(await incidentEventCount(getDb(), String(overflow[0]?.id))).toBe(n - 5);
         const baselines = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
         expect(baselines.length).toBeLessThanOrEqual(20);
         // The least recently updated baselines were evicted: those kept come from the last chunk.
         expect(baselines.every((b) => Number(b.dbUser?.slice(4)) >= n - EVENT_CHUNK_PER_AGENT)).toBe(true);
-        // One more flood the same hour opens nothing new.
-        await send(auth, [dumpEvent({ ts: at(n * 1000), principal: { db_user: "late", client_addr: "192.0.2.200" } })]);
+        // One more ordinary event the same hour opens nothing new.
+        await send(auth, [dumpEvent({ ts: at(n * 1000), principal: { db_user: "late", client_addr: "192.0.2.200" }, rows: 10, signals: ["shape.full_table_read"] })]);
         await drainPolicyWork(getDb());
-        expect(await incidentsOf(auth.agentId)).toHaveLength(5);
+        expect(await incidentsOf(auth.agentId)).toHaveLength(6);
+        // N1 (c): a signature event bypasses the full cap.
+        await send(auth, [dumpEvent({ ts: at(n * 1000 + 1), principal: { db_user: "dumper" }, signals: ["signature.pg_dump", "shape.full_table_copy"] })]);
+        await drainPolicyWork(getDb());
+        const after = await incidentsOf(auth.agentId);
+        expect(after).toHaveLength(7);
+        expect(after.filter((i) => i.principal === "dumper")).toHaveLength(1);
       } finally {
         delete process.env[EVENT_INCIDENTS_CAP_VAR];
         delete process.env[BASELINES_CAP_VAR];
       }
+    });
+
+    it("N1: the cap is per target; a resolved overflow does not silence worse or severe events", async () => {
+      process.env[EVENT_INCIDENTS_CAP_VAR] = "2";
+      try {
+        const auth = await agentWithTargets();
+        await policy({ signals: ["shape.*"] });
+        const read = (i: number, target_id = "pg-prod-1", over: Record<string, unknown> = {}) =>
+          dumpEvent({
+            target_id,
+            ts: at(i * 1000),
+            principal: { db_user: `noise${i}` },
+            objects: target_id === "pg-prod-1" ? [{ database: "crm", schema: "public", object: "clients" }] : [{ database: "shop", object: "customers" }],
+            rows: 5,
+            signals: ["shape.full_table_read"],
+            source: target_id === "pg-prod-1" ? "pgaudit" : "performance_schema",
+            ...over,
+          });
+        // Noise on target A (pg-prod-1) fills its cap and overflows.
+        await send(auth, Array.from({ length: 30 }, (_, i) => read(i)));
+        await drainPolicyWork(getDb());
+        const onTarget = async (t: string) => (await incidentsOf(auth.agentId)).filter((x) => x.targetId === t);
+        expect((await onTarget("pg-prod-1")).map((x) => x.eventOverflow).sort()).toEqual([false, false, true]);
+        // Target B is not affected.
+        await send(auth, [read(100, "mysql-crm"), read(101, "mysql-crm")]);
+        await drainPolicyWork(getDb());
+        expect((await onTarget("mysql-crm")).map((x) => x.eventOverflow)).toEqual([false, false]);
+        // Resolve A's overflow: a similar event is linked; a worse one (new signal) opens a new overflow.
+        const [ov] = (await onTarget("pg-prod-1")).filter((x) => x.eventOverflow);
+        await transitionIncident(getDb(), String(ov?.id), "resolved", actor());
+        const links = await incidentEventCount(getDb(), String(ov?.id));
+        await send(auth, [read(40)]);
+        await drainPolicyWork(getDb());
+        expect(await incidentEventCount(getDb(), String(ov?.id))).toBe(links + 1);
+        await send(auth, [read(41, "pg-prod-1", { signals: ["shape.full_table_copy"] })]);
+        await drainPolicyWork(getDb());
+        const overflows = (await onTarget("pg-prod-1")).filter((x) => x.eventOverflow);
+        expect(overflows).toHaveLength(2);
+        const [d] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(overflows[1]?.id)));
+        expect(d?.payload).toMatchObject({ overflow: { limit_per_hour: 2 }, incident: { reopened_from: ov?.id } });
+        // A pg_dump after the resolved overflow opens its own incident.
+        await transitionIncident(getDb(), String(overflows[1]?.id), "resolved", actor());
+        await send(auth, [read(42, "pg-prod-1", { principal: { db_user: "backup" }, signals: ["signature.pg_dump", "shape.full_table_copy"] })]);
+        await drainPolicyWork(getDb());
+        expect((await onTarget("pg-prod-1")).filter((x) => x.principal === "backup" && !x.eventOverflow)).toHaveLength(1);
+      } finally {
+        delete process.env[EVENT_INCIDENTS_CAP_VAR];
+      }
+    });
+
+    it("N2: failed logins are grouped per client network (IPv4 /24, IPv6 /64, IPv4-mapped as IPv4, local)", async () => {
+      const auth = await agentWithTargets();
+      await policy({ event_actions: ["auth_failure"] });
+      const fail = (i: number, client_addr: string) =>
+        dumpEvent({ ts: at(i * 1000), principal: { db_user_fingerprint: randomFp(), client_addr }, action: "auth_failure", objects: [], rows: undefined, signals: [] });
+      await send(auth, [
+        fail(0, "203.0.113.9"),
+        fail(1, "203.0.113.77"),
+        fail(2, "::ffff:203.0.113.5"),
+        fail(3, "2001:db8:1:2::1"),
+        fail(4, "2001:0DB8:0001:0002:ffff::9"),
+        fail(5, "local"),
+        fail(6, "local"),
+        fail(7, "203.0.114.1"),
+      ]);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(auth.agentId)).map((i) => i.matchCount).sort()).toEqual([1, 2, 2, 3]);
     });
 
     it("M1: after a resolution, a worse event of the same hour opens a new incident; a similar one is only linked", async () => {

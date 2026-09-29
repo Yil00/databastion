@@ -732,7 +732,7 @@ export const accessEvents = pgTable(
     index("access_events_principal_ts_idx").on(t.agentId, t.targetId, t.principalKey, t.ts),
     index("access_events_signals_idx").using("gin", t.signals),
     index("access_events_pending_idx")
-      .on(t.agentId, t.receivedAt, t.id)
+      .on(t.agentId, t.receivedAt, t.itemIndex, t.id)
       .where(sql`${t.evaluatedAt} is null`),
     check("access_events_principal", sql`(${t.dbUser} is null) <> (${t.dbUserFingerprint} is null)`),
     check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
