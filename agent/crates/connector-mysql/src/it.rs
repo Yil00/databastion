@@ -285,12 +285,18 @@ fn agent_target(server: &Server) -> (TempDir, TargetConfig) {
     target(server, &server.url.user, &server.url.password)
 }
 
-/// An administrator session (no read-only default).
+/// An administrator session (no read-only default). The connector's
+/// session setup pins `wait_timeout` to 60 s; test fixtures keep their
+/// admin session open across long steps (a probe scan under a loaded CI
+/// runner takes longer), so the idle timeout is raised on this session
+/// only: otherwise the server closes it and the next query fails.
 async fn admin_session(server: &Server, admin: &Url) -> Session {
     let (_dir, t) = target(server, &admin.user, &admin.password);
-    Session::connect_admin(&t, Timeouts::new(Duration::from_secs(120)))
+    let mut s = Session::connect_admin(&t, Timeouts::new(Duration::from_secs(120)))
         .await
-        .unwrap()
+        .unwrap();
+    exec(&mut s, "SET SESSION wait_timeout = 3600").await;
+    s
 }
 
 async fn exec(s: &mut Session, statement: &str) {
@@ -423,6 +429,25 @@ async fn agent_connections(admin: &mut Session) -> Vec<String> {
 }
 
 // ------------------------------------------------------------------ tests
+
+#[tokio::test]
+async fn admin_sessions_outlive_the_connector_idle_timeout() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        assert_eq!(
+            scalar(&mut a, "SELECT @@session.wait_timeout")
+                .await
+                .as_deref(),
+            Some("3600"),
+            "{}",
+            server.name
+        );
+    }
+}
 
 #[tokio::test]
 async fn check_reports_reachable_with_an_honest_audit_level() {
