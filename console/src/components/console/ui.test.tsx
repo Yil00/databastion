@@ -5,6 +5,7 @@ import { displayStatus, formatAge } from "@/lib/agent-status";
 import { contentSecurityPolicy } from "@/lib/csp";
 
 import { AgentsTable, type AgentListItem } from "./agents-table";
+import { TargetNotes, UNKNOWN_NOTE_TITLE } from "./target-notes";
 
 const NOW = Date.parse("2026-09-28T12:00:00Z");
 
@@ -47,6 +48,40 @@ describe("AgentsTable", () => {
 
   it("shows an empty state", () => {
     expect(renderToStaticMarkup(<AgentsTable agents={[]} now={NOW} />)).toContain("No agent enrolled yet.");
+  });
+});
+
+describe("target notes", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+
+  it("renders catalog phrases and unknown codes as escaped text", () => {
+    const html = renderToStaticMarkup(
+      <TargetNotes
+        notes={[
+          { code: "coverage.relations_rls_skipped", count: 5 },
+          { code: "privilege.role_attributes", labels: [hostile] },
+          { code: "coverage.shards_skipped", count: 2, labels: [hostile] },
+        ]}
+      />,
+    );
+    expect(html).toContain("5 relation(s) skipped because of row-level security (ADR-0012).");
+    expect(html).not.toContain("<img");
+    expect(html).toContain("Role attributes beyond the minimal grants: &lt;img src=x onerror=&quot;alert(1)&quot;&gt;.");
+    expect(html).toContain("coverage.shards_skipped, count 2, labels &lt;img");
+    expect(html).toContain(`title="${UNKNOWN_NOTE_TITLE.replace("'", "&#x27;")}"`);
+    expect(renderToStaticMarkup(<TargetNotes notes={[]} />)).toBe("");
+  });
+
+  it("the agents list shows the number of notes and their phrases as a tooltip", () => {
+    const html = renderToStaticMarkup(
+      <AgentsTable
+        agents={[agent({ targets: [{ targetId: "pg-prod-1", auditLevel: "partial", present: true, notes: [{ code: "security.tls_disabled" }, { code: "x.y", labels: [hostile] }] }] })]}
+        now={NOW}
+      />,
+    );
+    expect(html).toContain("(2 notes)");
+    expect(html).toContain("TLS disabled on a network connection");
+    expect(html).not.toContain("<img");
   });
 });
 

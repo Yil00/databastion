@@ -204,7 +204,8 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
-90 s) / revoked / locked, last seen, targets with audit level), `/agents/{id}` (targets; admin:
+90 s) / revoked / locked, last seen, targets with audit level and their number of notes),
+`/agents/{id}` (targets with their notes, see "Target notes"; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
 `dbe_…` token is shown once with a copy button; list; revoke), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
@@ -416,6 +417,18 @@ names (contract: `^[a-z][a-z0-9_]{0,63}$`, numeric values) on the reserved list 
 at agent level, starting with `target_` are ignored, so an agent cannot shadow a console series.
 Cardinality caps: 1000 agents (applied in SQL, targets joined to those agents), 50 000 agent-driven series per scrape (agent-reported and per-target series) (the contract already caps
 128 metrics per map and 64 targets per agent).
+
+## Target notes
+The notes of the **latest** heartbeat of each target (contract `TargetStatus.notes`, P4-D) are
+stored in `agent_targets.notes` (migration `0028`): contract fields only (`code`, `count`,
+`labels`), at most 16 notes and 16 KiB serialized (also a database check); a heartbeat without
+notes clears them. The agent page renders each note from the phrase catalog generated from
+`shared/protocol/target-notes.json` (`src/generated/protocol/target-notes.gen.ts`, renderer
+`src/lib/target-notes.ts`): templates looked up with `Object.hasOwn`, `{count}` replaced by the
+integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQL role attributes
+and MySQL / MariaDB privileges in upper case, the other labels as sent), in one non-recursive pass;
+a code this console does not know is shown raw with its count and labels. Everything is rendered as
+text (escaped). The console never derives a decision from notes.
 
 ## Docker image
 [`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,

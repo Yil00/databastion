@@ -5,6 +5,7 @@ import { AgentActions } from "@/components/console/agent-actions";
 import { findingsHref } from "@/components/console/findings-table";
 import { ScanDialog } from "@/components/console/scan-dialog";
 import { StatusBadge } from "@/components/console/status-badge";
+import { TargetNotes } from "@/components/console/target-notes";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { getDb } from "@/db/client";
@@ -95,6 +96,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                   <TableHead>Audit level</TableHead>
                   <TableHead>Audit source</TableHead>
                   <TableHead>Last error</TableHead>
+                  <TableHead>Notes</TableHead>
                   <TableHead>Reported</TableHead>
                   <TableHead>Last scan</TableHead>
                   <TableHead>Audit settings</TableHead>
@@ -114,6 +116,9 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     <TableCell>{t.auditLevel}</TableCell>
                     <TableCell>{t.auditSource ?? ""}</TableCell>
                     <TableCell>{t.lastError ?? ""}</TableCell>
+                    <TableCell className="max-w-80 whitespace-normal">
+                      <TargetNotes notes={t.notes} />
+                    </TableCell>
                     <TableCell>{formatAge(t.lastReportedAt, now)}</TableCell>
                     <TableCell>
                       {(() => {

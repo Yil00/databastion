@@ -8,7 +8,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
-import { enrollFailureAuditBudget, revokeAgent } from "@/server/agents";
+import schemasBundle from "@/generated/protocol/schemas.gen.json";
+import { MAX_TARGET_NOTES_BYTES } from "@/lib/target-notes";
+import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
@@ -714,6 +716,55 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(400);
       await expectConformingError(res, body);
+    });
+
+    it("stores the notes of the latest heartbeat per target (contract fields only), clears them when absent", async () => {
+      const auth = await enroll();
+      const [body] = fixtures("valid", "HeartbeatRequest").filter(([name]) => name.includes("target-notes")).map(([, b]) => b);
+      const hb = body as { targets: { target_id: string; notes?: unknown[] }[] };
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+      expect(stored.map((t) => [t.targetId, t.notes])).toEqual([
+        ["mysql-crm", hb.targets[1]?.notes],
+        ["pg-prod-1", hb.targets[0]?.notes],
+      ]);
+      const detail = await getAgentDetail(getDb(), auth.agentId);
+      expect(detail?.targets.find((t) => t.targetId === "pg-prod-1")?.notes).toHaveLength(6);
+      const listed = (await listAgents(getDb())).find((a) => a.id === auth.agentId);
+      expect(listed?.targets.find((t) => t.targetId === "mysql-crm")?.notes).toEqual([{ code: "check.stage_failed", labels: ["stage_auth"] }]);
+      // The next heartbeat carries no notes: the target's notes are those of the latest heartbeat.
+      const next = { ...hb, targets: hb.targets.map(({ notes: _n, ...t }) => t) };
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: next }))).status).toBe(200);
+      const cleared = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(cleared.map((t) => t.notes)).toEqual([null, null]);
+    });
+
+    it("stores the largest notes the contract allows, within the size bound", async () => {
+      const auth = await enroll();
+      const labels = (schemasBundle.$defs.TargetNoteLabel.enum as string[])
+        .slice()
+        .sort((a, b) => b.length - a.length)
+        .slice(0, 16);
+      const word = "abcdefghijklmnop";
+      const code = `privilege.${word}_${word}_${word}_abc`;
+      expect(code).toHaveLength(64);
+      const notes = Array.from({ length: 16 }, () => ({ code, count: Number.MAX_SAFE_INTEGER, labels }));
+      const body = { ...MINIMAL_HEARTBEAT, targets: [{ ...MINIMAL_HEARTBEAT.targets[0], notes }] };
+      expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+      const [t] = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(t?.notes).toEqual(notes);
+      const size = await getDb().execute<{ n: number }>(
+        sql`select octet_length(notes::text)::int as n from agent_targets where agent_id = ${auth.agentId}`,
+      );
+      expect(Number(size.rows[0]?.n)).toBeLessThanOrEqual(MAX_TARGET_NOTES_BYTES);
+      // The database refuses anything beyond the bound (migration 0028).
+      await expect(
+        getDb().execute(sql`update agent_targets set notes = ${JSON.stringify([{ code: "x".repeat(20_000) }])}::jsonb where agent_id = ${auth.agentId}`),
+      ).rejects.toThrow();
+      await expect(
+        getDb().execute(sql`update agent_targets set notes = '{"code": "audit.x"}'::jsonb where agent_id = ${auth.agentId}`),
+      ).rejects.toThrow();
     });
 
     it("marks targets absent from the last heartbeat", async () => {

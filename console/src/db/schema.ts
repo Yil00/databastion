@@ -170,13 +170,25 @@ export const agentTargets = pgTable(
     auditLevel: auditLevel("audit_level").notNull(),
     auditSource: text("audit_source"),
     lastError: text("last_error"),
+    /**
+     * Contract `TargetStatus.notes` of the latest heartbeat (P4-D): closed codes with a bounded
+     * count and closed labels, never free text; null when that heartbeat carried none. Bounded
+     * (at most 16 notes, 16 KiB serialized; see src/lib/target-notes.ts).
+     */
+    notes: jsonb("notes").$type<{ code: string; count?: number; labels?: string[] }[]>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
     /** false when the target was absent from the last heartbeat (removed from agent.yaml). */
     present: boolean("present").notNull().default(true),
     firstSeenAt: tsz("first_seen_at").notNull().defaultNow(),
     lastReportedAt: tsz("last_reported_at").notNull().defaultNow(),
   },
-  (t) => [primaryKey({ columns: [t.agentId, t.targetId] })],
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.targetId] }),
+    check(
+      "agent_targets_notes_bounded",
+      sql`${t.notes} is null or (jsonb_typeof(${t.notes}) = 'array' and jsonb_array_length(${t.notes}) <= 16 and octet_length(${t.notes}::text) <= 16384)`,
+    ),
+  ],
 );
 
 export const enrollmentTokens = pgTable(

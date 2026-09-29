@@ -1,0 +1,2 @@
+ALTER TABLE "agent_targets" ADD COLUMN "notes" jsonb;--> statement-breakpoint
+ALTER TABLE "agent_targets" ADD CONSTRAINT "agent_targets_notes_bounded" CHECK ("agent_targets"."notes" is null or (jsonb_typeof("agent_targets"."notes") = 'array' and jsonb_array_length("agent_targets"."notes") <= 16 and octet_length("agent_targets"."notes"::text) <= 16384));
