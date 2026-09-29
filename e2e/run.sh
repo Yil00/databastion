@@ -697,7 +697,9 @@ console_sql() {
 # audit_client_<c>_query_statements  read statements the queries run (sum of aggregated_count)
 # audit_client_<c>_query_signal   signal the query principal's events must carry, or empty
 # audit_client_<c>_dump           runs the dump tool on the whole seeded database, output discarded
-# audit_client_<c>_queries ENGINE queries whose text holds ground-truth literals (PostgreSQL: a
+# audit_client_<c>_queries ENGINE queries whose text holds ground-truth literals; on failure
+#                                 returns the failing step (1 queries, 2 INTO OUTFILE check), whose
+#                                 error code only is printed (client_error_code). (PostgreSQL: a
 #                                 filtered and a whole-table COPY too; MariaDB: a refused INTO
 #                                 OUTFILE);
 #                                 prints the needle ids of the literals
@@ -709,6 +711,15 @@ console_sql() {
 # Client output never reaches a log: result rows go to /dev/null in the container, and errors
 # (which may echo a statement holding a literal) to a private file; only exit codes are printed.
 
+# client_error_code: the error code of the last client failure (client.err), never its text (it
+# can echo a statement holding a literal, or rows): `ERROR 1227` (mariadb), `ERROR 42P01` (psql with
+# VERBOSITY=sqlstate), `mariadb-dump: Got error: 1045`, `pg_dump: error`; `none` otherwise.
+client_error_code() {
+  local code
+  code="$(grep -m 1 -oE '^ERROR [0-9]+|ERROR: +[0-9A-Z]{5}$|^(pg_dump|mariadb-dump|mysqldump): (Got )?error(: [0-9]+)?' \
+    "$E2E_WORK_DIR/client.err" 2>/dev/null | head -n 1 | tr -s ' ')"
+  printf '%s' "${code:-none}"
+}
 pg_client() {
   timeout 300 docker compose -f "$HERE/docker-compose.yml" --profile tools run --rm -T --no-deps \
     pg-client "$1"
@@ -747,7 +758,7 @@ audit_client_pg_queries() {
   } >"$sql"
   unset email iban
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
-  pg_client 'PGPASSWORD="$(cat /run/secrets/target_client_password)" exec psql -X -q -v ON_ERROR_STOP=1 -U e2e_analyst -f -' \
+  pg_client 'PGPASSWORD="$(cat /run/secrets/target_client_password)" exec psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate -U e2e_analyst -f -' \
     <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
   rm -f -- "$sql"
   printf '%s %s' "$email_id" "$iban_id"
@@ -812,8 +823,10 @@ audit_client_my_queries() {
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
   my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_analyst support' \
     <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || rc=$?
-  # ER_ACCESS_DENIED_ERROR: MariaDB's answer to INTO OUTFILE without the FILE privilege.
-  [ "$rc" = 1 ] && grep -qE '^ERROR 1045 ' "$E2E_WORK_DIR/client.err" || return 2
+  # ER_SPECIFIC_ACCESS_DENIED_ERROR (1227, "you need (at least one of) the FILE privilege(s)"):
+  # MariaDB 11.4 checks FILE with check_global_access() before running an INTO OUTFILE
+  # (sql/sql_parse.cc, mysql_execute_command). Not 1290 (secure_file_priv) and not a success.
+  [ "$rc" = 1 ] && grep -qE '^ERROR 1227 ' "$E2E_WORK_DIR/client.err" || return 2
   unset email phone
   rm -f -- "$sql"
   printf '%s %s' "$email_id" "$phone_id"
@@ -1209,7 +1222,8 @@ audit_run() {
   n0="$(critical_incidents)" || fail "cannot read the critical incident count on the incidents page"
   log "Audit ($target): dump of the seeded database as $dump_p, from the ${client}-client container"
   t0="$(now_ms)"
-  "audit_client_${client}_dump" || fail "the dump of $target failed (exit $?; client output kept private)"
+  "audit_client_${client}_dump" \
+    || fail "the dump of $target failed (exit $?, $(client_error_code); client output kept private)"
   t_dump="$(now_ms)"
   log "Audit ($target): dump finished in $((t_dump - t0)) ms; waiting for its incident on the incidents page"
   # The page count must rise AND the console must hold the incident of this target, this principal
@@ -1241,7 +1255,7 @@ audit_run() {
 
   log "Audit ($target): queries with ground-truth literals as $query_p (see audit_client_${client}_queries)"
   ids="$("audit_client_${client}_queries" "$engine")" \
-    || fail "the literal queries on $target failed (step $?; client output kept private)"
+    || fail "the literal queries on $target failed (step $?, $(client_error_code); client output kept private)"
   [ -n "$ids" ] || fail "the literal queries on $target returned no needle id"
   AUDIT_LITERALS[$engine]="${AUDIT_LITERALS[$engine]:-} $ids"
 

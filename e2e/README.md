@@ -134,7 +134,7 @@ lives in `tmpfs`) and `no-new-privileges`.
      and `COPY ops.app_credentials TO STDOUT`, fed on stdin (the literals are on no command line
      and in no log of the harness). MariaDB: `SELECT … FROM tickets WHERE requester_email = '<…>'`
      and `… WHERE requester_phone = '<…>'`, then `SELECT * FROM tickets INTO OUTFILE …`, which must
-     be refused (`ERROR 1045`, no `FILE` privilege) and still carry `signature.into_outfile`. The
+     be refused (`ERROR 1227`, MariaDB's missing-`FILE`-privilege error) and still carry `signature.into_outfile`. The
      harness waits (240 s at most) until the object sets read (PostgreSQL 3, MariaDB 1) and every
      literal-bearing read statement (3 on each target, the sum of `aggregated_count` of the
      `e2e_analyst` read events) are stored, every event is evaluated, a `e2e reads` incident exists
