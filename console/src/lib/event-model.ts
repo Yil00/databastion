@@ -24,8 +24,10 @@ import {
  * column; false positives excluded): for each classifier found, its weight (table below) times the
  * highest confidence among the object's columns for it, summed over the classifiers and capped at
  * `SENSITIVITY_CAP`. An object without finding has sensitivity 0. An event's sensitivity is the
- * highest sensitivity among its objects. An event object without a schema (MySQL, MongoDB, LDAP, or
- * a source that does not log it) matches the findings of that database and object in any schema.
+ * highest sensitivity among its objects. An event object without a schema (MySQL, MongoDB, or a
+ * source that does not log it) matches the findings of that database and object in any schema.
+ * OpenLDAP events carry the entry's container as `schema` (ADR-0029 decision 6), matched exactly;
+ * an OpenLDAP object `*` (no sensitive object reachable) carries the container too.
  *
  * ## Score (per event)
  * `score = sensitivity x log10(1 + rows)`, rounded to 2 decimals; 0 when the event reports no
@@ -428,19 +430,27 @@ export function exceptionCoversEvent(
 
 /**
  * Dedup scope of the incidents raised from events: one incident per policy, agent, target,
- * principal, database and UTC hour of the event `ts`. The principal part is coarse for events
- * whose account is unknown (a fingerprint sent instead of the name) and for failed
- * authentications: all of them from one client address count as one principal
- * (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
- * `local` kept), so random account names or rotating addresses cannot open one incident each
- * (security review H1, re-review N2). On top of that, a policy opens at most a configured number
+ * principal, database and UTC hour of the event `ts`. The principal part (`dedupPrincipal`):
+ * - failed authentications: coarse, all of them from one client network count as one principal
+ *   (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
+ *   `local` kept), so random account names or rotating addresses cannot open one incident each
+ *   (security review H1, re-review N2);
+ * - every other event: its principal key (SHA-256 of the name, or of the fingerprint sent in its
+ *   place), so distinct principals are never merged (ADR-0031 decision 1, end-of-phase-6 review
+ *   M1: on OpenLDAP nearly every principal is fingerprinted and has no client address, so the
+ *   former coarse key for fingerprinted principals merged them all, and a false positive of one
+ *   suppressed every other user's incidents of the hour). The console cannot recognize the
+ *   fingerprint of an unidentified account (the HMAC key never leaves the agent): the agent sends
+ *   every unidentified account of one agent as the same fingerprint, so they form one principal. On top of that, a policy opens at most a configured number
  * of incidents per hour on one target; the further matches go to one overflow incident of the
  * policy on that target, except severe events (`severeEvent`). The database is the one of the most sensitive
  * retained object (the first on a tie), none for an event without object. While that incident is
  * open or acknowledged, the later events of the scope are added to it (`match_count`, rows, highest
- * score, signals). Once it is a false positive, the later events of the scope in that hour are
- * only linked to it. Once it is resolved, a later event of the hour opens a new incident only when
- * it is worse (`worseThanResolved`), else it is linked to it; the next hour opens a new incident. A `pg_dump` of a whole database (one event per table) thus
+ * score, signals). Once it is a false positive, a later event of the scope in that hour opens a
+ * new incident only when it is clearly worse (`worseThanFalsePositive`: a `signature.*` signal the
+ * incident did not have, or a strictly higher score), else it is only linked to it (M1). Once it
+ * is resolved, a later event of the hour opens a new incident only when it is worse
+ * (`worseThanResolved`), else it is linked to it; the next hour opens a new incident. A `pg_dump` of a whole database (one event per table) thus
  * raises one incident per policy and hour, not one per table.
  */
 export const EVENT_BUCKET_MS = 3600_000;
@@ -449,9 +459,17 @@ export function eventBucket(ts: Date): Date {
   return new Date(Math.floor(ts.getTime() / EVENT_BUCKET_MS) * EVENT_BUCKET_MS);
 }
 
-/** Whether the event's principal is grouped by client address in the dedup scope. */
-export function coarsePrincipal(e: { fingerprinted: boolean; action: string }): boolean {
-  return e.fingerprinted || e.action === "auth_failure";
+/** Whether the event's principal is grouped by client network only in the dedup scope. */
+export function coarsePrincipal(e: { action: string }): boolean {
+  return e.action === "auth_failure";
+}
+
+/**
+ * Principal part of the dedup key (see above, ADR-0031 decision 1). `principalKey` = SHA-256 of
+ * the principal, `networkHash` = SHA-256 of the client network: hashes only, never agent text.
+ */
+export function dedupPrincipal(e: { action: string; principalKey: string; networkHash: string }): string {
+  return coarsePrincipal(e) ? `unknown:${e.networkHash}` : e.principalKey;
 }
 
 /** Key parts are identifiers and hashes only: never agent-provided free text. */
@@ -504,6 +522,42 @@ export function worseThanResolved(
   if (e.anomaly && resolved.eventAnomaly !== true) return true;
   const known = new Set(resolved.eventSignals ?? []);
   return e.signals.some((s) => !known.has(s));
+}
+
+/**
+ * After the incident of a scope was marked a false positive, a later event of the same scope opens
+ * a new incident only when it is clearly worse than what was judged (ADR-0031 decision 2): a
+ * `signature.*` signal (a dump or export tool) the incident did not have, a strictly higher score,
+ * or more rows in total than the incident had when it was judged: the rows of the events linked to
+ * it since it was marked a false positive, this event's included (`rowsSinceFalsePositive`), above
+ * its `eventRows` (so an extraction split into many small reads, each below the judged score,
+ * still opens an incident). The baseline verdict and `shape.*` / `volume.*` signals alone do not
+ * count (the administrator judged this principal's activity on this database). Otherwise the event
+ * is only linked to the false positive.
+ */
+export function worseThanFalsePositive(
+  fp: { eventScore: number | null; eventSignals: readonly string[] | null; eventRows?: number | null },
+  e: { score: number; signals: readonly string[] },
+  rowsSinceFalsePositive = 0,
+): boolean {
+  if (e.score > (fp.eventScore ?? 0)) return true;
+  if (rowsSinceFalsePositive > 0 && rowsSinceFalsePositive > (fp.eventRows ?? 0)) return true;
+  const known = new Set(fp.eventSignals ?? []);
+  return e.signals.some((s) => s.startsWith("signature.") && !known.has(s));
+}
+
+/**
+ * Whether an event of a closed (resolved or false-positive) incident's scope opens a new incident.
+ * `rowsSinceFalsePositive`: see `worseThanFalsePositive` (this event's rows included).
+ */
+export function worseThanClosed(
+  closed: { status: string; eventScore: number | null; eventSignals: readonly string[] | null; eventAnomaly: boolean | null; eventRows?: number | null },
+  e: { score: number; anomaly: boolean; signals: readonly string[] },
+  rowsSinceFalsePositive = 0,
+): boolean {
+  if (closed.status === "resolved") return worseThanResolved(closed, e);
+  if (closed.status === "false_positive") return worseThanFalsePositive(closed, e, rowsSinceFalsePositive);
+  return false;
 }
 
 /** Index of the retained object that sets the dedup database: the most sensitive, first on a tie. */

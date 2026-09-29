@@ -76,6 +76,29 @@ describe("FindingsTable", () => {
     );
   });
 
+  it("OpenLDAP locations name their parts: naming context, container, object class, attribute (ADR-0029)", () => {
+    const ldap = finding({
+      targetId: "ldap-1",
+      engine: "openldap",
+      databaseName: "dc=example,dc=org",
+      schemaName: "ou=people,dc=example,dc=org",
+      objectName: "inetOrgPerson",
+      fieldName: "mail",
+    });
+    const html = renderToStaticMarkup(<FindingsTable findings={[ldap, finding({ id: "pg", schemaName: HOSTILE })]} csrfToken="csrf" now={NOW} canMark />);
+    for (const label of ["naming context", "container", "object class", "attribute"]) expect(html).toContain(`>${label}</dt>`);
+    expect(html).toContain(">ou=people,dc=example,dc=org</dd>");
+    expect(html).toContain(">inetOrgPerson</dd>");
+    // Other engines keep the plain path (and escaped names).
+    expect(html).toContain("crm / &lt;img src=x onerror=&quot;alert(1)&quot;&gt; / clients / email");
+    expect(html).not.toContain("<img");
+    expect(locationLabel(ldap, "openldap")).toBe(
+      "naming context dc=example,dc=org / container ou=people,dc=example,dc=org / object class inetOrgPerson / attribute mail",
+    );
+    expect(locationLabel({ ...ldap, schemaName: null }, "openldap")).toBe("naming context dc=example,dc=org / object class inetOrgPerson / attribute mail");
+    expect(locationLabel(ldap)).toBe("dc=example,dc=org / ou=people,dc=example,dc=org / inetOrgPerson / mail");
+  });
+
   it("summary links filter by target and classifier", () => {
     const html = renderToStaticMarkup(
       <FindingsSummary

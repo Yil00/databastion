@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { eventsHref, principalHref } from "@/lib/events-filter";
+import { fingerprintNoun, fingerprintTitle, isLdapEngine, locationPartLabels, shortFingerprint } from "@/lib/location-labels";
 import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
 
@@ -13,9 +14,21 @@ import type { EventView, PrincipalView } from "@/server/events";
  * never HTML. Events carry no value (ADR-0007): only who, which objects, how many rows, signals.
  */
 
-export function objectsLabel(objects: EventView["objects"], max = 3): string {
-  const names = objects.map((o) => [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."));
-  return names.length > max ? `${names.slice(0, max).join(", ")} and ${names.length - max} more` : names.join(", ");
+/**
+ * The objects of an event. OpenLDAP (ADR-0029 decision 6): `object class <class> in container
+ * <container DN>` (the naming context when no container is known), separated by `;` since DNs hold
+ * commas; `*` is an object class the log does not tell (no sensitive object reachable).
+ */
+export function objectsLabel(objects: EventView["objects"], max = 3, engine: string | null = null): string {
+  const ldap = isLdapEngine(engine);
+  const l = locationPartLabels(engine);
+  const names = objects.map((o) =>
+    ldap
+      ? `${l.object} ${o.object} in ${o.schema !== undefined ? `${l.schema} ${o.schema}` : `${l.database} ${o.database}`}`
+      : [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."),
+  );
+  const sep = ldap ? "; " : ", ";
+  return names.length > max ? `${names.slice(0, max).join(sep)} and ${names.length - max} more` : names.join(sep);
 }
 
 export function formatCount(n: number | null): string {
@@ -60,11 +73,16 @@ export function SignalBadge({ signal }: { signal: string }) {
   );
 }
 
-export function PrincipalLabel({ principal, fingerprinted }: { principal: string; fingerprinted: boolean }) {
+/**
+ * A principal: the account name (or, OpenLDAP, the DN sent in clear), or a fingerprint. A
+ * fingerprint is never shown as if it were a name: labelled, shortened in a monospace font, with
+ * what it is and its full value in the tooltip.
+ */
+export function PrincipalLabel({ principal, fingerprinted, engine = null }: { principal: string; fingerprinted: boolean; engine?: string | null }) {
   if (!fingerprinted) return <span className="break-all">{principal}</span>;
   return (
-    <span title="The agent sent a fingerprint instead of the account name (unknown or non-conforming name)">
-      fingerprint {principal.slice("hmac-sha256:".length, "hmac-sha256:".length + 12)}…
+    <span title={fingerprintTitle(principal, engine)} data-fingerprint="">
+      <span className="text-muted-foreground">{fingerprintNoun(engine)}</span> <code className="font-mono text-xs">{shortFingerprint(principal)}</code>
     </span>
   );
 }
@@ -102,7 +120,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
             </TableCell>
             <TableCell className="max-w-48 whitespace-normal">
               <Link className="hover:underline" prefetch={false} href={principalHref(e.agentId, e.targetId, e.principalKey)}>
-                <PrincipalLabel principal={e.principal} fingerprinted={e.fingerprinted} />
+                <PrincipalLabel principal={e.principal} fingerprinted={e.fingerprinted} engine={e.engine} />
               </Link>
             </TableCell>
             <TableCell className="max-w-40 break-all whitespace-normal text-xs">
@@ -110,7 +128,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
               {e.application ? <div className="text-muted-foreground">{e.application}</div> : null}
             </TableCell>
             <TableCell>{e.action}</TableCell>
-            <TableCell className="max-w-64 break-all whitespace-normal text-xs">{objectsLabel(e.objects)}</TableCell>
+            <TableCell className="max-w-64 break-all whitespace-normal text-xs">{objectsLabel(e.objects, 3, e.engine)}</TableCell>
             <TableCell>
               {formatCount(e.rows)}
               {e.bytes !== null && (
@@ -176,7 +194,7 @@ export function PrincipalsTable({ principals, now }: { principals: PrincipalView
           <TableRow key={`${p.agentId}/${p.targetId}/${p.principalKey}`}>
             <TableCell className="max-w-48 whitespace-normal">
               <Link className="hover:underline" prefetch={false} href={principalHref(p.agentId, p.targetId, p.principalKey)}>
-                <PrincipalLabel principal={p.principal} fingerprinted={p.fingerprinted} />
+                <PrincipalLabel principal={p.principal} fingerprinted={p.fingerprinted} engine={p.engine} />
               </Link>
             </TableCell>
             <TableCell>

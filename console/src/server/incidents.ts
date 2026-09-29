@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, or, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { agents, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
+import { agents, agentTargets, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
 import {
   ACTIVE_STATUSES,
@@ -536,6 +536,8 @@ export interface IncidentView {
   agentName: string | null;
   targetId: string | null;
   classifier: string | null;
+  /** Engine of the finding, else of the target as last reported by the agent (null: unknown). */
+  engine: string | null;
   location: { databaseName: string; schemaName: string | null; objectName: string; fieldName: string } | null;
   findingMatched: number | null;
   matchCount: number;
@@ -590,6 +592,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       agentName: agents.name,
       targetId: incidents.targetId,
       classifier: incidents.classifier,
+      engine: sql<string | null>`coalesce(${findings.engine}, (select ${agentTargets.engine} from ${agentTargets}
+        where ${agentTargets.agentId} = ${incidents.agentId} and ${agentTargets.targetId} = ${incidents.targetId}))`,
       databaseName: findings.databaseName,
       schemaName: findings.schemaName,
       objectName: findings.objectName,
