@@ -179,10 +179,7 @@ impl Tailer {
         let mut records = Vec::new();
         let mut read_total: u64 = 0;
         let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
-        loop {
-            let Some((file, dev, ino)) = self.file.as_mut() else {
-                break;
-            };
+        while let Some((file, dev, ino)) = self.file.as_mut() {
             let (dev, ino) = (*dev, *ino);
             // Truncated (or rewritten) in place?
             let rewritten = {
