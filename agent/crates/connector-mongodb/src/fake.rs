@@ -931,7 +931,8 @@ fn seed_collections() -> Vec<FakeColl> {
 
 /// The dev seed, served over the wire by the scripted server, gives every
 /// ground-truth location of the `app` database and nothing on the
-/// negative controls; value-bearing keys never reach a location.
+/// negative controls; value-bearing keys never reach a location, and no
+/// ground-truth value is in clear in the serialized findings (interim I2).
 #[tokio::test]
 async fn seed_recall_over_the_wire() {
     let gt: serde_json::Value =
@@ -1027,6 +1028,9 @@ async fn seed_recall_over_the_wire() {
         extra.is_empty(),
         "findings outside the ground truth: {extra:?}"
     );
+    // Interim I2 check (end-of-phase-5 review M1): no ground-truth value
+    // (length >= 4) in clear in the serialized masked findings.
+    assert!(crate::i2::assert_no_value(&gt, "app", &findings) > 0);
 }
 
 /// Time-series collections are read through their view (no

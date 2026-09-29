@@ -396,6 +396,9 @@ async fn seed_recall_regression() {
         !text.contains("@example."),
         "a sampled value reached the logs"
     );
+    // Interim I2 check (end-of-phase-5 review M1): no ground-truth value
+    // in clear in what would leave the agent.
+    assert!(crate::i2::assert_no_value(&gt, &url.dbname, &findings) > 0);
 }
 
 /// Recreates the probe database and the test accounts.
