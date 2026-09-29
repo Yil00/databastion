@@ -184,8 +184,14 @@ async fn audit_from_the_server_log() {
     let connector = Arc::new(MongodbConnector::new());
     let h = connector.check(&t).await;
     assert!(h.reachable, "{h:?}");
-    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
+    // Nothing read from the log yet: None until the stream parses a record.
+    assert_eq!(h.audit_level, AuditLevel::None, "{:?}", h.detail);
     assert_eq!(connector.audit_source(&t), Some(EventSource::MongodbLog));
+    assert!(
+        codes(&h.notes).contains(&NoteCode::AuditLimitedPendingFirstRecord.as_str()),
+        "{:?}",
+        h.notes
+    );
     let got = codes(&h.notes);
     assert!(
         got.contains(&NoteCode::AuditSlowOperationsOnly.as_str()),
@@ -227,6 +233,9 @@ async fn audit_from_the_server_log() {
     .await;
     // A little longer for the agent's own reads (they must not come).
     collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+    // Records were read: Limited now.
+    let h = connector.check(&t).await;
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
     task.abort();
     let text: Vec<String> = events.iter().map(describe).collect();
     assert!(has(&events, COLLECTION, "signature.mongodump"), "{text:#?}");
@@ -369,7 +378,12 @@ async fn audit_from_the_profiler() {
     let connector = Arc::new(MongodbConnector::new());
     let h = connector.check(&t).await;
     assert!(h.reachable, "{h:?}");
-    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
+    assert_eq!(h.audit_level, AuditLevel::None, "{:?}", h.detail);
+    assert!(
+        codes(&h.notes).contains(&NoteCode::AuditLimitedPendingFirstRecord.as_str()),
+        "{:?}",
+        h.notes
+    );
     assert_eq!(
         connector.audit_source(&t),
         Some(EventSource::MongodbProfiler)
@@ -407,6 +421,9 @@ async fn audit_from_the_profiler() {
     })
     .await;
     collect_until(&mut rx, &mut events, Duration::from_secs(4), |_| false).await;
+    // Entries were read: Limited now.
+    let h = connector.check(&t).await;
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
     task.abort();
     let text: Vec<String> = events.iter().map(describe).collect();
     let export = events

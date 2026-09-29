@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use databastion_classifiers::masking::ClientAddr;
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use zeroize::Zeroizing;
 
 /// Longest user, database, collection or application name kept, in bytes
 /// (longer: the record is dropped).
@@ -205,8 +206,9 @@ pub(crate) struct Record {
     pub(crate) ts: Option<SystemTime>,
     pub(crate) kind: Kind,
     pub(crate) conn: Option<ConnId>,
-    /// `name@authdb`.
-    pub(crate) user: Option<String>,
+    /// `name@authdb` (zeroized: a failed authentication's name may be a
+    /// mistyped password).
+    pub(crate) user: Option<Zeroizing<String>>,
     pub(crate) client: Option<ClientAddr>,
     pub(crate) app: Option<String>,
     /// Database and collection (`None`: database-level command).
@@ -881,7 +883,8 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
         .users
         .as_ref()
         .and_then(|u| u.first())
-        .and_then(|u| user_at(&u.user, &u.db));
+        .and_then(|u| user_at(&u.user, &u.db))
+        .map(Zeroizing::new);
     let base = |kind: Kind| {
         let mut r = Record::new(kind);
         r.ts = head.ts.as_ref().and_then(DateField::time);
@@ -915,7 +918,8 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let line: AuthenticateLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let ok = head.result == Some(0);
             let mut r = base(Kind::Auth { ok });
-            r.user = Some(user_at(&line.param.user, &line.param.db).ok_or(())?);
+            let name = Zeroizing::new(line.param.user);
+            r.user = Some(Zeroizing::new(user_at(&name, &line.param.db).ok_or(())?));
             Some(r)
         }
         "clientMetadata" => {
@@ -1098,10 +1102,9 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
                 Some(ns) => Some(namespace(ns).ok_or(())?),
                 None => None,
             };
-            r.app = match a.app.as_deref() {
-                Some(app) => Some(bounded(app).ok_or(())?),
-                None => None,
-            };
+            // A descriptive field that is not valid is dropped, never the
+            // record (an application name with a NUL must not hide it).
+            r.app = a.app.as_deref().and_then(bounded);
             r.client = client_of(a.remote.as_deref());
             r.shape = command.shape;
             r.origin = a.origin.map(|o| o.shape);
@@ -1150,9 +1153,9 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let mut r = base(Kind::Auth {
                 ok: ID_AUTH_OK.contains(&id),
             });
-            let user = a.user.or(a.principal).unwrap_or_default();
+            let user = Zeroizing::new(a.user.or(a.principal).unwrap_or_default());
             let db = a.db.or(a.auth_db).unwrap_or_default();
-            r.user = Some(user_at(&user, &db).ok_or(())?);
+            r.user = Some(Zeroizing::new(user_at(&user, &db).ok_or(())?));
             r.client = client_of(a.client.as_deref().or(a.remote.as_deref()));
             // Intra-cluster authentication (replication, sharding).
             r.system |= a.cluster_member == Some(true);
@@ -1265,6 +1268,27 @@ mod tests {
         assert!(!format!("{r:?}").contains("jane"));
     }
 
+    /// Security review M3: an invalid application name (a NUL) drops the
+    /// name, never the record.
+    #[test]
+    fn an_invalid_application_name_does_not_hide_the_operation() {
+        let line = SLOW_FIND.replace(r#""appName":"mongodump""#, r#""appName":"mongo\u0000dump""#);
+        let r = parse_server_log(line.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert!(r.app.is_none());
+        let long = SLOW_FIND.replace("mongodump", &"x".repeat(MAX_NAME_BYTES + 1));
+        assert!(
+            parse_server_log(long.as_bytes())
+                .unwrap()
+                .unwrap()
+                .app
+                .is_none()
+        );
+        // An invalid namespace still drops the record.
+        let ns = SLOW_FIND.replace(r#""ns":"app.customers""#, r#""ns":"a\u0000b.c""#);
+        assert!(parse_server_log(ns.as_bytes()).is_err());
+    }
+
     #[test]
     fn server_log_other_lines() {
         let accepted = r#"{"t":{"$date":"2026-09-29T10:00:00.000+00:00"},"s":"I","c":"NETWORK","id":22943,"ctx":"listener","msg":"Connection accepted","attr":{"remote":"172.18.0.1:53422","isLoadBalanced":false,"uuid":{"uuid":{"$uuid":"0b1b7b36-0000-0000-0000-000000000000"}},"connectionId":12,"connectionCount":3}}"#;
@@ -1275,7 +1299,7 @@ mod tests {
         let auth = r#"{"t":{"$date":"2026-09-29T10:00:00.000+00:00"},"s":"I","c":"ACCESS","id":5286306,"ctx":"conn12","msg":"Successfully authenticated","attr":{"client":"172.18.0.1:53422","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"alice","db":"admin","result":0,"metrics":{"conversation_duration":{"micros":5000,"summary":{}}},"extraInfo":{}}}"#;
         let r = parse_server_log(auth.as_bytes()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Auth { ok: true });
-        assert_eq!(r.user.as_deref(), Some("alice@admin"));
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("alice@admin"));
         let failed = r#"{"t":{"$date":"2026-09-29T10:00:00.000+00:00"},"s":"I","c":"ACCESS","id":5286307,"ctx":"conn13","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:1234","isSpeculative":false,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"hunter2-secret","db":"admin","error":"AuthenticationFailed: SCRAM authentication failed, storedKey mismatch","result":18}}"#;
         let r = parse_server_log(failed.as_bytes()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Auth { ok: false });
@@ -1340,7 +1364,7 @@ mod tests {
         let find = r#"{ "atype" : "authCheck", "ts" : { "$date" : "2026-09-29T10:00:00.000+00:00" }, "uuid" : { "$binary" : "AAAA", "$type" : "04" }, "local" : { "ip" : "127.0.0.1", "port" : 27017 }, "remote" : { "ip" : "10.0.0.9", "port" : 51000 }, "users" : [ { "user" : "alice", "db" : "admin" } ], "roles" : [ { "role" : "readWrite", "db" : "app" } ], "param" : { "command" : "find", "ns" : "app.customers", "args" : { "find" : "customers", "filter" : { "iban" : "FR7630006000011234567890189" }, "$db" : "app" } }, "result" : 0 }"#;
         let r = parse_audit_log(find.as_bytes()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Op(Cmd::Find));
-        assert_eq!(r.user.as_deref(), Some("alice@admin"));
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("alice@admin"));
         assert_eq!(r.shape.filter, Filter::Keys(1));
         assert_eq!(
             r.conn,
@@ -1371,7 +1395,7 @@ mod tests {
         let auth = r#"{"atype":"authenticate","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"user":"mallory","db":"admin","mechanism":"SCRAM-SHA-256"},"result":18}"#;
         let r = parse_audit_log(auth.as_bytes()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Auth { ok: false });
-        assert_eq!(r.user.as_deref(), Some("mallory@admin"));
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("mallory@admin"));
         let meta = r#"{"atype":"clientMetadata","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"localEndpoint":{"ip":"127.0.0.1","port":27017},"clientMetadata":{"application":{"name":"mongodump"},"driver":{"name":"mongo-go-driver"}}},"result":0}"#;
         let r = parse_audit_log(meta.as_bytes()).unwrap().unwrap();
         assert_eq!(r.app.as_deref(), Some("mongodump"));

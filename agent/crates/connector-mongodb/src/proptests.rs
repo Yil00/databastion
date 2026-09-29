@@ -230,6 +230,7 @@ fn builder() -> EventBuilder {
             SharedOwnUsage::default(),
         ),
         "databastion@admin".to_owned(),
+        200,
     )
 }
 
@@ -330,7 +331,7 @@ proptest! {
             if let Ok(Some(r)) = parsed {
                 let debug = format!("{r:?}");
                 prop_assert!(!debug.contains("LEAK"));
-                prop_assert!(r.user.as_deref().is_none_or(|u| !u.contains("LEAK")));
+                prop_assert!(r.user.as_ref().is_none_or(|u| !u.contains("LEAK")));
                 prop_assert!(r.app.as_deref().is_none_or(|u| !u.contains("LEAK")));
                 prop_assert!(r.ns.as_ref().is_none_or(|(d, c)| !d.contains("LEAK") && c.as_deref().is_none_or(|c| !c.contains("LEAK"))));
                 all.extend(builder().convert(vec![r], source, std::time::SystemTime::now()));

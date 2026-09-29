@@ -135,6 +135,8 @@ pub(crate) struct CheckState {
     sources: Mutex<HashMap<String, EventSource>>,
     /// When the stream last parsed a successful `authCheck` record.
     authchecks: Mutex<HashMap<String, Instant>>,
+    /// When the stream last parsed a record of a server log or profiler.
+    records: Mutex<HashMap<(String, Source), Instant>>,
     /// Running streams (count) and the source of the latest one.
     streams: Mutex<HashMap<String, (usize, Source)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
@@ -210,6 +212,18 @@ impl CheckState {
     pub(crate) fn recent_authcheck(&self, target_id: &str) -> bool {
         lock(&self.authchecks)
             .get(target_id)
+            .is_some_and(|t| t.elapsed() < RECORD_FRESHNESS)
+    }
+
+    /// The stream of `target_id` parsed a record of `source`.
+    pub(crate) fn note_record(&self, target_id: &str, source: Source) {
+        lock(&self.records).insert((target_id.to_owned(), source), Instant::now());
+    }
+
+    /// Whether a record of `source` was parsed for `target_id` recently.
+    pub(crate) fn recent_record(&self, target_id: &str, source: Source) -> bool {
+        lock(&self.records)
+            .get(&(target_id.to_owned(), source))
             .is_some_and(|t| t.elapsed() < RECORD_FRESHNESS)
     }
 
@@ -523,6 +537,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         profiler: cached
             .as_ref()
             .is_some_and(|r| r.privileges_known && r.privileges.can_read_profiler()),
+        profiler_recent: state.recent_record(&target.id, Source::Profiler),
     };
     let file = audit::file_state(state, target).await;
     let (level, source) = audit::choose(probe, file);
@@ -639,6 +654,7 @@ mod tests {
             NoteCode::AuditAuthcheckSuccessPending,
             NoteCode::AuditSlowOperationsOnly,
             NoteCode::AuditSourceNotConfigured,
+            NoteCode::AuditLimitedPendingFirstRecord,
             NoteCode::AuditLogNotReadable,
             NoteCode::AuditLogWithoutRowCounts,
             NoteCode::AuditRecordsDropped,

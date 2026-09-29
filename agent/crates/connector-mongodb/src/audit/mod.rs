@@ -57,7 +57,7 @@ fn internal() -> ConnectorError {
 }
 
 /// The Audit source of a target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Source {
     AuditLog,
     ServerLog,
@@ -90,8 +90,8 @@ impl Source {
 pub(crate) struct FileState {
     pub(crate) format: MongodbLogFormat,
     pub(crate) readable: bool,
-    /// The stream parsed a successful `authCheck` record in the last 24 h
-    /// (`auditLog` only).
+    /// In the last 24 h, the stream parsed a successful `authCheck` record
+    /// (`auditLog`), or an audit record (server log).
     pub(crate) recent: bool,
 }
 
@@ -104,6 +104,8 @@ pub(crate) struct Probe {
     pub(crate) mongos: bool,
     /// The account can `find` on some database's `system.profile`.
     pub(crate) profiler: bool,
+    /// The stream read a profiler entry in the last 24 h.
+    pub(crate) profiler_recent: bool,
 }
 
 impl Probe {
@@ -115,9 +117,11 @@ impl Probe {
 /// The level and source of a target (ADR-0027 decisions 1 and 2): the
 /// `auditLog` on Enterprise / Percona when readable (Partial once a
 /// successful `authCheck` was read, Limited before), the server log when
-/// readable (Limited), the profiler when the account can read it and the
-/// target is not a `mongos` (Limited), else none. `check()` and the Audit
-/// stream use this same rule.
+/// readable, the profiler when the account can read it and the target is
+/// not a `mongos`, else none. The server log and the profiler are Limited
+/// once the stream read a record of them in the last 24 h, None before
+/// (a readable source that records nothing proves nothing). `check()` and
+/// the Audit stream use this same rule.
 pub(crate) fn choose(probe: Probe, file: Option<FileState>) -> (AuditLevel, Source) {
     if let Some(f) = file.filter(|f| f.readable) {
         match f.format {
@@ -130,13 +134,21 @@ pub(crate) fn choose(probe: Probe, file: Option<FileState>) -> (AuditLevel, Sour
                 return (level, Source::AuditLog);
             }
             MongodbLogFormat::AuditLog => {}
-            MongodbLogFormat::ServerLog => return (AuditLevel::Limited, Source::ServerLog),
+            MongodbLogFormat::ServerLog => return (limited(f.recent), Source::ServerLog),
         }
     }
     if probe.profiler && !probe.mongos {
-        return (AuditLevel::Limited, Source::Profiler);
+        return (limited(probe.profiler_recent), Source::Profiler);
     }
     (AuditLevel::None, Source::None)
+}
+
+fn limited(recent: bool) -> AuditLevel {
+    if recent {
+        AuditLevel::Limited
+    } else {
+        AuditLevel::None
+    }
 }
 
 /// Explanations of the level: the log detail, and the same as closed
@@ -184,6 +196,19 @@ pub(crate) fn explain(
             codes.push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
         }
         Source::ServerLog | Source::Profiler => {
+            let recent = if source == Source::Profiler {
+                probe.profiler_recent
+            } else {
+                file.is_some_and(|f| f.recent)
+            };
+            if !recent {
+                out.push(
+                    "Limited once the Audit stream has read a record of the source (none in \
+                     the last 24 h)"
+                        .to_owned(),
+                );
+                codes.push(TargetNote::new(NoteCode::AuditLimitedPendingFirstRecord));
+            }
             out.push(
                 "only operations the server logs or profiles (slower than slowms, or sampled) \
                  are seen"
@@ -213,10 +238,14 @@ pub(crate) async fn file_state(state: &CheckState, target: &TargetConfig) -> Opt
         tokio::task::spawn_blocking(move || databastion_core::audit::tail::readable(&path))
             .await
             .unwrap_or(false);
+    let recent = match log.format {
+        MongodbLogFormat::AuditLog => state.recent_authcheck(&target.id),
+        MongodbLogFormat::ServerLog => state.recent_record(&target.id, Source::ServerLog),
+    };
     Some(FileState {
         format: log.format,
         readable,
-        recent: state.recent_authcheck(&target.id),
+        recent,
     })
 }
 
@@ -321,6 +350,7 @@ pub(crate) async fn prerequisites(
         edition,
         mongos: session.info.mongos,
         profiler: !profile_dbs.is_empty(),
+        profiler_recent: state.recent_record(&target.id, Source::Profiler),
     };
     let (_, source) = choose(probe, file_state(state, target).await);
     Ok(Prerequisites {
@@ -354,6 +384,7 @@ fn builder(
             state.own_usage(&target.id),
         ),
         user,
+        u64::from(cfg.max_sample_rows()),
     )
 }
 
@@ -460,7 +491,7 @@ pub(crate) async fn audit_stream(
                 if let Some(old) = st.session.replace(session) {
                     old.close().await;
                 }
-                profiler_run(cfg, target, sink, st, &pre.profile_dbs, timeouts).await?;
+                profiler_run(cfg, target, sink, state, st, &pre.profile_dbs, timeouts).await?;
             }
             Source::None => {
                 session.close().await;
@@ -523,6 +554,9 @@ async fn file_run(
         if format == MongodbLogFormat::AuditLog && records.iter().any(proves_reads) {
             state.note_authcheck(&target.id);
         }
+        if format == MongodbLogFormat::ServerLog && !records.is_empty() {
+            state.note_record(&target.id, Source::ServerLog);
+        }
         if unparsed > 0 {
             state.note_dropped(&target.id, unparsed);
             tracing::warn!(
@@ -572,6 +606,7 @@ async fn profiler_run(
     cfg: &AuditConfig,
     target: &TargetConfig,
     sink: &EventSink,
+    state: &CheckState,
     st: &mut ProfilerStream,
     dbs: &[String],
     timeouts: Timeouts,
@@ -627,6 +662,9 @@ async fn profiler_run(
                     }
                     Err(e) => return Err(e.into_connector_error()),
                 };
+                if !polled.records.is_empty() {
+                    state.note_record(&target.id, Source::Profiler);
+                }
                 let events = st.builder.convert(
                     polled.records,
                     EventSource::MongodbProfiler,
@@ -656,6 +694,7 @@ mod tests {
             edition,
             mongos: false,
             profiler,
+            profiler_recent: true,
         }
     }
 
@@ -693,8 +732,25 @@ mod tests {
             (AuditLevel::Limited, Source::Profiler)
         );
         assert_eq!(
-            choose(probe(Some("community"), true), file(ServerLog, true, false)),
+            choose(probe(Some("community"), true), file(ServerLog, true, true)),
             (AuditLevel::Limited, Source::ServerLog)
+        );
+        // Nothing read yet from the server log or the profiler: None, but
+        // the source is kept (the stream reads it).
+        assert_eq!(
+            choose(probe(Some("community"), true), file(ServerLog, true, false)),
+            (AuditLevel::None, Source::ServerLog)
+        );
+        let pending = Probe {
+            profiler_recent: false,
+            ..probe(Some("community"), true)
+        };
+        assert_eq!(choose(pending, None), (AuditLevel::None, Source::Profiler));
+        let (_, notes) = explain(pending, None, Source::Profiler);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.code() == NoteCode::AuditLimitedPendingFirstRecord)
         );
         // Unreadable file: the profiler, else nothing.
         assert_eq!(

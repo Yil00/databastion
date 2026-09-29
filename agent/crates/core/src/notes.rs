@@ -126,6 +126,8 @@ pub enum NoteCode {
     AuditHistoryLongConsumerDisabled,
     /// `audit.history_not_readable`.
     AuditHistoryNotReadable,
+    /// `audit.limited_pending_first_record`.
+    AuditLimitedPendingFirstRecord,
     /// `audit.log_not_readable`.
     AuditLogNotReadable,
     /// `audit.log_plugin_mismatch`.
@@ -237,6 +239,7 @@ impl NoteCode {
         Self::AuditGeneralLogEnabled,
         Self::AuditHistoryLongConsumerDisabled,
         Self::AuditHistoryNotReadable,
+        Self::AuditLimitedPendingFirstRecord,
         Self::AuditLogNotReadable,
         Self::AuditLogPluginMismatch,
         Self::AuditLogWithoutRowCounts,
@@ -300,6 +303,7 @@ impl NoteCode {
             Self::AuditGeneralLogEnabled => "audit.general_log_enabled",
             Self::AuditHistoryLongConsumerDisabled => "audit.history_long_consumer_disabled",
             Self::AuditHistoryNotReadable => "audit.history_not_readable",
+            Self::AuditLimitedPendingFirstRecord => "audit.limited_pending_first_record",
             Self::AuditLogNotReadable => "audit.log_not_readable",
             Self::AuditLogPluginMismatch => "audit.log_plugin_mismatch",
             Self::AuditLogWithoutRowCounts => "audit.log_without_row_counts",

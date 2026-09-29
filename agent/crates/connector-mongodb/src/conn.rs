@@ -132,12 +132,21 @@ impl Session<Transport> {
         target: &TargetConfig,
         timeouts: Timeouts,
     ) -> Result<Self, MgError> {
-        Self::connect_as(target, timeouts, APP_NAME).await
+        Self::connect_with_app(target, timeouts, APP_NAME).await
     }
 
     /// [`Self::connect`] declaring another application name (the
     /// integration tests play dump tools with it).
+    #[cfg(test)]
     pub(crate) async fn connect_as(
+        target: &TargetConfig,
+        timeouts: Timeouts,
+        app: &str,
+    ) -> Result<Self, MgError> {
+        Self::connect_with_app(target, timeouts, app).await
+    }
+
+    async fn connect_with_app(
         target: &TargetConfig,
         timeouts: Timeouts,
         app: &str,

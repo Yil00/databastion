@@ -50,6 +50,12 @@
       "mariadb"
     ]
   },
+  "audit.limited_pending_first_record": {
+    "description": "Limited once the Audit stream has read a record of its source (server log or profiler; none in the last 24 h): reported None until then.",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "audit.log_not_readable": {
     "description": "The audit log file configured in agent.yaml is not readable by the agent.",
     "engines": [

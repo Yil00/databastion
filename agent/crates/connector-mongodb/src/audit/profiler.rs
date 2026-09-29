@@ -323,7 +323,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
     let mut r = Record::new(Kind::Op(cmd));
     r.ts = millis_time(ts);
     r.ns = string(doc, "ns")?.as_deref().and_then(namespace);
-    r.user = string(doc, "user")?.filter(|u| !u.is_empty());
+    r.user = string(doc, "user")?
+        .filter(|u| !u.is_empty())
+        .map(zeroize::Zeroizing::new);
     r.app = string(doc, "appName")?;
     r.client = string(doc, "client")?
         .as_deref()
@@ -531,7 +533,7 @@ mod tests {
         assert_eq!(r.rows, Some(150));
         assert_eq!(r.shape.filter, Filter::Keys(0));
         assert_eq!(r.client, ClientAddr::parse("10.0.0.9"));
-        assert_eq!(r.user.as_deref(), Some("alice@admin"));
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("alice@admin"));
         let bytes = DocBuf::new()
             .date("ts", 1)
             .str("op", "command")

@@ -1210,6 +1210,7 @@ async fn profiler_polls_are_bounded_and_resume_after_what_was_read() {
             databastion_core::audit::own::SharedOwnUsage::default(),
         ),
         "databastion@admin".to_owned(),
+        200,
     );
     let mut cursor = DbCursor::after(0);
     let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();

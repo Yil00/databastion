@@ -30,6 +30,7 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
+use zeroize::Zeroizing;
 
 use super::records::{Cmd, ConnId, Kind, Record, Shape};
 use crate::discover::{normalize_collection, normalize_database};
@@ -150,14 +151,34 @@ pub(crate) struct EventBuilder {
     own: OwnAccount,
     /// The agent's account as the sources name it (`account@auth_source`).
     own_user: String,
+    /// Documents per collection and day the agent's own reads may take
+    /// (`limits.max_sample_rows`).
+    budget: u64,
     conns: Conns,
 }
 
+/// The agent's own profiler polls (`audit::profiler`): a `find` on
+/// `system.profile` with a one-key filter on `ts` and the batch limit, or
+/// the newest-entry probe (no filter, limit 1). Only these are left out
+/// without being charged, and only on the profiler source.
+fn own_profiler_poll(cmd: Cmd, r: &Record) -> bool {
+    use super::records::Filter;
+    cmd == Cmd::Find
+        && r.ns
+            .as_ref()
+            .is_some_and(|(_, c)| c.as_deref() == Some("system.profile"))
+        && matches!(
+            (r.shape.filter, r.shape.limit),
+            (Filter::Keys(1), Some(super::profiler::BATCH)) | (Filter::Keys(0), Some(1))
+        )
+}
+
 impl EventBuilder {
-    pub(crate) fn new(own: OwnAccount, own_user: String) -> Self {
+    pub(crate) fn new(own: OwnAccount, own_user: String, budget: u64) -> Self {
         Self {
             own,
             own_user,
+            budget,
             conns: Conns::default(),
         }
     }
@@ -214,7 +235,7 @@ impl EventBuilder {
                 None
             }
             Kind::Auth { ok } => {
-                let user = r.user?;
+                let user = r.user.take()?;
                 let client = r
                     .client
                     .or_else(|| self.known(r.conn).and_then(|c| c.client));
@@ -229,7 +250,7 @@ impl EventBuilder {
                 let app = self.known(r.conn).and_then(|c| c.app.clone());
                 if let Some(ConnId::Log(_)) = r.conn {
                     let entry = self.conns.entry(r.conn?);
-                    entry.user = Some(user.clone());
+                    entry.user = Some(user.to_string());
                     if client.is_some() {
                         entry.client = client;
                     }
@@ -252,7 +273,7 @@ impl EventBuilder {
                 // What the connection told earlier.
                 if let Some(c) = self.known(r.conn).cloned() {
                     if r.user.is_none() {
-                        r.user = c.user;
+                        r.user = c.user.map(Zeroizing::new);
                     }
                     if r.client.is_none() {
                         r.client = c.client;
@@ -283,7 +304,7 @@ impl EventBuilder {
             return None;
         }
         let mut principal = match &r.user {
-            Some(u) => EventPrincipal::account(u),
+            Some(u) => EventPrincipal::account(u.as_str()),
             None => EventPrincipal::unidentified(),
         }
         .with_client(r.client);
@@ -318,20 +339,34 @@ impl EventBuilder {
         {
             e = e.with_signal(Signal::LargeResult);
         }
-        let user = r.user.as_deref().unwrap_or("");
+        let user = r.user.as_ref().map_or("", |u| u.as_str());
+        // Writes, DDL and DCL by the agent's account are always reported:
+        // the agent only reads (I4).
+        if user != self.own_user || action != EventAction::Read {
+            return Some(e);
+        }
         let client = ClientSeen::Logged(r.client);
-        let now = Instant::now();
+        let app = r.app.as_deref();
         // The agent's own reads that return no document of a collection:
-        // its `count` without a filter, and its polls of the profiler.
+        // its `count` without a filter, and its polls of the profiler (on
+        // the profiler source, with their exact shape).
         let unbudgeted = (cmd == Cmd::Count && r.shape.filter.is_empty())
-            || (cmd.returns_documents() && collection == Some("system.profile"));
-        let routine = if user != self.own_user {
-            false
-        } else if unbudgeted {
-            self.own
-                .routine_unbudgeted(user, r.app.as_deref(), client, &e)
+            || (source == EventSource::MongodbProfiler && own_profiler_poll(cmd, r));
+        let routine = if unbudgeted {
+            self.own.routine_unbudgeted(user, app, client, &e)
+        } else if r.rows.is_some() {
+            self.own.routine(user, app, client, &e, Instant::now())
         } else {
-            self.own.routine(user, r.app.as_deref(), client, &e, now)
+            // No count (auditLog): only a `find` with a limit within the
+            // budget, charged that limit; anything else is reported.
+            match (cmd, r.shape.limit) {
+                (Cmd::Find, Some(l)) if l > 0 && l.unsigned_abs() <= self.budget => {
+                    let charged = e.clone().with_rows(Some(l.unsigned_abs()));
+                    self.own
+                        .routine(user, app, client, &charged, Instant::now())
+                }
+                _ => false,
+            }
         };
         (!routine).then_some(e)
     }
@@ -362,6 +397,7 @@ mod tests {
                 SharedOwnUsage::default(),
             ),
             "databastion@admin".to_owned(),
+            200,
         )
     }
 
@@ -558,7 +594,7 @@ mod tests {
 
     fn own_record(cmd: Cmd, coll: &str, rows: Option<u64>, app: Option<&str>) -> Record {
         let mut r = Record::new(Kind::Op(cmd));
-        r.user = Some("databastion@admin".to_owned());
+        r.user = Some(Zeroizing::new("databastion@admin".to_owned()));
         r.client = ClientAddr::parse(AGENT);
         r.app = app.map(str::to_owned);
         r.ns = Some(("app".to_owned(), Some(coll.to_owned())));
@@ -572,11 +608,18 @@ mod tests {
     fn own_reads_are_left_out_within_the_budget() {
         let mut b = builder();
         let app = Some("databastion-agent");
+        let poll = |filter, limit| {
+            let mut r = own_record(Cmd::Find, "system.profile", Some(1000), app);
+            r.shape.filter = filter;
+            r.shape.limit = Some(limit);
+            r
+        };
         let own = vec![
             own_record(Cmd::Count, "customers", None, app),
             own_record(Cmd::Find, "customers", Some(200), app),
-            own_record(Cmd::Find, "system.profile", Some(1000), app),
-            own_record(Cmd::Find, "system.profile", Some(1000), app),
+            poll(Filter::Keys(1), crate::audit::profiler::BATCH),
+            poll(Filter::Keys(1), crate::audit::profiler::BATCH),
+            poll(Filter::Keys(0), 1),
         ];
         assert!(
             b.convert(own, EventSource::MongodbProfiler, SystemTime::now())
@@ -599,7 +642,7 @@ mod tests {
         );
         // Another account reading system.profile: reported.
         let mut r = own_record(Cmd::Find, "system.profile", Some(1), None);
-        r.user = Some("alice@admin".to_owned());
+        r.user = Some(Zeroizing::new("alice@admin".to_owned()));
         assert_eq!(
             b.convert(vec![r], EventSource::MongodbProfiler, SystemTime::now())
                 .len(),
@@ -615,6 +658,109 @@ mod tests {
         )];
         assert_eq!(
             b.convert(dump, EventSource::MongodbProfiler, SystemTime::now())
+                .len(),
+            1
+        );
+    }
+
+    /// Security review M1: only the agent's exact profiler polls, on the
+    /// profiler source, are free; any other read of `system.profile` with
+    /// the agent's identity is charged (and reported past the budget).
+    #[test]
+    fn system_profile_reads_are_free_only_as_the_agents_own_polls() {
+        let app = Some("databastion-agent");
+        let shaped = |filter, limit| {
+            let mut r = own_record(Cmd::Find, "system.profile", Some(150), app);
+            r.shape.filter = filter;
+            r.shape.limit = limit;
+            r
+        };
+        // Not the poll shape: charged, so reported past the budget (200).
+        let mut b = builder();
+        let reads = vec![
+            shaped(Filter::Keys(2), Some(5)),
+            shaped(Filter::Keys(2), Some(5)),
+        ];
+        assert_eq!(
+            b.convert(reads, EventSource::MongodbProfiler, SystemTime::now())
+                .len(),
+            1
+        );
+        // The poll shape on a file source: charged too.
+        let mut b = builder();
+        let reads = vec![
+            shaped(Filter::Keys(1), Some(crate::audit::profiler::BATCH)),
+            shaped(Filter::Keys(1), Some(crate::audit::profiler::BATCH)),
+        ];
+        assert_eq!(
+            b.convert(reads, EventSource::MongodbLog, SystemTime::now())
+                .len(),
+            1
+        );
+        // An aggregate on system.profile: charged.
+        let mut b = builder();
+        let mut agg = shaped(Filter::Keys(1), Some(crate::audit::profiler::BATCH));
+        agg.kind = Kind::Op(Cmd::Aggregate);
+        let reads = vec![agg.clone(), agg];
+        assert_eq!(
+            b.convert(reads, EventSource::MongodbProfiler, SystemTime::now())
+                .len(),
+            1
+        );
+    }
+
+    /// Security review M2: writes, DDL and DCL by the agent's account are
+    /// always reported, whatever its identity and budget.
+    #[test]
+    fn own_writes_ddl_and_dcl_are_always_reported() {
+        let mut b = builder();
+        let app = Some("databastion-agent");
+        let records = vec![
+            own_record(Cmd::Insert, "customers", Some(1), app),
+            own_record(Cmd::Ddl, "customers", None, app),
+            own_record(Cmd::Dcl, "customers", None, app),
+        ];
+        let ev = b.convert(records, EventSource::MongodbLog, SystemTime::now());
+        let actions: Vec<EventAction> = ev.iter().map(MaskedEvent::action).collect();
+        assert_eq!(
+            actions,
+            [EventAction::Write, EventAction::Ddl, EventAction::Dcl]
+        );
+    }
+
+    /// Security review L1: without counts (`auditLog`), only a `find` with
+    /// a limit within the budget is left out, charged that limit.
+    #[test]
+    fn own_reads_without_counts_need_a_bounded_find() {
+        let app = Some("databastion-agent");
+        let find = |limit| {
+            let mut r = own_record(Cmd::Find, "customers", None, app);
+            r.shape.limit = limit;
+            r
+        };
+        let mut b = builder();
+        let ev = b.convert(
+            vec![find(Some(150)), find(None), find(Some(201)), find(Some(0))],
+            EventSource::MongodbAuditLog,
+            SystemTime::now(),
+        );
+        // The first is left out; no limit, over the budget, `0`: reported.
+        assert_eq!(ev.len(), 3);
+        // Charged 150 of 200: a second one goes over.
+        assert_eq!(
+            b.convert(
+                vec![find(Some(100))],
+                EventSource::MongodbAuditLog,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+        let mut agg = own_record(Cmd::Aggregate, "customers", None, app);
+        agg.shape.limit = None;
+        let mut b = builder();
+        assert_eq!(
+            b.convert(vec![agg], EventSource::MongodbAuditLog, SystemTime::now())
                 .len(),
             1
         );
