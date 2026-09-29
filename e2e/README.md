@@ -78,7 +78,7 @@ lives in `tmpfs`) and `no-new-privileges`.
    Targets `mysql-e2e` and `mariadb-e2e` must be `reachable` too (`tls: verify_full` with the
    pinned test CA; audit level `none` without a `performance_schema` grant, printed only). As
    root in each target: the grants of `databastion` are exactly `USAGE ON *.*` and
-   `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 4` (MariaDB
+   `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 5` (MariaDB
    `max_statement_time = 30`), no role and no other `databastion` account; it logs in over TLS
    and is refused without TLS (error 1045).
 6. Audit setup (P4-D), through the user API as a user would: an e-mail channel to Mailpit
