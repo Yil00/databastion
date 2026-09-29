@@ -10,7 +10,10 @@
 #   dev/postgres/local-cluster.sh stop    # stops the server and deletes the cluster
 #
 # Listens on 127.0.0.1 only (DATABASTION_PG_LOCAL_PORT, default 55432) and on a Unix socket in the
-# data directory (DATABASTION_PG_LOCAL_DIR, default /tmp/databastion-pg-local). Dev-only passwords
+# data directory (DATABASTION_PG_LOCAL_DIR, default /tmp/databastion-pg-local). With pgaudit
+# installed on the host (`postgresql-<major>-pgaudit`), the server also loads pgaudit and writes
+# its log as jsonlog and csvlog under $DIR/log (DATABASTION_TEST_PG_AUDIT_LOG / _AUDIT_CSVLOG, for
+# the Audit integration tests). Dev-only passwords
 # from dev/.env.example. As root, the server runs as the `postgres` OS user. TLS with a throwaway
 # CA (DATABASTION_TEST_PG_CA_FILE); pg_hba lines for the md5 / cleartext refusal tests.
 set -euo pipefail
@@ -39,12 +42,22 @@ as_owner() {
   if [ "$(id -u)" = 0 ]; then runuser -u postgres -- "$@"; else "$@"; fi
 }
 
+has_pgaudit() {
+  [ -f "$(dirname "$BIN")/lib/pgaudit.so" ]
+}
+
 env_vars() {
   cat <<EOF
 export DATABASTION_TEST_PG_URL='postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PORT}/shop'
 export DATABASTION_TEST_PG_ADMIN_URL='postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${PORT}/shop'
 export DATABASTION_TEST_PG_CA_FILE='${DIR}/tls/ca.pem'
 EOF
+  if has_pgaudit; then
+    cat <<EOF
+export DATABASTION_TEST_PG_AUDIT_LOG='${DIR}/log/postgresql.json'
+export DATABASTION_TEST_PG_AUDIT_CSVLOG='${DIR}/log/postgresql.csv'
+EOF
+  fi
 }
 
 start() {
@@ -82,10 +95,26 @@ start() {
     if [ "$(id -u)" = 0 ]; then chown -R postgres: "$DIR/tls"; fi
   fi
   if ! as_owner "$BIN/pg_ctl" -D "$DATA" status >/dev/null 2>&1; then
+    # Audit (P4-A): with pgaudit installed on the host, the same audit settings as the dev image
+    # (docker-compose.yml), and the server log written as both jsonlog and csvlog (dev only, so
+    # that the connector's two parsers run against a real server).
+    local preload=pg_stat_statements audit_opts=""
+    if has_pgaudit; then
+      preload=pgaudit,pg_stat_statements
+      mkdir -p "$DIR/log"
+      if [ "$(id -u)" = 0 ]; then chown postgres: "$DIR/log"; fi
+      chmod 0755 "$DIR/log"
+      audit_opts="-c logging_collector=on -c log_destination=jsonlog,csvlog \
+        -c log_directory=$DIR/log -c log_filename=postgresql.log -c log_file_mode=0644 \
+        -c log_connections=on -c pgaudit.log=none -c pgaudit.role=databastion_auditor \
+        -c pgaudit.log_relation=on -c pgaudit.log_catalog=off -c pgaudit.log_parameter=off \
+        -c pgaudit.log_rows=on -c pg_stat_statements.track=all"
+    fi
     as_owner "$BIN/pg_ctl" -D "$DATA" -l "$DIR/server.log" -w start -o \
       "-c listen_addresses=127.0.0.1 -p $PORT -c unix_socket_directories=$DIR \
-       -c shared_preload_libraries=pg_stat_statements -c max_connections=50 \
-       -c ssl=on -c ssl_cert_file=$DIR/tls/server.pem -c ssl_key_file=$DIR/tls/server.key" \
+       -c shared_preload_libraries=$preload -c max_connections=50 \
+       -c ssl=on -c ssl_cert_file=$DIR/tls/server.pem -c ssl_key_file=$DIR/tls/server.key \
+       $audit_opts" \
       >/dev/null
   fi
   if [ "$fresh" = 1 ]; then

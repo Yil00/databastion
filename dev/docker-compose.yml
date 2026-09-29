@@ -54,6 +54,9 @@ services:
       - pgaudit.log_catalog=off
       - -c
       - pgaudit.log_parameter=off
+      # Rows per statement in the pgaudit records (P4-A: volume of each access, Full level).
+      - -c
+      - pgaudit.log_rows=on
       - -c
       - pg_stat_statements.track=all
     ports:
