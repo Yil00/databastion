@@ -762,15 +762,10 @@ fn do_body(text: &str) -> Option<&str> {
         return None;
     }
     i = skip_ws(i + 2);
-    if text
-        .get(i..i + 8)
-        .is_some_and(|w| w.eq_ignore_ascii_case("language"))
-    {
-        i = skip_ws(i + 8);
-        while i < b.len() && is_ident_cont(b[i]) {
-            i += 1;
-        }
-        i = skip_ws(i);
+    let mut language_seen = false;
+    if let Some(next) = language_clause(text, i)? {
+        language_seen = true;
+        i = skip_ws(next);
     }
     if b.get(i) != Some(&b'$') {
         return None;
@@ -779,7 +774,66 @@ fn do_body(text: &str) -> Option<&str> {
     let tag = &b[i..=tag_end];
     let body = tag_end + 1;
     let close = find(&b[body..], tag)?;
+    let mut j = skip_ws(body + close + tag.len());
+    if let Some(next) = language_clause(text, j)? {
+        if language_seen {
+            return None;
+        }
+        j = skip_ws(next);
+    }
+    // Nothing else may follow (an optional `;`): anything unexpected, a
+    // comment included, fails closed.
+    if b.get(j) == Some(&b';') {
+        j = skip_ws(j + 1);
+    }
+    if j != b.len() {
+        return None;
+    }
     text.get(body..body + close)
+}
+
+/// A `LANGUAGE <name>` clause at `i`: `Some(Some(end))` when it names
+/// PL/pgSQL (`plpgsql` unquoted or single-quoted in any case, or
+/// `"plpgsql"`), `Some(None)` when there is no clause, `None` when it names
+/// another language or cannot be read (the body is then not analyzed:
+/// other languages are not SQL).
+fn language_clause(text: &str, i: usize) -> Option<Option<usize>> {
+    let b = text.as_bytes();
+    let is_kw = text
+        .get(i..i + 8)
+        .is_some_and(|w| w.eq_ignore_ascii_case("language"))
+        && !b.get(i + 8).copied().is_some_and(is_ident_cont);
+    if !is_kw {
+        return Some(None);
+    }
+    let mut j = i + 8;
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let (name, end, fold) = match b.get(j) {
+        Some(b'\'') | Some(b'"') => {
+            let q = b[j];
+            let close = text.get(j + 1..)?.find(char::from(q))? + j + 1;
+            if b.get(close + 1) == Some(&q) {
+                return None; // doubled quote: not a plain name
+            }
+            (text.get(j + 1..close)?, close + 1, q == b'\'')
+        }
+        Some(c) if is_ident_start(*c) => {
+            let mut k = j;
+            while k < b.len() && is_ident_cont(b[k]) {
+                k += 1;
+            }
+            (text.get(j..k)?, k, true)
+        }
+        _ => return None,
+    };
+    let plpgsql = if fold {
+        name.eq_ignore_ascii_case("plpgsql")
+    } else {
+        name == "plpgsql"
+    };
+    plpgsql.then_some(Some(end))
 }
 
 /// A PL/pgSQL statement reduced to its SQL part: leading block keywords
@@ -1673,6 +1727,70 @@ mod tests {
             AnalyzeOptions::new(),
         );
         assert_eq!(a.parts().iter().filter(|p| p.nested).count(), 1);
+    }
+
+    #[test]
+    fn only_plpgsql_do_bodies_are_analyzed() {
+        let nested = |q: &str| {
+            let a = analyze(q, AnalyzeOptions::new());
+            assert!(a.relations().iter().all(|r| r.name != "jane_dupont"), "{q}");
+            a.parts().iter().filter(|p| p.nested).count()
+        };
+        // Other languages: never lexed as SQL.
+        assert_eq!(
+            nested(
+                "do $$ const note = `select copied from jane_dupont`; plv8.elog(NOTICE, note); $$ language plv8"
+            ),
+            0
+        );
+        assert_eq!(
+            nested("do language plperl $$ my $s = q{select a from jane_dupont}; $$"),
+            0
+        );
+        assert_eq!(
+            nested("do $$\n# select a from jane_dupont\nplpy.notice('x')\n$$ language plpython3u"),
+            0
+        );
+        assert_eq!(
+            nested("do $$ perform 1 from jane_dupont; $$ language 'plv8'"),
+            0
+        );
+        assert_eq!(
+            nested("do $$ perform 1 from jane_dupont; $$ language \"PLPGSQL\""),
+            0
+        );
+        assert_eq!(
+            nested("do $$ perform 1 from jane_dupont; $$ language plpgsql garbage"),
+            0
+        );
+        assert_eq!(
+            nested("do $$ perform 1 from jane_dupont; $$ -- language plv8"),
+            0
+        );
+        assert_eq!(
+            nested("do language plpgsql $$ perform 1 from jane_dupont; $$ language plpgsql"),
+            0
+        );
+        assert_eq!(nested("do language $$ perform 1 from jane_dupont; $$"), 0);
+        // PL/pgSQL: default, or named before / after, any case, quoted.
+        let plpgsql = |q: &str| {
+            let a = analyze(q, AnalyzeOptions::new());
+            a.parts().iter().filter(|p| p.nested).count()
+        };
+        assert_eq!(plpgsql("do $$ begin perform 1 from crm.t; end $$"), 1);
+        assert_eq!(plpgsql("do $$ begin perform 1 from crm.t; end $$;"), 1);
+        assert_eq!(
+            plpgsql("DO LANGUAGE PLpgSQL $$ begin perform 1 from crm.t; end $$"),
+            1
+        );
+        assert_eq!(
+            plpgsql("do $$ begin perform 1 from crm.t; end $$ language 'PLPGSQL'"),
+            1
+        );
+        assert_eq!(
+            plpgsql("do $$ begin perform 1 from crm.t; end $$ language \"plpgsql\""),
+            1
+        );
     }
 
     #[test]

@@ -140,6 +140,28 @@ proptest! {
         prop_assert!(a.relations().len() <= 16);
     }
 
+    /// A DO block in another language never yields statements, whatever its
+    /// body holds.
+    #[test]
+    fn non_plpgsql_do_bodies_yield_nothing(
+        lang in prop::sample::select(vec![
+            "plv8", "plperl", "plperlu", "plpython3u", "pltcl", "'plv8'", "\"PLPGSQL\"",
+            "sql", "c", "plpgsqlx",
+        ]),
+        before in any::<bool>(),
+        body in "[a-z_ ;(),.*=`{}#\n]{0,80}",
+    ) {
+        let body = format!("{body} select a from zq_rel; perform * from zq_rel2;");
+        let text = if before {
+            format!("do language {lang} $zq${body}$zq$")
+        } else {
+            format!("do $zq${body}$zq$ language {lang}")
+        };
+        let a = analyze(&text, AnalyzeOptions::new());
+        prop_assert!(a.parts().iter().all(|p| !p.nested), "{text:?}");
+        prop_assert!(a.relations().is_empty(), "{text:?}");
+    }
+
     /// Utility statements never keep text, whatever follows.
     #[test]
     fn utility_statements_keep_no_text(
