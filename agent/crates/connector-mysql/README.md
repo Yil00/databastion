@@ -57,8 +57,11 @@ supported (the configuration refuses them; a server writing them is noted by
   server) and `SQL_TEXT` only for a statement without a digest, and puts
   any text through the query normalizer. `check()` reports this grant as
   over-privilege (`SELECT on performance_schema without Audit enabled`)
-  while no Audit stream runs for the target, and says nothing while one
-  does. No other grant is added: no `PROCESS`, no global privilege.
+  while no Audit stream runs for the target; while one runs, it says
+  nothing when `performance_schema` is the source, and reports the grant as
+  unused (`SELECT on performance_schema unused`) when the audit log is the
+  source (on MariaDB it exposes clear-text passwords for nothing). No other
+  grant is added: no `PROCESS`, no global privilege.
 - `USER()` gives the agent's own client address as the server sees it; no
   privilege needed.
 
@@ -87,6 +90,15 @@ the agent anyway: the contract has no field for it). A password typed
 without quotes is a syntax error; the connector drops statements the server
 could not parse (errors 1064, 1149).
 
+Character sets: in gbk, big5, sjis, cp932 and gb18030, `\` (0x5c) and a
+backtick (0x60) can be the second byte of a two-byte character, which the
+server reads as part of the character and a byte-level lexer as an escape
+or a quote. Statement texts are kept as raw bytes: text that is not UTF-8,
+or that has a byte >= 0x80 directly followed by 0x5c or 0x60, keeps only
+its statement kind (the event names `*`), never names. A JSON record that
+is not UTF-8 (a latin1 client) is parsed from a lossy decoding with its
+text treated the same way, instead of being dropped.
+
 ## Signals
 
 `signature.mysqldump` (whole-table read with `SQL_NO_CACHE`, a dump
@@ -96,7 +108,17 @@ read lock or `LOCK TABLES`, or ran `SHOW CREATE TABLE` on the table),
 refused ones), `shape.full_table_read`, and `volume.large_result`
 (`performance_schema` only). Details in
 [../classifiers/README.md](../classifiers/README.md#access-events-and-signals-adr-0007-p4-a).
-Heuristic signals are evadable by design.
+Heuristic signals are evadable by design. Known evasions of
+`signature.mysqldump`: a plain `SELECT *` per table (no `SQL_NO_CACHE`, no
+dump `program_name`, no snapshot or lock); `mysqldump --skip-lock-tables`
+without `--single-transaction` (no snapshot or lock evidence: only
+`SQL_NO_CACHE` and the program name remain, which a modified client or
+another tool does not send); chunked reads
+(`mydumper` with a chunk size, `WHERE` ranges: no whole-table read); and a
+statement padded past `server_audit_query_log_limit` or the
+`performance_schema` text limit (the cut text gives no shape). Volumes
+(`performance_schema`) and the console's volume × sensitivity score do not
+depend on these.
 
 ## Known limits
 
@@ -151,10 +173,22 @@ Heuristic signals are evadable by design.
   filtered queries stays unreported.
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by
-  `server_audit`, JSON-encoded by `audit_log`), so it cannot add records. A
-  damaged JSON record is dropped and counted, the following ones are kept.
-- **Failed statements** read no rows and are skipped, except `INTO
-  OUTFILE` attempts. Failed connections become `auth_failure` events with a
+  `server_audit`, JSON-encoded by `audit_log`), so it cannot add records.
+  `server_audit` escapes `'`, `\`, newline, carriage return, tab,
+  backspace and form feed; a record with any other escape is kept with
+  its text used for the statement kind only (the event names `*`). A
+  damaged JSON record is dropped, the following ones are kept; records
+  dropped (not parsable, oversized, damaged) are counted and shown by
+  `check()` for 24 h.
+- **Failed statements** are skipped only when the server refused them
+  before reading anything and they sent no row: a syntax error (1064,
+  1149; never an event), an unknown database, table or column (1049, 1051,
+  1054, 1109, 1146), an ambiguous or duplicate name (1052, 1066), access
+  denied (1044, 1142, 1143, 1227, 1370) or an unknown routine (1305);
+  `INTO OUTFILE` attempts are kept. Any other failure (a timeout or kill
+  after rows were sent, 3024, 1317…), and on `performance_schema` any
+  statement with `ROWS_SENT > 0`, is reported. Session state (snapshot,
+  `SHOW CREATE TABLE`) is only recorded from statements that succeeded. Failed connections become `auth_failure` events with a
   fingerprinted account, except handshake network errors (a port probe).
 
 ## Tests

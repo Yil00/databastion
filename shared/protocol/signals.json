@@ -20,7 +20,7 @@
     "engines": ["mysql", "mariadb"]
   },
   "signature.mysqldump": {
-    "description": "A mysqldump, mariadb-dump, mysqlpump or mydumper run: a whole-table read with SQL_NO_CACHE (what these tools send), by a client whose program_name is one of them, or in a session that took a consistent snapshot, a global read lock or LOCK TABLES, or ran SHOW CREATE TABLE on that table.",
+    "description": "A mysqldump, mariadb-dump, mysqlpump or mydumper run: a whole-table read with SQL_NO_CACHE (what these tools send), by a client whose program_name is one of them, or in a session that took a consistent snapshot, a global read lock or LOCK TABLES, or ran SHOW CREATE TABLE on that table. Heuristic: evadable by design.",
     "engines": ["mysql", "mariadb"]
   },
   "signature.pg_dump": {
