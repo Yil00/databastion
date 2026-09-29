@@ -413,6 +413,7 @@ Frozen names (renaming one is a breaking change; the provisional Grafana dashboa
 | `databastion_security_events` | | rows of `security_events` |
 | `databastion_console_argon2_operations_total` | | argon2id operations of this process |
 | `databastion_console_rate_limit_store_errors_total` | | shared rate-limit store operations of this process that failed or timed out |
+| `databastion_console_rate_limit_store_short_circuits_total` | | shared rate-limit operations of this process answered by the failure mode during the circuit breaker, without calling the store |
 | `databastion_console_rate_limit_counters_rows` | | rows of `rate_limit_counters`, expired ones included, counted up to 1 000 000: alarm when it grows far beyond the number of active clients (floods of distinct keys between two prunes) |
 | `databastion_metrics_series_dropped` | | series dropped by the caps in the last scrape |
 
@@ -448,6 +449,12 @@ run, with no second bundler configuration to keep in sync; the cost is a larger 
 `node_modules` next to the standalone web bundle) and a short transpilation at startup.
 `HEALTHCHECK` ([docker/healthcheck.sh](docker/healthcheck.sh)) probes `/api/health` for `web` and
 reports healthy for the other commands. The image is not built by the CI yet.
+
+Database connections (plan PostgreSQL `max_connections` from them). Per **web** process: the main
+pool (10), the dedicated rate-limit pool (3, P4-D, see "Shared rate limits"), the send-only pg-boss
+pool (2) and the job-hub `LISTEN` connection (1): 13 for the query pools, 16 in all. The **worker**:
+its pg-boss pool (10, the pg-boss default) and its query pool (10). With N web replicas, plan at
+least N x 16 + 20 connections, plus PostgreSQL's reserved and administration connections.
 
 ## Data at rest
 | Data | Storage |
@@ -501,7 +508,10 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
   subset of the shared ones, so it can only refuse earlier, never admit more. When the store reports
   a key at its limit (a refused reservation, a hit or a check at the limit), the process records the
   key as limited until the end of the store's window: a flood on one key then costs each process at
-  most about `limit + 1` statements per window, whatever the number of requests. Consequence: a slot
+  most about `limit + 1` statements per window, whatever the number of requests. The three
+  agent-authentication limits are checked together and none is sent to the store when one of them
+  is already limited in the process: a source over the cheap per-/48 limit that rotates agent ids
+  and /64s costs no statement at all. Consequence: a slot
   given back (refund) in one process is only seen by another process that already refused the key
   at the end of the window, which is what `Retry-After` announces anyway. A secret in the 25 s
   verified cache or known good per the in-memory hint skips the shared check entirely (it is exempt
@@ -509,12 +519,24 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
 - **Dedicated pool**: the counters use their own pool of 3 connections (`lock_timeout` 1.5 s,
   `statement_timeout` 2 s, 2 s to get a connection), so a hot counter row can never starve the main
   pool, and a statement the limiter gave up on is cancelled by the server, never committed late.
+- **Circuit breaker**: after a store failure (an error, a timeout, no free connection), the process
+  does not call the store for 1.5 s; every limiter applies its failure mode at once (counted in
+  `databastion_console_rate_limit_store_short_circuits_total`). This sheds the queue of the
+  dedicated pool during an outage and bounds the latency of a login, which checks several limiters
+  in a row.
+- **IPv6 buckets**: `/enroll` per source IP buckets IPv6 by /56 (like logins: the usual per-site
+  allocation, so rotating /64s of one site gains nothing, while a fleet enrolled from several sites
+  of one /48 is not held by one bucket; enrollment tokens are 256-bit, so the limit bounds work,
+  not guessing); the cheap agent-authentication limit by /48 (see above); the other per-IP limits
+  keep /64.
 - **Username keys without a server key**: the per-(username, IP), per-username and degraded-login
   limits stay per process when no server key is available (only possible in production with
   `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1`, which logs it), rather than store an unkeyed hash of
   what was typed in the username field.
 - **Login timing**: every login reserves the unknown-username budget, concurrently with the user
   lookup (a known user gives it back), so known and unknown usernames pay the same store latency.
+  The price: every login of a known user writes the budget's single row twice (reservation and
+  refund).
 - **Store failures** (an error, a server-side lock or statement timeout, no connection within 2 s,
   or no answer within 5 s), logged at most once per minute per limiter (never the key) and counted
   in `databastion_console_rate_limit_store_errors_total`:
