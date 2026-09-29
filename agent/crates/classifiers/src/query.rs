@@ -670,7 +670,10 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     // level), so a `COPY … TO PROGRAM` inside a block is seen.
     if statements.len() == 1 && word(statements[0].first()) == Some("do") {
         if let Some(body) = do_body(text) {
-            if let Ok(inner) = lex(body, true) {
+            // Same fail-closed rule as the outer text: a body whose
+            // reading depends on `standard_conforming_strings` (any role
+            // can `SET` it) gives no nested part.
+            if let Some(inner) = lex_unambiguous(body) {
                 for st in split_statements(&inner) {
                     if let Some(st) = plpgsql_statement(st) {
                         let info = statement_info(&st, opts, true);
@@ -706,6 +709,18 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         statements: statements.len(),
         parts,
     }
+}
+
+/// Lexes `text` when its reading does not depend on
+/// `standard_conforming_strings`: without a backslash, or when both
+/// readings give the same tokens. `None` otherwise, or when it does not
+/// lex. Every sub-text holding code is lexed through this.
+fn lex_unambiguous(text: &str) -> Option<Vec<Tok>> {
+    let tokens = lex(text, true).ok()?;
+    if text.contains('\\') && lex(text, false).ok()? != tokens {
+        return None;
+    }
+    Some(tokens)
 }
 
 /// Most statements described per text.
@@ -1637,6 +1652,27 @@ mod tests {
                 .iter()
                 .all(|p| !p.nested)
         );
+    }
+
+    #[test]
+    fn ambiguous_do_bodies_give_no_nested_part() {
+        // Valid with standard_conforming_strings = off: the literal runs
+        // to the second quote, and `jane_dupont` is literal text.
+        let a = analyze(
+            "do $$ begin perform 'O\\'Brien from jane_dupont', 'D\\'Arc'; end $$",
+            AnalyzeOptions::new(),
+        );
+        assert!(a.parts().iter().all(|p| !p.nested), "{:?}", a.parts().len());
+        assert!(
+            a.relations().iter().all(|r| r.name != "jane_dupont"),
+            "literal text became a relation"
+        );
+        // A backslash that reads the same both ways is fine.
+        let a = analyze(
+            "do $$ begin perform E'a\\nb' from crm.t; end $$",
+            AnalyzeOptions::new(),
+        );
+        assert_eq!(a.parts().iter().filter(|p| p.nested).count(), 1);
     }
 
     #[test]

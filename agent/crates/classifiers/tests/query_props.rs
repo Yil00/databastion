@@ -40,6 +40,11 @@ fn hiding(m: String, d: String, tag: String) -> Vec<String> {
         format!("0x{d}"),
         format!("DATE '{m}'"),
         format!("interval '{m}'"),
+        // Plain literals with backslashes: read differently when
+        // standard_conforming_strings is off.
+        format!("'x\\' from {m}_t where \\'"),
+        format!("'{m}\\'"),
+        format!("'a\\' , {m} , '"),
     ]
 }
 
@@ -48,7 +53,7 @@ fn statement() -> impl Strategy<Value = (String, String, String)> {
         marker(),
         digits(),
         "[a-z_][a-z0-9_]{0,5}",
-        prop::collection::vec(0usize..18, 1..6),
+        prop::collection::vec(0usize..21, 1..6),
         prop::sample::select(vec![
             "select a, {} from crm.t where b = {}",
             "select * from t where c in ({}, {})",
@@ -61,6 +66,7 @@ fn statement() -> impl Strategy<Value = (String, String, String)> {
             "select {}; select {}",
             "select {}; alter system set x = {}",
             "do $zq$ begin perform a, {} from crm.t where b = {}; end $zq$",
+            "do $zq$ begin perform {}, {} from crm.t; end $zq$",
             "select {}; copy (select {} from t) to program 'x'",
         ]),
     )
