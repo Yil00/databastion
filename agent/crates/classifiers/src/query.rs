@@ -8,7 +8,8 @@
 //! field, so no statement text ever leaves the agent; this module is what
 //! the connectors use to look at the text anyway:
 //!
-//! - [`analyze`] lexes the text (PostgreSQL dialect) and extracts, from
+//! - [`analyze`] lexes the text (PostgreSQL dialect, or MySQL / MariaDB with
+//!   [`AnalyzeOptions::mysql`], see below) and extracts, from
 //!   literal-free tokens only, the statement kind, the relations it names,
 //!   the `COPY` form and the shape features the signals need (`*` list,
 //!   top-level `WHERE`, `LIMIT`). Names come from identifier tokens, never
@@ -33,6 +34,38 @@
 //! different token sequence, the reading is ambiguous and the analysis
 //! keeps neither text, relations nor shape (only the statement kind when
 //! both readings agree on it).
+//!
+//! **MySQL / MariaDB dialect** ([`Dialect::Mysql`]). The session
+//! `sql_mode` of a logged statement is unknown, so the text is lexed under
+//! every reading it may have been written for: with and without
+//! `NO_BACKSLASH_ESCAPES` (when it holds a backslash) and with and without
+//! `ANSI_QUOTES` (when it holds a double quote). The readings must give the
+//! same tokens, otherwise the text is ambiguous and keeps nothing but the
+//! statement kind, as above. Lexical rules: `'…'` and `"…"` are strings
+//! (quotes doubled, backslash escapes unless `NO_BACKSLASH_ESCAPES`);
+//! under `ANSI_QUOTES`, `"…"` is an identifier, but its content is still
+//! never read as a name (a `"…"` token is opaque in every reading);
+//! `` `…` `` is a quoted identifier; `N'…'`, `X'…'`, `B'…'` and the
+//! `_charset'…'` introducers are literals; `0x…`, `0b…` and numbers are
+//! literals; `?` is a placeholder (digest text); `#…` and `-- …` (a double
+//! dash followed by a space, a control character or the end) are line
+//! comments; `/* … */` comments do not nest; an executable comment
+//! (`/*! … */`, `/*!NNNNN … */`, MariaDB `/*M! … */`) is read as code,
+//! and its content must lex completely before its first `*/` (a literal
+//! running past it, or a nested comment, fails closed). A version
+//! comment is only certain to run when it has no version or a five-digit
+//! version below 5.7.0 (every supported server runs it; MariaDB skips
+//! `/*!50700` to `/*!99999`); otherwise (six digits, 5.7.0 and later,
+//! every MariaDB-only `/*M!`) the server may read
+//! it as a comment, so that reading is lexed too and must agree. Text with
+//! a byte >= 0x80 directly followed by `\` or a backtick (the trail byte
+//! of a two-byte character in gbk, big5, sjis, cp932 or gb18030) keeps
+//! only its kind, and so does text whose bytes are not UTF-8
+//! ([`analyze_raw`]). Optimizer hints
+//! (`/*+ … */`) are comments. The DML allow-list adds `REPLACE`; `CREATE`
+//! / `ALTER` / `DROP` / `RENAME` `USER` / `ROLE` and `SET PASSWORD` are
+//! DCL. `SELECT … INTO OUTFILE` / `INTO DUMPFILE` is reported
+//! ([`StatementInfo::outfile`]), and the file name is never a relation.
 
 use std::fmt;
 
@@ -77,6 +110,302 @@ enum LexError {
 
 fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+}
+
+/// SQL dialect of a statement text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Dialect {
+    /// PostgreSQL (pgaudit, `pg_stat_statements`).
+    #[default]
+    Postgres,
+    /// MySQL and MariaDB (`server_audit`, `audit_log`,
+    /// `performance_schema`); see the module documentation.
+    Mysql,
+}
+
+/// Lexing mode of a MySQL / MariaDB text: the two `sql_mode` flags that
+/// change token boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MyMode {
+    /// Backslash escapes in strings (no `NO_BACKSLASH_ESCAPES`).
+    backslash: bool,
+    /// `ANSI_QUOTES`: `"…"` is an identifier.
+    ansi_quotes: bool,
+    /// Version comments whose version may be above the server's
+    /// ([`version_always_executed`] false) are comments.
+    version_as_comment: bool,
+}
+
+/// Whether a version comment `/*!NNNNN` runs on every supported server:
+/// a five-digit version below 5.7.0 (50700). MySQL 8.0+ runs every
+/// five-digit version comment up to its own version, but MariaDB (10.6+)
+/// skips `/*!50700` to `/*!99999` (measured on MariaDB 11.4.13), so from
+/// 50700 up a supported server may read it as a comment. `/*!` without a
+/// version always runs; MariaDB's `/*M!` runs only on MariaDB, so it is
+/// never "always".
+fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
+    if mariadb_only {
+        return false;
+    }
+    if digits.is_empty() {
+        return true;
+    }
+    digits.len() == 5
+        && std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| d.parse::<u32>().ok())
+            .is_some_and(|v| v < 50_700)
+}
+
+/// Longest version number of an executable comment (`/*!NNNNNN`).
+const MAX_COMMENT_VERSION_DIGITS: usize = 6;
+
+fn is_my_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_my_op_char(b: u8) -> bool {
+    matches!(
+        b,
+        b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'=' | b'~' | b'!' | b'%' | b'^' | b'&' | b'|'
+    )
+}
+
+/// `--` at `i` starts a MySQL comment: the second dash is followed by a
+/// space, a control character or the end of the text.
+fn my_dash_comment(b: &[u8], i: usize, end: usize) -> bool {
+    b.get(i) == Some(&b'-')
+        && b.get(i + 1) == Some(&b'-')
+        && (i + 2 >= end || b.get(i + 2).is_none_or(|c| *c <= 0x20))
+}
+
+/// Lexes a MySQL / MariaDB text under one `sql_mode` reading.
+fn lex_mysql(text: &str, mode: MyMode) -> Result<Vec<Tok>, LexError> {
+    if text.len() > MAX_QUERY_BYTES {
+        return Err(LexError::TooLong);
+    }
+    let mut out = Vec::new();
+    lex_mysql_range(text, 0, text.len(), mode, false, &mut out)?;
+    Ok(out)
+}
+
+/// Lexes `text[start..end]` into `out`. `in_comment`: the range is the
+/// content of an executable comment (a comment start there fails).
+fn lex_mysql_range(
+    text: &str,
+    start: usize,
+    end: usize,
+    mode: MyMode,
+    in_comment: bool,
+    out: &mut Vec<Tok>,
+) -> Result<(), LexError> {
+    let b = text.as_bytes();
+    let mut i = start;
+    while i < end {
+        if out.len() >= MAX_TOKENS {
+            return Err(LexError::TooLong);
+        }
+        let c = b[i];
+        let next = if i + 1 < end { Some(b[i + 1]) } else { None };
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+            i += 1;
+            continue;
+        }
+        // Line comments: `#…` and `-- …`.
+        if c == b'#' || my_dash_comment(b, i, end) {
+            if in_comment {
+                // Where a line comment inside an executable comment ends
+                // is not settled: fail closed.
+                return Err(LexError::Unterminated);
+            }
+            while i < end && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && next == Some(b'*') {
+            if in_comment {
+                return Err(LexError::Unterminated);
+            }
+            let close = find(&b[i + 2..end], b"*/").ok_or(LexError::Unterminated)? + i + 2;
+            // Executable comment: `/*!`, `/*!NNNNN`, `/*M!`, `/*M!NNNNNN`.
+            let bang = match (b.get(i + 2), b.get(i + 3)) {
+                (Some(b'!'), _) => Some(i + 3),
+                (Some(b'M'), Some(b'!')) => Some(i + 4),
+                _ => None,
+            };
+            if let Some(mut j) = bang {
+                let digits_start = j;
+                while j < close
+                    && b[j].is_ascii_digit()
+                    && j - digits_start < MAX_COMMENT_VERSION_DIGITS
+                {
+                    j += 1;
+                }
+                let mariadb_only = b.get(i + 2) == Some(&b'M');
+                let always = version_always_executed(mariadb_only, &b[digits_start..j]);
+                if always || !mode.version_as_comment {
+                    lex_mysql_range(text, j.min(close), close, mode, true, out)?;
+                }
+            }
+            i = close + 2;
+            continue;
+        }
+        // Prefixed strings: N'…', X'…', B'…'.
+        if matches!(c, b'n' | b'N' | b'b' | b'B' | b'x' | b'X') && next == Some(b'\'') {
+            i = skip_quoted(b, i + 1, end, b'\'', mode.backslash)?;
+            out.push(Tok::Literal);
+            continue;
+        }
+        match c {
+            b'\'' => {
+                i = skip_quoted(b, i, end, b'\'', mode.backslash)?;
+                out.push(Tok::Literal);
+            }
+            b'"' => {
+                // A string, or an identifier under ANSI_QUOTES: opaque in
+                // both readings (never a name).
+                i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
+                out.push(Tok::Literal);
+            }
+            b'`' => {
+                let mut j = i + 1;
+                let mut name = Vec::new();
+                loop {
+                    if j >= end {
+                        return Err(LexError::Unterminated);
+                    }
+                    if b[j] == b'`' {
+                        if j + 1 < end && b[j + 1] == b'`' {
+                            name.push(b'`');
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    name.push(b[j]);
+                    j += 1;
+                }
+                i = j + 1;
+                out.push(Tok::Quoted(String::from_utf8_lossy(&name).into_owned()));
+            }
+            b'?' => {
+                out.push(Tok::Param);
+                i += 1;
+            }
+            b'0'..=b'9' => {
+                let from = i;
+                i = skip_number(b, i).min(end);
+                let digits = &text[from..i];
+                match digits.parse::<u64>() {
+                    Ok(v) if digits.bytes().all(|d| d.is_ascii_digit()) => out.push(Tok::Int(v)),
+                    _ => out.push(Tok::Literal),
+                }
+            }
+            b'.' if next.is_some_and(|d| d.is_ascii_digit()) => {
+                i = skip_number(b, i).min(end);
+                out.push(Tok::Literal);
+            }
+            _ if is_ident_start(c) || c == b'$' => {
+                let from = i;
+                while i < end && is_my_ident_cont(b[i]) {
+                    i += 1;
+                }
+                out.push(Tok::Word(text[from..i].to_ascii_lowercase()));
+            }
+            _ if is_my_op_char(c) => {
+                let from = i;
+                while i < end && is_my_op_char(b[i]) {
+                    if i > from
+                        && ((b[i] == b'/' && i + 1 < end && b[i + 1] == b'*')
+                            || my_dash_comment(b, i, end))
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(Tok::Punct(text[from..i].to_owned()));
+            }
+            _ => {
+                out.push(Tok::Punct(char::from(c).to_string()));
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Skips a string quoted with `q` starting at `b[start] == q`, within
+/// `end`: the quote doubled is a quote; `backslash`: a backslash escapes
+/// the next byte. Returns the index after the closing quote.
+fn skip_quoted(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    q: u8,
+    backslash: bool,
+) -> Result<usize, LexError> {
+    let mut i = start + 1;
+    loop {
+        if i >= end {
+            return Err(LexError::Unterminated);
+        }
+        let c = b[i];
+        if c == b'\\' && backslash {
+            i += 2;
+        } else if c == q {
+            if i + 1 < end && b[i + 1] == q {
+                i += 2;
+            } else {
+                return Ok(i + 1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Every `sql_mode` reading a MySQL text may have been written for.
+fn my_modes(text: &str) -> Vec<MyMode> {
+    let backslash: &[bool] = if text.contains('\\') {
+        &[true, false]
+    } else {
+        &[true]
+    };
+    let ansi: &[bool] = if text.contains('"') {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let version: &[bool] = if text.contains("/*!") || text.contains("/*M!") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let mut out = Vec::new();
+    for &bs in backslash {
+        for &aq in ansi {
+            for &vc in version {
+                out.push(MyMode {
+                    backslash: bs,
+                    ansi_quotes: aq,
+                    version_as_comment: vc,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Multibyte character sets (gbk, big5, sjis, cp932, gb18030) can have a
+/// `\` (0x5c) or a backtick (0x60) as the trail byte of a two-byte
+/// character, which the server reads as part of the character and this
+/// lexer as a quote or escape: text with a byte >= 0x80 directly followed
+/// by one of them cannot be lexed reliably.
+fn multibyte_hazard(b: &[u8]) -> bool {
+    b.windows(2)
+        .any(|w| w[0] >= 0x80 && (w[1] == b'\\' || w[1] == b'`'))
 }
 
 fn is_ident_cont(b: u8) -> bool {
@@ -379,8 +708,11 @@ pub enum StatementKind {
     Copy,
     /// Schema change: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COMMENT`.
     Ddl,
-    /// Privilege change: `GRANT`, `REVOKE`.
+    /// Privilege change: `GRANT`, `REVOKE` (MySQL: also account and
+    /// role statements, `SET PASSWORD`).
     Dcl,
+    /// MySQL `HANDLER t …`: reads rows without a `SELECT`.
+    Handler,
     /// Anything else, or no statement.
     Other,
 }
@@ -406,7 +738,10 @@ impl StatementKind {
     /// be kept).
     #[must_use]
     pub fn is_dml(self) -> bool {
-        !matches!(self, Self::Copy | Self::Ddl | Self::Dcl | Self::Other)
+        !matches!(
+            self,
+            Self::Copy | Self::Ddl | Self::Dcl | Self::Handler | Self::Other
+        )
     }
 
     /// Whether the statement reads rows (`SELECT`, `TABLE`, `VALUES`).
@@ -533,7 +868,18 @@ pub struct StatementInfo {
     pub copy: Option<CopyInfo>,
     /// From the body of a `DO` block.
     pub nested: bool,
+    /// MySQL `SELECT … INTO OUTFILE` / `INTO DUMPFILE`: rows written to a
+    /// file on the database server.
+    pub outfile: bool,
+    /// The leading unquoted words of the statement (at most
+    /// [`MAX_LEAD_WORDS`], ASCII-lowercased, from code tokens only, never
+    /// from a literal or a comment): the keywords of utility statements
+    /// (`flush tables with read lock`, `show create table`). Never sent.
+    pub lead: Vec<String>,
 }
+
+/// Most leading words kept in [`StatementInfo::lead`].
+pub const MAX_LEAD_WORDS: usize = 6;
 
 /// Result of [`analyze`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,6 +962,19 @@ pub struct AnalyzeOptions {
     pub possibly_truncated: bool,
     /// Limit from which a query counts as reading a whole relation.
     pub large_limit: u64,
+    /// Dialect of the text.
+    pub dialect: Dialect,
+    /// The text cannot be trusted to lex like the server read it (bytes
+    /// that were not UTF-8, an escape the source's format does not
+    /// define): only the statement kind is kept, from the prefix before
+    /// the first quote or comment.
+    pub opaque: bool,
+    /// The source has already transcoded the text to UTF-8 on the server
+    /// (MySQL `performance_schema`, read through a utf8mb4 connection): its
+    /// bytes are characters, not the client's multibyte encoding, so the
+    /// gbk / sjis trail-byte guard does not apply. Bytes that are not UTF-8
+    /// still make the text opaque.
+    pub transcoded: bool,
 }
 
 impl AnalyzeOptions {
@@ -627,6 +986,33 @@ impl AnalyzeOptions {
         Self {
             possibly_truncated: false,
             large_limit: 10_001,
+            dialect: Dialect::Postgres,
+            opaque: false,
+            transcoded: false,
+        }
+    }
+
+    /// Marks the text as transcoded to UTF-8 by its source (see
+    /// [`AnalyzeOptions::transcoded`]).
+    #[must_use]
+    pub fn transcoded(mut self, transcoded: bool) -> Self {
+        self.transcoded = transcoded;
+        self
+    }
+
+    /// Marks the text as opaque (see [`AnalyzeOptions::opaque`]).
+    #[must_use]
+    pub fn opaque(mut self, opaque: bool) -> Self {
+        self.opaque = opaque;
+        self
+    }
+
+    /// Like [`new`](Self::new), for MySQL / MariaDB text.
+    #[must_use]
+    pub fn mysql() -> Self {
+        Self {
+            dialect: Dialect::Mysql,
+            ..Self::new()
         }
     }
 
@@ -641,6 +1027,12 @@ impl AnalyzeOptions {
 /// Analyzes statement text. See the module documentation for what is kept.
 #[must_use]
 pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
+    if opts.dialect == Dialect::Mysql {
+        return analyze_mysql(text, opts);
+    }
+    if opts.opaque {
+        return QueryAnalysis::unparsed(first_kind_prefix(text));
+    }
     let Ok(tokens) = lex(text, true) else {
         return QueryAnalysis::unparsed(first_kind_prefix(text));
     };
@@ -711,6 +1103,150 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     }
 }
 
+/// [`analyze`] of statement text as raw bytes from its source: bytes that
+/// are not UTF-8 make the text opaque (only the statement kind is kept);
+/// the text is never decoded lossily for analysis.
+#[must_use]
+pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
+    match std::str::from_utf8(raw) {
+        Ok(text) => analyze(text, opts),
+        Err(e) => {
+            // The valid prefix only, for the kind.
+            let prefix = std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or("");
+            analyze(prefix, opts.opaque(true))
+        }
+    }
+}
+
+/// [`analyze`] for MySQL / MariaDB text: every `sql_mode` reading must
+/// give the same tokens.
+fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
+    if opts.opaque || (!opts.transcoded && multibyte_hazard(text.as_bytes())) {
+        return QueryAnalysis::unparsed(my_kind_prefix(text));
+    }
+    let mut readings = my_modes(text).into_iter().map(|m| lex_mysql(text, m));
+    let first = readings.next().unwrap_or(Err(LexError::Unterminated));
+    let tokens = match first {
+        Ok(t) => {
+            let mut agree = true;
+            let mut kinds_agree = true;
+            for other in readings {
+                match other {
+                    Ok(o) if o == t => {}
+                    Ok(o) => {
+                        agree = false;
+                        kinds_agree &= my_kind(&o) == my_kind(&t);
+                    }
+                    Err(_) => {
+                        agree = false;
+                        kinds_agree = false;
+                    }
+                }
+            }
+            if !agree {
+                return QueryAnalysis::unparsed(if kinds_agree {
+                    my_kind(&t)
+                } else {
+                    StatementKind::Other
+                });
+            }
+            t
+        }
+        Err(_) => return QueryAnalysis::unparsed(my_kind_prefix(text)),
+    };
+    let statements = split_statements(&tokens);
+    let kind = statements
+        .first()
+        .map_or(StatementKind::Other, |s| my_kind(s));
+    let mut relations = Vec::new();
+    for s in &statements {
+        collect_relations_dialect(s, Dialect::Mysql, &mut relations);
+    }
+    let parts: Vec<StatementInfo> = statements
+        .iter()
+        .take(MAX_PARTS)
+        .map(|s| statement_info(s, opts, false))
+        .collect();
+    let shape = match statements.first() {
+        Some(first) if !opts.possibly_truncated && kind.is_read() => main_shape(first),
+        _ => None,
+    };
+    let all_dml = !statements.is_empty() && statements.iter().all(|s| my_kind(s).is_dml());
+    let normalized = (all_dml && !opts.possibly_truncated).then(|| normalize_tokens(&tokens));
+    QueryAnalysis {
+        kind,
+        normalized,
+        relations,
+        shape,
+        copy: None,
+        statements: statements.len(),
+        parts,
+    }
+}
+
+/// Statement kind of a MySQL statement: [`first_kind`], plus `REPLACE`
+/// (a write), `HANDLER`, and account / role statements as DCL.
+fn my_kind(s: &[Tok]) -> StatementKind {
+    let Some(i) = main_start(s) else {
+        return StatementKind::Other;
+    };
+    let second = word(s.get(i + 1));
+    match word(s.get(i)) {
+        Some("replace") => StatementKind::Insert,
+        Some("handler") => StatementKind::Handler,
+        // Digest text writes `USER` as `SYSTEM_USER` (MySQL).
+        Some("create" | "alter" | "drop" | "rename")
+            if matches!(second, Some("user" | "role" | "system_user")) =>
+        {
+            StatementKind::Dcl
+        }
+        Some("set") if matches!(second, Some("password" | "role" | "default")) => {
+            StatementKind::Dcl
+        }
+        _ => first_kind(s),
+    }
+}
+
+/// Kind from the first word of a MySQL text that did not lex: the prefix
+/// up to the first quote or comment is lexed alone (it holds no literal).
+fn my_kind_prefix(text: &str) -> StatementKind {
+    let end = text
+        .find(['\'', '"', '`', '#', '-', '/'])
+        .unwrap_or(text.len())
+        .min(256);
+    let Some(prefix) = text.get(..end) else {
+        return StatementKind::Other;
+    };
+    let mode = MyMode {
+        backslash: true,
+        ansi_quotes: false,
+        version_as_comment: true,
+    };
+    lex_mysql(prefix, mode).map_or(StatementKind::Other, |t| my_kind(&t))
+}
+
+/// The leading words of a statement (after leading parentheses).
+fn lead_words(s: &[Tok]) -> Vec<String> {
+    s.iter()
+        .skip_while(|t| is_punct(Some(t), "("))
+        .map_while(|t| match t {
+            Tok::Word(w) => Some(w.clone()),
+            _ => None,
+        })
+        .take(MAX_LEAD_WORDS)
+        .collect()
+}
+
+/// `INTO OUTFILE '…'` / `INTO DUMPFILE '…'` anywhere in a statement (`?`
+/// in digest text).
+fn has_outfile(s: &[Tok]) -> bool {
+    s.windows(3).any(|w| {
+        matches!(&w[0], Tok::Word(i) if i == "into")
+            && matches!(&w[1], Tok::Word(f) if f == "outfile" || f == "dumpfile")
+            && matches!(w[2], Tok::Literal | Tok::Param)
+    })
+}
+
 /// Lexes `text` when its reading does not depend on
 /// `standard_conforming_strings`: without a backslash, or when both
 /// readings give the same tokens. `None` otherwise, or when it does not
@@ -727,9 +1263,12 @@ fn lex_unambiguous(text: &str) -> Option<Vec<Tok>> {
 const MAX_PARTS: usize = 64;
 
 fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInfo {
-    let kind = first_kind(s);
+    let kind = match opts.dialect {
+        Dialect::Mysql => my_kind(s),
+        Dialect::Postgres => first_kind(s),
+    };
     let mut relations = Vec::new();
-    collect_relations(s, &mut relations);
+    collect_relations_dialect(s, opts.dialect, &mut relations);
     let (shape, copy) = if opts.possibly_truncated {
         (None, None)
     } else {
@@ -745,6 +1284,8 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         shape,
         copy,
         nested,
+        outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
+        lead: lead_words(s),
     }
 }
 
@@ -1126,6 +1667,47 @@ fn cte_names(s: &[Tok]) -> Vec<String> {
     out
 }
 
+/// [`collect_relations`], plus, in MySQL, the tables named by `SHOW CREATE
+/// TABLE|VIEW t`, `SHOW COLUMNS|FIELDS|INDEX … FROM t` (through `FROM`),
+/// `LOCK TABLES t …, u …` and `HANDLER t …`.
+fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<RelationName>) {
+    collect_relations(s, out);
+    if dialect != Dialect::Mysql {
+        return;
+    }
+    let none: [String; 0] = [];
+    let lead = lead_words(s);
+    let lead: Vec<&str> = lead.iter().map(String::as_str).collect();
+    let start = s.iter().take_while(|t| is_punct(Some(t), "(")).count();
+    match lead.as_slice() {
+        ["show", "create", "table" | "view", ..] => {
+            read_relation(s, start + 3, &none, false, out);
+        }
+        ["handler", ..] => {
+            read_relation(s, start + 1, &none, false, out);
+        }
+        ["lock", "tables" | "table", ..] => {
+            // `LOCK TABLES t [[AS] a] READ [LOCAL] | [LOW_PRIORITY] WRITE, …`
+            let mut i = start + 2;
+            loop {
+                let next = read_relation(s, i, &none, false, out);
+                if next == i {
+                    break;
+                }
+                i = next;
+                while i < s.len() && !is_punct(s.get(i), ",") {
+                    i += 1;
+                }
+                if i >= s.len() {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Collects the relations named after `FROM` (and its comma list),
 /// `JOIN`, `UPDATE`, `INTO`, `COPY`, `USING`, and `TABLE` at a statement
 /// or subquery start, outside function-call parentheses.
@@ -1248,6 +1830,12 @@ fn read_relation(
     while matches!(word(s.get(i)), Some("only" | "lateral")) {
         i += 1;
     }
+    // MySQL `INTO OUTFILE '…'` / `INTO DUMPFILE '…'`: a file, not a relation.
+    if matches!(word(s.get(i)), Some("outfile" | "dumpfile"))
+        && matches!(s.get(i + 1), Some(Tok::Literal | Tok::Param))
+    {
+        return i + 2;
+    }
     let Some((parts, next)) = qualified_name(s, i) else {
         return i;
     };
@@ -1350,9 +1938,16 @@ fn main_shape(s: &[Tok]) -> Option<Shape> {
                     shape.filtered = true;
                 }
                 "group" | "having" => shape.aggregated = true,
-                "limit" => match s.get(i + 1) {
-                    Some(Tok::Word(a)) if a == "all" => {}
-                    Some(Tok::Int(n)) => shape.limit = Limit::Rows(*n),
+                "limit" => match (s.get(i + 1), s.get(i + 2), s.get(i + 3)) {
+                    (Some(Tok::Word(a)), _, _) if a == "all" => {}
+                    // MySQL `LIMIT offset, count`.
+                    (Some(Tok::Int(_)), Some(Tok::Punct(p)), Some(Tok::Int(n))) if p == "," => {
+                        shape.limit = Limit::Rows(*n);
+                    }
+                    (Some(Tok::Int(_) | Tok::Param), Some(Tok::Punct(p)), _) if p == "," => {
+                        shape.limit = Limit::Unknown;
+                    }
+                    (Some(Tok::Int(n)), _, _) => shape.limit = Limit::Rows(*n),
                     _ => shape.limit = Limit::Unknown,
                 },
                 "fetch" => {
@@ -1863,5 +2458,263 @@ mod tests {
         let a = analyze("select * from \"jane@example.com\"", AnalyzeOptions::new());
         let d = format!("{a:?}");
         assert!(!d.contains("jane"), "{d}");
+    }
+
+    fn my(s: &str) -> QueryAnalysis {
+        analyze(s, AnalyzeOptions::mysql())
+    }
+
+    fn my_norm(s: &str) -> Option<String> {
+        my(s).normalized().map(|n| n.as_str().to_owned())
+    }
+
+    fn my_rels(s: &str) -> Vec<(Option<String>, String)> {
+        my(s)
+            .relations()
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn mysql_literals_and_comments_become_placeholders() {
+        assert_eq!(
+            my_norm(
+                "SELECT `a`, b FROM hr.employees WHERE email = 'jane@example.com' \
+                 AND n = N'x' AND h = X'4A' AND bits = b'01' AND c = _utf8mb4'y' \
+                 AND z = 0x1F AND w = 1.5e3 AND v = ? # tail jane@example.com\n \
+                 -- another jane@example.com\n /* block jane@example.com */ LIMIT 5"
+            )
+            .unwrap(),
+            "select \"a\" , b from hr . employees where email = ? and n = ? and h = ? and \
+             bits = ? and c = _utf8mb4 ? and z = ? and w = ? and v = ? limit ?"
+        );
+        // `--` without a space is two minus signs, not a comment.
+        assert_eq!(
+            my_norm("select 1--2 from t").unwrap(),
+            "select ? -- ? from t"
+        );
+        assert!(my_norm("select 'open").is_none());
+        assert!(my_norm("select `open").is_none());
+        assert!(my_norm("select /* open").is_none());
+        assert!(my_norm("select \"open").is_none());
+    }
+
+    #[test]
+    fn mysql_executable_comments_are_code() {
+        let a = my("SELECT /*!40001 SQL_NO_CACHE */ * FROM `employees`");
+        assert_eq!(a.parts()[0].lead, ["select", "sql_no_cache"]);
+        assert_eq!(
+            my_rels("SELECT /*!40001 SQL_NO_CACHE */ * FROM `employees`"),
+            vec![r(None, "employees")]
+        );
+        assert!(a.shape().unwrap().whole_relation(10_001));
+        // Always executed on a supported server: read as code.
+        assert_eq!(
+            my_norm("select /*!50000 'secret', */ a from t").unwrap(),
+            "select ? , a from t"
+        );
+        for q in [
+            "SELECT /*!40100 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!32311 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!40101 SQL_NO_CACHE */ * FROM t",
+            "SELECT /*!50699 SQL_NO_CACHE */ * FROM t",
+        ] {
+            assert_eq!(my(q).parts()[0].lead, ["select", "sql_no_cache"], "{q}");
+        }
+        // Maybe a comment (MariaDB-only, or a version from 5.7.0, which
+        // MariaDB skips): both readings must agree, otherwise only the kind
+        // is kept. A filter or a limit hidden there must not make a
+        // whole-table read look filtered.
+        for q in [
+            "select /*M!100500 'secret', */ a from t",
+            "select a /*!80030 from Pa55word */ from t",
+            "select a /*!100500 , b */ from t",
+            "SELECT * FROM customers /*!50700 WHERE 1=1 */",
+            "SELECT * FROM customers /*!57000 LIMIT 1 */",
+            "SELECT * FROM customers /*!79999 WHERE id = 3 */",
+        ] {
+            let a = my(q);
+            assert!(a.normalized().is_none() && a.relations().is_empty(), "{q}");
+            assert_eq!(a.kind(), StatementKind::Select, "{q}");
+        }
+        assert_eq!(
+            my_rels("select a from t /*!50700 */"),
+            vec![r(None, "t")],
+            "an empty maybe-comment reads the same"
+        );
+        // A literal running past the end of the executable comment, a
+        // nested comment or a line comment inside it: fail closed.
+        for q in [
+            "select /*! 'a */ secret' from t",
+            "select /*! /* x */ a from t",
+            "select /*! # x */ a from t",
+            "select /*! -- x */ a from t",
+        ] {
+            let a = my(q);
+            assert!(a.normalized().is_none() && a.relations().is_empty(), "{q}");
+        }
+        // Optimizer hints are comments.
+        assert_eq!(
+            my_norm("select /*+ SET_VAR(sort_buffer_size = 16M) */ a from t").unwrap(),
+            "select a from t"
+        );
+    }
+
+    #[test]
+    fn mysql_sql_mode_ambiguity_fails_closed() {
+        // With NO_BACKSLASH_ESCAPES the first literal ends at `\'`.
+        let a = my("select 'a\\' , secret_col from t where x = 'b'");
+        assert!(a.normalized().is_none() && a.relations().is_empty());
+        assert_eq!(a.kind(), StatementKind::Select);
+        // Double quotes: a string, or an identifier under ANSI_QUOTES; the
+        // content is never a name either way.
+        let a = my("select \"jane@example.com\" from \"t\"");
+        assert!(a.relations().is_empty());
+        assert_eq!(a.normalized().unwrap().as_str(), "select ? from ?");
+        // Backslash inside double quotes: read differently with ANSI_QUOTES.
+        let a = my("select \"a\\\" , secret_col from t where x = \"b\"");
+        assert!(a.normalized().is_none() && a.relations().is_empty());
+        // A backslash that reads the same in every mode is fine.
+        assert!(my("select 'a\\nb' from t").normalized().is_some());
+    }
+
+    #[test]
+    fn mysql_multibyte_trail_bytes_fail_closed() {
+        // gbk 0xBF 0x5C is one character on the server; here the 0x5C
+        // would escape the quote. Valid UTF-8 cannot carry the raw pair, so
+        // both the raw bytes and any such byte pair keep the kind only.
+        let raw = b"select '\xBF\x5C' , 1 from t where x = ' from payroll.S3cr3t '";
+        let a = analyze_raw(raw, AnalyzeOptions::mysql());
+        assert!(a.relations().is_empty() && a.parts().is_empty());
+        assert_eq!(a.kind(), StatementKind::Select);
+        let a = my("select '\u{e9}\\' , 1 from t where x = ' from payroll.S3cr3t '");
+        assert!(a.relations().is_empty() && a.parts().is_empty());
+        let a = my("select `\u{e9}` from t");
+        assert!(
+            a.relations().is_empty(),
+            "backtick after a multibyte character"
+        );
+        // A text the source transcoded to UTF-8 (performance_schema) is
+        // made of characters: a CJK identifier stays readable.
+        let cjk = "SELECT * FROM `hr` . `\u{5ba2}\u{6237}`";
+        assert!(my(cjk).relations().is_empty());
+        assert_eq!(
+            analyze(cjk, AnalyzeOptions::mysql().transcoded(true))
+                .relations()
+                .len(),
+            1
+        );
+        assert!(
+            analyze_raw(
+                b"select 1 from \xFF",
+                AnalyzeOptions::mysql().transcoded(true)
+            )
+            .relations()
+            .is_empty()
+        );
+        // Other non-ASCII text is fine.
+        assert_eq!(my_rels("select 'caf\u{e9}' from t"), vec![r(None, "t")]);
+        assert!(
+            analyze_raw(b"select 1 from \xFF", AnalyzeOptions::mysql())
+                .relations()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mysql_backticks_and_qualified_names() {
+        assert_eq!(
+            my_rels("select * from `hr`.`em``ployees` e join sales.orders o using (id)"),
+            vec![r(Some("hr"), "em`ployees"), r(Some("sales"), "orders")]
+        );
+        assert_eq!(
+            my_rels("replace into hr.t (a) values (1)"),
+            vec![r(Some("hr"), "t")]
+        );
+        assert_eq!(
+            my("replace into t values (1)").kind(),
+            StatementKind::Insert
+        );
+    }
+
+    #[test]
+    fn mysql_into_outfile_is_reported_and_not_a_relation() {
+        for q in [
+            "select * from hr.t into outfile '/tmp/jane.csv'",
+            "select a into dumpfile '/tmp/jane' from hr.t",
+            "SELECT * FROM hr.t INTO OUTFILE ? ",
+        ] {
+            let a = my(q);
+            assert_eq!(a.relations().len(), 1, "{q}");
+            assert_eq!(a.relations()[0].name, "t");
+            assert!(a.parts()[0].outfile, "{q}");
+        }
+        assert!(!my("select * from hr.t into @x").parts()[0].outfile);
+    }
+
+    #[test]
+    fn mysql_utility_statements_keep_no_text() {
+        for q in [
+            "CREATE USER 'u'@'%' IDENTIFIED BY 'Secr3t'",
+            "ALTER USER 'u'@'%' IDENTIFIED BY <secret>",
+            "SET PASSWORD FOR 'u'@'%' = PASSWORD(*****)",
+            "GRANT SELECT ON hr.* TO 'u'@'%' IDENTIFIED BY 'Secr3t'",
+            "CHANGE MASTER TO MASTER_PASSWORD='Secr3t'",
+            "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = 'Secr3t'",
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (PASSWORD 'Secr3t')",
+            "SET @x = 'Secr3t'",
+            "LOAD DATA INFILE '/tmp/x' INTO TABLE t",
+            "HANDLER hr.t READ FIRST",
+            "FLUSH TABLES WITH READ LOCK",
+        ] {
+            assert!(my_norm(q).is_none(), "{q}");
+        }
+        for (q, k) in [
+            ("CREATE USER u IDENTIFIED BY 'x'", StatementKind::Dcl),
+            (
+                "CREATE SYSTEM_USER ? @? IDENTIFIED BY ?",
+                StatementKind::Dcl,
+            ),
+            ("drop role r", StatementKind::Dcl),
+            ("SET PASSWORD = 'x'", StatementKind::Dcl),
+            ("CREATE TABLE t (a int)", StatementKind::Ddl),
+            ("HANDLER t READ NEXT", StatementKind::Handler),
+        ] {
+            assert_eq!(my(q).kind(), k, "{q}");
+        }
+    }
+
+    #[test]
+    fn mysql_utility_relations_and_lead_words() {
+        assert_eq!(
+            my_rels("show create table `employees`"),
+            vec![r(None, "employees")]
+        );
+        assert_eq!(
+            my_rels("SHOW FIELDS FROM `employees`"),
+            vec![r(None, "employees")]
+        );
+        assert_eq!(
+            my_rels("LOCK TABLES `a` READ /*!32311 LOCAL */, hr.b AS x WRITE"),
+            vec![r(None, "a"), r(Some("hr"), "b")]
+        );
+        assert_eq!(my_rels("handler hr.t read first"), vec![r(Some("hr"), "t")]);
+        assert_eq!(
+            my("FLUSH /*!40101 LOCAL */ TABLES WITH READ LOCK").parts()[0].lead,
+            ["flush", "local", "tables", "with", "read", "lock"]
+        );
+    }
+
+    #[test]
+    fn mysql_limits() {
+        let shape = |q: &str| *my(q).shape().unwrap();
+        assert_eq!(shape("select * from t limit 10, 20").limit, Limit::Rows(20));
+        assert_eq!(shape("select * from t limit ?, ?").limit, Limit::Unknown);
+        assert_eq!(
+            shape("select * from t limit 50000").limit,
+            Limit::Rows(50_000)
+        );
+        assert!(!shape("select * from t where a = ?").whole_relation(10));
     }
 }

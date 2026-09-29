@@ -70,7 +70,8 @@ database credentials (invariant I3).
 |---------|--------------|
 | `pnpm install --frozen-lockfile` | Install the pinned dependencies |
 | `pnpm dev` | Web process in development mode (http://localhost:3000) |
-| `pnpm build` | Production build (also type-checks) |
+| `pnpm build` | Production build (also type-checks), then `pnpm check:build` |
+| `pnpm check:build` | Fails when the built wake-up functions (`requestPolicyEvaluation`, `requestNotificationDelivery` and their setters) are compiled to empty functions (`scripts/check-build-wakeups.mjs`) |
 | `pnpm start` | Serve the production build (web process) |
 | `pnpm worker` | Worker process (pg-boss); stops gracefully on `SIGTERM` / `SIGINT` |
 | `pnpm lint` | ESLint, zero warnings allowed |
@@ -495,7 +496,11 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   (`policy_exception.create`).
 - **Execution** (worker, pg-boss queue `policies.evaluate`, `stately`, no payload): the web process
   sends a wake-up after the commit of an accepted findings batch and after a policy or exception
-  change; the worker also schedules it every minute. The work itself is recorded in the tables, so a
+  change (through a send-only pg-boss instance installed at startup and kept process-wide on
+  `globalThis`, because the startup hook and the route handlers run separate bundled copies of
+  the server modules: `src/server/process-global.ts`; without a sender, a production process logs
+  `wake-up not sent: no job sender installed` at most every 10 minutes per queue); the worker also
+  schedules it every minute. The work itself is recorded in the tables, so a
   lost or repeated job loses or repeats nothing: a finding is pending while
   `findings.policy_evaluated_at` differs from `last_seen_at` (every rescan, and unmarking a false
   positive, makes it pending); a policy gets a full pass over the existing findings while

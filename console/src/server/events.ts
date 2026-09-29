@@ -11,6 +11,7 @@ import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
 import { ipv6Groups, mappedIPv4 } from "./net-guard";
 import { sha256Hex } from "./crypto";
 import { canonicalJson } from "./findings";
+import { processGlobal } from "./process-global";
 
 /**
  * Audit access events (P4-C): ingestion of `POST /events` batches, retention, and the views.
@@ -47,9 +48,16 @@ export type EventsIngestOutcome =
 /**
  * Process counters of `/events` (exported on `/metrics`). `unregisteredSignals`: signal ids of
  * stored events that are not in this console's signal registry (one per id and event). The
- * ingestion counters are added by `handleEvents` after the commit only.
+ * ingestion counters are added by `handleEvents` after the commit only. Process-wide (globalThis):
+ * incremented by the route handlers, read by the dedicated `/metrics` listener that the startup
+ * hook runs from another bundled copy of this module (see process-global.ts).
  */
-export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0, unregisteredSignals: 0 };
+export const eventStats = processGlobal("eventStats", () => ({
+  unexpectedTarget: 0,
+  expired: 0,
+  backpressure: 0,
+  unregisteredSignals: 0,
+}));
 
 /** SHA-256 of the validated batch in canonical JSON (same rule as `/findings`). */
 export function eventsBatchSha256(batch: EventsBatch): string {

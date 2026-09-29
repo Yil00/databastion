@@ -20,8 +20,9 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | Service | Host port | Seeded database | Audit source | Audit level ([docs/08](../docs/08-engine-capabilities.md)) |
 |---------|-----------|-----------------|--------------|-------|
 | PostgreSQL 17.11 + pgaudit (`postgres`) | 5432 | `shop` (schemas `crm`, `billing`, `ops`) | pgaudit in `jsonlog`, `pg_stat_statements`, `log_connections` | Full |
-| MariaDB 11.4 LTS (`mariadb`) | 3307 | `support` | `server_audit` plugin (`CONNECT,QUERY_DML,TABLE`), `performance_schema` | Full |
+| MariaDB 11.4 LTS (`mariadb`) | 3307 | `support` | `server_audit` plugin (`CONNECT,QUERY_DML,TABLE`), `performance_schema` | Partial (no row counts in the log) |
 | MySQL 8.4 LTS Community (`mysql`) | 3306 | `hr` | `performance_schema` history consumers (`events_statements_history_long`) | Partial |
+| Percona Server 8.4 (`percona`) | 3308 | `hr` (the MySQL seed) | `audit_log_filter` component, JSON (`log_all` for every account but `root@localhost`) | Partial (no row counts in the log) |
 | MongoDB 8.0 Community (`mongo`) | 27017 | `app` | profiler level 1 (`slowms` from `MONGO_SLOWMS`, default 0) + JSON log | Limited → Partial |
 | OpenLDAP (Debian slapd) (`openldap`) | 1389 | `dc=example,dc=org` | `slapo-accesslog` in `cn=accesslog` (`reads writes session`) | Full |
 | Mailpit (`mailpit`) | SMTP 1025, UI 8025 | | | |
@@ -45,7 +46,7 @@ Dev-only values in [.env.example](.env.example), copied to `dev/.env` (git-ignor
 | Engine | Account | Rights |
 |--------|---------|--------|
 | PostgreSQL | `databastion` | [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) minimal variant: `CONNECTION LIMIT 4`, no superuser / createdb / createrole / replication / bypassrls; `CONNECT`, `USAGE` + `SELECT` on `crm`, `billing`, `ops` (+ default privileges `FOR ROLE postgres`), `pg_read_all_stats`; role defaults `default_transaction_read_only=on`, `statement_timeout=30s`, `lock_timeout=2s`, `idle_in_transaction_session_timeout=60s` |
-| MariaDB / MySQL | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`, no `performance_schema` grant before Audit (P4-B) |
+| MariaDB / MySQL / Percona | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`, no `performance_schema` grant: MariaDB and Percona Audit reads their log files; on MySQL (whose only source is `performance_schema`), the Audit tests create their own account with that grant (ADR-0018 gives it only with Audit, and `check()` reports it as over-privilege while no Audit stream runs) |
 | MongoDB | `databastion` (auth db `admin`) | `read` on `app`, `clusterMonitor` |
 | OpenLDAP | `cn=databastion,ou=services,dc=example,dc=org` | read on the tree (except `userPassword`) and on `cn=accesslog` |
 
@@ -61,6 +62,7 @@ set -a; . dev/.env; set +a
 PGPASSWORD=$DATABASTION_DB_PASSWORD psql -h 127.0.0.1 -U databastion shop
 MYSQL_PWD=$DATABASTION_DB_PASSWORD mariadb -h 127.0.0.1 -P 3307 -u databastion support
 MYSQL_PWD=$DATABASTION_DB_PASSWORD mysql -h 127.0.0.1 -P 3306 -u databastion hr
+MYSQL_PWD=$DATABASTION_DB_PASSWORD mysql -h 127.0.0.1 -P 3308 -u databastion hr   # Percona
 mongosh "mongodb://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"
 ldapsearch -x -H ldap://127.0.0.1:1389 -D cn=databastion,ou=services,dc=example,dc=org -w "$DATABASTION_DB_PASSWORD" -b dc=example,dc=org
 ldapsearch -x -H ldap://127.0.0.1:1389 -D cn=databastion,ou=services,dc=example,dc=org -w "$DATABASTION_DB_PASSWORD" -b cn=accesslog
@@ -69,12 +71,13 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 ## Engine configuration
 - **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`, with `log_file_mode=0644` as a dev-only convenience (production: `0640` plus an ACL for the agent's OS user, ADR-0012).
-- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the audit trail. Log: `dev/.state/logs/mariadb/server_audit.log`. TLS with dev-only material from [mariadb/initdb/30-tls.sh](mariadb/initdb/30-tls.sh) (below).
+- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the `QUERY` / `TABLE` audit events (its connections are still logged). Log: `dev/.state/logs/mariadb/server_audit.log`, created `0644` through `UMASK=0644` as a dev-only convenience (production: the agent's OS user gets read access on the log directory only). `performance_schema` has `events_statements_current` on, without which MariaDB fills no statement history. TLS with dev-only material from [mariadb/initdb/30-tls.sh](mariadb/initdb/30-tls.sh) (below).
 - **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements). The `FEDERATED` engine is enabled as a test fixture only (the connector test proves such a table is never read). TLS with dev-only material from [mysql/initdb/30-tls.sh](mysql/initdb/30-tls.sh) (below).
+- **Percona Server**: [percona/databastion.cnf](percona/databastion.cnf) and [percona/initdb/20-databastion.sh](percona/initdb/20-databastion.sh): the `audit_log_filter` component, installed at initialization, writes JSON to `dev/.state/logs/percona/audit_filter.log` (`0644` through `UMASK`, dev only; rotated at each server start). Every account is logged but `root@localhost`, which the healthcheck uses on the socket. Same seed and TLS script as MySQL.
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
 - **OpenLDAP**: image built from Debian's `slapd` package ([openldap/Dockerfile](openldap/Dockerfile)): osixia/openldap is unmaintained and the Bitnami catalog no longer publishes free versioned tags. Configuration in [openldap/config.ldif](openldap/config.ldif) (`olcAccessLogOps: reads writes session`, purge after 7 days). Healthchecks use `ldapi://` on `cn=config`, so they do not add entries to `cn=accesslog`.
 
-`make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
+`make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb,percona}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
 
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
@@ -127,7 +130,28 @@ connector only performs over TLS, and the dev agent account requires TLS: withou
 `DATABASTION_TEST_<S>_CA_FILE` the tests of that server are skipped. The probes scan with test
 accounts (`databastion_it_scan` on the probe database, `databastion_it_min`, `databastion_it_rw`,
 `databastion_it_ext` for the extended variant) so that the dev account keeps its minimal grants. `DATABASTION_TEST_REQUIRE` accepts `mysql`, `mariadb`, `mysql-admin`, `mariadb-admin`,
-`mysql-tls`, `mariadb-tls`, `federated`, `pam`, `network` (or `all`).
+`mysql-tls`, `mariadb-tls`, `federated`, `pam`, `network`, and the Audit keys below (or `all`).
+
+The Audit tests (`agent/crates/connector-mysql/src/it/audit_it.rs`, P4-B) also read the audit logs
+on the host and use the `percona` service; the dump commands run the real tools inside the
+containers (their sessions are logged too):
+
+```sh
+docker compose -f dev/docker-compose.yml exec -T percona cat /var/lib/mysql/ca.pem > dev/.state/tls/percona-ca.pem
+export DATABASTION_TEST_MARIADB_AUDIT_LOG="$PWD/dev/.state/logs/mariadb/server_audit.log"
+export DATABASTION_TEST_PERCONA_URL="mysql://databastion:$DATABASTION_DB_PASSWORD@127.0.0.1:${PERCONA_PORT:-3308}/hr"
+export DATABASTION_TEST_PERCONA_ADMIN_URL="mysql://root:$PERCONA_ROOT_PASSWORD@127.0.0.1:${PERCONA_PORT:-3308}/"
+export DATABASTION_TEST_PERCONA_CA_FILE="$PWD/dev/.state/tls/percona-ca.pem"
+export DATABASTION_TEST_PERCONA_AUDIT_LOG="$PWD/dev/.state/logs/percona/audit_filter.log"
+C="docker compose -f $PWD/dev/docker-compose.yml exec -T"
+export DATABASTION_TEST_MARIADB_DUMP_CMD="$C -e MYSQL_PWD=$MARIADB_ROOT_PASSWORD mariadb mariadb-dump -uroot --single-transaction support"
+export DATABASTION_TEST_MYSQL_DUMP_CMD="$C -e MYSQL_PWD=$MYSQL_ROOT_PASSWORD mysql mysqldump -uroot --single-transaction hr"
+export DATABASTION_TEST_PERCONA_DUMP_CMD="$C -e MYSQL_PWD=$PERCONA_ROOT_PASSWORD percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
+```
+
+Audit keys of `DATABASTION_TEST_REQUIRE`: `mariadb-audit`, `percona`, `percona-audit`,
+`mysqldump`. The `performance_schema` test runs on MySQL and MariaDB with a test account
+(`databastion_it_pfs`) granted `SELECT` on the application database and on `performance_schema`.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.

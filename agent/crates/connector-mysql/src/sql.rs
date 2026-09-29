@@ -352,8 +352,29 @@ pub(crate) const AUDIT_PLUGINS: &str = "SELECT p.PLUGIN_NAME, p.PLUGIN_STATUS \
 
 /// MariaDB `server_audit` settings (only when the plugin is active: the
 /// variables do not exist otherwise). The log path is not read.
-pub(crate) const SERVER_AUDIT_SETTINGS: &str =
-    "SELECT @@GLOBAL.server_audit_logging, @@GLOBAL.server_audit_output_type";
+pub(crate) const SERVER_AUDIT_SETTINGS: &str = "SELECT @@GLOBAL.server_audit_logging, \
+     @@GLOBAL.server_audit_output_type, @@GLOBAL.server_audit_events";
+
+/// Percona `audit_log` plugin settings (only when it is active). The log
+/// path is not read.
+pub(crate) const AUDIT_LOG_SETTINGS: &str =
+    "SELECT @@GLOBAL.audit_log_format, @@GLOBAL.audit_log_policy";
+
+/// Format of the `audit_log_filter` component (an error when it is not
+/// installed: the variable does not exist).
+pub(crate) const AUDIT_LOG_FILTER_FORMAT: &str = "SELECT @@GLOBAL.audit_log_filter.format";
+
+/// MariaDB `server_audit_query_log_limit`: statement texts are cut there.
+pub(crate) const SERVER_AUDIT_QUERY_LIMIT: &str = "SELECT @@GLOBAL.server_audit_query_log_limit";
+
+/// Seconds the server's system time zone is ahead of UTC now
+/// (`server_audit` writes local times).
+pub(crate) const SYSTEM_UTC_OFFSET: &str = "SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), \
+     CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', 'SYSTEM'))";
+
+/// The account and the client host as the server sees this session
+/// (`user@host`; no privilege needed).
+pub(crate) const SESSION_USER: &str = "SELECT USER()";
 
 /// `performance_schema` enabled, and the general log (noted only).
 pub(crate) const PS_ENABLED: &str =
@@ -363,13 +384,68 @@ pub(crate) const PS_ENABLED: &str =
 pub(crate) const PS_CONSUMERS: &str = "SELECT c.NAME, c.ENABLED \
      FROM performance_schema.setup_consumers c \
      WHERE c.NAME IN ('events_statements_history_long', 'events_statements_history', \
-                      'events_statements_current')";
+                      'events_statements_current', 'global_instrumentation', \
+                      'thread_instrumentation')";
 
 /// Readability of the statement history (a count: no statement text).
 pub(crate) const PS_HISTORY_LONG: &str =
     "SELECT COUNT(*) FROM performance_schema.events_statements_history_long";
+pub(crate) const PS_HISTORY: &str =
+    "SELECT COUNT(*) FROM performance_schema.events_statements_history";
 pub(crate) const PS_CURRENT: &str =
     "SELECT COUNT(*) FROM performance_schema.events_statements_current";
+
+/// Thread id of this session in `performance_schema` (Audit).
+pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
+     WHERE t.PROCESSLIST_ID = CONNECTION_ID()";
+
+/// Text limits of `performance_schema` (statement text, digest text).
+pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
+pub(crate) const PS_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_digest_length";
+
+/// Timers of an Audit poll: this session's current statement start (the
+/// timer's "now") and the oldest and newest end in the polled table. No
+/// text. `table` is one of the three statement tables (`PsTable`).
+#[must_use]
+pub(crate) fn ps_stats(table: &str, own_thread: u64) -> String {
+    format!(
+        "SELECT (SELECT c.TIMER_START FROM performance_schema.events_statements_current c \
+                 WHERE c.THREAD_ID = {own_thread} ORDER BY c.EVENT_ID DESC LIMIT 1), \
+                MIN(h.TIMER_END), MAX(h.TIMER_END) FROM performance_schema.{table} h"
+    )
+}
+
+/// The Audit poll of `performance_schema` statements (the only statement
+/// that reads statement text, ADR-0018): `DIGEST_TEXT`, and `SQL_TEXT` only
+/// for a statement without a digest; with the session's account, host,
+/// type and `program_name` while it is connected. Rows are ordered by end
+/// timer from `from`, this session's own thread excluded, at most `limit`.
+/// `table` is one of the three statement tables (`PsTable`).
+#[must_use]
+pub(crate) fn ps_statements(
+    table: &str,
+    own_thread: u64,
+    from: u64,
+    limit: usize,
+    with_program: bool,
+) -> String {
+    let program = if with_program {
+        "(SELECT a.ATTR_VALUE FROM performance_schema.session_connect_attrs a \
+          WHERE a.PROCESSLIST_ID = t.PROCESSLIST_ID AND a.ATTR_NAME = 'program_name' LIMIT 1)"
+    } else {
+        "NULL"
+    };
+    format!(
+        "SELECT h.THREAD_ID, h.EVENT_ID, h.TIMER_END, h.CURRENT_SCHEMA, h.DIGEST_TEXT, \
+         CASE WHEN h.DIGEST_TEXT IS NULL THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
+         h.MYSQL_ERRNO, t.PROCESSLIST_USER, t.PROCESSLIST_HOST, t.TYPE, {program} \
+         FROM performance_schema.{table} h \
+         LEFT JOIN performance_schema.threads t ON t.THREAD_ID = h.THREAD_ID \
+         WHERE h.TIMER_END >= {from} AND h.END_EVENT_ID IS NOT NULL \
+           AND h.THREAD_ID <> {own_thread} \
+         ORDER BY h.TIMER_END, h.THREAD_ID, h.EVENT_ID LIMIT {limit}"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -492,7 +568,16 @@ mod tests {
             PS_ENABLED.to_owned(),
             PS_CONSUMERS.to_owned(),
             PS_HISTORY_LONG.to_owned(),
+            PS_HISTORY.to_owned(),
             PS_CURRENT.to_owned(),
+            AUDIT_LOG_SETTINGS.to_owned(),
+            AUDIT_LOG_FILTER_FORMAT.to_owned(),
+            SERVER_AUDIT_QUERY_LIMIT.to_owned(),
+            SYSTEM_UTC_OFFSET.to_owned(),
+            SESSION_USER.to_owned(),
+            PS_TEXT_LIMIT.to_owned(),
+            PS_DIGEST_LIMIT.to_owned(),
+            ps_stats("events_statements_history_long", 7),
         ];
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
@@ -521,6 +606,7 @@ mod tests {
             "sql_text",
             "digest_text",
             "processlist",
+            "session_connect_attrs",
         ];
         for s in all_statements() {
             let lower = s.to_lowercase();
@@ -529,8 +615,48 @@ mod tests {
                 if d == "general_log" && lower.contains("@@global.general_log") {
                     continue;
                 }
+                // A length setting, not the statement text.
+                if d == "sql_text"
+                    && lower == "select @@global.performance_schema_max_sql_text_length"
+                {
+                    continue;
+                }
                 assert!(!lower.contains(d), "{d} in {s}");
             }
+        }
+    }
+
+    #[test]
+    fn the_audit_poll_reads_text_only_through_the_digest() {
+        for with_program in [true, false] {
+            let s = ps_statements("events_statements_history_long", 7, 0, 10, with_program);
+            let lower = s.to_lowercase();
+            // SQL_TEXT only when there is no digest; never the text of a
+            // running statement of another session (PROCESSLIST_INFO), the
+            // processlist, or another attribute than program_name.
+            assert_eq!(lower.matches("sql_text").count(), 1, "{s}");
+            assert!(
+                lower.contains("case when h.digest_text is null then h.sql_text end"),
+                "{s}"
+            );
+            for d in [
+                "processlist_info",
+                "information_schema.processlist",
+                "mysql.",
+                "into outfile",
+                "call ",
+                ";",
+            ] {
+                assert!(!lower.contains(d), "{d} in {s}");
+            }
+            assert_eq!(
+                lower.matches("session_connect_attrs").count(),
+                usize::from(with_program)
+            );
+            if with_program {
+                assert!(lower.contains("a.attr_name = 'program_name'"));
+            }
+            assert!(lower.contains("h.thread_id <> 7"), "{s}");
         }
     }
 

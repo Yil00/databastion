@@ -10,8 +10,11 @@ server_audit_file_rotate_size = 10485760
 server_audit_file_rotations = 5
 # The image's healthcheck user polls every few seconds: keep it out of the audit trail.
 server_audit_excl_users = healthcheck
-# performance_schema: volumes (ROWS_SENT) for Audit.
+# performance_schema: statement history with ROWS_SENT (the Audit fallback when the server_audit log
+# is not configured). The history consumers depend on events_statements_current, which MariaDB
+# leaves off by default: without it, events_statements_history_long stays empty.
 performance_schema = ON
+performance-schema-consumer-events-statements-current = ON
 performance-schema-consumer-events-statements-history = ON
 performance-schema-consumer-events-statements-history-long = ON
 # DEV-ONLY TLS material created by initdb/30-tls.sh (throwaway CA, certificate for 127.0.0.1 /
