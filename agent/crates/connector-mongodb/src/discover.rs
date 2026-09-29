@@ -170,45 +170,48 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
             Kind::Read,
         )
         .await?;
-    let cursor_id;
-    let collector = {
+    // The cursor id is read first: whatever happens to the documents, an
+    // open cursor is killed before returning (no session id is sent, so
+    // closing the connection would not release it).
+    let (cursor_id, parsed) = {
         let doc = reply.doc();
         let bad = |_| non_fatal(FailureCode::Internal);
-        let cursor = doc
-            .doc("cursor")
-            .map_err(bad)?
-            .ok_or(non_fatal(FailureCode::Internal))?;
-        let batch = cursor
-            .array("firstBatch")
-            .map_err(bad)?
-            .ok_or(non_fatal(FailureCode::Internal))?;
-        let mut documents = Vec::new();
-        for element in batch.iter() {
-            // A server that ignores the limit is not read further.
-            if documents.len() >= n as usize {
-                break;
+        let cursor = doc.doc("cursor").ok().flatten();
+        let cursor_id = cursor.and_then(|c| c.int("id").ok().flatten()).unwrap_or(0);
+        let parsed = (|| {
+            let cursor = cursor.ok_or(non_fatal(FailureCode::Internal))?;
+            let batch = cursor
+                .array("firstBatch")
+                .map_err(bad)?
+                .ok_or(non_fatal(FailureCode::Internal))?;
+            let mut documents = Vec::new();
+            for element in batch.iter() {
+                // A server that ignores the limit is not read further.
+                if documents.len() >= n as usize {
+                    break;
+                }
+                let (_, value) = element.map_err(bad)?;
+                let Value::Doc(document) = value else {
+                    return Err(non_fatal(FailureCode::Internal));
+                };
+                documents.push(document);
             }
-            let (_, value) = element.map_err(bad)?;
-            let Value::Doc(document) = value else {
-                return Err(non_fatal(FailureCode::Internal));
-            };
-            documents.push(document);
-        }
-        // First the shape (which object levels are maps keyed by data),
-        // then the values.
-        let mut collector = Collector::with_shape(n as usize, Shape::learn(&documents));
-        for document in documents {
-            collector.add_document(document).map_err(bad)?;
-        }
-        cursor_id = cursor.int("id").map_err(bad)?.unwrap_or(0);
-        collector
+            // First the shape (which object levels are maps keyed by
+            // data), then the values.
+            let mut collector = Collector::with_shape(n as usize, Shape::learn(&documents));
+            for document in documents {
+                collector.add_document(document).map_err(bad)?;
+            }
+            Ok(collector)
+        })();
+        (cursor_id, parsed)
     };
     drop(reply);
     if cursor_id != 0 {
         session.kill_cursor(db, &collection.name, cursor_id).await;
     }
     Ok(Sampled {
-        collector,
+        collector: parsed?,
         estimated_rows,
         method,
     })

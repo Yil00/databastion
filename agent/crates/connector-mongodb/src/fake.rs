@@ -69,6 +69,9 @@ pub(crate) struct Script {
     pub(crate) oversized_find: bool,
     /// Commands answered `Unauthorized`.
     pub(crate) failing: Vec<&'static str>,
+    /// `find` / `aggregate` replies carry a malformed element in their
+    /// batch (with the scripted cursor id).
+    pub(crate) malformed_batch: bool,
 }
 
 impl Default for Script {
@@ -93,6 +96,7 @@ impl Default for Script {
             ],
             oversized_find: false,
             failing: Vec::new(),
+            malformed_batch: false,
         }
     }
 }
@@ -354,6 +358,17 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                     Some(c) if c.kind == "timeseries" && keys_have(&body, "singleBatch") => {
                         error_reply(168)
                     }
+                    // A batch holding a string where a document belongs.
+                    Some(c) if script.malformed_batch => DocBuf::new()
+                        .doc(
+                            "cursor",
+                            DocBuf::new()
+                                .i64("id", script.cursor_id)
+                                .str("ns", &format!("{db}.{}", c.name))
+                                .raw(0x04, "firstBatch", &DocBuf::new().str("0", "x").finish()),
+                        )
+                        .i32("ok", 1)
+                        .finish(),
                     Some(c) => {
                         let n = usize::try_from(size.unwrap_or(0)).unwrap();
                         let docs: Vec<Vec<u8>> = c.docs.iter().take(n).cloned().collect();
@@ -1076,4 +1091,48 @@ async fn privileges_not_evaluated_and_coverage_failures() {
     let r = crate::check::report(&mut s.unwrap()).await;
     assert!(r.privileges_known && !r.coverage_known);
     assert_eq!(codes(&r), ["privilege.cluster_actions"]);
+}
+
+/// A malformed batch with an open cursor: the collection is skipped and
+/// the cursor is still killed (security review N1), on the `find` path and
+/// on the `$sample` path.
+#[tokio::test]
+async fn an_open_cursor_is_killed_when_the_batch_is_malformed() {
+    for count in [None, Some(1_000_000)] {
+        let script = Script {
+            cursor_id: 77,
+            malformed_batch: true,
+            databases: vec![(
+                "app".to_owned(),
+                vec![FakeColl {
+                    count,
+                    ..FakeColl::new("users", vec![user_doc(1)])
+                }],
+            )],
+            ..Script::default()
+        };
+        let (s, log) = session(script, PASSWORD).await;
+        let mut s = s.unwrap();
+        let e = discover::sample_collection(
+            &mut s,
+            "app",
+            &Collection {
+                name: "users".to_owned(),
+                kind: CollKind::Collection,
+            },
+            5,
+        )
+        .await
+        .unwrap_err();
+        assert!(!e.fatal);
+        let received = log.lock().unwrap().clone();
+        let read = if count.is_some() { "aggregate" } else { "find" };
+        assert!(received.iter().any(|c| c.name == read), "{received:?}");
+        assert!(
+            received
+                .iter()
+                .any(|c| c.name == "killCursors" && c.collection.as_deref() == Some("users")),
+            "{received:?}"
+        );
+    }
 }
