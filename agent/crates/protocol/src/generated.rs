@@ -2617,8 +2617,9 @@ impl ::std::convert::TryFrom<::std::string::String> for JobStatusUpdateStatus {
 /**Where the data lives, down to the column / field / attribute; never a record. All names are
 normalized (see `Identifier`).
 PostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).
-MongoDB: database, collection, normalized field path. OpenLDAP: suffix (as `database`),
-objectClass or container (as `object`, never an entry DN), attribute.
+MongoDB: database, collection, normalized field path. OpenLDAP: naming context (as
+`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,
+never an entry DN), structural objectClass (as `object`), attribute (ADR-0029).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]

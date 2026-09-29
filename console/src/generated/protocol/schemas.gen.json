@@ -1380,7 +1380,7 @@
       }
     },
     "Location": {
-      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: suffix (as `database`),\nobjectClass or container (as `object`, never an entry DN), attribute.\n",
+      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
