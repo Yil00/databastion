@@ -1,8 +1,8 @@
-# ADR-0025: MySQL / MariaDB role privileges in `check()`, per-account heartbeat checks, and the scan status hold
+# ADR-0025: MySQL / MariaDB role privileges in `check()`, per-account heartbeat checks, connection sizing with Audit, and the scan status hold
 
 - **Status**: Accepted
 - **Date**: 2026-09-29
-- **Refines**: [ADR-0018](0018-mysql-mariadb-grants-and-connector.md) and [ADR-0020](0020-mysql-mariadb-connector-as-merged.md) (both stay Accepted): ADR-0018 decision 1 (over-privilege of granted roles), its `MAX_USER_CONNECTIONS` sizing and its residual risk "role privileges are not evaluated"; ADR-0020 decision 2 (granted roles under `extended_grants`)
+- **Refines**: [ADR-0012](0012-postgresql-agent-grants.md), [ADR-0018](0018-mysql-mariadb-grants-and-connector.md) and [ADR-0020](0020-mysql-mariadb-connector-as-merged.md) (all stay Accepted): the `CONNECTION LIMIT` of the ADR-0012 account; ADR-0018 decision 1 (over-privilege of granted roles, and the `MAX_USER_CONNECTIONS` sizing, which ignored Audit sessions) and its residual risk "role privileges are not evaluated"; ADR-0020 decision 2 (granted roles under `extended_grants`)
 - **Context references**: P4-D and P2-G, merged in #70 (`agent/crates/connector-mysql/src/check.rs`, `grants.rs`, `sql.rs`; `agent/crates/core/src/runtime.rs`, `spool.rs`; `agent/README.md`)
 
 ## Context
@@ -16,7 +16,13 @@ Two P2-G items from the end-of-phase-2 review were merged in the same change:
 - Heartbeat target checks ran one after the other, each bounded at 10 s, so N slow targets delayed the heartbeat by up to N × 10 s and could raise a false `agent.silent`.
 - A scan's terminal status could reach the console before its findings batches did.
 
-Running the checks concurrently raises a sizing question: ADR-0018 sizes `MAX_USER_CONNECTIONS` for one check next to one scan.
+Running the checks concurrently raises a sizing question: ADR-0018 sizes `MAX_USER_CONNECTIONS` for one check next to one scan (at least 3, 4 recommended). The end-of-phase-4 security review found that this sizing, and the PostgreSQL `CONNECTION LIMIT 4` of [ADR-0012](0012-postgresql-agent-grants.md), ignore the connections of Audit (P4-A, P4-B):
+- a MySQL / MariaDB `performance_schema` Audit stream holds its own session on the account for as long as it runs;
+- every 5 minutes the Audit stream re-probes its prerequisites on a new connection, opened while that session is still held;
+- when the held session goes stale, the new session is opened before the old one is closed;
+- a guarded Audit statement that is cancelled opens a `KILL QUERY` connection;
+- a file-source Audit stream holds no session, but its 5-minute re-probe opens one;
+- on PostgreSQL, the `pg_stat_statements` session is held while the re-probe connects.
 
 ## Decision
 1. **Roles in scope.** `check()` reads every role in `information_schema.APPLICABLE_ROLES`, enabled or not: roles granted directly or through another role, MySQL mandatory roles and the MariaDB default role. The read is capped at 1 000 rows (`LIMIT 1001`). The privileges of these roles are evaluated with the same rules as direct grants (any global privilege, privileges beyond `SELECT`, `SELECT` on `mysql` / `sys`, `SELECT` on `performance_schema` without a running Audit stream). `WITH ADMIN OPTION`, on a role grant or in `APPLICABLE_ROLES.IS_GRANTABLE`, counts as a grant option. A role that grants only the minimal variant is not over-privilege.
@@ -30,21 +36,36 @@ Running the checks concurrently raises a sizing question: ADR-0018 sizes `MAX_US
    On MariaDB, the default role is reported as not evaluated when its `SHOW GRANTS` fails, has a skipped row or has a line that is not understood. The `SHOW GRANTS` parser (`grants.rs`) works on bounded lines (64 KiB) and refuses anything it does not fully parse. It ignores `REVOKE` lines (MySQL partial revokes) and `SET DEFAULT ROLE`: ignoring a revoke can only over-report.
 7. **Database grants are `LIKE` patterns.** A database name in a grant is matched as a case-insensitive `LIKE` pattern with `\` escapes, for direct and role grants alike: `%`, `m%` and `performance\_schema` count as the system database they match. For a name that is literal on the server (a table-level grant, or `partial_revokes` ON), this over-reports and never under-reports.
 8. **Incomplete direct privilege lists.** A list of direct privileges that reaches its `LIMIT` or has a skipped row (not UTF-8) leaves the privileges not evaluated (`privilege.not_evaluated`). Before this change, that note only covered an account name that could not be matched.
-9. **Per-account heartbeat check turns.** The heartbeat runs the targets' `check()` concurrently under one shared deadline of 10 s from its start, so it waits at most 10 s for all targets. Targets that reach the same account take turns, one check at a time. The account is the tuple (engine, host lowercased or socket, port, account). This keeps ADR-0018's `MAX_USER_CONNECTIONS` sizing: a check can hold two connections (its session and a `KILL QUERY` connection), and the sizing allows one check next to one scan. A check still running, or still waiting for its turn, at the deadline is dropped. Its target is reported unreachable with `last_error = timeout` and the note `check.timed_out`, and the connector cancels its statement server-side.
+9. **Per-account heartbeat check turns.** The heartbeat runs the targets' `check()` concurrently under one shared deadline of 10 s from its start, so it waits at most 10 s for all targets. Targets that reach the same account take turns, one check at a time. The account is the tuple (engine, host lowercased or socket, port, account). The turns cover `check()` only: a check can hold two connections (its session and a `KILL QUERY` connection), and with the turns an account has at most one check next to one scan. Scans already run one at a time. Audit streams are not part of the turns: each target with Audit enabled runs its own stream, next to the checks and the scan (decision 11). A check still running, or still waiting for its turn, at the deadline is dropped. Its target is reported unreachable with `last_error = timeout` and the note `check.timed_out`, and the connector cancels its statement server-side.
 10. **Scan status hold.** After a scan ends, its terminal status is held until the console has answered every findings batch spooled for that job, for at most 120 s (`STATUS_FLUSH_WAIT`). There is no hold for a cancelled scan, when no spool worker runs, while `/findings` is parked after a `501`, while the spool worker is in a retry backoff (console unreachable, `5xx`, `429`), once the agent stops being active, or on shutdown. A status sent with batches of its job still spooled is counted in `scan_status_before_flush_total`. The batches stay durably spooled and are sent later; the console accepts them for 24 h after the terminal status.
+11. **Connection sizing with Audit (refines ADR-0018 decision 1 and the ADR-0012 account).** The recommended per-account limits count the Audit connections listed in the context:
+    - MySQL / MariaDB: `MAX_USER_CONNECTIONS 4` for Discovery only; **5** with a file-source Audit stream (`server_audit`, `audit_log`); **6** with a `performance_schema` Audit stream. The 6 are one scan and its `KILL QUERY` connection, one check and its `KILL QUERY` connection, the Audit session, and one re-probe, reconnect or Audit `KILL QUERY` connection.
+    - PostgreSQL: `CONNECTION LIMIT 4` for Discovery or pgaudit Audit; **5** with `pg_stat_statements` as the Audit source.
+    - Add **one per additional target on the same account that runs Audit**.
+    A connection refused at the limit fails the operation that needed it: the check reports the target unreachable, the scan fails, or the Audit stream restarts after a backoff (`audit_stream_failures_total`) and can miss what ran in between. It never widens a privilege.
 
 ## Consequences
 - **Replaces the ADR-0018 residual risk "role privileges are not evaluated".** It remains for:
   - MariaDB roles other than the session's current (default) role;
   - privileges granted to `PUBLIC` (MariaDB 10.11+), which `APPLICABLE_ROLES` does not list and `check()` does not read;
-  - MySQL before 8.0.19, which has no `information_schema.APPLICABLE_ROLES`: its roles are neither counted nor reported;
+  - MySQL before 8.0.19, which has no `information_schema.APPLICABLE_ROLES`, and any non-fatal error reading that table (a permission or unknown-object error): the roles are then neither counted nor reported, which is not fail-closed (a phase-7 follow-up);
   - the fail-closed cases of decision 6, which are reported as not evaluated.
 - **ADR-0018 decision 1 and ADR-0020 decision 2 in effect.** A granted role is no longer over-privilege in itself: only what it grants is, or the fact that it could not be evaluated. With `extended_grants: true`, a global `SELECT` held through a role is an expected warning, like a direct one.
 - On MariaDB, an account whose Discovery grant is held by a non-default role, or by a role that the default role grants, always gets `privilege.roles_not_evaluated`. Granting the minimal variant directly, or through the default role alone, avoids it.
 - **Account keys are literal.** Targets naming the same server differently are not recognized as the same account: an IP address and a host name, an alias, or an omitted port and an explicit default port. Their checks can then run at the same time and use more of `MAX_USER_CONNECTIONS` than the sizing assumes.
 - **No "account busy" distinction.** A hung check keeps its account's turn until the shared deadline. The other targets of that account then report `timeout` / `check.timed_out`, the same as if they were slow themselves. The order of the turns is not rotated between heartbeats.
+- **Connection limits.** The account blocks of [05-security.md](../05-security.md#recommended-database-accounts-read-only) follow decision 11. Existing accounts created with `MAX_USER_CONNECTIONS 4` or `CONNECTION LIMIT 4` that run Audit must be raised. Until then, a re-probe or reconnect can be refused while a scan and a check are running. The dev and E2E accounts keep 4.
+- **Re-probe connection.** The extra Audit connection exists because the 5-minute re-probe and the stale-session reconnect open a new connection while the Audit session is still held. Re-probing on the held session, and closing the old session before reconnecting, would remove it. This is a phase-7 follow-up.
 - **Queued scans wait behind the hold.** Scans run one at a time, and a scan counts as in flight until its status is sent. The next queued scan can therefore start up to 120 s later. Its `max_duration_s` window, which counts queue time, shrinks by as much.
 - `check()` sends a few more read-only statements per MySQL / MariaDB target and heartbeat: two or three role statements. They are bounded like every `check()` statement and cancelled with `KILL QUERY` when the deadline drops them (MySQL's `max_execution_time` does not apply to `SHOW`).
+- **Recorded with this ADR, in the scope of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md) (which stays Accepted): the failed-login flood.** A client that can reach the database port without credentials can try many made-up user names. Each name becomes its own `auth_failure` event group, because the aggregation key includes the account fingerprint and `auth_failure` always passes the `audit.configure` filter. The effects are:
+  - the aggregator flushes every 10 000 groups;
+  - events keep spooling while the console answers `429`;
+  - the console accepts at most 60 batches of 500 events per minute per agent, and applies back-pressure at 20 000 pending events;
+  - the batches of a later dump queue behind the flood, so its detection is delayed;
+  - once the spool is full, the oldest batches, findings included, are evicted;
+  - the console can store about 30 000 rows per minute per agent, kept 90 days.
+  The flood shows in the spool's dropped counters and the back-pressure metric. Phase-7 follow-ups: cap `auth_failure` groups per window with an overflow event, spool eviction that keeps `signature.*` batches with a separate quota for events, and a console alert when an agent's `dropped_batches` rises. See [08-engine-capabilities.md](../08-engine-capabilities.md#known-limits-1).
 - The `privilege.not_evaluated` description in `shared/protocol/target-notes.json` now also covers privilege lists that could not be fully read. The code is unchanged.
 
 ## Rejected alternatives
