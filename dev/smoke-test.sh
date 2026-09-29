@@ -108,6 +108,12 @@ check "service account cannot read userPassword" must_fail ex openldap \
   "ldapsearch $BIND -b dc=example,dc=org '(objectClass=inetOrgPerson)' userPassword | grep -qi '^userPassword'"
 check "cn=accesslog has an entry for the search" retry 10 ex openldap \
   "ldapsearch $BIND -b cn=accesslog '(&(objectClass=auditSearch)(reqAuthzID=cn=databastion,ou=services,dc=example,dc=org))' reqStart | grep -q '^reqStart:'"
+check "custom schema entries are readable" ex openldap \
+  "ldapsearch $BIND -b ou=contractors,dc=example,dc=org '(objectClass=databastionContractor)' databastionContractorNir | grep -q '^databastionContractorNir:'"
+check "LDAPS answers with the dev CA" ex openldap \
+  "LDAPTLS_CACERT=/var/lib/ldap/tls/ca.pem ldapwhoami -x -H ldaps://localhost -D cn=databastion,ou=services,dc=example,dc=org -w \"\$DATABASTION_DB_PASSWORD\" | grep -q '^dn:'"
+check "StartTLS answers with the dev CA" ex openldap \
+  "LDAPTLS_CACERT=/var/lib/ldap/tls/ca.pem ldapwhoami -ZZ -x -H ldap://localhost -D cn=databastion,ou=services,dc=example,dc=org -w \"\$DATABASTION_DB_PASSWORD\" | grep -q '^dn:'"
 
 echo "# Mailpit, Prometheus, Grafana"
 check "Mailpit API up" curl -fsS "http://127.0.0.1:${MAILPIT_UI_PORT}/api/v1/info"

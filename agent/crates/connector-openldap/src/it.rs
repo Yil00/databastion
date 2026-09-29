@@ -495,8 +495,10 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
         let cfg = cfg.clone();
         tokio::spawn(async move { connector.audit_stream(&cfg, &sink).await })
     };
-    // Let the stream start reading from now.
+    // Let the stream start. On a first start it also reads the last minute
+    // of the log (earlier tests): only what happens from here on counts.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let since = std::time::SystemTime::now() - Duration::from_secs(1);
     let logs = Logs::default();
     {
         let _guard = logs.capture();
@@ -521,6 +523,7 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
         }
     }
     stream.abort();
+    events.retain(|e| e.ts() >= since);
     let agent = crate::dn::canon(&service_dn()).unwrap();
     let bulk: Vec<&MaskedEvent> = events
         .iter()
@@ -529,7 +532,8 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
     assert!(!bulk.is_empty(), "no bulk search reported: {events:?}");
     assert!(
         bulk.iter()
-            .all(|e| e.principal().account_name() == ADMIN_DN)
+            .all(|e| e.principal().account_name() == ADMIN_DN),
+        "{bulk:?}"
     );
     assert!(bulk.iter().map(|e| e.rows().unwrap_or(0)).sum::<u64>() > 80);
     // The agent's own scan and connections are routine.

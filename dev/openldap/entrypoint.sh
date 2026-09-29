@@ -26,8 +26,28 @@ if [ ! -e "$CONF_DIR/cn=config.ldif" ]; then
   rm -rf "$tmp"
 fi
 
+# DEV ONLY TLS: a CA and a server certificate for localhost / 127.0.0.1 / openldap, generated once
+# per data volume. The CA key is deleted at once; tests read ca.pem with `docker compose exec`.
+TLS_DIR=/var/lib/ldap/tls
+if [ ! -e "$TLS_DIR/server.pem" ]; then
+  echo "databastion-ldap: generating the dev-only TLS certificates" >&2
+  mkdir -p "$TLS_DIR"
+  tmp=$(mktemp -d)
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DataBastion dev LDAP CA" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout "$tmp/ca.key" -out "$TLS_DIR/ca.pem" 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+    -keyout "$TLS_DIR/server.key" -out "$tmp/server.csr" 2>/dev/null
+  printf '%s\n' "subjectAltName=DNS:localhost,DNS:openldap,IP:127.0.0.1" "basicConstraints=CA:FALSE" \
+    "keyUsage=digitalSignature,keyEncipherment" "extendedKeyUsage=serverAuth" > "$tmp/ext.cnf"
+  openssl x509 -req -in "$tmp/server.csr" -CA "$TLS_DIR/ca.pem" -CAkey "$tmp/ca.key" \
+    -CAcreateserial -days 3650 -extfile "$tmp/ext.cnf" -out "$TLS_DIR/server.pem" 2>/dev/null
+  rm -rf "$tmp"
+  chmod 0640 "$TLS_DIR/server.key"
+fi
+
 mkdir -p /run/slapd
 chown -R openldap:openldap "$CONF_DIR" /var/lib/ldap /run/slapd
 # ldapi:// is used by the healthcheck only (EXTERNAL bind as root, cn=config): it never touches the
 # audited database, so healthchecks do not pollute cn=accesslog.
-exec slapd -d stats -u openldap -g openldap -F "$CONF_DIR" -h "ldap:/// ldapi:///"
+exec slapd -d stats -u openldap -g openldap -F "$CONF_DIR" -h "ldap:/// ldaps:/// ldapi:///"

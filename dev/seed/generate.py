@@ -674,6 +674,33 @@ def gen_openldap(f: Fake, t: Truth) -> str:
     t.add(E, SUFFIX, f"ou={lead_ou},ou=teams,{SUFFIX}", "inetOrgPerson", "mail", ["pii.email"], team_mails,
           name_values=[lead_ou], name_value_classifiers=["pii.person_name"],
           normalized=f"ou=*,ou=teams,{SUFFIX}", note="container ou= is a person name")
+
+    # Custom schema (dev/openldap/config.ldif, cn=databastion-dev): a structural class with
+    # sensitive custom attributes (phase 6: Discovery of custom attributes). Drawn last, so every
+    # value above is unchanged.
+    contractors = f"ou=contractors,{SUFFIX}"
+    out += [f"dn: {contractors}", "objectClass: organizationalUnit", "ou: contractors", ""]
+    nirs, ibans = [], []
+    for i in range(20):
+        sex, year, month = f.r.choice((1, 2)), f.r.randint(1955, 2002), f.r.randint(1, 12)
+        nir = f.nir(sex, year, month)
+        iban = f.fr_iban() if f.r.random() < 0.7 else f.de_iban()
+        code = f"CTR-{f.digits(5)}"
+        out += [f"dn: cn=contractor-{i + 1:03d},{contractors}", "objectClass: databastionContractor",
+                f"cn: contractor-{i + 1:03d}", f"databastionContractorNir: {nir}",
+                f"databastionContractorIban: {iban}", f"databastionContractorCode: {code}",
+                "description: Contract record (fixed term)", ""]
+        nirs.append(nir)
+        ibans.append(iban)
+    obj = "databastionContractor"
+    t.add(E, SUFFIX, contractors, obj, "databastioncontractornir", ["pii.nir"], nirs,
+          note="custom attribute (dev schema cn=databastion-dev)")
+    t.add(E, SUFFIX, contractors, obj, "databastioncontractoriban", ["pii.iban"], ibans,
+          note="custom attribute (dev schema cn=databastion-dev)")
+    t.add(E, SUFFIX, contractors, obj, "databastioncontractorcode", [], negative_control=True,
+          note="custom attribute: contract reference, not personal data")
+    t.add(E, SUFFIX, contractors, obj, "cn", [], negative_control=True,
+          note="record names, not person names")
     return "\n".join(out) + "\n"
 
 
