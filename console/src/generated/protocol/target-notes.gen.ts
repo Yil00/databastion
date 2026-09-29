@@ -273,7 +273,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.roles_not_evaluated": {
-    "description": "Granted {count} role(s), whose privileges are not evaluated.",
+    "description": "{count} granted role(s) whose privileges are not evaluated.",
     "engines": [
       "mysql",
       "mariadb"
