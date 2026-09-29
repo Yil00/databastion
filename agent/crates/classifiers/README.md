@@ -249,6 +249,19 @@ reading depends on `standard_conforming_strings` give no normalized text
 (and no shape or relations when ambiguous). Property tests:
 `tests/query_props.rs`.
 
+The MySQL / MariaDB dialect (`AnalyzeOptions::mysql()`, P4-B, ROADMAP P4-D)
+lexes backticks, `'…'` and `"…"` strings with `\` escapes, `N'…'`, `X'…'`,
+`B'…'`, `_charset'…'`, `0x…`, `#` and `-- ` comments, and executable
+comments (`/*! … */`, `/*M! … */`) as code. The `sql_mode` of a logged
+statement is unknown: the text is lexed with and without
+`NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, and kept only when every reading
+gives the same tokens. A `"…"` token is never a name. `REPLACE` joins the
+DML allow-list; account statements, `SET PASSWORD`, `GRANT`, `CHANGE
+MASTER` / `CHANGE REPLICATION SOURCE`, `CREATE SERVER` and every other
+utility statement keep no text. Property tests: `tests/query_mysql_props.rs`
+(every literal and comment form, both `sql_mode` readings, password-bearing
+statements as clients write them and as the servers log them, truncation).
+
 ## Tests
 
 - unit tests: positive / negative cases per detector, validator, hint and masking format;
