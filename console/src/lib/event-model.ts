@@ -1,3 +1,4 @@
+import { EVENT_ACTIONS } from "@/lib/protocol/enums";
 import { validateSchema } from "@/lib/protocol/validate";
 
 import {
@@ -180,7 +181,8 @@ export function updateBaseline(state: BaselineState, rows: number | null | undef
 
 // ------------------------------------------------------------------------- conditions
 
-export const EVENT_ACTIONS = ["connect", "auth_failure", "read", "write", "ddl", "dcl"] as const;
+/** Contract `AccessEvent.action` (checked against the generated types in src/lib/protocol/enums.ts). */
+export { EVENT_ACTIONS };
 /**
  * A signal id of the contract (`Signal`: 1 to 6 words of 1 to 16 letters, no digit, ADR-0022), or a
  * family: `signature.*`, `shape.*`, `volume.*`. Checked on every new or changed policy.
