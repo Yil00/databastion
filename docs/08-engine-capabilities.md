@@ -21,9 +21,9 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 | **MariaDB** | `server_audit` log file, read locally by the agent; otherwise `performance_schema` | Partial (Limited without a record parsed in the last 24 h); never Full | `server_audit` loaded, logging to a file with `QUERY` (or `QUERY_DML`) and `TABLE` events, log file readable by the agent and declared in `agent.yaml`; or `performance_schema` as for MySQL Community (see below) |
 | **Percona Server for MySQL** | `audit_log` plugin or `audit_log_filter` component, JSON file read locally by the agent; otherwise `performance_schema` | Partial (Limited without a record parsed in the last 24 h); never Full | JSON format, a policy or filter logging queries, log file readable by the agent and declared in `agent.yaml` |
 | **MySQL Community** | `performance_schema` (`events_statements_history_long`, `ROWS_SENT`) | Partial / Limited; never Full | `performance_schema=ON`, statement consumers enabled with the consumers they depend on, `SELECT ON performance_schema.*` for the agent |
-| **MongoDB Enterprise** | `auditLog` (JSON) + profiler for volumes | Full | `auditLog.destination=file`, filter on reads |
-| **Percona Server for MongoDB** | `auditLog` | Full | Same |
-| **MongoDB Community** | Structured JSON logs (slow operations: `appName`, `nreturned`) + profiler | Limited → Partial | Profiler level 1 with low `slowms`; level 2 = Partial but costly |
+| **MongoDB Enterprise**, **Percona Server for MongoDB** | `auditLog` JSON file (`mongo` schema), read locally by the agent; no document counts | Partial once a successful `authCheck` record was parsed in the last 24 h, Limited before; never Full | `auditLog.destination: file`, `format: JSON`, `auditAuthorizationSuccess: true` (otherwise reads and writes are not logged), file readable by the agent and declared in `agent.yaml` |
+| **MongoDB** (any edition) | Structured JSON server log (slow operations: `appName`, `nreturned`), read locally by the agent | Limited once a record was parsed in the last 24 h, None before | `systemLog.destination: file`, a `slowms` low enough for the operations to audit, file readable by the agent and declared in `agent.yaml` |
+| **MongoDB** (any edition, not a `mongos`), no readable file | Profiler (`system.profile`), polled over the agent's connection | Limited once an entry was read in the last 24 h, None before | Profiling on (level 1 with a suitable `slowms`, set by the operator); `find` on `system.profile` of each database to audit (see [05-security.md](05-security.md#recommended-database-accounts-read-only)) |
 | **OpenLDAP** | `slapo-accesslog` overlay (`cn=accesslog` database, queryable over LDAP) | Full | `olcAccessLogOps: reads writes session`, read account on `cn=accesslog` |
 
 > **PostgreSQL, as implemented (P2-B, P4-A #58; [ADR-0015](adr/0015-postgresql-connector-decisions.md))**: see [PostgreSQL Audit](#postgresql-audit) below.
@@ -32,9 +32,9 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 
 > **`FEDERATED` and other remote engines**: on MySQL 8.4, computing `information_schema.TABLES.TABLE_ROWS` for a `FEDERATED` table opens its handler, which connects to the remote server. The connector therefore reads no statistics column during introspection, asks for a table's `TABLE_ROWS` only after reading its engine alone and finding a local one ([ADR-0020](adr/0020-mysql-mariadb-connector-as-merged.md)), and never samples tables of remote-access engines (I5).
 
-> **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations (or all of them, at the cost of a level 2 profiler). A fast `mongodump` of a small collection can go unnoticed. **This must be stated clearly in the user documentation and in the console.**
+> **MongoDB Community**: this edition has no audit log. DataBastion sees *slow* operations only: those the server logs or profiles (slower than `slowms`, sampled by `slowOpSampleRate`; the profiler is also a ring buffer). A fast `mongodump` of a small collection can go unnoticed. The console shows the level Limited and the note `audit.slow_operations_only`.
 
-> **MongoDB, as implemented (P5-A #74; [ADR-0026](adr/0026-mongodb-connector.md))**: Discovery only. The three MongoDB rows above are the target levels of P5-B / P5-C, **not implemented yet**: every MongoDB target reports the audit level **None**, with the note `audit.stream_not_available`, whatever its edition. The connector does not report the level a server could provide before it reads an Audit source. See [MongoDB Discovery](#mongodb-discovery) below.
+> **MongoDB, as implemented (P5-A #74; P5-B / P5-C #76, [ADR-0027](adr/0027-mongodb-audit.md), Proposed)**: see [MongoDB Audit](#mongodb-audit) below. **Full is never reported** for MongoDB: the `auditLog` has no document counts, and the server log and the profiler only hold the operations the server records.
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
@@ -86,18 +86,19 @@ Both 10 000 thresholds sit just above the largest Discovery sample (`limits.max_
 
 The agent's own Discovery reads would otherwise show up as access events. An event of the agent's account is left out only when **all** of these hold:
 
+- it is a read or a connection: **writes, DDL and DCL of the agent's account are always reported** (the agent never writes, I4, so such an event with its identity is someone else using it; #76, commit `35c6459`, [ADR-0027](adr/0027-mongodb-audit.md) decision 7);
 - it comes from the agent's `application_name` (`databastion-agent`; checked with pgaudit only);
 - it comes from the agent's own client address as the server sees it (`inet_client_addr()`, probed at stream start; checked with pgaudit only). When the agent's address cannot be read, or a record carries no address, nothing is left out;
 - it carries no signal: events with a signal are always kept;
 - the agent's reads of each object stay within `limits.max_sample_rows` rows over a rolling 24 h. A statement with an unknown row count (no `pgaudit.log_rows`) is charged the whole budget. A second Discovery scan of the same table within 24 h therefore shows up as events of the agent's account.
 
-With `pg_stat_statements`, application and address are not visible: only the signal and row-budget rules apply.
+With `pg_stat_statements`, application and address are not visible: only the action, signal and row-budget rules apply.
 
 **The connector's own table-less statements** (#65). The connector sends a few statements that read no relation: the per-connection and per-transaction `pg_catalog.set_config(…)` / `current_setting(…)` (one per transaction, about 90 per Discovery scan), `pg_catalog.host(pg_catalog.inet_client_addr())`, and, in `pg_stat_statements` mode, its text query through the extension's `pg_stat_statements(true)` function. They form a closed allow-list (a unit test fails on any other connector statement that names no relation). Such a statement of the agent's account that passes the identity and signal rules above is never reported and is not charged to any row budget. It is recognized by its exact text with pgaudit and by its normalized shape with `pg_stat_statements`. Anything else of the agent's account whose objects are unknown (`*`: any other function call, including `pg_catalog` functions that run SQL such as `query_to_xml`, text that does not parse, several statements) is **always reported and never budgeted**, so no traffic can use up a `*` budget. The same statements from any other role, or from the agent's account under another application or address, are reported against `*`.
 
 Limits of these rules:
 - Behind a connection pooler (PgBouncer…) every client has the pooler's address, and another process on the agent host shares the agent's address: there the address check only separates remote clients.
-- Someone holding the agent's credentials on the agent host (or behind the same pooler), spoofing its `application_name` and reading at most the budget per object and day with filtered queries stays unreported.
+- Someone holding the agent's credentials on the agent host (or behind the same pooler), spoofing its `application_name` and reading at most the budget per object and day with filtered queries stays unreported. Writes, DDL and DCL with the agent's identity are always reported.
 - Someone holding the agent's credentials who passes the identity checks can run the allow-listed table-less statements unreported. They read no row of any relation (`set_config` changes their own session only, `current_setting` reads settings the role may read, and the text query returns statement texts, as a read of the view `pg_stat_statements` does). With `pg_stat_statements`, where only the shape is visible, the settings read by `current_setting(…)` are not checked. The text query is recognized in pgaudit records written during a `pg_stat_statements` period only if the agent did not restart in between.
 - The row counters are kept per target for the life of the agent process. Restarting a stream (a failure, a source switch, the agent's sessions terminated on purpose) does not reset them; an **agent restart** does, since they are not persisted, and gives a fresh budget per object.
 
@@ -158,12 +159,13 @@ The signal ids are registered for `mysql` and `mariadb` in [`shared/protocol/sig
 
 As for PostgreSQL, an event of the agent's account is left out only when **all** of these hold:
 
+- it is a read or a connection: **writes, DDL and DCL of the agent's account are always reported** (the agent never writes, I4, so such an event with its identity is someone else using it; #76, commit `35c6459`, [ADR-0027](adr/0027-mongodb-audit.md) decision 7);
 - it comes from the agent's client address as the server sees it (`USER()`, read at each re-probe). Only an IP literal counts: a host name there, such as `localhost` for a Unix socket, leaves nothing out;
 - it comes from the agent's `program_name` (`databastion-agent`) when the source shows one;
 - it carries no signal;
 - the agent's reads of each object stay within `limits.max_sample_rows` rows over a rolling 24 h. The audit-log sources have no row count, so each statement is charged the whole budget: a second read of a table within 24 h is reported.
 
-Behind a proxy every client has the proxy's address, and another process on the agent host shares the agent's address. Someone holding the agent's credentials on the agent host, spoofing its `program_name` and reading at most the budget per table and day with filtered queries stays unreported.
+Behind a proxy every client has the proxy's address, and another process on the agent host shares the agent's address. Someone holding the agent's credentials on the agent host, spoofing its `program_name` and reading at most the budget per table and day with filtered queries stays unreported. Writes, DDL and DCL with the agent's identity are always reported.
 
 ### Known limits
 
@@ -221,7 +223,74 @@ A finding's location is the database, the collection (`object`) and a normalized
 | `skipped_limit` | Database or collection listing cut at its bound |
 | `skipped_error` | Any other failure on one collection (dropped since listed, `maxTimeMS` expired, reply over the limit, malformed document) |
 
-`check()` notes for MongoDB targets: `audit.stream_not_available`; `coverage.views_not_sampled`; `coverage.timeseries_not_readable`; the over-privilege notes `privilege.write_actions`, `privilege.read_beyond_discovery`, `privilege.cluster_actions`, `privilege.any_database`, `privilege.system_collections` and `privilege.not_evaluated`; `security.tls_disabled`; `check.stage_failed`, `check.timed_out`. The privilege and coverage report is recomputed at most every 10 minutes per target.
+`check()` notes for MongoDB targets, Discovery part: `coverage.views_not_sampled`; `coverage.timeseries_not_readable`; the over-privilege notes `privilege.write_actions`, `privilege.read_beyond_discovery`, `privilege.cluster_actions`, `privilege.any_database`, `privilege.system_collections` and `privilege.not_evaluated`; `security.tls_disabled`; `check.stage_failed`, `check.timed_out`. The privilege and coverage report is recomputed at most every 10 minutes per target. The Audit notes are listed in [MongoDB Audit](#mongodb-audit); `audit.stream_not_available` is no longer sent (the code stays registered).
+
+## MongoDB Audit
+
+What the MongoDB connector does for Audit, as implemented in P5-B / P5-C (#76, not merged yet). Decisions in [ADR-0027](adr/0027-mongodb-audit.md) (Proposed); the reference is [the connector README](../agent/crates/connector-mongodb/README.md#audit).
+
+### Sources and level
+
+`check()` and the Audit stream choose one source per target with the same rule, re-evaluated every 5 minutes. In order of preference:
+
+| Level | Condition | Source (`audit_source`) |
+|-------|-----------|--------|
+| **Partial** | The `auditLog` JSON file declared in `agent.yaml` (`format: audit_log`) is readable by the agent, `buildInfo` reports MongoDB Enterprise or Percona Server for MongoDB, **and** the stream has parsed a successful `authCheck` record in the last 24 h (**Limited** until then, note `audit.authcheck_success_pending`) | `mongodb_audit_log` |
+| **Limited** | The structured JSON server log declared in `agent.yaml` (`format: server_log`) is readable by the agent, on any edition, **and** the stream has parsed a record of it in the last 24 h (**None** until then) | `mongodb_log` |
+| **Limited** | No usable file; the target is not a `mongos`; the account holds `find` on `system.profile` of at least one database, **and** the stream has read a profiler entry in the last 24 h (**None** until then) | `mongodb_profiler` |
+| **None** | None of the above (note `audit.source_not_configured`; `audit.log_not_readable` when a declared file cannot be read) | none |
+
+**Full is never reported for MongoDB.** The `auditLog` logs every authorized command (with `auditAuthorizationSuccess`) but no document count (note `audit.log_without_row_counts`); the server log and the profiler have counts, but only for the operations the server records (slower than `slowms`, sampled by `slowOpSampleRate`; the profiler is a capped collection that overwrites itself), with the note `audit.slow_operations_only`. The agent cannot read `slowms`, `slowOpSampleRate`, the profiling level or `auditAuthorizationSuccess` without cluster privileges, so a level is proven from records read, never predicted from settings: a server log or profiler that recorded nothing in the last 24 h reports **None** with the note `audit.limited_pending_first_record` (the source is still read meanwhile).
+
+- **`auditLog`.** `auditLog.destination: file`, `format: JSON`, the `mongo` schema. The BSON format, the OCSF schema and the `syslog` / `console` destinations are not supported: their records do not parse and are counted as dropped (`audit.records_dropped`). An `auditLog` declared on a Community server is not used (`audit.auditlog_on_community`). An `auditLog.filter` that leaves reads out cannot be detected, and `auditAuthorizationSuccess` turned off is only noticed after 24 h without a successful `authCheck`.
+- **Server log.** `systemLog.destination: file` (JSON, MongoDB 4.4 and later). Operations come from the slow-query lines; a slow-query line has no user, so the connector follows connections by `ctx` (accept, client metadata and authentication lines, at most 4096). An operation on a connection that authenticated before the agent started reading the log is reported as an unidentified account.
+- **Profiler.** Per database and poll, one bounded `find` on `system.profile` (`ts` filter, fixed server-side projection, `limit: 1000`, `singleBatch`, `maxTimeMS`), at most 64 databases per poll, never `admin`, `local` or `config`. The position is kept in memory and the first poll starts at the newest entry. Profiling itself is set by the operator; level 2 is costly ([below](#cost-for-the-monitored-database)).
+- **One node.** The log and the profiler are per node, and the connector never follows the replica-set topology: only the declared node's activity is seen.
+
+### What is kept
+
+Closed-shape facts only (I2, [ADR-0007](adr/0007-mask-access-events.md)): the time, the command name (compared with a closed list), the normalized namespace, the user (`name@authdb`), the client IP (port dropped), the application name, the document counts, a failure flag, whether the filter has keys (a count, never a key or a value), a numeric `limit`, and the aggregation stage operators compared with a closed list. Command documents (`param.args`, `command`, `originatingCommand`), `errMsg`, `planSummary` and every other field hold other users' literals: they are skipped without being copied in the files, and never fetched from the profiler (the facts are computed by the server's projection). A failed operation is reported only when it returned documents.
+
+### Signals
+
+The signal ids are registered for `mongodb` in [`shared/protocol/signals.json`](../shared/protocol/signals.json).
+
+| Signal | When it is set |
+|--------|----------------|
+| `signature.mongodump` | A read of a collection (`find`, `aggregate`, `getMore`) by a client whose application name (`appName`) is `mongodump`, alone or followed by a space, `/`, `-` or a digit |
+| `signature.mongoexport` | The same with `mongoexport` |
+| `shape.full_table_read` | A `find` whose filter has no key, without a limit or with a limit above 10 000; an `aggregate` with no stage or only pass-through stages (`$project`, `$addFields`, `$set`, `$unset`, `$sort`, `$replaceRoot`, `$replaceWith`); a `getMore` of such a cursor when the source shows the command that opened it (log, profiler) |
+| `volume.large_result` | More than 10 000 documents returned or written by one operation (server log and profiler only) |
+
+These are heuristics, evadable by design. The application name is declared by the client: a dump tool run under another name carries no signature, and any client can declare the tools' names. The shape rule is cheap to evade: a filter that selects everything (`{_id: {$exists: true}}`), an `aggregate` with `{$match: {}}` or a large `$sample`, or a dump in many small filtered reads is not a whole-collection shape; `getMore` batches split a large read into operations below the volume threshold. On the `auditLog`, `getMore` records carry no filter, so only the application-name signatures apply to them. The volume × sensitivity score computed by the console remains the robust signal, and it needs row counts: `auditLog` events have none and score 0 ([ADR-0021](adr/0021-access-event-correlation.md)).
+
+### The agent's own account
+
+As for PostgreSQL and MySQL / MariaDB, an event of the agent's account is left out only when **all** of these hold:
+
+- it is a read or a connection: writes, DDL and DCL of the agent's account are always reported;
+- the account is `<account>@<auth_source>` of the target;
+- the application name is `databastion-agent` when the source shows one;
+- the client address is the agent's own address as the server sees it (the `whatsmyuri` command, read at each re-probe). Only an IP literal counts: a Unix socket leaves nothing out;
+- it carries no signal;
+- the documents it read stay within `limits.max_sample_rows` per collection over a rolling 24 h. On the `auditLog`, which has no counts, only a `find` with a numeric limit in `1..=max_sample_rows` is left out, charged that limit; any other read (an `aggregate`, including the agent's own `$sample`, a `find` without a limit) is reported.
+
+Not charged to the budget (same identity rules): the agent's `count` without a filter (it reads no document), and, **on the profiler source only**, the agent's own profiler polls with their exact shape: a `find` on `system.profile` with a one-key filter and `limit: 1000`, or the newest-entry probe with no filter and `limit: 1`. Any other read of `system.profile` with the agent's identity is charged like any read, and a read of it by any other account is reported.
+
+Limits of these rules: behind a proxy or NAT every client has the same address. Someone holding the agent's credentials on the agent host, spoofing its application name and reading at most the budget per collection and day stays unreported (on the `auditLog`, with `find`s whose limits add up to the budget); on the profiler source, the exact poll shape lets such a client read the latest 1000 profiler entries of a database per request unreported, as the agent itself does. The row counters are reset by an agent restart.
+
+### Notes
+
+`check()` Audit notes for MongoDB targets: `audit.authcheck_success_pending`, `audit.auditlog_on_community`, `audit.log_without_row_counts`, `audit.slow_operations_only`, `audit.limited_pending_first_record`, `audit.source_not_configured`, `audit.log_not_readable`, `audit.records_dropped`. `check()` counts `find` on `<db>.system.profile` as the Audit grant only while a stream reads the profiler; otherwise it reports it as `privilege.system_collections`.
+
+### Known limits
+
+- **Never Full; no document counts on the `auditLog`** (above).
+- **Slow operations only on the server log and the profiler.** A fast `mongodump` of a small collection, or any read under `slowms`, is not seen; a sampled log misses operations at random.
+- **Profiler ring buffer.** Entries overwritten between two polls are lost without a trace.
+- **Heuristic signals** and **own-account residuals** (above).
+- **Log literals on the agent host.** The files the agent reads hold other users' literals; the agent keeps none (zeroized buffers, never logged or sent), but a compromised agent host can read them through the file ACL it was given ([05-security.md](05-security.md#recommended-database-accounts-read-only)).
+- **At-most-once delivery**, as for the other engines; the profiler position is in memory, so an agent restart skips what the profiler recorded while the agent was stopped.
 
 ## Known export signatures
 | Tool | Observable signature | Engine |
@@ -233,7 +302,7 @@ A finding's location is the database, the collection (`object`) and a normalized
 | `mongodump` / `mongoexport` | Tool's `appName`, unfiltered `find` over the whole collection | MongoDB |
 | LDIF export / bulk `ldapsearch` | `scope=sub` search from the root, `(objectClass=*)` filter, high `reqEntries` | OpenLDAP |
 
-As implemented: on PostgreSQL (P4-A) the agent uses the `application_name` and the whole-relation `COPY … TO STDOUT` parts of the `pg_dump` signature (not the `REPEATABLE READ` transaction) and the outbound `COPY` signatures; see [PostgreSQL Audit](#postgresql-audit). On MySQL / MariaDB (P4-B) the agent uses the `SQL_NO_CACHE`, `SHOW CREATE TABLE` and `FLUSH TABLES WITH READ LOCK` parts of the `mysqldump` signature, plus the dump tools' `program_name`, consistent snapshots and `LOCK TABLES`, as one heuristic `signature.mysqldump`, and the `INTO OUTFILE` / `INTO DUMPFILE` signature; see [MySQL / MariaDB Audit](#mysql--mariadb-audit). The MongoDB (phase 5) and OpenLDAP (phase 6) signatures are not implemented yet.
+As implemented: on PostgreSQL (P4-A) the agent uses the `application_name` and the whole-relation `COPY … TO STDOUT` parts of the `pg_dump` signature (not the `REPEATABLE READ` transaction) and the outbound `COPY` signatures; see [PostgreSQL Audit](#postgresql-audit). On MySQL / MariaDB (P4-B) the agent uses the `SQL_NO_CACHE`, `SHOW CREATE TABLE` and `FLUSH TABLES WITH READ LOCK` parts of the `mysqldump` signature, plus the dump tools' `program_name`, consistent snapshots and `LOCK TABLES`, as one heuristic `signature.mysqldump`, and the `INTO OUTFILE` / `INTO DUMPFILE` signature; see [MySQL / MariaDB Audit](#mysql--mariadb-audit). On MongoDB (P5-B / P5-C, #76) the agent uses the tools' `appName` (`signature.mongodump`, `signature.mongoexport`) and, separately, the whole-collection `find` shape (`shape.full_table_read`); see [MongoDB Audit](#mongodb-audit). The OpenLDAP (phase 6) signatures are not implemented yet.
 
 Signatures are easy to forge (`application_name` and `program_name` are chosen by the client). They are only **one** of the three signals; the volume × sensitivity combination remains the primary signal (see [02-architecture.md](02-architecture.md#exfiltration-detection-audit)). The console computes it from the row count the source reports ([ADR-0021](adr/0021-access-event-correlation.md)): an event without `rows` scores 0 and feeds no baseline (the contract has an optional `AccessEvent.bytes` since #60; no connector produces it yet, and the console stores and shows it but does not use it in the score, #62), so on a source that gives no volume only signatures, shapes and object or principal conditions can raise an incident. Sensitivity is per object (table, collection), not per column.
 
