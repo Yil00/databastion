@@ -575,7 +575,8 @@ async fn profiled(a: &Url) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Cursors of the agent's probe account still open on the server.
+/// Idle cursors on the probe database (only the agent reads it with
+/// cursors; the fixture reads are single batches).
 async fn open_agent_cursors(a: &Url) -> usize {
     let mut s = admin_session(a).await;
     let reply = run(
@@ -594,9 +595,10 @@ async fn open_agent_cursors(a: &Url) -> usize {
                     ),
                     DocBuf::new().doc(
                         "$match",
-                        DocBuf::new()
-                            .str("type", "idleCursor")
-                            .str("effectiveUsers.user", MIN_USER),
+                        DocBuf::new().str("type", "idleCursor").doc(
+                            "ns",
+                            DocBuf::new().str("$regex", &format!("^{PROBE_DB}\\.")),
+                        ),
                     ),
                 ],
             )
