@@ -36,6 +36,8 @@ pub(crate) const LOG_ATTRIBUTES: [&str; 14] = [
     "entryCSN",
 ];
 
+/// Stands for a `reqDN` longer than `dn::MAX_DN_BYTES`.
+pub(crate) const OVERSIZED_DN: &str = "#oversized";
 /// Most `reqAttr` values examined.
 const MAX_REQ_ATTRS: usize = 2048;
 
@@ -167,7 +169,14 @@ pub(crate) fn parse(e: &Entry) -> Result<Record, ()> {
         .first_str("reqStart")
         .and_then(time::parse_generalized)
         .ok_or(())?;
-    let target = Zeroizing::new(e.first_str("reqDN").unwrap_or_default().to_owned());
+    // An oversized DN is replaced by a marker that is not a DN (never
+    // parsed, never sliced; review L1): no naming context, `*` objects, and
+    // a fingerprinted principal for a bind.
+    let target = Zeroizing::new(match e.first_str("reqDN") {
+        Some(d) if d.len() > dn::MAX_DN_BYTES => OVERSIZED_DN.to_owned(),
+        Some(d) => d.to_owned(),
+        None => String::new(),
+    });
     let target_canon = Zeroizing::new(dn::canon(&target).unwrap_or_default());
     let authz = match e.first_str("reqAuthzID") {
         Some(a) if !a.trim().is_empty() => Some(dn::canon(a).ok_or(())?),
@@ -330,6 +339,21 @@ pub(crate) mod tests {
         ] {
             assert!(parse(&bad).is_err());
         }
+    }
+
+    #[test]
+    fn oversized_dns_are_replaced() {
+        let long = format!("uid={},dc=x", "a".repeat(dn::MAX_DN_BYTES));
+        let e = log_entry(&[
+            ("reqStart", &["20260929202642.000001Z"]),
+            ("reqType", &["bind"]),
+            ("reqDN", &[long.as_str()]),
+            ("reqResult", &["0"]),
+            ("entryCSN", &[CSN]),
+        ]);
+        let r = parse(&e).unwrap();
+        assert_eq!(r.target.as_str(), OVERSIZED_DN);
+        assert!(r.target_canon.is_empty());
     }
 
     #[test]

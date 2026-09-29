@@ -508,8 +508,9 @@ Audit (ADR-0029 decisions 7 to 10; `src/audit/`):
   `entryCSN`; never `reqMod`, `reqOld`, `reqAssertion`, `reqMessage` or the controls. The filter
   and the DN are reduced in memory to closed facts (unselective or not, the agent's own filter or
   not; naming context, normalized container, a keyed hash for paged totals);
-- events: principal = authorization DN (bind DN for binds, fingerprinted on failure), no client
-  address (the log has none); objects = the naming context and the console's `sensitive_objects`
+- events: principal = authorization DN (bind DN for binds), sent by name only for `anonymous`, the
+  agent's own DN and `openldap.clear_principals`, a keyed fingerprint otherwise (entry DNs name
+  people); no client address (the log has none); objects = the naming context and the console's `sensitive_objects`
   reachable from the base and scope, else `*` with the container; rows = `reqEntries`;
 - signals: `shape.bulk_search` (scope one-level, subtree or children with a filter of presence
   tests and `objectClass` assertions only), `volume.large_result` (more than 10 000 entries by one

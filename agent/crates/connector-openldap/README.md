@@ -30,6 +30,14 @@ olcLimits: dn.exact="cn=databastion,ou=services,dc=example,dc=org" size=1000 tim
 - With SASL `EXTERNAL` over `ldapi://` (`openldap.bind: sasl_external`), map
   the agent's Unix uid to the service DN (`olcAuthzRegexp`) and set that DN
   as `account`; no `secret`.
+- Restrict the service DN to the agent's address (recommended): the log
+  records no client address, so the agent cannot tell its own reads from
+  someone else's with its credentials. Before rule {1} on the data database:
+
+  ```
+  olcAccess: {0}to * by dn.exact="cn=databastion,ou=services,dc=example,dc=org" peername.ip=10.0.0.15 break by dn.exact="cn=databastion,ou=services,dc=example,dc=org" none by * break
+  ```
+
 - Write, `manage` and `auth` access are never needed. OpenLDAP does not show
   a read-only account its effective rights, so `check()` cannot evaluate
   them and always reports `privilege.write_not_evaluated`: check `olcAccess`
@@ -67,6 +75,11 @@ search record from the last 24 h: `check()` looks for one and, when there is
 none, reads the context's root entry itself, so a server that logs reads
 proves it at the first check.
 
+Principals: an entry DN usually names a person, so Audit events carry the
+DN in clear only for `anonymous`, the agent's own DN and the DNs listed in
+`openldap.clear_principals` (service and administrator accounts); every
+other principal is sent as the agent's keyed fingerprint of the DN.
+
 What the log does not give, and so the events lack: the client address
 (principals carry none, and the agent's own activity is recognized by its
 DN, shapes and row budget only) and the object class of the entries a
@@ -87,6 +100,8 @@ search returned (events name the objects of the console's
     # ca_file: /etc/databastion/ldap-ca.pem
     bind: simple            # or sasl_external (ldapi:// socket, no secret)
     accesslog_base: cn=accesslog
+    # DNs sent by name in Audit events (others: fingerprints)
+    clear_principals: ["cn=admin,dc=example,dc=org"]
 ```
 
 ## Not covered

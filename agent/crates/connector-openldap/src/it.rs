@@ -541,6 +541,9 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
         "{bulk:?}"
     );
     assert!(bulk.iter().map(|e| e.rows().unwrap_or(0)).sum::<u64>() > 80);
+    // The administrator is not in openldap.clear_principals: its DN leaves
+    // as a fingerprint.
+    assert!(bulk.iter().all(|e| !e.principal().send_name()));
     // The agent's own scan and connections are routine.
     let own: Vec<&MaskedEvent> = events
         .iter()

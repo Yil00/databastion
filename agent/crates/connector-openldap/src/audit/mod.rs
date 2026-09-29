@@ -233,6 +233,7 @@ pub(crate) async fn audit_stream(
             )
         });
         b.set_contexts(p.contexts);
+        b.set_clear_principals(&target.openldap_settings().clear_principals);
         run(
             cfg,
             target,

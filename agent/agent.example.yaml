@@ -138,6 +138,10 @@ targets:
       # slapo-accesslog database read by Audit (olcAccessLogDB); never scanned
       # by Discovery. The service DN needs read on it.
       accesslog_base: cn=accesslog
+      # Audit events carry a principal's DN by name only for this list (service and
+      # administrator accounts, at most 64) and the agent's own DN; every other DN
+      # usually names a person and is sent as a keyed fingerprint (ADR-0029).
+      # clear_principals: ["cn=admin,dc=example,dc=com"]
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting

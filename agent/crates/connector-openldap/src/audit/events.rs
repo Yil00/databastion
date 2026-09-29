@@ -58,6 +58,8 @@ pub(crate) struct EventBuilder {
     /// (connection, hashed base and scope) -> (entries, last use).
     totals: HashMap<(u64, u64), (u64, Instant)>,
     keys: std::collections::hash_map::RandomState,
+    /// Canonical DNs sent by name besides the agent's own.
+    clear: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for EventBuilder {
@@ -93,7 +95,25 @@ impl EventBuilder {
             sensitive,
             totals: HashMap::new(),
             keys: std::collections::hash_map::RandomState::new(),
+            clear: std::collections::HashSet::new(),
         }
+    }
+
+    /// The principal of a canonical DN (security review M2 of #79): entry
+    /// DNs name people, so only the agent's own identity, `anonymous` and
+    /// the DNs listed in `openldap.clear_principals` are sent by name;
+    /// every other DN is sent as its keyed fingerprint (`db_user_fingerprint`).
+    fn principal(&self, user: &str) -> EventPrincipal {
+        if user == ANONYMOUS || user == self.identity || self.clear.contains(user) {
+            EventPrincipal::account(user)
+        } else {
+            EventPrincipal::failed_account(user)
+        }
+    }
+
+    /// DNs sent by name (canonical forms of `openldap.clear_principals`).
+    pub(crate) fn set_clear_principals(&mut self, dns: &[String]) {
+        self.clear = dns.iter().filter_map(|d| dn::canon(d)).collect();
     }
 
     /// The naming contexts (re-read at each re-probe).
@@ -271,6 +291,9 @@ impl EventBuilder {
             }
             Op::Other => return None,
             Op::Bind { sasl } => {
+                // A bind DN that is not a DN (a password typed as the user
+                // name, review L3): fingerprinted, never an identity.
+                let malformed = r.target_canon.is_empty() && !r.target.trim().is_empty();
                 let user = if r.target_canon.is_empty() {
                     None
                 } else {
@@ -278,16 +301,21 @@ impl EventBuilder {
                 };
                 match (r.result, sasl, user) {
                     (14, _, _) => return None,
+                    (0, _, _) if malformed => (
+                        EventAction::Connect,
+                        EventPrincipal::failed_account(&r.target),
+                        None,
+                    ),
                     (0, true, None) => (EventAction::Connect, EventPrincipal::unidentified(), None),
                     (0, false, None) => (
                         EventAction::Connect,
                         EventPrincipal::account(ANONYMOUS),
                         Some(ANONYMOUS.to_owned()),
                     ),
-                    (0, _, Some(u)) => (EventAction::Connect, EventPrincipal::account(&u), Some(u)),
+                    (0, _, Some(u)) => (EventAction::Connect, self.principal(&u), Some(u)),
                     (_, _, u) => (
                         EventAction::AuthFailure,
-                        EventPrincipal::failed_account(u.as_deref().unwrap_or("")),
+                        EventPrincipal::failed_account(u.as_deref().unwrap_or(&r.target)),
                         None,
                     ),
                 }
@@ -309,7 +337,7 @@ impl EventBuilder {
                     EventAction::Read
                 };
                 let user = r.authz.clone().unwrap_or_else(|| ANONYMOUS.to_owned());
-                (action, EventPrincipal::account(&user), Some(user))
+                (action, self.principal(&user), Some(user))
             }
         };
         let mut e = MaskedEvent::new(source, action, principal, r.start);
@@ -511,6 +539,8 @@ mod tests {
             e.principal().account_name(),
             "uid=app,ou=services,dc=example,dc=org"
         );
+        // Entry DNs are sent as fingerprints (security review M2).
+        assert!(!e.principal().send_name());
         assert_eq!(e.principal().client(), None);
         assert_eq!(
             names(&e),
@@ -757,6 +787,39 @@ mod tests {
                 .is_empty()
         );
         let _ = normalize_path("x");
+    }
+
+    #[test]
+    fn only_listed_dns_the_agent_and_anonymous_are_sent_by_name() {
+        let mut b = builder(Vec::new());
+        b.set_clear_principals(&["UID=App, ou=services,dc=example,dc=org".to_owned()]);
+        let now = Instant::now();
+        let listed = b.convert(vec![search(&DEFAULT)], now).pop().unwrap();
+        assert!(listed.principal().send_name());
+        let person = S {
+            who: "uid=jdoe,ou=people,dc=example,dc=org",
+            ..DEFAULT
+        };
+        let e = b.convert(vec![search(&person)], now).pop().unwrap();
+        assert!(!e.principal().send_name());
+        let anonymous = S { who: "", ..DEFAULT };
+        let e = b.convert(vec![search(&anonymous)], now).pop().unwrap();
+        assert!(e.principal().send_name());
+        assert_eq!(e.principal().account_name(), ANONYMOUS);
+        // A bind whose DN is not a DN (a password typed as the user name,
+        // review L3): fingerprinted, even when it succeeds.
+        let bind = parse(&log_entry(&[
+            ("reqStart", &["20260929202642.000001Z"]),
+            ("reqType", &["bind"]),
+            ("reqDN", &["hunter2-typed-as-user"]),
+            ("reqResult", &["0"]),
+            ("reqMethod", &["SIMPLE"]),
+            ("entryCSN", &[CSN]),
+        ]))
+        .unwrap();
+        let e = b.convert(vec![bind], now).pop().unwrap();
+        assert_eq!(e.action(), EventAction::Connect);
+        assert!(!e.principal().send_name());
     }
 
     #[test]

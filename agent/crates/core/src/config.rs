@@ -569,8 +569,22 @@ impl TargetConfig {
     }
 }
 
-/// Longest `openldap.accesslog_base`.
+/// Longest `openldap.accesslog_base` or `openldap.clear_principals` DN.
 pub const MAX_OPENLDAP_DN: usize = 512;
+/// Most `openldap.clear_principals`.
+pub const MAX_CLEAR_PRINCIPALS: usize = 64;
+
+/// A DN of `attr=value` RDNs, without control characters, at most
+/// [`MAX_OPENLDAP_DN`] bytes.
+fn is_dn(dn: &str) -> bool {
+    !dn.is_empty()
+        && dn.len() <= MAX_OPENLDAP_DN
+        && !dn.chars().any(char::is_control)
+        && dn.split(',').all(|rdn| {
+            rdn.split_once('=')
+                .is_some_and(|(t, v)| !t.trim().is_empty() && !v.trim().is_empty())
+        })
+}
 
 /// OpenLDAP settings of a target (ADR-0029). One connection to the declared
 /// server covers every naming context the account can read; the job's
@@ -596,6 +610,12 @@ pub struct OpenldapTargetConfig {
     /// `cn=accesslog`.
     #[serde(default = "default_accesslog_base")]
     pub accesslog_base: String,
+    /// Bind DNs whose Audit events carry the DN by name (service and
+    /// administrator accounts). Every other DN names a person more often
+    /// than not and is sent as its fingerprint (ADR-0029 decision 7). The
+    /// agent's own DN is always sent by name.
+    #[serde(default)]
+    pub clear_principals: Vec<String>,
 }
 
 fn default_accesslog_base() -> String {
@@ -609,6 +629,7 @@ impl Default for OpenldapTargetConfig {
             ca_file: None,
             bind: OpenldapBind::default(),
             accesslog_base: default_accesslog_base(),
+            clear_principals: Vec::new(),
         }
     }
 }
@@ -838,6 +859,7 @@ const KNOWN_KEYS: &[&str] = &[
     "simple",
     "sasl_external",
     "accesslog_base",
+    "clear_principals",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -1206,6 +1228,12 @@ impl TargetConfig {
                 field,
                 "a Unix socket has no TLS: set `tls: disable` for this target",
             )),
+            (_, true, false) if !loopback && self.engine == TargetEngine::Openldap => Err(invalid(
+                field,
+                "`disable` is only for an ldapi:// Unix socket or a loopback IP literal; use \
+                 `verify_full` (LDAPS) or `start_tls` (OpenLDAP has no `disable_insecure`: a \
+                 simple bind would send the password in clear)",
+            )),
             (_, true, false) if !loopback => Err(invalid(
                 field,
                 "`disable` is only for a Unix socket or a loopback IP literal; use \
@@ -1295,16 +1323,16 @@ impl TargetConfig {
                 "sasl_external needs an ldapi:// Unix socket (socket, tls: disable)",
             ));
         }
-        // A DN of `attr=value` RDNs, without control characters.
-        let dn = &ldap.accesslog_base;
-        if dn.is_empty()
-            || dn.len() > MAX_OPENLDAP_DN
-            || dn.chars().any(char::is_control)
-            || !dn.split(',').all(|rdn| {
-                rdn.split_once('=')
-                    .is_some_and(|(t, v)| !t.trim().is_empty() && !v.trim().is_empty())
-            })
-        {
+        if ldap.clear_principals.len() > MAX_CLEAR_PRINCIPALS {
+            return Err(invalid(f("clear_principals"), "at most 64 DNs"));
+        }
+        if !ldap.clear_principals.iter().all(|d| is_dn(d)) {
+            return Err(invalid(
+                f("clear_principals"),
+                "each must be a DN (attr=value[,attr=value…]), at most 512 bytes",
+            ));
+        }
+        if !is_dn(&ldap.accesslog_base) {
             return Err(invalid(
                 f("accesslog_base"),
                 "must be a DN (attr=value[,attr=value…]), at most 512 bytes",
@@ -1708,12 +1736,24 @@ targets:
         assert_eq!(settings.accesslog_base, "cn=log");
         // No cleartext on a network, and no `disable_insecure` at all.
         assert!(err(&with("    openldap: {tls: disable}\n")).contains("openldap.tls"));
+        assert!(!err(&with("    openldap: {tls: disable}\n")).contains("disable_insecure` to"));
         assert!(err(&with("    openldap: {tls: disable_insecure}\n")).contains("invalid value"));
         assert!(err(&with("    openldap: {tls: disable, ca_file: /x.pem}\n")).contains("ca_file"));
         assert!(
             err(&with("    openldap: {accesslog_base: accesslog}\n")).contains("accesslog_base")
         );
         assert!(err(&with("    openldap: {accesslog_base: \"cn=\"}\n")).contains("accesslog_base"));
+        let cfg = parse(&with(
+            "    openldap: {clear_principals: [\"cn=admin,dc=example,dc=org\"]}\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.targets[0].openldap_settings().clear_principals,
+            ["cn=admin,dc=example,dc=org"]
+        );
+        assert!(
+            err(&with("    openldap: {clear_principals: [admin]}\n")).contains("clear_principals")
+        );
         // SASL EXTERNAL: ldapi only, and no secret.
         assert!(err(&with("    openldap: {bind: sasl_external}\n")).contains("openldap.bind"));
         let socket = LDAP.replace(

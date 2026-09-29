@@ -24,6 +24,8 @@ const OID_NOTICE_OF_DISCONNECTION: &str = "1.3.6.1.4.1.1466.20036";
 
 /// Most attribute values kept per entry (beyond: skipped, counted).
 pub(crate) const MAX_VALUES_PER_ENTRY: usize = 4096;
+/// Most attributes kept per entry (beyond: skipped, counted; review L1).
+pub(crate) const MAX_ATTRIBUTES_PER_ENTRY: usize = 4096;
 /// Longest attribute description accepted (longer: the attribute is
 /// skipped).
 const MAX_ATTR_NAME: usize = 256;
@@ -343,7 +345,9 @@ fn entry(r: &mut Reader<'_>) -> Result<Entry, ParseError> {
                 skipped += 1;
             }
         }
-        if usable {
+        if usable && attributes.len() >= MAX_ATTRIBUTES_PER_ENTRY {
+            skipped += 1 + values.len();
+        } else if usable {
             attributes.push(Attribute {
                 name: utf8(name)?,
                 values,
@@ -749,6 +753,20 @@ mod tests {
         assert!(parse(unbind(1).as_bytes()).is_err());
         // An empty sequence (the input that panics other decoders).
         assert!(parse(&[0x30, 0x00]).is_err());
+    }
+
+    #[test]
+    fn attributes_per_entry_are_capped() {
+        let names: Vec<String> = (0..MAX_ATTRIBUTES_PER_ENTRY + 3)
+            .map(|i| format!("a{i}"))
+            .collect();
+        let attrs: Vec<(&str, &[&[u8]])> = names.iter().map(|n| (n.as_str(), &[][..])).collect();
+        let m = parse(&encode::entry(1, "cn=x", &attrs)).unwrap();
+        let Response::Entry(e) = m.op else {
+            panic!("not an entry")
+        };
+        assert_eq!(e.attributes.len(), MAX_ATTRIBUTES_PER_ENTRY);
+        assert_eq!(e.skipped, 3);
     }
 
     #[test]
