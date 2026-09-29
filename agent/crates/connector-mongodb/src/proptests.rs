@@ -6,7 +6,7 @@ use databastion_classifiers::names;
 use proptest::prelude::*;
 
 use crate::bson::{Doc, DocBuf, Value};
-use crate::paths::{self, Collector};
+use crate::paths::{self, Collector, Shape};
 use crate::scram::Scram;
 use crate::wire;
 
@@ -142,5 +142,71 @@ proptest! {
             }
             prop_assert!(!name.contains('@'), "{}", name);
         }
+    }
+
+    /// Map keys that are ordinary lowercase words (logins, surnames), each
+    /// in one document, never reach a path: the level collapses to `*`
+    /// (security review M3).
+    #[test]
+    fn word_map_keys_never_reach_a_path(
+        words in prop::collection::hash_set("[a-z]{3,10}", 2..12),
+    ) {
+        let words: Vec<String> = words
+            .into_iter()
+            .filter(|w| !["acl", "role", "admin"].contains(&w.as_str()))
+            .collect();
+        prop_assume!(words.len() >= 2);
+        let docs: Vec<Vec<u8>> = words
+            .iter()
+            .map(|w| {
+                DocBuf::new()
+                    .doc("acl", DocBuf::new().doc(w, DocBuf::new().str("role", "admin")))
+                    .finish()
+            })
+            .collect();
+        let parsed: Vec<Doc<'_>> = docs.iter().map(|d| Doc::new(d).unwrap()).collect();
+        let mut c = Collector::with_shape(10, Shape::learn(&parsed));
+        for d in &parsed {
+            c.add_document(*d).unwrap();
+        }
+        let paths: Vec<String> = c
+            .into_paths()
+            .into_iter()
+            .map(|(n, _)| n.as_str().to_owned())
+            .collect();
+        // Two documents with one distinct key each are below the singleton
+        // rule's minimum of 3 keys.
+        if words.len() >= paths::MIN_SINGLETON_KEYS {
+            prop_assert_eq!(paths.clone(), vec!["acl.*.role".to_owned()]);
+            for p in &paths {
+                for w in &words {
+                    prop_assert!(!p.split('.').any(|seg| seg == w.as_str()), "{} kept {}", p, w);
+                }
+            }
+        }
+    }
+
+    /// Random bodies inside a valid BSON length and terminator, and inside
+    /// a valid OP_MSG section, reach the inner parsers (security review L3).
+    #[test]
+    fn framed_random_bodies_never_panic(body in prop::collection::vec(any::<u8>(), 0..400)) {
+        let mut doc = Vec::with_capacity(body.len() + 5);
+        doc.extend_from_slice(&i32::try_from(body.len() + 5).unwrap().to_le_bytes());
+        doc.extend_from_slice(&body);
+        doc.push(0);
+        let parsed = Doc::new(&doc);
+        prop_assert!(parsed.is_ok());
+        if let Ok(d) = parsed {
+            walk(d, 0);
+            let mut c = Collector::with_shape(10, Shape::learn(&[d]));
+            let _ = c.add_document(d);
+            for (name, _) in c.into_paths() {
+                prop_assert!(names::conforms(name.as_str()), "{}", name.as_str());
+            }
+        }
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(&doc);
+        prop_assert!(wire::parse(&payload).is_ok());
     }
 }

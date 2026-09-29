@@ -663,6 +663,98 @@ mod tests {
         }
     }
 
+    /// Normalized paths of documents walked with the shape learned from
+    /// them.
+    fn shaped(docs: &[Vec<u8>]) -> Vec<String> {
+        let parsed: Vec<Doc<'_>> = docs.iter().map(|d| Doc::new(d).unwrap()).collect();
+        let mut c = Collector::with_shape(10, Shape::learn(&parsed));
+        for d in &parsed {
+            c.add_document(*d).unwrap();
+        }
+        c.into_paths()
+            .into_iter()
+            .map(|(n, _)| n.as_str().to_owned())
+            .collect()
+    }
+
+    /// Maps keyed by data that do not look like values (logins, surnames,
+    /// short ids) collapse to `*` (security review M3).
+    #[test]
+    fn maps_keyed_by_data_are_collapsed() {
+        let logins = ["jdupont", "mmartin", "abernard", "lpetit", "cdurand"];
+        let docs: Vec<Vec<u8>> = logins
+            .iter()
+            .enumerate()
+            .map(|(i, login)| {
+                DocBuf::new()
+                    .doc(
+                        "acl",
+                        DocBuf::new().doc(login, DocBuf::new().str("role", "admin")),
+                    )
+                    .doc(
+                        "sessions",
+                        DocBuf::new().doc(
+                            &format!("u{i:04}"),
+                            DocBuf::new().str("ip", &format!("10.0.0.{i}")),
+                        ),
+                    )
+                    .doc(
+                        "users",
+                        DocBuf::new().doc(
+                            login,
+                            DocBuf::new().doc(
+                                &format!("{login}-laptop"),
+                                DocBuf::new().str("ip", "10.1.1.1"),
+                            ),
+                        ),
+                    )
+                    .doc(
+                        "address",
+                        DocBuf::new().str("street", "1 rue").str("city", "Nantes"),
+                    )
+                    .finish()
+            })
+            .collect();
+        let paths = shaped(&docs);
+        assert_eq!(
+            paths,
+            [
+                "acl.*.role",
+                "sessions.*.ip",
+                "users.*.*.ip",
+                "address.street",
+                "address.city"
+            ]
+        );
+        for p in &paths {
+            for login in logins {
+                assert!(!p.contains(login), "{p}");
+            }
+        }
+        // More than MAX_STATIC_KEYS keys in one document: a map.
+        let mut by_owner = DocBuf::new();
+        for i in 0..=MAX_STATIC_KEYS {
+            by_owner = by_owner.doc(
+                &format!("owner{}", char::from(b'a' + u8::try_from(i).unwrap())),
+                DocBuf::new().str("email", "x@example.com"),
+            );
+        }
+        let doc = DocBuf::new().doc("by_owner", by_owner).finish();
+        assert_eq!(shaped(&[doc]), ["by_owner.*.email"]);
+        // Top-level fields are never collapsed; a few keys in a single
+        // document are kept (not enough evidence).
+        let doc = DocBuf::new()
+            .doc(
+                "acl",
+                DocBuf::new()
+                    .str("dupont", "r")
+                    .str("martin", "w")
+                    .str("petit", "r"),
+            )
+            .finish();
+        assert_eq!(shaped(&[doc]), ["acl.dupont", "acl.martin", "acl.petit"]);
+    }
+
     #[test]
     fn walk_bounds() {
         // Nesting deeper than MAX_DEPTH is skipped and counted.

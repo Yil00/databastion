@@ -356,7 +356,7 @@ the same rustls crates:
   a bounded reader that fails closed; error replies reduced to their numeric code (never `errmsg`);
 - one declared host or socket, direct connection: `hello`'s `hosts` are never followed, no
   `mongodb+srv`; one connection per scan and per `check()`, no pool, no monitoring connection;
-- SCRAM-SHA-256 only (SASLprep, iteration count 4096 to 1 000 000, the server nonce must extend
+- SCRAM-SHA-256 only (SASLprep, iteration count 4096 to 100 000, derived off the async runtime, the server nonce must extend
   the client's, the server signature verified before any other command); SCRAM-SHA-1, `PLAIN`,
   X.509, Kerberos, AWS and OIDC are not supported; `authSource` from `mongodb.auth_source`
   (default `admin`);
@@ -385,8 +385,9 @@ Behavior:
   that, natural order with `limit` otherwise; per document at most 20 levels, 16 elements per
   array, 512 values; per collection 1024 normalized paths; values cut to 4096 bytes;
 - field paths: arrays as `[]`, keys through `names::normalize_field_path` (digit-only keys, keys
-  with a dot or that look like values become `*`), values of every raw path with the same
-  normalized path pooled; collection names through `names::normalize_path` (`fs.files`);
+  with a dot or that look like values become `*`), object levels that are maps keyed by data
+  (more than 16 distinct keys in the sample, or keys each in one document) collapsed to `*`,
+  values of every raw path with the same normalized path pooled; collection names through `names::normalize_path` (`fs.files`);
 - values: strings and symbols; `int32` / `int64` digits; integral doubles below 2^53; finite
   `Decimal128`; dates as `YYYY-MM-DD`; generic and user binaries only when they are UTF-8 text;
   UUID, encrypted, compressed, sensitive and vector binaries, ObjectIds, booleans, code and
