@@ -2,7 +2,7 @@
 
 MongoDB connector of the DataBastion agent: Discovery and `check()` (P5-A,
 [ADR-0026](../../../docs/adr/0026-mongodb-connector.md)) and Audit (P5-B,
-P5-C, [ADR-0027](../../../docs/adr/0027-mongodb-audit.md), Proposed). The
+P5-C, [ADR-0027](../../../docs/adr/0027-mongodb-audit.md)). The
 client, the commands, the sampling and the Audit sources are described in
 [agent/README.md](../../README.md#mongodb-connector); this page records what
 an operator sets up and what the connector does not cover.

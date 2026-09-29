@@ -18,7 +18,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B), Audit (P4-A, [README](crates/connector-postgres/README.md)) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
-| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md), Proposed) |
+| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
@@ -400,7 +400,7 @@ Behavior:
   privileges on every database, system collections or the `admin` / `local` / `config`
   databases; views not sampled. Recomputed at most every 10 minutes per target.
 
-Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md), Proposed; `src/audit/`):
+Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
 
 - sources, one per target, chosen by the same rule as `check()` and re-evaluated every 5 minutes:
   the Enterprise / Percona `auditLog` JSON file (`mongodb.audit_log` with `format: audit_log`;
