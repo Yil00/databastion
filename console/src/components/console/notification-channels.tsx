@@ -205,6 +205,10 @@ export function ChannelForm({ csrfToken, initial }: { csrfToken: string; initial
               Webhook URL (https://){edit ? `: currently ${(initial?.config as WebhookConfig).origin}/…; leave empty to keep it` : ""}
             </Label>
             <Input id={id("url")} name="url" type="url" required={!edit} maxLength={2048} autoComplete="off" />
+            <p className="text-xs text-muted-foreground">
+              The receiver must escape the text fields it renders (HTML, Markdown, chat messages), the principal first:
+              it is a database account name that any client of the database can choose.
+            </p>
           </div>
         )}
         <div className="flex flex-wrap items-center gap-6">
@@ -214,7 +218,7 @@ export function ChannelForm({ csrfToken, initial }: { csrfToken: string; initial
           </label>
           <label className="flex items-center gap-2 text-sm">
             <input name="system_alerts" type="checkbox" defaultChecked={initial?.systemAlerts ?? false} className="size-4" />
-            Also receive console alerts (silent agents, agent-integrity events)
+            Also receive console alerts (silent agents, agent-integrity events, dropped batches)
           </label>
         </div>
         <div className="flex items-center gap-3">

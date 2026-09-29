@@ -62,6 +62,7 @@ export const NOTIFICATION_EVENTS = [
   "agent.silent",
   "agent.recovered",
   "agent.integrity",
+  "agent.batches_dropped",
   "channel.test",
   "notifications.suppressed",
 ] as const;

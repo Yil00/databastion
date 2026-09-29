@@ -28,6 +28,8 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - Next.js App Router; the agent API server code lives in `console/src/app/api/agent/v1/`
 - Every agent API input is validated against the schema generated from `shared/protocol/` (rejected on unknown fields)
 - Versioned Drizzle migrations; never modify the schema by hand
+  - Only exception: the migrate runner steps of [ADR-0028](docs/adr/0028-online-constraint-validation.md) (migration `0027` applied `NOT VALID` then validated on installs at `0026`, and `VALIDATE CONSTRAINT` for `DEFERRED_VALIDATIONS`)
+  - A `CHECK` or foreign key added to a table that may be large is written `NOT VALID` in a custom migration and listed in `DEFERRED_VALIDATIONS` (`console/src/db/online-constraints.ts`, plain lower-case names), never validated in the migration itself
 - Process-wide mutable state in the web process uses `processGlobal` / `processSlot` (`console/src/server/process-global.ts`), never module-level variables: Turbopack gives each layer its own module instance (#63)
 - pnpm; commands (to be filled in as soon as they exist): `pnpm lint`, `pnpm test`, `pnpm build`
 

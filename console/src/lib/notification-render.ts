@@ -98,6 +98,25 @@ export interface AgentIntegrityPayload {
   details: Record<string, string | number | boolean | null>;
 }
 
+/**
+ * P7 (end-of-phase-4 review M2): the agent reported dropped spool batches (spool full, or batches
+ * rejected with a non-retryable status): findings or access events were lost, possibly those of
+ * an extraction. Console-computed counts and timestamps only: no agent-provided text.
+ */
+export interface AgentBatchesDroppedPayload {
+  event: "agent.batches_dropped";
+  occurred_at: string;
+  url: string | null;
+  agent_id: string;
+  /** Batches dropped since `since` (sum of the increases of the agent's counter), not alerted before. */
+  dropped_batches: number;
+  /** When the console first saw one of these drops. */
+  since: string;
+  /** At most one alert per agent in this many seconds; later drops are counted in the next one. */
+  min_interval_s: number;
+  security_event_id: string;
+}
+
 export interface ChannelTestPayload {
   event: "channel.test";
   occurred_at: string;
@@ -124,6 +143,7 @@ export type NotificationPayload =
   | AgentSilentPayload
   | AgentRecoveredPayload
   | AgentIntegrityPayload
+  | AgentBatchesDroppedPayload
   | ChannelTestPayload;
 
 /** Webhook body: the payload plus the format version and the delivery id. */
@@ -232,6 +252,18 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
       return {
         subject: `[DataBastion] ${p.severity.toUpperCase()} agent-integrity event: ${one(p.kind, 64)}`,
         text: `The console recorded ${one(p.kind, 64)} for the agent ${p.agent_id} at ${p.occurred_at} (security event ${p.security_event_id}). A conforming agent never causes it.\n\n${details}\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "agent.batches_dropped": {
+      const p = payload;
+      const n = `${p.dropped_batches} batch${p.dropped_batches === 1 ? "" : "es"}`;
+      return {
+        subject: `[DataBastion] Agent dropped ${n}: ${p.agent_id}`,
+        text: [
+          `The agent ${p.agent_id} reported ${n} dropped since ${p.since} (security event ${p.security_event_id}).`,
+          "Dropped batches are findings or access events that never reached the console: the spool was full, or the console rejected them. An extraction during that time may have gone undetected.",
+          `Check the agent's spool size, its link to the console and, on Audit targets, floods of events (e.g. failed logins). At most one such alert is sent per agent every ${Math.round(p.min_interval_s / 60)} minutes; later drops are counted in the next one.`,
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
     case "notifications.suppressed": {
