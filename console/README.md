@@ -505,6 +505,7 @@ least N x 16 + 20 connections, plus PostgreSQL's reserved and administration con
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
 | Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
 | System-alert budgets (`system_alert_budgets`) | per (channel, UTC hour): the number of system alerts queued to the channel. No agent data. Past hours are pruned by the worker. Read, insert, update and delete for the runtime role (migration `0033`) |
+| Per-agent system-alert shares (`system_alert_agent_budgets`) | per (channel, agent id, UTC hour): the number of that agent's system alerts charged to the channel. No foreign key to `agents` (its lock would deadlock with heartbeats); past hours are pruned by the worker. Read, insert, update and delete for the runtime role (migration `0036`) |
 | Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1`, never in clear. Without a server key the username-derived limits are not stored at all (per process, see "Shared rate limits") and the other keys are a domain-separated SHA-256. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
 
 The argon2 concurrency caps and the 25 s verified-secret cache are in memory, per process (the
@@ -919,15 +920,24 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <
   limit`) in the transaction that records the alert, so concurrent heartbeats, web replicas and
   workers are serialized on that row and never exceed it; no in-memory state. A repeated alert
-  (same idempotency key) is not charged, and an aborted transaction gives its charge back. Over the
-  budget, the delivery is recorded as `skipped` (`rate_limited`); the security event, the audit
+  (same idempotency key) is not charged, and an aborted transaction gives its charge back.
+  **Per-agent share** (PR #81 security review M1): one agent may use at most `max(2, ceil(limit /
+  4))` of a channel's hourly budget (5 of the default 20), counted the same way in
+  `system_alert_agent_budgets` (one row per channel, agent and hour, charged before the channel
+  budget; a charge the channel budget then refuses is given back), so one compromised or
+  misbehaving agent cannot spend the budget of the others. **Critical alerts are never held**:
+  an `agent.integrity` alert of severity `critical` (`agent.rotation_conflict`: another party may
+  hold the agent's secret) is neither charged to nor refused by either budget, like severe events
+  bypass the incident cap. Over a budget, the delivery is recorded as `skipped` (`rate_limited`); the security event, the audit
   entry and the agent page are unaffected (every alert stays recorded). Once the hour is over
   (worker, every minute), one `system_alerts.suppressed` digest per channel and hour reports
   `suppressed` (total), `by_event` (count per event), `agents` (number of distinct agents) and
   `limit_per_hour`, with a link to the agents list: counts only, never an agent id, name or host
-  name. Digests, tests and incident notifications are not charged. Limit: within an hour, once the
-  budget is spent, a later alert (e.g. a silence) is only counted in the digest, sent after the
-  hour; the Agents page and the security events show it at once. Budget rows of past hours are
+  name. Digests, tests and incident notifications are not charged. Residual risk: within an hour,
+  once the channel budget is spent (by at least `limit / share` agents, e.g. four agents failing
+  together, or a fleet-wide outage), a later non-critical alert (e.g. a silence) is only counted in
+  the digest, sent after the hour; the Agents page and the security events show it at once, and
+  critical alerts still go out. Budget rows of past hours are
   pruned by the worker.
 - **Hardening (security review)**: moving an e-mail channel with a stored password to another host,
   port, TLS mode or user requires the password again (`400 password_required`); SMTP ports 25, 465,

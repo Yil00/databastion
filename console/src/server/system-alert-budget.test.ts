@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { getDb, type Database } from "@/db/client";
 import * as schema from "@/db/schema";
-import { agents, notificationChannels, notificationDeliveries, securityEvents, systemAlertBudgets } from "@/db/schema";
+import { agents, notificationChannels, notificationDeliveries, securityEvents, systemAlertAgentBudgets, systemAlertBudgets } from "@/db/schema";
 import type { AgentIntegrityPayload } from "@/lib/notification-render";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 
@@ -15,7 +15,15 @@ import {
   SYSTEM_ALERTS_MAX_PER_HOUR_VAR,
   systemAlertsMaxPerHour,
 } from "./alerting-config";
-import { drainDeliveries, enqueueSystemAlert, enqueueSystemAlertDigests, notificationClock, type Senders } from "./notifications";
+import {
+  criticalSystemAlert,
+  drainDeliveries,
+  enqueueSystemAlert,
+  enqueueSystemAlertDigests,
+  notificationClock,
+  systemAlertAgentShare,
+  type Senders,
+} from "./notifications";
 import { checkSilentAgents } from "./system-alerts";
 
 describe("DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR", () => {
@@ -131,6 +139,46 @@ describe.skipIf(!hasDb)("global hourly budget of system alerts per channel (Post
     expect(await getDb().transaction((tx) => enqueueSystemAlert(tx, integrityAlert(String(late), "2026-09-27T11")))).toBe(2);
   });
 
+  it("PR #81 M1: one noisy agent uses at most its share; a critical alert of another agent is never held", async () => {
+    process.env[SYSTEM_ALERTS_MAX_PER_HOUR_VAR] = "8";
+    expect(systemAlertAgentShare(8)).toBe(2);
+    expect(systemAlertAgentShare(1)).toBe(2);
+    expect(systemAlertAgentShare(20)).toBe(5);
+    notificationClock.now = () => new Date("2026-09-27T16:15:00.000Z");
+    const [noisy, a, b, c, d] = (await newAgents(5, "share")) as [string, string, string, string, string];
+    const kinds = ["agent.batch_rejected", "agent.batch_conflict", "agent.foreign_target", "agent.k4", "agent.k5", "agent.k6"];
+    for (const kind of kinds) await getDb().transaction((tx) => enqueueSystemAlert(tx, integrityAlert(noisy, "2026-09-27T16", kind)));
+    // The noisy agent: 2 of 6 sent per channel, the rest counted in the digest.
+    expect(statusCount(await rowsOf([noisy]), ops)).toEqual({ pending: 2, "skipped:rate_limited": 4 });
+    // The other agents still get the rest of the budget (8 - 2 = 6 = 3 agents x their share).
+    for (const id of [a, b, c]) {
+      for (const kind of kinds.slice(0, 2)) await getDb().transaction((tx) => enqueueSystemAlert(tx, integrityAlert(id, "2026-09-27T16", kind)));
+      expect(statusCount(await rowsOf([id]), ops)).toEqual({ pending: 2 });
+    }
+    // The channel budget is spent: d's ordinary alert waits for the digest, and its share charge
+    // is given back.
+    await getDb().transaction((tx) => enqueueSystemAlert(tx, integrityAlert(d, "2026-09-27T16")));
+    expect(statusCount(await rowsOf([d]), ops)).toEqual({ "skipped:rate_limited": 1 });
+    const share = await getDb().select().from(systemAlertAgentBudgets).where(and(eq(systemAlertAgentBudgets.channelId, ops), eq(systemAlertAgentBudgets.agentId, d)));
+    expect(share[0]?.sent).toBe(0);
+    // A critical alert (rotation conflict) of d: delivered at once, not charged.
+    const critical = integrityAlert(d, "2026-09-27T16", "agent.rotation_conflict");
+    critical.payload.severity = "critical";
+    expect(criticalSystemAlert(critical.payload)).toBe(true);
+    expect(await getDb().transaction((tx) => enqueueSystemAlert(tx, critical))).toBe(2);
+    const rows = (await rowsOf([d])).filter((r) => (r.payload as { kind: string }).kind === "agent.rotation_conflict");
+    expect(rows.map((r) => r.status)).toEqual(["pending", "pending"]);
+    const [budget] = await getDb()
+      .select()
+      .from(systemAlertBudgets)
+      .where(and(eq(systemAlertBudgets.channelId, ops), eq(systemAlertBudgets.windowStart, new Date("2026-09-27T16:00:00.000Z"))));
+    expect(budget?.sent).toBe(8);
+    // Even from the noisy agent itself, over its share.
+    const own = integrityAlert(noisy, "2026-09-27T16", "agent.rotation_conflict");
+    own.payload.severity = "critical";
+    expect(await getDb().transaction((tx) => enqueueSystemAlert(tx, own))).toBe(2);
+  });
+
   it("an aborted transaction gives its charge back", async () => {
     process.env[SYSTEM_ALERTS_MAX_PER_HOUR_VAR] = "1";
     notificationClock.now = () => new Date("2026-09-27T12:15:00.000Z");
@@ -224,6 +272,9 @@ describe.skipIf(!hasDb)("global hourly budget of system alerts per channel (Post
     expect(
       await getDb().select().from(systemAlertBudgets).where(sql`${systemAlertBudgets.windowStart} < '2026-09-27T16:00:00Z'::timestamptz`),
     ).toHaveLength(0);
+    expect(
+      await getDb().select().from(systemAlertAgentBudgets).where(sql`${systemAlertAgentBudgets.windowStart} < '2026-09-27T16:00:00Z'::timestamptz`),
+    ).toHaveLength(0);
 
     // Digests are not charged to the budget and are sent like any delivery.
     const calls: string[] = [];
@@ -251,6 +302,8 @@ describe.skipIf(!hasDb)("global hourly budget of system alerts per channel (Post
       notificationClock.now = () => new Date("2026-09-28T12:00:00.000Z");
       expect(await enqueueSystemAlertDigests(db)).toBe(2);
       await expect(pool.query("truncate system_alert_budgets")).rejects.toThrow(/permission denied/);
+      await expect(pool.query("truncate system_alert_agent_budgets")).rejects.toThrow(/permission denied/);
+      expect(await getDb().select().from(systemAlertAgentBudgets).where(inArray(systemAlertAgentBudgets.agentId, ids))).toHaveLength(0);
     } finally {
       await pool.end();
     }

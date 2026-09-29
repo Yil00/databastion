@@ -352,7 +352,7 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
           "",
           ...lines,
           "",
-          "Every one of them is recorded: see the agents and their security events in the console.",
+          "Every one of them is recorded in the console: silences, integrity events, dropped batches and stopped Audit streams as security events on the agent, recoveries in the audit log.",
         ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }

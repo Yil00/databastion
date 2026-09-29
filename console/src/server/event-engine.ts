@@ -328,6 +328,16 @@ interface ChunkState {
   created: Map<string, number>;
 }
 
+/**
+ * Rows of the events linked to a false-positive incident since it was marked (0 for another
+ * status). Table-qualified on purpose: an unqualified "id" in the subquery would resolve to ae.id.
+ */
+function rowsSinceFalsePositiveSql() {
+  return sql<number>`case when incidents.status = 'false_positive' then coalesce((
+      select sum(ae.rows) from incident_events ie join access_events ae on ae.id = ie.event_id
+      where ie.incident_id = incidents.id and ie.created_at >= incidents.false_positive_at), 0) else 0 end::double precision`;
+}
+
 async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<LatestIncident | null> {
   if (state.latest.has(key)) return state.latest.get(key) ?? null;
   const [row] = await tx
@@ -338,10 +348,7 @@ async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<L
       eventSignals: incidents.eventSignals,
       eventAnomaly: incidents.eventAnomaly,
       eventRows: incidents.eventRows,
-      // Table-qualified on purpose: an unqualified "id" in the subquery would resolve to ae.id.
-      rowsSinceFalsePositive: sql<number>`case when incidents.status = 'false_positive' then coalesce((
-          select sum(ae.rows) from incident_events ie join access_events ae on ae.id = ie.event_id
-          where ie.incident_id = incidents.id and ie.created_at >= incidents.false_positive_at), 0) else 0 end::double precision`,
+      rowsSinceFalsePositive: rowsSinceFalsePositiveSql(),
     })
     .from(incidents)
     .where(eq(incidents.dedupKey, key))
@@ -388,14 +395,25 @@ async function createdThisHour(tx: Tx, state: ChunkState, policyId: string, e: P
   return n;
 }
 
+/**
+ * Links an event to an incident. `created_at` is the wall clock of the insert, not the transaction
+ * start (`now()`): the rows linked after a false-positive mark are counted from it (ADR-0031
+ * decision 2), and a chunk transaction that started before a concurrent mark links after it (PR #81
+ * security review L1).
+ */
 async function link(tx: Tx, incidentId: string, eventId: string): Promise<void> {
-  await tx.insert(incidentEvents).values({ incidentId, eventId }).onConflictDoNothing();
+  await tx.insert(incidentEvents).values({ incidentId, eventId, createdAt: sql`clock_timestamp()` }).onConflictDoNothing();
 }
 
-/** Adds an event to an active incident. */
+/**
+ * Adds an event to an active incident. Only while it is still active (PR #81 security review L1):
+ * when a user closed it after the chunk read it (the update waits for that transaction, then
+ * re-checks the status), the event is only linked to it, as to any closed incident, and the
+ * cached state is refreshed for the next events of the chunk.
+ */
 async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: EventFacts): Promise<void> {
   const signals = mergeSignals(latest.eventSignals ?? [], facts.signals);
-  await tx
+  const updated = await tx
     .update(incidents)
     .set({
       matchCount: sql`${incidents.matchCount} + 1`,
@@ -406,7 +424,21 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
       lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
       updatedAt: sql`now()`,
     })
-    .where(eq(incidents.id, latest.id));
+    .where(and(eq(incidents.id, latest.id), inArray(incidents.status, ["open", "acknowledged"])))
+    .returning({ id: incidents.id });
+  if (updated.length === 0) {
+    const [now] = await tx
+      .select({
+        status: incidents.status,
+        rowsSinceFalsePositive: rowsSinceFalsePositiveSql(),
+      })
+      .from(incidents)
+      .where(eq(incidents.id, latest.id));
+    latest.status = now?.status ?? "resolved";
+    latest.rowsSinceFalsePositive = Number(now?.rowsSinceFalsePositive ?? 0);
+    await linkClosed(tx, latest, e);
+    return;
+  }
   latest.eventSignals = signals;
   latest.eventScore = Math.max(latest.eventScore ?? 0, facts.score);
   latest.eventAnomaly = latest.eventAnomaly === true || facts.anomaly;

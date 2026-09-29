@@ -163,42 +163,85 @@ function hourSql() {
   return sql`date_trunc('hour', ${clockSql()}, 'UTC')`;
 }
 
+/** Per-agent share of a channel's hourly budget of system alerts (PR #81 security review M1). */
+export function systemAlertAgentShare(limit: number): number {
+  return Math.max(2, Math.ceil(limit / 4));
+}
+
 /**
- * P7 (#75 review L4): charges one system alert to the hourly budget of each channel, in the
- * caller's transaction. One conditional upsert per channel on `system_alert_budgets`: the row of
- * (channel, hour) is created at 1, or incremented only while below the limit. The row lock is held
- * until the transaction ends, so concurrent transactions of any process are serialized on it and
- * never exceed the limit; an aborted transaction gives its charge back. Channels are charged in
- * sorted order, so two transactions charging the same channels cannot deadlock. Callers take the
- * budget rows last (after their agent row), never the other way round. Returns the channels whose
- * budget of the hour is spent.
+ * P7 (#75 review L4, PR #81 security review M1): charges one system alert to the hourly budgets of
+ * each channel, in the caller's transaction, and returns the channels that refused it.
+ *
+ * Per channel, two conditional upserts (created at 1, or incremented only while below the limit):
+ * - the agent's share (`system_alert_agent_budgets`, at most `systemAlertAgentShare(limit)` per
+ *   agent, channel and hour), when the alert has an agent: one compromised or misbehaving agent
+ *   cannot spend the budget of the others;
+ * - then the channel budget (`system_alert_budgets`, at most `limit`). When it refuses, the agent's
+ *   charge just taken is given back (same transaction, row still locked by it).
+ * Row locks are held until the transaction ends, so concurrent transactions of any process are
+ * serialized on each row and never exceed a limit; an aborted transaction gives its charges back.
+ * Channels are charged in sorted order, the agent row before the channel row, and a transaction
+ * only charges its own agent's rows: every transaction takes these locks in one global order, so
+ * they cannot deadlock. Callers take the budget rows last (after their agent row), never the other
+ * way round.
  */
-async function chargeSystemAlertBudget(tx: Exec, channelIds: readonly string[]): Promise<Set<string>> {
+async function chargeSystemAlertBudget(tx: Exec, channelIds: readonly string[], agentId: string | null): Promise<Set<string>> {
   const limit = systemAlertsMaxPerHour();
+  const share = systemAlertAgentShare(limit);
   const refused = new Set<string>();
   for (const id of [...new Set(channelIds)].sort()) {
+    if (agentId !== null) {
+      const mine = await tx.execute<{ sent: number }>(sql`
+        insert into system_alert_agent_budgets as b (channel_id, agent_id, window_start, sent)
+        values (${id}, ${agentId}, ${hourSql()}, 1)
+        on conflict (channel_id, agent_id, window_start) do update set sent = b.sent + 1 where b.sent < ${share}
+        returning b.sent`);
+      if (mine.rows.length === 0) {
+        refused.add(id);
+        continue;
+      }
+    }
     const res = await tx.execute<{ sent: number }>(sql`
       insert into system_alert_budgets as b (channel_id, window_start, sent)
       values (${id}, ${hourSql()}, 1)
       on conflict (channel_id, window_start) do update set sent = b.sent + 1 where b.sent < ${limit}
       returning b.sent`);
-    if (res.rows.length === 0) refused.add(id);
+    if (res.rows.length === 0) {
+      refused.add(id);
+      if (agentId !== null) {
+        await tx.execute(sql`
+          update system_alert_agent_budgets set sent = sent - 1
+          where channel_id = ${id} and agent_id = ${agentId} and window_start = ${hourSql()} and sent > 0`);
+      }
+    }
   }
   return refused;
 }
 
 /**
- * A console alert (silent agent and recovery, agent-integrity event, dropped batches) to every
- * enabled channel flagged `system_alerts`. `subjectKey` identifies the alert (e.g. the silence
- * episode); with no such channel nothing is queued (the security event row remains). Returns the
- * number of rows queued as pending.
+ * Critical system alerts (an `agent.integrity` event of severity `critical`, e.g.
+ * `agent.rotation_conflict`: another party may hold the agent's secret) are never charged to nor
+ * held by the hourly budgets (PR #81 security review M1), like severe events bypass the incident
+ * cap: a noisy agent must not delay them to the digest. They are bounded by their own cause (a
+ * rotation conflict locks the agent).
+ */
+export function criticalSystemAlert(payload: NotificationPayload): boolean {
+  return payload.event === "agent.integrity" && payload.severity === "critical";
+}
+
+/**
+ * A console alert (silent agent and recovery, agent-integrity event, dropped batches, stopped Audit
+ * stream) to every enabled channel flagged `system_alerts`. `subjectKey` identifies the alert
+ * (e.g. the silence episode); with no such channel nothing is queued (the security event row
+ * remains). Returns the number of rows queued as pending.
  *
- * P7 (#75 review L4): besides the per-agent bounds of each alert, a global budget of
- * `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` system alerts per channel and UTC clock hour holds for
- * all agents together (N misbehaving agents no longer send N alerts per hour to each channel).
- * Over it, the delivery is recorded as `skipped` (`rate_limited`) and counted in the hour's
- * `system_alerts.suppressed` digest (`enqueueSystemAlertDigests`). Only new deliveries are
- * charged: a repeated alert (same idempotency key) costs nothing.
+ * P7 (#75 review L4, PR #81 review M1): besides the per-agent bounds of each alert, a global budget
+ * of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` system alerts per channel and UTC clock hour holds for
+ * all agents together (N misbehaving agents no longer send N alerts per hour to each channel), of
+ * which one agent may use at most `systemAlertAgentShare(limit)`. Over either, the delivery is
+ * recorded as `skipped` (`rate_limited`) and counted in the hour's `system_alerts.suppressed`
+ * digest (`enqueueSystemAlertDigests`). Only new deliveries are charged: a repeated alert (same
+ * idempotency key) costs nothing. Critical alerts are never charged (`criticalSystemAlert`).
  */
 export async function enqueueSystemAlert(
   tx: Exec,
@@ -225,9 +268,11 @@ export async function enqueueSystemAlert(
   );
   const fresh = inserted.filter((r): r is typeof r & { channelId: string } => r.status === "pending" && r.channelId !== null);
   if (fresh.length === 0) return 0;
+  if (criticalSystemAlert(alert.payload)) return fresh.length;
   const refused = await chargeSystemAlertBudget(
     tx,
     fresh.map((r) => r.channelId),
+    alert.agentId,
   );
   const over = fresh.filter((r) => refused.has(r.channelId)).map((r) => r.id);
   if (over.length > 0) {
@@ -235,7 +280,7 @@ export async function enqueueSystemAlert(
       .update(notificationDeliveries)
       .set({ status: "skipped", lastError: "rate_limited" })
       .where(inArray(notificationDeliveries.id, over));
-    log.debug({ event: alert.payload.event, channels: over.length }, "system alert over the channel's hourly budget: counted in the digest");
+    log.debug({ event: alert.payload.event, channels: over.length }, "system alert over an hourly budget: counted in the digest");
   }
   return fresh.length - over.length;
 }
@@ -344,6 +389,9 @@ export async function enqueueSystemAlertDigests(db: Database): Promise<number> {
   }
   await db.execute(
     sql`delete from system_alert_budgets where window_start < date_trunc('hour', ${now}, 'UTC') - make_interval(hours => ${SYSTEM_ALERT_BUDGET_KEEP_HOURS})`,
+  );
+  await db.execute(
+    sql`delete from system_alert_agent_budgets where window_start < date_trunc('hour', ${now}, 'UTC') - make_interval(hours => ${SYSTEM_ALERT_BUDGET_KEEP_HOURS})`,
   );
   return queued;
 }

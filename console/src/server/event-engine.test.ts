@@ -570,6 +570,23 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       }
     });
 
+    it("PR #81 L1: links carry the wall clock of their insert, not the transaction start", async () => {
+      const auth = await agentWithTargets();
+      await policy({ signals: ["shape.*"] });
+      await send(auth, Array.from({ length: 4 }, (_, i) => dumpEvent({ ts: at(i * 1000), principal: { db_user: "clocked" }, rows: 10, signals: ["shape.full_table_read"] })));
+      await drainPolicyWork(getDb());
+      const [inc] = await incidentsOf(auth.agentId);
+      expect(inc?.matchCount).toBe(4);
+      // One chunk, one transaction: with now() the four links would share one instant (compared in
+      // microseconds, in the database).
+      const [row] = (
+        await getDb().execute<{ n: number; distinct_at: number }>(
+          sql`select count(*)::int as n, count(distinct created_at)::int as distinct_at from incident_events where incident_id = ${String(inc?.id)}`,
+        )
+      ).rows;
+      expect(row).toEqual({ n: 4, distinct_at: 4 });
+    });
+
     it("end-of-phase-6 M1: fingerprinted principals are keyed per fingerprint, never merged with each other", async () => {
       const auth = await agentWithTargets();
       await scanWith(auth, [finding("email", "pii.email", 1)]);
