@@ -140,16 +140,17 @@ impl Collector {
     /// A collector keeping at most `per_path` values per normalized path,
     /// collapsing the dynamic levels of `shape`.
     pub(crate) fn with_shape(per_path: usize, shape: Shape) -> Self {
-        let mut c = Self::new(per_path);
+        let mut c = Self::default();
+        c.per_path = per_path;
         c.shape = shape;
         c
     }
 
-    /// A collector keeping at most `per_path` values per normalized path.
+    /// Tests only: a collector keeping at most `per_path` values per
+    /// normalized path, with no shape learned (nothing collapsed).
+    #[cfg(test)]
     pub(crate) fn new(per_path: usize) -> Self {
-        let mut c = Self::default();
-        c.per_path = per_path;
-        c
+        Self::with_shape(per_path, Shape::keep_all())
     }
 
     /// Walks one document.
@@ -289,13 +290,33 @@ impl Collector {
 /// never observed (past [`MAX_TRACKED_LEVELS`], or below a level collapsed
 /// in the last round) is treated as dynamic, and a key it never saw on a
 /// static level becomes `*`.
-#[derive(Default)]
 pub(crate) struct Shape {
     dynamic: HashSet<Vec<u8>>,
     /// Static levels observed by the learner, with the keys seen there.
-    /// `None`: no shape learned (a collector built with
-    /// [`Collector::new`], tests only): nothing is collapsed.
+    /// `None` (tests only, [`Shape::keep_all`]): nothing is collapsed.
     known: Option<HashMap<Vec<u8>, HashSet<Vec<u8>>>>,
+}
+
+impl Default for Shape {
+    /// Nothing learned: every non-top level is treated as dynamic (fail
+    /// closed).
+    fn default() -> Self {
+        Self {
+            dynamic: HashSet::new(),
+            known: Some(HashMap::new()),
+        }
+    }
+}
+
+impl Shape {
+    /// Tests only: no shape, nothing collapsed.
+    #[cfg(test)]
+    pub(crate) fn keep_all() -> Self {
+        Self {
+            dynamic: HashSet::new(),
+            known: None,
+        }
+    }
 }
 
 /// What the collector does with the keys of one object level.
@@ -373,10 +394,7 @@ impl Drop for LevelStats {
 impl Shape {
     /// Learns the dynamic and the static levels of a sample.
     pub(crate) fn learn(documents: &[Doc<'_>]) -> Self {
-        let mut shape = Self {
-            dynamic: HashSet::new(),
-            known: Some(HashMap::new()),
-        };
+        let mut shape = Self::default();
         for round in 0..SHAPE_ROUNDS {
             let mut levels: HashMap<Vec<u8>, LevelStats> = HashMap::new();
             for (i, d) in documents.iter().enumerate() {
