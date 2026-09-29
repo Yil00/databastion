@@ -75,9 +75,9 @@ describe("access events view", () => {
   });
 
   it("flags signal ids missing from the registry as unregistered", () => {
-    const html = renderToStaticMarkup(<EventsTable events={[event({ signals: ["signature.pg_dump", "signature.mysqldump", "volume.huge"] })]} now={NOW} />);
+    const html = renderToStaticMarkup(<EventsTable events={[event({ signals: ["signature.pg_dump", "signature.unregistered_example", "volume.huge"] })]} now={NOW} />);
     expect(html.match(/unregistered<\/span>/g)).toHaveLength(2);
-    expect(html).toContain('href="/events?signal=signature.mysqldump"');
+    expect(html).toContain('href="/events?signal=signature.unregistered_example"');
     const registered = renderToStaticMarkup(<SignalBadge signal="signature.pg_dump" />);
     expect(registered).not.toContain("unregistered");
     expect(registered).toContain('title="A pg_dump or pg_dumpall run');
