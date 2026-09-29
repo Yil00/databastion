@@ -7,6 +7,14 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ✨ Features
+- MySQL / MariaDB Audit from the MariaDB `server_audit` log, the Percona `audit_log` / `audit_log_filter` JSON log and `performance_schema`, at most Partial, with the `signature.mysqldump`, `signature.into_outfile`, `shape.full_table_read` and `volume.large_result` signals (#64, ADR-0023)
+- Console: `AccessEvent.bytes` stored and shown, target notes stored and rendered from the phrase catalog, signals missing from the registry flagged, `signature.*` signals kept first when an incident's signals are truncated (#62)
+
+### 🐛 Bug Fixes
+- Console: policy and notification wake-ups were not sent by the production build; process-wide state now lives in `processGlobal` / `processSlot`, and the build checks the wake-up functions (#63)
+- Agent: the PostgreSQL connector's own table-less statements are no longer reported as access events; other agent-account events on unknown objects are always reported; pgaudit counts as loaded only when its `pgaudit.log_catalog` setting is in `pg_settings`; `pg_stat_statements` counts as a catalog only in the extension's schema (#65)
+
 ### 🐛 Agent classifiers
 - Value-based column classification: birth dates, person names and postal addresses are detected without a column-name hint (age distribution, name lexicon, address structure); broader phone, IBAN, NIR, AWS key and password-hash formats; card and e-mail precision rules (checksum consistency, personal mailboxes only)
 - Values are put in Unicode NFC before detection and fingerprinting: fingerprints of decomposed (NFD) non-ASCII values, e.g. accented e-mail addresses, change to those of their composed form
