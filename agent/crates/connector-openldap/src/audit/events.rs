@@ -244,12 +244,6 @@ impl EventBuilder {
             (Some(LogScope::Base), Some(OwnFilter::Everything)) if q.none && !r.attrs_only => {
                 Some(OwnShape::Probe)
             }
-            // The check's size-limited search (failed searches logged?).
-            (Some(LogScope::Sub), Some(OwnFilter::Everything))
-                if q.none && !r.attrs_only && r.size_limit == Some(1) =>
-            {
-                Some(OwnShape::Probe)
-            }
             (Some(LogScope::Sub), Some(OwnFilter::Everything))
                 if r.attrs_only
                     && q.listed == 2
@@ -820,6 +814,26 @@ mod tests {
         let e = b.convert(vec![bind], now).pop().unwrap();
         assert_eq!(e.action(), EventAction::Connect);
         assert!(!e.principal().send_name());
+    }
+
+    #[test]
+    fn failed_searches_without_entries_are_not_events() {
+        // The check's read of a missing entry (noSuchObject), by anyone.
+        let mut b = builder(Vec::new());
+        let r = parse(&log_entry(&[
+            ("reqStart", &["20260929202642.000001Z"]),
+            ("reqType", &["search"]),
+            ("reqAuthzID", &[AGENT]),
+            ("reqDN", &["cn=databastion-absent-probe,dc=example,dc=org"]),
+            ("reqResult", &["32"]),
+            ("reqScope", &["base"]),
+            ("reqFilter", &["(objectClass=*)"]),
+            ("reqAttr", &["1.1"]),
+            ("reqEntries", &["0"]),
+            ("entryCSN", &[CSN]),
+        ]))
+        .unwrap();
+        assert!(b.convert(vec![r], Instant::now()).is_empty());
     }
 
     #[test]

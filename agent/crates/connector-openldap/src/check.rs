@@ -354,15 +354,29 @@ pub(crate) async fn base_readable<S: AsyncRead + AsyncWrite + Unpin>(
         .is_some_and(|n| n > 0))
 }
 
+/// Which search records [`search_record`] looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// `reqResult` 0.
+    Succeeded,
+    /// Any other result: `olcAccessLogSuccess` is all or nothing, so one
+    /// failed operation logged proves they all are.
+    Failed,
+}
+
 /// Whether `cn=accesslog` holds a search record of `context` from the last
-/// 24 h with the result code `result` (`0`: a successful search; `4`: one
-/// cut by a size limit).
+/// 24 h with the given outcome.
 pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     accesslog_base: &str,
     context: &str,
-    result: &str,
+    outcome: Outcome,
 ) -> Result<bool, LdError> {
+    let success = Filter::Eq("reqResult", "0".to_owned());
+    let result = match outcome {
+        Outcome::Succeeded => success,
+        Outcome::Failed => Filter::Not(Box::new(success)),
+    };
     let since = time::csn_at(SystemTime::now() - RECORD_FRESHNESS);
     let search = Search {
         base: accesslog_base,
@@ -372,7 +386,7 @@ pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
         types_only: false,
         filter: Filter::And(vec![
             Filter::Eq("objectClass", "auditSearch".to_owned()),
-            Filter::Eq("reqResult", result.to_owned()),
+            result,
             Filter::Extensible {
                 rule: "dnSubtreeMatch",
                 attr: "reqDN",
@@ -443,59 +457,41 @@ async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|(_, c)| !state.proven(&target.id, c))
         .take(MAX_PROVEN_PER_REPORT)
     {
-        let mut found = search_record(s, accesslog_base, raw, "0").await?;
+        let mut found = search_record(s, accesslog_base, raw, Outcome::Succeeded).await?;
         if !found {
             // A read of the context itself: a server logging reads records
             // it at once.
             base_readable(s, raw).await?;
-            found = search_record(s, accesslog_base, raw, "0").await?;
+            found = search_record(s, accesslog_base, raw, Outcome::Succeeded).await?;
         }
         if found {
             state.note_search(&target.id, canon);
         }
     }
-    // Failed searches (a size limit reached after returning entries, the
-    // shape of a capped export) must be logged too: `olcAccessLogSuccess:
-    // TRUE` leaves them out, and the agent cannot read that setting.
+    // Failed operations (a search cut by a limit after returning entries:
+    // a capped export) must be logged too: `olcAccessLogSuccess: TRUE`
+    // leaves them out, and the agent cannot read that setting. A base read
+    // of an entry that does not exist fails on any context (32).
     for (raw, canon) in contexts
         .iter()
-        .filter(|(_, c)| state.failures_logged(&target.id, c).is_none())
+        .filter(|(_, c)| state.failures_logged(&target.id, c) != Some(true))
         .take(MAX_PROVEN_PER_REPORT)
     {
-        if search_record(s, accesslog_base, raw, "4").await? {
+        if search_record(s, accesslog_base, raw, Outcome::Failed).await? {
             state.note_failures_logged(&target.id, canon, true);
             continue;
         }
-        if limited_search(s, raw).await? {
-            let logged = search_record(s, accesslog_base, raw, "4").await?;
-            state.note_failures_logged(&target.id, canon, logged);
-        }
-        // A context of one entry cannot end in a size limit: unknown.
+        let probe_dn = format!("{ABSENT_RDN},{raw}");
+        base_readable(s, &probe_dn).await?;
+        let logged = search_record(s, accesslog_base, raw, Outcome::Failed).await?;
+        state.note_failures_logged(&target.id, canon, logged);
     }
     Ok(())
 }
 
-/// A subtree search of `context` with `sizeLimit` 1 and no attribute
-/// (`1.1`): `true` when the server answered `sizeLimitExceeded` (4).
-pub(crate) async fn limited_search<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut Session<S>,
-    context: &str,
-) -> Result<bool, LdError> {
-    let search = Search {
-        base: context,
-        scope: Scope::Sub,
-        size_limit: 1,
-        time_limit: 0,
-        types_only: false,
-        filter: Filter::Present("objectClass"),
-        attributes: &["1.1"],
-    };
-    match s.search(Stage::Check, &search, &mut |_: Entry| {}).await {
-        Ok(o) => Ok(o.code == 4),
-        Err(e) if !e.fatal => Ok(false),
-        Err(e) => Err(e),
-    }
-}
+/// The RDN of the entry the check reads to cause a failed search
+/// (`noSuchObject`); it is not expected to exist.
+pub(crate) const ABSENT_RDN: &str = "cn=databastion-absent-probe";
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth, Source) {
     let mut detail: Vec<String> = Vec::new();
@@ -591,7 +587,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         .count();
     let failures_unlogged = contexts
         .iter()
-        .filter(|(_, c)| state.failures_logged(&target.id, c) == Some(false))
+        // Unknown counts as not proven (review N1): Full needs a logged
+        // failed operation for every context.
+        .filter(|(_, c)| state.failures_logged(&target.id, c) != Some(true))
         .count();
     let (level, source) = choose(readable, proven, contexts.len(), failures_unlogged);
     match report.as_ref().and_then(|r| r.accesslog_readable) {
@@ -610,8 +608,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
             }
             if failures_unlogged > 0 {
                 detail.push(format!(
-                    "{failures_unlogged} naming context(s) where a search cut by a size limit \
-                     left no accesslog record (olcAccessLogSuccess: TRUE?): at most Partial"
+                    "{failures_unlogged} naming context(s) where no failed operation is proven \
+                     to be logged (olcAccessLogSuccess: TRUE, or not checked yet): at most \
+                     Partial"
                 ));
                 codes.add(
                     TargetNote::new(NoteCode::AuditFailedOperationsNotLogged)

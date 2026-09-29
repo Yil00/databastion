@@ -53,6 +53,8 @@ impl Scope {
 pub(crate) enum Filter {
     And(Vec<Filter>),
     Or(Vec<Filter>),
+    /// `(!f)`.
+    Not(Box<Filter>),
     /// `(attr=value)`.
     Eq(&'static str, String),
     /// `(attr=*)`.
@@ -93,6 +95,7 @@ impl Filter {
                 ],
             ),
             Self::Present(attr) => Enc::octets(ber::ctx(7), attr.as_bytes()),
+            Self::Not(inner) => Enc::constructed(ber::ctx_constructed(2), &[inner.encode()]),
             Self::Extensible { rule, attr, value } => Enc::constructed(
                 ber::ctx_constructed(9),
                 &[
@@ -569,6 +572,10 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<(i32, Request)> {
                 s.push(')');
                 s
             }
+            0xa2 => {
+                let (t, c) = r.tlv().ok()?;
+                format!("(!{})", filter_text(t, c)?)
+            }
             0xa3 | 0xa5 => {
                 let a = std::str::from_utf8(r.expect(OCTET_STRING).ok()?).ok()?;
                 let v = std::str::from_utf8(r.expect(OCTET_STRING).ok()?).ok()?;
@@ -668,6 +675,7 @@ mod tests {
             },
             Filter::Ge("entryCSN", "2026".to_owned()),
             Filter::Or(vec![Filter::Present("objectClass")]),
+            Filter::Not(Box::new(Filter::Eq("reqResult", "0".to_owned()))),
         ]);
         let search_req = Search {
             base: "cn=accesslog",
@@ -687,7 +695,7 @@ mod tests {
                 size_limit: 10,
                 types_only: true,
                 filter: "(&(objectClass=auditSearch)(reqDN:dnSubtreeMatch:=dc=x)\
-                         (entryCSN>=2026)(|(objectClass=*)))"
+                         (entryCSN>=2026)(|(objectClass=*))(!(reqResult=0)))"
                     .to_owned(),
                 attributes: vec!["1.1".to_owned()],
             }

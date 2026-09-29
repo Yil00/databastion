@@ -53,7 +53,7 @@ olcLimits: dn.exact="cn=databastion,ou=services,dc=example,dc=org" size=1000 tim
 | `privilege.write_not_evaluated` | always: write access cannot be evaluated read-only |
 | `audit.accesslog_not_readable` | no Audit source (level None) |
 | `audit.reads_not_logged` | naming contexts without a search record in the last 24 h (count) |
-| `audit.failed_operations_not_logged` | naming contexts where a search cut by a size limit left no record (`olcAccessLogSuccess: TRUE`): at most Partial (count) |
+| `audit.failed_operations_not_logged` | naming contexts where no failed operation is proven logged (the agent's read of a missing entry left no record: `olcAccessLogSuccess: TRUE`, or not checked yet): at most Partial (count) |
 | `audit.records_dropped` | log entries that did not parse in the last 24 h (count) |
 
 ## Audit

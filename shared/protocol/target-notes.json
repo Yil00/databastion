@@ -30,7 +30,7 @@
     ]
   },
   "audit.failed_operations_not_logged": {
-    "description": "{count} naming context(s) where a search cut by a size limit after returning entries left no cn=accesslog record (olcAccessLogSuccess: TRUE logs successful operations only): capped or failed exports are not seen, the level is at most Partial.",
+    "description": "{count} naming context(s) where no failed operation is proven to be logged in cn=accesslog in the last 24 h: the agent's read of a missing entry left no record (olcAccessLogSuccess: TRUE logs successful operations only), or it could not be checked yet. Capped or failed exports may go unseen; the level is at most Partial.",
     "engines": [
       "openldap"
     ]
