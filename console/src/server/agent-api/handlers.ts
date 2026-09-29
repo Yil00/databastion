@@ -432,6 +432,9 @@ export function handleEvents(req: Request): Promise<Response> {
     if (outcome.kind !== "accepted" || outcome.duplicate) refund();
     switch (outcome.kind) {
       case "accepted":
+        // Counted after the commit only (an aborted transaction counts nothing; a duplicate 0).
+        eventStats.unexpectedTarget += outcome.unexpectedTarget;
+        eventStats.unregisteredSignals += outcome.unregisteredSignals;
         // After the commit, not awaited: the events are durably pending evaluation (P4 exit
         // criterion: incident within 2 min; the worker polls its queue every 2 s).
         if (!outcome.duplicate) void requestPolicyEvaluation();

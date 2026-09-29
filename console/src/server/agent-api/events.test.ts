@@ -329,6 +329,35 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect(text).toMatch(new RegExp(`^databastion_console_events_unregistered_signals_total ${eventStats.unregisteredSignals}$`, "m"));
     });
 
+    it("counts unexpected targets and unregistered signals after the commit only (duplicate, aborted)", async () => {
+      const auth = await agentWithTargets();
+      await getDb().execute(sql`update agent_targets set present = false where agent_id = ${auth.agentId} and target_id = 'mysql-crm'`);
+      const odd = { ...PG_DUMP, target_id: "mysql-crm", signals: ["signature.mysqldump"] };
+      const counters = () => ({ unexpected: eventStats.unexpectedTarget, unregistered: eventStats.unregisteredSignals });
+      const b = batch([odd]);
+      const before = counters();
+      expect((await post(auth, b)).status).toBe(202);
+      expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+      // A replay is a duplicate: nothing stored, nothing counted.
+      expect(await (await post(auth, b)).json()).toEqual({ batch_id: b.batch_id, duplicate: true });
+      expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+      // An aborted transaction (the batch record insert fails after the events insert) counts nothing.
+      await getDb().execute(sql.raw(`
+        create function public.test_fail_events_batch() returns trigger language plpgsql as $$
+        begin raise exception 'forced abort'; end $$`));
+      await getDb().execute(sql.raw(`create trigger test_fail_events_batch before insert on public.events_batches
+        for each row when (new.agent_id = '${auth.agentId}') execute function public.test_fail_events_batch()`));
+      try {
+        const aborted = batch([odd]);
+        await expect(ingestEvents(getDb(), auth.agentId, aborted as never)).rejects.toThrow();
+        expect(counters()).toEqual({ unexpected: before.unexpected + 1, unregistered: before.unregistered + 1 });
+        expect(await storedEvents(auth.agentId)).toHaveLength(1);
+      } finally {
+        await getDb().execute(sql.raw("drop trigger if exists test_fail_events_batch on public.events_batches"));
+        await getDb().execute(sql.raw("drop function if exists public.test_fail_events_batch()"));
+      }
+    });
+
     it("stores AccessEvent.bytes when the source reports it, null otherwise", async () => {
       const auth = await agentWithTargets();
       const withBytes = { ...PG_DUMP, bytes: 9_007_199_254_740_991 };

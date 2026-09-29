@@ -26,7 +26,12 @@ type EventsBatch = Schemas["EventsBatch"];
 type AccessEvent = Schemas["AccessEvent"];
 
 export type EventsIngestOutcome =
-  | { kind: "accepted"; duplicate: boolean; stored: number }
+  /**
+   * `unexpectedTarget` / `unregisteredSignals`: counts of the stored events, for the process
+   * counters. The caller adds them only after the commit (0 for a duplicate), so an aborted
+   * transaction never over-counts.
+   */
+  | { kind: "accepted"; duplicate: boolean; stored: number; unexpectedTarget: number; unregisteredSignals: number }
   | { kind: "batch_conflict" }
   /** `target_id` not reported by this agent: pointers `/events/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
@@ -41,7 +46,8 @@ export type EventsIngestOutcome =
 
 /**
  * Process counters of `/events` (exported on `/metrics`). `unregisteredSignals`: signal ids of
- * stored events that are not in this console's signal registry (one per id and event).
+ * stored events that are not in this console's signal registry (one per id and event). The
+ * ingestion counters are added by `handleEvents` after the commit only.
  */
 export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0, unregisteredSignals: 0 };
 
@@ -159,7 +165,7 @@ export async function ingestEvents(
       .limit(1);
     if (previous) {
       return previous.bodySha256 === bodySha256
-        ? { kind: "accepted" as const, duplicate: true, stored: 0 }
+        ? { kind: "accepted" as const, duplicate: true, stored: 0, unexpectedTarget: 0, unregisteredSignals: 0 }
         : { kind: "batch_conflict" as const };
     }
 
@@ -188,10 +194,14 @@ export async function ingestEvents(
     await tx
       .insert(accessEvents)
       .values(batch.events.map((e, i) => eventRow(agentId, batch.batch_id, e, i, unexpected.has(e.target_id))));
-    eventStats.unexpectedTarget += batch.events.filter((e) => unexpected.has(e.target_id)).length;
-    eventStats.unregisteredSignals += batch.events.reduce((n, e) => n + unregisteredSignals(e.signals ?? []).length, 0);
     await tx.insert(eventsBatches).values({ agentId, batchId: batch.batch_id, bodySha256, eventsCount: batch.events.length });
-    return { kind: "accepted" as const, duplicate: false, stored: batch.events.length };
+    return {
+      kind: "accepted" as const,
+      duplicate: false,
+      stored: batch.events.length,
+      unexpectedTarget: batch.events.filter((e) => unexpected.has(e.target_id)).length,
+      unregisteredSignals: batch.events.reduce((n, e) => n + unregisteredSignals(e.signals ?? []).length, 0),
+    };
   });
 }
 
