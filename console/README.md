@@ -532,11 +532,16 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - **Ingestion** (`POST /api/agent/v1/events`): same pipeline and bounds as `/findings`
   (authentication, 4 MiB body cap `413`, schema then `checkSemantics`: unknown fields such as query
   text, names or account names failing the contract patterns, a batch over 1 MiB (`maxBytes`) and
-  `ts_last < ts` (`/events/<i>/ts_last`, `formatMinimum`) are `400`). Then, in one transaction
+  `ts_last < ts` (`/events/<i>/ts_last`, `formatMinimum`) are `400`). The request rate,
+  back-pressure and stored-batch rate limits below answer `429` **before** the idempotency check:
+  a throttled batch is never recorded, and even the replay of an accepted batch gets `429` until
+  the throttle ends, then `202 duplicate: true`; a back-pressure `429` does not consume the
+  stored-batch rate. Then, in one transaction
   serialized per agent: the idempotency check on (`agent_id`, `batch_id`) over the canonical JSON
   (replay `202 duplicate: true`, other content `409 batch_conflict`), target ownership (`404`,
   `/events/<i>/target_id`, `notFound`), timestamps at most 5 min ahead (`/events/<i>/ts` or
-  `ts_last`, `formatMaximum`), storage. Rejected batches, conflicts and foreign targets are
+  `ts_last`, `formatMaximum`), storage of exactly the contract fields (`bytes` included, migration
+  `0027`: shown next to the rows, not used by the score). Rejected batches, conflicts and foreign targets are
   agent-integrity events (endpoint `events`). Events whose `ts` is older than the retention period
   are refused (`400`, `/events/<i>/ts`, `formatMinimum`; possible from a conforming agent with an
   old spool, so counted in `databastion_console_events_expired_total`, not an integrity event).
@@ -684,7 +689,8 @@ contents: `src/lib/notification-render.ts`.*
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
   has `source: "access_event"` and, instead of the classifier, location and counts: `principal`,
   `principal_fingerprinted`, `database`, `hour` and `access` (the first event's `ts`, action,
-  source, rows, score, sensitivity, anomaly flag, signals and objects); receivers should switch on
+  source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
+  missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
   finding, and access events carry none.
 - **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:
