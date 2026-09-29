@@ -73,15 +73,25 @@ pub(crate) enum UplinkError {
     #[error("console error ({status})")]
     Server { status: u16 },
     /// Non-retryable `4xx` (other than 401 / 426 / 429).
+    /// `unknown_field`: a `details[].keyword` is `additionalProperties`,
+    /// what a console built before an optional field answers to a body
+    /// carrying it (docs/09, ADR-0022).
     #[error("request rejected ({status}, code {code:?})")]
     Rejected {
         status: u16,
         code: Option<ErrorCode>,
+        unknown_field: bool,
     },
     /// `400` / `404` on `/findings` or `/events` whose `details` all point at
-    /// items: the (deduplicated, sorted) indices of the rejected items.
+    /// items: the (deduplicated, sorted) indices of the rejected items, and
+    /// among them those pointed at with the keyword `additionalProperties`
+    /// (`unknown_field`, sorted).
     #[error("batch items rejected ({status}, {} items)", items.len())]
-    ItemsRejected { status: u16, items: Vec<usize> },
+    ItemsRejected {
+        status: u16,
+        items: Vec<usize>,
+        unknown_field: Vec<usize>,
+    },
     /// Unexpected status or undecodable body.
     #[error("unexpected response ({status})")]
     UnexpectedResponse { status: u16 },
@@ -323,10 +333,24 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, Uplink
     Ok(body)
 }
 
+/// The keyword a closed schema reports for a field it does not know: what
+/// a console built before an optional field answers (docs/09).
+const UNKNOWN_FIELD_KEYWORD: &str = "additionalProperties";
+
+/// Whether a detail reports an unknown field.
+fn is_unknown_field(d: &databastion_protocol::ErrorDetail) -> bool {
+    d.keyword.as_str() == UNKNOWN_FIELD_KEYWORD
+}
+
 /// Indices of the items designated by every `details[].pointer`, when all
-/// of them point inside `/findings/<i>` or `/events/<i>` (docs/09). `None`
-/// if any pointer targets the envelope, or if there is no detail.
-fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<usize>> {
+/// of them point inside `/findings/<i>` or `/events/<i>` (docs/09), and
+/// those of them pointed at with the keyword `additionalProperties` (both
+/// sorted, deduplicated). `None` if any pointer targets the envelope, or
+/// if there is no detail.
+fn item_pointers(
+    path: &str,
+    error: &databastion_protocol::Error,
+) -> Option<(Vec<usize>, Vec<usize>)> {
     let prefix = match path {
         "/findings" => "/findings/",
         "/events" => "/events/",
@@ -336,14 +360,21 @@ fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Vec<
         return None;
     }
     let mut items = Vec::with_capacity(error.details.len());
+    let mut unknown = Vec::new();
     for d in &error.details {
         let rest = d.pointer.as_str().strip_prefix(prefix)?;
         let index = rest.split('/').next()?;
-        items.push(index.parse::<usize>().ok()?);
+        let index = index.parse::<usize>().ok()?;
+        items.push(index);
+        if is_unknown_field(d) {
+            unknown.push(index);
+        }
     }
-    items.sort_unstable();
-    items.dedup();
-    Some(items)
+    for v in [&mut items, &mut unknown] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Some((items, unknown))
 }
 
 /// The result endpoints, which a `501` parks.
@@ -361,6 +392,9 @@ fn classify(
 ) -> UplinkError {
     let error = serde_json::from_slice::<databastion_protocol::Error>(body).ok();
     let code = error.as_ref().map(|e| e.code);
+    let unknown_field = error
+        .as_ref()
+        .is_some_and(|e| e.details.iter().any(is_unknown_field));
     if let Some(error) = &error {
         let details: Vec<String> = error
             .details
@@ -401,10 +435,22 @@ fn classify(
         },
         500..=599 => UplinkError::Server { status },
         400 | 404 => match error.as_ref().and_then(|e| item_pointers(path, e)) {
-            Some(items) => UplinkError::ItemsRejected { status, items },
-            None => UplinkError::Rejected { status, code },
+            Some((items, unknown_field)) => UplinkError::ItemsRejected {
+                status,
+                items,
+                unknown_field,
+            },
+            None => UplinkError::Rejected {
+                status,
+                code,
+                unknown_field,
+            },
         },
-        400..=499 => UplinkError::Rejected { status, code },
+        400..=499 => UplinkError::Rejected {
+            status,
+            code,
+            unknown_field,
+        },
         _ => UplinkError::UnexpectedResponse { status },
     }
 }
@@ -559,6 +605,73 @@ impl ResultBatch {
         Ok((out.len > 0).then_some(out))
     }
 
+    /// Whether an item carries a field gated by capability negotiation
+    /// (ADR-0022): `AccessEvent.bytes`. Findings have none. `false` if the
+    /// bytes cannot be decoded.
+    pub(crate) fn carries_gated(&self) -> bool {
+        match Self::decode(self.findings, &self.bytes) {
+            Some(Parsed::Events(b)) => b.events.iter().any(event_carries_gated),
+            Some(Parsed::Findings(_)) | None => false,
+        }
+    }
+
+    /// The batch to send again after a `400` reporting an unknown field
+    /// (`additionalProperties`) to a batch carrying gated fields (ADR-0022
+    /// decision 9), under a **new** `batch_id`, with every gated field of
+    /// every item stripped. Of the items at `rejected` (sorted), those
+    /// pointed at with `additionalProperties` (`unknown`, sorted) that
+    /// carried a gated field are kept (an older console accepts them
+    /// without it); the others were rejected for another reason and are
+    /// left out. Returns the batch (`None` if nothing is left) and the
+    /// number of items left out. The result carries no gated field, so it
+    /// is stripped at most once.
+    pub(crate) fn stripped(
+        &self,
+        rejected: &[usize],
+        unknown: &[usize],
+    ) -> Result<(Option<Self>, usize), Unserializable> {
+        let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
+        let mut left_out = 0usize;
+        let out = match parsed {
+            // No gated finding field exists: only the rejected items go.
+            Parsed::Findings(b) => {
+                let n = b.findings.len();
+                let findings: Vec<Finding> = b
+                    .findings
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| rejected.binary_search(i).is_err())
+                    .map(|(_, f)| f)
+                    .collect();
+                left_out = n - findings.len();
+                Parsed::Findings(FindingsBatch {
+                    batch_id: new_batch_id(),
+                    findings,
+                    ..b
+                })
+            }
+            Parsed::Events(b) => {
+                let mut events = Vec::with_capacity(b.events.len());
+                for (i, mut e) in b.events.into_iter().enumerate() {
+                    if rejected.binary_search(&i).is_ok()
+                        && (unknown.binary_search(&i).is_err() || !event_carries_gated(&e))
+                    {
+                        left_out += 1;
+                        continue;
+                    }
+                    strip_gated_event(&mut e);
+                    events.push(e);
+                }
+                Parsed::Events(EventsBatch {
+                    batch_id: new_batch_id(),
+                    events,
+                })
+            }
+        }
+        .into_batch()?;
+        Ok(((out.len > 0).then_some(out), left_out))
+    }
+
     /// Two halves, each under a new `batch_id` (`413`); `Ok(None)` for a
     /// single item, `Err` if a half could not be serialized or would be
     /// empty (`len` disagreeing with the decoded items).
@@ -577,6 +690,17 @@ impl ResultBatch {
             _ => Err(Unserializable),
         }
     }
+}
+
+/// Whether an event carries a gated field (ADR-0022).
+fn event_carries_gated(e: &AccessEvent) -> bool {
+    e.bytes.is_some()
+}
+
+/// Removes every gated field of an event (ADR-0022): `bytes`. A new gated
+/// `AccessEvent` field must be added here and in [`event_carries_gated`].
+fn strip_gated_event(e: &mut AccessEvent) {
+    e.bytes = None;
 }
 
 /// Batches built from masked results, and the items dropped on the way.
@@ -624,6 +748,9 @@ pub(crate) enum MaskedResults<'a> {
         target_id: &'a TargetId,
         events: &'a [MaskedEvent],
         fingerprints: &'a dyn sanitize::Fingerprinter,
+        /// The console listed `access_event.bytes` (ADR-0022): otherwise
+        /// `AccessEvent.bytes` is never sent.
+        accept_bytes: bool,
     },
 }
 
@@ -661,6 +788,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             target_id,
             events,
             fingerprints,
+            accept_bytes,
         } => {
             let mut dropped = 0u64;
             let items: Vec<AccessEvent> = events
@@ -673,7 +801,7 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
                     item
                 })
                 .collect();
-            let mut built = pack_events(items);
+            let mut built = pack_events(items, accept_bytes);
             built.dropped_items += dropped;
             built
         }
@@ -735,7 +863,9 @@ fn event_item(
             EventAction::Dcl => AccessEventAction::Dcl,
         },
         aggregated_count: std::num::NonZeroU64::new(e.aggregated_count())?,
-        // No connector reports a result size yet (the PostgreSQL sources have none).
+        // No connector reports a result size yet (the PostgreSQL sources
+        // have none). A gated field (ADR-0022): `pack_events` strips it
+        // unless the console listed `access_event.bytes`.
         bytes: None,
         objects,
         principal,
@@ -826,8 +956,10 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
     built
 }
 
-/// Packs sanitized events under the item and byte caps.
-fn pack_events(items: Vec<AccessEvent>) -> Built {
+/// Packs sanitized events under the item and byte caps. `accept_bytes`:
+/// the console accepts the gated `AccessEvent.bytes`; otherwise it is
+/// stripped from every event.
+fn pack_events(items: Vec<AccessEvent>, accept_bytes: bool) -> Built {
     let make = |events: Vec<AccessEvent>| EventsBatch {
         batch_id: new_batch_id(),
         events,
@@ -840,6 +972,9 @@ fn pack_events(items: Vec<AccessEvent>) -> Built {
         if !sanitize::check_event(&mut item) {
             built.dropped_items += 1;
             continue;
+        }
+        if !accept_bytes {
+            strip_gated_event(&mut item);
         }
         let Ok(len) = serde_json::to_vec(&item).map(|v| v.len() + 1) else {
             built.dropped_items += 1;
@@ -937,7 +1072,7 @@ mod tests {
 
     #[test]
     fn splitting_a_batch_whose_len_disagrees_with_its_items_is_an_error() {
-        let built = pack_events(vec![crate::sanitize::tests::event("read", 16)]);
+        let built = pack_events(vec![crate::sanitize::tests::event("read", 16)], false);
         let mut batch = built.batches.into_iter().next().unwrap();
         assert_eq!(batch.len(), 1);
         // Claims more items than it decodes to: one half ends up empty.
@@ -977,7 +1112,8 @@ mod tests {
             classify("/rotate", StatusCode::CONFLICT, None, body),
             UplinkError::Rejected {
                 status: 409,
-                code: Some(ErrorCode::RotationConflict)
+                code: Some(ErrorCode::RotationConflict),
+                unknown_field: false,
             }
         );
         assert!(classify("/x", StatusCode::BAD_GATEWAY, None, b"").is_retryable());
@@ -1069,7 +1205,7 @@ mod tests {
     fn event_packing_respects_the_byte_cap() {
         let event = crate::sanitize::tests::event("read", 16);
         let events: Vec<_> = (0..2000).map(|_| event.clone()).collect();
-        let built = pack_events(events);
+        let built = pack_events(events, false);
         assert!(built.batches.len() >= 4);
         for b in &built.batches {
             assert!(b.len() <= 500);
@@ -1077,7 +1213,7 @@ mod tests {
         }
         assert_eq!(built.dropped_items, 0);
         assert_eq!(
-            pack_events(vec![crate::sanitize::tests::event("read", 0)]).dropped_items,
+            pack_events(vec![crate::sanitize::tests::event("read", 0)], false).dropped_items,
             1
         );
         let target = TargetId::try_from("pg-main").unwrap();
@@ -1088,11 +1224,148 @@ mod tests {
                 target_id: &target,
                 events: &[],
                 fingerprints: &fps,
+                accept_bytes: true,
             })
             .batches
             .as_slice(),
             []
         ));
+    }
+
+    fn event_with_bytes(bytes: i64) -> AccessEvent {
+        let mut e = crate::sanitize::tests::event("read", 1);
+        e.bytes = Some(Count(bytes));
+        e
+    }
+
+    fn events_of(batch: &ResultBatch) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_slice(batch.bytes()).unwrap();
+        v["events"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn access_event_bytes_is_sent_only_when_accepted() {
+        let built = pack_events(vec![event_with_bytes(42)], false);
+        let batch = &built.batches[0];
+        assert!(events_of(batch)[0].get("bytes").is_none());
+        assert!(!batch.carries_gated());
+        let built = pack_events(vec![event_with_bytes(42)], true);
+        let batch = &built.batches[0];
+        assert_eq!(events_of(batch)[0]["bytes"], 42);
+        assert!(batch.carries_gated());
+    }
+
+    #[test]
+    fn stripping_keeps_gated_items_and_drops_other_rejected_ones() {
+        let plain = crate::sanitize::tests::event("read", 1);
+        let built = pack_events(
+            vec![
+                event_with_bytes(1),
+                plain.clone(),
+                event_with_bytes(3),
+                plain,
+            ],
+            true,
+        );
+        let batch = &built.batches[0];
+        assert!(batch.carries_gated());
+        // Items 0 (gated) and 1 (not gated) pointed at as unknown fields.
+        let (again, left_out) = batch.stripped(&[0, 1], &[0, 1]).unwrap();
+        let again = again.unwrap();
+        assert_eq!(left_out, 1);
+        assert_eq!(again.len(), 3);
+        assert_ne!(again.batch_id(), batch.batch_id());
+        assert!(!again.carries_gated(), "every gated field is stripped");
+        assert!(events_of(&again).iter().all(|e| e.get("bytes").is_none()));
+        // Item 2 (gated) pointed at for another keyword only (e.g.
+        // `formatMinimum`): rejected for another reason, left out as well.
+        let (again, left_out) = batch.stripped(&[0, 2], &[0]).unwrap();
+        assert_eq!((again.unwrap().len(), left_out), (3, 1));
+        // Envelope rejection: everything kept, stripped.
+        let (all, left_out) = batch.stripped(&[], &[]).unwrap();
+        assert_eq!((all.unwrap().len(), left_out), (4, 0));
+        // Nothing left.
+        let only = pack_events(vec![crate::sanitize::tests::event("read", 1)], true);
+        let (none, left_out) = only.batches[0].stripped(&[0], &[0]).unwrap();
+        assert!(none.is_none());
+        assert_eq!(left_out, 1);
+    }
+
+    #[test]
+    fn findings_carry_no_gated_field() {
+        let items = vec![crate::sanitize::tests::finding(); 3];
+        let built = pack_findings(
+            Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+            &ClassifiersVersion::try_from("2026.09.1").unwrap(),
+            items,
+        );
+        let batch = &built.batches[0];
+        assert!(!batch.carries_gated());
+        let (again, left_out) = batch.stripped(&[1], &[1]).unwrap();
+        assert_eq!((again.unwrap().len(), left_out), (2, 1));
+    }
+
+    #[test]
+    fn classify_reports_unknown_field_details() {
+        let body = |details: &str| {
+            format!(r#"{{"code":"invalid_request","message":"Invalid.","details":[{details}]}}"#)
+        };
+        let d = |pointer: &str, keyword: &str| {
+            format!(r#"{{"pointer":"{pointer}","keyword":"{keyword}"}}"#)
+        };
+        let items = body(
+            &[
+                d("/events/2", "additionalProperties"),
+                d("/events/0", "formatMinimum"),
+                d("/events/2/ts", "formatMinimum"),
+            ]
+            .join(","),
+        );
+        assert_eq!(
+            classify("/events", StatusCode::BAD_REQUEST, None, items.as_bytes()),
+            UplinkError::ItemsRejected {
+                status: 400,
+                items: vec![0, 2],
+                unknown_field: vec![2],
+            }
+        );
+        let other = body(&d("/events/1", "formatMinimum"));
+        assert_eq!(
+            classify("/events", StatusCode::BAD_REQUEST, None, other.as_bytes()),
+            UplinkError::ItemsRejected {
+                status: 400,
+                items: vec![1],
+                unknown_field: vec![],
+            }
+        );
+        let status = body(&d("/progress", "additionalProperties"));
+        assert_eq!(
+            classify(
+                "/jobs/x/status",
+                StatusCode::BAD_REQUEST,
+                None,
+                status.as_bytes()
+            ),
+            UplinkError::Rejected {
+                status: 400,
+                code: Some(ErrorCode::InvalidRequest),
+                unknown_field: true,
+            }
+        );
+        let status = body(&d("/ts", "formatMaximum"));
+        assert_eq!(
+            classify(
+                "/jobs/x/status",
+                StatusCode::BAD_REQUEST,
+                None,
+                status.as_bytes()
+            ),
+            UplinkError::Rejected {
+                status: 400,
+                code: Some(ErrorCode::InvalidRequest),
+                unknown_field: false,
+            }
+        );
     }
 
     /// End to end: raw column values -> classifier with the agent key ->

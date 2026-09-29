@@ -236,6 +236,9 @@ pub(crate) struct Coverage {
     pub(crate) foreign: usize,
     /// Leaves beyond [`MAX_LEAVES`] of a partitioned root.
     pub(crate) leaves_over_limit: usize,
+    /// The introspection reached [`MAX_RELATIONS`]: later relations are
+    /// not covered (how many is unknown).
+    pub(crate) truncated: bool,
 }
 
 impl Coverage {
@@ -269,6 +272,7 @@ impl std::fmt::Debug for Coverage {
             .field("rls_ancestor", &self.rls_ancestor.len())
             .field("foreign", &self.foreign)
             .field("leaves_over_limit", &self.leaves_over_limit)
+            .field("truncated", &self.truncated)
             .finish()
     }
 }
@@ -287,7 +291,10 @@ pub(crate) fn plan(
         relations.iter().map(|r| (r.oid, r)).collect();
     let mut units: Vec<Unit> = Vec::new();
     let mut index: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    let mut coverage = Coverage::default();
+    let mut coverage = Coverage {
+        truncated: relations.len() >= usize::try_from(MAX_RELATIONS).unwrap_or(usize::MAX),
+        ..Coverage::default()
+    };
     for rel in relations {
         // Reported under the partitioned root when it is visible;
         // otherwise under its own name.

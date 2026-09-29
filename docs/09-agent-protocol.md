@@ -29,12 +29,12 @@ Optional fields added after protocol 0.1.0 are therefore **negotiated** ([ADR-00
 - **Form-only registries** (`signals.json`, `target-notes.json`) need no negotiation: an older console accepts a well-formed id it does not know.
 - **Multi-replica consoles** list a token only once **every** replica accepts the field. During a rolling upgrade, the build that accepts a field ships first without listing it; the listing follows once no older replica remains.
 - **The agent keeps at most 64 tokens** of a list, the contract bound.
-- **Obligations of the first gated producer** (none exists yet; [ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 9):
-  - clear the capabilities on any `400` from `/events`, `/findings` or `/jobs/{id}/status` whose body carried a gated field, not only on a heartbeat;
-  - resend the items pointed at with the gated fields stripped, rather than dropping them;
+- **Obligations of the first gated producer** (met by the PostgreSQL and MySQL / MariaDB connectors; [ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 9):
+  - clear the capabilities on a `400` from `/events` or `/jobs/{id}/status` whose body carried a gated field and whose `details` report an unknown field (keyword `additionalProperties`); a `400` with any other keyword keeps the ordinary rules and the capabilities. The heartbeat still clears them on any `400`. `/findings` carries no gated field;
+  - resend the items pointed at with the gated fields stripped, rather than dropping them; the stripped batch goes under a new `batch_id`, so after a console rollback it may duplicate a batch the console already accepted whose `202` was lost;
   - hold note codes as a closed Rust enum (`NoteCode::ALL`) with a contract test against `target-notes.json`, never built with `format!`.
 
-Today the agent populates none of the negotiated fields: `TargetStatus.notes`, `AccessEvent.bytes` and the `objects_sampled` / `skipped_*` counters are always absent.
+The agent populates `TargetStatus.notes` (from `check()`) and the `objects_sampled` / `skipped_*` counters (on the terminal status of a scan) of the PostgreSQL and MySQL / MariaDB connectors, only while the console lists their tokens. No connector sets `AccessEvent.bytes` yet; it is always absent.
 
 **Without negotiation** (a field sent that the console does not accept), today's behavior is as follows; it is why a producer must check `console_accepts`:
 - **Heartbeat.** The whole heartbeat is rejected, not only the new field. The agent treats the `400` as a non-retryable rejection: it logs a warning, counts it in `heartbeat_failures_total`, forgets the console's capabilities and sends the next heartbeat at the normal interval (30 s). It stays active: job polling and result uploads go on. On the console side:

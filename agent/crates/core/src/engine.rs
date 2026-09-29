@@ -62,9 +62,13 @@ pub struct TargetHealth {
     /// Why the target is unreachable or degraded, as reported to the
     /// console (`TargetStatus.last_error`). `None` when healthy.
     pub failure: Option<FailureCode>,
-    /// Human-readable explanation, e.g. why the audit level is degraded.
-    /// Must never contain a sampled value or a credential.
+    /// Human-readable explanation, e.g. why the audit level is degraded,
+    /// for the agent's logs only (never sent). Must never contain a
+    /// sampled value or a credential.
     pub detail: Option<String>,
+    /// The same explanations as closed notes, sent to the console
+    /// (`TargetStatus.notes`) when it accepts them (ADR-0022).
+    pub notes: Vec<crate::notes::TargetNote>,
 }
 
 impl TargetHealth {
@@ -76,6 +80,7 @@ impl TargetHealth {
             audit_level: AuditLevel::None,
             failure: Some(FailureCode::Unsupported),
             detail: Some(format!("{engine} connector is not implemented yet")),
+            notes: Vec::new(),
         }
     }
 }

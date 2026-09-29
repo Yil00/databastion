@@ -1200,12 +1200,27 @@ async fn immediate_204_does_not_hot_loop() {
 /// Scripted `/findings` responses, in order; then plain acks.
 enum Step {
     Ack(bool),
+    /// `400`, keyword `maximum` on every pointer.
     Items(&'static [&'static str]),
+    /// `400`, keyword `additionalProperties` (an unknown field) on every
+    /// pointer: what an older console answers.
+    Unknown(&'static [&'static str]),
+    /// `400` with these (pointer, keyword) details.
+    Details(&'static [(&'static str, &'static str)]),
     TooLarge,
     Conflict,
 }
 
 struct Script(std::sync::Mutex<std::collections::VecDeque<Step>>);
+
+fn details_400<'a>(details: impl Iterator<Item = (&'a str, &'a str)>) -> ResponseTemplate {
+    let details: Vec<_> = details
+        .map(|(p, k)| serde_json::json!({"pointer": p, "keyword": k}))
+        .collect();
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "code": "invalid_request", "message": "Invalid.", "details": details
+    }))
+}
 
 impl wiremock::Respond for Script {
     fn respond(&self, request: &Request) -> ResponseTemplate {
@@ -1217,15 +1232,11 @@ impl wiremock::Respond for Script {
         match self.0.lock().unwrap().pop_front() {
             None | Some(Step::Ack(false)) => ack(false),
             Some(Step::Ack(true)) => ack(true),
-            Some(Step::Items(pointers)) => {
-                let details: Vec<_> = pointers
-                    .iter()
-                    .map(|p| serde_json::json!({"pointer": p, "keyword": "maximum"}))
-                    .collect();
-                ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                    "code": "invalid_request", "message": "Invalid.", "details": details
-                }))
+            Some(Step::Items(pointers)) => details_400(pointers.iter().map(|p| (*p, "maximum"))),
+            Some(Step::Unknown(pointers)) => {
+                details_400(pointers.iter().map(|p| (*p, "additionalProperties")))
             }
+            Some(Step::Details(details)) => details_400(details.iter().copied()),
             Some(Step::TooLarge) => error_body(413, "payload_too_large"),
             Some(Step::Conflict) => error_body(409, "batch_conflict"),
         }
@@ -1799,12 +1810,14 @@ async fn connector_failure_code_is_reported_as_last_error() {
         audit_level: AuditLevel::None,
         failure: Some(FailureCode::TargetUnreachable),
         detail: None,
+        notes: Vec::new(),
     };
     let healthy = TargetHealth {
         reachable: true,
         audit_level: AuditLevel::Limited,
         failure: None,
         detail: None,
+        notes: Vec::new(),
     };
     for (health, expected) in [
         (
@@ -1825,6 +1838,141 @@ async fn connector_failure_code_is_reported_as_last_error() {
         assert_eq!(statuses[0].last_error, expected);
         assert_eq!(statuses[0].reachable, health.reachable);
     }
+}
+
+fn accepts_response(tokens: &[&str]) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "console_min_protocol": 1,
+        "heartbeat_interval_s": 30,
+        "server_time": "2026-09-28T14:02:00Z",
+        "accepts": tokens
+    }))
+}
+
+fn heartbeat_bodies(requests: &[Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/heartbeat"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn target_notes_are_sent_only_while_the_console_accepts_them() {
+    use crate::capabilities::token;
+    use crate::notes::{NoteLabel, TargetNote};
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // 1: no capability yet; 2: the console lists the notes; 3: it rejects
+    // the heartbeat (rolled back); 4: nothing accepted any more.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(accepts_response(&[token::TARGET_STATUS_NOTES]))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(400, "invalid_request"))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: Some("free text stays local: hunter2".to_owned()),
+        notes: vec![
+            TargetNote::new(NoteCode::CoverageRelationsWithoutSelect).with_count(3),
+            TargetNote::new(NoteCode::PrivilegeRoleAttributes).with_labels([
+                NoteLabel::parse("bypassrls"),
+                NoteLabel::parse("app_owner_hunter2"),
+            ]),
+            TargetNote::new(NoteCode::SecurityTlsDisabled),
+        ],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(health))],
+    )
+    .unwrap();
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap_err();
+    rt.heartbeat_once().await.unwrap();
+    let bodies = heartbeat_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 4);
+    for b in &bodies {
+        serde_json::from_value::<HeartbeatRequest>(b.clone()).unwrap();
+        let text = b.to_string();
+        assert!(
+            !text.contains("hunter2") && !text.contains("free text"),
+            "{text}"
+        );
+    }
+    assert!(bodies[0]["targets"][0].get("notes").is_none());
+    assert_eq!(
+        bodies[1]["targets"][0]["notes"],
+        serde_json::json!([
+            {"code": "security.tls_disabled"},
+            {"code": "privilege.role_attributes", "labels": ["other", "bypassrls"]},
+            {"code": "coverage.relations_without_select", "count": 3}
+        ])
+    );
+    // Rejected, then no capability: no notes until a response lists them.
+    assert!(bodies[2]["targets"][0].get("notes").is_some());
+    assert!(bodies[3]["targets"][0].get("notes").is_none());
+}
+
+#[tokio::test]
+async fn a_check_timed_out_by_the_core_is_noted() {
+    struct Slow;
+    #[async_trait::async_trait]
+    impl Connector for Slow {
+        fn engine(&self) -> Engine {
+            Engine::Postgres
+        }
+        async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+            std::future::pending().await
+        }
+        async fn discover(
+            &self,
+            _: &crate::ScanJob,
+            _: &crate::FindingSink,
+        ) -> Result<(), crate::ConnectorError> {
+            Ok(())
+        }
+        async fn audit_stream(
+            &self,
+            _: &crate::AuditConfig,
+            _: &crate::EventSink,
+        ) -> Result<(), crate::ConnectorError> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let mut rt = Runtime::new(&env.config_path, env.config.clone(), vec![Box::new(Slow)]).unwrap();
+    rt.check_timeout = Duration::from_millis(50);
+    rt.console_caps.record(Some(
+        &serde_json::from_value(serde_json::json!([
+            crate::capabilities::token::TARGET_STATUS_NOTES
+        ]))
+        .unwrap(),
+    ));
+    let statuses = rt.target_statuses(&env.config).await;
+    assert_eq!(statuses[0].last_error, Some(FailureCode::Timeout));
+    assert_eq!(statuses[0].notes.len(), 1);
+    assert_eq!(statuses[0].notes[0].code.as_str(), "check.timed_out");
 }
 
 // ------------------------------------------------------- discovery scans
@@ -2767,6 +2915,7 @@ impl Connector for FakeAudit {
             audit_level: AuditLevel::Full,
             failure: None,
             detail: None,
+            notes: Vec::new(),
         }
     }
     async fn discover(
@@ -2978,4 +3127,457 @@ async fn audit_configure_needs_an_audit_connector() {
     let got = statuses(&server).await;
     assert_eq!(got[0].1["error"]["code"], "unsupported");
     assert!(rt.lock_audits().snapshot().is_empty());
+}
+
+// ------------------------------------------- gated fields (ADR-0022)
+
+/// Answers with the scripted responses in order, then `fallback`.
+struct Seq(
+    std::sync::Mutex<std::collections::VecDeque<ResponseTemplate>>,
+    ResponseTemplate,
+);
+
+impl wiremock::Respond for Seq {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.1.clone())
+    }
+}
+
+fn seq(first: Vec<ResponseTemplate>, then: ResponseTemplate) -> Seq {
+    Seq(std::sync::Mutex::new(first.into()), then)
+}
+
+fn accept_tokens(rt: &Runtime, tokens: &[&str]) {
+    rt.console_caps.record(Some(
+        &serde_json::from_value(serde_json::json!(tokens)).unwrap(),
+    ));
+}
+
+fn rejected_400(pointer: &str) -> ResponseTemplate {
+    details_400([(pointer, "additionalProperties")].into_iter())
+}
+
+/// Reports coverage counters as a connector does while it scans.
+struct Covered;
+
+#[async_trait::async_trait]
+impl Connector for Covered {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        sink.add_coverage(crate::ScanCoverage {
+            not_readable: 2,
+            remote: 1,
+            ..crate::ScanCoverage::default()
+        });
+        for _ in 0..3 {
+            sink.add_coverage(crate::ScanCoverage {
+                sampled: 1,
+                ..crate::ScanCoverage::default()
+            });
+        }
+        sink.add_coverage(crate::ScanCoverage {
+            error: 1,
+            ..crate::ScanCoverage::default()
+        });
+        Ok(())
+    }
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+async fn covered_scan(status: Seq, tokens: &[&str]) -> (MockServer, Runtime, Env) {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(status)
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Covered)],
+    )
+    .unwrap();
+    accept_tokens(&rt, tokens);
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    (server, rt, env)
+}
+
+fn scan_statuses(got: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+    got.iter()
+        .filter(|(i, _)| i == JOB)
+        .map(|(_, b)| {
+            serde_json::from_value::<JobStatusUpdate>(b.clone()).unwrap();
+            b.clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn scan_coverage_counters_are_sent_only_when_accepted() {
+    use crate::capabilities::token;
+    let (server, _rt, _env) = covered_scan(
+        seq(Vec::new(), ResponseTemplate::new(204)),
+        &[token::JOB_PROGRESS_COVERAGE],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], "succeeded");
+    assert_eq!(
+        sent[0]["progress"],
+        serde_json::json!({
+            "objects_sampled": 3, "skipped_not_readable": 2, "skipped_remote": 1,
+            "skipped_error": 1
+        })
+    );
+
+    // Not listed (an older console): no counters at all.
+    let (server, _rt, _env) = covered_scan(
+        seq(Vec::new(), ResponseTemplate::new(204)),
+        &[token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].get("progress").is_none(), "{}", sent[0]);
+}
+
+#[test]
+fn coverage_counters_saturate_at_the_contract_bound() {
+    let p = coverage_progress(crate::ScanCoverage {
+        sampled: u64::MAX,
+        limit: u64::MAX,
+        ..crate::ScanCoverage::default()
+    });
+    assert_eq!(p.objects_sampled.unwrap().0, crate::sanitize::MAX_COUNT);
+    assert_eq!(p.skipped_limit.unwrap().0, crate::sanitize::MAX_COUNT);
+    assert!(p.skipped_error.is_none() && p.objects_done.is_none());
+}
+
+#[tokio::test]
+async fn status_rejected_with_coverage_is_resent_once_without_it() {
+    use crate::capabilities::token;
+    // 400 to the status carrying the counters, then 400 again: the
+    // stripped status is sent once, never in a loop.
+    let (server, rt, _env) = covered_scan(
+        seq(
+            vec![rejected_400("/progress"), rejected_400("/progress")],
+            ResponseTemplate::new(204),
+        ),
+        &[token::JOB_PROGRESS_COVERAGE, token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].get("progress").is_some());
+    assert!(sent[1].get("progress").is_none());
+    assert_eq!(sent[0]["ts"], sent[1]["ts"]);
+    assert_eq!(sent[1]["status"], "succeeded");
+    // Every capability is forgotten until the next heartbeat response.
+    assert!(
+        !rt.console_caps
+            .console_accepts(token::JOB_PROGRESS_COVERAGE)
+    );
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+
+    // Accepted once stripped: reported.
+    let (server, rt, _env) = covered_scan(
+        seq(vec![rejected_400("/progress")], ResponseTemplate::new(204)),
+        &[token::JOB_PROGRESS_COVERAGE],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[1].get("progress").is_none());
+    let reported = rt
+        .ledger
+        .lock()
+        .unwrap()
+        .get(&Uuid::try_from(JOB).unwrap())
+        .map(|e| e.reported);
+    assert_eq!(reported, Some(true));
+}
+
+#[tokio::test]
+async fn status_with_coverage_rejected_for_another_keyword_is_not_stripped() {
+    use crate::capabilities::token;
+    // e.g. `ts` in the future: not an older console, so nothing is
+    // stripped, the status is not resent and the capabilities are kept.
+    let (server, rt, _env) = covered_scan(
+        seq(
+            vec![details_400([("/ts", "formatMaximum")].into_iter())],
+            ResponseTemplate::new(204),
+        ),
+        &[token::JOB_PROGRESS_COVERAGE, token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].get("progress").is_some());
+    assert!(
+        rt.console_caps
+            .console_accepts(token::JOB_PROGRESS_COVERAGE)
+    );
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+}
+
+#[tokio::test]
+async fn a_400_without_gated_fields_keeps_the_capabilities() {
+    use crate::capabilities::token;
+    let (server, rt, _env) = covered_scan(
+        seq(vec![rejected_400("/ts")], ResponseTemplate::new(204)),
+        &[token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    // No gated field in the body: nothing to strip, not resent.
+    assert_eq!(scan_statuses(&statuses(&server).await).len(), 1);
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+}
+
+/// Spools one events batch of `n` events, those at `with_bytes` carrying
+/// the gated `bytes` (as built while the console listed
+/// `access_event.bytes`).
+fn spool_events_with_bytes(rt: &Runtime, n: usize, with_bytes: &[usize]) {
+    let events: Vec<databastion_protocol::AccessEvent> = (0..n)
+        .map(|i| {
+            let mut e = crate::sanitize::tests::event("read", 1);
+            if with_bytes.contains(&i) {
+                e.bytes = Some(databastion_protocol::Count(1000 + i as i64));
+            }
+            e
+        })
+        .collect();
+    let batch = databastion_protocol::EventsBatch {
+        batch_id: databastion_protocol::new_batch_id(),
+        events,
+    };
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&batch).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+}
+
+async fn sent_event_batches(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/events"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+async fn events_runtime(server: &MockServer, steps: Vec<Step>) -> (Env, Runtime) {
+    use crate::capabilities::token;
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[token::ACCESS_EVENT_BYTES, token::TARGET_STATUS_NOTES],
+    );
+    (env, rt)
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_by_pointer_are_resent_stripped_once() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 1 carries `bytes`, item 3 does not: both pointed at. Then the
+    // stripped batch is rejected again: it is handled as any batch (the
+    // pointed item dropped), never stripped a second time.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![
+            Step::Unknown(&["/events/1", "/events/3/objects/0"]),
+            Step::Items(&["/events/0"]),
+        ],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 5, &[1, 2]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    let ids: std::collections::HashSet<_> = sent.iter().map(|b| b["batch_id"].clone()).collect();
+    assert_eq!(ids.len(), 3, "every resend has a new batch_id");
+    let count_bytes = |b: &serde_json::Value| {
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e.get("bytes").is_some())
+            .count()
+    };
+    assert_eq!(count_bytes(&sent[0]), 2);
+    // Items 0, 1 (stripped), 2 (stripped), 4 resent; 3 left out.
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 4);
+    assert_eq!(count_bytes(&sent[1]), 0);
+    for b in &sent {
+        serde_json::from_value::<databastion_protocol::EventsBatch>(b.clone()).unwrap();
+    }
+    // Second 400: the ordinary item rule (one more item dropped).
+    assert_eq!(sent[2]["events"].as_array().unwrap().len(), 3);
+    assert!(!rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    assert_eq!(status.batches.0, 0);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_as_a_whole_are_resent_stripped() {
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Unknown(&["/batch_id"])]).await;
+    spool_events_with_bytes(&rt, 3, &[0]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 3);
+    assert!(!sent[1].to_string().contains("\"bytes\""));
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 0);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_for_another_keyword_keep_the_ordinary_rules() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 1 carries `bytes` but is rejected for `formatMinimum` (e.g. too
+    // old for the retention): dropped as before, nothing stripped, the
+    // capabilities kept.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[("/events/1/ts", "formatMinimum")])],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 3, &[0, 1]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let rest = sent[1]["events"].as_array().unwrap();
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest[0]["bytes"], 1000, "not stripped");
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn events_mixed_rejection_keeps_only_the_unknown_field_items() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Item 0: unknown field (kept, stripped); item 2: gated too, but
+    // rejected for another keyword (left out).
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[
+            ("/events/0", "additionalProperties"),
+            ("/events/2/ts", "formatMinimum"),
+        ])],
+    )
+    .await;
+    spool_events_with_bytes(&rt, 4, &[0, 2]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 3);
+    assert!(!sent[1].to_string().contains("\"bytes\""));
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert!(!rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn events_with_gated_fields_rejected_as_a_whole_for_another_keyword_are_dropped() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/batch_id"])]).await;
+    spool_events_with_bytes(&rt, 3, &[0]);
+    drain(&rt).await;
+    // Envelope rejected for `maximum`: dropped as before, not stripped.
+    assert_eq!(sent_event_batches(&server).await.len(), 1);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+#[tokio::test]
+async fn events_without_gated_fields_keep_the_ordinary_400_rules() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Items(&["/events/1"])]).await;
+    spool_events_with_bytes(&rt, 3, &[]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 2);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+}
+
+#[tokio::test]
+async fn findings_carry_no_gated_field_so_a_400_keeps_the_capabilities() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/0"])], 3).await;
+    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+}
+
+#[tokio::test]
+async fn spooled_events_carry_bytes_only_while_accepted() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let target = TargetId::try_from("pg-main").unwrap();
+    // No producer sets `bytes` yet; whatever the capability, the built
+    // events conform and carry no `bytes` when it is not listed.
+    for accepted in [false, true] {
+        if accepted {
+            accept_tokens(&rt, &[token::ACCESS_EVENT_BYTES]);
+        }
+        rt.spool_events(&target, &[fake_event(10)]);
+    }
+    let mut spool = rt.lock_spool();
+    while let Some((key, batch)) = spool.front() {
+        assert!(!batch.carries_gated());
+        spool.remove(&key);
+    }
 }

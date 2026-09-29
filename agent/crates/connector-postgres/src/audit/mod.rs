@@ -233,6 +233,7 @@ async fn pgaudit_run(
             );
         }
         if forged > 0 {
+            state.note_dropped(&target.id, forged);
             tracing::warn!(
                 target_id = %target.id,
                 dropped = forged,
@@ -243,6 +244,7 @@ async fn pgaudit_run(
             state.note_record(&target.id);
         }
         if t.oversized > st.reported_oversized {
+            state.note_dropped(&target.id, t.oversized - st.reported_oversized);
             tracing::warn!(
                 target_id = %target.id,
                 skipped = t.oversized - st.reported_oversized,

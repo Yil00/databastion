@@ -415,6 +415,7 @@ impl Session {
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 400,
                     code: Some(ErrorCode::InvalidSecret),
+                    unknown_field: false,
                 }))
             }
             Err(UplinkError::Unauthorized) => {

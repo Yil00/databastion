@@ -3,8 +3,14 @@
 
 /** Registered `TargetNote` codes: the phrase catalog (`{count}` and `{labels}` placeholders) and engines. */
 export const TARGET_NOTE_REGISTRY = {
+  "audit.audit_log_filter_not_read": {
+    "description": "The audit_log_filter component is active, but its log file is not configured in agent.yaml (mysql.audit_log), so the agent does not read it.",
+    "engines": [
+      "mysql"
+    ]
+  },
   "audit.audit_log_plugin_not_read": {
-    "description": "The audit_log plugin is active, but Full needs the agent to read its log file (not configured yet).",
+    "description": "The audit_log plugin is active, but its log file is not configured in agent.yaml (mysql.audit_log), so the agent does not read it.",
     "engines": [
       "mysql"
     ]
@@ -39,7 +45,30 @@ export const TARGET_NOTE_REGISTRY = {
   "audit.log_not_readable": {
     "description": "The audit log file configured in agent.yaml is not readable by the agent.",
     "engines": [
-      "postgres"
+      "postgres",
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "audit.log_plugin_mismatch": {
+    "description": "The audit log configured in agent.yaml has no matching active audit plugin logging statements in a supported format: it is not used.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "audit.log_without_row_counts": {
+    "description": "The audit log carries no row counts: result volumes are unknown.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "audit.partial_pending_first_record": {
+    "description": "Partial once the Audit stream has read a record of the audit log (none in the last 24 h): reported Limited until then.",
+    "engines": [
+      "mysql",
+      "mariadb"
     ]
   },
   "audit.performance_schema_not_readable": {
@@ -55,10 +84,24 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres"
     ]
   },
+  "audit.pgaudit_not_loaded": {
+    "description": "pgaudit settings are set, but the pgaudit library is not loaded (shared_preload_libraries): pgaudit writes no record.",
+    "engines": [
+      "postgres"
+    ]
+  },
   "audit.pgaudit_read_class_missing": {
     "description": "pgaudit.log does not include the read class.",
     "engines": [
       "postgres"
+    ]
+  },
+  "audit.records_dropped": {
+    "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb"
     ]
   },
   "audit.records_dropped_severity": {
@@ -68,7 +111,14 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.server_audit_not_read": {
-    "description": "server_audit is active ({labels}: logging_on / logging_off, file_output / non_file_output), but Full needs the agent to read its log file (not configured yet).",
+    "description": "server_audit is active ({labels}: logging_on / logging_off, file_output / non_file_output), but its log file is not configured in agent.yaml (mysql.audit_log), so the agent does not read it.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "audit.statement_consumers_disabled": {
+    "description": "The performance_schema consumers the statement history depends on (global_instrumentation, thread_instrumentation, events_statements_current) are disabled.",
     "engines": [
       "mysql",
       "mariadb"
@@ -142,7 +192,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.beyond_select": {
-    "description": "Privileges beyond SELECT on databases, tables or columns: {labels}.",
+    "description": "{count} privilege(s) beyond SELECT on databases, tables or columns; the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb"
@@ -157,7 +207,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.global_privileges": {
-    "description": "Global privileges other than SELECT and USAGE: {labels}.",
+    "description": "{count} global privilege(s) other than SELECT and USAGE; the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb"
@@ -194,6 +244,20 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "Owner of {count} object(s).",
     "engines": [
       "postgres"
+    ]
+  },
+  "privilege.performance_schema_unused": {
+    "description": "SELECT on performance_schema is unused (the audit log is the Audit source): the statement text of every session is readable, with clear-text passwords on MariaDB.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "privilege.performance_schema_without_audit": {
+    "description": "SELECT on performance_schema while no Audit stream runs for the target: the statement text of every session is readable.",
+    "engines": [
+      "mysql",
+      "mariadb"
     ]
   },
   "privilege.predefined_roles": {

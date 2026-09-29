@@ -29,6 +29,7 @@ use crate::engine::{AuditLevel, Engine};
 use crate::identity::{Identity, IdentityError, StateDir};
 use crate::job::{AuditConfig, AuditParams, ScanJob, ScanParams};
 use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
+use crate::notes::{NoteCode, TargetNote};
 use crate::session::{CallError, RotateOutcome, Session};
 use crate::sink::{EventSink, FindingSink};
 use crate::spool::Spool;
@@ -305,6 +306,9 @@ struct Counters {
     events_lost: AtomicU64,
     /// Audit streams that ended with an error (restarted with backoff).
     audit_stream_failures: AtomicU64,
+    /// Requests or batches rejected with `400` while carrying a gated
+    /// field (ADR-0022), sent again once with every gated field stripped.
+    gated_fields_stripped: AtomicU64,
 }
 
 /// Capacity of the event channel between a connector and the core.
@@ -380,6 +384,9 @@ struct ScanQueue {
     in_flight: std::collections::HashSet<Uuid>,
 }
 
+/// Bound of one target's `check()` in a heartbeat.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Scans queued at most; more are left unacknowledged and redelivered.
 const MAX_QUEUED_SCANS: usize = 16;
 
@@ -418,6 +425,9 @@ struct Runtime {
     /// Findings emitted per job at most ([`MAX_FINDINGS_PER_JOB`]; lowered
     /// in tests).
     findings_cap: usize,
+    /// Bound of one target's `check()` ([`CHECK_TIMEOUT`]; lowered in
+    /// tests).
+    check_timeout: Duration,
     /// Audit settings per target.
     audits: Mutex<AuditTable>,
     /// Wakes the audit worker when `audits` changes.
@@ -581,6 +591,7 @@ impl Runtime {
             console_caps: crate::capabilities::ConsoleCapabilities::default(),
             parked: Mutex::new(Parked::default()),
             findings_cap: MAX_FINDINGS_PER_JOB,
+            check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_changed: tokio::sync::Notify::new(),
         })
@@ -628,14 +639,22 @@ impl Runtime {
                 .connectors
                 .iter()
                 .find(|c| c.engine() == target.engine.connector());
-            let (reachable, level, last_error) = match connector {
-                None => (false, AuditLevel::None, Some(FailureCode::Unsupported)),
-                Some(c) => {
-                    match tokio::time::timeout(Duration::from_secs(10), c.check(target)).await {
-                        Ok(h) => (h.reachable, h.audit_level, h.failure),
-                        Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
-                    }
-                }
+            let (reachable, level, last_error, notes) = match connector {
+                None => (
+                    false,
+                    AuditLevel::None,
+                    Some(FailureCode::Unsupported),
+                    Vec::new(),
+                ),
+                Some(c) => match tokio::time::timeout(self.check_timeout, c.check(target)).await {
+                    Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
+                    Err(_) => (
+                        false,
+                        AuditLevel::None,
+                        Some(FailureCode::Timeout),
+                        vec![TargetNote::new(NoteCode::CheckTimedOut)],
+                    ),
+                },
             };
             let audit_source = match connector {
                 Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
@@ -646,9 +665,17 @@ impl Runtime {
                 }),
                 _ => None,
             };
-            // `notes` (closed codes from the connector's `check()`) are not produced yet
-            // (ROADMAP P2-G); when they are, they are sent only if the console accepts
-            // `target_status.notes` (ADR-0022, `capabilities`).
+            // Closed notes from the connector's `check()`, sent only when the
+            // console's latest heartbeat response listed `target_status.notes`
+            // (ADR-0022): an older console rejects the whole heartbeat otherwise.
+            let notes = if self
+                .console_caps
+                .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
+            {
+                crate::notes::to_protocol(&notes)
+            } else {
+                Vec::new()
+            };
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
                 audit_source,
@@ -656,7 +683,7 @@ impl Runtime {
                 engine: proto_engine(target.engine),
                 last_error,
                 metrics: None,
-                notes: Vec::new(),
+                notes,
                 reachable,
                 server_version: None,
                 target_id,
@@ -700,6 +727,7 @@ impl Runtime {
             ("events_filtered_total", &c.events_filtered),
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
+            ("gated_fields_stripped_total", &c.gated_fields_stripped),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1130,6 +1158,25 @@ impl Runtime {
                 self.lock_spool().drop_batch(&key);
                 Ok(Flush::Progress)
             }
+            // ADR-0022 decision 9: a `400` reporting an unknown field
+            // (`additionalProperties`) to a batch that carried a gated field
+            // is more likely an older console than bad items. Any other
+            // keyword (`formatMinimum`, retention…) keeps the ordinary rules
+            // and the capabilities.
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                status: 400,
+                items,
+                unknown_field,
+            })) if !unknown_field.is_empty() && batch.carries_gated() => {
+                Ok(self.resend_stripped(&key, &batch, &items, &unknown_field, failures))
+            }
+            Err(CallError::Uplink(UplinkError::Rejected {
+                status: 400,
+                code: Some(_),
+                unknown_field: true,
+            })) if batch.carries_gated() => {
+                Ok(self.resend_stripped(&key, &batch, &[], &[], failures))
+            }
             Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
                 tracing::warn!(
@@ -1177,6 +1224,7 @@ impl Runtime {
             Err(CallError::Uplink(UplinkError::Rejected {
                 status,
                 code: Some(code),
+                ..
             })) => {
                 if code == databastion_protocol::ErrorCode::BatchConflict {
                     bump(&self.counters.batch_conflicts, 1);
@@ -1192,7 +1240,9 @@ impl Runtime {
                 Ok(Flush::Progress)
             }
             Err(CallError::Uplink(
-                UplinkError::Rejected { status, code: None }
+                UplinkError::Rejected {
+                    status, code: None, ..
+                }
                 | UplinkError::UnexpectedResponse { status },
             )) => {
                 bump(&self.counters.batches_unexpected_response, 1);
@@ -1207,6 +1257,47 @@ impl Runtime {
                 Ok(Flush::Retry(delay))
             }
         }
+    }
+
+    /// A batch carrying a gated field was rejected with `400` for an
+    /// unknown field (`additionalProperties`, ADR-0022 decision 9): the
+    /// console may be an older replica or a rolled-back build. Forget its
+    /// capabilities (no new gated field until a heartbeat response lists
+    /// them again) and replace the batch with the same items under a new
+    /// `batch_id`, every gated field stripped, instead of dropping them. Of
+    /// the `rejected` items, only those pointed at as an unknown field
+    /// (`unknown`) that carried a gated field are kept; the others were
+    /// rejected for another reason and are left out. The replacement
+    /// carries no gated field: it is never stripped again.
+    fn resend_stripped(
+        &self,
+        key: &[u64],
+        batch: &ResultBatch,
+        rejected: &[usize],
+        unknown: &[usize],
+        failures: u32,
+    ) -> Flush {
+        self.console_caps.clear();
+        bump(&self.counters.gated_fields_stripped, 1);
+        let (again, left_out) = match batch.stripped(rejected, unknown) {
+            Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
+            Err(uplink::Unserializable) => {
+                self.count_unserializable(1);
+                (Vec::new(), batch.len())
+            }
+        };
+        tracing::warn!(
+            path = batch.path(),
+            left_out,
+            "batch with gated fields rejected (400): console capabilities cleared, items sent \
+             again without them"
+        );
+        let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
+        if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
+            tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+            return Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
+        }
+        Flush::Progress
     }
 
     // ----------------------------------------------------------------- jobs
@@ -1560,6 +1651,9 @@ impl Runtime {
             target_id,
             events,
             fingerprints: &fingerprints,
+            accept_bytes: self
+                .console_caps
+                .console_accepts(crate::capabilities::token::ACCESS_EVENT_BYTES),
         });
         self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();
@@ -1903,6 +1997,7 @@ impl Runtime {
             return Outcome::failed(FailureCode::Internal);
         };
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
+        let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
         let spool_failed = std::sync::atomic::AtomicBool::new(false);
         // Findings emitted for this job (per-job cap).
@@ -2045,12 +2140,18 @@ impl Runtime {
             }
         }
         flush();
-        if spool_failed.load(Ordering::Relaxed) && outcome.error.is_none() {
-            return Outcome::failed(FailureCode::ResourceLimit);
-        }
-        if capped.load(Ordering::Relaxed) && outcome.error.is_none() {
-            return Outcome::failed(FailureCode::ResourceLimit);
-        }
+        let mut outcome = if (spool_failed.load(Ordering::Relaxed)
+            || capped.load(Ordering::Relaxed))
+            && outcome.error.is_none()
+        {
+            Outcome::failed(FailureCode::ResourceLimit)
+        } else {
+            outcome
+        };
+        // What the connector covered until it returned or was stopped.
+        outcome.coverage = *coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         outcome
     }
 
@@ -2144,21 +2245,36 @@ impl Runtime {
             .record(id, LedgerEntry { outcome, reported });
     }
 
+    /// Reports a terminal status. The coverage counters of a scan are
+    /// gated fields (ADR-0022): sent only when the console's latest
+    /// heartbeat response listed `job_progress.coverage`. A `400` reporting
+    /// an unknown field (`additionalProperties`) to a body that carried
+    /// them clears the capabilities (the console may be an older replica or
+    /// a rolled-back build) and the status is sent again once without them,
+    /// instead of being lost (decision 9). Any other `400` is not retried
+    /// and keeps the capabilities.
     async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
-        let update = JobStatusUpdate {
-            error: outcome.error.map(|code| JobError {
-                code,
-                engine_code: None,
-            }),
-            progress: None,
-            status: outcome.status,
-            ts: now(),
-        };
-        let Ok(body) = serde_json::to_vec(&update) else {
-            return false;
-        };
+        let ts = now();
+        let mut progress = outcome.coverage.and_then(|c| {
+            self.console_caps
+                .console_accepts(crate::capabilities::token::JOB_PROGRESS_COVERAGE)
+                .then(|| coverage_progress(c))
+        });
         let path = format!("/jobs/{id}/status");
-        for attempt in 0..3 {
+        let mut attempt = 0;
+        while attempt < 3 {
+            let update = JobStatusUpdate {
+                error: outcome.error.map(|code| JobError {
+                    code,
+                    engine_code: None,
+                }),
+                progress: progress.clone(),
+                status: outcome.status,
+                ts: ts.clone(),
+            };
+            let Ok(body) = serde_json::to_vec(&update) else {
+                return false;
+            };
             match self
                 .session
                 .call(
@@ -2176,6 +2292,25 @@ impl Runtime {
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
                 })) => return true,
+                // A gated field was sent and the console does not know a
+                // field: forget the capabilities and send the status once
+                // more without it (never a loop: the stripped body carries
+                // no gated field).
+                Err(CallError::Uplink(UplinkError::Rejected {
+                    status: 400,
+                    unknown_field: true,
+                    ..
+                })) if progress.is_some() => {
+                    self.console_caps.clear();
+                    bump(&self.counters.gated_fields_stripped, 1);
+                    tracing::warn!(
+                        job_id = %id,
+                        "job status with coverage counters rejected (400): console capabilities \
+                         cleared, status sent again without them"
+                    );
+                    progress = None;
+                    continue;
+                }
                 Err(CallError::Uplink(e)) if e.is_retryable() => {
                     tokio::time::sleep(e.retry_delay(attempt)).await;
                 }
@@ -2184,8 +2319,32 @@ impl Runtime {
                     return false;
                 }
             }
+            attempt += 1;
         }
         false
+    }
+}
+
+/// `JobProgress` with the coverage counters of a scan only (every other
+/// field absent): `objects_sampled` always, each `skipped_*` counter when
+/// non-zero (absent counts 0 in the contract), saturated at the contract
+/// bound.
+fn coverage_progress(c: crate::sink::ScanCoverage) -> databastion_protocol::JobProgress {
+    use crate::sanitize::clamped_count;
+    let nonzero = |n: u64| (n > 0).then(|| clamped_count(n));
+    databastion_protocol::JobProgress {
+        batches: None,
+        findings: None,
+        objects_done: None,
+        objects_sampled: Some(clamped_count(c.sampled)),
+        objects_total: None,
+        ratio: None,
+        skipped_error: nonzero(c.error),
+        skipped_limit: nonzero(c.limit),
+        skipped_not_readable: nonzero(c.not_readable),
+        skipped_remote: nonzero(c.remote),
+        skipped_row_level_security: nonzero(c.row_level_security),
+        skipped_unsupported: nonzero(c.unsupported),
     }
 }
 

@@ -19,8 +19,7 @@ use databastion_protocol::CapabilityList;
 pub(crate) const MAX_CAPABILITIES: usize = 64;
 
 /// Tokens of the optional request fields the agent may send (contract
-/// `Capability`). No producer uses them yet.
-#[allow(dead_code)]
+/// `Capability`).
 pub(crate) mod token {
     /// `TargetStatus.notes`.
     pub(crate) const TARGET_STATUS_NOTES: &str = "target_status.notes";
@@ -61,7 +60,6 @@ impl ConsoleCapabilities {
     }
 
     /// Whether the latest heartbeat response listed `token`.
-    #[allow(dead_code)]
     pub(crate) fn console_accepts(&self, token: &str) -> bool {
         self.accepted
             .read()
