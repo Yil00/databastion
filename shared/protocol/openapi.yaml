@@ -687,7 +687,9 @@ components:
           verification runs (`429`), so the hash cost cannot be used for denial of service;
         - the authentication, `/enroll` and `/rotate` rate limits hold across every console process;
           when the console cannot evaluate them, it refuses (`429`, `Retry-After`) rather than skip
-          them, except for a secret that console process has itself verified recently;
+          them, except for a secret the console process holds as verified (its 25 s cache) or as
+          known good (its in-memory copy of the agent row); the `/rotate` late-retry limit instead
+          falls back to per-process counters;
         - a cache of verified secrets, if any, keeps entries less than 30 s and is purged on revocation
           and on rotation;
         - revocation invalidates the current **and** the pending secret and closes the agent's held
