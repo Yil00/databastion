@@ -77,7 +77,7 @@ fn url(var: &str) -> Option<Url> {
 
 /// Reports a skipped check. When its prerequisite is listed in
 /// `DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`,
-/// `pgaudit`, `weak-auth`, `tls`, or `all`), the skip is a failure: CI
+/// `pgaudit`, `pgaudit-log`, `weak-auth`, `tls`, or `all`), the skip is a failure: CI
 /// lists what each run must exercise.
 fn skip(prerequisite: &str, message: &str) {
     let required = std::env::var("DATABASTION_TEST_REQUIRE").unwrap_or_default();
@@ -281,7 +281,7 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
     assert!(health.reachable, "{health:?}");
     assert_eq!(health.failure, None);
     // Minimal variant with pg_read_all_stats and pg_stat_statements loaded:
-    // Limited. Never Full before the audit log path can be checked (P4-A).
+    // Limited: this target declares no audit log, so never Full.
     assert!(health.audit_level <= AuditLevel::Limited, "{health:?}");
     let detail = health.detail.unwrap();
     assert!(!detail.contains("over-privileged"), "{detail}");
@@ -1216,4 +1216,399 @@ async fn poisoned_session_is_closed_before_submit() {
         }
     }
     assert!(n > 1);
+}
+
+// ------------------------------------------------------------------ audit
+
+/// Marker planted in literals of audited statements: it must never appear
+/// in an event or a log line (I2, ADR-0007).
+const AUDIT_MARKER: &str = "it-audit-marker-7Qz@example.test";
+
+/// The pgaudit log files of the test server (`DATABASTION_TEST_PG_AUDIT_LOG`
+/// for jsonlog, `DATABASTION_TEST_PG_AUDIT_CSVLOG` for csvlog).
+fn audit_logs() -> Vec<(PathBuf, &'static str)> {
+    let mut out = Vec::new();
+    for (var, format) in [
+        ("DATABASTION_TEST_PG_AUDIT_LOG", "jsonlog"),
+        ("DATABASTION_TEST_PG_AUDIT_CSVLOG", "csvlog"),
+    ] {
+        if let Ok(p) = std::env::var(var) {
+            out.push((PathBuf::from(p), format));
+        }
+    }
+    if out.is_empty() {
+        skip(
+            "pgaudit-log",
+            "DATABASTION_TEST_PG_AUDIT_LOG is not set (pgaudit log of the dev image or of \
+             dev/postgres/local-cluster.sh with pgaudit installed)",
+        );
+    }
+    out
+}
+
+/// An audited target `id`, reading `log` when given.
+fn audit_target(
+    u: &Url,
+    id: &str,
+    log: Option<(&std::path::Path, &str)>,
+) -> (TempDir, TargetConfig) {
+    let (dir, t) = target(u, &u.user, &u.password, &u.dbname, false);
+    let secret = dir.0.join("secret");
+    let audit = log.map_or(String::new(), |(p, f)| {
+        format!(", audit_log: {{path: \"{}\", format: {f}}}", p.display())
+    });
+    let yaml = format!(
+        "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: {id}\n    \
+         engine: postgres\n    host: \"{}\"\n    port: {}\n    account: \"{}\"\n    \
+         secret: {{file: \"{}\"}}\n    postgres: {{databases: [\"{}\"], tls: disable{audit}}}\n",
+        u.host,
+        u.port,
+        u.user,
+        secret.display(),
+        u.dbname
+    );
+    drop(t);
+    let config = databastion_core::AgentConfig::parse(&yaml).unwrap();
+    (dir, config.targets[0].clone())
+}
+
+/// Runs `audit_stream` in a task; events arrive on the returned channel.
+fn start_audit(
+    t: &TargetConfig,
+    state: &std::path::Path,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectorError>>,
+    tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
+) {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(state.to_owned());
+    let (sink, rx) = databastion_core::EventSink::channel(10_000);
+    let task =
+        tokio::spawn(async move { PostgresConnector::new().audit_stream(&cfg, &sink).await });
+    (task, rx)
+}
+
+/// What `pg_dump` sends for its data phase (application name, repeatable
+/// read snapshot, one `COPY … TO stdout` per table), for servers whose
+/// major version is newer than the host's `pg_dump`.
+async fn simulated_pg_dump(adm: &Url) {
+    use futures_util::StreamExt as _;
+    let mut c = tokio_postgres::Config::new();
+    c.host(&adm.host)
+        .port(adm.port)
+        .user(&adm.user)
+        .password(&adm.password)
+        .dbname(&adm.dbname)
+        .application_name("pg_dump");
+    let (client, conn) = c.connect(NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .await
+        .unwrap();
+    for table in [
+        "billing.invoices (id, customer_id, invoice_number, amount_cents, email_template_id)",
+        "crm.customers (id, first_name, last_name, email, phone, birth_date)",
+        "ops.app_credentials (id, service, owner_email)",
+    ] {
+        let stream = client
+            .copy_out(&format!("COPY {table} TO stdout;"))
+            .await
+            .unwrap();
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+    }
+    client.batch_execute("COMMIT").await.unwrap();
+}
+
+/// Runs the host's `pg_dump` when its major version can dump the server.
+fn real_pg_dump(adm: &Url) -> bool {
+    let out = std::process::Command::new("pg_dump")
+        .args([
+            "-h",
+            &adm.host,
+            "-p",
+            &adm.port.to_string(),
+            "-U",
+            &adm.user,
+            "-d",
+            &adm.dbname,
+            "--data-only",
+            "-f",
+            "/dev/null",
+        ])
+        .env("PGPASSWORD", &adm.password)
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
+fn describe(e: &databastion_classifiers::masking::MaskedEvent) -> String {
+    format!(
+        "{:?} user={} app={:?} objects={:?} rows={:?} signals={:?} source={}",
+        e.action(),
+        e.principal().account_name(),
+        e.principal().application(),
+        e.objects()
+            .iter()
+            .map(|o| format!(
+                "{}.{}.{}",
+                o.database().as_str(),
+                o.schema().map_or("", |s| s.as_str()),
+                o.object().as_str()
+            ))
+            .collect::<Vec<_>>(),
+        e.rows(),
+        e.signals().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        e.source().as_str()
+    )
+}
+
+/// Collects events until `done` holds or `timeout`.
+async fn collect_until(
+    rx: &mut tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
+    out: &mut Vec<databastion_classifiers::masking::MaskedEvent>,
+    timeout: Duration,
+    done: impl Fn(&[databastion_classifiers::masking::MaskedEvent]) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !done(out) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(e)) => out.push(e),
+            _ => break,
+        }
+    }
+}
+
+fn has(
+    events: &[databastion_classifiers::masking::MaskedEvent],
+    object: &str,
+    signal: &str,
+) -> bool {
+    events.iter().any(|e| {
+        e.objects().iter().any(|o| o.object().as_str() == object)
+            && e.signals().iter().any(|s| s.as_str() == signal)
+    })
+}
+
+#[tokio::test]
+async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let logs_available = audit_logs();
+    if logs_available.is_empty() {
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let state = TempDir::new();
+    let mut streams = Vec::new();
+    for (i, (path, format)) in logs_available.iter().enumerate() {
+        let (dir, t) = audit_target(&u, &format!("pg-audit-{i}"), Some((path, format)));
+        // check(): Full once the log is readable (ADR-0015 decision 4).
+        let connector = PostgresConnector::new();
+        let health = connector.check(&t).await;
+        assert_eq!(health.audit_level, AuditLevel::Full, "{format}: {health:?}");
+        assert_eq!(
+            connector.audit_source(&t),
+            Some(databastion_classifiers::masking::EventSource::Pgaudit)
+        );
+        let (task, rx) = start_audit(&t, &state.0);
+        streams.push((dir, t, task, rx, *format));
+    }
+    // The tailers start at the end of the log: let them open it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let a = admin(&adm, &adm.dbname).await;
+    a.batch_execute(
+        "DROP TABLE IF EXISTS crm.it_audit_big; \
+         CREATE TABLE crm.it_audit_big AS SELECT g AS id, 'x' || g AS v FROM generate_series(1, 20000) g",
+    )
+    .await
+    .unwrap();
+    simulated_pg_dump(&adm).await;
+    let real = real_pg_dump(&adm);
+    eprintln!("real pg_dump run: {real}");
+    // A large read, and a filtered read with a marker literal.
+    let big = a
+        .query("SELECT * FROM crm.it_audit_big", &[])
+        .await
+        .unwrap();
+    assert_eq!(big.len(), 20_000);
+    a.query(
+        &format!("SELECT id FROM crm.customers WHERE email = '{AUDIT_MARKER}'"),
+        &[],
+    )
+    .await
+    .unwrap();
+    a.batch_execute(&format!(
+        "COPY (SELECT id FROM crm.customers WHERE email <> '{AUDIT_MARKER}') TO stdout"
+    ))
+    .await
+    .ok();
+
+    for (_dir, t, task, mut rx, format) in streams {
+        let mut events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
+            has(ev, "customers", "signature.pg_dump")
+                && has(ev, "it_audit_big", "volume.large_result")
+                && has(ev, "it_audit_big", "shape.full_table_read")
+        })
+        .await;
+        task.abort();
+        let all: Vec<String> = events.iter().map(describe).collect();
+        for d in &all {
+            eprintln!("{format}: {d}");
+        }
+        assert!(
+            has(&events, "customers", "signature.pg_dump"),
+            "{format}: {all:#?}"
+        );
+        assert!(
+            has(&events, "customers", "shape.full_table_copy"),
+            "{format}: {all:#?}"
+        );
+        assert!(
+            has(&events, "invoices", "signature.pg_dump"),
+            "{format}: {all:#?}"
+        );
+        assert!(
+            has(&events, "it_audit_big", "volume.large_result"),
+            "{format}: {all:#?}"
+        );
+        assert!(
+            has(&events, "it_audit_big", "shape.full_table_read"),
+            "{format}: {all:#?}"
+        );
+        let big = events
+            .iter()
+            .find(|e| {
+                e.principal().application() == Some("databastion-it")
+                    && e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "it_audit_big")
+            })
+            .unwrap();
+        assert_eq!(big.rows(), Some(20_000), "pgaudit.log_rows");
+        assert_eq!(big.principal().account_name(), adm.user);
+        assert_eq!(
+            big.principal().client(),
+            Some(databastion_classifiers::masking::ClientAddr::Ip(
+                adm.host.parse().unwrap()
+            ))
+        );
+        // The value-bearing table name of the seed never leaves as is.
+        assert!(!all.iter().any(|d| d.contains("0639988384")), "{all:#?}");
+        // No literal in any event.
+        for e in &events {
+            assert!(!format!("{e:?}").contains(AUDIT_MARKER));
+            assert!(!describe(e).contains(AUDIT_MARKER));
+        }
+        // The agent's own statements (check()) are not reported.
+        assert!(!all.iter().any(|d| d.contains(&format!("user={} ", u.user))));
+        // The cursor is persisted, private.
+        let cursor = state.0.join(format!("{}.pgaudit.cursor", t.id));
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&cursor).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}", cursor.display());
+    }
+    a.batch_execute("DROP TABLE IF EXISTS crm.it_audit_big")
+        .await
+        .unwrap();
+    let text = logs.text();
+    assert!(!text.contains(AUDIT_MARKER), "a literal reached the logs");
+    assert!(!text.contains("COPY crm"), "statement text in the logs");
+}
+
+#[tokio::test]
+async fn audit_resumes_from_its_cursor() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let Some((path, format)) = audit_logs().into_iter().next() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let state = TempDir::new();
+    let (_dir, t) = audit_target(&u, "pg-audit-resume", Some((&path, format)));
+    let a = admin(&adm, &adm.dbname).await;
+    // First run: establishes the cursor at the end of the log.
+    let (task, _rx) = start_audit(&t, &state.0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    task.abort();
+    let _ = task.await;
+    // Activity while the agent is stopped is read on restart.
+    a.query("SELECT * FROM crm.customers", &[]).await.unwrap();
+    let (task, mut rx) = start_audit(&t, &state.0);
+    let mut events = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(20), |ev| {
+        has(ev, "customers", "shape.full_table_read")
+    })
+    .await;
+    task.abort();
+    assert!(
+        has(&events, "customers", "shape.full_table_read"),
+        "{:#?}",
+        events.iter().map(describe).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let (_dir, t) = audit_target(&u, "pg-audit-pss", None);
+    let connector = PostgresConnector::new();
+    let health = connector.check(&t).await;
+    if health.audit_level != AuditLevel::Limited {
+        skip("pss", "pg_stat_statements is not usable by the agent role");
+        return;
+    }
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(databastion_classifiers::masking::EventSource::PgStatStatements)
+    );
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(&t, &state.0);
+    // First poll: baseline.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    simulated_pg_dump(&adm).await;
+    let a = admin(&adm, &adm.dbname).await;
+    a.query(
+        &format!("SELECT id FROM crm.customers WHERE email = '{AUDIT_MARKER}'"),
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut events = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(20), |ev| {
+        has(ev, "customers", "signature.pg_dump")
+    })
+    .await;
+    task.abort();
+    let all: Vec<String> = events.iter().map(describe).collect();
+    assert!(has(&events, "customers", "signature.pg_dump"), "{all:#?}");
+    assert!(
+        has(&events, "customers", "shape.full_table_copy"),
+        "{all:#?}"
+    );
+    for e in &events {
+        assert_eq!(
+            e.source(),
+            databastion_classifiers::masking::EventSource::PgStatStatements
+        );
+        // No client address nor application in this mode.
+        assert!(e.principal().client().is_none() && e.principal().application().is_none());
+        assert!(!format!("{e:?}").contains(AUDIT_MARKER));
+    }
 }

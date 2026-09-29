@@ -343,10 +343,6 @@ pub(crate) const AUDIT_PREREQUISITES: &str = "SELECT \
        pg_catalog.pg_has_role(CURRENT_USER, 'pg_read_all_stats', 'MEMBER'), \
        pg_catalog.current_setting('pgaudit.log', true)";
 
-/// `pgaudit.log`, `NULL` when pgaudit is not loaded (a setting, not
-/// data): shows whether pgaudit is loaded without `pg_read_all_settings`.
-pub(crate) const PGAUDIT_LOG: &str = "SELECT pg_catalog.current_setting('pgaudit.log', true)";
-
 /// Probes that `pg_stat_statements` is loaded (`shared_preload_libraries`
 /// is not readable without `pg_read_all_settings`): the info view errors
 /// otherwise. Reads no statement text.
@@ -354,6 +350,65 @@ pub(crate) const PGAUDIT_LOG: &str = "SELECT pg_catalog.current_setting('pgaudit
 pub(crate) fn pss_probe(schema: &str) -> Option<String> {
     Some(format!(
         "SELECT 1 FROM {}.pg_stat_statements_info",
+        quote_ident(schema)?
+    ))
+}
+
+/// pgaudit settings of this session's database (`NULL` when pgaudit is not
+/// loaded): `pgaudit.log`, `pgaudit.log_rows`, `pgaudit.role`. Settings,
+/// not data; readable without `pg_read_all_settings` (verified in P2-B).
+pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
+       pg_catalog.current_setting('pgaudit.log', true), \
+       pg_catalog.current_setting('pgaudit.log_rows', true), \
+       pg_catalog.current_setting('pgaudit.role', true)";
+
+/// Schema of the `pg_stat_statements(boolean)` function, if it is a member
+/// of the `pg_stat_statements` extension in its own schema (obligation 3).
+pub(crate) const PSS_FUNCTION_SCHEMA: &str = "SELECT n.nspname FROM pg_catalog.pg_extension e \
+       JOIN pg_catalog.pg_depend d \
+         ON d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass \
+        AND d.refobjid = e.oid AND d.deptype = 'e' \
+        AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+       JOIN pg_catalog.pg_proc p ON p.oid = d.objid \
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+       WHERE e.extname = 'pg_stat_statements' AND p.proname = 'pg_stat_statements' \
+         AND p.pronamespace = e.extnamespace AND p.pronargs = 1 \
+       LIMIT 1";
+
+/// Most `pg_stat_statements` entries read per poll (`pg_stat_statements.max`
+/// defaults to 5000).
+pub(crate) const PSS_MAX_ENTRIES: u32 = 20_000;
+/// Longest statement text read from `pg_stat_statements`, in characters.
+pub(crate) const PSS_MAX_TEXT_CHARS: u32 = 8192;
+
+/// `pg_stat_statements` counters, without statement text
+/// (`showtext => false`: the text file is not read). `toplevel` exists
+/// since PostgreSQL 14.
+pub(crate) fn pss_counters(schema: &str, toplevel: bool) -> Option<String> {
+    Some(format!(
+        "SELECT s.userid, s.dbid, s.queryid, {}, s.calls, s.rows, \
+                pg_catalog.pg_get_userbyid(s.userid), d.datname \
+           FROM {}.pg_stat_statements(false) AS s \
+           JOIN pg_catalog.pg_database d ON d.oid = s.dbid \
+          WHERE s.queryid IS NOT NULL \
+          LIMIT {PSS_MAX_ENTRIES}",
+        if toplevel { "s.toplevel" } else { "true" },
+        quote_ident(schema)?
+    ))
+}
+
+/// Statement texts of the given `queryid`s (`$1`, `int8[]`), cut at
+/// [`PSS_MAX_TEXT_CHARS`] characters, with a flag when cut. The text goes
+/// through the query normalizer only (obligation 5).
+pub(crate) fn pss_texts(schema: &str, toplevel: bool) -> Option<String> {
+    Some(format!(
+        "SELECT s.userid, s.dbid, s.queryid, {}, \
+                pg_catalog.left(s.query, {PSS_MAX_TEXT_CHARS}), \
+                pg_catalog.char_length(s.query) >= {PSS_MAX_TEXT_CHARS} \
+           FROM {}.pg_stat_statements(true) AS s \
+          WHERE s.queryid = ANY($1) \
+          LIMIT {PSS_MAX_ENTRIES}",
+        if toplevel { "s.toplevel" } else { "true" },
         quote_ident(schema)?
     ))
 }
@@ -415,8 +470,12 @@ mod tests {
             LOGIN_EVENT_TRIGGERS.to_owned(),
             SCHEMAS_WITHOUT_USAGE.to_owned(),
             AUDIT_PREREQUISITES.to_owned(),
-            PGAUDIT_LOG.to_owned(),
             pss_probe("public").unwrap(),
+            PGAUDIT_SETTINGS.to_owned(),
+            PSS_FUNCTION_SCHEMA.to_owned(),
+            pss_counters("public", true).unwrap(),
+            pss_counters("public", false).unwrap(),
+            pss_texts("public", true).unwrap(),
             sample_statement("s", "t", &["c"], true).unwrap(),
         ]
     }
@@ -485,6 +544,9 @@ mod tests {
             "pg_has_role(",
             "pg_partition_root(",
             "count(",
+            "pg_get_userbyid(",
+            "left(",
+            "char_length(",
         ];
         for s in all_statements() {
             for f in functions {

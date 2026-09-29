@@ -1,16 +1,25 @@
 //! `check()`: reachability, honest audit level, over-privilege and
 //! coverage (ADR-0012 obligation 6).
 //!
-//! Audit level, per docs/08 and obligation 6, reporting only what can be
-//! proven without `pg_read_all_settings`:
+//! Audit level, per docs/08, ADR-0012 obligation 6 and ADR-0015 decision 4,
+//! reporting only what can be proven without `pg_read_all_settings`:
+//! - **Full**: the audit log configured in `agent.yaml`
+//!   (`postgres.audit_log`) is readable by the agent, pgaudit is loaded
+//!   with the `read` class in `pgaudit.log` for a monitored database, and
+//!   volumes are visible: `pgaudit.log_rows` is on, or `pg_stat_statements`
+//!   is usable (Limited prerequisites below).
+//! - **Partial**: the log is readable and pgaudit logs reads (without a
+//!   volume source), or only object audit is set (`pgaudit.role`, reads
+//!   of the objects granted to that role).
 //! - **Limited**: `pg_stat_statements` is installed in a monitored database
 //!   and loaded (its `pg_stat_statements_info` view, a member of the
 //!   extension, answers), and the role sees other users' statements
 //!   (member of `pg_read_all_stats`, or superuser).
-//! - **Full** also needs pgaudit and a readable audit log file. The log
-//!   path is not configured before P4-A, so Full is never reported yet: a
-//!   loaded pgaudit is only mentioned in the detail.
 //! - **None** otherwise.
+//!
+//! The source reported with the level (heartbeat `audit_source`) is
+//! `pgaudit` for Full / Partial and `pg_stat_statements` for Limited: the
+//! same choice as the Audit stream.
 //!
 //! Over-privilege (warned, not refused): superuser, `BYPASSRLS`,
 //! replication, `CREATEROLE` / `CREATEDB`, membership of any role but
@@ -29,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use databastion_classifiers::masking::EventSource;
 use databastion_core::config::TargetConfig;
 use databastion_core::{AuditLevel, FailureCode, TargetHealth};
 
@@ -58,11 +68,35 @@ pub(crate) struct AuditProbe {
     /// `pg_read_all_settings`: `Some(true)`; not loaded: `Some(false)`;
     /// not readable: `None`.
     pub(crate) pgaudit_loaded: Option<bool>,
+    /// `pgaudit.log` enables the `read` class in this database.
+    pub(crate) pgaudit_reads: bool,
+    /// `pgaudit.log_rows` is on.
+    pub(crate) pgaudit_rows: bool,
+    /// `pgaudit.role` is set (object audit).
+    pub(crate) pgaudit_object_audit: bool,
+}
+
+/// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
+/// listed, and `-read` not listed.
+pub(crate) fn pgaudit_logs_reads(setting: &str) -> bool {
+    let items: Vec<String> = setting
+        .split(',')
+        .map(|i| i.trim().to_ascii_lowercase())
+        .collect();
+    items.iter().any(|i| i == "read" || i == "all") && !items.iter().any(|i| i == "-read")
 }
 
 impl AuditProbe {
-    pub(crate) fn level(&self) -> AuditLevel {
-        if self.pss_installed && self.pss_loaded && self.stats_visible {
+    /// Level proven in this database; `log_readable`: the configured audit
+    /// log can be read by the agent.
+    pub(crate) fn level(&self, log_readable: bool) -> AuditLevel {
+        let limited = self.pss_installed && self.pss_loaded && self.stats_visible;
+        let pgaudit = self.pgaudit_loaded == Some(true);
+        if log_readable && pgaudit && self.pgaudit_reads && (self.pgaudit_rows || limited) {
+            AuditLevel::Full
+        } else if log_readable && pgaudit && (self.pgaudit_reads || self.pgaudit_object_audit) {
+            AuditLevel::Partial
+        } else if limited {
             AuditLevel::Limited
         } else {
             AuditLevel::None
@@ -145,13 +179,44 @@ struct Cached {
     report: Report,
 }
 
-/// Per target and database: last detailed report.
+/// Per target and database: last detailed report; per target: source of
+/// the last reported level.
 #[derive(Default)]
 pub(crate) struct CheckState {
     reports: Mutex<HashMap<(String, String), Cached>>,
+    sources: Mutex<HashMap<String, EventSource>>,
 }
 
 impl CheckState {
+    /// Source of the level last reported for `target_id`.
+    pub(crate) fn audit_source(&self, target_id: &str) -> Option<EventSource> {
+        self.sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .copied()
+    }
+
+    fn set_source(&self, target_id: &str, level: AuditLevel) {
+        let source = match level {
+            AuditLevel::Full | AuditLevel::Partial => Some(EventSource::Pgaudit),
+            AuditLevel::Limited => Some(EventSource::PgStatStatements),
+            AuditLevel::None => None,
+        };
+        let mut map = self
+            .sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match source {
+            Some(s) => {
+                map.insert(target_id.to_owned(), s);
+            }
+            None => {
+                map.remove(target_id);
+            }
+        }
+    }
+
     fn due(&self, key: &(String, String)) -> bool {
         self.reports
             .lock()
@@ -201,7 +266,7 @@ fn unreachable(e: &PgError) -> TargetHealth {
 
 /// `check()` of a target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
-    match tokio::time::timeout(CHECK_TIMEOUT, check_inner(state, target)).await {
+    let health = match tokio::time::timeout(CHECK_TIMEOUT, check_inner(state, target)).await {
         Ok(h) => h,
         Err(_) => TargetHealth {
             reachable: false,
@@ -209,7 +274,9 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
             failure: Some(FailureCode::Timeout),
             detail: Some("check timed out".to_owned()),
         },
-    }
+    };
+    state.set_source(&target.id, health.audit_level);
+    health
 }
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth {
@@ -223,6 +290,10 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
              in clear, read-only not guaranteed"
                 .to_owned(),
         );
+    }
+    let log_readable = crate::audit::log_readable(target);
+    if settings.audit_log.is_some() && !log_readable {
+        notes.push("the configured audit log is not readable by the agent".to_owned());
     }
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
@@ -243,12 +314,17 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             Ok(p) => p,
             Err(e) => return unreachable(&e),
         };
-        level = level.max(probe.level());
-        if probe.pgaudit_installed || probe.pgaudit_loaded == Some(true) {
+        level = level.max(probe.level(log_readable));
+        if (probe.pgaudit_installed || probe.pgaudit_loaded == Some(true))
+            && settings.audit_log.is_none()
+        {
             notes.push(
-                "pgaudit present; Full needs a readable audit log (log path not configured)"
+                "pgaudit present; Full needs its log file in agent.yaml (postgres.audit_log)"
                     .to_owned(),
             );
+        }
+        if probe.pgaudit_loaded == Some(true) && !probe.pgaudit_reads {
+            notes.push("pgaudit.log does not include the read class".to_owned());
         }
         let key = (target.id.clone(), database.clone());
         if state.due(&key) {
@@ -430,19 +506,26 @@ pub(crate) async fn audit_probe(
             Err(_) => false,
         };
     }
-    // ADR-0012 open question: is `pgaudit.log` readable without
-    // `pg_read_all_settings`? `NULL` when pgaudit is not loaded.
-    p.pgaudit_loaded = match probe(session, timeouts, sql::PGAUDIT_LOG).await {
-        Ok(rows) => Some(
-            rows.first()
-                .map(|r| col::<Option<String>>(r, 0))
-                .transpose()?
-                .flatten()
-                .is_some(),
-        ),
+    // `pgaudit.*` are readable without `pg_read_all_settings` (verified in
+    // P2-B); `NULL` when pgaudit is not loaded.
+    match probe(session, timeouts, sql::PGAUDIT_SETTINGS).await {
+        Ok(rows) => {
+            let setting = |i: usize| -> Result<Option<String>, PgError> {
+                Ok(rows
+                    .first()
+                    .map(|r| col::<Option<String>>(r, i))
+                    .transpose()?
+                    .flatten())
+            };
+            let log = setting(0)?;
+            p.pgaudit_loaded = Some(log.is_some());
+            p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
+            p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
+            p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
+        }
         Err(e) if e.fatal => return Err(e),
-        Err(_) => None,
-    };
+        Err(_) => p.pgaudit_loaded = None,
+    }
     Ok(p)
 }
 
@@ -588,6 +671,16 @@ mod tests {
     }
 
     #[test]
+    fn pgaudit_log_setting_is_read() {
+        assert!(pgaudit_logs_reads("read, write"));
+        assert!(pgaudit_logs_reads("ALL"));
+        assert!(!pgaudit_logs_reads("all, -read"));
+        assert!(!pgaudit_logs_reads("write,ddl"));
+        assert!(!pgaudit_logs_reads("none"));
+        assert!(!pgaudit_logs_reads("readx"));
+    }
+
+    #[test]
     fn audit_level_is_proven_not_assumed() {
         let full_prereqs = AuditProbe {
             pss_installed: true,
@@ -595,9 +688,55 @@ mod tests {
             stats_visible: true,
             pgaudit_installed: true,
             pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            pgaudit_rows: false,
+            pgaudit_object_audit: false,
         };
-        // Full needs the audit log, which cannot be checked yet.
-        assert_eq!(full_prereqs.level(), AuditLevel::Limited);
+        // Full needs the audit log to be readable (ADR-0015 decision 4).
+        assert_eq!(full_prereqs.level(true), AuditLevel::Full);
+        assert_eq!(full_prereqs.level(false), AuditLevel::Limited);
+        // Volumes from pgaudit.log_rows alone.
+        let rows_only = AuditProbe {
+            pss_loaded: false,
+            pgaudit_rows: true,
+            ..full_prereqs.clone()
+        };
+        assert_eq!(rows_only.level(true), AuditLevel::Full);
+        // No volume source: Partial.
+        let no_volume = AuditProbe {
+            pss_loaded: false,
+            ..full_prereqs.clone()
+        };
+        assert_eq!(no_volume.level(true), AuditLevel::Partial);
+        // pgaudit not logging reads: object audit only is Partial, else Limited.
+        let no_reads = AuditProbe {
+            pgaudit_reads: false,
+            ..full_prereqs.clone()
+        };
+        assert_eq!(no_reads.level(true), AuditLevel::Limited);
+        assert_eq!(
+            AuditProbe {
+                pgaudit_object_audit: true,
+                ..no_reads.clone()
+            }
+            .level(true),
+            AuditLevel::Partial
+        );
+        // pgaudit not loaded, or not provably loaded.
+        for loaded in [Some(false), None] {
+            assert_eq!(
+                AuditProbe {
+                    pgaudit_loaded: loaded,
+                    ..full_prereqs.clone()
+                }
+                .level(true),
+                AuditLevel::Limited
+            );
+        }
+        let full_prereqs = AuditProbe {
+            pgaudit_reads: false,
+            ..full_prereqs
+        };
         for p in [
             AuditProbe {
                 pss_loaded: false,
@@ -612,7 +751,7 @@ mod tests {
                 ..full_prereqs.clone()
             },
         ] {
-            assert_eq!(p.level(), AuditLevel::None);
+            assert_eq!(p.level(false), AuditLevel::None);
         }
     }
 }

@@ -5,9 +5,12 @@
 //!   7), classification through `ScanJob::classify`, names through the
 //!   ADR-0009 normalizer; only masked findings reach the sink (I2).
 //! - [`check`](Connector::check): reachability, honest audit level (docs/08:
-//!   pgaudit = Full, `pg_stat_statements` = Limited), over-privilege and
+//!   readable pgaudit log = Full, `pg_stat_statements` = Limited), over-privilege and
 //!   coverage of the role (ADR-0012 obligation 6).
-//! - Audit (`audit_stream`) is P4-A: not implemented.
+//! - Audit ([`audit_stream`](Connector::audit_stream), P4-A): access events
+//!   from the pgaudit log (`jsonlog` / `csvlog`, cursor persisted) or, as a
+//!   degraded Limited level, from `pg_stat_statements` deltas; statement
+//!   text is only analyzed locally (`classifiers::query`), never sent.
 //!
 //! The connector only reads (I4): read-only transactions, `SET LOCAL`
 //! timeouts, statements cancelled on the server when their future is
@@ -16,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod catalog;
 mod check;
 mod conn;
@@ -74,13 +78,21 @@ impl Connector for PostgresConnector {
 
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
-        _sink: &EventSink,
+        cfg: &AuditConfig,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(ConnectorError::NotImplemented {
-            engine: self.engine(),
-            operation: "audit_stream",
-        })
+        audit::audit_stream(cfg, sink).await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        self.check_state.audit_source(&target.id)
     }
 }
 
@@ -128,7 +140,10 @@ mod tests {
             connector
                 .audit_stream(&AuditConfig::default(), &events)
                 .await,
-            Err(ConnectorError::NotImplemented { .. })
+            Err(ConnectorError::Target {
+                code: FailureCode::Internal,
+                ..
+            })
         ));
     }
 }
