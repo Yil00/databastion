@@ -46,7 +46,7 @@ Dev-only values in [.env.example](.env.example), copied to `dev/.env` (git-ignor
 | Engine | Account | Rights |
 |--------|---------|--------|
 | PostgreSQL | `databastion` | [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md) minimal variant: `CONNECTION LIMIT 4`, no superuser / createdb / createrole / replication / bypassrls; `CONNECT`, `USAGE` + `SELECT` on `crm`, `billing`, `ops` (+ default privileges `FOR ROLE postgres`), `pg_read_all_stats`; role defaults `default_transaction_read_only=on`, `statement_timeout=30s`, `lock_timeout=2s`, `idle_in_transaction_session_timeout=60s` |
-| MariaDB / MySQL / Percona | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`. MySQL only: `SELECT` on `performance_schema`, its Audit source (ADR-0018 grants it with Audit; `check()` reports it as over-privilege while no Audit stream runs). MariaDB and Percona: Audit reads their log files, no grant |
+| MariaDB / MySQL / Percona | `databastion@'%'` | ADR-0018 minimal variant: `SELECT` on the application database only (`support` / `hr`), `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (scan, `check()` and the connector's `KILL QUERY` session); MariaDB also `MAX_STATEMENT_TIME 30`. No global privilege, no `PROCESS`, no `SHOW VIEW`, no `performance_schema` grant: MariaDB and Percona Audit reads their log files; on MySQL (whose only source is `performance_schema`), the Audit tests create their own account with that grant (ADR-0018 gives it only with Audit, and `check()` reports it as over-privilege while no Audit stream runs) |
 | MongoDB | `databastion` (auth db `admin`) | `read` on `app`, `clusterMonitor` |
 | OpenLDAP | `cn=databastion,ou=services,dc=example,dc=org` | read on the tree (except `userPassword`) and on `cn=accesslog` |
 
@@ -150,8 +150,8 @@ export DATABASTION_TEST_PERCONA_DUMP_CMD="$C -e MYSQL_PWD=$PERCONA_ROOT_PASSWORD
 ```
 
 Audit keys of `DATABASTION_TEST_REQUIRE`: `mariadb-audit`, `percona`, `percona-audit`,
-`mysqldump`. The `performance_schema` test runs on MySQL with the dev agent account and on MariaDB
-with a test account (`databastion_it_pfs`) granted `SELECT` on `performance_schema`.
+`mysqldump`. The `performance_schema` test runs on MySQL and MariaDB with a test account
+(`databastion_it_pfs`) granted `SELECT` on the application database and on `performance_schema`.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.

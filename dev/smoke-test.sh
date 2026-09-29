@@ -69,10 +69,14 @@ check "read-only account cannot write" must_fail ex mysql "$MYSQL -e 'DELETE FRO
 check "agent account has no global privilege (mysql.user not readable)" \
   must_fail ex mysql "$MYSQL -e 'SELECT COUNT(*) FROM mysql.user'"
 check "agent account needs TLS" must_fail ex mysql "$MYSQL --ssl-mode=DISABLED -e 'SELECT 1'"
-# Audit (P4-B): MySQL Community's only source is performance_schema, granted to the agent account
-# for Audit (ADR-0018). The agent reads DIGEST_TEXT, never SQL_TEXT when a digest exists.
-check "agent account reads the statement digests (Audit grant)" ex mysql \
-  "$MYSQL -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE DIGEST_TEXT LIKE '%employees%'\" | grep -Eq '^[1-9]'"
+# ADR-0018 minimal variant: the dev agent account has no performance_schema grant (the Audit
+# tests create their own account with it); the audit source itself is checked as root. The agent
+# reads DIGEST_TEXT, never SQL_TEXT when a digest exists.
+check "agent account has no performance_schema grant" \
+  must_fail ex mysql "$MYSQL -e 'SELECT COUNT(*) FROM performance_schema.events_statements_history_long'"
+MYSQL_ROOT='MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h 127.0.0.1 -u root -N'
+check "events_statements_history_long records the statement digest" ex mysql \
+  "$MYSQL_ROOT -e \"SELECT COUNT(*) FROM performance_schema.events_statements_history_long WHERE DIGEST_TEXT LIKE '%employees%'\" | grep -Eq '^[1-9]'"
 
 echo "# Percona Server + audit_log_filter (JSON)"
 PERCONA='MYSQL_PWD="$DATABASTION_DB_PASSWORD" mysql -h 127.0.0.1 -u databastion -N'

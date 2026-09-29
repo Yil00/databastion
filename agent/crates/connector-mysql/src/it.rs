@@ -434,30 +434,18 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
         assert_eq!(health.failure, None);
         let detail = health.detail.unwrap();
         eprintln!("{} check: {detail}", server.name);
-        if server.name == "mysql" {
-            // The dev MySQL account has the Audit grant on
-            // performance_schema (MySQL Community's only source): Partial,
-            // and over-privilege while no Audit stream runs (ADR-0018).
-            assert_eq!(health.audit_level, AuditLevel::Partial, "{detail}");
-            assert!(
-                detail.contains(
-                    "over-privileged: SELECT on performance_schema without Audit enabled"
-                ),
-                "{detail}"
-            );
-            assert!(
-                detail.contains("audit source: performance_schema.events_statements_history_long"),
-                "{detail}"
-            );
-        } else {
-            // MariaDB: the dev account has no performance_schema grant and
-            // this target no audit log: no source it can read.
-            assert_eq!(health.audit_level, AuditLevel::None, "{detail}");
-            assert!(
-                detail.contains("performance_schema not readable by the account"),
-                "{detail}"
-            );
-            assert!(!detail.contains("over-privileged"), "{detail}");
+        // ADR-0018 minimal variant: no performance_schema grant (the Audit
+        // tests use their own account) and no audit log on this target:
+        // no source the account can read.
+        assert_eq!(health.audit_level, AuditLevel::None, "{detail}");
+        assert!(
+            detail.contains("performance_schema not readable by the account"),
+            "{detail}"
+        );
+        assert!(detail.contains("no audit source"), "{detail}");
+        // The dev account is not over-privileged.
+        assert!(!detail.contains("over-privileged"), "{detail}");
+        if server.name == "mariadb" {
             assert!(
                 detail.contains("server_audit active (logging ON, file output)"),
                 "{detail}"

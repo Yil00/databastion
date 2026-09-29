@@ -12,9 +12,9 @@
 //!   running the real `mysqldump` / `mariadb-dump` against the server (e.g.
 //!   `docker compose -f …/dev/docker-compose.yml exec -T … mariadb-dump …`).
 //!   Without it, only the simulated dump runs (skip key `mysqldump`).
-//! - The `performance_schema` source runs on MySQL with the dev agent
-//!   account (granted for Audit) and on MariaDB with a test account
-//!   created with that grant.
+//! - The `performance_schema` source runs on MySQL and MariaDB with a test
+//!   account created with the Audit grant (the dev agent accounts stay
+//!   minimal).
 //!
 //! Client addresses are those the server reports (`USER()`): in CI the
 //! servers run in Docker and see the bridge gateway, never loopback.
@@ -435,33 +435,28 @@ async fn performance_schema_gives_events_with_rows() {
         let _guard = logs.capture();
         let mut a = admin_session(&server, &admin).await;
         audit_fixture(&mut a).await;
-        // MySQL: the dev agent account (performance_schema granted for
-        // Audit). MariaDB: a test account with that grant (the dev account
-        // uses the server_audit log).
-        let (user, password) = if server.flavor() == Flavor::Mariadb {
-            exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
-            exec(
-                &mut a,
-                &format!("CREATE USER '{PFS_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
-            )
-            .await;
-            exec(
-                &mut a,
-                &format!(
-                    "GRANT SELECT ON {}.* TO '{PFS_USER}'@'%'",
-                    server.url.dbname
-                ),
-            )
-            .await;
-            exec(
-                &mut a,
-                &format!("GRANT SELECT ON performance_schema.* TO '{PFS_USER}'@'%'"),
-            )
-            .await;
-            (PFS_USER.to_owned(), IT_PASSWORD.to_owned())
-        } else {
-            (server.url.user.clone(), server.url.password.clone())
-        };
+        // A test account with the Audit grant (ADR-0018): the dev agent
+        // accounts stay minimal (MariaDB reads its server_audit log).
+        exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{PFS_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!(
+                "GRANT SELECT ON {}.* TO '{PFS_USER}'@'%'",
+                server.url.dbname
+            ),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON performance_schema.* TO '{PFS_USER}'@'%'"),
+        )
+        .await;
+        let (user, password) = (PFS_USER.to_owned(), IT_PASSWORD.to_owned());
         let (_d, t) = audit_target(&server, &user, &password, None);
         let connector = Arc::new(MysqlConnector::new());
         let health = connector.check(&t).await;
@@ -594,8 +589,6 @@ async fn performance_schema_gives_events_with_rows() {
         assert_no_marker(&events, &logs);
         task.abort();
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {AUDIT_DB}")).await;
-        if server.flavor() == Flavor::Mariadb {
-            exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
-        }
+        exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
     }
 }

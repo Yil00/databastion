@@ -1,13 +1,11 @@
 # Sourced by the MySQL entrypoint after 10-seed.sql. Agent account, ADR-0018 minimal variant:
 # SELECT on the application database only (no global privilege: SELECT ON *.* would expose the
 # mysql.user password hashes; no PROCESS, no SHOW VIEW), TLS required, at most 4 sessions (a scan, a
-# check() and the separate KILL QUERY session of the connector). '%' because the agent connects
-# through the published port in dev; restrict the host in production.
-#
-# Audit (P4-B): MySQL Community has no audit plugin, so its only source is performance_schema,
-# which needs SELECT on it (ADR-0018: granted only when Audit is enabled for the target; check()
-# reports it as over-privilege while no Audit stream runs). It exposes the statement text of every
-# session: the agent reads DIGEST_TEXT first and puts any text through the query normalizer.
+# check() and the separate KILL QUERY session of the connector). No performance_schema grant: that
+# Audit grant (ADR-0018, MySQL Community's only source) is given to a test account by the
+# connector's Audit integration tests, so the dev account stays minimal (the E2E harness checks it).
+# '%' because the agent connects through the published port in dev; restrict the host in
+# production.
 databastion_agent_account() {
   # Single quotes doubled and backslashes escaped (default sql_mode): any dev password works.
   local pw
@@ -16,7 +14,6 @@ databastion_agent_account() {
 CREATE USER 'databastion'@'%' IDENTIFIED WITH caching_sha2_password BY '${pw}'
   REQUIRE SSL WITH MAX_USER_CONNECTIONS 4;
 GRANT SELECT ON hr.* TO 'databastion'@'%';
-GRANT SELECT ON performance_schema.* TO 'databastion'@'%';
 EOSQL
 }
 databastion_agent_account
