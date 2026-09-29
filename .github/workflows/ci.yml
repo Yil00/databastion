@@ -57,7 +57,7 @@ jobs:
           esac
           if [ -z "$changed" ]; then
             e2e=true
-          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|dev/postgres/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
             e2e=true
           else
             e2e=false
@@ -377,14 +377,19 @@ jobs:
 
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
-  # (in parallel), revocation < 60 s, and invariant I2: no ground-truth value in clear text in the
-  # console database, the logs or the findings page, for every engine. Required through ci-result.
+  # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit) and the
+  # MariaDB target (server_audit log): a real pg_dump / mariadb-dump must open an incident in under
+  # 2 minutes, the agent's own reads none, and the policy engine must be woken up; revocation
+  # < 60 s, and invariant I2: no ground-truth value in clear text in the console database, the logs,
+  # the console pages or the notification e-mails, for every engine; no secret in the targets'
+  # audit logs. run.sh prints the phase timings and the dump -> incident times. Required through
+  # ci-result.
   e2e:
-    name: E2E (enrollment, Discovery, invariant I2)
+    name: E2E (enrollment, Discovery, Audit, invariant I2)
     needs: detect
     if: needs.detect.outputs.e2e == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
     steps:

@@ -18,6 +18,16 @@ Subcommands
             (expected row count, enough rendered samples, no `unavailable` samples) and no masked
             sample keeps more than MAX_CLEAR_DIGITS digits (masking contract: at most 4 kept), which
             catches partial masking regressions that the value search cannot see.
+  audit     Checks the console's access events and incidents of one target (Audit path, P4-D; JSON
+            arrays, see run.sh): at least one of each; no event and no incident of the agent's own
+            account (--agent-account: its Discovery reads must not surface); the required events
+            (principal, optionally with a signal) and incidents (policy and principal, optionally
+            with a signal) are present; no stored event object (database, schema or object name)
+            holds a raw value-bearing name, even partially. Values themselves are searched by
+            `scan`, on the same rows.
+  `scan --needle ID` restricts a scan to the given needle ids (and their e-mail local part): run.sh
+  uses it to follow the ground-truth literals it put in query text, on the console side (must be
+  absent) and in the target's own audit log (positive control: must be present).
 
 Output: counts, needle ids (`L<location index>.v<value index>`, `.n<name value index>`,
 `.object`) and file names only. A matched value, or a value-bearing name, is never printed: the
@@ -28,7 +38,9 @@ What "in clear" means (a *needle* is one ground-truth value or value-bearing nam
   recomposed, so NFC / NFD, case and accent variants of a value match ("Lefèvre", "LEFEVRE",
   "Lefèvre").
   Views: each file is searched as is and, when it holds such escapes, after decoding JSON
-  \\uXXXX escapes, URL %XX escapes, HTML character references and SQL doubled quotes.
+  \\uXXXX escapes, URL %XX escapes, HTML character references and SQL doubled quotes; HTML is also
+  searched as rendered text (`html-text`: comments such as React's `<!-- -->` and inline tags
+  removed, other tags replaced by a space, character references decoded).
   Plain form: the folded needle is a substring of a folded view. Needles with fewer than
   BOUNDED_BELOW letters / digits must also stand at word boundaries (no letter or digit right
   before or after; `_` and punctuation are boundaries), so that "Martin" matches in
@@ -237,6 +249,21 @@ def _json_unescape(text: str) -> str:
     return _JSON_U.sub(rep, text)
 
 
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_HTML_TAG = re.compile(r"<[^<>]*>")
+_INLINE_TAG = re.compile(r"</?(?:span|b|i|em|strong|code|a|mark|small|sub|sup|wbr)\b[^<>]*>", re.I)
+
+
+def html_text(text: str) -> str:
+    """Rendered text of an HTML page: comments (React's `<!-- -->` text-node separators) and inline
+    tags removed without a gap, other tags replaced by a space (cells stay apart), then character
+    references decoded."""
+    text = _HTML_COMMENT.sub("", text)
+    text = _INLINE_TAG.sub("", text)
+    text = _HTML_TAG.sub(" ", text)
+    return html.unescape(text)
+
+
 def views(text: str) -> Iterator[tuple[str, str]]:
     """(name, folded text) of every decoded view of a file."""
     yield "raw", fold(text)
@@ -248,6 +275,8 @@ def views(text: str) -> Iterator[tuple[str, str]]:
         yield "html-entities", fold(html.unescape(text))
     if "''" in text:
         yield "sql-quotes", fold(text.replace("''", "'"))
+    if "<" in text and ">" in text:
+        yield "html-text", fold(html_text(text))
 
 
 def projection(folded: str) -> str:
@@ -338,9 +367,22 @@ def load_plan(args: argparse.Namespace) -> Plan:
     with open(args.ground_truth, encoding="utf-8") as f:
         gt = json.load(f)
     plan = build_plan(gt, args.engine)
+    wanted = getattr(args, "needle", None) or []
+    if wanted:
+        plan = restrict_plan(plan, wanted)
     if not plan.needles:
         raise ValueError(f"no searchable value for engine {args.engine!r} in the ground truth")
     return plan
+
+
+def restrict_plan(plan: Plan, ids: list[str]) -> Plan:
+    """The plan reduced to the given needle ids and their derived needles (`<id>.local`)."""
+    keep = [n for n in plan.needles if any(n.id == i or n.id.startswith(i + ".") for i in ids)]
+    missing = [i for i in ids if not any(n.id == i for n in keep)]
+    if missing:
+        raise ValueError(f"unknown or excluded needle id(s): {' '.join(missing)}")
+    locations = {n.location: plan.locations[n.location] for n in keep}
+    return Plan(keep, {"short": 0, "common": 0}, locations)
 
 
 def summary_line(plan: Plan) -> str:
@@ -412,6 +454,24 @@ def expected_classifiers(ground_truth: dict, engine: str) -> list[str]:
     return sorted(out)
 
 
+def raw_name_parts(loc: dict) -> tuple[set[str], list[str]]:
+    """Folded raw names (object, container, field) of a value-bearing location that carry a value,
+    and its folded name values long enough to be searched inside a stored name."""
+    name_values = [fold(v) for v in loc.get("name_values") or []]
+    names = {
+        fold(v) for v in (loc.get("object"), loc.get("container"), loc.get("field"))
+        if v and any(nv in fold(v) for nv in name_values)
+    }
+    parts = [nv for nv in name_values if alnum_count(nv) >= MIN_ALNUM]
+    return names, parts
+
+
+def holds_raw_name(stored: Iterable[str], names: set[str], parts: list[str]) -> bool:
+    """Whether a stored name is a raw value-bearing name, or holds one of its name values."""
+    folded = {fold(str(s or "")) for s in stored}
+    return bool(names & folded) or any(nv in st for nv in parts for st in folded)
+
+
 def check_findings(rows: list[dict], ground_truth: dict, engine: str, required: list[str],
                    require_expected: bool = False,
                    forbid_negative_controls: bool = False) -> tuple[list[str], list[str]]:
@@ -445,17 +505,12 @@ def check_findings(rows: list[dict], ground_truth: dict, engine: str, required: 
         label = location_label(i, loc)
         want = set(loc.get("expected_classifiers") or [])
         if loc.get("name_contains_value"):
-            name_values = [fold(v) for v in loc.get("name_values") or []]
-            # The raw name parts that carry a value (object, container or field).
-            names = {
-                fold(v) for v in (loc.get("object"), loc.get("container"), loc.get("field"))
-                if v and any(nv in fold(v) for nv in name_values)
-            }
-            # A name value inside a stored name counts too (partial normalization).
-            parts = [nv for nv in name_values if alnum_count(nv) >= MIN_ALNUM]
+            # The raw name parts that carry a value (object, container or field); a name value
+            # inside a stored name counts too (partial normalization).
+            names, parts = raw_name_parts(loc)
             for r in rows:
-                stored = {fold(str(r.get(k) or "")) for k in ("schema_name", "object_name", "field_name")}
-                if names & stored or any(nv in st for nv in parts for st in stored):
+                if holds_raw_name((r.get(k) for k in ("schema_name", "object_name", "field_name")),
+                                  names, parts):
                     errors.append(f"{label}: a finding stores the raw value-bearing name")
                     break
             norm = loc.get("expected_normalized_name")
@@ -620,6 +675,99 @@ def cmd_page(args: argparse.Namespace, out) -> int:
     return 1 if errors else 0
 
 
+# ------------------------------------------------------------------------------ audit (P4-D)
+def _principal(row: dict) -> str:
+    return str(row.get("db_user") or row.get("principal") or "")
+
+
+def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, engine: str,
+                agent_account: str, require_events: list[str],
+                require_incidents: list[str]) -> tuple[list[str], list[str]]:
+    """Returns (errors, info). Only principals given on the command line, policy names, signal ids
+    and counts are printed: never an object name (it may be value-bearing) or a value."""
+    errors: list[str] = []
+    info: list[str] = []
+    if not events:
+        errors.append("no access event was stored")
+    if not incidents:
+        errors.append("no incident was opened")
+    agent = fold(agent_account)
+    own_events = [e for e in events if fold(_principal(e)) == agent]
+    own_incidents = [i for i in incidents if fold(_principal(i)) == agent]
+    info.append(f"{len(events)} event(s), {len(incidents)} incident(s); of the agent's own account "
+                f"{agent_account!r}: {len(own_events)} event(s), {len(own_incidents)} incident(s)")
+    if own_events:
+        errors.append(f"{len(own_events)} access event(s) of the agent's own account "
+                      f"{agent_account!r}: its own reads surfaced")
+    if own_incidents:
+        errors.append(f"{len(own_incidents)} incident(s) attributed to the agent's own account "
+                      f"{agent_account!r}")
+    for req in require_events:
+        principal, _, signal = req.partition(":")
+        mine = [e for e in events if _principal(e) == principal]
+        if signal:
+            mine = [e for e in mine if signal in (e.get("signals") or [])]
+        what = f"principal {principal!r}" + (f" with {signal}" if signal else "")
+        if mine:
+            sig = sorted({s for e in mine for s in e.get("signals") or []})
+            info.append(f"{len(mine)} event(s) of {what}; signals: {', '.join(sig) or 'none'}")
+        else:
+            errors.append(f"no access event of {what}")
+    for req in require_incidents:
+        parts = req.split(":")
+        if len(parts) not in (2, 3):
+            errors.append(f"bad --require-incident {req!r}: POLICY:PRINCIPAL[:SIGNAL]")
+            continue
+        policy, principal = parts[0], parts[1]
+        signal = parts[2] if len(parts) == 3 else ""
+        mine = [i for i in incidents if i.get("policy_name") == policy and _principal(i) == principal]
+        if signal:
+            mine = [i for i in mine if signal in (i.get("event_signals") or [])]
+        what = f"policy {policy!r}, principal {principal!r}" + (f", signal {signal}" if signal else "")
+        if mine:
+            info.append(f"{len(mine)} incident(s) of {what}")
+        else:
+            errors.append(f"no incident of {what}")
+    for i, loc in enumerate(ground_truth.get("locations", [])):
+        if loc.get("engine") != engine or not loc.get("name_contains_value"):
+            continue
+        names, parts = raw_name_parts(loc)
+        bad = sum(
+            1 for e in events for o in e.get("objects") or []
+            if isinstance(o, dict)
+            and holds_raw_name((o.get(k) for k in ("database", "schema", "object")), names, parts)
+        )
+        if bad:
+            errors.append(f"{location_label(i, loc)}: {bad} stored event object(s) hold the raw "
+                          "value-bearing name")
+    masked = sum(1 for e in events for o in e.get("objects") or []
+                 if isinstance(o, dict) and o.get("object") == "*")
+    info.append(f"event objects named '*' (masked or unknown): {masked} (informational)")
+    return errors, info
+
+
+def _load_rows(path: str, what: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise ValueError(f"{what}: not a JSON array of objects")
+    return rows
+
+
+def cmd_audit(args: argparse.Namespace, out) -> int:
+    with open(args.ground_truth, encoding="utf-8") as f:
+        gt = json.load(f)
+    events = _load_rows(args.events, "events file")
+    incidents = _load_rows(args.incidents, "incidents file")
+    errors, info = check_audit(events, incidents, gt, args.engine, args.agent_account,
+                               args.require_event, args.require_incident)
+    for line in info:
+        print(f"i2 audit: {line}", file=out)
+    for line in errors:
+        print(f"i2 audit: FAIL {line}", file=out)
+    return 1 if errors else 0
+
+
 def main(argv: list[str] | None = None, out=None) -> int:
     out = out or sys.stdout
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -631,6 +779,8 @@ def main(argv: list[str] | None = None, out=None) -> int:
         s.add_argument("--exclude", action="append", default=[],
                        help="basename glob of files to skip (repeatable)")
         s.add_argument("--label", default="files")
+        s.add_argument("--needle", action="append", default=[],
+                       help="only this needle id and its derived needles (repeatable)")
         s.add_argument("paths", nargs="+")
     f = sub.add_parser("findings")
     f.add_argument("--ground-truth", required=True)
@@ -641,6 +791,16 @@ def main(argv: list[str] | None = None, out=None) -> int:
     f.add_argument("--forbid-negative-controls", action="store_true",
                    help="fail on any finding stored on a negative-control location")
     f.add_argument("rows")
+    a = sub.add_parser("audit")
+    a.add_argument("--ground-truth", required=True)
+    a.add_argument("--engine", required=True)
+    a.add_argument("--agent-account", required=True,
+                   help="the agent's own database account: no event or incident may name it")
+    a.add_argument("--require-event", action="append", default=[], metavar="PRINCIPAL[:SIGNAL]")
+    a.add_argument("--require-incident", action="append", default=[],
+                   metavar="POLICY:PRINCIPAL[:SIGNAL]")
+    a.add_argument("--events", required=True)
+    a.add_argument("--incidents", required=True)
     g = sub.add_parser("page")
     g.add_argument("--expected-rows", type=int, default=None)
     g.add_argument("--min-sampled-rows", type=int, required=True)
@@ -653,6 +813,8 @@ def main(argv: list[str] | None = None, out=None) -> int:
             return cmd_coverage(args, out)
         if args.cmd == "page":
             return cmd_page(args, out)
+        if args.cmd == "audit":
+            return cmd_audit(args, out)
         return cmd_findings(args, out)
     except (OSError, ValueError) as e:
         # OSError / ValueError messages hold file names only, never file contents.
