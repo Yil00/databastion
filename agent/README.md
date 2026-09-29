@@ -377,9 +377,10 @@ Behavior:
 - scope: the databases and collections the account holds privileges on (`authorizedDatabases`,
   `authorizedCollections`, `nameOnly`), never `admin`, `local`, `config`, `system.*` or
   `enxcol_.*`; views are never read (their pipeline could read other collections or run
-  JavaScript); time-series collections are read with `find` only (no `count`), and need the optional
-  `system_buckets` `find` grant (reads are authorized on their bucket collections), otherwise
-  they are counted as not readable and `check()` reports `coverage.timeseries_not_readable`;
+  JavaScript); time-series collections are read through their view with `find`, `limit` and a batch of
+  `n + 1` (no `count`, and no `singleBatch`: the server's view conversion refuses it); one the
+  server refuses is counted as not readable and reported by `check()` as
+  `coverage.timeseries_not_readable` (observed in the last scan);
 - sampling: `count` (metadata) as the estimate; `$sample` of `sample_rows` documents above 20 times
   that, natural order with `limit` otherwise; per document at most 20 levels, 16 elements per
   array, 512 values; per collection 1024 normalized paths; values cut to 4096 bytes;

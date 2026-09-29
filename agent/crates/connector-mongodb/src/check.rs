@@ -51,10 +51,6 @@ pub(crate) struct Report {
     pub(crate) databases: usize,
     pub(crate) views: u64,
     pub(crate) other_kinds: u64,
-    /// Time-series collections the account cannot read (no `find` on
-    /// their bucket collections); counted only when the privileges are
-    /// known.
-    pub(crate) timeseries_unreadable: u64,
     /// Databases beyond [`MAX_CHECKED_DATABASES`], or listings cut or
     /// failed.
     pub(crate) coverage_truncated: bool,
@@ -70,7 +66,6 @@ impl Default for Report {
             databases: 0,
             views: 0,
             other_kinds: 0,
-            timeseries_unreadable: 0,
             coverage_truncated: false,
             coverage_known: true,
         }
@@ -87,12 +82,6 @@ impl Report {
         };
         if self.views > 0 {
             out.push(TargetNote::new(NoteCode::CoverageViewsNotSampled).with_count(self.views));
-        }
-        if self.timeseries_unreadable > 0 {
-            out.push(
-                TargetNote::new(NoteCode::CoverageTimeseriesNotReadable)
-                    .with_count(self.timeseries_unreadable),
-            );
         }
         out
     }
@@ -111,13 +100,6 @@ impl Report {
             out.push("coverage not evaluated (databases not listed)".to_owned());
         } else if self.databases == 0 {
             out.push("the account holds privileges on no database: nothing to scan".to_owned());
-        }
-        if self.timeseries_unreadable > 0 {
-            out.push(format!(
-                "not covered: {} time-series collection(s) not readable (no find on their \
-                 bucket collections, the optional system_buckets grant of ADR-0026)",
-                self.timeseries_unreadable
-            ));
         }
         if self.views > 0 || self.other_kinds > 0 {
             out.push(format!(
@@ -138,9 +120,33 @@ struct Cached {
 #[derive(Default)]
 pub(crate) struct CheckState {
     reports: Mutex<HashMap<String, Cached>>,
+    /// Per target: time-series collections the server refused to the
+    /// account (`Unauthorized`) in the last scan, and when.
+    timeseries_refused: Mutex<HashMap<String, (u64, Instant)>>,
 }
 
+/// How long a scan's time-series refusals are reported.
+const SCAN_OBSERVATION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
 impl CheckState {
+    /// Records what the last scan of `target_id` observed: how many
+    /// time-series collections the server refused to the account.
+    pub(crate) fn record_scan(&self, target_id: &str, timeseries_refused: u64) {
+        self.timeseries_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target_id.to_owned(), (timeseries_refused, Instant::now()));
+    }
+
+    fn timeseries_refused(&self, target_id: &str) -> u64 {
+        self.timeseries_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .filter(|(_, at)| at.elapsed() < SCAN_OBSERVATION_TTL)
+            .map_or(0, |(n, _)| *n)
+    }
+
     fn due(&self, key: &str) -> bool {
         self.reports
             .lock()
@@ -312,11 +318,6 @@ pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(session: &mut Sess
                     match c.kind {
                         CollKind::View => r.views += 1,
                         CollKind::Other => r.other_kinds += 1,
-                        CollKind::Timeseries
-                            if r.privileges_known && !r.privileges.can_read_buckets(db) =>
-                        {
-                            r.timeseries_unreadable += 1;
-                        }
                         CollKind::Collection | CollKind::Timeseries => {}
                     }
                 }
@@ -387,6 +388,23 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             detail.push("privileges not evaluated".to_owned());
             codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
         }
+    }
+    // Observed, not predicted: what the server refused in the last scan.
+    let refused = state.timeseries_refused(&target.id);
+    if refused > 0 {
+        let granted = state
+            .cached(&target.id)
+            .is_some_and(|r| r.privileges.has_bucket_grant());
+        detail.push(format!(
+            "not covered: {refused} time-series collection(s) refused to the account in the last \
+             scan{}",
+            if granted {
+                ""
+            } else {
+                " (the account holds no find on bucket collections: see ADR-0026)"
+            }
+        ));
+        codes.add(TargetNote::new(NoteCode::CoverageTimeseriesNotReadable).with_count(refused));
     }
     if !session.is_broken() {
         session.close().await;
@@ -488,6 +506,16 @@ mod tests {
         assert_eq!(h.notes[0].code(), NoteCode::CheckStageFailed);
         assert_eq!(h.notes[0].labels()[0].as_str(), "stage_auth");
         assert_eq!(h.detail.as_deref(), Some("auth failed (error 18)"));
+    }
+
+    #[test]
+    fn time_series_refusals_come_from_the_last_scan() {
+        let state = CheckState::default();
+        assert_eq!(state.timeseries_refused("t"), 0);
+        state.record_scan("t", 2);
+        assert_eq!(state.timeseries_refused("t"), 2);
+        state.record_scan("t", 0);
+        assert_eq!(state.timeseries_refused("t"), 0);
     }
 
     #[test]

@@ -193,7 +193,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "coverage.timeseries_not_readable": {
-    "description": "{count} time-series collection(s) not read: the account has no find privilege on their bucket collections (system_buckets resource).",
+    "description": "{count} time-series collection(s) refused to the agent's account in the last scan (their reads may need find on their bucket collections, system_buckets resource).",
     "engines": [
       "mongodb"
     ]
@@ -255,10 +255,11 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.not_evaluated": {
-    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped).",
+    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable).",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "privilege.other_roles": {

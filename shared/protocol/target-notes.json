@@ -189,7 +189,7 @@
     ]
   },
   "coverage.timeseries_not_readable": {
-    "description": "{count} time-series collection(s) not read: the account has no find privilege on their bucket collections (system_buckets resource).",
+    "description": "{count} time-series collection(s) refused to the agent's account in the last scan (their reads may need find on their bucket collections, system_buckets resource).",
     "engines": [
       "mongodb"
     ]

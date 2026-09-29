@@ -26,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::bson::{DocBuf, Value};
 use crate::catalog::{self, CollKind, Collection};
+use crate::check::CheckState;
 use crate::conn::{Kind, Session, Timeouts};
 use crate::error::{MgError, Stage};
 use crate::paths::{Collector, Shape, WalkStats};
@@ -239,22 +240,31 @@ where
 }
 
 /// Runs a Discovery scan of the job's target.
-pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
+pub(crate) async fn discover(
+    job: &ScanJob,
+    sink: &FindingSink,
+    state: &CheckState,
+) -> Result<(), ConnectorError> {
     let Some(target) = job.target() else {
         return Err(MgError::new(FailureCode::Internal, Stage::Connect).into_connector_error());
     };
     let timeouts = Timeouts::new(job.statement_timeout());
-    scan(job, sink, target, || Session::connect(target, timeouts)).await
+    let refused = scan(job, sink, target, || Session::connect(target, timeouts)).await?;
+    // What the server refused is reported by `check()` (observed, never
+    // predicted from the privileges).
+    state.record_scan(&target.id, refused);
+    Ok(())
 }
 
 /// The scan, with the way sessions are opened (tests use a scripted
-/// server).
+/// server). Returns how many time-series collections the server refused
+/// to the account.
 pub(crate) async fn scan<S, F, Fut>(
     job: &ScanJob,
     sink: &FindingSink,
     target: &TargetConfig,
     mut connect: F,
-) -> Result<(), ConnectorError>
+) -> Result<u64, ConnectorError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut() -> Fut,
@@ -373,12 +383,10 @@ where
                     });
                     totals.skipped += 1;
                     let reason = match (unit.kind, not_readable) {
-                        // Reads of a time-series collection are authorized
-                        // on its bucket collection (`system.buckets.*`),
-                        // which `collection: ""` does not cover.
                         (CollKind::Timeseries, true) => {
-                            "time-series collection: no find on its bucket collection \
-                             (optional system_buckets grant, ADR-0026)"
+                            totals.timeseries_refused += 1;
+                            "time-series collection refused: its reads may need find on its \
+                             bucket collection (system_buckets resource, ADR-0026)"
                         }
                         (_, true) => "no find privilege",
                         _ => "read failed",
@@ -433,11 +441,12 @@ where
         not_sampled = totals.unsupported,
         "target scanned"
     );
-    Ok(())
+    Ok(totals.timeseries_refused)
 }
 
 #[derive(Debug, Default)]
 struct Totals {
+    timeseries_refused: u64,
     sampled: u64,
     skipped: u64,
     unsupported: u64,

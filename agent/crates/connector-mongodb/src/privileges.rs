@@ -275,8 +275,14 @@ impl PrivilegeReport {
             && !self.system_collections
     }
 
-    /// Whether the account can read the time-series collections of `db`
-    /// (`find` on their bucket collections).
+    /// Whether the account holds `find` on some bucket collections (the
+    /// optional time-series grant).
+    pub(crate) fn has_bucket_grant(&self) -> bool {
+        self.bucket_find_any || !self.bucket_find.is_empty()
+    }
+
+    /// Whether the account can `find` on the bucket collections of `db`.
+    #[cfg(test)]
     pub(crate) fn can_read_buckets(&self, db: &str) -> bool {
         self.bucket_find_any || self.bucket_find.contains("") || self.bucket_find.contains(db)
     }

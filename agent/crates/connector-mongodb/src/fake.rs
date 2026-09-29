@@ -518,7 +518,7 @@ fn target() -> TargetConfig {
         .clone()
 }
 
-async fn run_scan(script: Script) -> (Result<(), ConnectorError>, Vec<MaskedFinding>, Log) {
+async fn run_scan(script: Script) -> (Result<u64, ConnectorError>, Vec<MaskedFinding>, Log) {
     let t = target();
     let job = ScanJob::new(
         ScanParams::contract_defaults(),
@@ -1010,55 +1010,39 @@ async fn seed_recall_over_the_wire() {
     );
 }
 
-/// Time-series collections are read through their bucket collections: the
-/// Discovery role alone cannot read them, and `check()` reports them;
-/// with the optional `system_buckets` grant, they are not reported.
+/// Time-series collections are read through their view (no
+/// `singleBatch`); one the server refuses is counted for `check()`.
 #[tokio::test]
-async fn unreadable_time_series_collections_are_reported() {
-    let discovery = || {
-        DocBuf::new()
-            .doc(
-                "resource",
-                DocBuf::new().str("db", "app").str("collection", ""),
-            )
-            .array_str("actions", &["find", "listCollections"])
-            .finish()
+async fn time_series_collections_are_read_or_their_refusal_counted() {
+    let metrics: Vec<Vec<u8>> = (0..10)
+        .map(|i| {
+            DocBuf::new()
+                .str("owner", &format!("metric{i}@example.net"))
+                .finish()
+        })
+        .collect();
+    let timeseries = |unauthorized| FakeColl {
+        kind: "timeseries",
+        unauthorized,
+        ..FakeColl::new("metrics", metrics.clone())
     };
-    let buckets = DocBuf::new()
-        .doc(
-            "resource",
-            DocBuf::new().str("db", "app").str("system_buckets", ""),
-        )
-        .array_str("actions", &["find"])
-        .finish();
-    for (privileges, expected) in [
-        (vec![discovery()], Some(1)),
-        (vec![discovery(), buckets], None),
-    ] {
-        let script = Script {
-            databases: vec![(
-                "app".to_owned(),
-                vec![
-                    FakeColl::new("users", Vec::new()),
-                    FakeColl {
-                        kind: "timeseries",
-                        ..FakeColl::new("metrics", Vec::new())
-                    },
-                ],
-            )],
-            privileges,
-            ..Script::default()
-        };
-        let (s, _) = session(script, PASSWORD).await;
-        let mut s = s.unwrap();
-        let r = crate::check::report(&mut s).await;
-        assert!(r.privileges.is_minimal());
-        let note = r
-            .notes()
-            .into_iter()
-            .find(|n| n.code() == databastion_core::NoteCode::CoverageTimeseriesNotReadable);
-        assert_eq!(note.and_then(|n| n.count()), expected);
-    }
+    let script = Script {
+        databases: vec![("app".to_owned(), vec![timeseries(false)])],
+        ..Script::default()
+    };
+    let (r, findings, _) = run_scan(script).await;
+    assert_eq!(r.unwrap(), 0);
+    assert!(findings.iter().any(|f| {
+        let l = f.location().unwrap();
+        l.object.as_str() == "metrics" && l.field.as_str() == "owner"
+    }));
+    let script = Script {
+        databases: vec![("app".to_owned(), vec![timeseries(true)])],
+        ..Script::default()
+    };
+    let (r, findings, _) = run_scan(script).await;
+    assert_eq!(r.unwrap(), 1);
+    assert!(findings.is_empty());
 }
 
 /// Privileges that cannot be read are reported as not evaluated (never as

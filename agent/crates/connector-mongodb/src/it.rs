@@ -675,17 +675,15 @@ async fn probes() {
     };
     assert!(has("people", "email"), "{found:?}");
     assert!(has("nested", "profile.contacts[].mail"), "{found:?}");
-    // MongoDB authorizes reads of a time-series collection on its bucket
-    // collection (`system.buckets.metrics`), which `collection: ""` does not
-    // cover: the minimal role cannot read it, and the scan says so.
-    assert!(!found.iter().any(|k| k.1 == "metrics"), "{found:?}");
+    // The time-series collection is read through its view (a `find`
+    // without `singleBatch`, which the server's view conversion refuses).
     let text = logs.text();
-    let metrics_lines: Vec<&str> = text.lines().filter(|l| l.contains("metrics")).collect();
     assert!(
-        metrics_lines
-            .iter()
-            .any(|l| l.contains("no find on its bucket collection") && l.contains("server_code=13")),
-        "the time-series collection is not reported as not readable: {metrics_lines:?}"
+        has("metrics", "owner"),
+        "{found:?}\n{:?}",
+        text.lines()
+            .filter(|l| l.contains("metrics"))
+            .collect::<Vec<_>>()
     );
     // The deep value is beyond the walk bound; the view is never read.
     assert!(!found.iter().any(|k| k.1 == "deep"), "{found:?}");
@@ -761,24 +759,34 @@ async fn probes() {
             code.as_str()
         );
     }
-    // The minimal role is not; its unreadable time-series collection is
-    // reported as not covered.
+    // The minimal role is not, and after a scan that read the time-series
+    // collection nothing is reported as refused (the same connector
+    // instance scans and checks).
     let (_dir, t) = target(&url, MIN_USER, IT_PASSWORD, "admin");
-    let h = MongodbConnector::new().check(&t).await;
+    let connector = MongodbConnector::new();
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &t,
+        &Limits::default(),
+        key(),
+    );
+    let (sink, mut rx) = FindingSink::channel(100_000);
+    connector.discover(&job, &sink).await.unwrap();
+    drop(sink);
+    while rx.recv().await.is_some() {}
+    let h = connector.check(&t).await;
+    assert!(
+        !codes(&h.notes).contains(&NoteCode::CoverageTimeseriesNotReadable.as_str()),
+        "{:?}",
+        h.notes
+    );
     assert!(
         codes(&h.notes).iter().all(|c| !c.starts_with("privilege.")),
         "{:?}",
         h.notes
     );
-    let ts = h
-        .notes
-        .iter()
-        .find(|n| n.code() == NoteCode::CoverageTimeseriesNotReadable);
-    assert_eq!(ts.and_then(TargetNote::count), Some(1), "{:?}", h.notes);
-
-    // With the optional time-series grant, the time-series collection is
-    // read (through its view, `find` with a limit) and is no longer
-    // reported; the grant is not over-privilege.
+    // The optional time-series grant (find on the bucket collections) is
+    // not reported as over-privilege.
     let (_dir, t) = target(&url, BUCKETS_USER, IT_PASSWORD, "admin");
     let (r, findings) = scan(&t).await;
     r.unwrap();
