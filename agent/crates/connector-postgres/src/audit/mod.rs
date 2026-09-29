@@ -34,6 +34,7 @@ use crate::conn::Timeouts;
 use crate::error::{PgError, Stage};
 use databastion_core::audit::own::OwnAccount;
 use databastion_core::audit::tail::{self, TailError, Tailer};
+use events::PgOwn;
 use records::{AuditRecord, Format, Skip, parse_record_checked};
 
 /// Name of the pgaudit cursor in the core's cursor store.
@@ -87,14 +88,15 @@ fn own_account(
     target: &TargetConfig,
     pre: &check::Prerequisites,
     state: &CheckState,
-) -> OwnAccount {
-    OwnAccount::new(
+) -> PgOwn {
+    let core = OwnAccount::new(
         &target.account,
         Some(crate::conn::APPLICATION_NAME),
         pre.own_addr,
         u64::from(cfg.max_sample_rows()),
         state.own_usage(&target.id),
-    )
+    );
+    PgOwn::new(core, state.own_statements(&target.id))
 }
 
 /// State kept across source re-evaluations.
@@ -147,6 +149,7 @@ pub(crate) async fn audit_stream(
                         })
                     }
                 };
+                st.builder.set_catalogs(pre.catalogs.clone());
                 if let Err(kind) = pgaudit_run(cfg, target, sink, state, st, &pre.severity).await? {
                     tracing::warn!(
                         target_id = %target.id,
@@ -168,6 +171,7 @@ pub(crate) async fn audit_stream(
                     pss_session = Some(conn);
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
+                    poller.set_catalogs(pre.catalogs.clone());
                     pss_run(cfg, target, sink, session, poller, timeouts).await?;
                 }
             }

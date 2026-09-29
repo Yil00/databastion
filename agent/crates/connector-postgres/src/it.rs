@@ -992,9 +992,25 @@ async fn adr_0012_probes() {
             Some(true),
             "pgaudit.log not readable: {probe:?}"
         );
+        assert!(!probe.pgaudit_placeholders, "{probe:?}");
         eprintln!("pgaudit loaded; pgaudit.log readable without pg_read_all_settings");
     } else {
         assert_eq!(probe.pgaudit_loaded, Some(false));
+        // A `pgaudit.log` value without the library (a placeholder) is
+        // not taken for a loaded pgaudit.
+        a.batch_execute(&format!(
+            "ALTER DATABASE {PROBE_DB} SET pgaudit.log = 'read'"
+        ))
+        .await
+        .unwrap();
+        let session = Session::connect(&t, PROBE_DB, timeouts).await.unwrap();
+        let probe = crate::check::audit_probe(&session, timeouts).await;
+        a.batch_execute(&format!("ALTER DATABASE {PROBE_DB} RESET pgaudit.log"))
+            .await
+            .unwrap();
+        let probe = probe.unwrap();
+        assert_eq!(probe.pgaudit_loaded, Some(false), "{probe:?}");
+        assert!(probe.pgaudit_placeholders, "{probe:?}");
         skip(
             "pgaudit",
             "pgaudit is not loaded on this server (pgaudit.log probe)",
@@ -1638,6 +1654,11 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
     let (task, mut rx) = start_audit(&t, &state.0);
     // First poll: baseline.
     tokio::time::sleep(Duration::from_millis(2500)).await;
+    // A Discovery scan of the agent's own account: its per-transaction
+    // `set_config` calls and the stream's own text query are never
+    // events, nor charged to `*`.
+    let (discovery, _) = scan(&t, ScanParams::contract_defaults()).await;
+    discovery.unwrap();
     simulated_pg_dump(&adm).await;
     let a = admin(&adm, &adm.dbname).await;
     a.query(
@@ -1653,6 +1674,11 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
     .await;
     task.abort();
     let all: Vec<String> = events.iter().map(describe).collect();
+    assert!(
+        !all.iter()
+            .any(|d| d.contains(&format!("user={} ", u.user)) && d.contains("..*")),
+        "the agent's own table-less statements: {all:#?}"
+    );
     assert!(has(&events, "customers", "signature.pg_dump"), "{all:#?}");
     assert!(
         has(&events, "customers", "shape.full_table_copy"),

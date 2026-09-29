@@ -354,19 +354,42 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
     ))
 }
 
-/// pgaudit settings of this session's database (`NULL` when pgaudit is not
-/// loaded): `pgaudit.log`, `pgaudit.log_rows`, `pgaudit.role`,
-/// `pgaudit.log_level`. Settings,
-/// not data; readable without `pg_read_all_settings` (verified in P2-B).
+/// pgaudit settings of this session's database: `pgaudit.log`,
+/// `pgaudit.log_rows`, `pgaudit.role`, `pgaudit.log_level` (`NULL` when
+/// not set), whether the pgaudit library is loaded, and
+/// `pgaudit.log_catalog`. Settings, not
+/// data; readable without `pg_read_all_settings` (verified in P2-B).
+///
+/// A `pgaudit.*` value alone does not prove the library is loaded: set in
+/// `postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` without the library
+/// in `shared_preload_libraries`, it is a placeholder that
+/// `current_setting` still returns. `shared_preload_libraries` itself is
+/// not readable without `pg_read_all_settings`. `pg_settings` (readable by
+/// every role) hides placeholders and shows a string type for them; the
+/// library defines `pgaudit.log_catalog` as a boolean: that row is the
+/// proof.
 pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.log', true), \
        pg_catalog.current_setting('pgaudit.log_rows', true), \
        pg_catalog.current_setting('pgaudit.role', true), \
-       pg_catalog.current_setting('pgaudit.log_level', true)";
+       pg_catalog.current_setting('pgaudit.log_level', true), \
+       EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
+               WHERE s.name = 'pgaudit.log_catalog' AND s.vartype = 'bool'), \
+       pg_catalog.current_setting('pgaudit.log_catalog', true)";
 
 /// Client address the server sees for this session (`NULL` on a Unix
 /// socket): tells the agent's own statements apart in the audit log.
 pub(crate) const OWN_CLIENT_ADDR: &str = "SELECT pg_catalog.host(pg_catalog.inet_client_addr())";
+
+/// The connector's statements that name no relation. They call
+/// `pg_catalog` functions only, with bound parameters, and read no row of
+/// any relation: `pg_catalog.set_config`, `pg_catalog.current_setting`,
+/// `pg_catalog.inet_client_addr`, `pg_catalog.host`. The Audit stream
+/// leaves them out for the agent's own account without charging its row
+/// budget (`audit::events::PgOwn`), matched by exact text (pgaudit)
+/// or normalized shape (`pg_stat_statements`). A unit test checks that
+/// every other statement of this module names a relation.
+pub(crate) const OWN_TABLELESS: [&str; 3] = [SESSION_SETUP, SET_LOCAL_TIMEOUTS, OWN_CLIENT_ADDR];
 
 /// Schema of the `pg_stat_statements(boolean)` function, if it is a member
 /// of the `pg_stat_statements` extension in its own schema (obligation 3).
@@ -419,6 +442,40 @@ pub(crate) fn pss_texts(schema: &str, toplevel: bool) -> Option<String> {
     ))
 }
 
+/// Every statement text of this module (tests).
+#[cfg(test)]
+pub(crate) fn all_statements() -> Vec<String> {
+    vec![
+        SESSION_SETUP.to_owned(),
+        BEGIN.to_owned(),
+        COMMIT.to_owned(),
+        ROLLBACK.to_owned(),
+        SET_LOCAL_TIMEOUTS.to_owned(),
+        INTROSPECT.to_owned(),
+        POLICY_TREES.to_owned(),
+        POLICY_REFS_REJECTED.to_owned(),
+        COLUMNS.to_owned(),
+        ROLE_ATTRIBUTES.to_owned(),
+        MEMBERSHIPS.to_owned(),
+        write_privileges(true),
+        write_privileges(false),
+        OWNERSHIP.to_owned(),
+        LOGIN_EVENT_TRIGGERS.to_owned(),
+        SCHEMAS_WITHOUT_USAGE.to_owned(),
+        AUDIT_PREREQUISITES.to_owned(),
+        pss_probe("public").unwrap(),
+        PGAUDIT_SETTINGS.to_owned(),
+        OWN_CLIENT_ADDR.to_owned(),
+        PSS_FUNCTION_SCHEMA.to_owned(),
+        pss_counters("public", true).unwrap(),
+        pss_counters("public", false).unwrap(),
+        pss_texts("public", true).unwrap(),
+        pss_texts("public", false).unwrap(),
+        sample_statement("s", "t", &["c"], true).unwrap(),
+        sample_statement("s", "t", &["c"], false).unwrap(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,36 +512,6 @@ mod tests {
             "SELECT \"email\" FROM ONLY \"crm\".\"customers\" LIMIT $1"
         );
         assert!(sample_statement("crm", "t", &[], false).is_none());
-    }
-
-    fn all_statements() -> Vec<String> {
-        vec![
-            SESSION_SETUP.to_owned(),
-            BEGIN.to_owned(),
-            COMMIT.to_owned(),
-            ROLLBACK.to_owned(),
-            SET_LOCAL_TIMEOUTS.to_owned(),
-            INTROSPECT.to_owned(),
-            POLICY_TREES.to_owned(),
-            POLICY_REFS_REJECTED.to_owned(),
-            COLUMNS.to_owned(),
-            ROLE_ATTRIBUTES.to_owned(),
-            MEMBERSHIPS.to_owned(),
-            write_privileges(true),
-            write_privileges(false),
-            OWNERSHIP.to_owned(),
-            LOGIN_EVENT_TRIGGERS.to_owned(),
-            SCHEMAS_WITHOUT_USAGE.to_owned(),
-            AUDIT_PREREQUISITES.to_owned(),
-            pss_probe("public").unwrap(),
-            PGAUDIT_SETTINGS.to_owned(),
-            OWN_CLIENT_ADDR.to_owned(),
-            PSS_FUNCTION_SCHEMA.to_owned(),
-            pss_counters("public", true).unwrap(),
-            pss_counters("public", false).unwrap(),
-            pss_texts("public", true).unwrap(),
-            sample_statement("s", "t", &["c"], true).unwrap(),
-        ]
     }
 
     #[test]
@@ -533,6 +560,43 @@ mod tests {
             assert!(!upper.contains("READ WRITE"), "{s}");
             assert!(!upper.contains("REPEATABLE READ"), "{s}");
             assert!(!upper.contains("SERIALIZABLE"), "{s}");
+        }
+    }
+
+    #[test]
+    fn only_the_own_tableless_statements_name_no_relation() {
+        use databastion_classifiers::query::{AnalyzeOptions, StatementKind, analyze};
+        for s in all_statements() {
+            let a = analyze(&s, AnalyzeOptions::new());
+            let named = a.parts().iter().any(|p| !p.relations.is_empty());
+            let utility = a.kind() == StatementKind::Other;
+            // The `pg_stat_statements` text query reads the extension's
+            // function: registered by its stream (`audit::pss`).
+            let own =
+                OWN_TABLELESS.contains(&s.as_str()) || s.contains(".pg_stat_statements(true)");
+            assert!(
+                named || utility || own,
+                "table-less statement not listed: {s}"
+            );
+            if OWN_TABLELESS.contains(&s.as_str()) {
+                assert!(!named, "listed but names a relation: {s}");
+                assert_eq!(a.kind(), StatementKind::Select, "{s}");
+                assert_eq!(a.statements(), 1, "{s}");
+                assert!(a.normalized().is_some(), "{s}");
+            }
+        }
+        // Every call in them is a `pg_catalog` function.
+        for s in OWN_TABLELESS {
+            let b = s.as_bytes();
+            for (i, _) in s.match_indices('(') {
+                let mut j = i;
+                while j > 0 && (b[j - 1].is_ascii_alphanumeric() || b[j - 1] == b'_') {
+                    j -= 1;
+                }
+                if j < i {
+                    assert!(s[..j].ends_with("pg_catalog."), "{}", &s[j..i]);
+                }
+            }
         }
     }
 

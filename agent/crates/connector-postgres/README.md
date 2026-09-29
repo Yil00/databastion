@@ -18,6 +18,25 @@ documentation (docs/08) builds on.
 The source is re-evaluated every 5 minutes. `volume.large_result` on the
 pgaudit source needs `pgaudit.log_rows = on`.
 
+"pgaudit loaded" is proven, not assumed: a `pgaudit.*` value set in
+`postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` without pgaudit in
+`shared_preload_libraries` is a placeholder that `current_setting()` still
+returns. `shared_preload_libraries` is not readable without
+`pg_read_all_settings`, so the probe requires the library's own
+`pgaudit.log_catalog` setting, typed `bool`, in `pg_settings` (which hides
+placeholders). Settings without the library give no pgaudit level (at best
+Limited), with the note "pgaudit settings are set but the pgaudit library
+is not loaded".
+
+The proof, like every setting the probe reads, reflects **the agent's own
+session** in each monitored database. A library loaded for some roles or
+databases only (`session_preload_libraries`, `ALTER ROLE … SET
+session_preload_libraries`, `LOAD`) or `pgaudit.*` values set per role
+(`ALTER ROLE … SET pgaudit.log`) may differ for other roles: the level
+says what holds for the agent's session, not that every role is audited
+alike. pgaudit itself requires `shared_preload_libraries` (it refuses to
+load otherwise), so a server-wide load is the normal case.
+
 ## Known limits
 
 - **At-most-once delivery.** The log cursor advances once the events are
@@ -44,7 +63,42 @@ pgaudit source needs `pgaudit.log_rows = on`.
   client, so it is a server-side export (file or program).
 - **Objects not named by the log** (function or procedure bodies without
   `pgaudit.log_relation`, text that does not parse) are reported as `*` in
-  the database, never dropped.
+  the database, never dropped. Relations named by pgaudit itself
+  (`pgaudit.log_catalog`, `log_relation`) are skipped when they are
+  catalogs, like catalogs named by the text.
+- **What counts as a catalog.** Relations in `pg_catalog`,
+  `information_schema`, `pg_toast` and the temporary schemas; and the two
+  relations of the `pg_stat_statements` extension
+  (`pg_stat_statements`, `pg_stat_statements_info`) **only in the
+  extension's schema** of that database, as probed from the agent's
+  session (a `pg_stat_statements_x` or a `pg_stat_statements` in another
+  schema is application data: any role with `CREATE` can make one). A
+  database the target does not list has no known extension schema. An
+  **unqualified** `pg_*` name (the text does not tell its schema):
+  - pgaudit with `pgaudit.log_catalog = off` (as the agent's session sees
+    it): statements on catalogs only are not logged, so an unqualified
+    `pg_*` name in a logged record without object name is a catalog only
+    when pgaudit names it in `pg_catalog` for the same statement;
+    otherwise it is reported as a relation without schema.
+  - pgaudit with `log_catalog` on (the pgaudit default) or unknown, and
+    `pg_stat_statements` (which names no object): it counts as a catalog.
+    **Residual:** a role that can create a relation named `pg_*` in a
+    schema of its search path (`CREATE TABLE public.pg_loot AS SELECT …`)
+    and reads it later by its unqualified name is not reported for that
+    later read (the copy itself reads the source relation and is
+    reported). With pgaudit, `pgaudit.log_relation = on` names every
+    relation with its schema and closes this; so does `log_catalog = off`.
+    An unqualified `pg_stat_statements` / `pg_stat_statements_info` counts
+    as a catalog when the extension is installed in the database (the same
+    residual for a shadowing relation earlier in the search path).
+- **`pgaudit.log_statement_once = on`.** Only the first record of a
+  statement and substatement carries the text; later ones carry
+  `<previously logged>`. The connector analyzes those with the first
+  record's text of the same substatement when it read it; when it did not
+  (the first record fell before the cursor, or in another read), the text
+  does not parse and the record's objects are unknown (`*`, fail safe).
+  Signals computed from the text then come from the records whose text is
+  known.
 - **The agent's own account.** Its statements are left out only when all
   hold: they come from its `application_name` (`databastion-agent`, pgaudit
   only) and from its own client address as the server sees it
@@ -67,6 +121,37 @@ pgaudit source needs `pgaudit.log_rows = on`.
   does not reset them, but an **agent restart** does (they are not
   persisted), which gives a fresh budget per object. The agent's
   database credentials never leave its host (I3).
+- **The agent's own table-less statements.** The connector sends a few
+  statements that read no relation: the per-connection and
+  per-transaction `pg_catalog.set_config(…)` / `current_setting(…)`
+  (`SESSION_SETUP`, `SET_LOCAL_TIMEOUTS`: one per transaction, about 90 per
+  Discovery scan), `pg_catalog.host(pg_catalog.inet_client_addr())`, and,
+  in `pg_stat_statements` mode, its text query through the extension's
+  `pg_stat_statements(true)` function. They are a closed list
+  (`sql::OWN_TABLELESS`, plus the text query registered by the stream; a
+  unit test fails on any other connector statement that names no
+  relation). Such a statement of the agent's account is left out on the
+  same identity and signal rules as above, and is **not charged** to any
+  row budget; it is never reported. It is recognized by its exact text with
+  pgaudit (pgaudit logs the text as sent; bound parameter values are not
+  part of it) and by its normalized shape with `pg_stat_statements`
+  (constants, booleans included, are placeholders there). Anything else of
+  the agent's account whose objects are unknown (`*`: any other function
+  call, including `pg_catalog` ones that run SQL such as `query_to_xml`,
+  text that does not parse, several statements) is **always reported** and
+  never budgeted, so no traffic can use up a `*` budget. The same
+  statements from any other role, or from the agent's account under
+  another application or address, are reported against `*` as before.
+  Residuals: someone holding the agent's credentials who passes the
+  identity checks can run these exact statements unreported; they read no
+  row of any relation (`set_config` changes their own session only;
+  `current_setting` reads settings the role may read; the text query
+  returns statement texts, as a read of the view `pg_stat_statements`
+  does, which is skipped as statistics for every role). With
+  `pg_stat_statements`, where only the shape is visible, the settings read
+  by `current_setting(…)` are not checked. The text query is recognized in
+  pgaudit records written during a `pg_stat_statements` period only if the
+  agent did not restart in between.
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.
 - **`pg_stat_statements` mode** sees no client address, application name,

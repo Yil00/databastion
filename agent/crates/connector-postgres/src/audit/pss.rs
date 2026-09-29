@@ -27,9 +27,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use databastion_core::audit::own::OwnAccount;
-
-use super::events::{StatementDelta, analyze_pss, pss_events};
+use super::events::{Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -53,7 +51,8 @@ struct Counters {
 pub(crate) struct PssPoller {
     schema: String,
     toplevel: bool,
-    own: OwnAccount,
+    own: PgOwn,
+    catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
     analyses: HashMap<Key, QueryAnalysis>,
     last_poll: SystemTime,
@@ -64,7 +63,7 @@ pub(crate) struct PssPoller {
 pub(crate) async fn connect(
     target: &TargetConfig,
     timeouts: Timeouts,
-    own: OwnAccount,
+    own: PgOwn,
 ) -> Result<(Session, PssPoller), PgError> {
     let mut own = Some(own);
     let settings = target.postgres_settings();
@@ -101,14 +100,23 @@ pub(crate) async fn connect(
             continue;
         };
         let toplevel = session.server_version_num() >= 140_000;
+        let mut own = own
+            .take()
+            .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
+        // The text query reads `pg_stat_statements` through the
+        // extension's function (no relation named): one of the
+        // connector's own statements, like the view `pg_stat_statements*`
+        // skipped as statistics for every role.
+        let texts_sql = sql::pss_texts(&schema, toplevel)
+            .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
+        own.allow_statement(&texts_sql);
         return Ok((
             session,
             PssPoller {
                 schema,
                 toplevel,
-                own: own
-                    .take()
-                    .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?,
+                own,
+                catalogs: Catalogs::default(),
                 snapshot: None,
                 analyses: HashMap::new(),
                 last_poll: SystemTime::now(),
@@ -133,6 +141,11 @@ fn delta(now: Counters, prev: Option<Counters>, first: bool) -> Option<(u64, u64
 }
 
 impl PssPoller {
+    /// Sets the per-database catalog facts (re-probed with the source).
+    pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
+        self.catalogs = catalogs;
+    }
+
     /// One poll: reads the counters, fetches the texts of new statements,
     /// submits the events of the deltas.
     pub(crate) async fn poll(
@@ -238,7 +251,7 @@ impl PssPoller {
                 })
             })
             .collect();
-        let events = pss_events(&deltas, &mut self.own, self.last_poll, now);
+        let events = pss_events(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
         drop(deltas);
         self.snapshot = Some(snapshot);
         self.last_poll = now;
