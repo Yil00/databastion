@@ -26,7 +26,7 @@ use databastion_classifiers::id::ClassifierId;
 use databastion_classifiers::masking::{HmacKey, MaskedFinding};
 use databastion_core::config::{Limits, TargetConfig};
 use databastion_core::{
-    AuditLevel, Connector, ConnectorError, FailureCode, FindingSink, ScanJob, ScanParams,
+    AuditLevel, Connector, ConnectorError, FailureCode, FindingSink, NoteCode, ScanJob, ScanParams,
 };
 use tokio_postgres::NoTls;
 
@@ -285,6 +285,17 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
     assert!(health.audit_level <= AuditLevel::Limited, "{health:?}");
     let detail = health.detail.unwrap();
     assert!(!detail.contains("over-privileged"), "{detail}");
+    // The same as closed notes: no privilege note for the minimal variant,
+    // and every code registered for postgres.
+    assert!(
+        !health
+            .notes
+            .iter()
+            .any(|n| n.code().as_str().starts_with("privilege.")),
+        "{:?}",
+        health.notes
+    );
+    assert_registered_notes(&health.notes);
     eprintln!("check: {:?}; {detail}", health.audit_level);
 
     // Wrong password: authentication_failed, no server text.
@@ -292,7 +303,33 @@ async fn check_reports_reachable_with_an_honest_audit_level() {
     let health = PostgresConnector::new().check(&bad).await;
     assert!(!health.reachable);
     assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+    assert_eq!(health.notes.len(), 1, "{:?}", health.notes);
+    assert_eq!(health.notes[0].code(), NoteCode::CheckStageFailed);
+    assert!(!health.notes[0].labels()[0].is_other());
     assert!(!health.detail.unwrap().contains("password"));
+}
+
+/// Every note is registered for `postgres` in the contract registry.
+fn assert_registered_notes(notes: &[databastion_core::TargetNote]) {
+    let registry: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/target-notes.json"
+    ))
+    .unwrap();
+    for n in notes {
+        let engines = registry[n.code().as_str()]["engines"].as_array();
+        assert!(
+            engines.is_some_and(|e| e.iter().any(|x| x == "postgres")),
+            "{} not registered for postgres",
+            n.code().as_str()
+        );
+    }
+}
+
+fn note(notes: &[databastion_core::TargetNote], code: NoteCode) -> &databastion_core::TargetNote {
+    notes
+        .iter()
+        .find(|n| n.code() == code)
+        .unwrap_or_else(|| panic!("no {} note: {notes:?}", code.as_str()))
 }
 
 #[tokio::test]
@@ -974,6 +1011,14 @@ async fn adr_0012_probes() {
             && detail.contains("5 relation(s) skipped for row-level security"),
         "{detail}"
     );
+    assert_registered_notes(&health.notes);
+    for (code, count) in [
+        (NoteCode::CoverageSchemasWithoutUsage, 1),
+        (NoteCode::CoverageRelationsWithoutSelect, 1),
+        (NoteCode::CoverageRelationsRlsSkipped, 5),
+    ] {
+        assert_eq!(note(&health.notes, code).count(), Some(count));
+    }
     assert!(logs.text().contains("probe_hidden"));
 
     // pgaudit (dev image): is `pgaudit.log` readable without
@@ -1038,6 +1083,13 @@ async fn extended_variant_leaks_no_catalog_marker() {
     let detail = health.detail.clone().unwrap();
     assert!(detail.contains("extended variant"), "{detail}");
     assert!(!detail.contains("over-privileged"), "{detail}");
+    assert_registered_notes(&health.notes);
+    assert!(
+        note(&health.notes, NoteCode::PrivilegeExtendedVariant)
+            .labels()
+            .iter()
+            .any(|l| l.as_str() == "pg_read_all_data")
+    );
     // pg_read_all_data reads every schema, never a system one.
     let found = located(&findings);
     assert!(found.iter().any(|k| k.0 == "probe_hidden"));
@@ -1054,6 +1106,12 @@ async fn extended_variant_leaks_no_catalog_marker() {
     // Same role without the flag: reported as over-privileged.
     let (_dir, t) = target(&u, EXT_ROLE, EXT_PASSWORD, PROBE_DB, false);
     let health = PostgresConnector::new().check(&t).await;
+    assert!(
+        note(&health.notes, NoteCode::PrivilegePredefinedRoles)
+            .labels()
+            .iter()
+            .any(|l| l.as_str() == "pg_read_all_data")
+    );
     let detail = health.detail.unwrap();
     assert!(
         detail.contains("over-privileged") && detail.contains("pg_read_all_data"),

@@ -17,7 +17,7 @@
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FindingSink, ScanJob};
+use databastion_core::{ConnectorError, FindingSink, ScanCoverage, ScanJob};
 use futures_util::StreamExt;
 use tokio_postgres::types::Type;
 
@@ -103,6 +103,7 @@ async fn scan_database(
         job.includes_schema(schema) && job.includes_object(name)
     });
     log_coverage(target, &db_name, &coverage);
+    sink.add_coverage(planned_coverage(&coverage));
     let mut skipped = 0usize;
     for unit in &units {
         let current = match session.take() {
@@ -127,6 +128,10 @@ async fn scan_database(
             Ok(s) => s,
             Err(e) if !e.fatal => {
                 skipped += 1;
+                sink.add_coverage(ScanCoverage {
+                    error: 1,
+                    ..ScanCoverage::default()
+                });
                 tracing::warn!(
                     target_id = %target.id,
                     database = db_name.as_str(),
@@ -140,6 +145,10 @@ async fn scan_database(
             }
             Err(e) => return Err(fail(target, &db_name, e)),
         };
+        sink.add_coverage(ScanCoverage {
+            sampled: 1,
+            ..ScanCoverage::default()
+        });
         if unit.rls {
             // Obligation 2: sampled under row-level security.
             tracing::info!(
@@ -176,6 +185,19 @@ async fn scan_database(
         "database scanned"
     );
     Ok(())
+}
+
+/// The objects of a database's scope skipped by the plan, as coverage
+/// counters (`JobProgress` `skipped_*`): foreign tables are remote (never
+/// read, I5), partition leaves over the per-root cap a connector bound.
+pub(crate) fn planned_coverage(c: &Coverage) -> ScanCoverage {
+    ScanCoverage {
+        not_readable: c.not_readable.len() as u64,
+        row_level_security: (c.rls_policy.len() + c.rls_ancestor.len()) as u64,
+        remote: c.foreign as u64,
+        limit: c.leaves_over_limit as u64,
+        ..ScanCoverage::default()
+    }
 }
 
 fn log_coverage(target: &TargetConfig, db: &NormalizedName, c: &Coverage) {
@@ -423,6 +445,34 @@ async fn read_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_coverage_counts_each_skip_reason() {
+        let pair = || ("s".to_owned(), "t".to_owned());
+        let c = Coverage {
+            not_readable: vec![pair(); 2],
+            rls_policy: vec![pair(); 3],
+            rls_ancestor: vec![pair()],
+            foreign: 4,
+            leaves_over_limit: 5,
+        };
+        assert_eq!(
+            planned_coverage(&c),
+            ScanCoverage {
+                sampled: 0,
+                not_readable: 2,
+                row_level_security: 4,
+                remote: 4,
+                unsupported: 0,
+                limit: 5,
+                error: 0,
+            }
+        );
+        assert_eq!(
+            planned_coverage(&Coverage::default()),
+            ScanCoverage::default()
+        );
+    }
 
     #[test]
     fn value_bearing_names_are_normalized() {

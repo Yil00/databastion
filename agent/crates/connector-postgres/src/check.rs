@@ -33,6 +33,13 @@
 //! The detailed report (privileges, coverage) is recomputed at most every
 //! [`REPORT_INTERVAL`] per database and logged when it changes; the
 //! reachability and the audit level are checked on every call.
+//!
+//! Every explanation is also reported as a closed note
+//! (`TargetHealth::notes`, `shared/protocol/target-notes.json`): a code, a
+//! count and closed labels, never a name or any other text from the
+//! server. Notes of several databases are merged per code: counts of
+//! per-database facts (relations, schemas, owned objects) are added up,
+//! cluster-wide facts (role attributes and memberships) are kept once.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -40,7 +47,9 @@ use std::time::{Duration, Instant};
 
 use databastion_classifiers::masking::EventSource;
 use databastion_core::config::TargetConfig;
-use databastion_core::{AuditLevel, FailureCode, TargetHealth};
+use databastion_core::{
+    AuditLevel, CountMerge, FailureCode, NoteCode, NoteLabel, Notes, TargetHealth, TargetNote,
+};
 
 use crate::catalog;
 use crate::conn::{Session, Timeouts};
@@ -121,6 +130,8 @@ pub(crate) struct Report {
     pub(crate) over_privileged: Vec<String>,
     /// Expected with the extended-variant flag.
     pub(crate) expected: Vec<String>,
+    /// The same privileges as closed notes.
+    pub(crate) privilege_notes: Vec<TargetNote>,
     pub(crate) schemas_not_covered: Vec<String>,
     pub(crate) coverage: catalog::Coverage,
     pub(crate) login_event_trigger: bool,
@@ -136,17 +147,18 @@ pub(crate) struct RoleAttributes {
     pub(crate) createdb: bool,
 }
 
-/// Evaluates over-privilege (obligation 6). Returns (over-privileged,
-/// expected) labels.
+/// Evaluates over-privilege (obligation 6). Returns the over-privileged
+/// and expected labels (logs), and the same as closed notes.
 pub(crate) fn evaluate_privileges(
     attrs: RoleAttributes,
     memberships: &[(String, bool)],
     write_relations: i64,
     owned_objects: i64,
     extended: bool,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<TargetNote>) {
     let mut over = Vec::new();
     let mut expected = Vec::new();
+    let mut attributes = Vec::new();
     for (flag, label) in [
         (attrs.superuser, "superuser"),
         (attrs.bypassrls, "bypassrls"),
@@ -156,32 +168,101 @@ pub(crate) fn evaluate_privileges(
     ] {
         if flag {
             over.push(label.to_owned());
+            attributes.push(NoteLabel::parse(label));
         }
     }
+    let mut predefined_over = Vec::new();
+    let mut predefined_expected = Vec::new();
     let mut other_roles = 0usize;
     for (name, predefined) in memberships {
         match (name.as_str(), predefined) {
             ("pg_read_all_stats", true) => {}
             ("pg_read_all_data" | "pg_read_all_settings", true) if extended => {
                 expected.push(format!("member of {name}"));
+                predefined_expected.push(NoteLabel::parse(name));
             }
-            // Predefined role names are PostgreSQL constants.
+            // Predefined role names are PostgreSQL constants; one this
+            // build does not know is the label `other`.
             (_, true) if name.starts_with("pg_") && name.len() <= 64 => {
                 over.push(format!("member of {name}"));
+                predefined_over.push(NoteLabel::parse(name));
             }
             _ => other_roles += 1,
         }
     }
+    let mut notes = Vec::new();
+    if !attributes.is_empty() {
+        notes.push(TargetNote::new(NoteCode::PrivilegeRoleAttributes).with_labels(attributes));
+    }
+    if !predefined_over.is_empty() {
+        notes
+            .push(TargetNote::new(NoteCode::PrivilegePredefinedRoles).with_labels(predefined_over));
+    }
+    if !predefined_expected.is_empty() {
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeExtendedVariant).with_labels(predefined_expected),
+        );
+    }
     if other_roles > 0 {
         over.push(format!("member of {other_roles} non-predefined role(s)"));
+        notes.push(TargetNote::new(NoteCode::PrivilegeOtherRoles).with_count(other_roles as u64));
     }
     if write_relations > 0 {
         over.push(format!("write privilege on {write_relations} relation(s)"));
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeWriteOnRelations)
+                .with_count(write_relations.unsigned_abs()),
+        );
     }
     if owned_objects > 0 {
         over.push(format!("owner of {owned_objects} object(s)"));
+        notes.push(
+            TargetNote::new(NoteCode::PrivilegeOwnerOfObjects)
+                .with_count(owned_objects.unsigned_abs()),
+        );
     }
-    (over, expected)
+    (over, expected, notes)
+}
+
+/// Notes of one database's report, merged into `notes`: per-database
+/// counts are added up, cluster-wide facts kept once.
+fn report_notes(r: &Report, notes: &mut Notes) {
+    for n in &r.privilege_notes {
+        let how = match n.code() {
+            NoteCode::PrivilegeWriteOnRelations | NoteCode::PrivilegeOwnerOfObjects => {
+                CountMerge::Sum
+            }
+            _ => CountMerge::Max,
+        };
+        notes.merge(n.clone(), how);
+    }
+    let c = &r.coverage;
+    for (code, n) in [
+        (
+            NoteCode::CoverageSchemasWithoutUsage,
+            r.schemas_not_covered.len(),
+        ),
+        (
+            NoteCode::CoverageRelationsWithoutSelect,
+            c.not_readable.len(),
+        ),
+        (
+            NoteCode::CoverageRelationsRlsSkipped,
+            c.rls_policy.len() + c.rls_ancestor.len(),
+        ),
+    ] {
+        if n > 0 {
+            notes.merge(TargetNote::new(code).with_count(n as u64), CountMerge::Sum);
+        }
+    }
+    if r.login_event_trigger {
+        notes.add(TargetNote::new(NoteCode::SecurityLoginEventTrigger));
+    }
+}
+
+/// The note of an unreachable target: the stage that failed.
+fn stage_note(stage: Stage) -> TargetNote {
+    TargetNote::new(NoteCode::CheckStageFailed).with_labels([NoteLabel::stage(stage.as_str())])
 }
 
 struct Cached {
@@ -200,6 +281,9 @@ pub(crate) struct CheckState {
     /// Per target: records dropped for their severity, and when the
     /// count started (reported for 24 h, then reset).
     severity_mismatches: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Per target: records dropped as oversized or damaged (an `AUDIT`
+    /// record with an error context), and when the count started.
+    dropped: Mutex<HashMap<String, (u64, Instant)>>,
     /// Per target: the agent's own reads, shared by every Audit stream of
     /// the target (see `databastion_core::audit::own::OwnUsage`).
     own_usage: Mutex<HashMap<String, databastion_core::audit::own::SharedOwnUsage>>,
@@ -210,6 +294,30 @@ pub(crate) struct CheckState {
 
 /// Full needs a pgaudit record parsed within this period.
 pub(crate) const RECORD_FRESHNESS: Duration = Duration::from_secs(24 * 3600);
+
+/// Adds `n` to a per-target count reported for [`RECORD_FRESHNESS`] from
+/// its first addition, then restarted.
+fn add_windowed(map: &Mutex<HashMap<String, (u64, Instant)>>, target_id: &str, n: u64) {
+    let mut map = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = map
+        .entry(target_id.to_owned())
+        .or_insert((0, Instant::now()));
+    if entry.1.elapsed() >= RECORD_FRESHNESS {
+        *entry = (0, Instant::now());
+    }
+    entry.0 = entry.0.saturating_add(n);
+}
+
+/// The count of [`add_windowed`], `0` once its window has passed.
+fn windowed(map: &Mutex<HashMap<String, (u64, Instant)>>, target_id: &str) -> u64 {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(target_id)
+        .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)
+        .map_or(0, |(n, _)| *n)
+}
 
 impl CheckState {
     /// The Audit stream of `target_id` parsed a pgaudit record.
@@ -253,26 +361,20 @@ impl CheckState {
     /// Records of `target_id` dropped for a severity other than
     /// `pgaudit.log_level`.
     pub(crate) fn note_severity_mismatch(&self, target_id: &str, n: u64) {
-        let mut map = self
-            .severity_mismatches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map
-            .entry(target_id.to_owned())
-            .or_insert((0, Instant::now()));
-        if entry.1.elapsed() >= RECORD_FRESHNESS {
-            *entry = (0, Instant::now());
-        }
-        entry.0 = entry.0.saturating_add(n);
+        add_windowed(&self.severity_mismatches, target_id, n);
     }
 
     fn severity_mismatches(&self, target_id: &str) -> u64 {
-        self.severity_mismatches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(target_id)
-            .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)
-            .map_or(0, |(n, _)| *n)
+        windowed(&self.severity_mismatches, target_id)
+    }
+
+    /// Records of `target_id` dropped as oversized or damaged.
+    pub(crate) fn note_dropped(&self, target_id: &str, n: u64) {
+        add_windowed(&self.dropped, target_id, n);
+    }
+
+    fn dropped(&self, target_id: &str) -> u64 {
+        windowed(&self.dropped, target_id)
     }
 
     /// Whether a pgaudit record of `target_id` was parsed recently.
@@ -357,7 +459,7 @@ fn unreachable(e: &PgError) -> TargetHealth {
             e.stage.as_str(),
             e.sqlstate().unwrap_or("none")
         )),
-        notes: Vec::new(),
+        notes: vec![stage_note(e.stage)],
     }
 }
 
@@ -370,7 +472,7 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
             audit_level: AuditLevel::None,
             failure: Some(FailureCode::Timeout),
             detail: Some("check timed out".to_owned()),
-            notes: Vec::new(),
+            notes: vec![TargetNote::new(NoteCode::CheckTimedOut)],
         },
     };
     state.set_source(&target.id, health.audit_level);
@@ -381,17 +483,21 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     let settings = target.postgres_settings();
     let timeouts = Timeouts::new(CHECK_STATEMENT_TIMEOUT);
     let mut level = AuditLevel::None;
+    // `notes`: the local log detail; `codes`: the same as closed notes.
     let mut notes: Vec<String> = Vec::new();
+    let mut codes = Notes::default();
     if settings.tls == databastion_core::config::PgTlsMode::DisableInsecure {
         notes.push(
             "INSECURE: TLS disabled on a network connection (tls: disable_insecure): traffic \
              in clear, read-only not guaranteed"
                 .to_owned(),
         );
+        codes.add(TargetNote::new(NoteCode::SecurityTlsDisabled));
     }
     let log_readable = crate::audit::log_readable(target).await;
     if settings.audit_log.is_some() && !log_readable {
         notes.push("the configured audit log is not readable by the agent".to_owned());
+        codes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
     }
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
@@ -413,24 +519,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             Err(e) => return unreachable(&e),
         };
         level = level.max(probe.level(log_readable));
-        if (probe.pgaudit_installed || probe.pgaudit_loaded == Some(true))
-            && settings.audit_log.is_none()
-        {
-            notes.push(
-                "pgaudit present; Full needs its log file in agent.yaml (postgres.audit_log)"
-                    .to_owned(),
-            );
-        }
-        if probe.pgaudit_placeholders {
-            notes.push(
-                "pgaudit settings are set but the pgaudit library is not loaded \
-                 (shared_preload_libraries)"
-                    .to_owned(),
-            );
-        }
-        if probe.pgaudit_loaded == Some(true) && !probe.pgaudit_reads {
-            notes.push("pgaudit.log does not include the read class".to_owned());
-        }
+        let (text, probe_codes) = probe_notes(&probe, settings.audit_log.is_some());
+        notes.extend(text);
+        codes.extend(probe_codes);
         let key = (target.id.clone(), database.clone());
         if state.due(&key) {
             match report(&session, timeouts, settings.extended_grants).await {
@@ -450,6 +541,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         }
         if let Some(r) = state.cached(&key) {
             notes.extend(summary(&r));
+            report_notes(&r, &mut codes);
         }
     }
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
@@ -459,6 +551,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             "Full once the Audit stream has read a pgaudit record (none in the last 24 h)"
                 .to_owned(),
         );
+        codes.add(TargetNote::new(NoteCode::AuditFullPendingFirstRecord));
     }
     let mismatched = state.severity_mismatches(&target.id);
     if mismatched > 0 {
@@ -466,6 +559,14 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             "{mismatched} pgaudit record(s) dropped in the last 24 h: severity differs from \
              pgaudit.log_level"
         ));
+        codes.add(TargetNote::new(NoteCode::AuditRecordsDroppedSeverity).with_count(mismatched));
+    }
+    let dropped = state.dropped(&target.id);
+    if dropped > 0 {
+        notes.push(format!(
+            "{dropped} pgaudit log record(s) dropped in the last 24 h (oversized or damaged)"
+        ));
+        codes.add(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(dropped));
     }
     notes.sort();
     notes.dedup();
@@ -478,8 +579,35 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             if notes.is_empty() { "" } else { "; " },
             notes.join("; ")
         )),
-        notes: Vec::new(),
+        notes: codes.into_vec(),
     }
+}
+
+/// Explanations of one database's audit prerequisites (log detail and
+/// closed notes). `log_configured`: `postgres.audit_log` is set.
+fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<TargetNote>) {
+    let mut text = Vec::new();
+    let mut codes = Vec::new();
+    if (probe.pgaudit_installed || probe.pgaudit_loaded == Some(true)) && !log_configured {
+        text.push(
+            "pgaudit present; Full needs its log file in agent.yaml (postgres.audit_log)"
+                .to_owned(),
+        );
+        codes.push(TargetNote::new(NoteCode::AuditPgauditLogNotConfigured));
+    }
+    if probe.pgaudit_placeholders {
+        text.push(
+            "pgaudit settings are set but the pgaudit library is not loaded \
+             (shared_preload_libraries)"
+                .to_owned(),
+        );
+        codes.push(TargetNote::new(NoteCode::AuditPgauditNotLoaded));
+    }
+    if probe.pgaudit_loaded == Some(true) && !probe.pgaudit_reads {
+        text.push("pgaudit.log does not include the read class".to_owned());
+        codes.push(TargetNote::new(NoteCode::AuditPgauditReadClassMissing));
+    }
+    (text, codes)
 }
 
 fn summary(r: &Report) -> Vec<String> {
@@ -784,11 +912,12 @@ async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result
         }
     };
     let (_, coverage) = catalog::plan(&relations, |_, _| true);
-    let (over_privileged, expected) =
+    let (over_privileged, expected, privilege_notes) =
         evaluate_privileges(attrs, &memberships, writes, owned, extended);
     Ok(Report {
         over_privileged,
         expected,
+        privilege_notes,
         schemas_not_covered,
         coverage,
         login_event_trigger,
@@ -805,7 +934,7 @@ mod tests {
 
     #[test]
     fn minimal_variant_is_not_over_privileged() {
-        let (over, expected) = evaluate_privileges(
+        let (over, expected, notes) = evaluate_privileges(
             RoleAttributes::default(),
             &[m("pg_read_all_stats")],
             0,
@@ -813,6 +942,7 @@ mod tests {
             false,
         );
         assert!(over.is_empty() && expected.is_empty(), "{over:?}");
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]
@@ -822,19 +952,36 @@ mod tests {
             bypassrls: true,
             ..RoleAttributes::default()
         };
-        let (over, _) = evaluate_privileges(
+        let (over, _, notes) = evaluate_privileges(
             attrs,
             &[
                 m("pg_monitor"),
                 m("pg_read_all_data"),
                 m("pg_write_all_data"),
                 m("pg_read_server_files"),
+                m("pg_future_role"),
                 ("app_owner".to_owned(), false),
             ],
             3,
             1,
             false,
         );
+        let json = notes_json(&notes);
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"code": "privilege.role_attributes", "labels": ["superuser", "bypassrls"]},
+                {"code": "privilege.predefined_roles", "labels": [
+                    "other", "pg_monitor", "pg_read_all_data", "pg_read_server_files",
+                    "pg_write_all_data"
+                ]},
+                {"code": "privilege.other_roles", "count": 1},
+                {"code": "privilege.write_on_relations", "count": 3},
+                {"code": "privilege.owner_of_objects", "count": 1}
+            ])
+        );
+        assert!(!json.to_string().contains("app_owner"));
+        assert!(!json.to_string().contains("future"));
         for label in [
             "superuser",
             "bypassrls",
@@ -859,14 +1006,193 @@ mod tests {
             m("pg_read_all_settings"),
             m("pg_read_all_stats"),
         ];
-        let (over, expected) =
+        let (over, expected, notes) =
             evaluate_privileges(RoleAttributes::default(), &memberships, 0, 0, true);
         assert!(over.is_empty(), "{over:?}");
         assert_eq!(expected.len(), 2);
-        let (over, expected) =
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.extended_variant",
+                                "labels": ["pg_read_all_data", "pg_read_all_settings"]}])
+        );
+        let (over, expected, notes) =
             evaluate_privileges(RoleAttributes::default(), &memberships, 0, 0, false);
         assert_eq!(over.len(), 2);
         assert!(expected.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].code(), NoteCode::PrivilegePredefinedRoles);
+    }
+
+    /// A note as the console receives it: `code`, `count`, `labels` only.
+    fn note_json(n: &TargetNote) -> serde_json::Value {
+        let mut v = serde_json::json!({"code": n.code().as_str()});
+        if let Some(c) = n.count() {
+            v["count"] = c.into();
+        }
+        if !n.labels().is_empty() {
+            v["labels"] = n.labels().iter().map(|l| l.as_str()).collect();
+        }
+        v
+    }
+
+    fn notes_json(notes: &[TargetNote]) -> serde_json::Value {
+        notes.iter().map(note_json).collect()
+    }
+
+    /// Codes registered for `postgres` in `shared/protocol/target-notes.json`.
+    fn registered_for_postgres() -> std::collections::BTreeSet<String> {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../shared/protocol/target-notes.json"
+        ))
+        .unwrap();
+        v.as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| {
+                e["engines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|x| x == "postgres")
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    fn assert_registered(notes: &[TargetNote]) {
+        let registered = registered_for_postgres();
+        for n in notes {
+            assert!(
+                registered.contains(n.code().as_str()),
+                "{} is not registered for postgres",
+                n.code().as_str()
+            );
+        }
+    }
+
+    fn report(over: &[TargetNote], schemas: usize, not_readable: usize, rls: usize) -> Report {
+        Report {
+            privilege_notes: over.to_vec(),
+            schemas_not_covered: vec!["s".to_owned(); schemas],
+            coverage: catalog::Coverage {
+                not_readable: vec![("s".to_owned(), "secret_table".to_owned()); not_readable],
+                rls_policy: vec![("s".to_owned(), "t".to_owned()); rls],
+                ..catalog::Coverage::default()
+            },
+            login_event_trigger: true,
+            ..Report::default()
+        }
+    }
+
+    #[test]
+    fn notes_of_several_databases_are_merged_per_code() {
+        let (_, _, privileges) = evaluate_privileges(
+            RoleAttributes {
+                createdb: true,
+                ..RoleAttributes::default()
+            },
+            &[("app".to_owned(), false), ("etl".to_owned(), false)],
+            4,
+            0,
+            false,
+        );
+        let mut notes = Notes::default();
+        report_notes(&report(&privileges, 1, 2, 3), &mut notes);
+        report_notes(&report(&privileges, 2, 0, 1), &mut notes);
+        let notes = notes.into_vec();
+        assert_registered(&notes);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "privilege.role_attributes", "labels": ["createdb"]},
+                // Cluster-wide: the same two roles seen from both databases.
+                {"code": "privilege.other_roles", "count": 2},
+                // Per database: added up.
+                {"code": "privilege.write_on_relations", "count": 8},
+                {"code": "coverage.schemas_without_usage", "count": 3},
+                {"code": "coverage.relations_without_select", "count": 2},
+                {"code": "coverage.relations_rls_skipped", "count": 4},
+                {"code": "security.login_event_trigger"}
+            ])
+        );
+        // Names of schemas and relations never reach a note.
+        let text = notes_json(&notes).to_string();
+        assert!(
+            !text.contains("secret_table") && !text.contains("\"s\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn audit_prerequisites_are_noted() {
+        let loaded = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: false,
+            ..AuditProbe::default()
+        };
+        let (text, notes) = probe_notes(&loaded, false);
+        assert_eq!(text.len(), notes.len());
+        assert_registered(&notes);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "audit.pgaudit_log_not_configured"},
+                {"code": "audit.pgaudit_read_class_missing"}
+            ])
+        );
+        let placeholders = AuditProbe {
+            pgaudit_placeholders: true,
+            pgaudit_loaded: Some(false),
+            ..AuditProbe::default()
+        };
+        let (_, notes) = probe_notes(&placeholders, true);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "audit.pgaudit_not_loaded"}])
+        );
+        let (_, notes) = probe_notes(&AuditProbe::default(), false);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn check_failures_are_noted_with_their_stage_only() {
+        let mut e = PgError::new(FailureCode::TargetUnreachable, Stage::Connect);
+        e.sqlstate = Some("28P01".to_owned());
+        let health = unreachable(&e);
+        assert_registered(&health.notes);
+        assert_eq!(
+            notes_json(&health.notes),
+            serde_json::json!([{"code": "check.stage_failed", "labels": ["stage_connect"]}])
+        );
+        // Every stage of this connector has its contract label.
+        for stage in [
+            Stage::Secret,
+            Stage::Tls,
+            Stage::Connect,
+            Stage::SessionSetup,
+            Stage::Begin,
+            Stage::Commit,
+            Stage::Introspection,
+            Stage::Columns,
+            Stage::Sample,
+            Stage::Check,
+            Stage::Audit,
+        ] {
+            assert!(!NoteLabel::stage(stage.as_str()).is_other(), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn dropped_records_are_counted_per_target() {
+        let state = CheckState::default();
+        assert_eq!(state.dropped("t"), 0);
+        state.note_dropped("t", 2);
+        state.note_dropped("t", 3);
+        assert_eq!(state.dropped("t"), 5);
+        assert_eq!(state.dropped("u"), 0);
+        state.note_severity_mismatch("t", 1);
+        assert_eq!(state.severity_mismatches("t"), 1);
     }
 
     #[test]
