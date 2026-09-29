@@ -268,9 +268,10 @@ verification is counted before it runs (and refunded on success), so concurrent 
 exceed the limits. Logins, agent authentications and enrollments use separate argon2id pools (4, 8
 and 2 concurrent operations per process, `503` + `Retry-After` beyond; a `503` on `/enroll` does
 not consume the token), plus a pool reserved for agents presenting their last verified secret, so a
-login flood can never block agents. Failed logins on unknown usernames share a process-wide budget
+login flood can never block agents. Failed logins on unknown usernames share one budget
 (30 per 5 minutes). Per-IP limits bucket IPv6 addresses by /64 and only apply when the client IP is
-known (trusted proxy).
+known (trusted proxy). Every limit below is shared by all console processes (see "Shared rate
+limits"): N web replicas enforce one limit, not N.
 
 Failed logins (P1-D M2), all over 15 minutes:
 - 20 per source IP (IPv6 bucketed by /56 for logins, not /64);
@@ -366,8 +367,8 @@ never reported), all `high`, each with an audit-log entry of the same name; sinc
 `agent.silent` (`medium`, see "Alerting"). Each one is notified to the system-alert channels. Their details are the
 endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
 per 10 minutes; beyond, they are counted, logged once per window, and the next recorded event of the
-agent carries the count (`suppressed_before`). The budget is in memory, per web process (like the
-rate limiters): with N web processes an agent can get up to N x 20 rows per window.
+agent carries the count (`suppressed_before`). The budget is shared by all console processes (see "Shared
+rate limits"; per-process fallback if the shared store fails).
 
 ## Metrics
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
@@ -410,6 +411,7 @@ Frozen names (renaming one is a breaking change; the provisional Grafana dashboa
 | `databastion_enrollment_tokens_active` | | usable enrollment tokens |
 | `databastion_security_events` | | rows of `security_events` |
 | `databastion_console_argon2_operations_total` | | argon2id operations of this process |
+| `databastion_console_rate_limit_store_errors_total` | | shared rate-limit store operations of this process that failed or timed out |
 | `databastion_metrics_series_dropped` | | series dropped by the caps in the last scrape |
 
 Per-agent series cover enrolled / online agents (not revoked or locked). Agent-provided metric
@@ -468,9 +470,50 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
 | Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
 
-Rate limiters, the argon2 concurrency cap and the 25 s verified-secret cache are in-memory, per
-process (the known-good fingerprint is in the database): the MVP runs one web process. Several web replicas would need a shared store for the
-limiters (the secret cache is already safe across processes, as it is bound to the stored hash).
+| Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1` (domain-separated SHA-256 without a server key), never in clear. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
+
+The argon2 concurrency caps and the 25 s verified-secret cache are in memory, per process (the
+known-good fingerprint is in the database; the cache is safe across processes, as it is bound to the
+stored hash). The rate limiters are shared (see "Shared rate limits").
+
+## Shared rate limits
+*P4-D (and the P3-D test-send item): `src/server/rate-limit.ts`, migrations `0029`, `0030`.*
+
+Every rate limit of the console (agent authentication failures, `/enroll`, `/rotate` and its late
+retries, the `/findings` and `/events` request and stored-batch rates, the agent-integrity and
+failed-enrollment audit budgets, failed logins, channel test sends) is kept in the console's
+PostgreSQL, so several web processes enforce one limit. Only a per-process log de-duplication
+(integrity suppression warnings) stays in memory.
+- **Windows**: fixed, anchored at the first hit of the key (as before), one row per (limiter, key)
+  reset in place by the first hit after its end; database clock. `Retry-After` is the rest of the
+  window (the `/events` values of the contract are unchanged: `30` for back-pressure, 1 to 60 s
+  for the rate limits).
+- **One round-trip per decision**: a hit is one `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`; a
+  reservation (check-and-count) is the same statement guarded by `count < limit`, so concurrent
+  requests from any process cannot overrun a limit; a refund is one guarded `UPDATE` that only
+  touches the window it was counted in; the three agent-authentication limits are checked with one
+  `SELECT`. Refunds keep their semantics: a successful login or authentication, and a duplicate,
+  rejected or failed (exception) findings or events batch give their slot back.
+- **Per-process pre-check**: each process also counts its own hits in memory and refuses early when
+  they alone reach the limit, without a database round-trip. Its hits are a subset of the shared
+  ones, so it can only refuse earlier, never admit more. A secret in the 25 s verified cache or
+  known good per the in-memory hint skips the shared check entirely (it is exempt anyway).
+- **Store failures** (error, or no answer within 2 s), logged at most once per minute per limiter
+  (never the key) and counted in `databastion_console_rate_limit_store_errors_total`:
+  - **fail closed** for agent authentication, `/enroll`, `/rotate`, logins and test sends: the
+    limit is treated as reached (`429` + `Retry-After: 5`; for logins over the per-username caps,
+    the degraded path, which never refuses). A secret exempt from the failure limits (verified
+    less than 25 s ago, or known good) still authenticates, so a store outage does not lock
+    legitimate agents out;
+  - **per-process fallback** for the `/findings` and `/events` request and stored-batch rates, the
+    integrity and failed-enrollment audit budgets, and the late `/rotate` retries: the in-memory
+    counters decide (the pre-P4-D per-process limit). The ingestion and the audit rows use the
+    same database, so failing closed would only make every agent back off on a limiter hiccup,
+    and failing open would drop the bound. The late `/rotate` retries lock the agent when over
+    their limit: failing closed would turn a transient store error into an irreversible lock.
+- **Pruning**: worker queue `rate_limits.prune`, every 5 minutes, in chunks of 10 000 rows.
+  Pruning changes no decision. The table holds at most one row per key seen in the last window
+  (at most 15 minutes).
 
 ## Policies and incidents
 *P3-A, P3-B. Model and lifecycle: `src/lib/policy-model.ts`, `src/lib/incident-lifecycle.ts`;
@@ -552,7 +595,7 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   old spool, so counted in `databastion_console_events_expired_total`, not an integrity event).
   Events of a target the agent no longer reports, or whose Audit settings are disabled, are stored
   with `unexpected_target` set (shown in the view, counted in
-  `databastion_console_events_unexpected_target_total`). Limits per agent and process: 300
+  `databastion_console_events_unexpected_target_total`). Limits per agent, shared by all console processes: 300
   requests and 60 stored batches (30 000 events) per minute (`429`), and `429` + `Retry-After: 30`
   while the agent has more than 20 000 events not evaluated yet (back-pressure, counted in
   `databastion_console_events_backpressure_total`). An accepted batch wakes the policy worker.
@@ -757,7 +800,7 @@ contents: `src/lib/notification-render.ts`.*
   587 and 2525 only (any port with the dev flag); SMTP replies capped at 100 lines / 64 KiB; any
   byte received in clear after the STARTTLS `220` aborts the session; the upgraded certificate is
   verified against the configured host; channel tests are limited to 10 per administrator and 3 per
-  channel per 10 minutes (`429`), and report refused and filtered connections alike
+  channel per 10 minutes (`429`; shared by all console processes, fail closed), and report refused and filtered connections alike
   (`connect_failed`).
 - **Agent-integrity alerts**: every `security_events` row written by the console
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
