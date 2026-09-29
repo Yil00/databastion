@@ -883,17 +883,28 @@ pub enum Signal {
     /// `volume.large_result`: rows returned or affected at or above the
     /// agent's threshold.
     LargeResult,
+    /// `signature.mysqldump`: the client declares itself as `mysqldump` /
+    /// `mariadb-dump`, or a session reads whole tables the way they do
+    /// (`SELECT /*!40001 SQL_NO_CACHE */ … FROM t`, several whole tables,
+    /// or a whole table after `SHOW CREATE TABLE` of it, or after a
+    /// consistent-snapshot / global read lock).
+    Mysqldump,
+    /// `signature.into_outfile`: `SELECT … INTO OUTFILE` / `INTO DUMPFILE`
+    /// (rows written to a file on the database server).
+    IntoOutfile,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
         Self::FullTableCopy,
         Self::FullTableRead,
         Self::LargeResult,
+        Self::Mysqldump,
+        Self::IntoOutfile,
     ];
 
     /// Contract value.
@@ -906,6 +917,8 @@ impl Signal {
             Self::FullTableCopy => "shape.full_table_copy",
             Self::FullTableRead => "shape.full_table_read",
             Self::LargeResult => "volume.large_result",
+            Self::Mysqldump => "signature.mysqldump",
+            Self::IntoOutfile => "signature.into_outfile",
         }
     }
 }
@@ -987,6 +1000,15 @@ impl EventPrincipal {
             send_name: false,
             ..Self::account(raw)
         }
+    }
+
+    /// An account the source cannot name (MySQL `performance_schema`: a
+    /// statement whose session ended before the agent read it). Sent as a
+    /// `db_user` fingerprint (of an empty name), which the console treats
+    /// as an unknown account.
+    #[must_use]
+    pub fn unidentified() -> Self {
+        Self::failed_account("")
     }
 
     /// Sets the client address.
@@ -1307,6 +1329,30 @@ mod tests {
 
     fn key(b: u8) -> HmacKey {
         HmacKey::new(&[b; 32]).unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn signals_follow_the_contract_pattern() {
+        for sig in Signal::ALL {
+            let v = sig.as_str();
+            let (family, name) = v.split_once('.').unwrap();
+            assert!(matches!(family, "signature" | "shape" | "volume"), "{v}");
+            assert!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{v}"
+            );
+            assert!(v.len() <= 64);
+        }
+    }
+
+    #[test]
+    fn unidentified_principal_is_never_sent_by_name() {
+        let p = EventPrincipal::unidentified();
+        assert!(!p.send_name());
+        assert_eq!(p.account_name(), "");
     }
 
     #[test]
