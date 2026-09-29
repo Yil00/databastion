@@ -44,7 +44,11 @@ pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 /// A search record seen within this period proves reads are logged.
 pub(crate) const RECORD_FRESHNESS: Duration = Duration::from_secs(24 * 3600);
 /// Naming contexts proven per report (the others wait for the next one).
-const MAX_PROVEN_PER_REPORT: usize = 16;
+const MAX_PROVEN_PER_REPORT: usize = 8;
+/// Naming contexts probed for readable password attributes per report.
+const MAX_PASSWORD_PROBES: usize = 8;
+/// Bound of the privilege and audit-source evaluation within a check.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Credential attributes probed (attributes-only).
 pub(crate) const PASSWORD_ATTRIBUTES: [&str; 2] = ["userPassword", "authPassword"];
 /// Entries of each naming context the password-attribute probe looks at.
@@ -363,7 +367,7 @@ async fn report<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(config) = &dse.config_context {
         r.config_readable = base_readable(s, config).await?;
     }
-    for (raw, _) in contexts {
+    for (raw, _) in contexts.iter().take(MAX_PASSWORD_PROBES) {
         let search = Search {
             base: raw,
             scope: Scope::Sub,
@@ -451,41 +455,62 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         }
     };
     let contexts = data_contexts(&dse, &settings.accesslog_base);
+    // The report has its own bound, so a slow server still gets a
+    // reachability answer; what it could not evaluate is noted.
+    let mut incomplete: Option<TargetNote> = None;
     if state.due(&target.id) && !session.is_broken() {
-        match report(&mut session, &dse, &contexts, &settings.accesslog_base).await {
-            Ok(r) => {
-                if r.accesslog_readable == Some(true) {
-                    if let Err(e) = prove(
-                        state,
-                        target,
-                        &mut session,
-                        &contexts,
-                        &settings.accesslog_base,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            target_id = %target.id,
-                            result = e.result,
-                            "accesslog proof interrupted"
-                        );
-                    }
-                }
+        let evaluated = tokio::time::timeout(REPORT_TIMEOUT, async {
+            let r = report(&mut session, &dse, &contexts, &settings.accesslog_base).await?;
+            if r.accesslog_readable == Some(true) {
+                prove(
+                    state,
+                    target,
+                    &mut session,
+                    &contexts,
+                    &settings.accesslog_base,
+                )
+                .await?;
+            }
+            Ok::<Report, LdError>(r)
+        })
+        .await;
+        match evaluated {
+            Ok(Ok(r)) => {
                 if state.store(target.id.clone(), r.clone()) {
                     log_report(target, &r);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     target_id = %target.id,
                     stage = e.stage.as_str(),
                     result = e.result,
-                    "privileges not evaluated"
+                    "privileges and audit source not evaluated"
                 );
+                incomplete = Some(
+                    TargetNote::new(NoteCode::CheckStageFailed)
+                        .with_labels([NoteLabel::stage(e.stage.as_str())]),
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    "privileges and audit source not evaluated in time"
+                );
+                incomplete = Some(TargetNote::new(NoteCode::CheckTimedOut));
+                // The session may be in the middle of a search.
+                drop(session);
+                session = match Session::connect(target, Timeouts::new(CHECK_OP_TIMEOUT)).await {
+                    Ok(s) => s,
+                    Err(e) => return (unreachable(&e, codes.into_vec()), Source::None),
+                };
             }
         }
     }
     let report = state.cached(&target.id);
+    if report.is_none() {
+        codes.add(incomplete.unwrap_or_else(|| TargetNote::new(NoteCode::CheckTimedOut)));
+    }
     let readable = report
         .as_ref()
         .is_some_and(|r| r.accesslog_readable == Some(true));
@@ -521,10 +546,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
             detail.push("accesslog not readable or missing: no Audit source".to_owned());
             codes.add(TargetNote::new(NoteCode::AuditAccesslogNotReadable));
         }
-        None => {
-            detail.push("accesslog not evaluated".to_owned());
-            codes.add(TargetNote::new(NoteCode::AuditAccesslogNotReadable));
-        }
+        None => detail.push("accesslog not evaluated".to_owned()),
     }
     let dropped = state.dropped(&target.id);
     if dropped > 0 {

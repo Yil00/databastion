@@ -28,6 +28,8 @@ use crate::tls;
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(60);
 /// Client-side margin on top of the time limit.
 const CLIENT_MARGIN: Duration = Duration::from_secs(2);
+/// Continuation references accepted per search (counted, never followed).
+const MAX_REFERENCES: u64 = 4096;
 /// Default ports.
 const LDAPS_PORT: u16 = 636;
 const LDAP_PORT: u16 = 389;
@@ -460,9 +462,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 match self.next(id, stage).await? {
                     Response::Entry(e) => {
                         outcome.entries += 1;
+                        if outcome.entries > u64::from(search.size_limit.max(1)) {
+                            // More entries than the size limit asked: the
+                            // server ignores the bound, and memory would
+                            // follow it.
+                            self.broken = true;
+                            tracing::warn!(
+                                stage = stage.as_str(),
+                                "the server returned more entries than the size limit"
+                            );
+                            return Err(LdError::new(FailureCode::ResourceLimit, stage));
+                        }
                         on_entry(e);
                     }
-                    Response::Reference => outcome.references += 1,
+                    Response::Reference => {
+                        outcome.references += 1;
+                        if outcome.references > MAX_REFERENCES {
+                            self.broken = true;
+                            return Err(LdError::new(FailureCode::ResourceLimit, stage));
+                        }
+                    }
                     Response::Intermediate => {}
                     Response::Done { code } => {
                         outcome.code = code;

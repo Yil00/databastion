@@ -254,6 +254,18 @@ async fn searches_count_entries_and_references_and_fail_closed() {
         ),
         (directory(AGENT, |_, _| Vec::new()), FailureCode::Timeout),
     ];
+    // More entries than the size limit (10): the bound is enforced here.
+    let flood: Handler = directory(AGENT, |id, _| {
+        let mut out: Vec<Vec<u8>> = (0..11)
+            .map(|i| encode::entry(id, &format!("cn={i},dc=example,dc=org"), &[]))
+            .collect();
+        out.push(encode::done(id, 0));
+        out
+    });
+    let cases: Vec<(Handler, FailureCode)> = cases
+        .into_iter()
+        .chain(std::iter::once((flood, FailureCode::ResourceLimit)))
+        .collect();
     for (h, code) in cases {
         let (s, _) = session(h).await;
         let mut s = s.unwrap();
