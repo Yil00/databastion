@@ -46,7 +46,7 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 | `mongodump` / `mongoexport` | Tool's `appName`, unfiltered `find` over the whole collection | MongoDB |
 | LDIF export / bulk `ldapsearch` | `scope=sub` search from the root, `(objectClass=*)` filter, high `reqEntries` | OpenLDAP |
 
-Signatures are easy to forge (`application_name` is chosen by the client). They are only **one** of the three signals; the volume × sensitivity combination remains the primary signal (see [02-architecture.md](02-architecture.md#exfiltration-detection-audit)).
+Signatures are easy to forge (`application_name` is chosen by the client). They are only **one** of the three signals; the volume × sensitivity combination remains the primary signal (see [02-architecture.md](02-architecture.md#exfiltration-detection-audit)). The console computes it from the row count the source reports ([ADR-0021](adr/0021-access-event-correlation.md)): an event without `rows` scores 0 and feeds no baseline, so on a source that gives no volume only signatures, shapes and object or principal conditions can raise an incident. Sensitivity is per object (table, collection), not per column.
 
 ## Cost for the monitored database
 | Source | Cost | Recommendation |
