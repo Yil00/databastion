@@ -936,7 +936,7 @@ components:
         registered ids. Registered: `signature.pg_dump`, `signature.copy_to_file`,
         `signature.copy_to_program`, `signature.mysqldump`, `signature.into_outfile`,
         `signature.mongodump`, `signature.mongoexport`, `shape.full_table_copy`,
-        `shape.full_table_read`, `volume.large_result`. Families: `signature.*` a dump or export
+        `shape.full_table_read`, `shape.bulk_search`, `volume.large_result`. Families: `signature.*` a dump or export
         tool or command (the console treats it as severe), `shape.*` a query shape (heuristic,
         evadable), `volume.*` a volume threshold of the agent. The registry is **append-only**: a
         new signal is a new entry added by a compatible contract change; an id is never removed,
