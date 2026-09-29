@@ -186,6 +186,72 @@ proptest! {
         }
     }
 
+    /// Fail closed (end-of-phase-5 review L2): a shape learned from other
+    /// documents (here: none) keeps no nested key of the collected ones;
+    /// only the top-level fields keep their names.
+    #[test]
+    fn levels_the_learner_never_saw_keep_no_key(
+        docs in prop::collection::vec(document(), 1..4),
+        learned in 0usize..2,
+    ) {
+        let bytes: Vec<Vec<u8>> = docs.into_iter().map(|(d, _)| d).collect();
+        let parsed: Vec<Doc<'_>> = bytes.iter().map(|d| Doc::new(d).unwrap()).collect();
+        // Learned from nothing, or from an unrelated document.
+        let other = DocBuf::new()
+            .doc("zz_Other9", DocBuf::new().str("inner", "v"))
+            .finish();
+        let sample: Vec<Doc<'_>> = if learned == 0 {
+            Vec::new()
+        } else {
+            vec![Doc::new(&other).unwrap()]
+        };
+        let mut c = Collector::with_shape(10, Shape::learn(&sample));
+        for d in &parsed {
+            c.add_document(*d).unwrap();
+        }
+        for (name, _) in c.into_paths() {
+            let name = name.as_str();
+            for segment in name.split('.').skip(1) {
+                prop_assert_eq!(segment.trim_end_matches("[]"), "*", "{}", name);
+            }
+        }
+    }
+
+    /// A map reached by the collector is seen whole by the learner, even
+    /// when later siblings use up the visit budget (the learner walks in
+    /// the collector's order).
+    #[test]
+    fn a_map_before_a_budget_cut_never_reaches_a_path(
+        words in prop::collection::hash_set("[a-z]{5,10}", (paths::MAX_STATIC_KEYS + 1)..40),
+        padding in (paths::MAX_VISITS_PER_DOC - 64)..(paths::MAX_VISITS_PER_DOC + 16),
+        depth in 0usize..4,
+    ) {
+        let mut map = DocBuf::new();
+        for w in &words {
+            map = map.str(w, "v");
+        }
+        let mut inner = DocBuf::new().doc("m", map);
+        for _ in 0..depth {
+            inner = DocBuf::new().doc("x", inner);
+        }
+        let mut a = DocBuf::new().doc("x", inner);
+        for i in 0..padding {
+            a = a.i32(&format!("s{i}"), 1);
+        }
+        let doc = DocBuf::new().doc("a", a).finish();
+        let d = Doc::new(&doc).unwrap();
+        let mut c = Collector::with_shape(10, Shape::learn(&[d]));
+        c.add_document(d).unwrap();
+        for (name, _) in c.into_paths() {
+            for w in &words {
+                prop_assert!(
+                    !name.as_str().split('.').any(|seg| seg == w.as_str()),
+                    "{} kept {}", name.as_str(), w
+                );
+            }
+        }
+    }
+
     /// Random bodies inside a valid BSON length and terminator, and inside
     /// a valid OP_MSG section, reach the inner parsers (security review L3).
     #[test]

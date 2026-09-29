@@ -16,7 +16,7 @@
 //! per-path value limit given by the job (`sample_rows`). Values are cut to
 //! [`MAX_VALUE_BYTES`] on a character boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use databastion_classifiers::masking::RawValue;
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
@@ -160,7 +160,12 @@ impl Collector {
             values: MAX_VALUES_PER_DOC,
             visits: MAX_VISITS_PER_DOC,
         };
-        self.walk(doc, false, &mut steps, 0, &mut budget)?;
+        // The shape is read while values are pushed: move it out for the
+        // walk.
+        let shape = std::mem::take(&mut self.shape);
+        let walked = self.walk(&shape, doc, false, &mut steps, 0, &mut budget);
+        self.shape = shape;
+        walked?;
         if budget.values == 0 || budget.visits == 0 {
             self.stats.documents_cut += 1;
         }
@@ -169,13 +174,18 @@ impl Collector {
 
     fn walk<'a>(
         &mut self,
+        shape: &Shape,
         doc: Doc<'a>,
         is_array: bool,
         steps: &mut Vec<Step<'a>>,
         depth: usize,
         budget: &mut Budget,
     ) -> Result<(), Malformed> {
-        let dynamic = !is_array && depth > 0 && self.shape.is_dynamic(steps);
+        let level = if is_array || depth == 0 {
+            Level::Keep
+        } else {
+            shape.level(steps)
+        };
         for (i, element) in doc.iter().enumerate() {
             if budget.values == 0 || budget.visits == 0 {
                 return Ok(());
@@ -188,18 +198,18 @@ impl Collector {
             budget.visits -= 1;
             steps.push(if is_array {
                 Step::Index
-            } else if dynamic {
-                Step::Key(WILD)
-            } else {
+            } else if level.keeps(key) {
                 Step::Key(key)
+            } else {
+                Step::Key(WILD)
             });
             match value {
                 Value::Doc(d) | Value::Array(d) if depth + 1 > MAX_DEPTH => {
                     let _ = d;
                     self.stats.too_deep += 1;
                 }
-                Value::Doc(d) => self.walk(d, false, steps, depth + 1, budget)?,
-                Value::Array(d) => self.walk(d, true, steps, depth + 1, budget)?,
+                Value::Doc(d) => self.walk(shape, d, false, steps, depth + 1, budget)?,
+                Value::Array(d) => self.walk(shape, d, true, steps, depth + 1, budget)?,
                 leaf => {
                     if let Some(text) = to_text(leaf) {
                         budget.values -= 1;
@@ -272,15 +282,47 @@ impl Collector {
 /// collapsed to `*`. The top level is never collapsed (a collection's
 /// fields). Levels are identified by their raw path (collapsed ancestors
 /// as `*`), zeroized on drop.
+///
+/// Fail closed (end-of-phase-5 review L2): the learner walks the sample in
+/// the collector's order and within the same visit budget, and keeps the
+/// keys it saw on each static level. A non-top object level the learner
+/// never observed (past [`MAX_TRACKED_LEVELS`], or below a level collapsed
+/// in the last round) is treated as dynamic, and a key it never saw on a
+/// static level becomes `*`.
 #[derive(Default)]
 pub(crate) struct Shape {
-    dynamic: std::collections::HashSet<Vec<u8>>,
+    dynamic: HashSet<Vec<u8>>,
+    /// Static levels observed by the learner, with the keys seen there.
+    /// `None`: no shape learned (a collector built with
+    /// [`Collector::new`], tests only): nothing is collapsed.
+    known: Option<HashMap<Vec<u8>, HashSet<Vec<u8>>>>,
+}
+
+/// What the collector does with the keys of one object level.
+enum Level<'s> {
+    /// Keys kept (top level, or no shape learned).
+    Keep,
+    /// Every key is `*` (a map keyed by data, or a level never observed).
+    Wild,
+    /// A static level: the keys the learner saw are kept, others are `*`.
+    Known(&'s HashSet<Vec<u8>>),
+}
+
+impl Level<'_> {
+    fn keeps(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Keep => true,
+            Self::Wild => false,
+            Self::Known(keys) => keys.contains(key),
+        }
+    }
 }
 
 impl std::fmt::Debug for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Shape")
             .field("dynamic_levels", &self.dynamic.len())
+            .field("static_levels", &self.known.as_ref().map(HashMap::len))
             .finish()
     }
 }
@@ -289,6 +331,14 @@ impl Drop for Shape {
     fn drop(&mut self) {
         for key in self.dynamic.drain() {
             drop(Zeroizing::new(key));
+        }
+        if let Some(known) = self.known.as_mut() {
+            for (level, keys) in known.drain() {
+                drop(Zeroizing::new(level));
+                for key in keys {
+                    drop(Zeroizing::new(key));
+                }
+            }
         }
     }
 }
@@ -321,10 +371,13 @@ impl Drop for LevelStats {
 }
 
 impl Shape {
-    /// Learns the dynamic levels of a sample.
+    /// Learns the dynamic and the static levels of a sample.
     pub(crate) fn learn(documents: &[Doc<'_>]) -> Self {
-        let mut shape = Self::default();
-        for _ in 0..SHAPE_ROUNDS {
+        let mut shape = Self {
+            dynamic: HashSet::new(),
+            known: Some(HashMap::new()),
+        };
+        for round in 0..SHAPE_ROUNDS {
             let mut levels: HashMap<Vec<u8>, LevelStats> = HashMap::new();
             for (i, d) in documents.iter().enumerate() {
                 let mut steps = Vec::new();
@@ -336,13 +389,27 @@ impl Shape {
                 .filter(|(level, stats)| !shape.dynamic.contains(*level) && stats.is_dynamic())
                 .map(|(level, _)| level.clone())
                 .collect();
+            let last = found.is_empty() || round + 1 == SHAPE_ROUNDS;
+            shape.dynamic.extend(found);
+            if last {
+                // The levels of the last round that stayed static, with
+                // their keys. A level below one collapsed in this round has
+                // a new path, never observed: the collector treats it as
+                // dynamic.
+                let known = shape.known.get_or_insert_with(HashMap::new);
+                for (level, mut stats) in levels.drain() {
+                    if shape.dynamic.contains(&level) {
+                        drop(Zeroizing::new(level));
+                        continue;
+                    }
+                    let keys: HashSet<Vec<u8>> = stats.keys.drain().map(|(k, _)| k).collect();
+                    known.insert(level, keys);
+                }
+                break;
+            }
             for (level, _) in levels.drain() {
                 drop(Zeroizing::new(level));
             }
-            if found.is_empty() {
-                break;
-            }
-            shape.dynamic.extend(found);
         }
         shape
     }
@@ -355,6 +422,24 @@ impl Shape {
         self.dynamic.contains(&*level)
     }
 
+    /// How the collector treats the keys of the non-top object level at
+    /// `steps`.
+    fn level(&self, steps: &[Step<'_>]) -> Level<'_> {
+        let Some(known) = &self.known else {
+            return Level::Keep;
+        };
+        let level = Zeroizing::new(encode(steps));
+        if self.dynamic.contains(&*level) {
+            return Level::Wild;
+        }
+        known.get(&*level).map_or(Level::Wild, Level::Known)
+    }
+
+    /// Records the object levels of one document. Walks in the collector's
+    /// order ([`Collector::walk`]: depth first, the same array, depth and
+    /// visit bounds), so every level and key the collector reaches has
+    /// been seen here (the collector's value budget only stops it
+    /// earlier).
     #[allow(clippy::too_many_arguments)]
     fn observe<'a>(
         &self,
@@ -367,41 +452,38 @@ impl Shape {
         visits: &mut usize,
     ) {
         let dynamic = !is_array && depth > 0 && self.is_dynamic(steps);
-        // Keys of this level (bounded like the collection walk).
-        let mut children: Vec<(&'a [u8], Value<'a>)> = Vec::new();
-        for (i, element) in doc.iter().enumerate() {
-            if *visits == 0 || (is_array && i >= MAX_ARRAY_ELEMENTS) {
-                break;
-            }
-            let Ok((key, value)) = element else {
-                break;
-            };
-            *visits -= 1;
-            children.push((key, value));
-        }
+        let mut level: Option<Zeroizing<Vec<u8>>> = None;
         if !is_array && depth > 0 && !dynamic {
-            let level = encode(steps);
-            if levels.len() < MAX_TRACKED_LEVELS || levels.contains_key(&level) {
-                let stats = levels.entry(level).or_default();
+            let encoded = Zeroizing::new(encode(steps));
+            if levels.len() < MAX_TRACKED_LEVELS || levels.contains_key(&*encoded) {
+                let stats = levels.entry(encoded.to_vec()).or_default();
                 if stats.last_document != Some(document) {
                     stats.last_document = Some(document);
                     stats.documents = stats.documents.saturating_add(1);
                 }
-                for (key, _) in &children {
-                    if let Some((n, last)) = stats.keys.get_mut(*key) {
-                        if *last != document {
-                            *last = document;
-                            *n = n.saturating_add(1);
-                        }
-                    } else if stats.keys.len() < MAX_TRACKED_KEYS {
-                        stats.keys.insert(key.to_vec(), (1, document));
-                    } else {
-                        stats.overflow = true;
-                    }
-                }
+                level = Some(encoded);
             }
         }
-        for (key, value) in children {
+        for (i, element) in doc.iter().enumerate() {
+            if *visits == 0 || (is_array && i >= MAX_ARRAY_ELEMENTS) {
+                return;
+            }
+            let Ok((key, value)) = element else {
+                return;
+            };
+            *visits -= 1;
+            if let Some(stats) = level.as_ref().and_then(|l| levels.get_mut(&***l)) {
+                if let Some((n, last)) = stats.keys.get_mut(key) {
+                    if *last != document {
+                        *last = document;
+                        *n = n.saturating_add(1);
+                    }
+                } else if stats.keys.len() < MAX_TRACKED_KEYS {
+                    stats.keys.insert(key.to_vec(), (1, document));
+                } else {
+                    stats.overflow = true;
+                }
+            }
             let (Value::Doc(child) | Value::Array(child)) = value else {
                 continue;
             };
@@ -753,6 +835,60 @@ mod tests {
             )
             .finish();
         assert_eq!(shaped(&[doc]), ["acl.dupont", "acl.martin", "acl.petit"]);
+    }
+
+    /// Levels and keys the learner never observed are collapsed (fail
+    /// closed, end-of-phase-5 review L2).
+    #[test]
+    fn unobserved_levels_and_keys_are_collapsed() {
+        let learned = DocBuf::new()
+            .doc("name", DocBuf::new().str("first", "Jean"))
+            .finish();
+        let other = DocBuf::new()
+            .doc(
+                "name",
+                DocBuf::new().str("first", "Jean").str("jdupont", "x"),
+            )
+            .doc(
+                "acl",
+                DocBuf::new().doc("mmartin", DocBuf::new().str("role", "r")),
+            )
+            .finish();
+        let shape = Shape::learn(&[Doc::new(&learned).unwrap()]);
+        let mut c = Collector::with_shape(10, shape);
+        c.add_document(Doc::new(&other).unwrap()).unwrap();
+        let paths: Vec<String> = c
+            .into_paths()
+            .into_iter()
+            .map(|(n, _)| n.as_str().to_owned())
+            .collect();
+        assert_eq!(paths, ["name.first", "name.*", "acl.*.*"]);
+    }
+
+    /// The learner walks in the collector's order: a map reached by the
+    /// collector before the visit budget runs out is seen whole by the
+    /// learner, even when siblings listed later exhaust the budget (the
+    /// learner used to list a level's siblings before descending).
+    #[test]
+    fn learner_sees_what_the_collector_reaches() {
+        // One document: the map is a map by its key count alone.
+        let docs: Vec<Vec<u8>> = (0..1)
+            .map(|d| {
+                let mut map = DocBuf::new();
+                for k in 0..=MAX_STATIC_KEYS {
+                    map = map.str(&format!("owner{}x{}", to_letters(d), to_letters(k)), "v");
+                }
+                let mut a = DocBuf::new().doc("x", DocBuf::new().doc("m", map));
+                for i in 0..MAX_VISITS_PER_DOC - 8 {
+                    a = a.i32(&format!("s{}", to_letters(i)), 1);
+                }
+                DocBuf::new().doc("a", a).finish()
+            })
+            .collect();
+        let paths = shaped(&docs);
+        // `a` has more than MAX_STATIC_KEYS keys: a map too.
+        assert!(paths.iter().any(|p| p == "a.*.m.*"), "{paths:?}");
+        assert!(paths.iter().all(|p| !p.contains("owner")), "{paths:?}");
     }
 
     #[test]
