@@ -31,7 +31,7 @@ Optional fields added after protocol 0.1.0 are therefore **negotiated** ([ADR-00
 - **The agent keeps at most 64 tokens** of a list, the contract bound.
 - **Obligations of the first gated producer** (none exists yet; [ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 9):
   - clear the capabilities on any `400` from `/events`, `/findings` or `/jobs/{id}/status` whose body carried a gated field, not only on a heartbeat;
-  - resend the items pointed at with the gated fields stripped, rather than dropping them;
+  - resend the items pointed at with the gated fields stripped, rather than dropping them; the stripped batch goes under a new `batch_id`, so after a console rollback it may duplicate a batch the console already accepted whose `202` was lost;
   - hold note codes as a closed Rust enum (`NoteCode::ALL`) with a contract test against `target-notes.json`, never built with `format!`.
 
 Today the agent populates none of the negotiated fields: `TargetStatus.notes`, `AccessEvent.bytes` and the `objects_sampled` / `skipped_*` counters are always absent.
