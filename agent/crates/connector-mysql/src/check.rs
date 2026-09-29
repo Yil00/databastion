@@ -378,8 +378,11 @@ pub(crate) fn evaluate_privileges(
         }
     }
     if !global.is_empty() {
+        // `count`: the distinct privileges, all of them, when the labels
+        // are cut to the 16 most severe.
         notes.push(
             TargetNote::new(NoteCode::PrivilegeGlobalPrivileges)
+                .with_count(global.len() as u64)
                 .with_labels(global.iter().map(|p| NoteLabel::privilege(p))),
         );
         over.push(format!(
@@ -428,6 +431,7 @@ pub(crate) fn evaluate_privileges(
     if !beyond_select.is_empty() {
         notes.push(
             TargetNote::new(NoteCode::PrivilegeBeyondSelect)
+                .with_count(beyond_select.len() as u64)
                 .with_labels(beyond_select.iter().map(|p| NoteLabel::privilege(p))),
         );
         over.push(format!(
@@ -1159,7 +1163,7 @@ mod tests {
             notes_json(&notes),
             serde_json::json!([
                 {"code": "privilege.global_select"},
-                {"code": "privilege.global_privileges", "labels": ["process", "show_view"]}
+                {"code": "privilege.global_privileges", "count": 2, "labels": ["process", "show_view"]}
             ])
         );
         // Extended variant: global SELECT expected, PROCESS / SHOW VIEW not.
@@ -1170,9 +1174,52 @@ mod tests {
             notes_json(&notes),
             serde_json::json!([
                 {"code": "privilege.extended_variant", "labels": ["select"]},
-                {"code": "privilege.global_privileges", "labels": ["process", "show_view"]}
+                {"code": "privilege.global_privileges", "count": 2, "labels": ["process", "show_view"]}
             ])
         );
+    }
+
+    #[test]
+    fn long_privilege_lists_keep_the_most_severe_labels_and_the_full_count() {
+        let names = [
+            "ALTER",
+            "CREATE",
+            "CREATE VIEW",
+            "DELETE",
+            "DROP",
+            "EVENT",
+            "EXECUTE",
+            "INDEX",
+            "INSERT",
+            "LOCK TABLES",
+            "REFERENCES",
+            "SHOW VIEW",
+            "SHOW DATABASES",
+            "TRIGGER",
+            "UPDATE",
+            "CREATE ROUTINE",
+            "ALTER ROUTINE",
+            "FLUSH_TABLES",
+            "SUPER",
+            "FILE",
+        ];
+        let grants = Grants {
+            global: names.iter().map(|n| g(n)).collect(),
+            scoped: vec![],
+            roles: 0,
+        };
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_registered(&notes);
+        let n = notes
+            .iter()
+            .find(|n| n.code() == NoteCode::PrivilegeGlobalPrivileges)
+            .unwrap();
+        assert_eq!(n.count(), Some(names.len() as u64));
+        let labels: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        assert_eq!(labels.len(), 16);
+        for must in ["super", "file", "execute"] {
+            assert!(labels.iter().any(|l| l == must), "{must} cut: {labels:?}");
+        }
     }
 
     #[test]
@@ -1193,9 +1240,9 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!([
-                {"code": "privilege.global_privileges", "labels": ["file", "super"]},
+                {"code": "privilege.global_privileges", "count": 2, "labels": ["file", "super"]},
                 {"code": "privilege.system_database_select"},
-                {"code": "privilege.beyond_select", "labels": ["other", "execute", "insert"]},
+                {"code": "privilege.beyond_select", "count": 3, "labels": ["other", "execute", "insert"]},
                 {"code": "privilege.grant_option"},
                 {"code": "privilege.roles_not_evaluated", "count": 2}
             ])

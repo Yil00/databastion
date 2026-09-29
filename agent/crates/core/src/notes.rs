@@ -21,6 +21,88 @@ pub(crate) const MAX_NOTES: usize = 16;
 /// Contract `TargetNote.labels.maxItems`.
 const MAX_LABELS: usize = 16;
 
+/// Labels that matter most, in decreasing severity: kept first when a note
+/// has more than [`MAX_LABELS`] labels, so that e.g. `super` or `file` is
+/// never cut from a long privilege list. Any label not listed ranks after
+/// them (in enum order), and `other` last.
+const SEVERITY: &[TargetNoteLabel] = {
+    use TargetNoteLabel as L;
+    &[
+        // PostgreSQL role attributes and predefined roles.
+        L::Superuser,
+        L::Bypassrls,
+        L::Createrole,
+        L::Replication,
+        L::PgExecuteServerProgram,
+        L::PgWriteServerFiles,
+        L::PgReadServerFiles,
+        L::PgWriteAllData,
+        L::PgReadAllData,
+        L::Createdb,
+        L::PgSignalBackend,
+        L::PgCreateSubscription,
+        L::PgDatabaseOwner,
+        L::PgMaintain,
+        // MySQL / MariaDB privileges.
+        L::Super,
+        L::File,
+        L::Process,
+        L::Shutdown,
+        L::CreateUser,
+        L::Reload,
+        L::SystemUser,
+        L::SetUserId,
+        L::SetAnyDefiner,
+        L::SetUser,
+        L::ConnectionAdmin,
+        L::SystemVariablesAdmin,
+        L::RoleAdmin,
+        L::CreateRole,
+        L::DropRole,
+        L::AuditAdmin,
+        L::AuditAbortExempt,
+        L::EncryptionKeyAdmin,
+        L::FirewallAdmin,
+        L::BinlogAdmin,
+        L::BinlogReplay,
+        L::ReplicationSlaveAdmin,
+        L::ReplicationMasterAdmin,
+        L::FederatedAdmin,
+        L::BackupAdmin,
+        L::CloneAdmin,
+        L::Execute,
+        L::CreateRoutine,
+        L::AlterRoutine,
+        L::Trigger,
+        L::Event,
+        L::Drop,
+        L::Delete,
+        L::DeleteHistory,
+        L::Update,
+        L::Insert,
+        L::Alter,
+        L::Create,
+        L::Index,
+        L::References,
+        L::LockTables,
+        L::ReplicationSlave,
+        L::ReplicationClient,
+        L::ShowDatabases,
+    ]
+};
+
+/// Truncation rank of a label: its place in [`SEVERITY`], then any other
+/// label, `other` last.
+fn severity_rank(label: TargetNoteLabel) -> usize {
+    if label == TargetNoteLabel::Other {
+        return usize::MAX;
+    }
+    SEVERITY
+        .iter()
+        .position(|l| *l == label)
+        .unwrap_or(SEVERITY.len())
+}
+
 /// Closed target-note code. Each value is registered in
 /// `shared/protocol/target-notes.json` (checked both ways by
 /// `tests/contract_target_notes.rs`). A code is never built with `format!`
@@ -358,7 +440,7 @@ impl TargetNote {
         self
     }
 
-    /// Adds labels (sorted, deduplicated, at most 16 kept).
+    /// Adds labels (sorted, deduplicated; past 16, the most severe kept).
     #[must_use]
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = NoteLabel>) -> Self {
         self.labels.extend(labels);
@@ -366,10 +448,14 @@ impl TargetNote {
         self
     }
 
+    /// Deduplicates the labels, keeps the [`MAX_LABELS`] most severe
+    /// ([`SEVERITY`], `other` last) and sorts them in enum order.
     fn normalize_labels(&mut self) {
-        self.labels.sort_unstable();
+        self.labels
+            .sort_unstable_by_key(|l| (severity_rank(l.0), *l));
         self.labels.dedup();
         self.labels.truncate(MAX_LABELS);
+        self.labels.sort_unstable();
     }
 
     /// The code.
@@ -560,6 +646,65 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, n.labels());
+    }
+
+    #[test]
+    fn the_most_severe_labels_survive_truncation() {
+        // 18 labels of lesser severity, listed first, then the ones that
+        // matter most: those are kept, `other` and unlisted labels go.
+        let lesser = [
+            "show_view",
+            "create_view",
+            "show_databases",
+            "lock_tables",
+            "references",
+            "index",
+            "create",
+            "alter",
+            "insert",
+            "update",
+            "delete",
+            "drop",
+            "event",
+            "trigger",
+            "alter_routine",
+            "create_routine",
+            "execute",
+            "flush_tables",
+        ];
+        let n = TargetNote::new(NoteCode::PrivilegeGlobalPrivileges)
+            .with_labels([NoteLabel::OTHER])
+            .with_labels(lesser.iter().map(|p| NoteLabel::parse(p)))
+            .with_labels(["super", "file", "process"].map(NoteLabel::parse));
+        let kept: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        assert_eq!(kept.len(), MAX_LABELS);
+        for must in ["super", "file", "process", "execute"] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
+        for gone in ["other", "show_view", "create_view", "flush_tables"] {
+            assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
+        }
+        let mut sorted = n.labels().to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, n.labels(), "sent in enum order");
+        // PostgreSQL attributes rank first, and survive a merge too.
+        let mut notes = Notes::default();
+        notes.add(
+            TargetNote::new(NoteCode::PrivilegeRoleAttributes)
+                .with_labels(lesser.iter().map(|p| NoteLabel::parse(p))),
+        );
+        notes.add(
+            TargetNote::new(NoteCode::PrivilegeRoleAttributes)
+                .with_labels(["superuser", "bypassrls", "createrole"].map(NoteLabel::parse)),
+        );
+        let kept: Vec<String> = notes.as_slice()[0]
+            .labels()
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        for must in ["superuser", "bypassrls", "createrole"] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
     }
 
     #[test]
