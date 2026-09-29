@@ -92,7 +92,8 @@ binary: `cargo build --no-default-features --features postgres`.
   findings that cannot be spooled are counted (`findings_lost_total`). The
   terminal status of a scan waits until the console has answered every
   findings batch of the job (P2-G), for at most 2 minutes; it does not wait
-  for a cancelled scan, while `/findings` is parked after a `501`, once the
+  for a cancelled scan, while `/findings` is parked after a `501`, while the
+  spool worker is backing off (console unreachable, `5xx`, `429`), once the
   agent is suspended, or on shutdown. A status sent with batches still
   spooled is counted (`scan_status_before_flush_total`); the batches are
   sent later (the console accepts them for 24 h after the status).
@@ -185,9 +186,12 @@ review remain the primary controls.
   `state_dir` is refused (`invalid_params`).
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
   `<= 0` are ignored. The heartbeat runs the targets' `check()`
-  concurrently, each bounded at 10 s, so it waits at most 10 s for all of
-  them (P2-G); a check still running then is reported unreachable with
-  `timeout` and the `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
+  concurrently under one 10 s deadline, so it waits at most 10 s for all of
+  them (P2-G); targets reaching the same account (engine, host or socket,
+  port, account) are checked one at a time, to stay within the ADR-0018
+  `MAX_USER_CONNECTIONS` budget. A check still running or waiting for its
+  turn at the deadline is reported unreachable with `timeout` and the
+  `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
@@ -298,7 +302,10 @@ Behavior:
   see [crates/connector-mysql/README.md](crates/connector-mysql/README.md));
   over-privilege (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`,
   `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, `SELECT` on `performance_schema` while no
-  Audit stream runs), `init_connect`, and coverage (views, engines). The same rules apply to
+  Audit stream runs; a database grant is a `LIKE` pattern, so `%`, `m%` or
+  `performance\_schema` count as the system database they match), `init_connect`, and
+  coverage (views, engines). A privilege list that is cut at its `LIMIT` or has an unreadable
+  row leaves the privileges not evaluated. The same rules apply to
   the privileges held through roles (P4-D): every role in `information_schema.APPLICABLE_ROLES`
   (granted directly or through a role, MySQL mandatory roles, the MariaDB default role; enabled
   or not). MySQL: `SHOW GRANTS FOR CURRENT_USER() USING …` with the direct and mandatory roles

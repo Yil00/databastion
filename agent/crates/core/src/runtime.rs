@@ -455,6 +455,10 @@ struct Runtime {
     spool_changed: tokio::sync::Notify,
     /// Wakes an idle spool worker when a batch is spooled.
     spool_pushed: tokio::sync::Notify,
+    /// The spool worker's last send attempt ended in a retry backoff
+    /// (console unreachable, `5xx`, `429`…): a terminal status is then not
+    /// held for the findings.
+    spool_backing_off: std::sync::atomic::AtomicBool,
 }
 
 /// A result endpoint parked after a `501` (not implemented by this
@@ -621,6 +625,7 @@ impl Runtime {
             spool_worker: std::sync::atomic::AtomicBool::new(false),
             spool_changed: tokio::sync::Notify::new(),
             spool_pushed: tokio::sync::Notify::new(),
+            spool_backing_off: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -658,30 +663,47 @@ impl Runtime {
 
     /// Target statuses of a heartbeat, from each connector's `check()`.
     ///
-    /// The checks run **concurrently**, each bounded by `check_timeout`
-    /// ([`CHECK_TIMEOUT`]): they all start together, so the heartbeat waits
-    /// at most one `check_timeout` for all targets, whatever their number
-    /// (at most `MAX_TARGETS`) and however many are slow or hung (P2-G:
-    /// sequential checks delayed it by up to N x 10 s and could raise a
-    /// false `agent.silent`). A check still running at the bound is dropped
-    /// and reported unreachable with `timeout` and `check.timed_out`; the
-    /// connectors cancel their statements server-side when dropped.
+    /// The checks run **concurrently**, under one deadline of
+    /// `check_timeout` ([`CHECK_TIMEOUT`]) from the start of the heartbeat:
+    /// the heartbeat waits at most one `check_timeout` for all targets,
+    /// whatever their number (at most `MAX_TARGETS`) and however many are
+    /// slow or hung (P2-G: sequential checks delayed it by up to N x 10 s
+    /// and could raise a false `agent.silent`). A check still running, or
+    /// still waiting for its turn, at the deadline is dropped and reported
+    /// unreachable with `timeout` and `check.timed_out`; the connectors
+    /// cancel their statements server-side when dropped.
+    ///
+    /// Targets reaching the same account (engine family, host or socket,
+    /// port, account) are checked **one at a time**: a check may hold two
+    /// connections (its session and a `KILL QUERY` one), and ADR-0018 sizes
+    /// the MySQL / MariaDB `MAX_USER_CONNECTIONS` for one check next to a
+    /// scan. Targets naming the same server differently (an alias, an IP
+    /// and a name) are not recognized as the same.
     ///
     /// Chosen over a cache refreshed in the background: every heartbeat
     /// still reports what was checked for it (no stale reachability or
-    /// audit level), no extra task or lifecycle is needed, and the bound
-    /// is the same. Cost: checks of several targets hit their servers at
-    /// the same time (one connection per target; targets sharing an account
-    /// on one server use one connection each, see the MySQL / MariaDB
-    /// `MAX_USER_CONNECTIONS` advice in ADR-0018).
+    /// audit level), no extra task or lifecycle is needed, and the bound is
+    /// the same.
     async fn target_statuses(&self, config: &AgentConfig) -> Vec<TargetStatus> {
+        type Account = (Engine, Option<String>, Option<u16>, Option<PathBuf>, String);
+        let deadline = tokio::time::Instant::now() + self.check_timeout;
+        let mut turns: std::collections::HashMap<Account, Arc<tokio::sync::Mutex<()>>> =
+            std::collections::HashMap::new();
         let checks = config
             .targets
             .iter()
             .filter_map(|target| {
                 // Validated by config; unreachable in practice.
                 let target_id = TargetId::try_from(target.id.as_str()).ok()?;
-                Some(self.target_status(target, target_id))
+                let account = (
+                    target.engine.connector(),
+                    target.host.as_ref().map(|h| h.to_ascii_lowercase()),
+                    target.port,
+                    target.socket.clone(),
+                    target.account.clone(),
+                );
+                let turn = Arc::clone(turns.entry(account).or_default());
+                Some(self.target_status(target, target_id, turn, deadline))
             })
             .collect::<Vec<_>>();
         futures_util::future::join_all(checks).await
@@ -692,6 +714,8 @@ impl Runtime {
         &self,
         target: &crate::config::TargetConfig,
         target_id: TargetId,
+        turn: Arc<tokio::sync::Mutex<()>>,
+        deadline: tokio::time::Instant,
     ) -> TargetStatus {
         let connector = self
             .connectors
@@ -704,7 +728,12 @@ impl Runtime {
                 Some(FailureCode::Unsupported),
                 Vec::new(),
             ),
-            Some(c) => match tokio::time::timeout(self.check_timeout, c.check(target)).await {
+            Some(c) => match tokio::time::timeout_at(deadline, async {
+                let _turn = turn.lock().await;
+                c.check(target).await
+            })
+            .await
+            {
                 Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
                 Err(_) => (
                     false,
@@ -1120,6 +1149,8 @@ impl Runtime {
                 }
             }
             let flushed = self.flush_once(failures.saturating_add(1)).await;
+            self.spool_backing_off
+                .store(matches!(flushed, Ok(Flush::Retry(_))), Ordering::Relaxed);
             // A scan waiting for its findings re-checks the spool.
             self.spool_changed.notify_waiters();
             let (delay, idle) = match flushed? {
@@ -2040,8 +2071,10 @@ impl Runtime {
     /// - at most `status_flush_wait` ([`STATUS_FLUSH_WAIT`]);
     /// - not at all without a running spool worker, nor for a cancelled
     ///   scan (shutdown or suspension: nothing is sent meanwhile);
-    /// - it ends when `/findings` is parked after a `501`, when the agent
-    ///   stops being active, and on shutdown.
+    /// - it ends when `/findings` is parked after a `501`, when the spool
+    ///   worker's last attempt ended in a retry backoff (console
+    ///   unreachable, `5xx`, `429`: queued scans are not held for an
+    ///   outage), when the agent stops being active, and on shutdown.
     ///
     /// Past these bounds the status is sent anyway and counted
     /// (`scan_status_before_flush_total`); the batches stay spooled and are
@@ -2066,7 +2099,14 @@ impl Runtime {
                 if pending() == 0 {
                     return true;
                 }
-                if !self.spool_worker.load(Ordering::Relaxed) || self.endpoint_parked(true) {
+                // No point holding the status while the console does not
+                // take batches: parked `/findings`, or the spool worker in
+                // a retry backoff (console down: the status report would
+                // wait on it too, and queued scans behind it).
+                if !self.spool_worker.load(Ordering::Relaxed)
+                    || self.endpoint_parked(true)
+                    || self.spool_backing_off.load(Ordering::Relaxed)
+                {
                     return false;
                 }
                 tokio::select! {

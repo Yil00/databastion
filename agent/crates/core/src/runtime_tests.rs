@@ -3701,11 +3701,20 @@ async fn scan_status_is_sent_only_after_its_findings_are_acknowledged() {
     assert_eq!(order, ["findings", "findings", "findings", "status"]);
 }
 
+/// Acknowledges a findings batch only after 2 s (a console slower than
+/// the flush wait of the test).
+struct StalledAck;
+
+impl wiremock::Respond for StalledAck {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        SlowAck.respond(request).set_delay(Duration::from_secs(2))
+    }
+}
+
 #[tokio::test]
 async fn scan_status_waits_for_its_findings_only_up_to_the_bound() {
     let server = MockServer::start().await;
-    // The console keeps answering 503: the batches stay spooled.
-    let (_env, mut rt, seen) = flushed_scan_runtime(&server, error_body(503, "unavailable")).await;
+    let (_env, mut rt, seen) = flushed_scan_runtime(&server, StalledAck).await;
     rt.status_flush_wait = Duration::from_millis(300);
     let started = Instant::now();
     run_scan_and_spool_workers(&rt, &server).await;
@@ -3716,6 +3725,25 @@ async fn scan_status_waits_for_its_findings_only_up_to_the_bound() {
         "succeeded"
     );
     // Sent at the bound with the batches still spooled, never dropped.
+    assert_eq!(*seen.lock().unwrap(), [3]);
+    assert!(rt.lock_spool().status().batches.0 >= 2);
+    assert_eq!(metric(&rt, "scan_status_before_flush_total"), 1.0);
+}
+
+#[tokio::test]
+async fn scan_status_is_not_held_while_the_console_is_down() {
+    let server = MockServer::start().await;
+    // The console keeps answering 503: the spool worker backs off, and
+    // the status does not wait for the (2 min) bound.
+    let (_env, rt, seen) = flushed_scan_runtime(&server, error_body(503, "unavailable")).await;
+    let started = Instant::now();
+    run_scan_and_spool_workers(&rt, &server).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let got = statuses(&server).await;
+    assert_eq!(
+        got.iter().find(|(i, _)| i == JOB).unwrap().1["status"],
+        "succeeded"
+    );
     assert_eq!(*seen.lock().unwrap(), [3]);
     assert_eq!(rt.lock_spool().status().batches.0, 3);
     assert_eq!(metric(&rt, "scan_status_before_flush_total"), 1.0);
@@ -3790,7 +3818,8 @@ impl Connector for Mixed {
     }
 }
 
-/// `env.config` with its target copied under each of `ids`.
+/// `env.config` with its target copied under each of `ids`, each with an
+/// account of its own, or the `shared` one for ids starting `shared-`.
 fn with_targets(env: &Env, ids: &[&str]) -> AgentConfig {
     let mut config = env.config.clone();
     let template = config.targets[0].clone();
@@ -3799,10 +3828,112 @@ fn with_targets(env: &Env, ids: &[&str]) -> AgentConfig {
         .map(|id| {
             let mut t = template.clone();
             t.id = (*id).to_owned();
+            t.account = if id.starts_with("shared-") {
+                "shared".to_owned()
+            } else {
+                (*id).to_owned()
+            };
             t
         })
         .collect();
     config
+}
+
+/// Takes 200 ms per `check()`; records the most checks of the `shared`
+/// account running at once.
+#[derive(Default)]
+struct Turns {
+    running: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Turns {
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        let shared = target.account == "shared";
+        if shared {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if shared {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::None,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+}
+
+struct SharedTurns(Arc<Turns>);
+
+#[async_trait::async_trait]
+impl Connector for SharedTurns {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        self.0.check(target).await
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn targets_sharing_an_account_are_checked_one_at_a_time() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let ids = ["shared-a", "own-a", "shared-b", "own-b", "shared-c"];
+    let config = with_targets(&env, &ids);
+    let turns = Arc::new(Turns::default());
+    let mut rt = Runtime::new(
+        &env.config_path,
+        config.clone(),
+        vec![Box::new(SharedTurns(Arc::clone(&turns)))],
+    )
+    .unwrap();
+    // Room for two 200 ms checks of the shared account, not three.
+    rt.check_timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let statuses = rt.target_statuses(&config).await;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    // ADR-0018 connection budget: one check per account at a time.
+    assert_eq!(turns.most.load(Ordering::SeqCst), 1);
+    let got: Vec<(&str, bool, Option<FailureCode>)> = statuses
+        .iter()
+        .map(|s| (s.target_id.as_str(), s.reachable, s.last_error))
+        .collect();
+    // Other accounts run next to them; the third check of the shared
+    // account is still waiting for its turn at the deadline.
+    assert_eq!(
+        got,
+        [
+            ("shared-a", true, None),
+            ("own-a", true, None),
+            ("shared-b", true, None),
+            ("own-b", true, None),
+            ("shared-c", false, Some(FailureCode::Timeout)),
+        ]
+    );
 }
 
 #[tokio::test]
