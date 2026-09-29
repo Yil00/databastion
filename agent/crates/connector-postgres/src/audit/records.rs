@@ -279,6 +279,25 @@ struct JsonLine {
     application_name: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    error_severity: Option<String>,
+    /// Only its presence is checked (pgaudit hides the context); the
+    /// text is never kept.
+    #[serde(default)]
+    context: Option<serde::de::IgnoredAny>,
+}
+
+/// Severity written in the server log for a `pgaudit.log_level` value
+/// (`debug1`…`debug5` are all written `DEBUG`). Default: `LOG`.
+pub(crate) fn expected_severity(log_level: Option<&str>) -> String {
+    let level = log_level.unwrap_or("log").trim().to_ascii_uppercase();
+    if level.starts_with("DEBUG") {
+        "DEBUG".to_owned()
+    } else if level.is_empty() {
+        "LOG".to_owned()
+    } else {
+        level
+    }
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -287,7 +306,15 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Parses one log record; `None` unless it is a well-formed pgaudit
 /// record.
-pub(crate) fn parse_record(format: Format, record: &[u8]) -> Option<AuditRecord> {
+///
+/// Forgery: any role can write `AUDIT: …` into the server log (`RAISE LOG`
+/// in PL/pgSQL). pgaudit emits its records at `pgaudit.log_level` with the
+/// error context hidden, so a record whose severity differs from
+/// `severity` (see [`expected_severity`]) or that carries a context (a
+/// `RAISE` always has one, `… at RAISE`) is dropped. What remains forgeable
+/// needs a role that can hide the context (`log_error_verbosity = terse`
+/// is superuser-only) or native code (C extensions, untrusted PLs).
+pub(crate) fn parse_record(format: Format, record: &[u8], severity: &str) -> Option<AuditRecord> {
     match format {
         Format::Jsonlog => {
             // Cheap pre-filter: other records are never deserialized.
@@ -295,6 +322,9 @@ pub(crate) fn parse_record(format: Format, record: &[u8]) -> Option<AuditRecord>
                 return None;
             }
             let line: JsonLine = serde_json::from_slice(record).ok()?;
+            if line.context.is_some() || line.error_severity.as_deref() != Some(severity) {
+                return None;
+            }
             let message = Zeroizing::new(line.message?);
             let audit = parse_pgaudit(&message)?;
             Some(AuditRecord {
@@ -314,6 +344,10 @@ pub(crate) fn parse_record(format: Format, record: &[u8]) -> Option<AuditRecord>
             let text = std::str::from_utf8(record).ok()?;
             let f = parse_csv(text)?;
             if f.len() < 23 {
+                return None;
+            }
+            // error_severity (11), context (18).
+            if f[11].as_str() != severity || !f[18].is_empty() {
                 return None;
             }
             let audit = parse_pgaudit(&f[13])?;
@@ -425,7 +459,7 @@ mod tests {
 
     #[test]
     fn jsonlog_audit_record_is_parsed() {
-        let r = parse_record(Format::Jsonlog, JSON_AUDIT.as_bytes()).unwrap();
+        let r = parse_record(Format::Jsonlog, JSON_AUDIT.as_bytes(), "LOG").unwrap();
         assert_eq!(r.user, "postgres");
         assert_eq!(r.database, "shop");
         assert_eq!(r.remote.as_deref(), Some("127.0.0.1"));
@@ -450,7 +484,7 @@ mod tests {
         let (records, s) = split(Format::Csvlog, data.as_bytes(), MAX_RECORD_BYTES);
         assert_eq!(records.len(), 2);
         assert_eq!(s.pending(), "partial,\"open".len() as u64);
-        let r = parse_record(Format::Csvlog, &records[0]).unwrap();
+        let r = parse_record(Format::Csvlog, &records[0], "LOG").unwrap();
         assert_eq!(r.remote.as_deref(), Some("127.0.0.1"));
         assert_eq!(r.application, "pg_dump");
         assert_eq!(r.audit.command, "PREPARE");
@@ -459,12 +493,42 @@ mod tests {
     }
 
     #[test]
+    fn forged_records_are_dropped() {
+        // RAISE LOG 'AUDIT: …' from PL/pgSQL (as logged by PostgreSQL 16).
+        let raise = r#"{"timestamp":"2026-09-28 21:45:31.320 UTC","user":"mallory","dbname":"shop","remote_host":"127.0.0.1","session_id":"s","error_severity":"LOG","message":"AUDIT: SESSION,1,1,READ,SELECT,TABLE,crm.fake,select 1,<not logged>,5","context":"PL/pgSQL function inline_code_block line 1 at RAISE","application_name":"psql"}"#;
+        assert!(parse_record(Format::Jsonlog, raise.as_bytes(), "LOG").is_none());
+        // Another severity than pgaudit.log_level (RAISE NOTICE, WARNING…).
+        let notice = JSON_AUDIT.replace("\"LOG\"", "\"NOTICE\"");
+        assert!(parse_record(Format::Jsonlog, notice.as_bytes(), "LOG").is_none());
+        assert!(parse_record(Format::Jsonlog, notice.as_bytes(), "NOTICE").is_some());
+        // csvlog: context column (18) set.
+        let csv = CSV_MULTILINE.trim_end().replacen(
+            ",,,,,,,,,\"pg_dump\"",
+            ",,,,,\"PL/pgSQL function f() line 3 at RAISE\",,,,\"pg_dump\"",
+            1,
+        );
+        assert_ne!(csv, CSV_MULTILINE.trim_end());
+        assert!(parse_record(Format::Csvlog, csv.as_bytes(), "LOG").is_none());
+        assert!(
+            parse_record(
+                Format::Csvlog,
+                CSV_MULTILINE.trim_end().as_bytes(),
+                "WARNING"
+            )
+            .is_none()
+        );
+        assert_eq!(expected_severity(Some("debug3")), "DEBUG");
+        assert_eq!(expected_severity(Some("notice")), "NOTICE");
+        assert_eq!(expected_severity(None), "LOG");
+    }
+
+    #[test]
     fn non_audit_records_are_not_parsed() {
         let other = r#"{"timestamp":"2026-09-28 21:45:31.568 UTC","user":"postgres","message":"connection authorized: user=postgres","detail":"AUDIT: SESSION,1,1,READ,SELECT,,,x,<not logged>"}"#;
-        assert!(parse_record(Format::Jsonlog, other.as_bytes()).is_none());
+        assert!(parse_record(Format::Jsonlog, other.as_bytes(), "LOG").is_none());
         let error = r#"{"message":"duplicate key","statement":"insert into t values ('secret')","error_severity":"ERROR"}"#;
-        assert!(parse_record(Format::Jsonlog, error.as_bytes()).is_none());
-        assert!(parse_record(Format::Csvlog, b"a,b,c").is_none());
+        assert!(parse_record(Format::Jsonlog, error.as_bytes(), "LOG").is_none());
+        assert!(parse_record(Format::Csvlog, b"a,b,c", "LOG").is_none());
     }
 
     #[test]
@@ -515,15 +579,15 @@ mod tests {
             b"{\"message\":\"AUDIT: SESSION,18446744073709551616,1,READ,SELECT,,,x,<not logged>\"}",
             &[0xff, 0xfe, b'"', b','],
         ] {
-            let _ = parse_record(Format::Jsonlog, line);
-            let _ = parse_record(Format::Csvlog, line);
+            let _ = parse_record(Format::Jsonlog, line, "LOG");
+            let _ = parse_record(Format::Csvlog, line, "LOG");
         }
         let deep = format!(
             "{{\"message\":\"AUDIT: \",\"x\":{}{}}}",
             "[".repeat(10_000),
             "]".repeat(10_000)
         );
-        assert!(parse_record(Format::Jsonlog, deep.as_bytes()).is_none());
+        assert!(parse_record(Format::Jsonlog, deep.as_bytes(), "LOG").is_none());
     }
 
     #[test]

@@ -311,6 +311,7 @@ dependencies = [
  "databastion-classifiers",
  "databastion-core",
  "futures-util",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

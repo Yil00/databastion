@@ -59,6 +59,7 @@ pub(crate) struct Polled {
 
 pub(crate) struct Tailer {
     path: PathBuf,
+    format: Format,
     file: Option<(File, u64, u64)>,
     /// Offset read up to in the open file.
     offset: u64,
@@ -74,21 +75,30 @@ pub(crate) struct Tailer {
     pub(crate) rotations: u64,
 }
 
+/// Opens the log without blocking (a FIFO or device planted at the path
+/// cannot block the open: `O_NONBLOCK`, `O_NOCTTY`), then checks the
+/// **handle** is a regular file (no stat-then-open race). Blocking I/O:
+/// call from a blocking thread.
 fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailError> {
-    let err = |e: std::io::Error| TailError::Unreadable(e.kind());
-    let meta = std::fs::metadata(path).map_err(err)?;
-    if !meta.file_type().is_file() {
-        return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
-    }
-    let file = File::open(path).map_err(err)?;
-    let meta = file.metadata().map_err(err)?;
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| TailError::Unreadable(std::io::Error::from(e).kind()))?;
+    let file = File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|e| TailError::Unreadable(e.kind()))?;
     if !meta.file_type().is_file() {
         return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
     }
     Ok((file, meta.dev(), meta.ino(), meta.len()))
 }
 
-/// Whether the configured log file can be opened and read (for `check()`).
+/// Whether the configured log file can be opened and read (for `check()`
+/// and the source choice). Blocking I/O: call from a blocking thread.
 pub(crate) fn readable(path: &std::path::Path) -> bool {
     open_regular(path).is_ok_and(|(mut f, _, _, _)| {
         let mut b = [0u8; 1];
@@ -100,6 +110,7 @@ impl Tailer {
     pub(crate) fn new(path: PathBuf, format: Format, store: Option<CursorStore>) -> Self {
         Self {
             path,
+            format,
             file: None,
             offset: 0,
             tail: Zeroizing::new(Vec::new()),
@@ -108,6 +119,11 @@ impl Tailer {
             oversized: 0,
             rotations: 0,
         }
+    }
+
+    /// Format of the log.
+    pub(crate) fn format(&self) -> Format {
+        self.format
     }
 
     fn load_cursor(&self) -> Option<Cursor> {
@@ -345,6 +361,28 @@ mod tests {
         let p2 = t.poll().unwrap();
         assert!(!p2.more);
         assert_eq!(p.records.len() + p2.records.len(), 9 * 1024);
+    }
+
+    #[test]
+    fn a_fifo_never_blocks() {
+        let d = Dir::new("fifo2");
+        let fifo = d.0.join("pg.json");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !status.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                readable(&path),
+                Tailer::new(path, Format::Jsonlog, None).poll().is_err(),
+            ));
+        });
+        let (ok, err) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO blocked");
+        assert!(!ok && err);
     }
 
     #[test]

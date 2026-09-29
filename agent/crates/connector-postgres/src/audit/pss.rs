@@ -168,7 +168,7 @@ impl PssPoller {
                 continue;
             };
             let user = catalog_text(r, 6).map_err(get)?.unwrap_or_default();
-            if user.is_empty() || user == self.own_account {
+            if user.is_empty() {
                 continue;
             }
             let database = catalog_text(r, 7).map_err(get)?.unwrap_or_default();
@@ -216,6 +216,10 @@ impl PssPoller {
             }
         }
         tx.commit().await?;
+        // A delta without an analysis (text limit per poll, cache cleared)
+        // is carried over: the previous counters stay the baseline, so the
+        // next poll reports it in full.
+        carry_over(&mut snapshot, &prev, &changed, &self.analyses);
         let deltas: Vec<StatementDelta<'_>> = changed
             .iter()
             .filter_map(|(k, user, database, calls, n)| {
@@ -228,7 +232,7 @@ impl PssPoller {
                 })
             })
             .collect();
-        let events = pss_events(&deltas, self.last_poll, now);
+        let events = pss_events(&deltas, &self.own_account, self.last_poll, now);
         drop(deltas);
         self.snapshot = Some(snapshot);
         self.last_poll = now;
@@ -236,6 +240,27 @@ impl PssPoller {
             sink.submit(e).await.map_err(|_| PollError::SinkClosed)?;
         }
         Ok(())
+    }
+}
+
+fn carry_over<V>(
+    snapshot: &mut HashMap<Key, Counters>,
+    prev: &HashMap<Key, Counters>,
+    changed: &[(Key, String, String, u64, u64)],
+    analyses: &HashMap<Key, V>,
+) {
+    for (k, ..) in changed {
+        if analyses.contains_key(k) {
+            continue;
+        }
+        match prev.get(k) {
+            Some(p) => {
+                snapshot.insert(*k, *p);
+            }
+            None => {
+                snapshot.remove(k);
+            }
+        }
     }
 }
 
@@ -255,6 +280,40 @@ impl From<PgError> for PollError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deltas_without_analysis_carry_over() {
+        let c = |calls, rows| Counters { calls, rows };
+        let (k1, k2, k3) = ((1, 1, 1, true), (1, 1, 2, true), (1, 1, 3, true));
+        let prev: HashMap<Key, Counters> = [(k1, c(5, 5)), (k2, c(1, 1))].into();
+        let mut snapshot: HashMap<Key, Counters> =
+            [(k1, c(9, 9)), (k2, c(4, 4)), (k3, c(2, 2))].into();
+        let changed = vec![
+            (k1, String::new(), String::new(), 4, 4),
+            (k2, String::new(), String::new(), 3, 3),
+            (k3, String::new(), String::new(), 2, 2),
+        ];
+        // Only k1 was analyzed this poll.
+        let analyses: HashMap<Key, ()> = [(k1, ())].into();
+        carry_over(&mut snapshot, &prev, &changed, &analyses);
+        assert_eq!(snapshot[&k1].calls, 9);
+        assert_eq!(
+            snapshot[&k2].calls, 1,
+            "baseline kept: the next delta includes this one"
+        );
+        assert!(
+            !snapshot.contains_key(&k3),
+            "new entry: seen as new next time"
+        );
+        assert_eq!(
+            delta(c(4, 4), snapshot.get(&k2).copied(), false),
+            Some((3, 3))
+        );
+        assert_eq!(
+            delta(c(2, 2), snapshot.get(&k3).copied(), false),
+            Some((2, 2))
+        );
+    }
 
     #[test]
     fn deltas_handle_baseline_resets_and_new_entries() {

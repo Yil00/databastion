@@ -30,6 +30,8 @@ futures-util.workspace = true
 # Audit: jsonlog records and the persisted cursor (serde only; no protocol types).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# Audit log opened with O_NONBLOCK / O_NOCTTY, checked on the handle (no `unsafe`).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }

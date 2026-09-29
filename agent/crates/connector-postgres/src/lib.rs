@@ -81,7 +81,7 @@ impl Connector for PostgresConnector {
         cfg: &AuditConfig,
         sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        audit::audit_stream(cfg, sink).await
+        audit::audit_stream(cfg, sink, &self.check_state).await
     }
 
     fn supports_audit(&self) -> bool {

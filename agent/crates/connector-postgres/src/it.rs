@@ -1280,14 +1280,24 @@ fn start_audit(
     tokio::task::JoinHandle<Result<(), ConnectorError>>,
     tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
 ) {
+    start_audit_with(Arc::new(PostgresConnector::new()), t, state)
+}
+
+fn start_audit_with(
+    connector: Arc<PostgresConnector>,
+    t: &TargetConfig,
+    state: &std::path::Path,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectorError>>,
+    tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
+) {
     let limits = Limits {
         min_audit_poll_interval_s: 1,
         ..Limits::default()
     };
     let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(state.to_owned());
     let (sink, rx) = databastion_core::EventSink::channel(10_000);
-    let task =
-        tokio::spawn(async move { PostgresConnector::new().audit_stream(&cfg, &sink).await });
+    let task = tokio::spawn(async move { connector.audit_stream(&cfg, &sink).await });
     (task, rx)
 }
 
@@ -1413,16 +1423,21 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
     let mut streams = Vec::new();
     for (i, (path, format)) in logs_available.iter().enumerate() {
         let (dir, t) = audit_target(&u, &format!("pg-audit-{i}"), Some((path, format)));
-        // check(): Full once the log is readable (ADR-0015 decision 4).
-        let connector = PostgresConnector::new();
+        // check(): Partial until the stream has read a pgaudit record, then
+        // Full (ADR-0015 decision 4).
+        let connector = Arc::new(PostgresConnector::new());
         let health = connector.check(&t).await;
-        assert_eq!(health.audit_level, AuditLevel::Full, "{format}: {health:?}");
+        assert_eq!(
+            health.audit_level,
+            AuditLevel::Partial,
+            "{format}: {health:?}"
+        );
         assert_eq!(
             connector.audit_source(&t),
             Some(databastion_classifiers::masking::EventSource::Pgaudit)
         );
-        let (task, rx) = start_audit(&t, &state.0);
-        streams.push((dir, t, task, rx, *format));
+        let (task, rx) = start_audit_with(Arc::clone(&connector), &t, &state.0);
+        streams.push((dir, t, task, rx, *format, connector));
     }
     // The tailers start at the end of the log: let them open it.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1454,16 +1469,31 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
     ))
     .await
     .ok();
+    // A forged pgaudit record (any role can RAISE LOG): never an event.
+    a.batch_execute(
+        "DO $$ BEGIN RAISE LOG 'AUDIT: SESSION,1,1,READ,SELECT,TABLE,crm.it_forged,select 1,<not logged>,99999'; END $$",
+    )
+    .await
+    .unwrap();
+    // COPY to a program inside a DO block.
+    a.batch_execute(
+        "DO $$ BEGIN COPY (SELECT id FROM crm.customers) TO PROGRAM 'cat > /dev/null'; END $$",
+    )
+    .await
+    .unwrap();
 
-    for (_dir, t, task, mut rx, format) in streams {
+    for (_dir, t, task, mut rx, format, connector) in streams {
         let mut events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
             has(ev, "customers", "signature.pg_dump")
                 && has(ev, "it_audit_big", "volume.large_result")
                 && has(ev, "it_audit_big", "shape.full_table_read")
+                && has(ev, "customers", "signature.copy_to_program")
         })
         .await;
         task.abort();
+        let health = connector.check(&t).await;
+        assert_eq!(health.audit_level, AuditLevel::Full, "{format}: {health:?}");
         let all: Vec<String> = events.iter().map(describe).collect();
         for d in &all {
             eprintln!("{format}: {d}");
@@ -1487,6 +1517,14 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         assert!(
             has(&events, "it_audit_big", "shape.full_table_read"),
             "{format}: {all:#?}"
+        );
+        assert!(
+            has(&events, "customers", "signature.copy_to_program"),
+            "{format}: {all:#?}"
+        );
+        assert!(
+            !all.iter().any(|d| d.contains("it_forged")),
+            "forged record: {all:#?}"
         );
         let big = events
             .iter()

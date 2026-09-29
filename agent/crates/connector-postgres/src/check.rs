@@ -74,6 +74,8 @@ pub(crate) struct AuditProbe {
     pub(crate) pgaudit_rows: bool,
     /// `pgaudit.role` is set (object audit).
     pub(crate) pgaudit_object_audit: bool,
+    /// `pgaudit.log_level` (severity of the pgaudit records).
+    pub(crate) pgaudit_log_level: Option<String>,
 }
 
 /// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
@@ -180,14 +182,36 @@ struct Cached {
 }
 
 /// Per target and database: last detailed report; per target: source of
-/// the last reported level.
+/// the last reported level, and when the Audit stream last parsed a
+/// pgaudit record.
 #[derive(Default)]
 pub(crate) struct CheckState {
     reports: Mutex<HashMap<(String, String), Cached>>,
     sources: Mutex<HashMap<String, EventSource>>,
+    records: Mutex<HashMap<String, Instant>>,
 }
 
+/// Full needs a pgaudit record parsed within this period.
+pub(crate) const RECORD_FRESHNESS: Duration = Duration::from_secs(24 * 3600);
+
 impl CheckState {
+    /// The Audit stream of `target_id` parsed a pgaudit record.
+    pub(crate) fn note_record(&self, target_id: &str) {
+        self.records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target_id.to_owned(), Instant::now());
+    }
+
+    /// Whether a pgaudit record of `target_id` was parsed recently.
+    pub(crate) fn recent_record(&self, target_id: &str) -> bool {
+        self.records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .is_some_and(|t| t.elapsed() < RECORD_FRESHNESS)
+    }
+
     /// Source of the level last reported for `target_id`.
     pub(crate) fn audit_source(&self, target_id: &str) -> Option<EventSource> {
         self.sources
@@ -291,7 +315,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 .to_owned(),
         );
     }
-    let log_readable = crate::audit::log_readable(target);
+    let log_readable = crate::audit::log_readable(target).await;
     if settings.audit_log.is_some() && !log_readable {
         notes.push("the configured audit log is not readable by the agent".to_owned());
     }
@@ -346,6 +370,14 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         if let Some(r) = state.cached(&key) {
             notes.extend(summary(&r));
         }
+    }
+    if level == AuditLevel::Full && !state.recent_record(&target.id) {
+        // ADR-0015 decision 4: Full once the log is actually read.
+        level = AuditLevel::Partial;
+        notes.push(
+            "Full once the Audit stream has read a pgaudit record (none in the last 24 h)"
+                .to_owned(),
+        );
     }
     notes.sort();
     notes.dedup();
@@ -449,6 +481,35 @@ fn log_report(target: &TargetConfig, database: &str, r: &Report) {
     }
 }
 
+/// Audit prerequisites of a target, from the same probe and rule as
+/// `check()`: the level provable now (before the freshness rule), and the
+/// severity pgaudit writes its records at.
+pub(crate) struct Prerequisites {
+    pub(crate) level: AuditLevel,
+    pub(crate) severity: String,
+}
+
+pub(crate) async fn prerequisites(
+    target: &TargetConfig,
+    timeouts: Timeouts,
+) -> Result<Prerequisites, PgError> {
+    let log_readable = crate::audit::log_readable(target).await;
+    let mut level = AuditLevel::None;
+    let mut log_level: Option<String> = None;
+    for database in &target.postgres_settings().databases {
+        let session = Session::connect(target, database, timeouts).await?;
+        let probe = audit_probe(&session, timeouts).await?;
+        level = level.max(probe.level(log_readable));
+        if log_level.is_none() {
+            log_level = probe.pgaudit_log_level.clone();
+        }
+    }
+    Ok(Prerequisites {
+        level,
+        severity: crate::audit::records::expected_severity(log_level.as_deref()),
+    })
+}
+
 /// Runs one statement in its own read-only transaction (a failing probe
 /// does not abort the others).
 async fn probe(
@@ -522,6 +583,7 @@ pub(crate) async fn audit_probe(
             p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
             p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
+            p.pgaudit_log_level = setting(3)?;
         }
         Err(e) if e.fatal => return Err(e),
         Err(_) => p.pgaudit_loaded = None,
@@ -671,6 +733,15 @@ mod tests {
     }
 
     #[test]
+    fn full_needs_a_recent_record() {
+        let state = CheckState::default();
+        assert!(!state.recent_record("t"));
+        state.note_record("t");
+        assert!(state.recent_record("t"));
+        assert!(!state.recent_record("u"));
+    }
+
+    #[test]
     fn pgaudit_log_setting_is_read() {
         assert!(pgaudit_logs_reads("read, write"));
         assert!(pgaudit_logs_reads("ALL"));
@@ -691,6 +762,7 @@ mod tests {
             pgaudit_reads: true,
             pgaudit_rows: false,
             pgaudit_object_audit: false,
+            pgaudit_log_level: None,
         };
         // Full needs the audit log to be readable (ADR-0015 decision 4).
         assert_eq!(full_prereqs.level(true), AuditLevel::Full);
