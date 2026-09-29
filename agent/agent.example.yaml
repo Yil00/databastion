@@ -84,6 +84,12 @@ targets:
       # ADR-0018 extended grant variant (SELECT ON *.*): check() then reports the
       # global SELECT as an expected warning instead of over-privilege.
       extended_grants: false
+      # Audit log file (P4-B), read by the agent on this host (never through SQL):
+      #   server_audit: MariaDB server_audit plugin (server_audit_output_type=file)
+      #   json: Percona audit_log (audit_log_format=JSON) or audit_log_filter
+      #         (audit_log_filter.format=JSON); XML and CSV are not supported
+      # Without it, Audit uses performance_schema (needs SELECT on it, ADR-0018).
+      # audit_log: {path: /var/log/mysql/server_audit.log, format: server_audit}
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

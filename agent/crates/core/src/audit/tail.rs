@@ -48,12 +48,22 @@ pub enum Framing {
     /// CSV records: a newline inside a quoted field does not end the
     /// record (`csvlog`).
     Csv,
+    /// Top-level JSON objects, one per line or pretty-printed over several
+    /// lines, possibly inside an array (`audit_log_filter` / MySQL
+    /// Enterprise JSON): a record is a balanced `{…}` (braces inside
+    /// strings ignored); bytes between objects (`[`, `,`, `]`, blanks) are
+    /// skipped. A line whose first non-blank byte is `{` always starts a
+    /// new record, so a damaged record (unbalanced, or a string cut by a
+    /// newline, which valid JSON cannot hold) is dropped instead of
+    /// swallowing the records after it.
+    JsonObjects,
 }
 
 /// Splits a byte stream into records (a newline ends a record; with
 /// [`Framing::Csv`], only outside a quoted field). Bounded: see
 /// [`MAX_RECORD_BYTES`].
 pub struct Splitter {
+    framing: Framing,
     csv: bool,
     buf: Zeroizing<Vec<u8>>,
     in_quotes: bool,
@@ -62,7 +72,15 @@ pub struct Splitter {
     pending: u64,
     /// Records skipped for their size.
     pub oversized: u64,
+    /// Records dropped as damaged ([`Framing::JsonObjects`]).
+    pub malformed: u64,
     max: usize,
+    /// [`Framing::JsonObjects`]: nesting depth, inside a string, after a
+    /// backslash in a string, at the start of a line.
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    line_start: bool,
 }
 
 impl Splitter {
@@ -76,13 +94,19 @@ impl Splitter {
     #[must_use]
     pub fn with_max(framing: Framing, max: usize) -> Self {
         Self {
+            framing,
             csv: framing == Framing::Csv,
             buf: Zeroizing::new(Vec::new()),
             in_quotes: false,
             skipping: false,
             pending: 0,
             oversized: 0,
+            malformed: 0,
             max,
+            depth: 0,
+            in_string: false,
+            escaped: false,
+            line_start: true,
         }
     }
 
@@ -98,10 +122,18 @@ impl Splitter {
         self.in_quotes = false;
         self.skipping = false;
         self.pending = 0;
+        self.depth = 0;
+        self.in_string = false;
+        self.escaped = false;
+        self.line_start = true;
     }
 
     /// Feeds bytes; complete records are appended to `out`.
     pub fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
+        if self.framing == Framing::JsonObjects {
+            self.feed_json(data, out);
+            return;
+        }
         for &b in data {
             self.pending += 1;
             if self.csv && b == b'"' {
@@ -133,6 +165,90 @@ impl Splitter {
             }
             self.buf.push(b);
         }
+    }
+}
+
+impl Splitter {
+    fn feed_json(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
+        for &b in data {
+            self.pending += 1;
+            if b == b'\n' {
+                if self.in_string {
+                    // Valid JSON has no raw newline in a string.
+                    self.in_string = false;
+                    self.escaped = false;
+                }
+                self.line_start = true;
+                self.keep(b);
+                continue;
+            }
+            let blank = matches!(b, b' ' | b'\t' | b'\r');
+            if self.line_start && !blank {
+                self.line_start = false;
+                if b == b'{' && self.depth > 0 {
+                    // A new record starts: the open one is damaged.
+                    self.malformed += 1;
+                    self.depth = 0;
+                    self.buf.clear();
+                    self.skipping = false;
+                }
+            }
+            if self.depth == 0 {
+                if b == b'{' {
+                    self.depth = 1;
+                    self.in_string = false;
+                    self.escaped = false;
+                    self.skipping = false;
+                    self.buf.clear();
+                    self.keep(b);
+                }
+                continue;
+            }
+            self.keep(b);
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        if self.skipping {
+                            self.skipping = false;
+                            self.oversized += 1;
+                        } else {
+                            let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
+                            record.extend_from_slice(&self.buf);
+                            out.push(record);
+                        }
+                        self.buf.clear();
+                        self.pending = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Keeps a byte of the current JSON record, within the bound.
+    fn keep(&mut self, b: u8) {
+        if self.depth == 0 || self.skipping {
+            return;
+        }
+        if self.buf.len() >= self.max {
+            self.skipping = true;
+            self.buf.clear();
+            return;
+        }
+        self.buf.push(b);
     }
 }
 
@@ -533,5 +649,42 @@ mod tests {
         assert!(out.is_empty());
         assert!(s.buf.len() <= 16);
         assert_eq!(s.pending(), 100_000);
+    }
+
+    #[test]
+    fn json_objects_are_framed_in_both_layouts() {
+        let lines = b"{\"audit_record\":{\"name\":\"Query\",\"sqltext\":\"select '}' \\\" {\"}}\n{\"a\":1}\n{\"par";
+        let mut s = Splitter::new(Framing::JsonObjects);
+        let mut out = Vec::new();
+        s.feed(lines, &mut out);
+        assert_eq!(out.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&out[0]).unwrap();
+        assert_eq!(first["audit_record"]["sqltext"], "select '}' \" {");
+        assert_eq!(s.pending(), 6);
+        // Pretty-printed array, cut in the middle of the second record.
+        let pretty = b"[\n  {\n    \"id\": 1,\n    \"account\": { \"user\": \"root\" }\n  },\n  {\n    \"id\": 2,";
+        let mut s = Splitter::new(Framing::JsonObjects);
+        let mut out = Vec::new();
+        s.feed(pretty, &mut out);
+        assert_eq!(out.len(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&out[0]).unwrap();
+        assert_eq!(v["account"]["user"], "root");
+        s.feed(b"\n    \"x\": \"}\"\n  }\n]", &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(s.pending(), 2);
+        // A damaged record (unterminated string, then a new record line)
+        // is dropped; the next one is kept.
+        let mut s = Splitter::new(Framing::JsonObjects);
+        let mut out = Vec::new();
+        s.feed(b"{\"a\": \"cut\n{\"b\": 2}\n", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(s.malformed, 1);
+        assert_eq!(&out[0][..], b"{\"b\": 2}");
+        // Oversized records are skipped whole.
+        let mut s = Splitter::with_max(Framing::JsonObjects, 8);
+        let mut out = Vec::new();
+        s.feed(b"{\"long\": \"0123456789\"}{\"k\":1}", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(s.oversized, 1);
     }
 }
