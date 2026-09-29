@@ -3117,3 +3117,214 @@ async fn audit_configure_needs_an_audit_connector() {
     assert_eq!(got[0].1["error"]["code"], "unsupported");
     assert!(rt.lock_audits().snapshot().is_empty());
 }
+
+// ------------------------------------------- gated fields (ADR-0022)
+
+/// Answers with the scripted responses in order, then `fallback`.
+struct Seq(
+    std::sync::Mutex<std::collections::VecDeque<ResponseTemplate>>,
+    ResponseTemplate,
+);
+
+impl wiremock::Respond for Seq {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.1.clone())
+    }
+}
+
+fn seq(first: Vec<ResponseTemplate>, then: ResponseTemplate) -> Seq {
+    Seq(std::sync::Mutex::new(first.into()), then)
+}
+
+fn accept_tokens(rt: &Runtime, tokens: &[&str]) {
+    rt.console_caps.record(Some(
+        &serde_json::from_value(serde_json::json!(tokens)).unwrap(),
+    ));
+}
+
+fn rejected_400(pointer: &str) -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "code": "invalid_request", "message": "Invalid.",
+        "details": [{"pointer": pointer, "keyword": "additionalProperties"}]
+    }))
+}
+
+/// Reports coverage counters as a connector does while it scans.
+struct Covered;
+
+#[async_trait::async_trait]
+impl Connector for Covered {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        sink.add_coverage(crate::ScanCoverage {
+            not_readable: 2,
+            remote: 1,
+            ..crate::ScanCoverage::default()
+        });
+        for _ in 0..3 {
+            sink.add_coverage(crate::ScanCoverage {
+                sampled: 1,
+                ..crate::ScanCoverage::default()
+            });
+        }
+        sink.add_coverage(crate::ScanCoverage {
+            error: 1,
+            ..crate::ScanCoverage::default()
+        });
+        Ok(())
+    }
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+async fn covered_scan(status: Seq, tokens: &[&str]) -> (MockServer, Runtime, Env) {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(status)
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Covered)],
+    )
+    .unwrap();
+    accept_tokens(&rt, tokens);
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    (server, rt, env)
+}
+
+fn scan_statuses(got: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+    got.iter()
+        .filter(|(i, _)| i == JOB)
+        .map(|(_, b)| {
+            serde_json::from_value::<JobStatusUpdate>(b.clone()).unwrap();
+            b.clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn scan_coverage_counters_are_sent_only_when_accepted() {
+    use crate::capabilities::token;
+    let (server, _rt, _env) = covered_scan(
+        seq(Vec::new(), ResponseTemplate::new(204)),
+        &[token::JOB_PROGRESS_COVERAGE],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], "succeeded");
+    assert_eq!(
+        sent[0]["progress"],
+        serde_json::json!({
+            "objects_sampled": 3, "skipped_not_readable": 2, "skipped_remote": 1,
+            "skipped_error": 1
+        })
+    );
+
+    // Not listed (an older console): no counters at all.
+    let (server, _rt, _env) = covered_scan(
+        seq(Vec::new(), ResponseTemplate::new(204)),
+        &[token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].get("progress").is_none(), "{}", sent[0]);
+}
+
+#[test]
+fn coverage_counters_saturate_at_the_contract_bound() {
+    let p = coverage_progress(crate::ScanCoverage {
+        sampled: u64::MAX,
+        limit: u64::MAX,
+        ..crate::ScanCoverage::default()
+    });
+    assert_eq!(p.objects_sampled.unwrap().0, crate::sanitize::MAX_COUNT);
+    assert_eq!(p.skipped_limit.unwrap().0, crate::sanitize::MAX_COUNT);
+    assert!(p.skipped_error.is_none() && p.objects_done.is_none());
+}
+
+#[tokio::test]
+async fn status_rejected_with_coverage_is_resent_once_without_it() {
+    use crate::capabilities::token;
+    // 400 to the status carrying the counters, then 400 again: the
+    // stripped status is sent once, never in a loop.
+    let (server, rt, _env) = covered_scan(
+        seq(
+            vec![rejected_400("/progress"), rejected_400("/progress")],
+            ResponseTemplate::new(204),
+        ),
+        &[token::JOB_PROGRESS_COVERAGE, token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].get("progress").is_some());
+    assert!(sent[1].get("progress").is_none());
+    assert_eq!(sent[0]["ts"], sent[1]["ts"]);
+    assert_eq!(sent[1]["status"], "succeeded");
+    // Every capability is forgotten until the next heartbeat response.
+    assert!(
+        !rt.console_caps
+            .console_accepts(token::JOB_PROGRESS_COVERAGE)
+    );
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+
+    // Accepted once stripped: reported.
+    let (server, rt, _env) = covered_scan(
+        seq(vec![rejected_400("/progress")], ResponseTemplate::new(204)),
+        &[token::JOB_PROGRESS_COVERAGE],
+    )
+    .await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[1].get("progress").is_none());
+    let reported = rt
+        .ledger
+        .lock()
+        .unwrap()
+        .get(&Uuid::try_from(JOB).unwrap())
+        .map(|e| e.reported);
+    assert_eq!(reported, Some(true));
+}
+
+#[tokio::test]
+async fn a_400_without_gated_fields_keeps_the_capabilities() {
+    use crate::capabilities::token;
+    let (server, rt, _env) = covered_scan(
+        seq(vec![rejected_400("/ts")], ResponseTemplate::new(204)),
+        &[token::TARGET_STATUS_NOTES],
+    )
+    .await;
+    // No gated field in the body: nothing to strip, not resent.
+    assert_eq!(scan_statuses(&statuses(&server).await).len(), 1);
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+}

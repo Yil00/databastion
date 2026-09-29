@@ -128,18 +128,22 @@ pub(crate) fn expires_at(job: &Job) -> Option<chrono::DateTime<chrono::Utc>> {
 pub(crate) struct Outcome {
     pub(crate) status: JobStatusUpdateStatus,
     pub(crate) error: Option<FailureCode>,
+    /// Discovery coverage reported by the connector (`discovery.scan`).
+    pub(crate) coverage: Option<crate::sink::ScanCoverage>,
 }
 
 impl Outcome {
     pub(crate) const SUCCEEDED: Self = Self {
         status: JobStatusUpdateStatus::Succeeded,
         error: None,
+        coverage: None,
     };
 
     pub(crate) const fn failed(code: FailureCode) -> Self {
         Self {
             status: JobStatusUpdateStatus::Failed,
             error: Some(code),
+            coverage: None,
         }
     }
 }

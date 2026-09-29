@@ -306,6 +306,9 @@ struct Counters {
     events_lost: AtomicU64,
     /// Audit streams that ended with an error (restarted with backoff).
     audit_stream_failures: AtomicU64,
+    /// Requests or batches rejected with `400` while carrying a gated
+    /// field (ADR-0022), sent again once with every gated field stripped.
+    gated_fields_stripped: AtomicU64,
 }
 
 /// Capacity of the event channel between a connector and the core.
@@ -724,6 +727,7 @@ impl Runtime {
             ("events_filtered_total", &c.events_filtered),
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
+            ("gated_fields_stripped_total", &c.gated_fields_stripped),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1927,6 +1931,7 @@ impl Runtime {
             return Outcome::failed(FailureCode::Internal);
         };
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
+        let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
         let spool_failed = std::sync::atomic::AtomicBool::new(false);
         // Findings emitted for this job (per-job cap).
@@ -2069,12 +2074,18 @@ impl Runtime {
             }
         }
         flush();
-        if spool_failed.load(Ordering::Relaxed) && outcome.error.is_none() {
-            return Outcome::failed(FailureCode::ResourceLimit);
-        }
-        if capped.load(Ordering::Relaxed) && outcome.error.is_none() {
-            return Outcome::failed(FailureCode::ResourceLimit);
-        }
+        let mut outcome = if (spool_failed.load(Ordering::Relaxed)
+            || capped.load(Ordering::Relaxed))
+            && outcome.error.is_none()
+        {
+            Outcome::failed(FailureCode::ResourceLimit)
+        } else {
+            outcome
+        };
+        // What the connector covered until it returned or was stopped.
+        outcome.coverage = *coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         outcome
     }
 
@@ -2168,21 +2179,34 @@ impl Runtime {
             .record(id, LedgerEntry { outcome, reported });
     }
 
+    /// Reports a terminal status. The coverage counters of a scan are
+    /// gated fields (ADR-0022): sent only when the console's latest
+    /// heartbeat response listed `job_progress.coverage`. A `400` to a body
+    /// that carried them clears the capabilities (the console may be an
+    /// older replica or a rolled-back build) and the status is sent again
+    /// once without them, instead of being lost (decision 9).
     async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
-        let update = JobStatusUpdate {
-            error: outcome.error.map(|code| JobError {
-                code,
-                engine_code: None,
-            }),
-            progress: None,
-            status: outcome.status,
-            ts: now(),
-        };
-        let Ok(body) = serde_json::to_vec(&update) else {
-            return false;
-        };
+        let ts = now();
+        let mut progress = outcome.coverage.and_then(|c| {
+            self.console_caps
+                .console_accepts(crate::capabilities::token::JOB_PROGRESS_COVERAGE)
+                .then(|| coverage_progress(c))
+        });
         let path = format!("/jobs/{id}/status");
-        for attempt in 0..3 {
+        let mut attempt = 0;
+        while attempt < 3 {
+            let update = JobStatusUpdate {
+                error: outcome.error.map(|code| JobError {
+                    code,
+                    engine_code: None,
+                }),
+                progress: progress.clone(),
+                status: outcome.status,
+                ts: ts.clone(),
+            };
+            let Ok(body) = serde_json::to_vec(&update) else {
+                return false;
+            };
             match self
                 .session
                 .call(
@@ -2200,6 +2224,22 @@ impl Runtime {
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
                 })) => return true,
+                // A gated field was sent: forget the capabilities and send
+                // the status once more without it (never a loop: the
+                // stripped body carries no gated field).
+                Err(CallError::Uplink(UplinkError::Rejected { status: 400, .. }))
+                    if progress.is_some() =>
+                {
+                    self.console_caps.clear();
+                    bump(&self.counters.gated_fields_stripped, 1);
+                    tracing::warn!(
+                        job_id = %id,
+                        "job status with coverage counters rejected (400): console capabilities \
+                         cleared, status sent again without them"
+                    );
+                    progress = None;
+                    continue;
+                }
                 Err(CallError::Uplink(e)) if e.is_retryable() => {
                     tokio::time::sleep(e.retry_delay(attempt)).await;
                 }
@@ -2208,8 +2248,32 @@ impl Runtime {
                     return false;
                 }
             }
+            attempt += 1;
         }
         false
+    }
+}
+
+/// `JobProgress` with the coverage counters of a scan only (every other
+/// field absent): `objects_sampled` always, each `skipped_*` counter when
+/// non-zero (absent counts 0 in the contract), saturated at the contract
+/// bound.
+fn coverage_progress(c: crate::sink::ScanCoverage) -> databastion_protocol::JobProgress {
+    use crate::sanitize::clamped_count;
+    let nonzero = |n: u64| (n > 0).then(|| clamped_count(n));
+    databastion_protocol::JobProgress {
+        batches: None,
+        findings: None,
+        objects_done: None,
+        objects_sampled: Some(clamped_count(c.sampled)),
+        objects_total: None,
+        ratio: None,
+        skipped_error: nonzero(c.error),
+        skipped_limit: nonzero(c.limit),
+        skipped_not_readable: nonzero(c.not_readable),
+        skipped_remote: nonzero(c.remote),
+        skipped_row_level_security: nonzero(c.row_level_security),
+        skipped_unsupported: nonzero(c.unsupported),
     }
 }
 
