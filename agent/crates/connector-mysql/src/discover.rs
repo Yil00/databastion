@@ -240,7 +240,9 @@ fn fail(target: &TargetConfig, e: MyError) -> ConnectorError {
 /// are remote (never read, I5); views, sequences, other object kinds and
 /// tables on an engine outside the allow-list (merge tables included:
 /// their tables are sampled directly) are kinds the connector does not
-/// sample. Counts only, never a name.
+/// sample. An introspection cut at its table limit counts 1 under the
+/// connector bound (`limit`): how many tables it left out is unknown.
+/// Counts only, never a name.
 pub(crate) fn planned_coverage(c: &Coverage) -> ScanCoverage {
     let remote = c
         .engines
@@ -251,6 +253,7 @@ pub(crate) fn planned_coverage(c: &Coverage) -> ScanCoverage {
     ScanCoverage {
         remote: remote as u64,
         unsupported: unsupported as u64,
+        limit: u64::from(c.truncated),
         ..ScanCoverage::default()
     }
 }
@@ -526,7 +529,7 @@ mod tests {
                 row_level_security: 0,
                 remote: 3,
                 unsupported: 2 + 2 + 4 + 1,
-                limit: 0,
+                limit: 1,
                 error: 0,
             }
         );

@@ -189,13 +189,15 @@ async fn scan_database(
 
 /// The objects of a database's scope skipped by the plan, as coverage
 /// counters (`JobProgress` `skipped_*`): foreign tables are remote (never
-/// read, I5), partition leaves over the per-root cap a connector bound.
+/// read, I5), partition leaves over the per-root cap a connector bound. An
+/// introspection cut at its relation limit counts 1 more under the bound:
+/// how many relations it left out is unknown.
 pub(crate) fn planned_coverage(c: &Coverage) -> ScanCoverage {
     ScanCoverage {
         not_readable: c.not_readable.len() as u64,
         row_level_security: (c.rls_policy.len() + c.rls_ancestor.len()) as u64,
         remote: c.foreign as u64,
-        limit: c.leaves_over_limit as u64,
+        limit: c.leaves_over_limit as u64 + u64::from(c.truncated),
         ..ScanCoverage::default()
     }
 }
@@ -455,6 +457,7 @@ mod tests {
             rls_ancestor: vec![pair()],
             foreign: 4,
             leaves_over_limit: 5,
+            truncated: false,
         };
         assert_eq!(
             planned_coverage(&c),
@@ -472,6 +475,12 @@ mod tests {
             planned_coverage(&Coverage::default()),
             ScanCoverage::default()
         );
+        // A truncated introspection: its unknown remainder counts 1.
+        let cut = Coverage {
+            truncated: true,
+            ..Coverage::default()
+        };
+        assert_eq!(planned_coverage(&cut).limit, 1);
     }
 
     #[test]
