@@ -21,8 +21,11 @@
 set -eu
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
 -- Test-only deviation from ADR-0012 (psql's password meta-command is interactive): the role
--- password is set with a PASSWORD literal. It is not recorded: pg_stat_statements is not loaded
--- here, log_statement does not log ROLE statements, and a failing statement is not logged either.
+-- password is set with a PASSWORD literal. It is not recorded: pg_stat_statements (preloaded for
+-- the Audit path, docker-compose.yml) does not track this session's utility statements, pgaudit
+-- is not enabled for the database yet (target-initdb/30-audit.sh), log_statement does not log
+-- ROLE statements, and a failing statement is not logged either.
+SET pg_stat_statements.track_utility = off;
 SET log_min_error_statement = panic;
 \set agent_password `cat /run/secrets/target_agent_password`
 CREATE ROLE databastion_agent LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS

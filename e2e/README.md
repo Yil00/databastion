@@ -3,12 +3,16 @@
 Phase 1 exit criterion ([ROADMAP](../docs/ROADMAP.md)): *end-to-end enrollment in containers;
 revocation effective in < 60 s*; and the invariant I2 test (P2-E): *no value of
 [`dev/ground-truth.json`](../dev/ground-truth.json) in clear text in the console, including
-value-bearing object and field names*, for the PostgreSQL, MySQL and MariaDB targets.
+value-bearing object and field names*, for the PostgreSQL, MySQL and MariaDB targets; and the Audit
+path (P4-D) with the phase 4 exit criterion *`pg_dump` in dev → incident in under 2 minutes*, on the
+PostgreSQL target (MySQL / MariaDB Audit, P4-B, adds a case to the same harness: see
+[Adding an Audit target](#adding-an-audit-target)).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
 It runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/`, `dev/seed/out/`,
-`dev/ground-truth.json`, `dev/mysql/`, `dev/mariadb/` or `ci.yml` change (and whenever the changed
-files cannot be listed).
+`dev/ground-truth.json`, `dev/mysql/`, `dev/mariadb/`, `dev/postgres/` or `ci.yml` change (and
+whenever the changed files cannot be listed). It prints the time of each phase and the measured
+dump → incident time.
 
 ## What runs
 | Service | Image | Role |
@@ -17,10 +21,12 @@ files cannot be listed).
 | `migrate` | `console/Dockerfile` | One-shot migrations as the owner role |
 | `web`, `worker` | `console/Dockerfile` | Console processes (runtime role) |
 | `proxy` | Caddy | TLS 1.3 reverse proxy, certificate from a throwaway CA; `/metrics` answers `404` |
-| `target-pg` | PostgreSQL 17 | Declared target of the agent, database `shop` loaded with the committed dev seed [`dev/seed/out/postgres.sql`](../dev/seed/out/postgres.sql) (schemas `crm`, `billing`, `ops`, value-bearing table names included); [`target-initdb/`](target-initdb/) creates the agent's read-only role and its per-schema Discovery grants |
+| `mailpit` | Mailpit 1.31 | Mail sink of the incident notifications: SMTP on 2525 with STARTTLS required (certificate from the throwaway CA for `mailpit`, verified by the worker through `NODE_EXTRA_CA_CERTS`); its HTTP API is read from the web container, on `console-net` only |
+| `target-pg` | [`dev/postgres`](../dev/postgres/Dockerfile) (PostgreSQL 17 + pgaudit) | Declared target of the agent, database `shop` loaded with the committed dev seed [`dev/seed/out/postgres.sql`](../dev/seed/out/postgres.sql) (schemas `crm`, `billing`, `ops`, value-bearing table names included); [`target-initdb/`](target-initdb/) creates the agent's read-only role and its per-schema Discovery grants, then ([`30-audit.sh`](target-initdb/30-audit.sh)) the Audit setup of the dev image, per database: pgaudit `read, write` session audit, object audit of the seeded tables through `databastion_auditor`, `log_relation`, `log_rows`, no catalog, no parameters; `pg_stat_statements`; and the test client roles `e2e_exporter` / `e2e_analyst` (read-only on the seeded schemas). Its jsonlog goes to the `target-pg-log` volume (directory `0750`, files `0640`, owner `postgres` 999:999) |
+| `pg-client` | PostgreSQL 17 | One-shot database client of the Audit test (`tools` profile): `pg_dump` as `e2e_exporter`, queries as `e2e_analyst`; rows go to `/dev/null` inside the container |
 | `target-mysql` | MySQL 8.4 (dev image pin) | Declared target, the dev configuration mounted read-only: [`dev/mysql/databastion.cnf`](../dev/mysql/databastion.cnf), seed [`dev/seed/out/mysql.sql`](../dev/seed/out/mysql.sql) (database `hr`), [`dev/mysql/initdb/20-databastion.sh`](../dev/mysql/initdb/20-databastion.sh) (agent account) and `30-tls.sh` (throwaway CA, certificate for the network alias `mysql`); [`target-initdb/15-agent-password.sh`](target-initdb/15-agent-password.sh) feeds the agent password from its Docker secret |
 | `target-mariadb` | MariaDB 11.4 (dev image pin) | Same with [`dev/mariadb/`](../dev/mariadb/) (`server_audit` on), seed [`dev/seed/out/mariadb.sql`](../dev/seed/out/mariadb.sql) (database `support`, one value-bearing table name), alias `mariadb` |
-| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA), `DATABASTION_LOG=debug` so the I2 log scan covers debug-level logging |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA), `DATABASTION_LOG=debug` so the I2 log scan covers debug-level logging; `target-pg-log` mounted read-only, readable through the supplementary group 999 (the e2e stand-in for the production ACL on the log directory, [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md)) and declared as `postgres.audit_log {path, format: jsonlog}` |
 | `bootstrap-admin`, `agent-files` | console / PostgreSQL | One-shot helpers (`tools` profile) |
 
 Networks: the agent sits on an `internal` network with the proxy and the targets only; it
@@ -30,8 +36,9 @@ cannot reach the console database or the outside. Only the proxy is published, o
 lives in `tmpfs`) and `no-new-privileges`.
 
 ## Flow
-1. Generate every secret (database passwords, metrics token, admin password, target superuser
-   and agent passwords) and the test CA + proxy certificate into a private temporary directory,
+1. Generate every secret (database passwords, metrics token, admin password, target superuser,
+   agent and test client passwords) and the test CA + proxy and Mailpit certificates into a
+   private temporary directory,
    write `agent.yaml`. The agent connects to the target as `databastion_agent` (minimal
    variant of [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md): `LOGIN`, no superuser /
    createdb / createrole / replication / bypassrls, `CONNECTION LIMIT 4`, `CONNECT`,
@@ -44,7 +51,9 @@ lives in `tmpfs`) and `no-new-privileges`.
    `MAX_STATEMENT_TIME 30`); root passwords stay in the targets.
    Before anything starts, the I2 scanner's positive control checks, per engine, that every
    searchable value of the ground truth is visible in the committed seed.
-2. Build the console and agent images, start the console stack and the three targets, wait for
+2. Build the console, agent and target PostgreSQL images, hand the `target-pg-log` volume to the
+   target's `postgres` user (`999:999`, `0750`), start the console stack, Mailpit and the three
+   targets, wait for
    `/api/health/ready` through the proxy and for the MySQL / MariaDB targets to be healthy; copy
    their CA (created by dev's `30-tls.sh`, checked to be that CA and to hold no key) into the work
    directory, mounted into the agent as `ca_file`.
@@ -56,8 +65,8 @@ lives in `tmpfs`) and `no-new-privileges`.
 5. Assert through `GET /api/agents` that the agent is `online` with target `pg-e2e` reported
    and `reachable` (the PostgreSQL connector connects with `databastion_agent`, TLS disabled on
    the internal network through the explicit insecure opt-in
-   `postgres: {databases: [shop], tls: disable_insecure}` in `agent.yaml`, SCRAM only; the audit
-   level, `none` without `pg_stat_statements`, is printed but not asserted), that `databastion_agent` has exactly the
+   `postgres: {databases: [shop], tls: disable_insecure, audit_log: {…}}` in `agent.yaml`, SCRAM
+   only; the audit level is printed here and asserted in step 7), that `databastion_agent` has exactly the
    attributes above (memberships exactly `pg_read_all_stats`, role settings in
    `pg_db_role_setting` exactly the four defaults) and, in its own session, gets the defaults and
    is denied `pg_authid` / `pg_user_mapping`, that its Discovery grants are exactly `USAGE`
@@ -70,7 +79,15 @@ lives in `tmpfs`) and `no-new-privileges`.
    `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 4` (MariaDB
    `max_statement_time = 30`), no role and no other `databastion` account; it logs in over TLS
    and is refused without TLS (error 1045).
-6. Discovery (P2-E): launch a `discovery.scan` of `pg-e2e`, `mysql-e2e` and `mariadb-e2e`
+6. Audit setup (P4-D), through the user API as a user would: an e-mail channel to Mailpit
+   (`starttls`, port 2525), two `access_event` policies, `e2e dump signature` (signal
+   `signature.pg_dump` on the Audit targets → **critical** incident + e-mail) and `e2e reads` (every
+   `read` on the Audit targets → medium incident + e-mail), then `audit.configure` of `pg-e2e`
+   (enabled, contract defaults: aggregation 60 s, poll 10 s, no `min_rows`; sensitive objects
+   derived from the findings, none yet). The harness waits for the job and for the agent's
+   `audit source: pgaudit log` line, **before** the Discovery scan, so the agent's own Discovery
+   reads go through the Audit stream.
+7. Discovery (P2-E): launch a `discovery.scan` of `pg-e2e`, `mysql-e2e` and `mariadb-e2e`
    together through the user API (admin session + CSRF) and wait for every job to succeed (360 s
    at most). The agent reports the job status before
    its spooled findings batches are uploaded, so the test then waits (90 s at most) for a
@@ -91,24 +108,57 @@ lives in `tmpfs`) and `no-new-privileges`.
    asserts it is complete (every finding listed, fewer than the 500-row listing cap, every
    finding with stored samples renders them, none `unavailable`) and that no masked sample keeps
    more than 4 digits (a partial masking regression the value search cannot see).
-7. Revoke the agent through the user API; within 60 s the agent must log
+8. Audit (P4-D), for each Audit target:
+   - `audit.configure` again: the sensitive objects derived from the findings must cover every
+     object with a finding (checked in `audit_configs.sent_objects`); the stream restarts from its
+     cursor.
+   - **Exit criterion**: `pg_dump` of `shop` as `e2e_exporter` from the `pg-client` container (not
+     the agent's account). The time from the start of the dump to the incident appearing on the
+     console (the `Active: N critical` count of the incidents page, fetched with the session
+     through the proxy, polled every second) is printed and must be **under 120 s**.
+   - As `e2e_analyst`: `SELECT * FROM crm.customers WHERE email = '<ground-truth e-mail>'`,
+     `COPY (SELECT * FROM billing.payment_methods WHERE iban = '<ground-truth IBAN>') TO STDOUT`
+     and `COPY ops.app_credentials TO STDOUT`, fed on stdin (the literals are on no command line
+     and in no log of the harness). The harness waits (240 s at most) until the three object sets
+     are stored as events of `e2e_analyst`, every event is evaluated, a `e2e reads` incident exists
+     for `e2e_analyst` and no notification is pending.
+   - The heartbeat must report audit level `partial` or `full` with source `pgaudit` (printed).
+   - Every notification to the channel is `delivered` and Mailpit holds the e-mail of the dump
+     incident.
+   - [`i2_check.py audit`](i2_check.py) on the target's events and incidents: an event of
+     `e2e_exporter` with `signature.pg_dump`, an event of `e2e_analyst`, the dump incident (policy,
+     principal, signal) and the `e2e reads` incident of `e2e_analyst`; **no event and no incident
+     of `databastion_agent`** (the agent's own Discovery reads, which ran while Audit was on, must
+     not surface); no stored event object holding a raw value-bearing name, even partially.
+   - Positive control of the literal search: both literals must be found in the target's own
+     pgaudit log (the source side keeps statement text), so the queries did reach the agent.
+9. Revoke the agent through the user API; within 60 s the agent must log
    `console rejected the current secret (401)`; the measured latency is printed and the test
    fails at 60 s or more. The console must show `revoked`, and the proxy access log must show no
    `/api/agent/v1/jobs` request during a 10 s window afterwards.
-8. Dump every container log (plus the one-shot command outputs); fail if `agent.log` or
+10. Dump every container log (plus the one-shot command outputs); fail if `agent.log` or
    `web.log` is empty; run a positive control (a random canary written to the log directory must
    be found by the scan and redacted, then it is removed); fail if any generated secret
    (enrollment token, agent secret, admin password, session cookie, metrics token, database and
    target passwords, encryption key) appears in clear text.
-9. `pg_dump` the console database into the private temporary directory (never the log
+11. `pg_dump` the console database into the private temporary directory (never the log
    directory) and fail if the agent secret, the enrollment token, the admin password or a
    target password is stored in clear text.
-10. Invariant I2, for each engine (`postgresql`, `mysql`, `mariadb`):
+12. Invariant I2, for each engine (`postgresql`, `mysql`, `mariadb`):
     [`i2_check.py scan`](i2_check.py) searches the plain dump of the whole console database
     (every schema, `pgboss` included), every container log except the targets' own (`target-*.log`,
-    the source databases; `all.log` includes them) and the rendered findings page for every value
-    of the engine in the ground truth and every value-bearing name. A canary file holding one
-    ground-truth e-mail of the engine must be reported by the log scan first (positive control).
+    the source databases; `all.log` includes them; the agent's and Mailpit's included) and the
+    rendered findings page for every value of the engine in the ground truth and every
+    value-bearing name. A canary file holding one ground-truth e-mail of the engine must be
+    reported by the log scan first (positive control).
+    For each engine with an Audit target, the same search runs on: every column of
+    `access_events` (`objects`, `signals` included), `incidents`, `incident_events`,
+    `notification_deliveries` (the notification payloads), `principal_baselines` and
+    `audit_configs` (exported as JSON rows, each of the first three non-empty); the events page,
+    each principal page, the incidents page (all statuses), each Audit incident page and the
+    notifications page; the e-mails in Mailpit (summary, decoded text and HTML parts, raw source).
+    Then the query literals of step 8 alone (`scan --needle`) on every console-side artifact above,
+    the console database dump and the logs: they must be nowhere.
 
 ### What "in clear" means (I2)
 The definition is in the docstring of [`i2_check.py`](i2_check.py); unit tests in
@@ -140,6 +190,19 @@ Each secret is registered in a private pattern file as soon as it is generated o
 them by `<REDACTED:name>` (a file that cannot be redacted is deleted), then the stack and its
 volumes are removed and the temporary directory is deleted.
 
+## Adding an Audit target
+The Audit steps are driven by `E2E_AUDIT_TARGETS` in [`run.sh`](run.sh), one line per target:
+`<target id> <ground-truth engine> <client> <agent account> <dump signal>`, and by the
+`audit_client_<client>_*` functions (`started`, `levels`, `source`, `principals`, `dump`,
+`queries`, `target_log`), which hold everything engine-specific: the agent log line of a started
+stream, the expected level and source, the test roles, the dump tool, the literal queries and the
+target's own audit log. A MySQL / MariaDB case (after P4-B) adds a line (for example
+`mariadb-e2e mariadb my databastion signature.mysqldump`), a `my` client (a one-shot `mysql` /
+`mariadb` client service, `mysqldump` as a test account created by the target's initdb), the
+target's audit log mounted read-only into the agent and declared in `agent.yaml`, and
+`dev/percona/` in the CI path filter if a Percona target is added. The policies, the channel, the
+timing, the Audit and I2 checks are shared.
+
 ## Running locally
 Requirements: Docker with Compose v2, `openssl`, `curl`, `jq`, bash.
 
@@ -148,8 +211,16 @@ e2e/run.sh
 E2E_HTTPS_PORT=9443 e2e/run.sh      # if 8443 is taken on 127.0.0.1
 ```
 
-The first run builds both images (several minutes). No secret is written to the repository;
-nothing listens outside `127.0.0.1`. `E2E_SKIP_BUILD=1` (ignored under GitHub Actions) reuses
-`databastion-console:e2e` and `databastion-agent:e2e` as already built, for hosts where the
-Dockerfiles cannot build as is (e.g. a TLS-intercepting proxy). Behind an HTTP proxy, add
-`console.e2e.internal` to `NO_PROXY` so that curl reaches the local TLS proxy directly.
+The first run builds the console, agent and target PostgreSQL (dev/postgres, pgaudit from the PGDG
+apt repository) images (several minutes). No secret is written to the repository; nothing listens
+outside `127.0.0.1`. `E2E_SKIP_BUILD=1` (ignored under GitHub Actions) reuses
+`databastion-console:e2e`, `databastion-agent:e2e` and `databastion-dev/postgres:17.11-pgaudit`
+as already built (`E2E_CONSOLE_IMAGE`, `E2E_AGENT_IMAGE`, `E2E_TARGET_PG_IMAGE` name other tags),
+for hosts where the Dockerfiles cannot build as is (e.g. a TLS-intercepting proxy). Behind an HTTP
+proxy, add `console.e2e.internal` to `NO_PROXY` so that curl reaches the local TLS proxy directly.
+Where the apt mirrors are blocked, `E2E_PG_AUDIT=pss` (local runs only; refused under GitHub
+Actions) runs `target-pg` on the plain pinned PostgreSQL image with `pg_stat_statements` only: the
+agent reports the Limited level from that source, the Audit steps run the same way (the dump is
+recognized by its `COPY … TO STDOUT` of several whole tables), and the pgaudit-only checks (level,
+source, literal positive control in the target's log) are replaced or skipped, as printed. It is not
+a substitute for the CI run.
