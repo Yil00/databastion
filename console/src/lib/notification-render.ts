@@ -30,10 +30,16 @@ export interface AccessIncidentOpenedPayload {
   source: "access_event";
   occurred_at: string;
   url: string | null;
-  incident: { id: string; severity: string; status: "open"; reopened_from: null };
+  /** `reopened_from`: the resolved incident of the same scope, when a worse event reopened it. */
+  incident: { id: string; severity: string; status: "open"; reopened_from: string | null };
   policy: { id: string; name: string; revision: number };
   agent_id: string;
   target_id: string;
+  /**
+   * Set on the per-policy overflow incident: the policy reached its hourly limit of new
+   * incidents; the further matches of the hour are counted in this one (`principal` is empty).
+   */
+  overflow: { limit_per_hour: number } | null;
   /** `db_user`, or the `hmac-sha256:` fingerprint the agent sent in its place. */
   principal: string;
   principal_fingerprinted: boolean;
@@ -138,14 +144,18 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
   const a = p.access;
   const objects = a.objects.slice(0, 5).map(objectText).join(", ") + (a.objects.length > 5 ? `, and ${a.objects.length - 5} more` : "");
   const lines = [
-    "A new incident was opened from database access events.",
+    p.overflow
+      ? `The policy reached its limit of ${p.overflow.limit_per_hour} new incidents this hour: the further matches of the hour are counted in this incident. The event below is the first of them.`
+      : p.incident.reopened_from
+        ? `A new incident was opened from database access events: a worse access than the one of the resolved incident ${p.incident.reopened_from}.`
+        : "A new incident was opened from database access events.",
     "",
     `Incident:   ${p.incident.id}`,
     `Severity:   ${p.incident.severity}`,
     `Policy:     ${one(p.policy.name, 100)} (rev. ${p.policy.revision}, ${p.policy.id})`,
     `Agent:      ${p.agent_id}`,
     `Target:     ${one(p.target_id, 128)}`,
-    `Principal:  ${one(p.principal, 128)}${p.principal_fingerprinted ? " (fingerprint of an unknown or non-conforming account name)" : ""}`,
+    `Principal:  ${p.overflow ? "several" : `${one(p.principal, 128)}${p.principal_fingerprinted ? " (fingerprint of an unknown or non-conforming account name)" : ""}`}`,
     `Database:   ${p.database === null ? "none" : one(p.database, 128)} (hour starting ${p.hour})`,
     `Access:     ${one(a.action, 16)} at ${a.ts} (${one(a.source, 32)})`,
     `Objects:    ${objects || "none"}`,
@@ -155,7 +165,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     `Opened at:  ${p.occurred_at}`,
   ];
   return {
-    subject: `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)} (${one(p.principal, 64)})`,
+    subject: `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)} (${p.overflow ? "hourly limit reached" : one(p.principal, 64)})`,
     text: `${lines.join("\n")}\n${link}${FOOTER}`,
   };
 }

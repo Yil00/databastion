@@ -2,7 +2,9 @@ import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { PgBoss } from "pg-boss";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
+
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb } from "@/db/client";
 import * as schema from "@/db/schema";
@@ -27,8 +29,9 @@ import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
 import { configureAudit } from "./audit-config";
-import { EVENT_CHUNK } from "./event-engine";
-import { getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
+import * as engine from "./event-engine";
+import { EVENT_CHUNK, EVENT_CHUNK_PER_AGENT, evaluateChunk } from "./event-engine";
+import { BASELINES_CAP_VAR, EVENT_INCIDENTS_CAP_VAR, getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
 import { setFalsePositive } from "./findings";
 import { drainPolicyWork, getIncident, transitionIncident } from "./incidents";
 import { createException, createPolicy, type PolicyInput } from "./policies";
@@ -144,6 +147,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
   let teardown: () => Promise<void>;
 
   beforeAll(async () => {
+    process.env.DATABASTION_EVENTS_RETENTION_DAYS = "3650";
     teardown = await setupTestDatabase();
     adminId = await adminUser();
   });
@@ -263,7 +267,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       // A pg_dump of two tables of `crm`, then of another database, in the same hour.
       await send(auth, [
         dumpEvent(),
-        dumpEvent({ ts: at(1000), objects: [{ database: "crm", schema: "public", object: "orders" }], rows: 10, signals: ["signature.pg_dump", "shape.copy_to"] }),
+        dumpEvent({ ts: at(1000), objects: [{ database: "crm", schema: "public", object: "orders" }], rows: 10, signals: ["signature.pg_dump", "shape.full_table_read"] }),
         dumpEvent({ ts: at(2000), objects: [{ database: "billing", schema: "public", object: "invoices" }] }),
       ]);
       await drainPolicyWork(getDb());
@@ -272,7 +276,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         ["crm", 2, 1_250_010],
         ["billing", 1, 1_250_000],
       ]);
-      expect(list[0]?.eventSignals).toEqual(["shape.copy_to", "shape.full_table_copy", "signature.pg_dump"]);
+      expect(list[0]?.eventSignals).toEqual(["shape.full_table_copy", "shape.full_table_read", "signature.pg_dump"]);
       expect(list[0]?.lastEventAt?.toISOString()).toBe(at(1000));
       // Another principal: another incident.
       await send(auth, [dumpEvent({ principal: { db_user: "report" } })]);
@@ -285,7 +289,8 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       await drainPolicyWork(getDb());
       list = await incidentsOf(auth.agentId);
       expect(list).toHaveLength(3);
-      expect(await incidentEventCount(getDb(), String(crm?.id))).toBe(2);
+      // M1: not worse than the resolved incident: linked to it, visible there.
+      expect(await incidentEventCount(getDb(), String(crm?.id))).toBe(3);
       await send(auth, [dumpEvent({ ts: at(HOUR) })]);
       await drainPolicyWork(getDb());
       list = await incidentsOf(auth.agentId);
@@ -338,6 +343,136 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
     });
   });
 
+  describe("security review", () => {
+    const randomFp = () => `hmac-sha256:${randomBytes(32).toString("hex")}`;
+    const ip = (i: number) => `198.51.${Math.floor(i / 250)}.${(i % 250) + 1}`;
+
+    it("H1: random account names create no baseline and one auth_failure incident per client and hour", async () => {
+      const auth = await agentWithTargets();
+      const pid = await policy({ event_actions: ["auth_failure"] });
+      const n = 450;
+      const failures = Array.from({ length: n }, (_, i) =>
+        dumpEvent({ ts: at(i * 1000), principal: { db_user_fingerprint: randomFp(), client_addr: "203.0.113.9" }, action: "auth_failure", objects: [], rows: undefined, signals: [] }),
+      );
+      // Also failures reported under random (conforming) names, from the same client.
+      failures.push(...Array.from({ length: 40 }, (_, i) => dumpEvent({ ts: at(i * 1000), principal: { db_user: `u${i}x${randomBytes(4).toString("hex")}`, client_addr: "203.0.113.9" }, action: "auth_failure", objects: [], rows: undefined, signals: [] })));
+      await send(auth, failures.slice(0, 250));
+      await send(auth, failures.slice(250));
+      await drainPolicyWork(getDb());
+      const baselines = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
+      expect(baselines).toHaveLength(0);
+      const list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(1);
+      expect(list[0]).toMatchObject({ policyId: pid, matchCount: n + 40 });
+      expect(list[0]?.dedupKey).toContain(`principal:unknown:`);
+    });
+
+    it("H1: a flood of distinct principals and clients is capped: incidents per policy and hour, baselines per target", async () => {
+      process.env[EVENT_INCIDENTS_CAP_VAR] = "5";
+      process.env[BASELINES_CAP_VAR] = "20";
+      try {
+        const auth = await agentWithTargets();
+        const pid = await policy({ signals: ["signature.pg_dump"] });
+        const n = 400;
+        const flood = Array.from({ length: n }, (_, i) =>
+          dumpEvent({ ts: at(i * 1000), principal: { db_user: `user${i}`, client_addr: ip(i) }, rows: 10 + i }),
+        );
+        await send(auth, flood.slice(0, 200));
+        await send(auth, flood.slice(200));
+        await drainPolicyWork(getDb());
+        const list = await incidentsOf(auth.agentId);
+        const overflow = await getDb().select().from(incidents).where(and(eq(incidents.policyId, pid), eq(incidents.eventOverflow, true)));
+        // The overflow incident carries no agent (it spans the policy), so it is not in `list`.
+        expect(list).toHaveLength(5);
+        expect(overflow).toHaveLength(1);
+        expect(overflow[0]?.matchCount).toBe(n - 5);
+        expect(await incidentEventCount(getDb(), String(overflow[0]?.id))).toBe(n - 5);
+        const baselines = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
+        expect(baselines.length).toBeLessThanOrEqual(20);
+        // The least recently updated baselines were evicted: those kept come from the last chunk.
+        expect(baselines.every((b) => Number(b.dbUser?.slice(4)) >= n - EVENT_CHUNK_PER_AGENT)).toBe(true);
+        // One more flood the same hour opens nothing new.
+        await send(auth, [dumpEvent({ ts: at(n * 1000), principal: { db_user: "late", client_addr: "192.0.2.200" } })]);
+        await drainPolicyWork(getDb());
+        expect(await incidentsOf(auth.agentId)).toHaveLength(5);
+      } finally {
+        delete process.env[EVENT_INCIDENTS_CAP_VAR];
+        delete process.env[BASELINES_CAP_VAR];
+      }
+    });
+
+    it("M1: after a resolution, a worse event of the same hour opens a new incident; a similar one is only linked", async () => {
+      const auth = await agentWithTargets();
+      await scanWith(auth, [finding("email", "pii.email", 1)]);
+      await policy({ signals: ["signature.*"] });
+      await send(auth, [dumpEvent({ rows: 1000 })]);
+      await drainPolicyWork(getDb());
+      const [first] = await incidentsOf(auth.agentId);
+      await transitionIncident(getDb(), String(first?.id), "resolved", actor());
+      // Same signals, lower score: linked to the resolved incident.
+      await send(auth, [dumpEvent({ ts: at(60_000), rows: 10 })]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      expect(await incidentEventCount(getDb(), String(first?.id))).toBe(2);
+      // A new signal: a new incident, reopened from the resolved one.
+      await send(auth, [dumpEvent({ ts: at(120_000), rows: 10, signals: ["signature.copy_to_program"] })]);
+      await drainPolicyWork(getDb());
+      let list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      const [delivery] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(list[1]?.id)));
+      expect(delivery?.payload).toMatchObject({ incident: { reopened_from: first?.id } });
+      // A higher score after resolving that one: another incident.
+      await transitionIncident(getDb(), String(list[1]?.id), "resolved", actor());
+      await send(auth, [dumpEvent({ ts: at(180_000), rows: 10_000_000, signals: ["signature.copy_to_program"] })]);
+      await drainPolicyWork(getDb());
+      list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(3);
+      // A false positive is never reopened within the hour.
+      await transitionIncident(getDb(), String(list[2]?.id), "false_positive", actor());
+      await send(auth, [dumpEvent({ ts: at(240_000), rows: 99_000_000, signals: ["signature.copy_to_file"] })]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(3);
+      expect(await incidentEventCount(getDb(), String(list[2]?.id))).toBe(2);
+    });
+
+    it("M2: one chunk takes at most a fair share of each agent's events", async () => {
+      await drainPolicyWork(getDb());
+      const busy = await agentWithTargets();
+      const quiet = await agentWithTargets();
+      await send(busy, Array.from({ length: 300 }, (_, i) => dumpEvent({ ts: at(i * 1000) })));
+      await send(quiet, Array.from({ length: 5 }, (_, i) => dumpEvent({ ts: at(i * 1000) })));
+      const stats = { events: 0, created: 0, anomalies: 0, more: false };
+      expect(await evaluateChunk(getDb(), stats)).toBe(EVENT_CHUNK_PER_AGENT + 5);
+      const done = async (agentId: string) => (await eventsOf(agentId)).filter((e) => e.evaluatedAt !== null).length;
+      expect(await done(quiet.agentId)).toBe(5);
+      expect(await done(busy.agentId)).toBe(EVENT_CHUNK_PER_AGENT);
+      // Each agent's events are taken in arrival order.
+      const busyEvents = await eventsOf(busy.agentId);
+      expect(busyEvents.slice(0, EVENT_CHUNK_PER_AGENT).every((e) => e.evaluatedAt !== null)).toBe(true);
+      await drainPolicyWork(getDb());
+    });
+
+    it("M2: the findings are evaluated even when the events use their whole share of the budget", async () => {
+      const auth = await agentWithTargets();
+      await createPolicy(
+        getDb(),
+        { name: `f-${uuidv7()}`, description: null, enabled: true, source: "finding", conditions: {}, actions: [{ type: "create_incident", severity: "low" }] },
+        actor(),
+      );
+      await drainPolicyWork(getDb());
+      await scanWith(auth, [finding("email", "pii.email", 1)]);
+      const spy = vi.spyOn(engine, "drainEventWork").mockResolvedValue({ events: 0, created: 0, anomalies: 0, more: true });
+      try {
+        const stats = await drainPolicyWork(getDb());
+        expect(stats.more).toBe(true);
+        expect(stats.findings).toBeGreaterThanOrEqual(1);
+        expect((await incidentsOf(auth.agentId)).map((i) => i.source)).toEqual(["finding"]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   describe("per-principal baselines", () => {
     it("warms up, then flags a volume far above the principal's usual one; anomaly policies fire", async () => {
       const auth = await agentWithTargets();
@@ -380,7 +515,9 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const fp = "hmac-sha256:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
       await send(auth, [
         dumpEvent({ principal: { db_user: fp } }),
-        dumpEvent({ principal: { db_user_fingerprint: fp }, action: "auth_failure", objects: [], rows: undefined, signals: [] }),
+        dumpEvent({ principal: { db_user_fingerprint: fp } }),
+        // Never a baseline for a failed authentication (security review H1).
+        dumpEvent({ principal: { db_user: "nobody" }, action: "auth_failure", objects: [], rows: 5, signals: [] }),
       ]);
       await drainPolicyWork(getDb());
       const rows = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
@@ -422,7 +559,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         await boss.send(POLICY_QUEUE, {});
       });
       const auth = await agentWithTargets();
-      await policy({ signals: ["signature.pg_dump", "signature.mysqldump"] });
+      await policy({ signals: ["signature.pg_dump", "signature.copy_to_file"] });
       const started = Date.now();
       await send(auth, [dumpEvent({ ts: new Date().toISOString() })]);
       for (let i = 0; i < 100 && (await incidentsOf(auth.agentId)).length === 0; i++) {

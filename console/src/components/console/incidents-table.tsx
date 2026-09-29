@@ -34,6 +34,7 @@ export function IncidentStatusBadge({ status }: { status: IncidentStatus }) {
 }
 
 export function incidentLocation(i: Pick<IncidentView, "location" | "access">): string {
+  if (i.access?.overflow) return "hourly limit of new incidents reached: further matches counted here";
   if (i.access) {
     const who = i.access.principal.startsWith("hmac-sha256:") ? "fingerprinted account" : i.access.principal;
     return `${who} on ${i.access.database ?? "(no object)"}`;

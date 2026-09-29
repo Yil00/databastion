@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { accessEvents, agents, agentTargets, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
+import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
@@ -29,7 +29,16 @@ export type EventsIngestOutcome =
   /** `target_id` not reported by this agent: pointers `/events/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
   /** Console-side checks (timestamps more than 5 min in the future). */
-  | { kind: "invalid"; details: ValidationDetail[] };
+  | { kind: "invalid"; details: ValidationDetail[] }
+  /**
+   * Events older than the retention period (L1): `400`, `/events/<i>/ts`, `formatMinimum`. A
+   * conforming agent can send them (a spool held longer than the retention), so it is not an
+   * integrity event; the agent drops those items and resends the rest.
+   */
+  | { kind: "expired"; details: ValidationDetail[] };
+
+/** Process counters of `/events` (exported on `/metrics`). */
+export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0 };
 
 /** SHA-256 of the validated batch in canonical JSON (same rule as `/findings`). */
 export function eventsBatchSha256(batch: EventsBatch): string {
@@ -64,7 +73,19 @@ function futureDetails(batch: EventsBatch, now: number): ValidationDetail[] {
   return details;
 }
 
-function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number) {
+/** Events whose `ts` is older than the retention period (they would be purged at once). */
+function expiredDetails(batch: EventsBatch, now: number, retentionDays: number): ValidationDetail[] {
+  const details: ValidationDetail[] = [];
+  const limit = now - retentionDays * 24 * 3600_000;
+  batch.events.forEach((e, i) => {
+    if (details.length < MAX_VALIDATION_DETAILS && Date.parse(e.ts) < limit) {
+      details.push({ pointer: `/events/${i}/ts`, keyword: "formatMinimum" });
+    }
+  });
+  return details;
+}
+
+function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, unexpectedTarget: boolean) {
   return {
     agentId,
     targetId: e.target_id,
@@ -84,6 +105,7 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number) {
     signals: [...(e.signals ?? [])],
     source: e.source,
     aggregatedCount: e.aggregated_count,
+    unexpectedTarget,
   };
 }
 
@@ -101,6 +123,7 @@ export async function ingestEvents(
   agentId: string,
   batch: EventsBatch,
   now: number = Date.now(),
+  retentionDays: number = eventsRetentionDays(),
 ): Promise<EventsIngestOutcome> {
   const bodySha256 = eventsBatchSha256(batch);
   return db.transaction(async (tx) => {
@@ -118,10 +141,13 @@ export async function ingestEvents(
 
     const targetIds = [...new Set(batch.events.map((e) => e.target_id))];
     const owned = await tx
-      .select({ targetId: agentTargets.targetId })
+      .select({ targetId: agentTargets.targetId, present: agentTargets.present, auditEnabled: auditConfigs.enabled })
       .from(agentTargets)
+      .leftJoin(auditConfigs, and(eq(auditConfigs.agentId, agentTargets.agentId), eq(auditConfigs.targetId, agentTargets.targetId)))
       .where(and(eq(agentTargets.agentId, agentId), inArray(agentTargets.targetId, targetIds)));
     const ownedIds = new Set(owned.map((t) => t.targetId));
+    // L4: a target removed from the agent's heartbeats, or whose Audit settings are disabled.
+    const unexpected = new Set(owned.filter((t) => !t.present || t.auditEnabled === false).map((t) => t.targetId));
     const foreign: ValidationDetail[] = [];
     batch.events.forEach((e, i) => {
       if (!ownedIds.has(e.target_id) && foreign.length < MAX_VALIDATION_DETAILS) {
@@ -132,8 +158,13 @@ export async function ingestEvents(
 
     const future = futureDetails(batch, now);
     if (future.length > 0) return { kind: "invalid" as const, details: future };
+    const expired = expiredDetails(batch, now, retentionDays);
+    if (expired.length > 0) return { kind: "expired" as const, details: expired };
 
-    await tx.insert(accessEvents).values(batch.events.map((e, i) => eventRow(agentId, batch.batch_id, e, i)));
+    await tx
+      .insert(accessEvents)
+      .values(batch.events.map((e, i) => eventRow(agentId, batch.batch_id, e, i, unexpected.has(e.target_id))));
+    eventStats.unexpectedTarget += batch.events.filter((e) => unexpected.has(e.target_id)).length;
     await tx.insert(eventsBatches).values({ agentId, batchId: batch.batch_id, bodySha256, eventsCount: batch.events.length });
     return { kind: "accepted" as const, duplicate: false, stored: batch.events.length };
   });
@@ -156,6 +187,46 @@ export function eventsRetentionDays(env: Readonly<Record<string, string | undefi
   if (raw === undefined || raw.trim() === "") return DEFAULT_EVENTS_RETENTION_DAYS;
   const n = Number(raw);
   return Number.isInteger(n) && n >= 7 && n <= 3650 ? n : DEFAULT_EVENTS_RETENTION_DAYS;
+}
+
+/**
+ * New incidents a policy may open per hour from access events
+ * (`DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR`, default 50, accepted 1 to 10000); further
+ * matches of that hour go to one overflow incident of the policy (security review H1).
+ */
+export const EVENT_INCIDENTS_CAP_VAR = "DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR";
+export const DEFAULT_EVENT_INCIDENTS_PER_POLICY_HOUR = 50;
+
+export function eventIncidentsPerPolicyHour(env: Readonly<Record<string, string | undefined>> = process.env): number {
+  const n = Number(env[EVENT_INCIDENTS_CAP_VAR] ?? "");
+  return env[EVENT_INCIDENTS_CAP_VAR]?.trim() && Number.isInteger(n) && n >= 1 && n <= 10_000 ? n : DEFAULT_EVENT_INCIDENTS_PER_POLICY_HOUR;
+}
+
+/**
+ * Principal baselines kept per target (`DATABASTION_BASELINES_PER_TARGET`, default 10000,
+ * accepted 10 to 1000000); beyond, the least recently updated ones are evicted (H1).
+ */
+export const BASELINES_CAP_VAR = "DATABASTION_BASELINES_PER_TARGET";
+export const DEFAULT_BASELINES_PER_TARGET = 10_000;
+
+export function baselinesPerTarget(env: Readonly<Record<string, string | undefined>> = process.env): number {
+  const n = Number(env[BASELINES_CAP_VAR] ?? "");
+  return env[BASELINES_CAP_VAR]?.trim() && Number.isInteger(n) && n >= 10 && n <= 1_000_000 ? n : DEFAULT_BASELINES_PER_TARGET;
+}
+
+/**
+ * Back-pressure (M2): an agent with more than this many events not evaluated yet gets `429` +
+ * `Retry-After` on `POST /events` (the agent keeps its batches spooled and retries).
+ */
+export const MAX_PENDING_EVENTS_PER_AGENT = 20_000;
+export const BACKPRESSURE_RETRY_AFTER_S = 30;
+
+export async function pendingEventsOver(db: Database, agentId: string, limit = MAX_PENDING_EVENTS_PER_AGENT): Promise<boolean> {
+  const res = await db.execute<{ n: number }>(sql`
+    select count(*)::int as n from (
+      select 1 from ${accessEvents} where ${accessEvents.agentId} = ${agentId} and ${accessEvents.evaluatedAt} is null
+      limit ${limit + 1}) x`);
+  return Number(res.rows[0]?.n ?? 0) > limit;
 }
 
 /** Deletes the events past the retention bound, in chunks, within `budgetMs`. */
@@ -199,6 +270,7 @@ export interface EventView {
   signals: string[];
   source: string;
   aggregatedCount: number;
+  unexpectedTarget: boolean;
   evaluated: boolean;
   sensitivity: number | null;
   score: number | null;
@@ -246,6 +318,7 @@ const EVENT_COLUMNS = {
   signals: accessEvents.signals,
   source: accessEvents.source,
   aggregatedCount: accessEvents.aggregatedCount,
+  unexpectedTarget: accessEvents.unexpectedTarget,
   evaluatedAt: accessEvents.evaluatedAt,
   sensitivity: accessEvents.sensitivity,
   score: accessEvents.score,

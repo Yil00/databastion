@@ -530,6 +530,13 @@ export const incidents = pgTable(
     eventRows: doublePrecision("event_rows"),
     eventSignals: jsonb("event_signals").$type<string[]>(),
     lastEventAt: tsz("last_event_at"),
+    /** An event of the incident was above its principal's baseline. */
+    eventAnomaly: boolean("event_anomaly"),
+    /**
+     * Per-policy overflow incident: the policy reached its hourly cap of new incidents, and the
+     * further matches of that hour are counted here (P4-C security review H1).
+     */
+    eventOverflow: boolean("event_overflow").notNull().default(false),
   },
   (t) => [
     uniqueIndex("incidents_active_dedup_key")
@@ -697,6 +704,12 @@ export const accessEvents = pgTable(
     signals: jsonb("signals").$type<string[]>().notNull().default([]),
     source: text("source").notNull(),
     aggregatedCount: integer("aggregated_count").notNull(),
+    /**
+     * At ingestion, the target was no longer reported by the agent (removed from its agent.yaml)
+     * or its Audit settings were disabled: a conforming agent should not report such events
+     * (security review L4). Stored and counted; the event is still evaluated.
+     */
+    unexpectedTarget: boolean("unexpected_target").notNull().default(false),
     // ---- evaluation (worker)
     evaluatedAt: tsz("evaluated_at"),
     /** Sensitivity of the most sensitive object reached (see src/lib/event-model.ts). */
@@ -719,7 +732,7 @@ export const accessEvents = pgTable(
     index("access_events_principal_ts_idx").on(t.agentId, t.targetId, t.principalKey, t.ts),
     index("access_events_signals_idx").using("gin", t.signals),
     index("access_events_pending_idx")
-      .on(t.receivedAt, t.id)
+      .on(t.agentId, t.receivedAt, t.id)
       .where(sql`${t.evaluatedAt} is null`),
     check("access_events_principal", sql`(${t.dbUser} is null) <> (${t.dbUserFingerprint} is null)`),
     check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),

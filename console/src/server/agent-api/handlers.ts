@@ -4,7 +4,7 @@ import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
 import { enrollAgent, recordHeartbeat } from "@/server/agents";
-import { ingestEvents } from "@/server/events";
+import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
 import { requestPolicyEvaluation } from "@/server/policy-queue";
@@ -406,6 +406,11 @@ export function handleEvents(req: Request): Promise<Response> {
       }
       return body.response;
     }
+    // M2 back-pressure: the worker has not evaluated this agent's backlog yet.
+    if (await pendingEventsOver(getDb(), agentId)) {
+      eventStats.backpressure++;
+      return rateLimited(BACKPRESSURE_RETRY_AFTER_S);
+    }
     const refund = eventsPerAgent.reserve(agentId);
     if (!refund) return rateLimited(eventsPerAgent.check(agentId).retryAfterS);
     let outcome: Awaited<ReturnType<typeof ingestEvents>>;
@@ -430,6 +435,10 @@ export function handleEvents(req: Request): Promise<Response> {
         return agentError(404, "not_found", { details: outcome.details });
       case "invalid":
         await integrity("batch_rejected", 400, outcome.details);
+        return invalidRequest(outcome.details);
+      case "expired":
+        // L1: possible from a conforming agent (long spool): counted, not an integrity event.
+        eventStats.expired += outcome.details.length;
         return invalidRequest(outcome.details);
     }
   });

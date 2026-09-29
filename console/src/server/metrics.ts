@@ -9,6 +9,7 @@ import { getDb, type Database } from "@/db/client";
 import { errorSummary, logger } from "@/lib/logger";
 
 import { argon2Stats } from "./crypto";
+import { eventStats } from "./events";
 
 /**
  * Prometheus `/metrics` (ADR-0004): console metrics plus the agent metrics received in heartbeats.
@@ -228,6 +229,9 @@ export async function collectMetrics(db: Database): Promise<string> {
   x.add("databastion_enrollment_tokens_active", "gauge", "Unused, unrevoked, unexpired enrollment tokens.", tokens);
   const [[, events] = ["", 0]] = await counts(sql`select 'all' as k, count(*) as n from security_events`);
   x.add("databastion_security_events", "gauge", "Security events recorded (e.g. rotation conflicts).", events);
+  x.add("databastion_console_events_unexpected_target_total", "counter", "Access events received for a target not reported anymore or with Audit disabled (this process).", eventStats.unexpectedTarget);
+  x.add("databastion_console_events_expired_total", "counter", "Access events refused as older than the retention period (this process).", eventStats.expired);
+  x.add("databastion_console_events_backpressure_total", "counter", "POST /events answered 429 because the agent's backlog was not evaluated yet (this process).", eventStats.backpressure);
   x.add("databastion_console_argon2_operations_total", "counter", "argon2id operations started by this process.", argon2Stats.started);
   x.add("databastion_metrics_series_dropped", "gauge", "Series dropped by the cardinality caps in this scrape.", dropped);
   return x.render();

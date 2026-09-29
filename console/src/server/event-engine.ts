@@ -3,7 +3,11 @@ import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { accessEvents, agentTargets, findings, incidentEvents, incidents, policies, policyExceptions, principalBaselines } from "@/db/schema";
 import {
+  baselineEligible,
   baselineVerdict,
+  coarsePrincipal,
+  eventOverflowKey,
+  worseThanResolved,
   dedupObject,
   eventBucket,
   eventDedupKey,
@@ -34,7 +38,7 @@ import {
 import { consoleUrl } from "./alerting-config";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
-import { principalLabel } from "./events";
+import { baselinesPerTarget, eventIncidentsPerPolicyHour, principalLabel } from "./events";
 import type { Tx } from "./findings";
 import { enqueueIncidentNotifications } from "./notifications";
 
@@ -58,6 +62,8 @@ import { enqueueIncidentNotifications } from "./notifications";
  */
 
 export const EVENT_CHUNK = 200;
+/** At most this many events of one agent per chunk: agents are drained round-robin (M2). */
+export const EVENT_CHUNK_PER_AGENT = 50;
 const EVALUATION_LOCK = "events.evaluate";
 
 const log = logger.child({ component: "event-engine" });
@@ -125,6 +131,7 @@ const PENDING_COLUMNS = {
   principalKey: accessEvents.principalKey,
   dbUser: accessEvents.dbUser,
   dbUserFingerprint: accessEvents.dbUserFingerprint,
+  clientAddr: accessEvents.clientAddr,
   action: accessEvents.action,
   objects: accessEvents.objects,
   rows: accessEvents.rows,
@@ -140,6 +147,7 @@ type PendingEvent = {
   principalKey: string;
   dbUser: string | null;
   dbUserFingerprint: string | null;
+  clientAddr: string | null;
   action: string;
   objects: EventObject[];
   rows: number | null;
@@ -198,33 +206,71 @@ type BaselineRow = BaselineState & {
 };
 
 const baselineKey = (e: Pick<PendingEvent, "agentId" | "targetId" | "principalKey">) => [e.agentId, e.targetId, e.principalKey].join(SEP);
+const targetKey = (e: Pick<PendingEvent, "agentId" | "targetId">) => `${e.agentId}${SEP}${e.targetId}`;
 
+/**
+ * Baselines of the principals of the eligible events of the chunk (events with `rows`, never
+ * `connect` / `auth_failure`: H1). A target keeps at most `baselinesPerTarget()` baselines: before
+ * creating new ones past the cap, the least recently updated baselines of the target are evicted
+ * (owner-defined function, migration 0024), after the baselines of this chunk were touched so they
+ * are never the ones evicted. New principals beyond the cap in one chunk get no baseline.
+ */
 async function loadBaselines(tx: Tx, events: readonly PendingEvent[]): Promise<Map<string, BaselineRow>> {
-  const first = new Map<string, PendingEvent>();
-  for (const e of events) if (!first.has(baselineKey(e))) first.set(baselineKey(e), e);
-  await tx
-    .insert(principalBaselines)
-    .values(
-      [...first.values()].map((e) => ({
-        agentId: e.agentId,
-        targetId: e.targetId,
-        principalKey: e.principalKey,
-        dbUser: e.dbUser,
-        dbUserFingerprint: e.dbUserFingerprint,
-      })),
-    )
-    .onConflictDoNothing();
-  const rows = await tx
-    .select()
-    .from(principalBaselines)
-    .where(
-      and(
-        inArray(principalBaselines.agentId, [...new Set(events.map((e) => e.agentId))]),
-        inArray(principalBaselines.principalKey, [...new Set(events.map((e) => e.principalKey))]),
-      ),
-    );
   const out = new Map<string, BaselineRow>();
-  for (const r of rows) {
+  const first = new Map<string, PendingEvent>();
+  for (const e of events) if (baselineEligible(e) && !first.has(baselineKey(e))) first.set(baselineKey(e), e);
+  if (first.size === 0) return out;
+  const select = () =>
+    tx
+      .select()
+      .from(principalBaselines)
+      .where(
+        and(
+          inArray(principalBaselines.agentId, [...new Set([...first.values()].map((e) => e.agentId))]),
+          inArray(principalBaselines.principalKey, [...new Set([...first.values()].map((e) => e.principalKey))]),
+        ),
+      );
+  const existing = new Set((await select()).map((r) => baselineKey(r)).filter((k) => first.has(k)));
+  const fresh = [...first.entries()].filter(([k]) => !existing.has(k)).map(([, e]) => e);
+  if (fresh.length > 0) {
+    const cap = baselinesPerTarget();
+    const byTarget = new Map<string, PendingEvent[]>();
+    for (const e of fresh) byTarget.set(targetKey(e), [...(byTarget.get(targetKey(e)) ?? []), e]);
+    // Touch the existing baselines of the chunk: the eviction takes the least recently updated.
+    for (const k of existing) {
+      const [agentId, targetId, pk] = k.split(SEP) as [string, string, string];
+      await tx
+        .update(principalBaselines)
+        .set({ updatedAt: sql`now()` })
+        .where(and(eq(principalBaselines.agentId, agentId), eq(principalBaselines.targetId, targetId), eq(principalBaselines.principalKey, pk)));
+    }
+    const create: PendingEvent[] = [];
+    for (const list of byTarget.values()) {
+      const [{ agentId, targetId }] = list as [PendingEvent];
+      const [{ n } = { n: 0 }] = await tx
+        .select({ n: sql<number>`count(*)::int` })
+        .from(principalBaselines)
+        .where(and(eq(principalBaselines.agentId, agentId), eq(principalBaselines.targetId, targetId)));
+      const keep = list.slice(0, cap);
+      let excess = n + keep.length - cap;
+      while (excess > 0) {
+        const res = await tx.execute<{ d: number }>(
+          sql`select public.databastion_evict_principal_baselines(${agentId}::uuid, ${targetId}, ${Math.min(excess, 1000)}::int) as d`,
+        );
+        const d = Number(res.rows[0]?.d ?? 0);
+        if (d === 0) break;
+        excess -= d;
+      }
+      create.push(...keep);
+    }
+    if (create.length > 0) {
+      await tx
+        .insert(principalBaselines)
+        .values(create.map((e) => ({ agentId: e.agentId, targetId: e.targetId, principalKey: e.principalKey, dbUser: e.dbUser, dbUserFingerprint: e.dbUserFingerprint })))
+        .onConflictDoNothing();
+    }
+  }
+  for (const r of await select()) {
     const key = baselineKey(r);
     if (first.has(key)) out.set(key, { ...r });
   }
@@ -255,7 +301,7 @@ async function saveBaselines(tx: Tx, baselines: Map<string, BaselineRow>, touche
   }
 }
 
-type ApplyResult = "created" | "rematched" | "suppressed" | "excepted" | "no_match" | "unchanged";
+type ApplyResult = "created" | "reopened" | "overflow_created" | "overflow" | "rematched" | "linked" | "excepted" | "no_match" | "unchanged";
 
 interface Evaluated {
   event: PendingEvent;
@@ -263,80 +309,171 @@ interface Evaluated {
   objectSensitivities: number[];
 }
 
+interface LatestIncident {
+  id: string;
+  status: string;
+  eventScore: number | null;
+  eventSignals: string[] | null;
+  eventAnomaly: boolean | null;
+}
+
+/** Per-chunk state: incident lookups by dedup key, and new incidents per policy in this hour. */
+interface ChunkState {
+  now: Date;
+  hour: Date;
+  cap: number;
+  latest: Map<string, LatestIncident | null>;
+  created: Map<string, number>;
+}
+
+async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<LatestIncident | null> {
+  if (state.latest.has(key)) return state.latest.get(key) ?? null;
+  const [row] = await tx
+    .select({
+      id: incidents.id,
+      status: incidents.status,
+      eventScore: incidents.eventScore,
+      eventSignals: incidents.eventSignals,
+      eventAnomaly: incidents.eventAnomaly,
+    })
+    .from(incidents)
+    .where(eq(incidents.dedupKey, key))
+    .orderBy(desc(incidents.createdAt), desc(incidents.id))
+    .limit(1);
+  state.latest.set(key, row ?? null);
+  return row ?? null;
+}
+
+/** New (non-overflow) incidents of the policy since the start of the current hour. */
+async function createdThisHour(tx: Tx, state: ChunkState, policyId: string): Promise<number> {
+  const known = state.created.get(policyId);
+  if (known !== undefined) return known;
+  const [{ n } = { n: 0 }] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(incidents)
+    .where(
+      and(
+        eq(incidents.policyId, policyId),
+        eq(incidents.source, "access_event"),
+        eq(incidents.eventOverflow, false),
+        sql`${incidents.createdAt} >= ${state.hour.toISOString()}::timestamptz`,
+      ),
+    );
+  state.created.set(policyId, n);
+  return n;
+}
+
+async function link(tx: Tx, incidentId: string, eventId: string): Promise<void> {
+  await tx.insert(incidentEvents).values({ incidentId, eventId }).onConflictDoNothing();
+}
+
+/** Adds an event to an active incident. */
+async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: EventFacts): Promise<void> {
+  const signals = mergeSignals(latest.eventSignals ?? [], facts.signals);
+  await tx
+    .update(incidents)
+    .set({
+      matchCount: sql`${incidents.matchCount} + 1`,
+      eventScore: sql`greatest(coalesce(${incidents.eventScore}, 0), ${facts.score}::double precision)`,
+      eventRows: sql`coalesce(${incidents.eventRows}, 0) + ${e.rows ?? 0}::double precision`,
+      eventSignals: signals,
+      eventAnomaly: sql`coalesce(${incidents.eventAnomaly}, false) or ${facts.anomaly}`,
+      lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
+      updatedAt: sql`now()`,
+    })
+    .where(eq(incidents.id, latest.id));
+  latest.eventSignals = signals;
+  latest.eventScore = Math.max(latest.eventScore ?? 0, facts.score);
+  latest.eventAnomaly = latest.eventAnomaly === true || facts.anomaly;
+  await link(tx, latest.id, e.id);
+}
+
 async function applyEventPolicy(
   tx: Tx,
   policy: LoadedEventPolicy,
   ev: Evaluated,
   exceptions: readonly EventExceptionScope[],
-  now: Date,
+  state: ChunkState,
 ): Promise<ApplyResult> {
   const { event: e, facts } = ev;
   const kept = eventMatches(policy.conditions, facts);
   if (kept === null) return "no_match";
-  if (exceptions.some((x) => exceptionCoversEvent(x, policy.id, facts, kept, now))) return "excepted";
+  if (exceptions.some((x) => exceptionCoversEvent(x, policy.id, facts, kept, state.now))) return "excepted";
   const oi = dedupObject(kept, ev.objectSensitivities);
   const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
+  const coarse = coarsePrincipal({ fingerprinted: e.dbUser === null, action: e.action });
   const key = eventDedupKey({
     policyId: policy.id,
     agentId: e.agentId,
     targetId: e.targetId,
-    principalKey: e.principalKey,
+    principalKey: coarse ? `unknown:${sha256Hex(e.clientAddr ?? "-")}` : e.principalKey,
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
   });
-  const [latest] = await tx
-    .select({ id: incidents.id, status: incidents.status, eventSignals: incidents.eventSignals })
-    .from(incidents)
-    .where(eq(incidents.dedupKey, key))
-    .orderBy(desc(incidents.createdAt), desc(incidents.id))
-    .limit(1);
-  const rows = e.rows ?? 0;
+  const latest = await latestIncident(tx, state, key);
   if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) {
-    await tx
-      .update(incidents)
-      .set({
-        matchCount: sql`${incidents.matchCount} + 1`,
-        eventScore: sql`greatest(coalesce(${incidents.eventScore}, 0), ${facts.score}::double precision)`,
-        eventRows: sql`coalesce(${incidents.eventRows}, 0) + ${rows}::double precision`,
-        eventSignals: mergeSignals(latest.eventSignals ?? [], facts.signals),
-        lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
-        updatedAt: sql`now()`,
-      })
-      .where(eq(incidents.id, latest.id));
-    await tx.insert(incidentEvents).values({ incidentId: latest.id, eventId: e.id }).onConflictDoNothing();
+    await rematch(tx, latest, e, facts);
     return "rematched";
   }
-  // Resolved or false positive: the rest of this scope (policy, principal, database, hour) is
-  // considered handled; the next hour opens a new incident.
-  if (latest) return "suppressed";
-  const principal = principalLabel(e);
+  // M1: after a resolution, only a clearly worse event opens a new incident; otherwise the event
+  // is linked to the closed incident (visible there). A false positive is only linked.
+  if (latest && (latest.status !== "resolved" || !worseThanResolved(latest, facts))) {
+    await link(tx, latest.id, e.id);
+    return "linked";
+  }
+  // H1: cap of new incidents per policy and hour; beyond, one overflow incident counts the rest.
+  const overflow = (await createdThisHour(tx, state, policy.id)) >= state.cap;
+  const incidentKey = overflow ? eventOverflowKey(policy.id, state.hour) : key;
+  if (overflow) {
+    const o = await latestIncident(tx, state, incidentKey);
+    if (o && (ACTIVE_STATUSES as readonly string[]).includes(o.status)) {
+      await rematch(tx, o, e, facts);
+      return "overflow";
+    }
+    if (o) {
+      await link(tx, o.id, e.id);
+      return "linked";
+    }
+  }
+  const principal = overflow ? null : principalLabel(e);
   const inserted = await tx
     .insert(incidents)
     .values({
-      dedupKey: key,
+      dedupKey: incidentKey,
       source: "access_event",
       policyId: policy.id,
       policyName: policy.name,
       policyRevision: policy.revision,
       severity: policy.severity,
       notifyChannels: policy.notifyChannels,
-      agentId: e.agentId,
-      targetId: e.targetId,
+      agentId: overflow ? null : e.agentId,
+      targetId: overflow ? null : e.targetId,
       accessEventId: e.id,
       principal,
-      eventDatabase: database,
-      eventBucket: bucket,
+      eventDatabase: overflow ? null : database,
+      eventBucket: overflow ? state.hour : bucket,
       eventScore: facts.score,
-      eventRows: rows,
+      eventRows: e.rows ?? 0,
       eventSignals: mergeSignals([], facts.signals),
+      eventAnomaly: facts.anomaly,
+      eventOverflow: overflow,
       lastEventAt: e.ts,
     })
     .onConflictDoNothing({ target: incidents.dedupKey, where: sql`${incidents.status} in ('open', 'acknowledged')` })
     .returning({ id: incidents.id });
   const row = inserted[0];
   if (!row) return "unchanged";
-  await tx.insert(incidentEvents).values({ incidentId: row.id, eventId: e.id }).onConflictDoNothing();
+  state.latest.set(incidentKey, {
+    id: row.id,
+    status: "open",
+    eventScore: facts.score,
+    eventSignals: mergeSignals([], facts.signals),
+    eventAnomaly: facts.anomaly,
+  });
+  if (!overflow) state.created.set(policy.id, (state.created.get(policy.id) ?? 0) + 1);
+  await link(tx, row.id, e.id);
+  const reopenedFrom = latest?.status === "resolved" ? latest.id : null;
   await writeAudit(tx, {
     actorType: "system",
     action: "incident.create",
@@ -350,21 +487,24 @@ async function applyEventPolicy(
       agent_id: e.agentId,
       target_id: e.targetId,
       severity: policy.severity,
+      overflow,
+      reopened_from: reopenedFrom,
     },
   });
   const payload: AccessIncidentOpenedPayload = {
     event: "incident.opened",
     source: "access_event",
-    occurred_at: now.toISOString(),
+    occurred_at: state.now.toISOString(),
     url: consoleUrl(`/incidents/${row.id}`),
-    incident: { id: row.id, severity: policy.severity, status: "open", reopened_from: null },
+    incident: { id: row.id, severity: policy.severity, status: "open", reopened_from: reopenedFrom },
     policy: { id: policy.id, name: policy.name, revision: policy.revision },
     agent_id: e.agentId,
     target_id: e.targetId,
-    principal,
+    principal: principal ?? "",
     principal_fingerprinted: e.dbUser === null,
-    database,
-    hour: bucket.toISOString(),
+    database: overflow ? null : database,
+    hour: (overflow ? state.hour : bucket).toISOString(),
+    overflow: overflow ? { limit_per_hour: state.cap } : null,
     access: {
       ts: e.ts.toISOString(),
       action: e.action,
@@ -378,7 +518,7 @@ async function applyEventPolicy(
     },
   };
   await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, payload);
-  return "created";
+  return overflow ? "overflow_created" : reopenedFrom ? "reopened" : "created";
 }
 
 export interface EventDrainStats {
@@ -389,20 +529,39 @@ export interface EventDrainStats {
   more: boolean;
 }
 
-/** Evaluates one chunk of pending events; returns the number evaluated. */
-async function evaluateChunk(db: Database, stats: EventDrainStats): Promise<number> {
+/**
+ * Pending events of the next chunk: at most `EVENT_CHUNK_PER_AGENT` per agent, agents interleaved
+ * (round-robin on each agent's arrival order), so a busy agent never holds back the others (M2).
+ * Returned in arrival order (batch reception, then position in the batch: events of one batch
+ * share `received_at`), which keeps each principal's events in order for its baseline.
+ */
+async function pendingChunk(tx: Tx): Promise<PendingEvent[]> {
+  const picked = await tx.execute<{ id: string }>(sql`
+    select id from (
+      select id, received_at, item_index, row_number() over (partition by agent_id order by received_at, item_index, id) as rn
+      from ${accessEvents} where ${accessEvents.evaluatedAt} is null) x
+    where rn <= ${EVENT_CHUNK_PER_AGENT}
+    order by rn, received_at, item_index, id
+    limit ${EVENT_CHUNK}`);
+  const ids = picked.rows.map((r) => r.id);
+  if (ids.length === 0) return [];
+  return (await tx
+    .select(PENDING_COLUMNS)
+    .from(accessEvents)
+    .where(and(inArray(accessEvents.id, ids), isNull(accessEvents.evaluatedAt)))
+    .orderBy(asc(accessEvents.receivedAt), asc(accessEvents.itemIndex), asc(accessEvents.id))
+    .for("update", { skipLocked: true })) as PendingEvent[];
+}
+
+/** Evaluates one chunk of pending events; returns the number evaluated. Exported for tests. */
+export async function evaluateChunk(db: Database, stats: EventDrainStats): Promise<number> {
   return db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${EVALUATION_LOCK}, 0))`);
-    const events = (await tx
-      .select(PENDING_COLUMNS)
-      .from(accessEvents)
-      .where(isNull(accessEvents.evaluatedAt))
-      .orderBy(asc(accessEvents.receivedAt), asc(accessEvents.id))
-      .limit(EVENT_CHUNK)
-      .for("update", { skipLocked: true })) as PendingEvent[];
+    const events = await pendingChunk(tx);
     if (events.length === 0) return 0;
     const [{ now } = { now: new Date() }] = (await tx.execute(sql`select now() as now`)).rows as { now: Date }[];
     const nowDate = new Date(now);
+    const state: ChunkState = { now: nowDate, hour: eventBucket(nowDate), cap: eventIncidentsPerPolicyHour(), latest: new Map(), created: new Map() };
     const targets = await tx
       .select({ agentId: agentTargets.agentId, targetId: agentTargets.targetId, engine: agentTargets.engine })
       .from(agentTargets)
@@ -419,7 +578,7 @@ async function evaluateChunk(db: Database, stats: EventDrainStats): Promise<numb
       const sensitivity = objectSensitivities.reduce((m, s) => Math.max(m, s), 0);
       const score = eventScore(sensitivity, e.rows);
       const bk = baselineKey(e);
-      const base = baselines.get(bk);
+      const base = baselineEligible(e) ? baselines.get(bk) : undefined;
       const verdict = base ? baselineVerdict(base, e.rows) : { anomaly: false, baselineRows: null };
       if (base) {
         const next = updateBaseline(base, e.rows, score);
@@ -447,8 +606,8 @@ async function evaluateChunk(db: Database, stats: EventDrainStats): Promise<numb
         anomaly: verdict.anomaly,
       };
       for (const p of active) {
-        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities }, exceptions, nowDate);
-        if (r === "created") stats.created += 1;
+        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities }, exceptions, state);
+        if (r === "created" || r === "reopened" || r === "overflow_created") stats.created += 1;
       }
       if (verdict.anomaly) stats.anomalies += 1;
       await tx
@@ -469,8 +628,10 @@ export async function drainEventWork(db: Database, deadline: number): Promise<Ev
       stats.more = true;
       return stats;
     }
+    // A chunk holds at most EVENT_CHUNK_PER_AGENT events per agent, so a short chunk does not
+    // mean the backlog is empty: stop only on an empty one.
     const n = await evaluateChunk(db, stats);
     stats.events += n;
-    if (n < EVENT_CHUNK) return stats;
+    if (n === 0) return stats;
   }
 }

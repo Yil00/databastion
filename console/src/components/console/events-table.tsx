@@ -82,6 +82,11 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
                   </Link>
                 ))}
                 {e.anomaly && <Badge variant="destructive">above baseline</Badge>}
+                {e.unexpectedTarget && (
+                  <Badge variant="outline" title="Received for a target the agent no longer reports, or whose Audit settings are disabled">
+                    unexpected target
+                  </Badge>
+                )}
               </div>
             </TableCell>
             <TableCell>

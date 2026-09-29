@@ -200,8 +200,8 @@ describe("access_event conditions", () => {
 
   it("matches with AND across keys and OR within a list", () => {
     expect(eventMatches({ signals: ["signature.*"] }, FACTS)).toEqual([0, 1]);
-    expect(eventMatches({ signals: ["signature.mysqldump"] }, FACTS)).toBeNull();
-    expect(eventMatches({ signals: ["signature.mysqldump", "shape.full_table_copy"] }, FACTS)).toEqual([0, 1]);
+    expect(eventMatches({ signals: ["signature.copy_to_file"] }, FACTS)).toBeNull();
+    expect(eventMatches({ signals: ["signature.copy_to_file", "shape.full_table_copy"] }, FACTS)).toEqual([0, 1]);
     expect(eventMatches({ signals: ["signature.*"], event_actions: ["write"] }, FACTS)).toBeNull();
     expect(eventMatches({ principals: ["BACK*"] }, FACTS)).toEqual([0, 1]);
     expect(eventMatches({ principals: ["*"], exclude_principals: ["backup"] }, FACTS)).toBeNull();

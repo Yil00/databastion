@@ -100,6 +100,15 @@ export function eventScore(sensitivity: number, rows: number | null | undefined)
 
 // -------------------------------------------------------------------------- baselines
 
+/**
+ * Only events that report a volume and read or change data feed a baseline: never `connect` or
+ * `auth_failure` (security review H1: a login attempt with a random account name must not create
+ * a baseline).
+ */
+export function baselineEligible(e: { action: string; rows: number | null | undefined }): boolean {
+  return e.rows !== null && e.rows !== undefined && e.rows >= 0 && e.action !== "connect" && e.action !== "auth_failure";
+}
+
 export const BASELINE_ALPHA = 0.05;
 export const BASELINE_WARMUP = 20;
 export const ANOMALY_FACTOR = 10;
@@ -402,11 +411,17 @@ export function exceptionCoversEvent(
 
 /**
  * Dedup scope of the incidents raised from events: one incident per policy, agent, target,
- * principal, database and UTC hour of the event `ts`. The database is the one of the most sensitive
+ * principal, database and UTC hour of the event `ts`. The principal part is coarse for events
+ * whose account is unknown (a fingerprint sent instead of the name) and for failed
+ * authentications: all of them from one client address count as one principal
+ * (`unknown:<sha256 of client_addr>`), so random account names cannot open one incident each
+ * (security review H1). On top of that, a policy opens at most a configured number of incidents
+ * per hour; the further matches of that hour go to one overflow incident of the policy. The database is the one of the most sensitive
  * retained object (the first on a tie), none for an event without object. While that incident is
  * open or acknowledged, the later events of the scope are added to it (`match_count`, rows, highest
- * score, signals); once it is resolved or a false positive, the rest of the hour opens nothing, and
- * the next hour opens a new incident. A `pg_dump` of a whole database (one event per table) thus
+ * score, signals). Once it is a false positive, the later events of the scope in that hour are
+ * only linked to it. Once it is resolved, a later event of the hour opens a new incident only when
+ * it is worse (`worseThanResolved`), else it is linked to it; the next hour opens a new incident. A `pg_dump` of a whole database (one event per table) thus
  * raises one incident per policy and hour, not one per table.
  */
 export const EVENT_BUCKET_MS = 3600_000;
@@ -415,17 +430,44 @@ export function eventBucket(ts: Date): Date {
   return new Date(Math.floor(ts.getTime() / EVENT_BUCKET_MS) * EVENT_BUCKET_MS);
 }
 
+/** Whether the event's principal is grouped by client address in the dedup scope. */
+export function coarsePrincipal(e: { fingerprinted: boolean; action: string }): boolean {
+  return e.fingerprinted || e.action === "auth_failure";
+}
+
 /** Key parts are identifiers and hashes only: never agent-provided free text. */
 export function eventDedupKey(k: {
   policyId: string;
   agentId: string;
   targetId: string;
+  /** The principal key, or `unknown:<sha256 of client_addr>` for a coarse principal. */
   principalKey: string;
   /** SHA-256 (hex) of the database name, or `-`. */
   databaseKey: string;
   bucket: Date;
 }): string {
   return `policy:${k.policyId}|agent:${k.agentId}|target:${k.targetId}|principal:${k.principalKey}|database:${k.databaseKey}|hour:${k.bucket.toISOString()}`;
+}
+
+/** Key of the per-policy overflow incident of an hour (console clock). */
+export function eventOverflowKey(policyId: string, hour: Date): string {
+  return `policy:${policyId}|overflow|hour:${hour.toISOString()}`;
+}
+
+/**
+ * After the incident of a scope was resolved, a later event of the same scope opens a new
+ * incident only when it is clearly worse: a higher score, above the baseline while the incident
+ * was not, or a signal the incident did not have (security review M1). Otherwise it is only
+ * linked to the resolved incident.
+ */
+export function worseThanResolved(
+  resolved: { eventScore: number | null; eventSignals: readonly string[] | null; eventAnomaly: boolean | null },
+  e: { score: number; anomaly: boolean; signals: readonly string[] },
+): boolean {
+  if (e.score > (resolved.eventScore ?? 0)) return true;
+  if (e.anomaly && resolved.eventAnomaly !== true) return true;
+  const known = new Set(resolved.eventSignals ?? []);
+  return e.signals.some((s) => !known.has(s));
 }
 
 /** Index of the retained object that sets the dedup database: the most sensitive, first on a tie. */

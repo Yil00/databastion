@@ -49,6 +49,8 @@ import { enqueueIncidentNotifications } from "./notifications";
  */
 
 export const EVALUATION_CHUNK = 200;
+/** Share of a `policies.evaluate` run given to access events before the findings (M2). */
+export const EVENT_BUDGET_SHARE = 0.6;
 
 interface LoadedPolicy {
   id: string;
@@ -305,14 +307,12 @@ export async function drainPolicyWork(db: Database, opts: { budgetMs?: number } 
     stats.created += results.filter((r) => r === "created").length;
   };
 
-  // 0. Access events (their own chunks and lock, see event-engine.ts).
-  const events = await drainEventWork(db, deadline);
+  // 0. Access events (their own chunks and lock, see event-engine.ts), within at most
+  // EVENT_BUDGET_SHARE of the budget: the finding work below always runs after (M2).
+  const events = await drainEventWork(db, Date.now() + (deadline - Date.now()) * EVENT_BUDGET_SHARE);
   stats.events = events.events;
   stats.created += events.created;
-  if (events.more) {
-    stats.more = true;
-    return stats;
-  }
+  if (events.more) stats.more = true;
 
   // 1. Full passes: policies changed since their last pass, or with an exception expired since.
   const stale = await db
@@ -550,6 +550,9 @@ export interface IncidentView {
     rows: number | null;
     signals: string[];
     lastEventAt: Date | null;
+    anomaly: boolean;
+    /** Per-policy overflow incident of an hour (H1). */
+    overflow: boolean;
   } | null;
   createdAt: Date;
   updatedAt: Date;
@@ -602,6 +605,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       eventRows: incidents.eventRows,
       eventSignals: incidents.eventSignals,
       lastEventAt: incidents.lastEventAt,
+      eventAnomaly: incidents.eventAnomaly,
+      eventOverflow: incidents.eventOverflow,
       createdAt: incidents.createdAt,
       updatedAt: incidents.updatedAt,
       acknowledgedAt: incidents.acknowledgedAt,
@@ -631,6 +636,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       eventRows,
       eventSignals,
       lastEventAt,
+      eventAnomaly,
+      eventOverflow,
       ...r
     }) => ({
     ...r,
@@ -645,6 +652,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
             rows: eventRows,
             signals: eventSignals ?? [],
             lastEventAt,
+            anomaly: eventAnomaly === true,
+            overflow: eventOverflow,
           }
         : null,
     location:

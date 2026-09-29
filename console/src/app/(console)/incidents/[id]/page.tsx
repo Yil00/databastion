@@ -88,7 +88,11 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
               <>
                 <dt className="text-muted-foreground">Principal</dt>
                 <dd className="break-all">
-                  <PrincipalLabel principal={access.principal} fingerprinted={access.principal.startsWith("hmac-sha256:")} />
+                  {access.overflow ? (
+                    "several: the policy reached its hourly limit of new incidents, the further matches of the hour are counted here"
+                  ) : (
+                    <PrincipalLabel principal={access.principal} fingerprinted={access.principal.startsWith("hmac-sha256:")} />
+                  )}
                 </dd>
                 <dt className="text-muted-foreground">Database</dt>
                 <dd>
@@ -103,7 +107,10 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                   {access.score ?? 0}
                 </dd>
                 <dt className="text-muted-foreground">Signals</dt>
-                <dd>{access.signals.length > 0 ? access.signals.join(", ") : "none"}</dd>
+                <dd>
+                  {access.signals.length > 0 ? access.signals.join(", ") : "none"}
+                  {access.anomaly ? " (and a volume above the principal's baseline)" : ""}
+                </dd>
               </>
             ) : (
               <>

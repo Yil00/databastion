@@ -7,7 +7,11 @@ import { accessEvents, auditLog, eventsBatches, securityEvents } from "@/db/sche
 import { validateSchema } from "@/lib/protocol/validate";
 import { canonicalJson } from "@/server/findings";
 import {
+  BACKPRESSURE_RETRY_AFTER_S,
   DEFAULT_EVENTS_RETENTION_DAYS,
+  eventStats,
+  MAX_PENDING_EVENTS_PER_AGENT,
+  pendingEventsOver,
   eventsBatchSha256,
   eventsRetentionDays,
   ingestEvents,
@@ -91,6 +95,8 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
   let teardown: () => Promise<void>;
 
   beforeAll(async () => {
+    // The contract fixtures carry fixed dates: a long retention keeps them acceptable over time.
+    process.env.DATABASTION_EVENTS_RETENTION_DAYS = "3650";
     teardown = await setupTestDatabase();
     await adminUser();
   });
@@ -223,6 +229,53 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       expect((await post(auth, batch([{ ...PG_DUMP, ts: soon }]))).status).toBe(202);
     });
 
+    it("400 formatMinimum for events older than the retention period, without an integrity event (L1)", async () => {
+      const auth = await agentWithTargets();
+      const old = new Date(Date.now() - 100 * 24 * 3600_000).toISOString();
+      const b = batch([{ ...PG_DUMP, ts: new Date().toISOString() }, { ...PG_DUMP, ts: old }]);
+      expect(await ingestEvents(getDb(), auth.agentId, b as never, Date.now(), 90)).toEqual({
+        kind: "expired",
+        details: [{ pointer: "/events/1/ts", keyword: "formatMinimum" }],
+      });
+      process.env.DATABASTION_EVENTS_RETENTION_DAYS = "90";
+      try {
+        const res = await post(auth, b);
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ details: [{ pointer: "/events/1/ts", keyword: "formatMinimum" }] });
+      } finally {
+        process.env.DATABASTION_EVENTS_RETENTION_DAYS = "3650";
+      }
+      expect(await integrityRows(auth.agentId, "agent.batch_rejected")).toHaveLength(0);
+      expect(await storedEvents(auth.agentId)).toHaveLength(0);
+    });
+
+    it("flags events of a target no longer reported or with Audit disabled (L4)", async () => {
+      const auth = await agentWithTargets();
+      await getDb().execute(sql`update agent_targets set present = false where agent_id = ${auth.agentId} and target_id = 'mysql-crm'`);
+      await getDb().execute(sql`insert into audit_configs (agent_id, target_id, enabled, aggregation_window_s, poll_interval_s)
+        values (${auth.agentId}, 'mongo-app', false, 60, 10)`);
+      const before = eventStats.unexpectedTarget;
+      const other = (target_id: string) => ({ ...PG_DUMP, target_id });
+      expect((await post(auth, batch([PG_DUMP, other("mysql-crm"), other("mongo-app")]))).status).toBe(202);
+      expect((await storedEvents(auth.agentId)).map((r) => r.unexpectedTarget)).toEqual([false, true, true]);
+      expect(eventStats.unexpectedTarget - before).toBe(2);
+    });
+
+    it("429 + Retry-After while the agent's backlog of unevaluated events is too large (M2)", async () => {
+      const auth = await agentWithTargets();
+      expect((await post(auth, batch())).status).toBe(202);
+      await getDb().execute(sql`insert into access_events (agent_id, target_id, batch_id, item_index, ts, principal_key, db_user, action, objects, source, aggregated_count)
+        select ${auth.agentId}, 'pg-prod-1', gen_random_uuid(), 0, now(), ${"3".repeat(64)}, 'x', 'connect', '[]'::jsonb, 'pgaudit', 1
+        from generate_series(1, ${MAX_PENDING_EVENTS_PER_AGENT})`);
+      expect(await pendingEventsOver(getDb(), auth.agentId)).toBe(true);
+      const res = await post(auth, batch());
+      expect(res.status).toBe(429);
+      expect(res.headers.get("retry-after")).toBe(String(BACKPRESSURE_RETRY_AFTER_S));
+      expect((await expectConformingError(res, {})).code).toBe("rate_limited");
+      const other = await agentWithTargets();
+      expect((await post(other, batch())).status).toBe(202);
+    });
+
     it("the replay of an accepted batch is acknowledged before the other checks", async () => {
       const auth = await agentWithTargets();
       const b = batch();
@@ -328,23 +381,56 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       });
     });
 
-    it("purges events past the retention bound, in chunks; the bound is never below 7 days", async () => {
+    /** Ages stored rows as the owner (the runtime role could not): events `ts` and evaluation. */
+    async function age(agentId: string, daysAgo: number[]) {
+      const rows = await storedEvents(agentId);
+      for (const [i, d] of daysAgo.entries()) {
+        await getDb().execute(sql`update access_events set ts = now() - make_interval(days => ${d}), evaluated_at = now() where id = ${rows[i]?.id}`);
+      }
+    }
+
+    it("purges evaluated events past the retention bound, in chunks; never below 7 days; never unevaluated ones", async () => {
       const auth = await agentWithTargets();
-      const day = 24 * 3600_000;
-      const at = (daysAgo: number) => new Date(Date.now() - daysAgo * day).toISOString();
-      const old = [120, 100, 95].map((d) => ({ ...PG_DUMP, ts: at(d) }));
-      const recent = [80, 5, 3].map((d) => ({ ...PG_DUMP, ts: at(d) }));
-      expect((await post(auth, batch([...old, ...recent]))).status).toBe(202);
+      expect((await post(auth, batch(Array.from({ length: 7 }, () => PG_DUMP)))).status).toBe(202);
+      // The 7th event is old but not evaluated yet: kept.
+      const rows = await storedEvents(auth.agentId);
+      for (const [i, d] of [120, 100, 95, 80, 5, 3].entries()) {
+        await getDb().execute(sql`update access_events set ts = now() - make_interval(days => ${d}), evaluated_at = now() where id = ${rows[i]?.id}`);
+      }
+      await getDb().execute(sql`update access_events set ts = now() - make_interval(days => 200), evaluated_at = null where id = ${rows[6]?.id}`);
       expect(await purgeAccessEvents(getDb(), { retentionDays: 90, chunk: 2 })).toEqual({ deleted: 3, more: false });
-      expect((await storedEvents(auth.agentId)).map((r) => r.ts.toISOString())).toEqual(recent.map((e) => new Date(e.ts).toISOString()));
+      expect(await storedEvents(auth.agentId)).toHaveLength(4);
       // A retention of 1 day is raised to 7: the events of 3 and 5 days survive.
       await purgeAccessEvents(getDb(), { retentionDays: 1 });
-      expect(await storedEvents(auth.agentId)).toHaveLength(2);
+      const left = await storedEvents(auth.agentId);
+      expect(left).toHaveLength(3);
+      expect(left.some((r) => r.evaluatedAt === null)).toBe(true);
+    });
+
+    it("keeps the batch records 30 days longer than the events, and purges idle baselines", async () => {
+      const auth = await agentWithTargets();
+      const a = batch();
+      const b = batch();
+      expect((await post(auth, a)).status).toBe(202);
+      expect((await post(auth, b)).status).toBe(202);
+      await getDb().execute(sql`update events_batches set received_at = now() - interval '100 days' where batch_id = ${a.batch_id}`);
+      await getDb().execute(sql`update events_batches set received_at = now() - interval '130 days' where batch_id = ${b.batch_id}`);
+      await getDb().execute(sql`insert into principal_baselines (agent_id, target_id, principal_key, db_user, updated_at)
+        values (${auth.agentId}, 'pg-prod-1', ${"1".repeat(64)}, 'old', now() - interval '100 days'),
+               (${auth.agentId}, 'pg-prod-1', ${"2".repeat(64)}, 'recent', now() - interval '10 days')`);
+      await purgeAccessEvents(getDb(), { retentionDays: 90 });
+      const kept = await getDb().select({ id: eventsBatches.batchId }).from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId));
+      expect(kept.map((r) => r.id)).toEqual([a.batch_id]);
+      // The replay of the kept batch is still a duplicate.
+      expect(await (await post(auth, a)).json()).toEqual({ batch_id: a.batch_id, duplicate: true });
+      const baselines = await getDb().execute<{ db_user: string }>(sql`select db_user from principal_baselines where agent_id = ${auth.agentId}`);
+      expect(baselines.rows.map((r) => r.db_user)).toEqual(["recent"]);
     });
 
     it("the runtime role deletes events only through the purge function", async () => {
       const auth = await agentWithTargets();
-      expect((await post(auth, batch([{ ...PG_DUMP, ts: new Date(Date.now() - 200 * 24 * 3600_000).toISOString() }, PG_DUMP]))).status).toBe(202);
+      expect((await post(auth, batch([PG_DUMP, PG_DUMP]))).status).toBe(202);
+      await age(auth.agentId, [200]);
       const { url } = await createRuntimeRole();
       const client = new Client({ connectionString: url });
       await client.connect();
@@ -352,6 +438,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         await expect(client.query("delete from public.access_events")).rejects.toThrow(/permission denied/);
         await expect(client.query("update public.access_events set db_user = 'x'")).rejects.toThrow(/permission denied/);
         await expect(client.query("delete from public.events_batches")).rejects.toThrow(/permission denied/);
+        await expect(client.query("delete from public.principal_baselines")).rejects.toThrow(/permission denied/);
         const res = await client.query<{ n: number }>("select public.databastion_purge_access_events(90, 100) as n");
         expect(res.rows[0]?.n).toBeGreaterThanOrEqual(1);
       } finally {
