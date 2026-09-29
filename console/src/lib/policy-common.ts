@@ -1,7 +1,10 @@
 /**
  * Helpers shared by the condition models of every policy source (`finding`:
- * src/lib/policy-model.ts, `access_event`: src/lib/event-model.ts). Pure functions, no dependency.
+ * src/lib/policy-model.ts, `access_event`: src/lib/event-model.ts). Pure functions, no dependency
+ * besides the contract value lists.
  */
+
+import { ENGINES } from "@/lib/protocol/enums";
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -9,8 +12,8 @@ export const fail = (error: string): { ok: false; error: string } => ({ ok: fals
 
 export const MAX_LIST_ITEMS = 50;
 
-/** Contract `Engine`. */
-export const ENGINES = ["postgres", "mysql", "mariadb", "mongodb", "openldap"] as const;
+/** Contract `Engine` (checked against the generated types in src/lib/protocol/enums.ts). */
+export { ENGINES };
 export const MAX_GLOB_LENGTH = 256;
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

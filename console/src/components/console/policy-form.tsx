@@ -6,6 +6,7 @@ import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { SEVERITIES } from "@/lib/incident-lifecycle";
+import { AUDIT_SOURCES, ENGINES, EVENT_ACTIONS, orList } from "@/lib/protocol/enums";
 import { REGISTERED_SIGNALS } from "@/lib/protocol/signals";
 
 import { userApi } from "./client-api";
@@ -37,11 +38,11 @@ export const THRESHOLD_FIELDS = [
 
 /** Source `access_event` (P4-C): conditions on Audit access events. */
 export const EVENT_LIST_FIELDS = [
-  { name: "signals", label: "Signals, e.g. signature.pg_dump, signature.copy_to_file, shape.full_table_copy, volume.large_result, or families such as signature.* (any when empty)" },
-  { name: "event_actions", label: "Actions: connect, auth_failure, read, write, ddl, dcl (any when empty)" },
+  { name: "signals", label: "Signals, e.g. signature.pg_dump, signature.mongodump, shape.full_table_read, volume.large_result, or families such as signature.* (any when empty)" },
+  { name: "event_actions", label: `Actions: ${EVENT_ACTIONS.join(", ")} (any when empty)` },
   { name: "principals", label: "Principals, globs (any when empty)" },
   { name: "exclude_principals", label: "Except principals, globs" },
-  { name: "sources", label: "Audit sources such as pgaudit (any when empty)" },
+  { name: "sources", label: "Audit sources such as pgaudit or mongodb_audit_log (any when empty)" },
   { name: "target_ids", label: "Targets (all when empty)" },
   { name: "engines", label: "Engines (all when empty)" },
   { name: "agent_ids", label: "Agent ids (all when empty)" },
@@ -135,14 +136,14 @@ export const POLICY_FIELD_ERRORS: Record<string, string> = {
   description: "Description: at most 500 printable characters.",
   classifiers: "Classifiers: registered ids (e.g. pii.email) or families (e.g. pii.*).",
   target_ids: "Targets: target ids as declared in agent.yaml.",
-  engines: "Engines: postgres, mysql, mariadb, mongodb or openldap.",
+  engines: `Engines: ${orList(ENGINES)}.`,
   agent_ids: "Agent ids: agent UUIDs.",
   min_confidence: "Minimum confidence: a number from 0 to 1.",
   min_match_ratio: "Minimum ratio: a number from 0 to 1.",
   min_matched: "Minimum matched: a whole number from 0 to 10000.",
   signals: `Signals: registered ids (${REGISTERED_SIGNALS.join(", ")}), other ids of 1 to 6 lowercase words without digits, or families signature.*, shape.*, volume.*.`,
-  event_actions: "Actions: connect, auth_failure, read, write, ddl or dcl.",
-  sources: "Audit sources: pgaudit, pg_stat_statements, performance_schema, mariadb_server_audit...",
+  event_actions: `Actions: ${orList(EVENT_ACTIONS)}.`,
+  sources: `Audit sources: ${orList(AUDIT_SOURCES)}.`,
   principals: "Principals: printable globs.",
   exclude_principals: "Excluded principals: printable globs.",
   min_score: "Minimum score: a number, 0 or more.",
