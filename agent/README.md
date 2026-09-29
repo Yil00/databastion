@@ -195,6 +195,13 @@ review remain the primary controls.
   `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
+- Access event timestamps (`ts`, `ts_last`) come from the target's audit
+  records and are clamped to the agent clock when the events are spooled, so
+  a target clock running ahead cannot make the console reject a batch as
+  future-dated (`formatMaximum`). The agent clock itself must stay within
+  5 min of the console's: run NTP on the agent host. Batches spooled by an
+  older agent are resent unchanged; after an upgrade, their future-dated
+  items can still be rejected once (only those items are dropped).
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
   `deny.toml` sets `[graph] exclude-dev = true`: the hyper `server` feature
   it needs is never linked into the binary, and the bans stay strict for
