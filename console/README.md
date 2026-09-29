@@ -680,6 +680,15 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
   `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
   and any printable character in `db_user`).
+- **OpenLDAP labels and principal fingerprints** (P7, ADR-0029 decision 6): for an OpenLDAP
+  target (from the event's audit source `openldap_accesslog`, else the target's engine) the
+  findings, events and incident views name the location parts as LDAP does: `database` is the
+  **naming context**, `schema` the entry's **container**, `object` the **object class** and
+  `field` the **attribute** (event objects read "object class X in container Y"). A principal the
+  agent sent as `db_user_fingerprint` is never shown as a name: it is labelled "fingerprint" (on
+  OpenLDAP "LDAP principal fingerprint": the keyed HMAC of an entry DN not listed in
+  `openldap.clear_principals`), shortened to 12 hex digits in a monospace font, with what it is and
+  the full value in the tooltip; only the agent host can map it back to a DN.
 - **Sensitivity** of an object: for each classifier found on it (any column, false positives
   excluded), its weight times the highest confidence, summed, capped at 30. An event's sensitivity
   is that of its most sensitive object; an event object without schema matches the findings of any

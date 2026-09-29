@@ -3,14 +3,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import { auditWarningText } from "@/lib/audit-warning";
 import { eventsHref, parseEventFilter, principalHref } from "@/lib/events-filter";
+import { auditSourceEngine } from "@/lib/location-labels";
+import { AUDIT_SOURCES, ENGINES } from "@/lib/protocol/enums";
 import { parsePolicyActions, parsePolicyConditions } from "@/lib/policy-model";
 import type { EventView, PrincipalView } from "@/server/events";
 import type { IncidentView } from "@/server/incidents";
 import type { PolicyView } from "@/server/policies";
 
 import { AuditForm, confirmationText, formatManualObjects, parseManualObjects } from "./audit-form";
-import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalsTable, SignalBadge, UNREGISTERED_SIGNAL_TITLE } from "./events-table";
-import { IncidentsTable } from "./incidents-table";
+import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalLabel, PrincipalsTable, SignalBadge, UNREGISTERED_SIGNAL_TITLE } from "./events-table";
+import { incidentLocation, IncidentsTable } from "./incidents-table";
 import { conditionLines, PoliciesTable, policyFormValues } from "./policies-table";
 import { PolicyForm, policyErrorMessage, policyRequestBody } from "./policy-form";
 
@@ -37,6 +39,7 @@ const event = (over: Partial<EventView> = {}): EventView => ({
   application: "pg_dump",
   action: "read",
   objects: [{ database: "crm", schema: "public", object: "clients" }],
+  engine: "postgres",
   rows: 1_250_000,
   bytes: null,
   signals: ["signature.pg_dump"],
@@ -69,7 +72,7 @@ describe("access events view", () => {
     expect(html).toContain('href="/events?signal=signature.pg_dump"');
     expect(html).toContain('href="/incidents/01890a5d-ac96-774b-bcce-b302099a8057"');
     expect(html).toContain("above baseline");
-    expect(html).toContain("fingerprint 5a5a5a5a5a5a");
+    expect(html).toContain('<span class="text-muted-foreground">fingerprint</span> <code class="font-mono text-xs">5a5a5a5a5a5a…</code>');
     expect(html).toContain("pending");
     expect(html).toContain("1.3 M");
   });
@@ -111,6 +114,7 @@ describe("access events view", () => {
       principalKey: KEY,
       principal: HOSTILE,
       fingerprinted: false,
+      engine: "postgres",
       events: 3,
       warm: false,
       baselineRows: null,
@@ -163,6 +167,99 @@ describe("access events view", () => {
   });
 });
 
+describe("OpenLDAP events (ADR-0029)", () => {
+  const FP = `hmac-sha256:${"3f".repeat(32)}`;
+  const ldapEvent = event({
+    targetId: "ldap-1",
+    source: "openldap_accesslog",
+    engine: "openldap",
+    principal: FP,
+    fingerprinted: true,
+    clientAddr: null,
+    application: null,
+    signals: ["shape.bulk_search"],
+    objects: [
+      { database: "dc=example,dc=org", schema: "ou=people,dc=example,dc=org", object: "inetOrgPerson" },
+      { database: "dc=example,dc=org", schema: "ou=*,ou=teams,dc=example,dc=org", object: "*" },
+    ],
+  });
+
+  it("labels objects as object class in container, separated by semicolons", () => {
+    expect(objectsLabel(ldapEvent.objects, 3, "openldap")).toBe(
+      "object class inetOrgPerson in container ou=people,dc=example,dc=org; object class * in container ou=*,ou=teams,dc=example,dc=org",
+    );
+    expect(objectsLabel([{ database: "dc=example,dc=org", object: "*" }], 3, "openldap")).toBe("object class * in naming context dc=example,dc=org");
+    const many = Array.from({ length: 5 }, (_, i) => ({ database: "dc=x", schema: `ou=u${i},dc=x`, object: "person" }));
+    expect(objectsLabel(many, 2, "openldap")).toBe("object class person in container ou=u0,dc=x; object class person in container ou=u1,dc=x and 3 more");
+    // Other engines unchanged.
+    expect(objectsLabel(ldapEvent.objects)).toBe("dc=example,dc=org.ou=people,dc=example,dc=org.inetOrgPerson, dc=example,dc=org.ou=*,ou=teams,dc=example,dc=org.*");
+  });
+
+  it("shows a fingerprinted LDAP principal as a fingerprint, never as a name", () => {
+    const html = renderToStaticMarkup(<EventsTable events={[ldapEvent]} now={NOW} />);
+    expect(html).toContain("LDAP principal fingerprint");
+    expect(html).toContain('<code class="font-mono text-xs">3f3f3f3f3f3f…</code>');
+    // The full value and what it is are in the tooltip only.
+    expect(html).toMatch(/title="The agent sent a keyed fingerprint \(HMAC\) of this LDAP principal instead of its DN[^"]*openldap.clear_principals[^"]*hmac-sha256:(3f){32}"/);
+    expect(html).not.toMatch(/>hmac-sha256:/);
+    expect(html).toContain("object class inetOrgPerson in container ou=people,dc=example,dc=org");
+  });
+
+  it("a DN sent in clear (clear_principals) is shown as is; other engines keep the account wording", () => {
+    const clear = renderToStaticMarkup(<PrincipalLabel principal="cn=admin,dc=example,dc=org" fingerprinted={false} engine="openldap" />);
+    expect(clear).toBe('<span class="break-all">cn=admin,dc=example,dc=org</span>');
+    const pg = renderToStaticMarkup(<PrincipalLabel principal={FP} fingerprinted engine="postgres" />);
+    expect(pg).toContain(">fingerprint</span>");
+    expect(pg).toContain("instead of the account name");
+    expect(pg).not.toContain("LDAP");
+  });
+
+  it("principals and incidents of an OpenLDAP target use the LDAP wording", () => {
+    const p: PrincipalView = {
+      agentId: AGENT,
+      agentName: "ldap-host",
+      targetId: "ldap-1",
+      principalKey: KEY,
+      principal: FP,
+      fingerprinted: true,
+      engine: "openldap",
+      events: 3,
+      warm: false,
+      baselineRows: null,
+      thresholdRows: null,
+      typicalScore: null,
+      rowsTotal: 30,
+      maxScore: 2,
+      anomalies: 0,
+      firstEventAt: null,
+      lastEventAt: new Date(NOW - 5000),
+    };
+    expect(renderToStaticMarkup(<PrincipalsTable principals={[p]} now={NOW} />)).toContain("LDAP principal fingerprint");
+    const i = {
+      access: { eventId: null, principal: FP, database: "dc=example,dc=org", bucket: new Date(NOW), score: 1, rows: 1, signals: [], lastEventAt: null, anomaly: false, overflow: false },
+      location: null,
+      engine: "openldap",
+    };
+    expect(incidentLocation(i)).toBe("fingerprinted LDAP principal on naming context dc=example,dc=org");
+    expect(incidentLocation({ ...i, engine: "postgres" })).toBe("fingerprinted account on dc=example,dc=org");
+    expect(
+      incidentLocation({
+        access: null,
+        engine: "openldap",
+        location: { databaseName: "dc=example,dc=org", schemaName: "ou=people,dc=example,dc=org", objectName: "inetOrgPerson", fieldName: "mail" },
+      }),
+    ).toBe("naming context dc=example,dc=org / container ou=people,dc=example,dc=org / object class inetOrgPerson / attribute mail");
+  });
+
+  it("engine of an audit source", () => {
+    expect(auditSourceEngine("openldap_accesslog")).toBe("openldap");
+    expect(auditSourceEngine("pgaudit")).toBe("postgres");
+    expect(auditSourceEngine("performance_schema")).toBeNull();
+    expect(auditSourceEngine("constructor")).toBeNull();
+    expect(AUDIT_SOURCES.every((s) => auditSourceEngine(s) === null || ENGINES.includes(auditSourceEngine(s) as never))).toBe(true);
+  });
+});
+
 describe("incidents raised from access events", () => {
   it("show the principal and database instead of a finding location", () => {
     const i: IncidentView = {
@@ -179,6 +276,7 @@ describe("incidents raised from access events", () => {
       agentName: "db-host-1",
       targetId: "pg-prod-1",
       classifier: null,
+      engine: "postgres",
       location: null,
       findingMatched: null,
       matchCount: 3,

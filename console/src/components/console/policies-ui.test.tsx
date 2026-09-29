@@ -32,6 +32,7 @@ const incident = (over: Partial<IncidentView> = {}): IncidentView => ({
   agentName: "db-host-1",
   targetId: "pg-prod-1",
   classifier: "pii.email",
+  engine: "postgres",
   location: { databaseName: "crm", schemaName: "public", objectName: "clients", fieldName: "email" },
   findingMatched: 150,
   matchCount: 1,
