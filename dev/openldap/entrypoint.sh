@@ -38,7 +38,7 @@ if [ ! -e "$TLS_DIR/server.pem" ]; then
     -keyout "$tmp/ca.key" -out "$TLS_DIR/ca.pem" 2>/dev/null
   openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
     -keyout "$TLS_DIR/server.key" -out "$tmp/server.csr" 2>/dev/null
-  printf '%s\n' "subjectAltName=DNS:localhost,DNS:openldap,IP:127.0.0.1" "basicConstraints=CA:FALSE" \
+  printf '%s\n' "subjectAltName=DNS:localhost,DNS:openldap,IP:127.0.0.1,IP:::1" "basicConstraints=CA:FALSE" \
     "keyUsage=digitalSignature,keyEncipherment" "extendedKeyUsage=serverAuth" > "$tmp/ext.cnf"
   openssl x509 -req -in "$tmp/server.csr" -CA "$TLS_DIR/ca.pem" -CAkey "$tmp/ca.key" \
     -CAcreateserial -days 3650 -extfile "$tmp/ext.cnf" -out "$TLS_DIR/server.pem" 2>/dev/null
