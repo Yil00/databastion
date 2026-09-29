@@ -617,9 +617,14 @@ pub(crate) enum MaskedResults<'a> {
         engine: Engine,
         findings: &'a [MaskedFinding],
     },
-    /// Access events (P4: `MaskedEvent` carries no content yet).
-    #[cfg_attr(not(test), allow(dead_code, reason = "event producers land in P4"))]
-    Events(&'a [MaskedEvent]),
+    /// Access events of one target. Account names that do not conform
+    /// (or come from a failed authentication) are fingerprinted with
+    /// `fingerprints` (the agent HMAC key, `db_user` domain).
+    Events {
+        target_id: &'a TargetId,
+        events: &'a [MaskedEvent],
+        fingerprints: &'a dyn sanitize::Fingerprinter,
+    },
 }
 
 /// **The** conversion from masked types to protocol batches (I2, I6,
@@ -652,15 +657,98 @@ pub(crate) fn to_batches(results: MaskedResults<'_>) -> Built {
             built.dropped_items += dropped;
             built
         }
-        MaskedResults::Events(events) => {
-            // P4: event masking produces no content yet; nothing to send.
-            Built {
-                batches: Vec::new(),
-                dropped_items: u64::try_from(events.len()).unwrap_or(u64::MAX),
-                unserializable_batches: 0,
-            }
+        MaskedResults::Events {
+            target_id,
+            events,
+            fingerprints,
+        } => {
+            let mut dropped = 0u64;
+            let items: Vec<AccessEvent> = events
+                .iter()
+                .filter_map(|e| {
+                    let item = event_item(target_id, e, fingerprints);
+                    if item.is_none() {
+                        dropped += 1;
+                    }
+                    item
+                })
+                .collect();
+            let mut built = pack_events(items);
+            built.dropped_items += dropped;
+            built
         }
     }
+}
+
+fn timestamp(t: std::time::SystemTime) -> databastion_protocol::Timestamp {
+    databastion_protocol::Timestamp(chrono::DateTime::<chrono::Utc>::from(t))
+}
+
+/// Converts a masked event (the protocol type is built here only, from
+/// the closed enums and normalized names of `MaskedEvent`).
+fn event_item(
+    target_id: &TargetId,
+    e: &MaskedEvent,
+    fingerprints: &dyn sanitize::Fingerprinter,
+) -> Option<AccessEvent> {
+    use databastion_classifiers::masking::{ClientAddr, EventAction};
+    use databastion_protocol::{AccessEventAction, AuditSource, ObjectRef, Signal};
+    let id =
+        |n: &databastion_classifiers::names::NormalizedName| Identifier::try_from(n.as_str()).ok();
+    let p = e.principal();
+    let client = p.client().map(|c| match c {
+        ClientAddr::Ip(ip) => ip.to_string(),
+        ClientAddr::Local => "local".to_owned(),
+    });
+    let principal = sanitize::principal(
+        p.account_name(),
+        p.send_name(),
+        client.as_deref(),
+        p.application(),
+        fingerprints,
+    )?;
+    let mut objects = Vec::with_capacity(e.objects().len());
+    for o in e.objects() {
+        objects.push(ObjectRef {
+            database: id(o.database())?,
+            object: id(o.object())?,
+            schema: match o.schema() {
+                Some(s) => Some(id(s)?),
+                None => None,
+            },
+        });
+    }
+    let signals: Vec<Signal> = e
+        .signals()
+        .iter()
+        .filter_map(|s| Signal::try_from(s.as_str()).ok())
+        .collect();
+    let source =
+        serde_json::from_value::<AuditSource>(serde_json::Value::from(e.source().as_str())).ok()?;
+    Some(AccessEvent {
+        action: match e.action() {
+            EventAction::Connect => AccessEventAction::Connect,
+            EventAction::AuthFailure => AccessEventAction::AuthFailure,
+            EventAction::Read => AccessEventAction::Read,
+            EventAction::Write => AccessEventAction::Write,
+            EventAction::Ddl => AccessEventAction::Ddl,
+            EventAction::Dcl => AccessEventAction::Dcl,
+        },
+        aggregated_count: std::num::NonZeroU64::new(e.aggregated_count())?,
+        // No connector reports a result size yet (the PostgreSQL sources have none).
+        bytes: None,
+        objects,
+        principal,
+        rows: e.rows().and_then(|r| i64::try_from(r).ok()).map(Count),
+        signals: (!signals.is_empty()).then_some(signals),
+        source,
+        target_id: target_id.clone(),
+        ts: timestamp(e.ts()),
+        ts_last: e
+            .ts_last()
+            .filter(|_| e.aggregated_count() > 1)
+            .map(timestamp),
+    })
 }
 
 fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Option<Finding> {
@@ -738,9 +826,7 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
     built
 }
 
-/// Packs sanitized events under the item and byte caps (used once event
-/// masking produces content, P4; tested now).
-#[cfg_attr(not(test), allow(dead_code, reason = "event masking lands in P4"))]
+/// Packs sanitized events under the item and byte caps.
 fn pack_events(items: Vec<AccessEvent>) -> Built {
     let make = |events: Vec<AccessEvent>| EventsBatch {
         batch_id: new_batch_id(),
@@ -994,8 +1080,17 @@ mod tests {
             pack_events(vec![crate::sanitize::tests::event("read", 0)]).dropped_items,
             1
         );
+        let target = TargetId::try_from("pg-main").unwrap();
+        let key = databastion_classifiers::masking::HmacKey::new(&[3u8; 32]).unwrap();
+        let fps = sanitize::HmacFingerprints(&key);
         assert!(matches!(
-            to_batches(MaskedResults::Events(&[])).batches.as_slice(),
+            to_batches(MaskedResults::Events {
+                target_id: &target,
+                events: &[],
+                fingerprints: &fps,
+            })
+            .batches
+            .as_slice(),
             []
         ));
     }

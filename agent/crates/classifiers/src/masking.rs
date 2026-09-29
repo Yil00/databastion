@@ -12,7 +12,10 @@
 //!   a [`MaskedSample`] only comes from [`mask`] / [`mask_as`] (or the column
 //!   API), a [`Fingerprint`] only from an [`HmacKey`]; a [`MaskedFinding`]
 //!   is built only from a [`ClassifierId`], [`MaskedSample`]s and
-//!   [`Fingerprint`]s; [`MaskedEvent`] cannot be built yet. None implements
+//!   [`Fingerprint`]s; a [`MaskedEvent`] only from closed enums
+//!   ([`EventSource`], [`EventAction`], [`Signal`]), an [`EventPrincipal`]
+//!   and [`EventObject`]s built from [`NormalizedName`]s: it carries no query
+//!   text, no parameter and no returned value (ADR-0007). None implements
 //!   `From<String>` or `Deserialize` (compile-fail doctests below prove it).
 //! - The core uplink (crate-private in `databastion-core`) and the connector
 //!   sinks only accept [`MaskedFinding`] / [`MaskedEvent`], so a connector
@@ -781,19 +784,516 @@ impl MaskedFinding {
     }
 }
 
-/// A normalized access event whose free-text parts (query text, filters,
-/// literals) have been masked. The only event type the uplink accepts.
+/// Action of an access event (contract `AccessEvent.action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EventAction {
+    /// Connection.
+    Connect,
+    /// Failed authentication (the account name is fingerprinted).
+    AuthFailure,
+    /// Rows read.
+    Read,
+    /// Rows written.
+    Write,
+    /// Schema change.
+    Ddl,
+    /// Privilege or role change.
+    Dcl,
+}
+
+impl EventAction {
+    /// Contract value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::AuthFailure => "auth_failure",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Ddl => "ddl",
+            Self::Dcl => "dcl",
+        }
+    }
+}
+
+/// Native source of an access event (contract `AuditSource`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum EventSource {
+    /// pgaudit log records.
+    Pgaudit,
+    /// `pg_stat_statements` counters.
+    PgStatStatements,
+    /// `pg_stat_activity` polling.
+    PgStatActivity,
+    /// MariaDB `server_audit`.
+    MariadbServerAudit,
+    /// Percona / MySQL `audit_log`.
+    MysqlAuditLog,
+    /// MySQL `performance_schema`.
+    PerformanceSchema,
+    /// MongoDB `auditLog`.
+    MongodbAuditLog,
+    /// MongoDB profiler.
+    MongodbProfiler,
+    /// MongoDB structured log.
+    MongodbLog,
+    /// OpenLDAP `cn=accesslog`.
+    OpenldapAccesslog,
+}
+
+impl EventSource {
+    /// Contract value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pgaudit => "pgaudit",
+            Self::PgStatStatements => "pg_stat_statements",
+            Self::PgStatActivity => "pg_stat_activity",
+            Self::MariadbServerAudit => "mariadb_server_audit",
+            Self::MysqlAuditLog => "mysql_audit_log",
+            Self::PerformanceSchema => "performance_schema",
+            Self::MongodbAuditLog => "mongodb_audit_log",
+            Self::MongodbProfiler => "mongodb_profiler",
+            Self::MongodbLog => "mongodb_log",
+            Self::OpenldapAccesslog => "openldap_accesslog",
+        }
+    }
+}
+
+/// Exfiltration signals this agent emits (contract `Signal`: the contract
+/// only fixes the `signature.* | shape.* | volume.*` pattern; this closed
+/// set is the agent's vocabulary, documented in the classifiers README).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Signal {
+    /// `signature.pg_dump`: `application_name` of `pg_dump` / `pg_dumpall`,
+    /// or a session copying several whole relations to the client.
+    PgDump,
+    /// `signature.copy_to_file`: `COPY … TO '<server file>'`.
+    CopyToFile,
+    /// `signature.copy_to_program`: `COPY … TO PROGRAM`.
+    CopyToProgram,
+    /// `shape.full_table_copy`: `COPY` of a whole relation (or of an
+    /// unfiltered query) out of the database.
+    FullTableCopy,
+    /// `shape.full_table_read`: a query reading whole relations (no
+    /// `WHERE`, no aggregation, no or a large `LIMIT`).
+    FullTableRead,
+    /// `volume.large_result`: rows returned or affected at or above the
+    /// agent's threshold.
+    LargeResult,
+}
+
+impl Signal {
+    /// Every signal.
+    pub const ALL: [Self; 6] = [
+        Self::PgDump,
+        Self::CopyToFile,
+        Self::CopyToProgram,
+        Self::FullTableCopy,
+        Self::FullTableRead,
+        Self::LargeResult,
+    ];
+
+    /// Contract value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PgDump => "signature.pg_dump",
+            Self::CopyToFile => "signature.copy_to_file",
+            Self::CopyToProgram => "signature.copy_to_program",
+            Self::FullTableCopy => "shape.full_table_copy",
+            Self::FullTableRead => "shape.full_table_read",
+            Self::LargeResult => "volume.large_result",
+        }
+    }
+}
+
+/// Address of the database client: an IP literal or a Unix socket. A host
+/// name is never kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClientAddr {
+    /// IP literal.
+    Ip(std::net::IpAddr),
+    /// Unix socket (`[local]`).
+    Local,
+}
+
+impl ClientAddr {
+    /// Parses an engine-logged client address: an IP literal, or `[local]`
+    /// / `local`. Anything else (a host name, `host:port`) gives `None`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw == "[local]" || raw == "local" {
+            return Some(Self::Local);
+        }
+        raw.parse().ok().map(Self::Ip)
+    }
+}
+
+/// Longest account name kept, in bytes (longer ones are cut, and the core
+/// then sends a fingerprint: a cut name no longer equals itself cleaned).
+const MAX_ACCOUNT_BYTES: usize = 1024;
+/// Contract `Principal.application.maxLength`.
+const MAX_APPLICATION_CHARS: usize = 64;
+
+/// Who accessed. Account names may leave in clear (ADR-0007); the core
+/// replaces a name that does not match the contract pattern, and every
+/// failed-authentication name, by its `db_user` fingerprint.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EventPrincipal {
+    account: String,
+    send_name: bool,
+    client: Option<ClientAddr>,
+    application: Option<String>,
+}
+
+impl fmt::Debug for EventPrincipal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventPrincipal")
+            .field("send_name", &self.send_name)
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
+}
+
+fn bounded(raw: &str, max_bytes: usize) -> String {
+    let mut end = raw.len().min(max_bytes);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_owned()
+}
+
+impl EventPrincipal {
+    /// An account that authenticated (sent by name when it conforms).
+    #[must_use]
+    pub fn account(raw: &str) -> Self {
+        Self {
+            account: bounded(raw, MAX_ACCOUNT_BYTES),
+            send_name: true,
+            client: None,
+            application: None,
+        }
+    }
+
+    /// The account of a failed authentication: always fingerprinted (the
+    /// attempted name may be a mistyped password).
+    #[must_use]
+    pub fn failed_account(raw: &str) -> Self {
+        Self {
+            send_name: false,
+            ..Self::account(raw)
+        }
+    }
+
+    /// Sets the client address.
+    #[must_use]
+    pub fn with_client(mut self, client: Option<ClientAddr>) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Sets the client-declared application name, reduced to
+    /// `[A-Za-z0-9 ._:/+-]` (other characters become `_`) and 64
+    /// characters (contract `Principal.application`). Empty: none.
+    #[must_use]
+    pub fn with_application(mut self, raw: &str) -> Self {
+        let app: String = raw
+            .chars()
+            .take(MAX_APPLICATION_CHARS)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | ':' | '/' | '+' | '-')
+                {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.application = (!app.is_empty()).then_some(app);
+        self
+    }
+
+    /// Raw account name (the core decides between name and fingerprint).
+    #[must_use]
+    pub fn account_name(&self) -> &str {
+        &self.account
+    }
+
+    /// Whether the name may be sent (not a failed authentication).
+    #[must_use]
+    pub fn send_name(&self) -> bool {
+        self.send_name
+    }
+
+    /// Client address.
+    #[must_use]
+    pub fn client(&self) -> Option<ClientAddr> {
+        self.client
+    }
+
+    /// Reduced application name.
+    #[must_use]
+    pub fn application(&self) -> Option<&str> {
+        self.application.as_deref()
+    }
+}
+
+/// An object reached by an access. Built only from [`NormalizedName`]s
+/// (ADR-0009).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EventObject {
+    database: NormalizedName,
+    schema: Option<NormalizedName>,
+    object: NormalizedName,
+}
+
+impl EventObject {
+    /// An object from normalized names.
+    #[must_use]
+    pub fn new(
+        database: NormalizedName,
+        schema: Option<NormalizedName>,
+        object: NormalizedName,
+    ) -> Self {
+        Self {
+            database,
+            schema,
+            object,
+        }
+    }
+
+    /// Database (or LDAP suffix).
+    #[must_use]
+    pub fn database(&self) -> &NormalizedName {
+        &self.database
+    }
+
+    /// Schema (PostgreSQL).
+    #[must_use]
+    pub fn schema(&self) -> Option<&NormalizedName> {
+        self.schema.as_ref()
+    }
+
+    /// Table / collection / container.
+    #[must_use]
+    pub fn object(&self) -> &NormalizedName {
+        &self.object
+    }
+
+    fn sort_key(&self) -> (&str, &str, &str) {
+        (
+            self.database.as_str(),
+            self.schema.as_ref().map_or("", NormalizedName::as_str),
+            self.object.as_str(),
+        )
+    }
+}
+
+/// Contract `AccessEvent.objects.maxItems`.
+pub const MAX_EVENT_OBJECTS: usize = 16;
+/// Contract `AccessEvent.aggregated_count.maximum`.
+pub const MAX_AGGREGATED_COUNT: u64 = 1_000_000;
+
+/// A normalized access event: no query text, no bound parameter, no
+/// returned value (ADR-0007), only who, which objects (normalized names),
+/// which action, how many rows, and signals. The only event type the
+/// uplink accepts.
 ///
-/// Skeleton: opaque and **not constructible yet**. Until event masking is
-/// implemented, no access event can reach the uplink (safe by default).
+/// Outside this crate it is built from an [`EventSource`], an
+/// [`EventAction`], an [`EventPrincipal`], [`EventObject`]s (from
+/// [`NormalizedName`]s only) and [`Signal`]s; it has no constructor from a
+/// query text and no `Deserialize`:
 ///
 /// ```compile_fail
 /// use databastion_classifiers::masking::MaskedEvent;
-/// let _ = MaskedEvent { _private: () };
+/// let _ = MaskedEvent { query: "select 'secret'".to_owned() };
+/// ```
+///
+/// ```compile_fail
+/// use databastion_classifiers::masking::EventObject;
+/// let _ = EventObject::new("crm".to_owned(), None, "t".to_owned());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaskedEvent {
-    _private: (),
+    ts: std::time::SystemTime,
+    ts_last: Option<std::time::SystemTime>,
+    principal: EventPrincipal,
+    action: EventAction,
+    /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`].
+    objects: Vec<EventObject>,
+    rows: Option<u64>,
+    /// Sorted, without duplicates.
+    signals: Vec<Signal>,
+    source: EventSource,
+    aggregated_count: u64,
+}
+
+/// What pre-aggregation groups on: same principal, object set, action and
+/// source (docs/09).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EventGroupKey {
+    principal: EventPrincipal,
+    action: EventAction,
+    objects: Vec<EventObject>,
+    source: EventSource,
+}
+
+impl MaskedEvent {
+    /// A single raw event at `ts`.
+    #[must_use]
+    pub fn new(
+        source: EventSource,
+        action: EventAction,
+        principal: EventPrincipal,
+        ts: std::time::SystemTime,
+    ) -> Self {
+        Self {
+            ts,
+            ts_last: None,
+            principal,
+            action,
+            objects: Vec::new(),
+            rows: None,
+            signals: Vec::new(),
+            source,
+            aggregated_count: 1,
+        }
+    }
+
+    /// Adds an object (duplicates and objects past [`MAX_EVENT_OBJECTS`]
+    /// are ignored).
+    #[must_use]
+    pub fn with_object(mut self, object: EventObject) -> Self {
+        self.add_object(object);
+        self
+    }
+
+    fn add_object(&mut self, object: EventObject) {
+        if self.objects.len() < MAX_EVENT_OBJECTS && !self.objects.contains(&object) {
+            self.objects.push(object);
+            self.objects.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        }
+    }
+
+    /// Sets the rows returned or affected.
+    #[must_use]
+    pub fn with_rows(mut self, rows: Option<u64>) -> Self {
+        self.rows = rows;
+        self
+    }
+
+    /// Adds a signal.
+    #[must_use]
+    pub fn with_signal(mut self, signal: Signal) -> Self {
+        self.add_signal(signal);
+        self
+    }
+
+    fn add_signal(&mut self, signal: Signal) {
+        if let Err(pos) = self.signals.binary_search(&signal) {
+            self.signals.insert(pos, signal);
+        }
+    }
+
+    /// Marks the event as already aggregated by its source (e.g. counter
+    /// deltas): `count` raw events between `ts` and `ts_last` (`count` is
+    /// kept in `1..=`[`MAX_AGGREGATED_COUNT`]).
+    #[must_use]
+    pub fn with_aggregate(mut self, count: u64, ts_last: std::time::SystemTime) -> Self {
+        self.aggregated_count = count.clamp(1, MAX_AGGREGATED_COUNT);
+        self.ts_last = (ts_last > self.ts).then_some(ts_last);
+        self
+    }
+
+    /// The pre-aggregation group of this event.
+    #[must_use]
+    pub fn group_key(&self) -> EventGroupKey {
+        EventGroupKey {
+            principal: self.principal.clone(),
+            action: self.action,
+            objects: self.objects.clone(),
+            source: self.source,
+        }
+    }
+
+    /// Merges an event of the same group (see [`Self::group_key`]): counts
+    /// and rows add up (rows known on either side), timestamps widen,
+    /// signals are united. The count saturates at [`MAX_AGGREGATED_COUNT`].
+    pub fn merge(&mut self, other: Self) {
+        let other_last = other.ts_last.unwrap_or(other.ts);
+        let last = self.ts_last.unwrap_or(self.ts).max(other_last);
+        self.ts = self.ts.min(other.ts);
+        self.ts_last = (last > self.ts).then_some(last);
+        self.aggregated_count = self
+            .aggregated_count
+            .saturating_add(other.aggregated_count)
+            .min(MAX_AGGREGATED_COUNT);
+        self.rows = match (self.rows, other.rows) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (a, b) => a.or(b),
+        };
+        for s in other.signals {
+            self.add_signal(s);
+        }
+    }
+
+    /// First occurrence.
+    #[must_use]
+    pub fn ts(&self) -> std::time::SystemTime {
+        self.ts
+    }
+
+    /// Last occurrence, when aggregated over a period.
+    #[must_use]
+    pub fn ts_last(&self) -> Option<std::time::SystemTime> {
+        self.ts_last
+    }
+
+    /// Who accessed.
+    #[must_use]
+    pub fn principal(&self) -> &EventPrincipal {
+        &self.principal
+    }
+
+    /// Action.
+    #[must_use]
+    pub fn action(&self) -> EventAction {
+        self.action
+    }
+
+    /// Objects reached (sorted).
+    #[must_use]
+    pub fn objects(&self) -> &[EventObject] {
+        &self.objects
+    }
+
+    /// Rows returned or affected, when known.
+    #[must_use]
+    pub fn rows(&self) -> Option<u64> {
+        self.rows
+    }
+
+    /// Signals (sorted, unique).
+    #[must_use]
+    pub fn signals(&self) -> &[Signal] {
+        &self.signals
+    }
+
+    /// Source.
+    #[must_use]
+    pub fn source(&self) -> EventSource {
+        self.source
+    }
+
+    /// Raw events merged into this one.
+    #[must_use]
+    pub fn aggregated_count(&self) -> u64 {
+        self.aggregated_count
+    }
 }
 
 #[cfg(test)]

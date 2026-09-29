@@ -22,6 +22,7 @@ pub(crate) enum Stage {
     Columns,
     Sample,
     Check,
+    Audit,
 }
 
 impl Stage {
@@ -37,6 +38,7 @@ impl Stage {
             Self::Columns => "columns",
             Self::Sample => "sample",
             Self::Check => "check",
+            Self::Audit => "audit",
         }
     }
 }

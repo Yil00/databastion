@@ -7,6 +7,8 @@
 //!   the `agent.yaml` clamp.
 //! - [`sink`]: channels through which connectors hand results to the core.
 //!   They only carry masked types from `databastion_classifiers::masking`.
+//! - [`audit`]: persisted audit cursors ([`audit::CursorStore`]), and
+//!   (crate-private) pre-aggregation and the `audit.configure` filter.
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
 //!   limits).
 //! - [`runtime`]: enrollment and the heartbeat / jobs loops. This is all the
@@ -29,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 mod backoff;
 pub mod config;
 pub mod connector;
