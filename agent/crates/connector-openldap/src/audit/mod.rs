@@ -308,7 +308,15 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
             }
             if r.op == Op::Search {
                 if let Some(c) = builder_context(builder, &r) {
-                    proven.insert(c);
+                    // Proof of logged reads: a search that succeeded (or
+                    // returned entries); a failed one that returned
+                    // entries proves failures are logged too.
+                    if r.result == 0 || r.entries.is_some_and(|n| n > 0) {
+                        proven.insert(c.clone());
+                    }
+                    if r.result != 0 && r.entries.is_some_and(|n| n > 0) {
+                        state.note_failures_logged(&target.id, &c, true);
+                    }
                 }
             }
             fresh.push(r);

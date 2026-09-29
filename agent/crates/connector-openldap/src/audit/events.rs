@@ -224,6 +224,12 @@ impl EventBuilder {
             (Some(LogScope::Base), Some(OwnFilter::Everything)) if q.none && !r.attrs_only => {
                 Some(OwnShape::Probe)
             }
+            // The check's size-limited search (failed searches logged?).
+            (Some(LogScope::Sub), Some(OwnFilter::Everything))
+                if q.none && !r.attrs_only && r.size_limit == Some(1) =>
+            {
+                Some(OwnShape::Probe)
+            }
             (Some(LogScope::Sub), Some(OwnFilter::Everything))
                 if r.attrs_only
                     && q.listed == 2

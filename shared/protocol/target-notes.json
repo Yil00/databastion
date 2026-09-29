@@ -29,6 +29,12 @@
       "mongodb"
     ]
   },
+  "audit.failed_operations_not_logged": {
+    "description": "{count} naming context(s) where a search cut by a size limit after returning entries left no cn=accesslog record (olcAccessLogSuccess: TRUE logs successful operations only): capped or failed exports are not seen, the level is at most Partial.",
+    "engines": [
+      "openldap"
+    ]
+  },
   "audit.full_pending_first_record": {
     "description": "Full once the Audit stream has read a pgaudit record (none in the last 24 h): reported Partial until then.",
     "engines": [

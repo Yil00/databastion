@@ -45,6 +45,7 @@ olcLimits: dn.exact="cn=databastion,ou=services,dc=example,dc=org" size=1000 tim
 | `privilege.write_not_evaluated` | always: write access cannot be evaluated read-only |
 | `audit.accesslog_not_readable` | no Audit source (level None) |
 | `audit.reads_not_logged` | naming contexts without a search record in the last 24 h (count) |
+| `audit.failed_operations_not_logged` | naming contexts where a search cut by a size limit left no record (`olcAccessLogSuccess: TRUE`): at most Partial (count) |
 | `audit.records_dropped` | log entries that did not parse in the last 24 h (count) |
 
 ## Audit
@@ -59,7 +60,7 @@ olcAccessLogSuccess: FALSE
 olcAccessLogPurge: 07+00:00 01+00:00
 ```
 
-and an `entryCSN` index on the log database (`olcDbIndex: entryCSN eq`,
+(`olcAccessLogSuccess: FALSE` is required for Full: with `TRUE`, failed binds and searches cut by a limit after returning entries are not logged, and `check()` reports at most Partial) and an `entryCSN` index on the log database (`olcDbIndex: entryCSN eq`,
 with `reqStart`, `reqDN` and `objectClass`). `olcAccessLogSuccess: FALSE`
 also logs failed binds. The level is Full once every naming context shows a
 search record from the last 24 h: `check()` looks for one and, when there is

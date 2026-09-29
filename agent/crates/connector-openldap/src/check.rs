@@ -100,6 +100,11 @@ pub(crate) struct CheckState {
     /// Per (target, canonical naming context): when a search record of it
     /// was last seen in `cn=accesslog`.
     proofs: Mutex<HashMap<(String, String), Instant>>,
+    /// Per (target, canonical naming context): whether a search that ended
+    /// in a size limit (after returning entries) was found in the log, and
+    /// when that was tested (security review M1: `olcAccessLogSuccess:
+    /// TRUE` logs successful operations only).
+    failures_logged: Mutex<HashMap<(String, String), (bool, Instant)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -149,6 +154,24 @@ impl CheckState {
         lock(&self.proofs)
             .get(&(target_id.to_owned(), context.to_owned()))
             .is_some_and(|t| t.elapsed() < RECORD_FRESHNESS)
+    }
+
+    /// Whether failed searches of `context` are logged: `Some(true)` when a
+    /// record of one was seen, `Some(false)` when the check's own
+    /// size-limited search left none, `None` when not known (24 h).
+    pub(crate) fn failures_logged(&self, target_id: &str, context: &str) -> Option<bool> {
+        lock(&self.failures_logged)
+            .get(&(target_id.to_owned(), context.to_owned()))
+            .filter(|(_, t)| t.elapsed() < RECORD_FRESHNESS)
+            .map(|(b, _)| *b)
+    }
+
+    /// Records whether failed searches of `context` are logged.
+    pub(crate) fn note_failures_logged(&self, target_id: &str, context: &str, logged: bool) {
+        lock(&self.failures_logged).insert(
+            (target_id.to_owned(), context.to_owned()),
+            (logged, Instant::now()),
+        );
     }
 
     /// Log entries of `target_id` dropped by the stream.
@@ -223,11 +246,16 @@ impl CheckState {
 
 /// The level and source of a target (decision 10): `check()` and the
 /// Audit stream use this rule.
-pub(crate) fn choose(readable: bool, proven: usize, contexts: usize) -> (AuditLevel, Source) {
+pub(crate) fn choose(
+    readable: bool,
+    proven: usize,
+    contexts: usize,
+    failures_unlogged: usize,
+) -> (AuditLevel, Source) {
     if !readable {
         return (AuditLevel::None, Source::None);
     }
-    let level = if contexts > 0 && proven >= contexts {
+    let level = if contexts > 0 && proven >= contexts && failures_unlogged == 0 {
         AuditLevel::Full
     } else if proven > 0 {
         AuditLevel::Partial
@@ -327,11 +355,13 @@ pub(crate) async fn base_readable<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Whether `cn=accesslog` holds a search record of `context` from the last
-/// 24 h.
+/// 24 h with the result code `result` (`0`: a successful search; `4`: one
+/// cut by a size limit).
 pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     accesslog_base: &str,
     context: &str,
+    result: &str,
 ) -> Result<bool, LdError> {
     let since = time::csn_at(SystemTime::now() - RECORD_FRESHNESS);
     let search = Search {
@@ -342,6 +372,7 @@ pub(crate) async fn search_record<S: AsyncRead + AsyncWrite + Unpin>(
         types_only: false,
         filter: Filter::And(vec![
             Filter::Eq("objectClass", "auditSearch".to_owned()),
+            Filter::Eq("reqResult", result.to_owned()),
             Filter::Extensible {
                 rule: "dnSubtreeMatch",
                 attr: "reqDN",
@@ -412,18 +443,58 @@ async fn prove<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|(_, c)| !state.proven(&target.id, c))
         .take(MAX_PROVEN_PER_REPORT)
     {
-        let mut found = search_record(s, accesslog_base, raw).await?;
+        let mut found = search_record(s, accesslog_base, raw, "0").await?;
         if !found {
             // A read of the context itself: a server logging reads records
             // it at once.
             base_readable(s, raw).await?;
-            found = search_record(s, accesslog_base, raw).await?;
+            found = search_record(s, accesslog_base, raw, "0").await?;
         }
         if found {
             state.note_search(&target.id, canon);
         }
     }
+    // Failed searches (a size limit reached after returning entries, the
+    // shape of a capped export) must be logged too: `olcAccessLogSuccess:
+    // TRUE` leaves them out, and the agent cannot read that setting.
+    for (raw, canon) in contexts
+        .iter()
+        .filter(|(_, c)| state.failures_logged(&target.id, c).is_none())
+        .take(MAX_PROVEN_PER_REPORT)
+    {
+        if search_record(s, accesslog_base, raw, "4").await? {
+            state.note_failures_logged(&target.id, canon, true);
+            continue;
+        }
+        if limited_search(s, raw).await? {
+            let logged = search_record(s, accesslog_base, raw, "4").await?;
+            state.note_failures_logged(&target.id, canon, logged);
+        }
+        // A context of one entry cannot end in a size limit: unknown.
+    }
     Ok(())
+}
+
+/// A subtree search of `context` with `sizeLimit` 1 and no attribute
+/// (`1.1`): `true` when the server answered `sizeLimitExceeded` (4).
+pub(crate) async fn limited_search<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut Session<S>,
+    context: &str,
+) -> Result<bool, LdError> {
+    let search = Search {
+        base: context,
+        scope: Scope::Sub,
+        size_limit: 1,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::Present("objectClass"),
+        attributes: &["1.1"],
+    };
+    match s.search(Stage::Check, &search, &mut |_: Entry| {}).await {
+        Ok(o) => Ok(o.code == 4),
+        Err(e) if !e.fatal => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth, Source) {
@@ -518,7 +589,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         .iter()
         .filter(|(_, c)| state.proven(&target.id, c))
         .count();
-    let (level, source) = choose(readable, proven, contexts.len());
+    let failures_unlogged = contexts
+        .iter()
+        .filter(|(_, c)| state.failures_logged(&target.id, c) == Some(false))
+        .count();
+    let (level, source) = choose(readable, proven, contexts.len(), failures_unlogged);
     match report.as_ref().and_then(|r| r.accesslog_readable) {
         Some(true) => {
             if proven < contexts.len() {
@@ -531,6 +606,16 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
                 codes.add(
                     TargetNote::new(NoteCode::AuditReadsNotLogged)
                         .with_count(u64::try_from(missing).unwrap_or(u64::MAX)),
+                );
+            }
+            if failures_unlogged > 0 {
+                detail.push(format!(
+                    "{failures_unlogged} naming context(s) where a search cut by a size limit \
+                     left no accesslog record (olcAccessLogSuccess: TRUE?): at most Partial"
+                ));
+                codes.add(
+                    TargetNote::new(NoteCode::AuditFailedOperationsNotLogged)
+                        .with_count(u64::try_from(failures_unlogged).unwrap_or(u64::MAX)),
                 );
             }
             if !state.stream_running(&target.id) {
@@ -607,11 +692,25 @@ mod tests {
 
     #[test]
     fn levels_are_proven_per_naming_context() {
-        assert_eq!(choose(false, 3, 3), (AuditLevel::None, Source::None));
-        assert_eq!(choose(true, 2, 2), (AuditLevel::Full, Source::Accesslog));
-        assert_eq!(choose(true, 1, 2), (AuditLevel::Partial, Source::Accesslog));
-        assert_eq!(choose(true, 0, 2), (AuditLevel::Limited, Source::Accesslog));
-        assert_eq!(choose(true, 0, 0), (AuditLevel::Limited, Source::Accesslog));
+        assert_eq!(choose(false, 3, 3, 0), (AuditLevel::None, Source::None));
+        assert_eq!(choose(true, 2, 2, 0), (AuditLevel::Full, Source::Accesslog));
+        // Failed searches not logged: never Full.
+        assert_eq!(
+            choose(true, 2, 2, 1),
+            (AuditLevel::Partial, Source::Accesslog)
+        );
+        assert_eq!(
+            choose(true, 1, 2, 0),
+            (AuditLevel::Partial, Source::Accesslog)
+        );
+        assert_eq!(
+            choose(true, 0, 2, 0),
+            (AuditLevel::Limited, Source::Accesslog)
+        );
+        assert_eq!(
+            choose(true, 0, 0, 0),
+            (AuditLevel::Limited, Source::Accesslog)
+        );
     }
 
     #[test]
@@ -623,6 +722,7 @@ mod tests {
         for code in [
             NoteCode::AuditAccesslogNotReadable,
             NoteCode::AuditReadsNotLogged,
+            NoteCode::AuditFailedOperationsNotLogged,
             NoteCode::AuditRecordsDropped,
             NoteCode::CheckStageFailed,
             NoteCode::CheckTimedOut,

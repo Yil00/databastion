@@ -120,6 +120,8 @@ pub enum NoteCode {
     AuditAuditlogOnCommunity,
     /// `audit.authcheck_success_pending`.
     AuditAuthcheckSuccessPending,
+    /// `audit.failed_operations_not_logged`.
+    AuditFailedOperationsNotLogged,
     /// `audit.full_pending_first_record`.
     AuditFullPendingFirstRecord,
     /// `audit.general_log_enabled`.
@@ -250,6 +252,7 @@ impl NoteCode {
         Self::AuditAuditLogPluginNotRead,
         Self::AuditAuditlogOnCommunity,
         Self::AuditAuthcheckSuccessPending,
+        Self::AuditFailedOperationsNotLogged,
         Self::AuditFullPendingFirstRecord,
         Self::AuditGeneralLogEnabled,
         Self::AuditHistoryLongConsumerDisabled,
@@ -321,6 +324,7 @@ impl NoteCode {
             Self::AuditAuditLogPluginNotRead => "audit.audit_log_plugin_not_read",
             Self::AuditAuditlogOnCommunity => "audit.auditlog_on_community",
             Self::AuditAuthcheckSuccessPending => "audit.authcheck_success_pending",
+            Self::AuditFailedOperationsNotLogged => "audit.failed_operations_not_logged",
             Self::AuditFullPendingFirstRecord => "audit.full_pending_first_record",
             Self::AuditGeneralLogEnabled => "audit.general_log_enabled",
             Self::AuditHistoryLongConsumerDisabled => "audit.history_long_consumer_disabled",
