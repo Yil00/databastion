@@ -1286,7 +1286,7 @@ fp_without_sql() {
 # principal_sql PRINCIPAL TARGET: SQL predicate on the `principal` column of TARGET's incidents.
 principal_sql() {
   case "$1" in
-    @fingerprint) printf "principal ~ '^[0-9a-f]{64}\$'" ;;
+    @fingerprint) printf "principal ~ '^hmac-sha256:[0-9a-f]{64}\$'" ;;
     "@fingerprint!"*) printf "principal IN %s" "$(fp_without_sql "$2" "${1#@fingerprint!}")" ;;
     *) printf "principal = '%s'" "$1" ;;
   esac

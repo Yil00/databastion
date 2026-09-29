@@ -816,7 +816,7 @@ class AuditTest(Base):
 
 
 class AuditFingerprintTest(Base):
-    FP1, FP2 = "a" * 64, "b" * 64
+    FP1, FP2 = "hmac-sha256:" + "a" * 64, "hmac-sha256:" + "b" * 64
     DN = "cn=manon bernard,ou=services,dc=example,dc=org"
 
     def events(self) -> list[dict]:
@@ -831,8 +831,8 @@ class AuditFingerprintTest(Base):
         ]
 
     INCIDENTS = [
-        {"policy_name": "e2e dump signature", "principal": "a" * 64, "event_signals": ["shape.bulk_search"]},
-        {"policy_name": "e2e reads", "principal": "a" * 64, "event_signals": ["shape.bulk_search"]},
+        {"policy_name": "e2e dump signature", "principal": "hmac-sha256:" + "a" * 64, "event_signals": ["shape.bulk_search"]},
+        {"policy_name": "e2e reads", "principal": "hmac-sha256:" + "a" * 64, "event_signals": ["shape.bulk_search"]},
     ]
     REQUIRED = ["--fingerprinted-only", "--min-fingerprints", "2",
                 "--require-event", "@fingerprint:shape.bulk_search",
@@ -871,6 +871,14 @@ class AuditFingerprintTest(Base):
         self.assertIn("no access event of principal '@fingerprint' with shape.bulk_search", out)
         self.assertIn("no incident of policy 'e2e reads', principal '@fingerprint'", out)
 
+    def test_bare_hex_is_not_a_fingerprint(self) -> None:
+        # The contract `Fingerprint` carries the "hmac-sha256:" prefix; 64 bare hex digits are not one.
+        ev = [dict(e, db_user_fingerprint=e["db_user_fingerprint"].removeprefix("hmac-sha256:"))
+              for e in self.events()]
+        rc, out = self.check(ev, self.INCIDENTS)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no access event of principal '@fingerprint' with shape.bulk_search", out)
+
 
     def test_at_most_the_test_clients_fingerprints(self) -> None:
         extra = ["--max-fingerprints", "2"]
@@ -882,7 +890,7 @@ class AuditFingerprintTest(Base):
         self.assertEqual(rc, 0, out)
         self.assertIn("2 distinct fingerprinted principal(s) over the events and incidents", out)
         # A third fingerprint (e.g. the agent's own read, not filtered), even on a connect event.
-        ev = self.events() + [{"db_user": None, "db_user_fingerprint": "c" * 64, "action": "connect",
+        ev = self.events() + [{"db_user": None, "db_user_fingerprint": "hmac-sha256:" + "c" * 64, "action": "connect",
                                "objects": [], "signals": [], "source": "openldap_accesslog"}]
         rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
                        "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",

@@ -805,9 +805,10 @@ def _principal(row: dict) -> str:
     return str(row.get("db_user") or row.get("principal") or "")
 
 
-# A principal the agent sent as its fingerprint (contract `Fingerprint`: lowercase hex HMAC-SHA256).
+# A principal the agent sent as its fingerprint (contract `Fingerprint`, shared/protocol/openapi.yaml:
+# "hmac-sha256:" followed by the lowercase hex HMAC-SHA256).
 FINGERPRINTED = "@fingerprint"
-_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+_FINGERPRINT = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 
 
 def _fingerprinted_event(e: dict) -> bool:
