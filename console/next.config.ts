@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   // Left off by default so that `pnpm start` (`next start`) keeps working locally.
   output: process.env.NEXT_OUTPUT_STANDALONE === "1" ? "standalone" : undefined,
   poweredByHeader: false,
+  // No image optimization: sharp (optional dependency of next) pulls LGPL-3.0 libvips binaries,
+  // which the Apache-2.0 image must not ship (I7, ADR-0005). The UI has no raster images to resize.
+  images: { unoptimized: true },
   reactStrictMode: true,
   // The repository already has its own AGENTS.md / CLAUDE.md at the root:
   // do not let `next dev` generate extra ones in console/.
