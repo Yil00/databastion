@@ -365,6 +365,15 @@ impl DocBuf {
         Self(vec![0; 4])
     }
 
+    /// An empty document with room for `capacity` bytes: a document
+    /// holding a secret (the SCRAM proof) is built without reallocating,
+    /// so no copy of it is left in a freed buffer.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let mut v = Vec::with_capacity(capacity.max(5));
+        v.extend_from_slice(&[0; 4]);
+        Self(v)
+    }
+
     fn key(&mut self, t: u8, key: &str) {
         self.0.push(t);
         // Keys are literals of this crate or array indices: no NUL.

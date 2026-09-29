@@ -278,10 +278,28 @@ pub(crate) fn namespace(ns: &str) -> Option<(String, Option<String>)> {
 }
 
 /// `name@db`, both non-empty.
-pub(crate) fn user_at(user: &str, db: &str) -> Option<String> {
-    (!user.is_empty() && !db.is_empty())
-        .then(|| bounded(&format!("{user}@{db}")))
-        .flatten()
+/// `name@authdb`, built in a zeroized buffer of the exact size (a failed
+/// authentication's name may be a mistyped password: no intermediate
+/// copy, end-of-phase-5 review I4).
+pub(crate) fn user_at(user: &str, db: &str) -> Option<Zeroizing<String>> {
+    if user.is_empty() || db.is_empty() {
+        return None;
+    }
+    let mut out = Zeroizing::new(String::with_capacity(user.len() + 1 + db.len()));
+    out.push_str(user);
+    out.push('@');
+    out.push_str(db);
+    (out.len() <= MAX_NAME_BYTES && !out.contains('\0')).then_some(out)
+}
+
+/// A string field zeroized as soon as it is deserialized (user names of
+/// authentication records).
+struct Secret(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d).map(|s| Self(Zeroizing::new(s)))
+    }
 }
 
 /// An address as logged: `ip:port`, `[v6]:port`, or a bare IP literal.
@@ -800,7 +818,7 @@ struct AuthenticateLine {
 
 #[derive(Deserialize)]
 struct AuthenticateParam {
-    user: String,
+    user: Secret,
     db: String,
 }
 
@@ -883,8 +901,7 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
         .users
         .as_ref()
         .and_then(|u| u.first())
-        .and_then(|u| user_at(&u.user, &u.db))
-        .map(Zeroizing::new);
+        .and_then(|u| user_at(&u.user, &u.db));
     let base = |kind: Kind| {
         let mut r = Record::new(kind);
         r.ts = head.ts.as_ref().and_then(DateField::time);
@@ -918,8 +935,7 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let line: AuthenticateLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let ok = head.result == Some(0);
             let mut r = base(Kind::Auth { ok });
-            let name = Zeroizing::new(line.param.user);
-            r.user = Some(Zeroizing::new(user_at(&name, &line.param.db).ok_or(())?));
+            r.user = Some(user_at(&line.param.user.0, &line.param.db).ok_or(())?);
             Some(r)
         }
         "clientMetadata" => {
@@ -1039,11 +1055,11 @@ struct AuthLine {
 #[derive(Deserialize)]
 struct AuthAttr {
     #[serde(default)]
-    user: Option<String>,
+    user: Option<Secret>,
     #[serde(default)]
     db: Option<String>,
     #[serde(default, rename = "principalName")]
-    principal: Option<String>,
+    principal: Option<Secret>,
     #[serde(default, rename = "authenticationDatabase")]
     auth_db: Option<String>,
     #[serde(default)]
@@ -1157,9 +1173,10 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let mut r = base(Kind::Auth {
                 ok: ID_AUTH_OK.contains(&id),
             });
-            let user = Zeroizing::new(a.user.or(a.principal).unwrap_or_default());
+            // Both names are zeroized, the one not used included.
+            let user = a.user.or(a.principal).map(|s| s.0).unwrap_or_default();
             let db = a.db.or(a.auth_db).unwrap_or_default();
-            r.user = Some(Zeroizing::new(user_at(&user, &db).ok_or(())?));
+            r.user = Some(user_at(&user, &db).ok_or(())?);
             r.client = client_of(a.client.as_deref().or(a.remote.as_deref()));
             // Intra-cluster authentication (replication, sharding).
             r.system |= a.cluster_member == Some(true);
