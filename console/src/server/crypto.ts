@@ -4,6 +4,8 @@ import { hash, verify, type Algorithm } from "@node-rs/argon2";
 
 import { readEnvOrFile, type Env } from "@/config/env";
 
+import { processGlobal } from "./process-global";
+
 /**
  * Secret primitives. Nothing here logs its input.
  *
@@ -21,8 +23,12 @@ const ARGON2_OPTIONS = {
   parallelism: 1,
 } as const;
 
-/** Counters for tests and metrics: argon2 operations started, running, and peak concurrency. */
-export const argon2Stats = { started: 0, active: 0, maxActive: 0 };
+/**
+ * Counters for tests and metrics: argon2 operations started, running, and peak concurrency.
+ * Process-wide (globalThis): counted by the route handlers, read by the dedicated `/metrics`
+ * listener that the startup hook runs from another bundled copy of this module (process-global.ts).
+ */
+export const argon2Stats = processGlobal("argon2Stats", () => ({ started: 0, active: 0, maxActive: 0 }));
 
 const recentDurations: number[] = [];
 const DEFAULT_ARGON2_MS = 50;

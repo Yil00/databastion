@@ -6,16 +6,18 @@ import { pgBossOptions } from "@/worker/queues";
 
 import { NOTIFICATION_QUEUE, setNotificationJobSender } from "./notification-queue";
 import { POLICY_QUEUE, setPolicyJobSender } from "./policy-queue";
+import { processGlobal } from "./process-global";
 
 /**
  * pg-boss sender of the web process: send only (no maintenance, no schedule, no migration: the
  * worker installs and maintains pg-boss). Started lazily on the first send; a failed start is
- * retried on the next send.
+ * retried on the next send. One per process (globalThis, see process-global.ts), whichever bundled
+ * copy of this module installs the senders.
  */
-let starting: Promise<PgBoss> | null = null;
+const shared = processGlobal<{ starting: Promise<PgBoss> | null }>("pgBossSender", () => ({ starting: null }));
 
 function boss(): Promise<PgBoss> {
-  if (!starting) {
+  if (!shared.starting) {
     const b = new PgBoss({
       ...pgBossOptions(getDatabaseUrl()),
       application_name: "databastion-web",
@@ -25,12 +27,13 @@ function boss(): Promise<PgBoss> {
       schedule: false,
     });
     b.on("error", (err: unknown) => logger.warn({ error: errorSummary(err) }, "pg-boss sender error"));
-    starting = b.start().catch((err: unknown) => {
-      starting = null;
+    const starting = b.start().catch((err: unknown) => {
+      if (shared.starting === starting) shared.starting = null;
       throw err;
     });
+    shared.starting = starting;
   }
-  return starting;
+  return shared.starting;
 }
 
 /** Installs the web process senders: policy engine and notification delivery wake-ups. */
