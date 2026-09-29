@@ -1111,6 +1111,22 @@ audit_client_my_dcl() {
 # has_dcl CLIENT: whether the client runs the DCL test.
 has_dcl() { declare -F "audit_client_${1}_dcl" >/dev/null && "audit_client_${1}_has_dcl"; }
 DCL_PRINCIPAL=e2e_admin
+# What the target's own audit log keeps of the DCL passwords (audit_verify). `all`: pgaudit logs the
+# statement text, so both passwords must be there (positive control: the source carries them, the
+# agent's redaction is exercised; a pgaudit release that starts masking them fails the run instead
+# of passing vacuously). `none`: server_audit replaces them by ***** (measured on MariaDB 11.4 for
+# every password form, agent/crates/connector-mysql/README.md), so neither may be there: the
+# MariaDB half proves the source's masking only, not the agent's redaction.
+audit_client_pg_dcl_in_source() { printf all; }
+audit_client_my_dcl_in_source() { printf none; }
+# dcl_scan [i2_check.py scan options...] PATH...: the two DCL passwords searched by i2_check.py
+# (--secret-file: case-insensitive, whole, every 16-character window, base64 / base64url at the three
+# byte alignments and hex, in the raw, JSON, URL, HTML, SQL and LDIF views). Prints needle ids
+# (S.dcl_password_<n>[.<form>]) and file names only; exit 1 on any hit, 2 on an error.
+dcl_scan() {
+  timeout 300 python3 "$I2_CHECK" scan --secret-file "$DCLP/dcl_password_1" \
+    --secret-file "$DCLP/dcl_password_2" "$@"
+}
 
 # MongoDB (target-mongo, Community: the structured JSON server log, ADR-0027). The accounts
 # e2e_exporter / e2e_analyst of `admin` come from target-initdb/mongo-20-clients.js; the principal
@@ -1187,9 +1203,10 @@ audit_client_mongo_time() { date -u +'%Y-%m-%dT%H:%M:%S'; }
 
 # OpenLDAP (target-ldap, cn=accesslog read over LDAPS, ADR-0029). The two client entries are in
 # the seed (OpenLDAP seed + clients, above): their DNs are principals, sent as fingerprints, so the
-# principals here are `@fingerprint` (i2_check.py) and the query principal's events are the
-# fingerprinted reads without the bulk-search shape (the exporter's carry it). ldapsearch declares
-# nothing: the "dump" is a bulk subtree search (shape.bulk_search, decision 8).
+# dump principal is `@fingerprint` (i2_check.py) and the query principal `@fingerprint!<signal>`:
+# the fingerprinted principal none of whose events carries the bulk-search shape (the exporter's
+# bulk search does), so the analyst's events and incidents cannot be satisfied by the exporter's.
+# ldapsearch declares nothing: the "dump" is a bulk subtree search (shape.bulk_search, decision 8).
 ldap_client() {
   timeout 300 docker compose -f "$HERE/docker-compose.yml" --profile tools run --rm -T --no-deps \
     ldap-client "$1"
@@ -1198,7 +1215,7 @@ audit_client_ldap_started() { printf 'audit source: cn=accesslog'; }
 # The dev overlay logs reads and failed operations: Full (decision 10).
 audit_client_ldap_levels() { printf 'full'; }
 audit_client_ldap_source() { printf 'openldap_accesslog'; }
-audit_client_ldap_principals() { printf '@fingerprint @fingerprint'; }
+audit_client_ldap_principals() { printf '@fingerprint @fingerprint!shape.bulk_search'; }
 audit_client_ldap_object_sets() { printf 1; }  # the objects of ou=people (both value filters)
 audit_client_ldap_query_statements() { printf 2; }  # the two searches
 audit_client_ldap_query_signal() { printf ''; }
@@ -1207,8 +1224,10 @@ audit_client_ldap_forbidden_notes() {
   printf 'privilege.accesslog_without_audit audit.accesslog_not_readable audit.reads_not_logged '
   printf 'audit.failed_operations_not_logged'
 }
-# Every principal a fingerprint; the exporter and the analyst are two distinct ones.
-audit_client_ldap_i2_args() { printf -- '--fingerprinted-only --min-fingerprints 2'; }
+# Every principal a fingerprint; the exporter and the analyst are two distinct ones that read, and
+# no other fingerprint on any event or incident (any action): exactly the two test clients, so none
+# of the agent's own reads, binds or probes surfaced as a fingerprint.
+audit_client_ldap_i2_args() { printf -- '--fingerprinted-only --min-fingerprints 2 --max-fingerprints 2'; }
 audit_client_ldap_dump() {
   # The whole tree, subtree scope, presence filter: the LDIF-export shape. The bind DN comes from
   # the exporter's ldaprc, the password from the secret file (-y).
@@ -1257,22 +1276,31 @@ audit_client_ldap_log_user_records() {
 }
 audit_client_ldap_time() { date -u +'%Y%m%d%H%M%S'; }
 
-# principal_sql PRINCIPAL: SQL predicate on the `principal` column of incidents.
-principal_sql() {
-  if [ "$1" = @fingerprint ]; then
-    printf "principal ~ '^[0-9a-f]{64}\$'"
-  else
-    printf "principal = '%s'" "$1"
-  fi
+# fp_without_sql TARGET SIGNAL: SQL subquery, the fingerprints of TARGET's events none of which
+# carries SIGNAL (`@fingerprint!SIGNAL`). One line (the dump poller reads its predicates by line).
+fp_without_sql() {
+  printf "(SELECT db_user_fingerprint FROM access_events WHERE agent_id = '%s' AND target_id = '%s'" \
+    "$AGENT_ID" "$1"
+  printf " AND db_user_fingerprint IS NOT NULL GROUP BY db_user_fingerprint HAVING NOT bool_or(signals ? '%s'))" "$2"
 }
-# query_events_sql PRINCIPAL DUMP_SIGNAL: SQL predicate on access_events for the query principal's
-# events (a fingerprinted principal: the fingerprinted events without the dump signal).
+# principal_sql PRINCIPAL TARGET: SQL predicate on the `principal` column of TARGET's incidents.
+principal_sql() {
+  case "$1" in
+    @fingerprint) printf "principal ~ '^[0-9a-f]{64}\$'" ;;
+    "@fingerprint!"*) printf "principal IN %s" "$(fp_without_sql "$2" "${1#@fingerprint!}")" ;;
+    *) printf "principal = '%s'" "$1" ;;
+  esac
+}
+# query_events_sql PRINCIPAL DUMP_SIGNAL TARGET: SQL predicate on TARGET's access_events for the
+# query principal's events (`@fingerprint`: the fingerprinted events without the dump signal).
 query_events_sql() {
-  if [ "$1" = @fingerprint ]; then
-    printf "db_user IS NULL AND db_user_fingerprint IS NOT NULL AND NOT (signals ? '%s')" "$2"
-  else
-    printf "db_user = '%s'" "$1"
-  fi
+  case "$1" in
+    @fingerprint)
+      printf "db_user IS NULL AND db_user_fingerprint IS NOT NULL AND NOT (signals ? '%s')" "$2" ;;
+    "@fingerprint!"*)
+      printf "db_user IS NULL AND db_user_fingerprint IN %s" "$(fp_without_sql "$3" "${1#@fingerprint!}")" ;;
+    *) printf "db_user = '%s'" "$1" ;;
+  esac
 }
 # client_fn CLIENT NAME [ARGS...]: the optional helper audit_client_<CLIENT>_<NAME>, or nothing.
 client_fn() {
@@ -1737,7 +1765,7 @@ audit_dump() {
   t0="$(now_ms)"
   "audit_client_${client}_dump" || rc=$?
   [ "$rc" = 0 ] || fail "the dump of $target failed (exit $rc, $(client_error_code); client output kept private)"
-  printf '%s %s %s\n' "$t0" "$signal" "$(principal_sql "$dump_p")" >"$AUDIT_POLL_DIR/$target.t0"
+  printf '%s %s %s\n' "$t0" "$signal" "$(principal_sql "$dump_p" "$target")" >"$AUDIT_POLL_DIR/$target.t0"
   AUDIT_T0[$target]="$t0"
   log "Audit ($target): dump finished in $(( $(now_ms) - t0 )) ms"
 }
@@ -1768,14 +1796,14 @@ audit_queries() {
 audit_state() {
   local target="$1" client="$2" signal="$3" query_p qsql
   read -r _ query_p <<<"$("audit_client_${client}_principals")"
-  qsql="$(query_events_sql "$query_p" "$signal")"
+  qsql="$(query_events_sql "$query_p" "$signal" "$target")"
   console_sql "SELECT concat_ws(',',
       (SELECT count(DISTINCT objects::text) FROM access_events
         WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND ${qsql}),
       (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
         WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND ${qsql} AND action = 'read'),
       (SELECT count(*) FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
-        AND $(principal_sql "$query_p") AND policy_name = '${AUDIT_POLICY_READS}'),
+        AND $(principal_sql "$query_p" "$target") AND policy_name = '${AUDIT_POLICY_READS}'),
       (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
         WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${DCL_PRINCIPAL}'
           AND action = 'dcl'),
@@ -1788,7 +1816,7 @@ audit_state() {
 # positive controls in the target's own audit log.
 audit_verify() {
   local target="$1" engine="$2" client="$3" account="$4" signal="$5"
-  local dump_p query_p query_signal level source deadline notes bad code rc id ids
+  local dump_p query_p query_signal level source deadline notes code rc id ids n
   local -a extra=() needles=()
   read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
   query_signal="$("audit_client_${client}_query_signal")"
@@ -1836,6 +1864,19 @@ audit_verify() {
     --require-incident "${AUDIT_POLICY_READS}:${query_p}" "${extra[@]}" >&2 \
     || fail "Audit check of $target failed (see above)"
   rm -f -- "$E2E_WORK_DIR/audit-events.json" "$E2E_WORK_DIR/audit-incidents.json"
+  # Fingerprinted principals are the test clients only (OpenLDAP). Audit ran from before the
+  # Discovery scan to the first client operation of this target (its dump, AUDIT_T0), so that window
+  # held the agent's own reads, binds and probes only: none may have surfaced as a fingerprint.
+  if [[ "$dump_p $query_p" == *@fingerprint* ]]; then
+    [[ "${AUDIT_T0[$target]:-}" =~ ^[0-9]+$ ]] || fail "Audit ($target): no dump start recorded"
+    n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}'
+        AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
+        AND ts < to_timestamp(${AUDIT_T0[$target]} / 1000.0)")" \
+      || fail "cannot count the fingerprinted events of $target before its first client operation"
+    [ "$n" = 0 ] \
+      || fail "Audit ($target): $n fingerprinted event(s) before the first client operation: the agent's own activity surfaced as a fingerprint"
+    log "Audit ($target): no fingerprinted event before the first client operation (the agent's own reads during the Discovery scan)"
+  fi
 
   # Positive control of the literal search: the literals (for OpenLDAP, the clients' DNs too) are in
   # the target's own audit log (the source side, which keeps statement text, filters and DNs), so
@@ -1859,17 +1900,32 @@ audit_verify() {
     done
     log "Audit ($target): the literals ($ids) are in the target's own audit log (positive control)"
     if has_dcl "$client"; then
-      # Informational: whether the source itself kept the DCL passwords (pgaudit logs the statement
-      # text; server_audit masks passwords). The `dcl` events above prove the statements reached the
-      # agent either way.
-      bad=0
-      for f in "$DCLP"/*; do
-        if LC_ALL=C grep -qFf "$f" -- "$E2E_WORK_DIR/target-audit.log"; then bad=$((bad + 1)); fi
-      done
-      log "Audit ($target): $bad of 2 DCL password(s) in clear in the target's own audit log (informational: the agent must not forward them)"
+      # The DCL passwords in the target's own audit log, searched as on the console side (below).
+      # The `dcl` events above prove the statements reached the agent.
+      rc=0
+      dcl_scan --label "$target target audit log (DCL passwords)" "$E2E_WORK_DIR/target-audit.log" \
+        >"$E2E_WORK_DIR/dcl-control.out" 2>&1 || rc=$?
+      case "$(client_fn "$client" dcl_in_source)" in
+        all)
+          for n in 1 2; do
+            if [ "$rc" != 1 ] || ! grep -q "^LEAK S\.dcl_password_$n " "$E2E_WORK_DIR/dcl-control.out"; then
+              cat "$E2E_WORK_DIR/dcl-control.out" >&2
+              fail "Audit ($target): DCL password $n not in the target's own audit log (positive control: the source must carry it, exit $rc)"
+            fi
+          done
+          log "Audit ($target): both DCL passwords are in the target's own audit log (positive control: the agent's redaction is exercised)" ;;
+        none)
+          if [ "$rc" != 0 ]; then
+            cat "$E2E_WORK_DIR/dcl-control.out" >&2
+            fail "Audit ($target): a DCL password (or part of it) is in the target's own audit log, which should mask it (exit $rc)"
+          fi
+          log "Audit ($target): no DCL password in the target's own audit log (the source masks them: this half proves the source's masking only)" ;;
+        *) fail "Audit ($target): audit_client_${client}_dcl_in_source is missing" ;;
+      esac
     fi
   fi
-  rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out"
+  rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out" \
+    "$E2E_WORK_DIR/dcl-control.out"
 }
 
 declare -A AUDIT_T0=() AUDIT_IDS=()
@@ -1949,7 +2005,29 @@ IFS=, read -r n_sent n_notif rc <<<"$st"
 mailpit_fetch "$AUDIT_DIR/mail.json" || fail "cannot read the Mailpit messages"
 jq -e --arg p "$AUDIT_POLICY_DUMP" 'any(.[]; (.summary.Subject // "") | contains($p))' \
   "$AUDIT_DIR/mail.json" >/dev/null || fail "Mailpit has no e-mail for the '$AUDIT_POLICY_DUMP' incident"
-log "Audit: $n_sent notification(s) delivered; Mailpit holds $(jq length "$AUDIT_DIR/mail.json") message(s), the dump incidents' included"
+# require_incident_mail TARGET POLICY: an incident of POLICY on TARGET has a delivered notification
+# to the e-mail channel, and Mailpit holds its e-mail: a text part naming both the incident id and
+# TARGET. Per target, so that the e-mail I2 scan below reads the notifications of every engine.
+require_incident_mail() {
+  local target="$1" policy="$2" ids
+  ids="$(console_sql "SELECT coalesce(json_agg(DISTINCT i.id::text), '[]') FROM incidents i
+      JOIN notification_deliveries d ON d.incident_id = i.id
+    WHERE i.agent_id = '${AGENT_ID}' AND i.target_id = '${target}' AND i.policy_name = '${policy}'
+      AND d.channel_slug = '${AUDIT_CHANNEL}' AND d.status = 'delivered'")" \
+    || fail "cannot read the notifications of the '$policy' incidents of $target"
+  jq -e 'type == "array" and length > 0' <<<"$ids" >/dev/null \
+    || fail "Audit ($target): no delivered notification of a '$policy' incident to ${AUDIT_CHANNEL}"
+  jq -e --argjson ids "$ids" --arg t "$target" 'any(.[]; (.message.Text // "") as $x
+      | ($x | contains($t)) and any($ids[]; . as $i | $x | contains($i)))' \
+    "$AUDIT_DIR/mail.json" >/dev/null \
+    || fail "Audit ($target): Mailpit has no e-mail naming $target and its '$policy' incident"
+}
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ <<<"$at"
+  require_incident_mail "$target" "$AUDIT_POLICY_DUMP"
+  if has_dcl "$client"; then require_incident_mail "$target" "$AUDIT_POLICY_DCL"; fi
+done
+log "Audit: $n_sent notification(s) delivered; Mailpit holds $(jq length "$AUDIT_DIR/mail.json") message(s), the dump incident e-mail of every Audit target (and the DCL one of every DCL target) included"
 
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
   read -r target engine client account signal <<<"$at"
@@ -2224,27 +2302,61 @@ for engine in "${!AUDIT_ENGINES[@]}"; do
     --exclude 'target-*.log' --exclude all.log \
     "$db_dump" "$E2E_LOG_DIR" "$E2E_WORK_DIR/findings-page.html" "$AUDIT_DIR" || i2_failed=1
 done
-# Password-bearing DCL on the Audit path (phase 7): neither password of the DCL statements is in
-# the console database, its Audit tables, the pages, the e-mails, the findings page or the console,
-# agent and proxy logs (fixed strings; only the pattern's name is printed). Positive control: the
-# `dcl` events of the DCL principal were required above (i2_check.py audit --require-action).
+# Password-bearing DCL on the Audit path (phase 7): neither password of the DCL statements, nor a
+# 16-character part or an encoded form of one, is in the console database, its Audit tables, the
+# pages, the e-mails, the findings page or the console, agent and proxy logs (dcl_scan: needle ids
+# and file names only). Positive controls: the `dcl` events of the DCL principal were required
+# above (i2_check.py audit --require-action), and the same scan found both passwords in target-pg's
+# own audit log (audit_verify).
 dcl_leaks=0
 if [ "$DCL_TARGET_IDS" != "[]" ]; then
-  for f in "$DCLP"/*; do
-    files="$(LC_ALL=C grep -rlF -f "$f" --exclude='target-*.log' --exclude=all.log -- \
-      "$db_dump" "$AUDIT_DIR" "$E2E_WORK_DIR/findings-page.html" "$E2E_LOG_DIR" 2>/dev/null \
-      | xargs -r -n1 basename | tr '\n' ' ' || true)"
-    if [ -n "$files" ]; then
-      log "LEAK: $(basename "$f") (a DCL statement's password) in: $files"
-      dcl_leaks=$((dcl_leaks + 1))
-    fi
-  done
-  log "DCL passwords: $dcl_leaks of 2 found on the console side or in the logs"
+  dcl_scan --label "DCL passwords, console side and logs" --exclude 'target-*.log' --exclude all.log \
+    "$db_dump" "$AUDIT_DIR" "$E2E_WORK_DIR/findings-page.html" "$E2E_LOG_DIR" >&2 || dcl_leaks=$?
 fi
+# L1: the OpenLDAP clients' DNs are sent as keyed fingerprints (HMAC under the agent's key). Neither
+# an unkeyed SHA-256 nor an empty-key HMAC-SHA256 of a DN (as written, lowercased, no space after a
+# comma) may be in the console database, its Audit tables, pages or e-mails: such a digest would
+# let anyone link the principal to a guessed DN. Hex digests only; never printed (needle ids).
+DNH="$E2E_WORK_DIR/dn-digests"
+mkdir -p "$DNH"
+for role in exporter analyst; do
+  # The DN (a ground-truth name) goes on stdin, never on a command line.
+  # shellcheck disable=SC2016 # Python program, not shell
+  printf '%s' "${LDAP_CLIENT_DN[$role]}" | python3 -c 'import hashlib, hmac, os, sys
+dn = sys.stdin.read()
+forms = {"asis": dn, "lower": dn.lower(), "nospace": dn.replace(", ", ","),
+         "lower-nospace": dn.lower().replace(", ", ",")}
+for form, v in forms.items():
+    b = v.encode("utf-8")
+    for alg, d in (("sha256", hashlib.sha256(b)), ("hmac0", hmac.new(b"", b, hashlib.sha256))):
+        with open(os.path.join(sys.argv[1], f"dn_{sys.argv[2]}_{form}_{alg}"), "w") as f:
+            f.write(d.hexdigest() + "\n")' "$DNH" "$role" || fail "cannot hash the OpenLDAP client DNs"
+done
+dn_args=()
+for f in "$DNH"/*; do dn_args+=(--literal-file "$f"); done
+[ "${#dn_args[@]}" = 32 ] || fail "expected 16 DN digests, found $(( ${#dn_args[@]} / 2 ))"
+# Positive control: one digest planted in a canary file must be reported.
+mkdir -p "$E2E_WORK_DIR/dn-canary"
+{ printf 'principal: '; cat "$DNH/dn_analyst_asis_hmac0"; } >"$E2E_WORK_DIR/dn-canary/zz-dn-canary.txt"
+rc=0
+timeout 60 python3 "$I2_CHECK" scan --label "DN digests (canary)" "${dn_args[@]}" \
+  "$E2E_WORK_DIR/dn-canary" >"$E2E_WORK_DIR/dn-canary.out" 2>&1 || rc=$?
+if [ "$rc" != 1 ] || ! grep -q '^LEAK S\.dn_analyst_asis_hmac0 ' "$E2E_WORK_DIR/dn-canary.out"; then
+  cat "$E2E_WORK_DIR/dn-canary.out" >&2
+  fail "DN digest scan positive control: canary not detected (exit $rc)"
+fi
+rm -rf -- "$E2E_WORK_DIR/dn-canary" "$E2E_WORK_DIR/dn-canary.out"
+dn_leaks=0
+timeout 300 python3 "$I2_CHECK" scan --label "OpenLDAP client DN digests, console side" "${dn_args[@]}" \
+  "$db_dump" "$AUDIT_DIR" >&2 || dn_leaks=$?
+rm -rf -- "$DNH"
 rm -rf -- "$AUDIT_DIR"
 rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err" "$E2E_WORK_DIR/findings-page.html"
 [ "$i2_failed" -eq 0 ] || fail "invariant I2: ground-truth value(s) in clear text (ids above)"
-[ "$dcl_leaks" -eq 0 ] || fail "a password of a DCL statement reached the console or a log"
+[ "$dcl_leaks" -eq 0 ] \
+  || fail "a password of a DCL statement (or part / encoded form of one) reached the console or a log, or its scan failed (exit $dcl_leaks, ids above)"
+[ "$dn_leaks" -eq 0 ] \
+  || fail "an unkeyed digest of an OpenLDAP client DN reached the console, or its scan failed (exit $dn_leaks, ids above)"
 
 phase_done i2
 log "all checks passed (revocation latency ${latency} ms; dump -> incident: ${AUDIT_LATENCIES})"

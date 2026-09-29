@@ -180,8 +180,8 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
      `ALTER USER … IDENTIFIED BY '…'`, the two DCL passwords, on stdin). The harness waits (240 s at
      most) until, on every target, the object sets read (PostgreSQL 3, MariaDB 1, MongoDB 2,
      OpenLDAP 1) and every literal-bearing read statement (3, 3, 3, 2: the sum of `aggregated_count`
-     of the query principal's read events; OpenLDAP: the fingerprinted reads without
-     `shape.bulk_search`) are stored, a `e2e reads` incident exists for the query principal, both
+     of the query principal's read events; OpenLDAP: the reads of the fingerprinted principal none
+     of whose events carries `shape.bulk_search`, the analyst) are stored, a `e2e reads` incident exists for the query principal, both
      DCL statements are stored as `dcl` events of `e2e_admin` with their `e2e dcl` incident, every
      event is evaluated and no notification is pending. The grants of `e2e_exporter` /
      `e2e_analyst` on MariaDB are checked to be exactly `USAGE` and `SELECT ON support.*` (step 5).
@@ -192,8 +192,11 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
      over-privilege of the account (MongoDB: `privilege.*`; OpenLDAP:
      `privilege.password_attributes_readable`, `privilege.config_readable`,
      `privilege.accesslog_without_audit`) nor a missing audit prerequisite (OpenLDAP).
-   - Every notification to the channel is `delivered` and Mailpit holds the e-mail of the dump
-     incident; every message has a text part naming an Audit target or principal.
+   - Every notification to the channel is `delivered`. For every Audit target, a `e2e dump
+     signature` incident has a `delivered` notification row, and Mailpit holds its e-mail: a text
+     part naming the incident id and the target id (so the e-mail scan of step 12 reads a
+     notification of every engine); the same for the `e2e dcl` incident of each DCL target
+     (PostgreSQL, MariaDB). Every message has a text part naming an Audit target or principal.
    - [`i2_check.py audit`](i2_check.py) on the target's events and incidents: an event of
      `e2e_exporter` with the dump signal, an event of `e2e_analyst` (MariaDB: with
      `signature.into_outfile`), the dump incident (policy, principal, signal) and the `e2e reads`
@@ -202,15 +205,22 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
      reads, which ran while Audit was on, must not surface); no stored event object holding a raw
      value-bearing name, even partially; the `dcl` events of `e2e_admin` and their incident
      (DCL test). OpenLDAP: every principal a fingerprint (`--fingerprinted-only`, a principal in
-     clear is counted, never printed), at least two distinct fingerprinted readers (exporter,
-     analyst).
+     clear is counted, never printed), exactly two distinct fingerprints over every event and
+     incident, any action (`--min-fingerprints 2` readers, `--max-fingerprints 2`: the exporter and
+     the analyst, nothing of the agent), and the `e2e reads` incident is the analyst's
+     (`@fingerprint!shape.bulk_search`: the fingerprinted principal without a bulk search, so the
+     exporter's reads cannot satisfy it). Also no fingerprinted event with a `ts` before the first
+     client operation (the dump): Audit ran from before the Discovery scan, so that window held
+     the agent's own reads only.
    - Positive control of the literal search: every literal must be found in the file the agent
      reads, alone: the pgaudit jsonlog; the `server_audit` log and its rotations (not
      `performance_schema`, which the agent's account cannot read); mongod's log; `cn=accesslog`
      (exported with `slapcat` as root in the target: no LDAP operation), where the OpenLDAP
-     clients' DNs must be found too. `E2E_PG_AUDIT=pss` has no such control. Informational: how
-     many DCL passwords the target's own log keeps in clear (pgaudit logs the statement text,
-     `server_audit` masks passwords).
+     clients' DNs must be found too. `E2E_PG_AUDIT=pss` has no such control. DCL passwords in the
+     target's own log (searched like on the console side, below): the pgaudit jsonlog must hold
+     both (positive control: the source carries them, so the agent's redaction is exercised; a
+     pgaudit that starts masking them fails the run), the `server_audit` log neither (it writes
+     `*****`: the MariaDB half proves the source's masking only).
    - After all targets: no event carries a `db_user_fingerprint` (but on the OpenLDAP target); every stored events batch woke
      the policy engine (as above, per batch received at `events_batches.received_at`); `web.log`
      holds no `wake-up not sent` warning. The agent's page, each Audit target's settings page and
@@ -254,9 +264,14 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
     the e-mails in Mailpit (summary, decoded text and HTML parts, raw source).
     Then the query literals of step 8 alone (`scan --needle`; OpenLDAP: the clients' DNs too) on
     every console-side artifact above, the console database dump and the logs: they must be
-    nowhere. Then the two DCL passwords (fixed strings) on the console database dump, the Audit
-    table exports, the pages, the e-mails, the findings page and the logs (but the targets' own):
-    they must be nowhere either.
+    nowhere. Then the two DCL passwords (`scan --secret-file`: case-insensitive, whole, every
+    16-character window, base64 / base64url at the three byte alignments and hex, in every view)
+    on the console database dump, the Audit table exports, the pages, the e-mails, the findings
+    page and the logs (but the targets' own): they must be nowhere either. Last, the OpenLDAP
+    clients' DNs must not be in the console database dump, the Audit tables, pages or e-mails as
+    an unkeyed digest (SHA-256 or empty-key HMAC-SHA256 of the DN as written, lowercased, without
+    a space after a comma; `scan --literal-file`, a planted digest must be found first): the agent
+    sends keyed fingerprints.
 
 ### What "in clear" means (I2)
 The definition is in the docstring of [`i2_check.py`](i2_check.py); unit tests in
@@ -299,8 +314,10 @@ The Audit steps are driven by `E2E_AUDIT_TARGETS` in [`run.sh`](run.sh), one lin
 `queries`, `target_log`), which hold everything engine-specific: the agent log line of a started
 stream, the expected level and source, the test roles, the dump tool, the literal queries and the
 target's own audit log (plus `object_sets`, `query_statements`, `query_signal`, `log_user_records`,
-`time`; optional: `dcl` and `has_dcl` for the DCL test, `forbidden_notes`, `i2_args`). A principal
-`@fingerprint` stands for one the agent sends as a fingerprint (OpenLDAP entry DNs). A new target adds a line, a client
+`time`; optional: `dcl`, `has_dcl` and `dcl_in_source` for the DCL test, `forbidden_notes`,
+`i2_args`). A principal `@fingerprint` stands for one the agent sends as a fingerprint (OpenLDAP
+entry DNs), `@fingerprint!<signal>` for the fingerprinted principal none of whose events carries
+that signal. A new target adds a line, a client
 service, its test accounts, its audit log mounted read-only into the agent and declared in
 `agent.yaml`, and its dev directory in the CI path filter. Not covered: MySQL Community (its only
 source, `performance_schema`, needs a grant the minimal agent account must not have in the e2e
