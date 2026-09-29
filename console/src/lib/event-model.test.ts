@@ -188,6 +188,9 @@ describe("access_event conditions", () => {
     ["an unknown key", { query: "select 1" }, "conditions"],
     ["a malformed signal", { signals: ["pg_dump"] }, "signals"],
     ["another signal family", { signals: ["value.x"] }, "signals"],
+    ["a digit in a signal id (contract pattern, ADR-0022)", { signals: ["signature.pg_dump2"] }, "signals"],
+    ["a signal word over 16 letters", { signals: [`shape.${"a".repeat(17)}`] }, "signals"],
+    ["a signal id of 7 words", { signals: ["shape.a_b_c_d_e_f_g"] }, "signals"],
     ["an unknown action", { event_actions: ["select"] }, "event_actions"],
     ["an unknown source", { signals: ["shape.*"], sources: ["syslog"] }, "sources"],
     ["an empty list", { signals: [] }, "signals"],
@@ -198,6 +201,14 @@ describe("access_event conditions", () => {
     ["anomaly false", { anomaly: false }, "anomaly"],
   ])("rejects %s", (_name, doc, field) => {
     expect(parseEventConditions(doc)).toEqual({ ok: false, error: field });
+  });
+
+  it("loads a stored document written with the pre-P4-D selector, never saves one", () => {
+    const doc = { signals: ["signature.tool2", "signature.pg_dump"] };
+    expect(parseEventConditions(doc)).toEqual({ ok: false, error: "signals" });
+    expect(parseEventConditions(doc, { stored: true })).toEqual({ ok: true, value: doc });
+    expect(parseEventConditions({ signals: ["value.x"] }, { stored: true })).toEqual({ ok: false, error: "signals" });
+    expect(parseEventConditions({ signals: ["shape.a_b_c_d_e_f"] }).ok).toBe(true);
   });
 
   it("matches with AND across keys and OR within a list", () => {
@@ -250,6 +261,8 @@ describe("severe events (N1)", () => {
     expect(severeEvent(base, 4.99)).toBe(true);
     expect(severeEvent({ ...base, signals: ["signature.copy_to_program"] }, 100)).toBe(true);
     expect(severeEvent({ ...base, anomaly: true }, 100)).toBe(true);
+    // Fail-safe: a signature id this console does not know (registered later) is still severe.
+    expect(severeEvent({ ...base, signals: ["signature.mysqldump"] }, 100)).toBe(true);
     expect(eventOverflowKey("p", "a", "t", new Date("2026-09-28T14:00:00Z"))).toBe("policy:p|agent:a|target:t|overflow|hour:2026-09-28T14:00:00.000Z");
   });
 });
@@ -282,5 +295,17 @@ describe("dedup scope", () => {
     expect(mergeSignals(["shape.b"], ["shape.a", "shape.b"])).toEqual(["shape.a", "shape.b"]);
     const many = Array.from({ length: 30 }, (_, i) => `shape.s${String(i).padStart(2, "0")}`);
     expect(mergeSignals(many, [])).toHaveLength(16);
+  });
+
+  it("keeps signature.* ids first, so truncation never drops them", () => {
+    const letters = "abcdefghijklmnopqrst";
+    const shapes = [...letters].map((c) => `shape.${c}`);
+    const merged = mergeSignals(shapes, ["volume.large_result", "signature.zeta", "signature.pg_dump"]);
+    expect(merged).toHaveLength(16);
+    expect(merged.slice(0, 2)).toEqual(["signature.pg_dump", "signature.zeta"]);
+    expect(merged.slice(2)).toEqual(shapes.slice(0, 14));
+    // Alphabetically, `shape.*` sorts before `signature.*`: a plain sort would have kept none.
+    expect([...shapes, "signature.pg_dump"].sort().slice(0, 16)).not.toContain("signature.pg_dump");
+    expect(mergeSignals(["volume.x", "shape.y"], ["signature.a"])).toEqual(["signature.a", "shape.y", "volume.x"]);
   });
 });

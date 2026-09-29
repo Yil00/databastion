@@ -1,3 +1,5 @@
+import { unregisteredSignals } from "@/lib/protocol/signals";
+
 /**
  * Notification contents (P3-C): the payload stored in the outbox, the webhook JSON body and the
  * plain-text e-mail. Payloads hold identifiers, counts, normalized names and console URLs only:
@@ -57,6 +59,11 @@ export interface AccessIncidentOpenedPayload {
     sensitivity: number;
     anomaly: boolean;
     signals: string[];
+    /**
+     * The ids of `signals` missing from the console's signal registry (registered after the
+     * console was built, or sent by a non-conforming agent). Absent in rows written before P4-D.
+     */
+    unregistered_signals?: string[];
     objects: { database: string; schema: string | null; object: string }[];
   };
 }
@@ -142,6 +149,7 @@ function objectText(o: AccessIncidentOpenedPayload["access"]["objects"][number])
 
 function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { subject: string; text: string } {
   const a = p.access;
+  const unregistered = new Set(a.unregistered_signals ?? unregisteredSignals(a.signals));
   const objects = a.objects.slice(0, 5).map(objectText).join(", ") + (a.objects.length > 5 ? `, and ${a.objects.length - 5} more` : "");
   const lines = [
     p.overflow
@@ -161,7 +169,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     `Objects:    ${objects || "none"}`,
     `Rows:       ${a.rows === null ? "not reported by the source" : a.rows}`,
     `Score:      ${a.score} (sensitivity ${a.sensitivity})${a.anomaly ? ", above the principal's baseline" : ""}`,
-    `Signals:    ${a.signals.map((s) => one(s, 64)).join(", ") || "none"}`,
+    `Signals:    ${a.signals.map((s) => `${one(s, 64)}${unregistered.has(s) ? " (unregistered)" : ""}`).join(", ") || "none"}`,
     `Opened at:  ${p.occurred_at}`,
   ];
   return {

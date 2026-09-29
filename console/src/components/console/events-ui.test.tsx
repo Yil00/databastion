@@ -9,7 +9,7 @@ import type { IncidentView } from "@/server/incidents";
 import type { PolicyView } from "@/server/policies";
 
 import { AuditForm, confirmationText, formatManualObjects, parseManualObjects } from "./audit-form";
-import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalsTable } from "./events-table";
+import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalsTable, SignalBadge, UNREGISTERED_SIGNAL_TITLE } from "./events-table";
 import { IncidentsTable } from "./incidents-table";
 import { conditionLines, PoliciesTable, policyFormValues } from "./policies-table";
 import { PolicyForm, policyErrorMessage, policyRequestBody } from "./policy-form";
@@ -72,6 +72,20 @@ describe("access events view", () => {
     expect(html).toContain("fingerprint 5a5a5a5a5a5a");
     expect(html).toContain("pending");
     expect(html).toContain("1.3 M");
+  });
+
+  it("flags signal ids missing from the registry as unregistered", () => {
+    const html = renderToStaticMarkup(<EventsTable events={[event({ signals: ["signature.pg_dump", "signature.mysqldump", "volume.huge"] })]} now={NOW} />);
+    expect(html.match(/unregistered<\/span>/g)).toHaveLength(2);
+    expect(html).toContain('href="/events?signal=signature.mysqldump"');
+    const registered = renderToStaticMarkup(<SignalBadge signal="signature.pg_dump" />);
+    expect(registered).not.toContain("unregistered");
+    expect(registered).toContain('title="A pg_dump or pg_dumpall run');
+    // Prototype names are never "registered".
+    for (const name of ["__proto__", "constructor", "toString"]) {
+      expect(renderToStaticMarkup(<SignalBadge signal={name} />)).toContain("unregistered");
+    }
+    expect(UNREGISTERED_SIGNAL_TITLE).toContain("still treated as severe");
   });
 
   it("shows AccessEvent.bytes when the source reports it", () => {

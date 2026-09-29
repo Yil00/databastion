@@ -581,7 +581,18 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   event. Signals are the agent's (P4-A emits `signature.pg_dump`, `signature.copy_to_file`,
   `signature.copy_to_program`, `shape.full_table_copy`, `shape.full_table_read`,
   `volume.large_result`; any contract-valid id is accepted). The console's own baseline verdict
-  is the `anomaly` condition, not a signal.
+  is the `anomaly` condition, not a signal. A new or changed policy must use the contract `Signal`
+  form (1 to 6 words of 1 to 16 lowercase letters, no digit, ADR-0022) or a family; policies
+  stored earlier with the former, wider selector keep being evaluated.
+- **Signal registry** (`shared/protocol/signals.json`, generated into
+  `src/generated/protocol/signals.gen.ts`, lookups in `src/lib/protocol/signals.ts`): an id
+  missing from it (registered after this console was built, or sent by a non-conforming agent) is
+  stored and matched like the others, flagged **unregistered** in the events and incident views and
+  in `incident.opened` notifications (`access.unregistered_signals` in the webhook payload, marked
+  in the e-mail), and counted in `databastion_console_events_unregistered_signals_total` (one per id
+  and stored event, this process). Every `signature.*` id stays severe (cap bypass), registered or
+  not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
+  them.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
   For an unknown account (a fingerprint sent instead of the name) and for every `auth_failure`,
   the principal part is `unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64 (canonical

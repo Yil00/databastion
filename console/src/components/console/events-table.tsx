@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { eventsHref, principalHref } from "@/lib/events-filter";
+import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
 
 /**
@@ -33,6 +34,30 @@ export function formatBytes(n: number | null): string {
     u++;
   }
   return u === 0 ? `${n} B` : `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
+
+export const UNREGISTERED_SIGNAL_TITLE =
+  "Not in this console's signal registry: registered after this console was built, or sent by a non-conforming agent. Stored and matched like the others; a signature.* id is still treated as severe.";
+
+/**
+ * A signal id: registered ids carry their meaning as a tooltip; ids missing from the registry
+ * (`shared/protocol/signals.json` as built into this console) are flagged "unregistered".
+ */
+export function SignalBadge({ signal }: { signal: string }) {
+  const description = signalDescription(signal);
+  if (description !== null) {
+    return (
+      <Badge variant="outline" title={description}>
+        {signal}
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="border-dashed" title={UNREGISTERED_SIGNAL_TITLE}>
+      {signal}
+      <span className="ml-1 text-muted-foreground">unregistered</span>
+    </Badge>
+  );
 }
 
 export function PrincipalLabel({ principal, fingerprinted }: { principal: string; fingerprinted: boolean }) {
@@ -98,7 +123,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
               <div className="flex flex-wrap gap-1">
                 {e.signals.map((s) => (
                   <Link key={s} prefetch={false} href={eventsHref({ signal: s })}>
-                    <Badge variant="outline">{s}</Badge>
+                    <SignalBadge signal={s} />
                   </Link>
                 ))}
                 {e.anomaly && <Badge variant="destructive">above baseline</Badge>}

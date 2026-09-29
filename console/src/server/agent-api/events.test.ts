@@ -19,6 +19,7 @@ import {
   purgeAccessEvents,
 } from "@/server/events";
 import { integrityWriteBudget } from "@/server/integrity";
+import { collectMetrics } from "@/server/metrics";
 import { setPolicyJobSender } from "@/server/policy-queue";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
@@ -314,6 +315,18 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       await getDb().execute(sql`update access_events set evaluated_at = now() where agent_id = ${auth.agentId}`);
       expect((await post(auth, batch())).status).toBe(202);
       expect(eventsPerAgent.count(auth.agentId)).toBe(eventsPerAgent.limit);
+    });
+
+    it("stores unregistered signal ids and counts them on /metrics", async () => {
+      const auth = await agentWithTargets();
+      const before = eventStats.unregisteredSignals;
+      const unknown = { ...PG_DUMP, signals: ["signature.mysqldump", "signature.pg_dump", "volume.huge_result"] };
+      expect((await post(auth, batch([unknown, PG_DUMP]))).status).toBe(202);
+      expect((await storedEvents(auth.agentId)).map((r) => r.signals)).toEqual([unknown.signals, PG_DUMP.signals]);
+      expect(eventStats.unregisteredSignals - before).toBe(2);
+      const text = await collectMetrics(getDb());
+      expect(text).toContain("# TYPE databastion_console_events_unregistered_signals_total counter");
+      expect(text).toMatch(new RegExp(`^databastion_console_events_unregistered_signals_total ${eventStats.unregisteredSignals}$`, "m"));
     });
 
     it("stores AccessEvent.bytes when the source reports it, null otherwise", async () => {

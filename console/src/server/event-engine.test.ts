@@ -235,7 +235,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         accessEventId: ev?.id,
         eventScore: ev?.score,
         eventRows: 1_250_000,
-        eventSignals: ["shape.full_table_copy", "signature.pg_dump"],
+        eventSignals: ["signature.pg_dump", "shape.full_table_copy"],
         matchCount: 1,
         findingId: null,
         classifier: null,
@@ -253,7 +253,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         source: "access_event",
         principal: "backup",
         database: "crm",
-        access: { action: "read", rows: 1_250_000, signals: ["signature.pg_dump", "shape.full_table_copy"] },
+        access: { action: "read", rows: 1_250_000, signals: ["signature.pg_dump", "shape.full_table_copy"], unregistered_signals: [] },
       });
       const view = await getIncident(getDb(), String(inc?.id));
       expect(view?.access).toMatchObject({ principal: "backup", database: "crm", rows: 1_250_000 });
@@ -276,7 +276,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         ["crm", 2, 1_250_010],
         ["billing", 1, 1_250_000],
       ]);
-      expect(list[0]?.eventSignals).toEqual(["shape.full_table_copy", "shape.full_table_read", "signature.pg_dump"]);
+      expect(list[0]?.eventSignals).toEqual(["signature.pg_dump", "shape.full_table_copy", "shape.full_table_read"]);
       expect(list[0]?.lastEventAt?.toISOString()).toBe(at(1000));
       // Another principal: another incident.
       await send(auth, [dumpEvent({ principal: { db_user: "report" } })]);

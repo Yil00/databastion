@@ -4,6 +4,7 @@ import type { Database } from "@/db/client";
 import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
+import { unregisteredSignals } from "@/lib/protocol/signals";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
@@ -38,8 +39,11 @@ export type EventsIngestOutcome =
    */
   | { kind: "expired"; details: ValidationDetail[] };
 
-/** Process counters of `/events` (exported on `/metrics`). */
-export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0 };
+/**
+ * Process counters of `/events` (exported on `/metrics`). `unregisteredSignals`: signal ids of
+ * stored events that are not in this console's signal registry (one per id and event).
+ */
+export const eventStats = { unexpectedTarget: 0, expired: 0, backpressure: 0, unregisteredSignals: 0 };
 
 /** SHA-256 of the validated batch in canonical JSON (same rule as `/findings`). */
 export function eventsBatchSha256(batch: EventsBatch): string {
@@ -185,6 +189,7 @@ export async function ingestEvents(
       .insert(accessEvents)
       .values(batch.events.map((e, i) => eventRow(agentId, batch.batch_id, e, i, unexpected.has(e.target_id))));
     eventStats.unexpectedTarget += batch.events.filter((e) => unexpected.has(e.target_id)).length;
+    eventStats.unregisteredSignals += batch.events.reduce((n, e) => n + unregisteredSignals(e.signals ?? []).length, 0);
     await tx.insert(eventsBatches).values({ agentId, batchId: batch.batch_id, bodySha256, eventsCount: batch.events.length });
     return { kind: "accepted" as const, duplicate: false, stored: batch.events.length };
   });

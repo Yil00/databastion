@@ -181,8 +181,18 @@ export function updateBaseline(state: BaselineState, rows: number | null | undef
 // ------------------------------------------------------------------------- conditions
 
 export const EVENT_ACTIONS = ["connect", "auth_failure", "read", "write", "ddl", "dcl"] as const;
-/** A signal id of the contract (`Signal`), or a family: `signature.*`, `shape.*`, `volume.*`. */
-export const SIGNAL_SELECTOR = /^(signature|shape|volume)\.([a-z0-9_]{1,55}|\*)$/;
+/**
+ * A signal id of the contract (`Signal`: 1 to 6 words of 1 to 16 letters, no digit, ADR-0022), or a
+ * family: `signature.*`, `shape.*`, `volume.*`. Checked on every new or changed policy.
+ */
+export const SIGNAL_SELECTOR = /^(signature|shape|volume)\.([a-z]{1,16}(_[a-z]{1,16}){0,5}|\*)$/;
+/**
+ * The selector accepted before the contract pattern was narrowed (P4-D). Only used to load stored
+ * policy documents (`parseEventConditions(v, { stored: true })`), so a policy written earlier with a
+ * digit in a signal id keeps being evaluated (that id can no longer match a conforming signal; its
+ * other conditions still apply). Saving the policy again requires the narrowed form.
+ */
+export const LEGACY_SIGNAL_SELECTOR = /^(signature|shape|volume)\.([a-z0-9_]{1,55}|\*)$/;
 export const OBJECT_PARTS = ["database", "schema", "object"] as const;
 export type ObjectPart = (typeof OBJECT_PARTS)[number];
 export type ObjectPattern = Partial<Record<ObjectPart, string>>;
@@ -263,13 +273,18 @@ export function parseObjectPattern(v: unknown): Parsed<ObjectPattern> {
 const threshold01 = (n: unknown): n is number =>
   typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= MAX_SCORE_THRESHOLD;
 
-/** Strict validation of a condition document of source `access_event` (unknown keys rejected). */
-export function parseEventConditions(v: unknown): Parsed<EventConditions> {
+/**
+ * Strict validation of a condition document of source `access_event` (unknown keys rejected).
+ * `stored: true` when loading a document saved earlier: signal selectors are then checked with
+ * {@link LEGACY_SIGNAL_SELECTOR}, so a narrower pattern never silently disables a stored policy.
+ */
+export function parseEventConditions(v: unknown, opts: { stored?: boolean } = {}): Parsed<EventConditions> {
   if (!isPlainObject(v)) return fail("conditions");
   if (onlyKeys(v, EVENT_CONDITION_KEYS) !== null) return fail("conditions");
   const out: EventConditions = {};
+  const selector = opts.stored ? LEGACY_SIGNAL_SELECTOR : SIGNAL_SELECTOR;
   const lists: [keyof EventConditions & string, (s: string) => boolean][] = [
-    ["signals", (s) => s.length <= 64 && SIGNAL_SELECTOR.test(s)],
+    ["signals", (s) => s.length <= 64 && selector.test(s)],
     ["event_actions", (s) => (EVENT_ACTIONS as readonly string[]).includes(s)],
     ["sources", (s) => validateSchema("AuditSource", s).ok],
     ["agent_ids", (s) => UUID.test(s)],
@@ -463,7 +478,9 @@ export function eventOverflowKey(policyId: string, agentId: string, targetId: st
 /**
  * A severe event opens its own incident even when the hourly cap is reached (re-review N1): it
  * carries a `signature.*` signal (a dump or export tool), is above its principal's baseline, or
- * scores higher than anything the overflow incident of its scope has counted so far.
+ * scores higher than anything the overflow incident of its scope has counted so far. A
+ * `signature.*` id is severe whether or not it is in this console's signal registry (fail-safe:
+ * an id registered after this console was built is still a dump or export tool).
  */
 export function severeEvent(e: { signals: readonly string[]; anomaly: boolean; score: number }, overflowMaxScore: number | null): boolean {
   if (e.signals.some((s) => s.startsWith("signature."))) return true;
@@ -498,7 +515,14 @@ export function dedupObject(objectIdx: readonly number[], sensitivities: readonl
 
 export const MAX_INCIDENT_SIGNALS = 16;
 
-/** Sorted union of signals, bounded. */
+/**
+ * Union of signals, bounded to {@link MAX_INCIDENT_SIGNALS}: the `signature.*` ids first (sorted),
+ * then the others (sorted), so truncation never drops a signature signal in favour of `shape.*` or
+ * `volume.*` ones (the severe family decides the cap bypass and the "worse than resolved" check).
+ */
 export function mergeSignals(a: readonly string[], b: readonly string[]): string[] {
-  return [...new Set([...a, ...b])].sort().slice(0, MAX_INCIDENT_SIGNALS);
+  const all = [...new Set([...a, ...b])];
+  const severe = all.filter((s) => s.startsWith("signature.")).sort();
+  const others = all.filter((s) => !s.startsWith("signature.")).sort();
+  return [...severe, ...others].slice(0, MAX_INCIDENT_SIGNALS);
 }

@@ -28,6 +28,7 @@ import {
 } from "@/lib/event-model";
 import { logger } from "@/lib/logger";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
+import { unregisteredSignals } from "@/lib/protocol/signals";
 import {
   ACTIVE_STATUSES,
   incidentSeverityOf,
@@ -92,7 +93,7 @@ async function loadEventPolicies(tx: Tx): Promise<LoadedEventPolicy[]> {
     .orderBy(asc(policies.id));
   const out: LoadedEventPolicy[] = [];
   for (const r of rows) {
-    const conditions = parseEventConditions(r.conditions);
+    const conditions = parseEventConditions(r.conditions, { stored: true });
     const actions = parsePolicyActions(r.actions);
     if (!conditions.ok || !actions.ok) {
       log.error({ policyId: r.id }, "policy document does not validate: skipped");
@@ -523,6 +524,7 @@ async function applyEventPolicy(
       sensitivity: facts.sensitivity,
       anomaly: facts.anomaly,
       signals: [...facts.signals],
+      unregistered_signals: unregisteredSignals(facts.signals),
       objects: facts.objects.map((o) => ({ database: o.database, schema: o.schema ?? null, object: o.object })),
     },
   };

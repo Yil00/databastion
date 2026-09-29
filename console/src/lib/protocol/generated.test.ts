@@ -3,11 +3,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   CLASSIFIERS_URL,
+  NOTES_URL,
   SCHEMAS_URL,
+  SIGNALS_URL,
   TYPES_URL,
   assertLocalRefs,
   renderArtifacts,
   renderClassifierRegistry,
+  renderIdRegistry,
 } from "../../../scripts/protocol/generate";
 
 // Drift check: the committed generated files must match shared/protocol/openapi.yaml.
@@ -20,6 +23,8 @@ describe("generated protocol artifacts", () => {
     expect((await readFile(CLASSIFIERS_URL, "utf8")) === expected.classifiers, `classifiers.gen.ts: ${hint}`).toBe(
       true,
     );
+    expect((await readFile(SIGNALS_URL, "utf8")) === expected.signals, `signals.gen.ts: ${hint}`).toBe(true);
+    expect((await readFile(NOTES_URL, "utf8")) === expected.targetNotes, `target-notes.gen.ts: ${hint}`).toBe(true);
   }, 60_000);
 });
 
@@ -76,5 +81,45 @@ describe("classifier registry rendering (fails closed)", () => {
     ["more than maxProperties versions", manyVersions(65)],
   ])("rejects %s", (_name, registry) => {
     expect(() => renderClassifierRegistry(registry, patterns)).toThrow();
+  });
+});
+
+describe("id registry rendering (signals.json, target-notes.json; fails closed)", () => {
+  const rules = {
+    id: /^(signature|shape|volume)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$/u,
+    maxIds: 3,
+    maxDescription: 40,
+    maxEngines: 2,
+    engines: ["postgres", "mysql", "mariadb"],
+  };
+  const entry = { description: "A dump.", engines: ["postgres"] };
+  const render = (registry: unknown) => renderIdRegistry(registry, rules, "SIGNAL_REGISTRY", "signals.json", "Signals.");
+
+  it("renders a const with only the registry fields", () => {
+    const out = render({ "shape.a": entry, "signature.b": { description: "x", engines: ["mysql", "mariadb"] } });
+    expect(out).toContain("export const SIGNAL_REGISTRY = {");
+    expect(out).toContain('"signature.b": {');
+    expect(out).toContain("as const;");
+  });
+
+  it.each([
+    ["not an object", ["shape.a"]],
+    ["null", null],
+    ["empty", {}],
+    ["too many ids", { "shape.a": entry, "shape.b": entry, "shape.c": entry, "shape.d": entry }],
+    ["bad id", { "shape.a1": entry }],
+    ["prototype key", JSON.parse('{"__proto__": {"description": "x", "engines": ["postgres"]}}') as unknown],
+    ["unsorted ids", { "shape.b": entry, "shape.a": entry }],
+    ["entry not an object", { "shape.a": "x" }],
+    ["unknown key", { "shape.a": { ...entry, extra: 1 } }],
+    ["empty description", { "shape.a": { ...entry, description: "" } }],
+    ["long description", { "shape.a": { ...entry, description: "x".repeat(41) } }],
+    ["control character", { "shape.a": { ...entry, description: "a\u202eb" } }],
+    ["no engine", { "shape.a": { ...entry, engines: [] } }],
+    ["unknown engine", { "shape.a": { ...entry, engines: ["oracle"] } }],
+    ["duplicate engine", { "shape.a": { ...entry, engines: ["postgres", "postgres"] } }],
+    ["too many engines", { "shape.a": { ...entry, engines: ["postgres", "mysql", "mariadb"] } }],
+  ])("rejects %s", (_name, registry) => {
+    expect(() => render(registry)).toThrow();
   });
 });
