@@ -268,8 +268,24 @@ name = "databastion-connector-mongodb"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "databastion-classifiers",
  "databastion-core",
+ "getrandom 0.4.3",
+ "hmac",
+ "proptest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
+ "sha2",
+ "stringprep",
+ "thiserror",
  "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

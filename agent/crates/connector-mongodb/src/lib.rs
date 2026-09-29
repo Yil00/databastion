@@ -1,35 +1,71 @@
-//! MongoDB connector for the DataBastion agent.
+//! MongoDB connector for the DataBastion agent (P5-A, ADR-0026).
 //!
-//! Audit source (docs/08-engine-capabilities.md): auditLog (Full, Enterprise / Percona) or slow-op logs + profiler (Limited to Partial, Community).
+//! - Discovery ([`discover`](Connector::discover)): the databases and
+//!   collections the account holds privileges on (never `admin`, `local`,
+//!   `config`, `system.*` collections nor views), one bounded read per
+//!   collection (`$sample` on large collections, natural order otherwise),
+//!   documents walked into normalized field paths (arrays as `[]`,
+//!   dynamic keys as `*`, ADR-0009), classification through
+//!   `ScanJob::classify`; only masked findings reach the sink (I2).
+//! - [`check`](Connector::check): reachability, audit level **None** (no
+//!   Audit stream in this build: P5-B, P5-C), over-privilege from the
+//!   account's resolved privileges, views not covered.
+//! - Audit: not implemented (`supports_audit` is `false`).
 //!
-//! Skeleton status (P0-D): every operation returns a "not implemented"
-//! result; nothing connects to a database yet.
+//! The connector only reads (I4): a closed set of commands built in code,
+//! `maxTimeMS` on every read (never `0`), no `getMore`, cursors killed at
+//! once, no server session or transaction. It connects only to the
+//! declared host or socket (I5; no replica-set discovery, no DNS SRV), with
+//! credentials from `agent.yaml` references (I3), over rustls TLS, through
+//! its own client for a subset of the wire protocol (`wire`, `bson`,
+//! `scram`): SCRAM-SHA-256 only, with mutual authentication.
 
 #![forbid(unsafe_code)]
 
+mod bson;
+mod catalog;
+mod check;
+mod conn;
+mod discover;
+mod error;
+mod net;
+mod paths;
+mod privileges;
+mod scram;
+mod tls;
+mod wire;
+
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+mod it;
+#[cfg(test)]
+mod proptests;
+
 use async_trait::async_trait;
+use databastion_core::config::TargetConfig;
 use databastion_core::{
     AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
-    config::TargetConfig,
 };
 
-/// MongoDB connector (stub).
-#[derive(Debug, Default)]
+/// MongoDB connector. One instance serves every declared MongoDB target.
+#[derive(Default)]
 #[non_exhaustive]
-pub struct MongodbConnector {}
+pub struct MongodbConnector {
+    check_state: check::CheckState,
+}
+
+impl std::fmt::Debug for MongodbConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongodbConnector").finish_non_exhaustive()
+    }
+}
 
 impl MongodbConnector {
-    /// Creates the (stub) connector.
+    /// Creates the connector.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
-    }
-
-    fn not_implemented(&self, operation: &'static str) -> ConnectorError {
-        ConnectorError::NotImplemented {
-            engine: self.engine(),
-            operation,
-        }
+        Self::default()
     }
 }
 
@@ -39,12 +75,12 @@ impl Connector for MongodbConnector {
         Engine::Mongodb
     }
 
-    async fn check(&self, _target: &TargetConfig) -> TargetHealth {
-        TargetHealth::not_implemented(self.engine())
+    async fn check(&self, target: &TargetConfig) -> TargetHealth {
+        check::check(&self.check_state, target).await
     }
 
-    async fn discover(&self, _job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("discover"))
+    async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
+        discover::discover(job, sink).await
     }
 
     async fn audit_stream(
@@ -52,47 +88,64 @@ impl Connector for MongodbConnector {
         _cfg: &AuditConfig,
         _sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(self.not_implemented("audit_stream"))
+        // P5-B / P5-C.
+        Err(ConnectorError::NotImplemented {
+            engine: Engine::Mongodb,
+            operation: "audit_stream",
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databastion_core::AuditLevel;
+    use databastion_core::{AuditLevel, FailureCode};
 
-    #[tokio::test]
-    async fn stub_reports_honest_health() {
-        let connector = MongodbConnector::new();
-        assert_eq!(connector.engine(), Engine::Mongodb);
-        let config = databastion_core::AgentConfig::parse(
-            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: \
-             [{id: t, engine: mongodb, host: h, account: a, secret: {env: PW}}]}",
-        )
+    fn target(yaml: &str) -> TargetConfig {
+        let config = databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{yaml}]}}"
+        ))
         .unwrap();
-        let health = connector.check(&config.targets[0]).await;
-        assert!(!health.reachable);
-        assert_eq!(health.audit_level, AuditLevel::None);
+        config.targets[0].clone()
     }
 
     #[tokio::test]
-    async fn stub_operations_return_not_implemented() {
+    async fn unreadable_secret_is_reported_without_connecting() {
         let connector = MongodbConnector::new();
-        let (findings, _findings_rx) = FindingSink::channel(1);
-        let (events, _events_rx) = EventSink::channel(1);
-        let discover = connector.discover(&ScanJob::default(), &findings).await;
+        let t = target(
+            "{id: t, engine: mongodb, host: 127.0.0.1, port: 9, account: a, \
+             secret: {env: DATABASTION_TEST_UNSET_MONGO_SECRET}, mongodb: {tls: disable}}",
+        );
+        let health = connector.check(&t).await;
+        assert!(!health.reachable);
+        assert_eq!(health.audit_level, AuditLevel::None);
+        assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+        assert_eq!(
+            health.notes[0].code(),
+            databastion_core::NoteCode::CheckStageFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn default_job_without_target_fails_closed_and_audit_is_not_supported() {
+        let connector = MongodbConnector::new();
+        assert_eq!(connector.engine(), Engine::Mongodb);
+        assert!(!connector.supports_audit());
+        let (findings, _rx) = FindingSink::channel(1);
+        let r = connector.discover(&ScanJob::default(), &findings).await;
         assert!(matches!(
-            discover,
-            Err(ConnectorError::NotImplemented {
+            r,
+            Err(ConnectorError::Target {
                 engine: Engine::Mongodb,
-                operation: "discover"
+                code: FailureCode::Internal,
+                ..
             })
         ));
-        let audit = connector
-            .audit_stream(&AuditConfig::default(), &events)
-            .await;
+        let (events, _rx) = EventSink::channel(1);
         assert!(matches!(
-            audit,
+            connector
+                .audit_stream(&AuditConfig::default(), &events)
+                .await,
             Err(ConnectorError::NotImplemented {
                 engine: Engine::Mongodb,
                 operation: "audit_stream"
