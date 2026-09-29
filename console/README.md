@@ -302,7 +302,8 @@ Without the server key, no device cookie is issued or accepted.
 Failed agent authentications (P1-D M1), all over 5 minutes: 10 per (agent, source IP), 50 per
 source IP. Only failures that ran an argon2id verification count; cheap failures (missing or
 malformed headers or secret, unknown or inactive agent, `/rotate` body missing its read deadline)
-count toward a separate limit of 500 per source IP that only gates reaching argon2id. No failure
+count toward a separate limit of 500 per source IP (IPv6 bucketed by /48 for this limit only, so
+one IPv6 allocation cannot multiply it by rotating /64s) that only gates reaching argon2id. No failure
 limit holds a secret verified less than 25 s ago or a known-good secret (current or pending, see
 "Data at rest"): agents sharing a NAT or proxy IP cannot be blocked by junk requests from it, which
 need no secret. The known-good exemption is checked first against an in-memory copy of the agent
@@ -412,6 +413,7 @@ Frozen names (renaming one is a breaking change; the provisional Grafana dashboa
 | `databastion_security_events` | | rows of `security_events` |
 | `databastion_console_argon2_operations_total` | | argon2id operations of this process |
 | `databastion_console_rate_limit_store_errors_total` | | shared rate-limit store operations of this process that failed or timed out |
+| `databastion_console_rate_limit_counters_rows` | | rows of `rate_limit_counters`, expired ones included, counted up to 1 000 000: alarm when it grows far beyond the number of active clients (floods of distinct keys between two prunes) |
 | `databastion_metrics_series_dropped` | | series dropped by the caps in the last scrape |
 
 Per-agent series cover enrolled / online agents (not revoked or locked). Agent-provided metric
@@ -470,7 +472,7 @@ reports healthy for the other commands. The image is not built by the CI yet.
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
 | Notification deliveries (`notification_deliveries`) | the outbox and delivery record: event, channel (id and slug), incident / agent / security event, payload (identifiers, counts, normalized names, console URL: never a sampled value, masked or not), status, attempts, next attempt, last error (closed code, never a server response). The runtime role cannot delete rows nor rewrite the key, subject or payload (migration `0019`) |
 
-| Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1` (domain-separated SHA-256 without a server key), never in clear. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
+| Shared rate-limit counters (`rate_limit_counters`) | per (limiter, key): window start and end, count. The key (source IP bucket, username as typed, `username|IP`, device-cookie nonce, agent id) is stored only as an HMAC-SHA256 under the server-key subkey `rate-limit-keys.v1`, never in clear. Without a server key the username-derived limits are not stored at all (per process, see "Shared rate limits") and the other keys are a domain-separated SHA-256. Expired windows are pruned by the worker every 5 minutes. Read, insert, update and delete for the runtime role (migration `0030`) |
 
 The argon2 concurrency caps and the 25 s verified-secret cache are in memory, per process (the
 known-good fingerprint is in the database; the cache is safe across processes, as it is bound to the
@@ -494,17 +496,34 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
   touches the window it was counted in; the three agent-authentication limits are checked with one
   `SELECT`. Refunds keep their semantics: a successful login or authentication, and a duplicate,
   rejected or failed (exception) findings or events batch give their slot back.
-- **Per-process pre-check**: each process also counts its own hits in memory and refuses early when
-  they alone reach the limit, without a database round-trip. Its hits are a subset of the shared
-  ones, so it can only refuse earlier, never admit more. A secret in the 25 s verified cache or
-  known good per the in-memory hint skips the shared check entirely (it is exempt anyway).
-- **Store failures** (error, or no answer within 2 s), logged at most once per minute per limiter
-  (never the key) and counted in `databastion_console_rate_limit_store_errors_total`:
+- **Per-process pre-check and negative entries**: each process also counts its own hits in memory
+  and refuses early when they alone reach the limit, without a database round-trip. Its hits are a
+  subset of the shared ones, so it can only refuse earlier, never admit more. When the store reports
+  a key at its limit (a refused reservation, a hit or a check at the limit), the process records the
+  key as limited until the end of the store's window: a flood on one key then costs each process at
+  most about `limit + 1` statements per window, whatever the number of requests. Consequence: a slot
+  given back (refund) in one process is only seen by another process that already refused the key
+  at the end of the window, which is what `Retry-After` announces anyway. A secret in the 25 s
+  verified cache or known good per the in-memory hint skips the shared check entirely (it is exempt
+  anyway).
+- **Dedicated pool**: the counters use their own pool of 3 connections (`lock_timeout` 1.5 s,
+  `statement_timeout` 2 s, 2 s to get a connection), so a hot counter row can never starve the main
+  pool, and a statement the limiter gave up on is cancelled by the server, never committed late.
+- **Username keys without a server key**: the per-(username, IP), per-username and degraded-login
+  limits stay per process when no server key is available (only possible in production with
+  `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1`, which logs it), rather than store an unkeyed hash of
+  what was typed in the username field.
+- **Login timing**: every login reserves the unknown-username budget, concurrently with the user
+  lookup (a known user gives it back), so known and unknown usernames pay the same store latency.
+- **Store failures** (an error, a server-side lock or statement timeout, no connection within 2 s,
+  or no answer within 5 s), logged at most once per minute per limiter (never the key) and counted
+  in `databastion_console_rate_limit_store_errors_total`:
   - **fail closed** for agent authentication, `/enroll`, `/rotate`, logins and test sends: the
     limit is treated as reached (`429` + `Retry-After: 5`; for logins over the per-username caps,
-    the degraded path, which never refuses). A secret exempt from the failure limits (verified
-    less than 25 s ago, or known good) still authenticates, so a store outage does not lock
-    legitimate agents out;
+    the degraded path, which never refuses). Only an agent secret verified by this process less than
+    25 s ago, or known good per this process's in-memory hint (refreshed on each request of the
+    agent), still authenticates during a store outage. An agent known good only per its database
+    row (e.g. its first request to a freshly started process) gets `429` until the store answers;
   - **per-process fallback** for the `/findings` and `/events` request and stored-batch rates, the
     integrity and failed-enrollment audit budgets, and the late `/rotate` retries: the in-memory
     counters decide (the pre-P4-D per-process limit). The ingestion and the audit rows use the
@@ -513,7 +532,8 @@ PostgreSQL, so several web processes enforce one limit. Only a per-process log d
     their limit: failing closed would turn a transient store error into an irreversible lock.
 - **Pruning**: worker queue `rate_limits.prune`, every 5 minutes, in chunks of 10 000 rows.
   Pruning changes no decision. The table holds at most one row per key seen in the last window
-  (at most 15 minutes).
+  (at most 15 minutes) plus the expired rows not pruned yet; its size is exported as
+  `databastion_console_rate_limit_counters_rows`.
 
 ## Policies and incidents
 *P3-A, P3-B. Model and lifecycle: `src/lib/policy-model.ts`, `src/lib/incident-lifecycle.ts`;
