@@ -75,8 +75,7 @@ impl<'a> Doc<'a> {
         Ok((doc, len))
     }
 
-    /// The encoded document (tests).
-    #[cfg(test)]
+    /// The encoded document.
     pub(crate) fn as_bytes(&self) -> &'a [u8] {
         self.bytes
     }
@@ -440,6 +439,28 @@ impl DocBuf {
         }
         self.key(0x04, key);
         self.0.extend_from_slice(&array.finish());
+        self
+    }
+
+    /// UTC datetime (milliseconds since the epoch).
+    pub(crate) fn date(mut self, key: &str, millis: i64) -> Self {
+        self.key(0x09, key);
+        self.0.extend_from_slice(&millis.to_le_bytes());
+        self
+    }
+
+    /// Null.
+    pub(crate) fn null(mut self, key: &str) -> Self {
+        self.key(0x0A, key);
+        self
+    }
+
+    /// An array whose elements are the elements of `items` (built with
+    /// the keys `0`, `1`…), for mixed-type arrays (aggregation
+    /// expressions).
+    pub(crate) fn list(mut self, key: &str, items: DocBuf) -> Self {
+        self.key(0x04, key);
+        self.0.extend_from_slice(&items.finish());
         self
     }
 

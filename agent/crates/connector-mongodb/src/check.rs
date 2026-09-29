@@ -3,11 +3,11 @@
 //!
 //! - Reachability: TLS, `hello` (MongoDB 5.0 or later), SCRAM-SHA-256.
 //! - Version and edition from `buildInfo`, for the agent's log only.
-//! - Audit level: **None**, with the note `audit.stream_not_available`.
-//!   This build has no MongoDB Audit stream (P5-B, P5-C), and the
-//!   Discovery account cannot read the profiler level nor the audit
-//!   settings: reporting the level a server could give would let an absent
-//!   audit pass for a working one (docs/08).
+//! - Audit level and source (ADR-0027): the same rule as the Audit stream
+//!   (`audit::choose`), proven from what the agent can read (the edition,
+//!   the configured log file, a successful `authCheck` read in the last
+//!   24 h, the account's `find` on `system.profile`), never from server
+//!   settings the account cannot see. Full is never reported.
 //! - Over-privilege from `connectionStatus` (see [`crate::privileges`]),
 //!   and coverage: views (never sampled) in the databases the account
 //!   sees. This report is recomputed at most every [`REPORT_INTERVAL`] per
@@ -21,12 +21,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use databastion_classifiers::masking::EventSource;
+use databastion_core::audit::own::SharedOwnUsage;
 use databastion_core::config::{MongodbTlsMode, TargetConfig};
 use databastion_core::{
     AuditLevel, FailureCode, NoteCode, NoteLabel, Notes, TargetHealth, TargetNote,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::audit::{self, Probe, Source};
 use crate::bson::{DocBuf, Value};
 use crate::catalog::{self, CollKind};
 use crate::conn::{Kind, Session, Timeouts};
@@ -74,9 +77,11 @@ impl Default for Report {
 
 impl Report {
     /// Closed notes: privileges and views (counts only).
-    pub(crate) fn notes(&self) -> Vec<TargetNote> {
+    /// `profiler_in_use`: an Audit stream reads the profiler (its grant is
+    /// then expected).
+    pub(crate) fn notes(&self, profiler_in_use: bool) -> Vec<TargetNote> {
         let mut out = if self.privileges_known {
-            self.privileges.notes()
+            self.privileges.notes(profiler_in_use)
         } else {
             vec![TargetNote::new(NoteCode::PrivilegeNotEvaluated)]
         };
@@ -86,14 +91,14 @@ impl Report {
         out
     }
 
-    fn summary(&self) -> Vec<String> {
+    fn summary(&self, profiler_in_use: bool) -> Vec<String> {
         let mut out = Vec::new();
         if !self.privileges_known {
             out.push("privileges not evaluated (connectionStatus not readable)".to_owned());
-        } else if !self.privileges.is_minimal() {
+        } else if !self.privileges.is_minimal(profiler_in_use) {
             out.push(format!(
                 "over-privileged: {}",
-                self.privileges.summary().join("; ")
+                self.privileges.summary(profiler_in_use).join("; ")
             ));
         }
         if !self.coverage_known {
@@ -116,19 +121,144 @@ struct Cached {
     report: Report,
 }
 
-/// Per-target state of `check()`: the last detailed report.
+/// Per-target state of `check()`: the last detailed report, what the
+/// Audit stream observed (the last successful `authCheck`, dropped
+/// records, its source) and the agent's own reads (shared by every stream
+/// of the target).
 #[derive(Default)]
 pub(crate) struct CheckState {
     reports: Mutex<HashMap<String, Cached>>,
     /// Per target: time-series collections the server refused to the
     /// account (`Unauthorized`) in the last scan, and when.
     timeseries_refused: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Source of the level last reported by `check()`.
+    sources: Mutex<HashMap<String, EventSource>>,
+    /// When the stream last parsed a successful `authCheck` record.
+    authchecks: Mutex<HashMap<String, Instant>>,
+    /// Running streams (count) and the source of the latest one.
+    streams: Mutex<HashMap<String, (usize, Source)>>,
+    own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
+    /// Records dropped (not parsable, oversized or damaged), and when the
+    /// count started (reported for 24 h).
+    dropped: Mutex<HashMap<String, (u64, Instant)>>,
+}
+
+/// A successful `authCheck` parsed within this period makes the
+/// `auditLog` source Partial.
+pub(crate) const RECORD_FRESHNESS: Duration = Duration::from_secs(24 * 3600);
+
+/// Marks an Audit stream as running for a target while alive.
+pub(crate) struct StreamGuard<'a> {
+    state: &'a CheckState,
+    target_id: String,
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = lock(&self.state.streams);
+        if let Some((n, _)) = map.get_mut(&self.target_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.target_id);
+            }
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// How long a scan's time-series refusals are reported.
 const SCAN_OBSERVATION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 impl CheckState {
+    /// The Audit stream of `target_id` starts (its source is set by
+    /// [`Self::set_stream_source`] at each re-probe).
+    pub(crate) fn stream_started(&self, target_id: &str) -> StreamGuard<'_> {
+        lock(&self.streams)
+            .entry(target_id.to_owned())
+            .or_insert((0, Source::None))
+            .0 += 1;
+        StreamGuard {
+            state: self,
+            target_id: target_id.to_owned(),
+        }
+    }
+
+    /// The source the running stream of `target_id` reads.
+    pub(crate) fn set_stream_source(&self, target_id: &str, source: Source) {
+        if let Some(entry) = lock(&self.streams).get_mut(target_id) {
+            entry.1 = source;
+        }
+    }
+
+    /// Whether a running Audit stream of `target_id` reads the profiler.
+    pub(crate) fn profiler_in_use(&self, target_id: &str) -> bool {
+        lock(&self.streams)
+            .get(target_id)
+            .is_some_and(|(_, s)| *s == Source::Profiler)
+    }
+
+    /// The stream of `target_id` parsed a successful `authCheck`.
+    pub(crate) fn note_authcheck(&self, target_id: &str) {
+        lock(&self.authchecks).insert(target_id.to_owned(), Instant::now());
+    }
+
+    /// Whether a successful `authCheck` of `target_id` was parsed
+    /// recently.
+    pub(crate) fn recent_authcheck(&self, target_id: &str) -> bool {
+        lock(&self.authchecks)
+            .get(target_id)
+            .is_some_and(|t| t.elapsed() < RECORD_FRESHNESS)
+    }
+
+    /// Records of `target_id` dropped by the stream.
+    pub(crate) fn note_dropped(&self, target_id: &str, n: u64) {
+        let mut map = lock(&self.dropped);
+        let entry = map
+            .entry(target_id.to_owned())
+            .or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= RECORD_FRESHNESS {
+            *entry = (0, Instant::now());
+        }
+        entry.0 = entry.0.saturating_add(n);
+    }
+
+    fn dropped(&self, target_id: &str) -> u64 {
+        lock(&self.dropped)
+            .get(target_id)
+            .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)
+            .map_or(0, |(n, _)| *n)
+    }
+
+    /// The agent's own-read counters of `target_id`, kept for the life of
+    /// the connector.
+    pub(crate) fn own_usage(&self, target_id: &str) -> SharedOwnUsage {
+        std::sync::Arc::clone(
+            lock(&self.own_usage)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Source of the level last reported for `target_id`.
+    pub(crate) fn audit_source(&self, target_id: &str) -> Option<EventSource> {
+        lock(&self.sources).get(target_id).copied()
+    }
+
+    fn set_source(&self, target_id: &str, source: Option<EventSource>) {
+        let mut map = lock(&self.sources);
+        match source {
+            Some(s) => {
+                map.insert(target_id.to_owned(), s);
+            }
+            None => {
+                map.remove(target_id);
+            }
+        }
+    }
+
     /// Records what the last scan of `target_id` observed: how many
     /// time-series collections the server refused to the account.
     pub(crate) fn record_scan(&self, target_id: &str, timeseries_refused: u64) {
@@ -202,14 +332,20 @@ fn unreachable(e: &MgError, mut notes: Vec<TargetNote>) -> TargetHealth {
 /// `check()` of a target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     match tokio::time::timeout(CHECK_TIMEOUT, check_inner(state, target)).await {
-        Ok(h) => h,
-        Err(_) => TargetHealth {
-            reachable: false,
-            audit_level: AuditLevel::None,
-            failure: Some(FailureCode::Timeout),
-            detail: Some("check timed out".to_owned()),
-            notes: vec![TargetNote::new(NoteCode::CheckTimedOut)],
-        },
+        Ok((h, source)) => {
+            state.set_source(&target.id, source.event_source());
+            h
+        }
+        Err(_) => {
+            state.set_source(&target.id, None);
+            TargetHealth {
+                reachable: false,
+                audit_level: AuditLevel::None,
+                failure: Some(FailureCode::Timeout),
+                detail: Some("check timed out".to_owned()),
+                notes: vec![TargetNote::new(NoteCode::CheckTimedOut)],
+            }
+        }
     }
 }
 
@@ -332,7 +468,7 @@ pub(crate) async fn report<S: AsyncRead + AsyncWrite + Unpin>(session: &mut Sess
     r
 }
 
-async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth {
+async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth, Source) {
     // `detail`: the local log detail; `codes`: the same as closed notes.
     let mut detail: Vec<String> = Vec::new();
     let mut codes = Notes::default();
@@ -354,33 +490,57 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 code = %e.code,
                 "target check failed"
             );
-            return unreachable(&e, codes.into_vec());
+            return (unreachable(&e, codes.into_vec()), Source::None);
         }
     };
-    match build_info(&mut session).await {
-        Ok(b) => detail.push(format!(
-            "MongoDB {} ({}{})",
-            b.version,
-            b.edition,
-            if session.info.mongos { ", mongos" } else { "" }
-        )),
-        Err(e) if !e.fatal => detail.push("buildInfo not readable".to_owned()),
-        Err(e) => return unreachable(&e, codes.into_vec()),
-    }
-    detail.push(
-        "no MongoDB Audit stream in this agent build (P5-B, P5-C): audit level None".to_owned(),
-    );
-    codes.add(TargetNote::new(NoteCode::AuditStreamNotAvailable));
+    let edition = match build_info(&mut session).await {
+        Ok(b) => {
+            detail.push(format!(
+                "MongoDB {} ({}{})",
+                b.version,
+                b.edition,
+                if session.info.mongos { ", mongos" } else { "" }
+            ));
+            Some(b.edition)
+        }
+        Err(e) if !e.fatal => {
+            detail.push("buildInfo not readable".to_owned());
+            None
+        }
+        Err(e) => return (unreachable(&e, codes.into_vec()), Source::None),
+    };
+    let profiler_in_use = state.profiler_in_use(&target.id);
     if state.due(&target.id) && !session.is_broken() {
         let r = report(&mut session).await;
         if state.store(target.id.clone(), r.clone()) {
-            log_report(target, &r);
+            log_report(target, &r, profiler_in_use);
         }
     }
-    match state.cached(&target.id) {
+    let cached = state.cached(&target.id);
+    let probe = Probe {
+        edition,
+        mongos: session.info.mongos,
+        profiler: cached
+            .as_ref()
+            .is_some_and(|r| r.privileges_known && r.privileges.can_read_profiler()),
+    };
+    let file = audit::file_state(state, target).await;
+    let (level, source) = audit::choose(probe, file);
+    let (text, audit_codes) = audit::explain(probe, file, source);
+    detail.extend(text);
+    codes.extend(audit_codes);
+    let dropped = state.dropped(&target.id);
+    if dropped > 0 {
+        detail.push(format!(
+            "{dropped} audit record(s) dropped in the last 24 h (not parsable, oversized or \
+             damaged)"
+        ));
+        codes.add(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(dropped));
+    }
+    match cached {
         Some(r) => {
-            detail.extend(r.summary());
-            codes.extend(r.notes());
+            detail.extend(r.summary(profiler_in_use));
+            codes.extend(r.notes(profiler_in_use));
         }
         // No report yet (the session broke before it): the privileges are
         // not evaluated, which must not read as least privilege.
@@ -409,19 +569,22 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     if !session.is_broken() {
         session.close().await;
     }
-    TargetHealth {
-        reachable: true,
-        audit_level: AuditLevel::None,
-        failure: None,
-        detail: Some(format!("audit level None; {}", detail.join("; "))),
-        notes: codes.into_vec(),
-    }
+    (
+        TargetHealth {
+            reachable: true,
+            audit_level: level,
+            failure: None,
+            detail: Some(format!("audit level {level:?}; {}", detail.join("; "))),
+            notes: codes.into_vec(),
+        },
+        source,
+    )
 }
 
-fn log_report(target: &TargetConfig, r: &Report) {
+fn log_report(target: &TargetConfig, r: &Report, profiler_in_use: bool) {
     if !r.privileges_known {
         tracing::warn!(target_id = %target.id, "account privileges not evaluated");
-    } else if r.privileges.is_minimal() {
+    } else if r.privileges.is_minimal(profiler_in_use) {
         tracing::info!(
             target_id = %target.id,
             "account privileges: find and listCollections only"
@@ -429,7 +592,7 @@ fn log_report(target: &TargetConfig, r: &Report) {
     } else {
         tracing::warn!(
             target_id = %target.id,
-            over_privileged = r.privileges.summary().join("; "),
+            over_privileged = r.privileges.summary(profiler_in_use).join("; "),
             "the agent account is over-privileged"
         );
     }
@@ -456,12 +619,12 @@ mod tests {
             views: 3,
             ..Report::default()
         };
-        let notes = r.notes();
+        let notes = r.notes(false);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].code(), NoteCode::CoverageViewsNotSampled);
         assert_eq!(notes[0].count(), Some(3));
         assert!(notes[0].labels().is_empty());
-        let text = r.summary().join("; ");
+        let text = r.summary(false).join("; ");
         assert!(text.contains("3 view(s)"), "{text}");
     }
 
@@ -472,7 +635,13 @@ mod tests {
         ))
         .unwrap();
         for code in [
-            NoteCode::AuditStreamNotAvailable,
+            NoteCode::AuditAuditlogOnCommunity,
+            NoteCode::AuditAuthcheckSuccessPending,
+            NoteCode::AuditSlowOperationsOnly,
+            NoteCode::AuditSourceNotConfigured,
+            NoteCode::AuditLogNotReadable,
+            NoteCode::AuditLogWithoutRowCounts,
+            NoteCode::AuditRecordsDropped,
             NoteCode::CheckStageFailed,
             NoteCode::CheckTimedOut,
             NoteCode::SecurityTlsDisabled,

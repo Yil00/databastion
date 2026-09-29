@@ -18,7 +18,7 @@
 //! `all`) turns the matching skips into failures: CI lists what each run
 //! must exercise.
 //!
-//! The tests are serialized.
+//! The tests are serialized. The Audit tests are in `it_audit.rs`.
 
 // Skip notices and the recall table (counts only, never a value).
 #![allow(clippy::print_stderr)]
@@ -166,6 +166,17 @@ impl Drop for TempDir {
 /// A declared target for `url`'s server with `user` (password in a `0600`
 /// file).
 fn target(url: &Url, user: &str, password: &str, auth_source: &str) -> (TempDir, TargetConfig) {
+    target_with(url, user, password, auth_source, "")
+}
+
+/// [`target`] with more `mongodb` settings (`, key: value`).
+fn target_with(
+    url: &Url,
+    user: &str,
+    password: &str,
+    auth_source: &str,
+    extra: &str,
+) -> (TempDir, TargetConfig) {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = TempDir::new();
     let file = dir.0.join("secret");
@@ -179,7 +190,7 @@ fn target(url: &Url, user: &str, password: &str, auth_source: &str) -> (TempDir,
     let yaml = format!(
         "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: mongo-it\n    \
          engine: mongodb\n    host: \"{}\"\n    port: {}\n    account: \"{user}\"\n    \
-         secret: {{file: \"{}\"}}\n    mongodb: {{tls: disable, auth_source: {auth_source}}}\n",
+         secret: {{file: \"{}\"}}\n    mongodb: {{tls: disable, auth_source: {auth_source}{extra}}}\n",
         url.host,
         url.port,
         file.display()
@@ -281,18 +292,24 @@ fn codes(notes: &[TargetNote]) -> Vec<&'static str> {
 }
 
 #[tokio::test]
-async fn check_reports_reachable_with_audit_none_and_minimal_grants() {
+async fn check_reports_reachable_without_audit_source_and_minimal_grants() {
     let _serial = SERIAL.lock().await;
     let Some(url) = server() else { return };
     let (_dir, t) = agent_target(&url);
     let connector = MongodbConnector::new();
     let h = connector.check(&t).await;
     assert!(h.reachable, "{h:?}");
+    // No log file declared, no profiler grant: no Audit source.
     assert_eq!(h.audit_level, AuditLevel::None);
     assert_eq!(h.failure, None);
+    assert_eq!(connector.audit_source(&t), None);
     let got = codes(&h.notes);
     assert!(
-        got.contains(&NoteCode::AuditStreamNotAvailable.as_str()),
+        got.contains(&NoteCode::AuditSourceNotConfigured.as_str()),
+        "{got:?}"
+    );
+    assert!(
+        !got.contains(&NoteCode::AuditStreamNotAvailable.as_str()),
         "{got:?}"
     );
     // The dev account holds the ADR-0026 grant only.
@@ -301,7 +318,7 @@ async fn check_reports_reachable_with_audit_none_and_minimal_grants() {
         "{got:?} ({:?})",
         h.detail
     );
-    assert!(!connector.supports_audit());
+    assert!(connector.supports_audit());
     // A wrong password.
     let (_dir, t) = target(&url, &url.user, "wrong-password", &url.auth_source);
     let h = connector.check(&t).await;
@@ -831,3 +848,6 @@ fn urls_are_parsed() {
     let u = parse_url("mongodb://root:pw@localhost/").unwrap();
     assert_eq!((u.port, u.auth_source.as_str()), (27017, "admin"));
 }
+
+#[path = "it_audit.rs"]
+mod audit;

@@ -92,6 +92,11 @@ pub(crate) struct PrivilegeReport {
     pub(crate) bucket_find: BTreeSet<String>,
     /// `find` on every resource (`anyResource`).
     pub(crate) bucket_find_any: bool,
+    /// Databases whose profiler (`system.profile`) the account can `find`
+    /// (`""`: every database), the Audit grant of the profiler source
+    /// (ADR-0027 decision 5). Counted as access to system collections by
+    /// `check()` unless an Audit stream reads the profiler.
+    pub(crate) profile_find: BTreeSet<String>,
 }
 
 enum Resource<'a> {
@@ -250,6 +255,17 @@ impl PrivilegeReport {
                         self.read_beyond.insert((*action).to_owned());
                     }
                 }
+                Some(Resource::Namespace { db, collection })
+                    if *collection == "system.profile"
+                        && *action == "find"
+                        && !is_system_database(db) =>
+                {
+                    // The profiler Audit grant (see `profile_find`).
+                    if db.is_empty() {
+                        self.any_database = true;
+                    }
+                    self.profile_find.insert((*db).to_owned());
+                }
                 Some(Resource::Namespace { db, collection }) => {
                     if db.is_empty() {
                         self.any_database = true;
@@ -266,13 +282,25 @@ impl PrivilegeReport {
     }
 
     /// Whether the account holds the Discovery grant only (with or
-    /// without the optional time-series grant).
-    pub(crate) fn is_minimal(&self) -> bool {
+    /// without the optional time-series grant, and the profiler grant
+    /// when `profiler_in_use`).
+    pub(crate) fn is_minimal(&self, profiler_in_use: bool) -> bool {
         self.write_actions.is_empty()
             && self.read_beyond.is_empty()
             && self.cluster_actions.is_empty()
             && !self.any_database
-            && !self.system_collections
+            && !self.system_access(profiler_in_use)
+    }
+
+    /// Access to system collections: any, or the profiler grant when no
+    /// Audit stream reads the profiler.
+    fn system_access(&self, profiler_in_use: bool) -> bool {
+        self.system_collections || (!self.profile_find.is_empty() && !profiler_in_use)
+    }
+
+    /// Whether the account can read the profiler of some database.
+    pub(crate) fn can_read_profiler(&self) -> bool {
+        !self.profile_find.is_empty()
     }
 
     /// Whether the account holds `find` on some bucket collections (the
@@ -288,7 +316,7 @@ impl PrivilegeReport {
     }
 
     /// The report as closed notes (counts only).
-    pub(crate) fn notes(&self) -> Vec<TargetNote> {
+    pub(crate) fn notes(&self, profiler_in_use: bool) -> Vec<TargetNote> {
         let mut out = Vec::new();
         let count = |s: &BTreeSet<String>| s.len() as u64;
         if !self.write_actions.is_empty() {
@@ -312,14 +340,14 @@ impl PrivilegeReport {
         if self.any_database {
             out.push(TargetNote::new(NoteCode::PrivilegeAnyDatabase));
         }
-        if self.system_collections {
+        if self.system_access(profiler_in_use) {
             out.push(TargetNote::new(NoteCode::PrivilegeSystemCollections));
         }
         out
     }
 
     /// The report for the agent's log (known action names only).
-    pub(crate) fn summary(&self) -> Vec<String> {
+    pub(crate) fn summary(&self, profiler_in_use: bool) -> Vec<String> {
         let names = |s: &BTreeSet<String>| {
             let mut v: Vec<&str> = s.iter().map(|a| loggable(a)).collect();
             v.dedup();
@@ -351,6 +379,10 @@ impl PrivilegeReport {
             out.push(
                 "access to system collections or to the admin, local or config databases"
                     .to_owned(),
+            );
+        } else if self.system_access(profiler_in_use) {
+            out.push(
+                "find on system.profile without an Audit stream reading the profiler".to_owned(),
             );
         }
         out
@@ -384,7 +416,7 @@ mod tests {
     }
 
     fn codes(r: &PrivilegeReport) -> Vec<(&'static str, Option<u64>)> {
-        r.notes()
+        r.notes(false)
             .iter()
             .map(|n| (n.code().as_str(), n.count()))
             .collect()
@@ -396,8 +428,8 @@ mod tests {
             privilege(ns("app", ""), &["find", "listCollections"]),
             privilege(ns("crm", ""), &["find", "listCollections"]),
         ]);
-        assert!(r.is_minimal(), "{r:?}");
-        assert!(r.notes().is_empty());
+        assert!(r.is_minimal(false), "{r:?}");
+        assert!(r.notes(false).is_empty());
     }
 
     #[test]
@@ -435,7 +467,7 @@ mod tests {
                 ("privilege.system_collections", None),
             ]
         );
-        assert!(r.summary().iter().any(|s| s.contains("changeStream")));
+        assert!(r.summary(false).iter().any(|s| s.contains("changeStream")));
     }
 
     #[test]
@@ -446,8 +478,8 @@ mod tests {
         )]);
         assert_eq!(codes(&r), [("privilege.write_actions", Some(4))]);
         // Unknown action names are logged as `other`, never as sent.
-        assert!(r.summary()[0].contains("other"));
-        assert!(!r.summary()[0].contains("someFutureAction"));
+        assert!(r.summary(false)[0].contains("other"));
+        assert!(!r.summary(false)[0].contains("someFutureAction"));
         let r = report(vec![privilege(
             DocBuf::new().bool("anyResource", true),
             &["find"],
@@ -471,8 +503,8 @@ mod tests {
             privilege(ns("app", ""), &["find", "listCollections"]),
             privilege(buckets("app"), &["find"]),
         ]);
-        assert!(r.is_minimal(), "{r:?}");
-        assert!(r.notes().is_empty());
+        assert!(r.is_minimal(false), "{r:?}");
+        assert!(r.notes(false).is_empty());
         assert!(r.can_read_buckets("app") && !r.can_read_buckets("crm"));
         // The Discovery role alone cannot read time-series collections.
         let r = report(vec![privilege(ns("app", ""), &["find", "listCollections"])]);
@@ -527,5 +559,32 @@ mod tests {
             )
             .finish();
         assert!(PrivilegeReport::from_connection_status(Doc::new(&bytes).unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_profiler_grant_is_the_audit_grant_only_while_it_is_read() {
+        let r = report(vec![
+            privilege(ns("app", ""), &["find", "listCollections"]),
+            privilege(ns("app", "system.profile"), &["find"]),
+        ]);
+        assert!(r.can_read_profiler());
+        assert!(!r.system_collections);
+        assert!(r.is_minimal(true), "{r:?}");
+        assert!(r.notes(true).is_empty());
+        assert!(!r.is_minimal(false));
+        assert_eq!(codes(&r), [("privilege.system_collections", None)]);
+        assert!(r.summary(false)[0].contains("system.profile"));
+        // Any other action on the profiler, or the profiler of a system
+        // database, stays over-privilege.
+        let r = report(vec![privilege(
+            ns("app", "system.profile"),
+            &["find", "remove"],
+        )]);
+        assert!(r.system_collections);
+        let r = report(vec![privilege(ns("admin", "system.profile"), &["find"])]);
+        assert!(r.system_collections && !r.can_read_profiler());
+        // Every database's profiler.
+        let r = report(vec![privilege(ns("", "system.profile"), &["find"])]);
+        assert!(r.any_database && r.can_read_profiler());
     }
 }

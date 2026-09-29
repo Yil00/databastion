@@ -34,11 +34,14 @@ sha2.workspace = true
 stringprep = "0.1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.4", default-features = false }
+# Audit (P5-B, P5-C): auditLog and server log JSON records, read with serde
+# visitors that skip command values (no protocol types).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
 tracing-subscriber.workspace = true
-serde_json = { version = "1", default-features = false, features = ["std"] }
 # Property tests of the BSON reader, the wire framing and the field paths
 # (src/proptests.rs).
 proptest = { version = "1", default-features = false, features = ["std"] }
