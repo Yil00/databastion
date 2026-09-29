@@ -3,9 +3,12 @@
 Phase 1 exit criterion ([ROADMAP](../docs/ROADMAP.md)): *end-to-end enrollment in containers;
 revocation effective in < 60 s*; and the invariant I2 test (P2-E): *no value of
 [`dev/ground-truth.json`](../dev/ground-truth.json) in clear text in the console, including
-value-bearing object and field names*. [`run.sh`](run.sh) drives
-[`docker-compose.yml`](docker-compose.yml); the CI job is
-[`.github/workflows/e2e.yml`](../.github/workflows/e2e.yml).
+value-bearing object and field names*, for the PostgreSQL, MySQL and MariaDB targets.
+[`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
+It runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/`, `dev/seed/out/`,
+`dev/ground-truth.json`, `dev/mysql/`, `dev/mariadb/` or `ci.yml` change (and whenever the changed
+files cannot be listed).
 
 ## What runs
 | Service | Image | Role |
@@ -15,13 +18,16 @@ value-bearing object and field names*. [`run.sh`](run.sh) drives
 | `web`, `worker` | `console/Dockerfile` | Console processes (runtime role) |
 | `proxy` | Caddy | TLS 1.3 reverse proxy, certificate from a throwaway CA; `/metrics` answers `404` |
 | `target-pg` | PostgreSQL 17 | Declared target of the agent, database `shop` loaded with the committed dev seed [`dev/seed/out/postgres.sql`](../dev/seed/out/postgres.sql) (schemas `crm`, `billing`, `ops`, value-bearing table names included); [`target-initdb/`](target-initdb/) creates the agent's read-only role and its per-schema Discovery grants |
+| `target-mysql` | MySQL 8.4 (dev image pin) | Declared target, the dev configuration mounted read-only: [`dev/mysql/databastion.cnf`](../dev/mysql/databastion.cnf), seed [`dev/seed/out/mysql.sql`](../dev/seed/out/mysql.sql) (database `hr`), [`dev/mysql/initdb/20-databastion.sh`](../dev/mysql/initdb/20-databastion.sh) (agent account) and `30-tls.sh` (throwaway CA, certificate for the network alias `mysql`); [`target-initdb/15-agent-password.sh`](target-initdb/15-agent-password.sh) feeds the agent password from its Docker secret |
+| `target-mariadb` | MariaDB 11.4 (dev image pin) | Same with [`dev/mariadb/`](../dev/mariadb/) (`server_audit` on), seed [`dev/seed/out/mariadb.sql`](../dev/seed/out/mariadb.sql) (database `support`, one value-bearing table name), alias `mariadb` |
 | `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | `databastion-agent`, HTTPS only (`ca_file` pins the test CA), `DATABASTION_LOG=debug` so the I2 log scan covers debug-level logging |
 | `bootstrap-admin`, `agent-files` | console / PostgreSQL | One-shot helpers (`tools` profile) |
 
-Networks: the agent sits on an `internal` network with the proxy and the target only; it
+Networks: the agent sits on an `internal` network with the proxy and the targets only; it
 cannot reach the console database or the outside. Only the proxy is published, on
 `127.0.0.1:${E2E_HTTPS_PORT:-8443}`. Every service runs with a read-only root filesystem,
-`cap_drop: ALL` (PostgreSQL gets back what its entrypoint needs) and `no-new-privileges`.
+`cap_drop: ALL` (PostgreSQL, MySQL and MariaDB get back what their entrypoints need; their data
+lives in `tmpfs`) and `no-new-privileges`.
 
 ## Flow
 1. Generate every secret (database passwords, metrics token, admin password, target superuser
@@ -32,10 +38,16 @@ cannot reach the console database or the outside. Only the proxy is published, o
    `pg_read_all_stats`, role defaults `default_transaction_read_only = on` and statement / lock /
    idle-in-transaction timeouts; Discovery grants `USAGE` + `SELECT` on `crm`, `billing`, `ops`
    and default privileges, after the seed: I4); the superuser password never leaves `target-pg`.
-   Before anything starts, the I2 scanner's positive control checks that every searchable
-   PostgreSQL value of the ground truth is visible in the committed seed.
-2. Build the console and agent images, start the console stack and the target, wait for
-   `/api/health/ready` through the proxy.
+   The MySQL / MariaDB agents connect as `databastion`, the [ADR-0018](../docs/adr/0018-mysql-mariadb-grants-and-connector.md)
+   minimal variant as the dev scripts create it ([ADR-0020](../docs/adr/0020-mysql-mariadb-connector-as-merged.md)):
+   `SELECT` on the application database only, `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (MariaDB:
+   `MAX_STATEMENT_TIME 30`); root passwords stay in the targets.
+   Before anything starts, the I2 scanner's positive control checks, per engine, that every
+   searchable value of the ground truth is visible in the committed seed.
+2. Build the console and agent images, start the console stack and the three targets, wait for
+   `/api/health/ready` through the proxy and for the MySQL / MariaDB targets to be healthy; copy
+   their CA (created by dev's `30-tls.sh`, checked to be that CA and to hold no key) into the work
+   directory, mounted into the agent as `ca_file`.
 3. `bootstrap-admin` with the random password (Docker secret file), log in through the user API
    (session cookie + `X-CSRF-Token`), create an enrollment token.
 4. Hand the token to the agent as a `0600` file owned by uid 10001 (sent on stdin, never on a
@@ -52,17 +64,29 @@ cannot reach the console database or the outside. Only the proxy is published, o
    (no `CREATE`) on the seeded schemas, `SELECT` on their tables and no write privilege outside
    the system catalogs, and that `/metrics` (scraped from inside the web
    container with the metrics token) shows `databastion_agent_up{agent_id="…"} 1`.
-6. Discovery (P2-E): launch a `discovery.scan` of `pg-e2e` through the user API (admin session +
-   CSRF) and wait for the job to succeed (240 s at most). The agent reports the job status before
+   Targets `mysql-e2e` and `mariadb-e2e` must be `reachable` too (`tls: verify_full` with the
+   pinned test CA; audit level `none` without a `performance_schema` grant, printed only). As
+   root in each target: the grants of `databastion` are exactly `USAGE ON *.*` and
+   `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 4` (MariaDB
+   `max_statement_time = 30`), no role and no other `databastion` account; it logs in over TLS
+   and is refused without TLS (error 1045).
+6. Discovery (P2-E): launch a `discovery.scan` of `pg-e2e`, `mysql-e2e` and `mariadb-e2e`
+   together through the user API (admin session + CSRF) and wait for every job to succeed (360 s
+   at most). The agent reports the job status before
    its spooled findings batches are uploaded, so the test then waits (90 s at most) for a
-   heartbeat received after the job ended whose spool status (`agents.spool`) reports no batch
+   heartbeat received after the last job ended whose spool status (`agents.spool`) reports no batch
    left and no dropped batch or item, checks that the agent log shows no lost / dropped /
-   rejected result batch, and that the stored findings count is stable.
+   rejected result batch, and that the stored findings count of every target is non-zero and
+   stable.
    [`i2_check.py findings`](i2_check.py) asserts at least one finding, the presence of
    `pii.email`, `pii.card_number`, `pii.iban` and `secret.aws_key`, that the value-bearing table
    `crm.export_client_<phone>` is stored under its `expected_normalized_name` (`*`) and that no
    finding stores a raw value-bearing name; it also prints how many ground-truth locations were
-   found (informational). The findings page is fetched with the session (masked samples are
+   found (informational). For `mysql-e2e` and `mariadb-e2e`, `i2_check.py findings
+   --require-expected-classifiers --forbid-negative-controls` requires a finding for every
+   classifier the ground truth expects for the engine, no finding on a negative-control location
+   (MariaDB's value-bearing table included, under its normalized name) and no stored name holding
+   a value-bearing name, even partially. The findings page is fetched with the session (masked samples are
    decrypted there; they are encrypted at rest in the database); [`i2_check.py page`](i2_check.py)
    asserts it is complete (every finding listed, fewer than the 500-row listing cap, every
    finding with stored samples renders them, none `unavailable`) and that no masked sample keeps
@@ -79,11 +103,12 @@ cannot reach the console database or the outside. Only the proxy is published, o
 9. `pg_dump` the console database into the private temporary directory (never the log
    directory) and fail if the agent secret, the enrollment token, the admin password or a
    target password is stored in clear text.
-10. Invariant I2: [`i2_check.py scan`](i2_check.py) searches the plain dump of the whole console
-    database (every schema, `pgboss` included), every container log except `target-pg`'s own
-    (the source database; `all.log` includes it) and the rendered findings page for every
-    PostgreSQL value of the ground truth and every value-bearing name. A canary file holding
-    one ground-truth value must be reported by the log scan first (positive control).
+10. Invariant I2, for each engine (`postgresql`, `mysql`, `mariadb`):
+    [`i2_check.py scan`](i2_check.py) searches the plain dump of the whole console database
+    (every schema, `pgboss` included), every container log except the targets' own (`target-*.log`,
+    the source databases; `all.log` includes them) and the rendered findings page for every value
+    of the engine in the ground truth and every value-bearing name. A canary file holding one
+    ground-truth e-mail of the engine must be reported by the log scan first (positive control).
 
 ### What "in clear" means (I2)
 The definition is in the docstring of [`i2_check.py`](i2_check.py); unit tests in
@@ -124,4 +149,7 @@ E2E_HTTPS_PORT=9443 e2e/run.sh      # if 8443 is taken on 127.0.0.1
 ```
 
 The first run builds both images (several minutes). No secret is written to the repository;
-nothing listens outside `127.0.0.1`.
+nothing listens outside `127.0.0.1`. `E2E_SKIP_BUILD=1` (ignored under GitHub Actions) reuses
+`databastion-console:e2e` and `databastion-agent:e2e` as already built, for hosts where the
+Dockerfiles cannot build as is (e.g. a TLS-intercepting proxy). Behind an HTTP proxy, add
+`console.e2e.internal` to `NO_PROXY` so that curl reaches the local TLS proxy directly.

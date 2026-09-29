@@ -10,8 +10,10 @@ Subcommands
   coverage  Positive control: every searchable value must be found in the given files (run on the
             committed seed, dev/seed/out/<engine>.sql). Exit 1 if one is missing.
   findings  Checks the console's findings rows (JSON array, see run.sh) against the ground truth:
-            at least one finding, required classifiers present, value-bearing names stored in their
-            expected normalized form (ADR-0009) and never in their raw form.
+            at least one finding, required classifiers present (listed, or every classifier the
+            ground truth expects for the engine), optionally no finding on a negative-control
+            location, value-bearing names stored in their expected normalized form (ADR-0009) and
+            never in their raw form.
   page      Checks the rendered findings page (masked samples decrypted): the table is complete
             (expected row count, enough rendered samples, no `unavailable` samples) and no masked
             sample keeps more than MAX_CLEAR_DIGITS digits (masking contract: at most 4 kept), which
@@ -401,8 +403,18 @@ def cmd_coverage(args: argparse.Namespace, out) -> int:
     return 0
 
 
-def check_findings(rows: list[dict], ground_truth: dict, engine: str,
-                   required: list[str]) -> tuple[list[str], list[str]]:
+def expected_classifiers(ground_truth: dict, engine: str) -> list[str]:
+    """Every classifier the ground truth expects on a location of the engine (sorted)."""
+    out: set[str] = set()
+    for loc in ground_truth.get("locations", []):
+        if loc.get("engine") == engine:
+            out.update(loc.get("expected_classifiers") or [])
+    return sorted(out)
+
+
+def check_findings(rows: list[dict], ground_truth: dict, engine: str, required: list[str],
+                   require_expected: bool = False,
+                   forbid_negative_controls: bool = False) -> tuple[list[str], list[str]]:
     """Returns (errors, info). Errors and info never hold a value-bearing name."""
     errors: list[str] = []
     info: list[str] = []
@@ -410,6 +422,12 @@ def check_findings(rows: list[dict], ground_truth: dict, engine: str,
         return ["no finding was ingested"], info
     classifiers = {r.get("classifier") for r in rows}
     info.append(f"{len(rows)} finding(s), classifiers: {', '.join(sorted(c for c in classifiers if c))}")
+    required = list(required)
+    if require_expected:
+        from_gt = expected_classifiers(ground_truth, engine)
+        if not from_gt:
+            errors.append(f"the ground truth expects no classifier for engine {engine!r}")
+        required += [c for c in from_gt if c not in required]
     for c in required:
         if c not in classifiers:
             errors.append(f"expected classifier {c} has no finding")
@@ -433,12 +451,20 @@ def check_findings(rows: list[dict], ground_truth: dict, engine: str,
                 fold(v) for v in (loc.get("object"), loc.get("container"), loc.get("field"))
                 if v and any(nv in fold(v) for nv in name_values)
             }
+            # A name value inside a stored name counts too (partial normalization).
+            parts = [nv for nv in name_values if alnum_count(nv) >= MIN_ALNUM]
             for r in rows:
                 stored = {fold(str(r.get(k) or "")) for k in ("schema_name", "object_name", "field_name")}
-                if names & stored:
+                if names & stored or any(nv in st for nv in parts for st in stored):
                     errors.append(f"{label}: a finding stores the raw value-bearing name")
                     break
             norm = loc.get("expected_normalized_name")
+            if norm and loc.get("negative_control") and forbid_negative_controls:
+                nkey = (loc.get("database"), loc.get("container"), norm, loc.get("field"))
+                hits = sorted(c for c in by_location.get(nkey, set()) if c)
+                if hits:
+                    errors.append(f"{label}: negative control has finding(s) under the normalized "
+                                  f"name {norm!r}: {', '.join(hits)}")
             if norm and want:
                 # SQL engines: the object (table) name carries the value.
                 nkey = (loc.get("database"), loc.get("container"), norm, loc.get("field"))
@@ -448,6 +474,11 @@ def check_findings(rows: list[dict], ground_truth: dict, engine: str,
                 else:
                     info.append(f"{label}: stored under the expected normalized name {norm!r}")
             continue
+        if loc.get("negative_control") and forbid_negative_controls:
+            k = (loc.get("database"), loc.get("container"), loc.get("object"), loc.get("field"))
+            hits = sorted(c for c in by_location.get(k, set()) if c)
+            if hits:
+                errors.append(f"{label}: negative control has finding(s): {', '.join(hits)}")
         if want:
             expected += 1
             k = (loc.get("database"), loc.get("container"), loc.get("object"), loc.get("field"))
@@ -466,7 +497,8 @@ def cmd_findings(args: argparse.Namespace, out) -> int:
     if not isinstance(rows, list):
         print("i2 findings: rows file is not a JSON array", file=out)
         return 2
-    errors, info = check_findings(rows, gt, args.engine, args.require_classifier)
+    errors, info = check_findings(rows, gt, args.engine, args.require_classifier,
+                                  args.require_expected_classifiers, args.forbid_negative_controls)
     for line in info:
         print(f"i2 findings: {line}", file=out)
     for line in errors:
@@ -604,6 +636,10 @@ def main(argv: list[str] | None = None, out=None) -> int:
     f.add_argument("--ground-truth", required=True)
     f.add_argument("--engine", required=True)
     f.add_argument("--require-classifier", action="append", default=[])
+    f.add_argument("--require-expected-classifiers", action="store_true",
+                   help="also require every classifier the ground truth expects for the engine")
+    f.add_argument("--forbid-negative-controls", action="store_true",
+                   help="fail on any finding stored on a negative-control location")
     f.add_argument("rows")
     g = sub.add_parser("page")
     g.add_argument("--expected-rows", type=int, default=None)

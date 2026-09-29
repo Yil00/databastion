@@ -4,7 +4,8 @@
 #
 # Networks:
 #   console-net  internal DB, migrate, web, worker, TLS proxy (published on 127.0.0.1 only)
-#   agent-net    internal (no outside access): TLS proxy, agent, target PostgreSQL.
+#   agent-net    internal (no outside access): TLS proxy, agent, target PostgreSQL, MySQL and
+#                MariaDB.
 # The agent reaches the console only through the HTTPS proxy and never sees the console DB.
 
 name: databastion-e2e
@@ -28,6 +29,9 @@ x-console: &console
     LOG_LEVEL: info
 
 x-postgres-image: &postgres-image postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+# Same pinned images as dev/docker-compose.yml.
+x-mysql-image: &mysql-image mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d
+x-mariadb-image: &mariadb-image mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
 
 services:
   # ------------------------------------------------------------------ console side
@@ -155,6 +159,76 @@ services:
       timeout: 5s
       retries: 60
 
+  # MySQL / MariaDB targets: the dev images and configuration (dev/mysql, dev/mariadb, mounted
+  # read-only), loaded with the committed dev seed (dev/seed/out/{mysql,mariadb}.sql, value-bearing
+  # table name included). target-initdb/15-agent-password.sh reads the agent password from its
+  # Docker secret (/run/secrets/agent_password) for dev's 20-databastion.sh, which creates the ADR-0018 minimal account
+  # `databastion` (SELECT on the application database only, REQUIRE SSL, MAX_USER_CONNECTIONS 4;
+  # MariaDB: MAX_STATEMENT_TIME 30); dev's 30-tls.sh creates the throwaway CA and the server
+  # certificate (SAN `mysql` / `mariadb`: the network aliases the agent connects to). run.sh copies
+  # the CA out of the container and hands it to the agent (`ca_file`, `tls: verify_full`).
+  target-mysql:
+    <<: *hardening
+    image: *mysql-image
+    # The entrypoint starts as root to prepare the data directory, then drops to `mysql`.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/root_password
+    secrets:
+      # Same in-container names in both targets (15-agent-password.sh, run.sh account checks).
+      - source: target_mysql_password
+        target: root_password
+      - source: target_mysql_agent_password
+        target: agent_password
+    volumes:
+      - ../dev/mysql/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
+      - ../dev/seed/out/mysql.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./target-initdb/15-agent-password.sh:/docker-entrypoint-initdb.d/15-agent-password.sh:ro
+      - ../dev/mysql/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+      - ../dev/mysql/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
+    tmpfs: [/var/lib/mysql, /var/run/mysqld, /tmp]
+    networks:
+      agent-net:
+        aliases: [mysql]
+    healthcheck:
+      # TCP, as the agent account (the temporary server of the initialization has no network):
+      # healthy once the seed, the account and the TLS material are in place. The password is
+      # read inside the container, never on a command line.
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$(cat /run/secrets/agent_password)\" mysql -h 127.0.0.1 -u databastion --ssl-mode=VERIFY_IDENTITY --ssl-ca=/var/lib/mysql/ca.pem -N -e 'SELECT 1 FROM hr.employees LIMIT 1'"]
+      interval: 2s
+      timeout: 5s
+      retries: 120
+
+  target-mariadb:
+    <<: *hardening
+    image: *mariadb-image
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/root_password
+    secrets:
+      # Same in-container names in both targets (15-agent-password.sh, run.sh account checks).
+      - source: target_mariadb_password
+        target: root_password
+      - source: target_mariadb_agent_password
+        target: agent_password
+    volumes:
+      - ../dev/mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
+      - ../dev/seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+      - ./target-initdb/15-agent-password.sh:/docker-entrypoint-initdb.d/15-agent-password.sh:ro
+      - ../dev/mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
+      - ../dev/mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
+    # /var/log/databastion: server_audit file output (dev/mariadb/databastion.cnf).
+    tmpfs: [/var/lib/mysql, /run/mysqld, /tmp, /var/log/databastion]
+    networks:
+      agent-net:
+        aliases: [mariadb]
+    healthcheck:
+      # --connect fails while the entrypoint's temporary (--skip-networking) server is seeding.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 120
+
   agent:
     <<: *hardening
     build:
@@ -173,12 +247,19 @@ services:
       - agent-secrets:/run/databastion-secrets:ro
       - ${E2E_WORK_DIR:?set by run.sh}/agent/agent.yaml:/etc/databastion/agent.yaml:ro
       - ${E2E_WORK_DIR:?set by run.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      # CAs of target-mysql / target-mariadb, copied out of the targets by run.sh.
+      - ${E2E_WORK_DIR:?set by run.sh}/tls/mysql-ca.pem:/etc/databastion/mysql-ca.pem:ro
+      - ${E2E_WORK_DIR:?set by run.sh}/tls/mariadb-ca.pem:/etc/databastion/mariadb-ca.pem:ro
     # No ports: the agent is outbound-only (I1).
     networks: [agent-net]
     depends_on:
       proxy:
         condition: service_started
       target-pg:
+        condition: service_healthy
+      target-mysql:
+        condition: service_healthy
+      target-mariadb:
         condition: service_healthy
 
   # Test helper (run.sh only), no network. As root (CHOWN only): hands the secrets volume to
@@ -227,3 +308,11 @@ secrets:
     file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_pg_password
   target_agent_password:
     file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_agent_password
+  target_mysql_password:
+    file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_mysql_password
+  target_mysql_agent_password:
+    file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_mysql_agent_password
+  target_mariadb_password:
+    file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_mariadb_password
+  target_mariadb_agent_password:
+    file: ${E2E_WORK_DIR:?set by run.sh}/secrets/target_mariadb_agent_password

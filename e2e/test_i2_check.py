@@ -18,6 +18,8 @@ import i2_check  # noqa: E402
 REPO = os.path.dirname(HERE)
 GROUND_TRUTH = os.path.join(REPO, "dev", "ground-truth.json")
 SEED_PG = os.path.join(REPO, "dev", "seed", "out", "postgres.sql")
+SEED_MYSQL = os.path.join(REPO, "dev", "seed", "out", "mysql.sql")
+SEED_MARIADB = os.path.join(REPO, "dev", "seed", "out", "mariadb.sql")
 
 # A small ground truth with the shapes of dev/ground-truth.json (fake values).
 GT = {
@@ -292,6 +294,14 @@ class CoverageTest(Base):
         rc, out = run(["coverage", "--ground-truth", GROUND_TRUTH, "--engine", "postgresql", SEED_PG])
         self.assertEqual(rc, 0, out)
 
+    @unittest.skipUnless(os.path.exists(SEED_MYSQL) and os.path.exists(SEED_MARIADB),
+                         "committed seeds not found")
+    def test_every_mysql_and_mariadb_value_is_visible_in_the_committed_seeds(self) -> None:
+        for engine, seed in (("mysql", SEED_MYSQL), ("mariadb", SEED_MARIADB)):
+            with self.subTest(engine=engine):
+                rc, out = run(["coverage", "--ground-truth", GROUND_TRUTH, "--engine", engine, seed])
+                self.assertEqual(rc, 0, out)
+
 
 class FindingsTest(Base):
     ROWS = [
@@ -336,6 +346,97 @@ class FindingsTest(Base):
         rc, out = self.check([r for r in self.ROWS if r["object_name"] != "*"])
         self.assertEqual(rc, 1, out)
         self.assertIn("expected normalized name", out)
+
+
+# MySQL / MariaDB shapes: no container (schema), a value-bearing table name as a negative control.
+GT_MY = {
+    "locations": [
+        {"engine": "mariadb", "database": "support", "container": None, "object": "tickets",
+         "field": "requester_email", "expected_classifiers": ["pii.email"],
+         "name_contains_value": False, "negative_control": False, "values": ["a.b@example.com"]},
+        {"engine": "mariadb", "database": "support", "container": None, "object": "tickets",
+         "field": "body", "expected_classifiers": ["pii.card_number", "pii.iban"],
+         "name_contains_value": False, "negative_control": False, "values": []},
+        {"engine": "mariadb", "database": "support", "container": None, "object": "tickets",
+         "field": "status", "expected_classifiers": [], "name_contains_value": False,
+         "negative_control": True, "values": []},
+        {"engine": "mariadb", "database": "support", "container": None,
+         "object": "escalations_jean.richard@example.com", "field": "reason",
+         "expected_classifiers": [], "expected_normalized_name": "*", "name_contains_value": True,
+         "name_value_classifiers": ["pii.email"], "name_values": ["jean.richard@example.com"],
+         "negative_control": True},
+        {"engine": "mysql", "database": "hr", "container": None, "object": "employees",
+         "field": "nir", "expected_classifiers": ["pii.nir"], "name_contains_value": False,
+         "negative_control": False, "values": []},
+    ]
+}
+
+
+class FindingsMySqlTest(Base):
+    ROWS = [
+        {"database_name": "support", "schema_name": None, "object_name": "tickets",
+         "field_name": "requester_email", "classifier": "pii.email"},
+        {"database_name": "support", "schema_name": None, "object_name": "tickets",
+         "field_name": "body", "classifier": "pii.card_number"},
+        {"database_name": "support", "schema_name": None, "object_name": "tickets",
+         "field_name": "body", "classifier": "pii.iban"},
+    ]
+
+    def check(self, rows: list[dict], *flags: str) -> tuple[int, str]:
+        gt = self.write("gt-my.json", json.dumps(GT_MY))
+        path = self.write("rows.json", json.dumps(rows))
+        return run(["findings", "--ground-truth", gt, "--engine", "mariadb", *flags, path])
+
+    def test_expected_classifiers_of_the_engine_only(self) -> None:
+        self.assertEqual(i2_check.expected_classifiers(GT_MY, "mariadb"),
+                         ["pii.card_number", "pii.email", "pii.iban"])
+        rc, out = self.check(self.ROWS, "--require-expected-classifiers",
+                             "--forbid-negative-controls")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("found: 2/2", out)
+
+    def test_missing_expected_classifier(self) -> None:
+        rc, out = self.check(self.ROWS[:2], "--require-expected-classifiers")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("expected classifier pii.iban has no finding", out)
+        # Without the flag, nothing is required.
+        rc, out = self.check(self.ROWS[:2])
+        self.assertEqual(rc, 0, out)
+
+    def test_engine_without_expected_classifier(self) -> None:
+        gt = self.write("gt-empty.json", json.dumps({"locations": GT_MY["locations"][2:4]}))
+        path = self.write("rows.json", json.dumps(self.ROWS))
+        rc, out = run(["findings", "--ground-truth", gt, "--engine", "mariadb",
+                       "--require-expected-classifiers", path])
+        self.assertEqual(rc, 1, out)
+
+    def test_negative_control_finding(self) -> None:
+        rows = self.ROWS + [{"database_name": "support", "schema_name": None,
+                             "object_name": "tickets", "field_name": "status",
+                             "classifier": "pii.person_name"}]
+        rc, out = self.check(rows, "--forbid-negative-controls")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("negative control has finding(s): pii.person_name", out)
+        rc, out = self.check(rows)
+        self.assertEqual(rc, 0, out)
+
+    def test_negative_control_under_the_normalized_name(self) -> None:
+        rows = self.ROWS + [{"database_name": "support", "schema_name": None, "object_name": "*",
+                             "field_name": "reason", "classifier": "pii.email"}]
+        rc, out = self.check(rows, "--forbid-negative-controls")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("under the normalized name '*'", out)
+
+    def test_raw_or_partially_normalized_value_bearing_name(self) -> None:
+        for name in ("escalations_jean.richard@example.com", "x_JEAN.RICHARD@example.com_y"):
+            with self.subTest(name=name):
+                rows = self.ROWS + [{"database_name": "support", "schema_name": None,
+                                     "object_name": name, "field_name": "reason",
+                                     "classifier": "pii.email"}]
+                rc, out = self.check(rows)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("stores the raw value-bearing name", out)
+                self.assertNotIn("richard", out.lower())
 
 
 def page(rows: list[tuple[str, list[str] | str]]) -> str:

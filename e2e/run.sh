@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end enrollment / revocation test (phase 1 exit criterion):
 #   "end-to-end enrollment in containers; revocation effective in < 60 s",
-# and invariant I2 test (P2-E): a Discovery scan of the seeded target leaves no ground-truth value
-# in clear text in the console database, the container logs or the findings page.
+# and invariant I2 test (P2-E): a Discovery scan of each seeded target (PostgreSQL, MySQL, MariaDB)
+# leaves no ground-truth value in clear text in the console database, the container logs or the
+# findings page.
 # See e2e/README.md. Requires: docker (compose v2), openssl, curl, jq, python3.
 #
 # Every secret is generated here at run time (never committed), kept under a private temporary
@@ -20,8 +21,11 @@ BASE_URL="https://${HOSTNAME_CONSOLE}:${E2E_HTTPS_PORT}"
 AGENT_401_MESSAGE="console rejected the current secret (401)"
 I2_CHECK="$HERE/i2_check.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
-TARGET_SEED="$HERE/../dev/seed/out/postgres.sql"
-SCAN_TIMEOUT_S=240
+SEED_DIR="$HERE/../dev/seed/out"
+# Declared targets: "<target id> <ground-truth engine> <committed seed>". The scans run in parallel.
+E2E_TARGETS=("pg-e2e postgresql postgres.sql" "mysql-e2e mysql mysql.sql" "mariadb-e2e mariadb mariadb.sql")
+SCAN_TIMEOUT_S=360   # every scan, launched together
+TARGET_TIMEOUT_S=240 # target-mysql / target-mariadb initialization (seed, account, TLS)
 SPOOL_TIMEOUT_S=90   # three heartbeat intervals (console HEARTBEAT_INTERVAL_S = 30)
 MAX_LISTED_FINDINGS=500  # console/src/server/findings.ts: the page lists at most this many
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -34,11 +38,14 @@ for tool in docker openssl curl jq timeout python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing tool: $tool"
 done
 
-# Invariant I2 scanner positive control, before anything starts: every searchable PostgreSQL
+# Invariant I2 scanner positive control, before anything starts: for each engine, every searchable
 # value of the ground truth (and every value-bearing name) must be visible in the committed seed
-# that target-pg loads. Counts and ids only are printed.
-timeout 60 python3 "$I2_CHECK" coverage --ground-truth "$GROUND_TRUTH" --engine postgresql \
-  "$TARGET_SEED" >&2 || fail "I2 scanner positive control failed (see above)"
+# that its target loads. Counts and ids only are printed.
+for t in "${E2E_TARGETS[@]}"; do
+  read -r _ engine seed <<<"$t"
+  timeout 60 python3 "$I2_CHECK" coverage --ground-truth "$GROUND_TRUTH" --engine "$engine" \
+    "$SEED_DIR/$seed" >&2 || fail "I2 scanner positive control failed for $engine (see above)"
+done
 
 umask 077
 E2E_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-e2e.XXXXXX")"
@@ -112,7 +119,7 @@ compose() { timeout 120 docker compose -f "$HERE/docker-compose.yml" "$@"; }
 dump_logs() {
   local svc
   compose logs --no-color --timestamps >"$E2E_LOG_DIR/all.log" 2>&1 || true
-  for svc in db migrate web worker proxy target-pg agent; do
+  for svc in db migrate web worker proxy target-pg target-mysql target-mariadb agent; do
     compose logs --no-color --timestamps "$svc" >"$E2E_LOG_DIR/$svc.log" 2>&1 || true
   done
 }
@@ -150,6 +157,10 @@ METRICS_TOKEN="$(rand_hex 32)"
 ADMIN_PASSWORD="$(rand_hex 24)"
 TARGET_PG_PASSWORD="$(rand_hex 24)"     # target superuser: stays in target-pg
 TARGET_AGENT_PASSWORD="$(rand_hex 24)"  # databastion_agent (least privilege, read-only)
+TARGET_MYSQL_PASSWORD="$(rand_hex 24)"         # MySQL root: stays in target-mysql
+TARGET_MYSQL_AGENT_PASSWORD="$(rand_hex 24)"   # MySQL `databastion` (ADR-0018 minimal)
+TARGET_MARIADB_PASSWORD="$(rand_hex 24)"       # MariaDB root: stays in target-mariadb
+TARGET_MARIADB_AGENT_PASSWORD="$(rand_hex 24)" # MariaDB `databastion` (ADR-0018 minimal)
 register_secret db_password "$DB_PASSWORD"
 register_secret db_owner_password "$DB_OWNER_PASSWORD"
 register_secret db_app_password "$DB_APP_PASSWORD"
@@ -158,6 +169,10 @@ register_secret metrics_token "$METRICS_TOKEN"
 register_secret admin_password "$ADMIN_PASSWORD"
 register_secret target_pg_password "$TARGET_PG_PASSWORD"
 register_secret target_agent_password "$TARGET_AGENT_PASSWORD"
+register_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
+register_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
+register_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
+register_secret target_mariadb_agent_password "$TARGET_MARIADB_AGENT_PASSWORD"
 put_secret db_password "$DB_PASSWORD"
 put_secret db_owner_password "$DB_OWNER_PASSWORD"
 put_secret db_app_password "$DB_APP_PASSWORD"
@@ -168,6 +183,10 @@ put_secret metrics_token "$METRICS_TOKEN"
 put_secret admin_password "$ADMIN_PASSWORD"
 put_secret target_pg_password "$TARGET_PG_PASSWORD"
 put_secret target_agent_password "$TARGET_AGENT_PASSWORD"
+put_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
+put_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
+put_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
+put_secret target_mariadb_agent_password "$TARGET_MARIADB_AGENT_PASSWORD"
 chmod 0700 "$S"
 
 # --------------------------------------------------------------------------- test CA
@@ -216,6 +235,29 @@ targets:
     postgres:
       databases: [shop]
       tls: disable_insecure
+  # ADR-0018 minimal accounts, TLS verified (default verify_full) against the CA that dev's
+  # initdb/30-tls.sh created in each target (copied out by this script); the host names are the
+  # targets' network aliases, named in their certificates.
+  - id: mysql-e2e
+    engine: mysql
+    host: mysql
+    port: 3306
+    account: databastion
+    secret:
+      file: /run/databastion-secrets/target_mysql_agent_password
+    mysql:
+      tls: verify_full
+      ca_file: /etc/databastion/mysql-ca.pem
+  - id: mariadb-e2e
+    engine: mariadb
+    host: mariadb
+    port: 3306
+    account: databastion
+    secret:
+      file: /run/databastion-secrets/target_mariadb_agent_password
+    mysql:
+      tls: verify_full
+      ca_file: /etc/databastion/mariadb-ca.pem
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -240,13 +282,23 @@ status_of() { head -n1 <<<"$1"; }
 body_of() { tail -n +2 <<<"$1"; }
 
 # --------------------------------------------------------------------------- build + start
-log "building images (console, agent)"
-timeout 1500 docker compose -f "$HERE/docker-compose.yml" build
+# E2E_SKIP_BUILD=1 (local runs only): use databastion-{console,agent}:e2e as already built, e.g.
+# behind a TLS-intercepting proxy that the Dockerfiles cannot trust. CI always builds.
+if [ "${E2E_SKIP_BUILD:-0}" = 1 ] && [ "${GITHUB_ACTIONS:-}" != true ]; then
+  log "E2E_SKIP_BUILD=1: using the existing databastion-{console,agent}:e2e images"
+  for img in databastion-console:e2e databastion-agent:e2e; do
+    docker image inspect "$img" >/dev/null 2>&1 || fail "E2E_SKIP_BUILD=1 but image $img is missing"
+  done
+else
+  log "building images (console, agent)"
+  timeout 1500 docker compose -f "$HERE/docker-compose.yml" build
+fi
 
-log "starting console DB, migrate, web, worker, TLS proxy and the target PostgreSQL"
+log "starting console DB, migrate, web, worker, TLS proxy and the target PostgreSQL, MySQL, MariaDB"
 # No `--wait`: it treats the exited one-shot `migrate` as a failure on some Compose versions.
 # `up` itself blocks on the depends_on conditions (db healthy, migrate done, web healthy).
-timeout 400 docker compose -f "$HERE/docker-compose.yml" up -d db web worker proxy target-pg
+timeout 400 docker compose -f "$HERE/docker-compose.yml" up -d db web worker proxy target-pg \
+  target-mysql target-mariadb
 
 log "waiting for console readiness through the TLS proxy"
 deadline=$(( $(date +%s) + 120 ))
@@ -256,6 +308,29 @@ until [ "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${BASE_URL}/api/health/r
 done
 
 [ "$(compose ps -a --format '{{.ExitCode}}' migrate)" = "0" ] || fail "migrate did not succeed"
+
+# The MySQL / MariaDB targets initialize in parallel with the console (seed, agent account, TLS
+# material); their CA must exist before any agent container is created (bind mounts).
+log "waiting for target-mysql and target-mariadb to be healthy (at most ${TARGET_TIMEOUT_S} s)"
+deadline=$(( $(date +%s) + TARGET_TIMEOUT_S ))
+for svc in target-mysql target-mariadb; do
+  until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q "$svc")" 2>/dev/null)" = healthy ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "$svc not healthy within ${TARGET_TIMEOUT_S} s"
+    sleep 2
+  done
+done
+log "copying the CA of target-mysql and target-mariadb (dev initdb/30-tls.sh) for the agent"
+compose exec -T target-mysql cat /var/lib/mysql/ca.pem >"$T/mysql-ca.pem" \
+  || fail "cannot read the CA of target-mysql"
+compose exec -T target-mariadb cat /var/lib/mysql/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \
+  || fail "cannot read the CA of target-mariadb"
+for ca in mysql mariadb; do
+  # A CA certificate (not MySQL's auto-generated material) with no private key next to it.
+  openssl x509 -in "$T/$ca-ca.pem" -noout -subject 2>/dev/null | grep -q "DataBastion dev CA ($ca)" \
+    || fail "$ca-ca.pem is not the dev CA of target-$ca"
+  ! grep -q 'PRIVATE KEY' "$T/$ca-ca.pem" || fail "$ca-ca.pem holds a private key"
+  chmod 0644 "$T/$ca-ca.pem"
+done
 
 # --------------------------------------------------------------------------- admin + token
 log "bootstrapping the administrator"
@@ -301,6 +376,10 @@ state_mode="$(files_root 'stat -c "%u:%g %a" /state')"
 [ "$state_mode" = "10001:10001 700" ] || fail "state volume is '$state_mode', expected '10001:10001 700'"
 files_root 'chmod 0700 /secrets && chown 10001:10001 /secrets'
 printf '%s' "$TARGET_AGENT_PASSWORD" | files_agent 'umask 077; cat > /secrets/target_agent_password'
+printf '%s' "$TARGET_MYSQL_AGENT_PASSWORD" \
+  | files_agent 'umask 077; cat > /secrets/target_mysql_agent_password'
+printf '%s' "$TARGET_MARIADB_AGENT_PASSWORD" \
+  | files_agent 'umask 077; cat > /secrets/target_mariadb_agent_password'
 printf '%s' "$ENROLLMENT_TOKEN" | files_agent 'umask 077; cat > /secrets/enrollment_token'
 
 # --------------------------------------------------------------------------- enroll + run
@@ -339,22 +418,33 @@ agent_json() {
   body_of "$r" | jq -c --arg id "$AGENT_ID" '.agents[] | select(.id == $id)'
 }
 
-log "waiting for the agent to be online with its target reported"
+log "waiting for the agent to be online with its targets reported"
 deadline=$(( $(date +%s) + 90 ))
 online=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   a="$(agent_json || true)"
   # The PostgreSQL connector (P2-B) connects with the least-privilege role: the target must be
   # reachable. Its audit level (`none`: no pg_stat_statements on target-pg) is printed, not asserted.
-  if [ -n "$a" ] && jq -e '.status == "online" and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present and .reachable == true)' \
+  # The MySQL / MariaDB connector (P2-C) connects with the ADR-0018 minimal account over verified
+  # TLS: both targets must be reachable too (audit level `none` without a performance_schema grant).
+  if [ -n "$a" ] && jq -e '.status == "online"
+      and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present and .reachable == true)
+      and any(.targets[]; .targetId == "mysql-e2e" and .engine == "mysql" and .present and .reachable == true)
+      and any(.targets[]; .targetId == "mariadb-e2e" and .engine == "mariadb" and .present and .reachable == true)' \
       <<<"$a" >/dev/null; then
     online="$a"
     break
   fi
   sleep 2
 done
-[ -n "$online" ] || fail "agent not online with target pg-e2e reachable within 90 s"
-log "agent online; target pg-e2e: $(jq -c '.targets[] | select(.targetId == "pg-e2e") | {reachable, auditLevel, lastError}' <<<"$online")"
+if [ -z "$online" ]; then
+  # Reachability and error codes only (lastError is a code, never a server message).
+  log "last agent state: $(jq -c '{status, targets: [.targets[]? | {targetId, engine, present, reachable, lastError}]}' <<<"${a:-{\}}" 2>/dev/null || true)"
+  fail "agent not online with targets pg-e2e, mysql-e2e and mariadb-e2e reachable within 90 s"
+fi
+for t in pg-e2e mysql-e2e mariadb-e2e; do
+  log "agent online; target $t: $(jq -c --arg t "$t" '.targets[] | select(.targetId == $t) | {reachable, auditLevel, lastError}' <<<"$online")"
+done
 
 log "checking the agent's target account (ADR-0012 minimal variant, read-only: I4)"
 role="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
@@ -412,6 +502,58 @@ grants="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T target
 [ "$grants" = "t,f,t,0" ] || fail "databastion_agent Discovery grants are unexpected ($grants)"
 unset role expected_role ro grants
 
+# MySQL / MariaDB agent accounts: ADR-0018 minimal variant (dev/{mysql,mariadb}/initdb/
+# 20-databastion.sh; ADR-0020). Inspected as root, whose password is read inside the target from its
+# Docker secret (never on a command line). Exactly USAGE on *.* and SELECT on the application
+# database, REQUIRE SSL, MAX_USER_CONNECTIONS 4 (MariaDB: MAX_STATEMENT_TIME 30), no role, no other
+# account named `databastion`; a session without TLS is refused.
+# my_sql SERVICE CLIENT SQL: runs SQL as root in SERVICE, one row per line, tab-separated.
+my_sql() {
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T "$1" sh -c \
+    'MYSQL_PWD="$(cat /run/secrets/root_password)" exec '"$2"' -h 127.0.0.1 -u root -N -B -e "$0"' "$3"
+}
+check_my_account() {
+  local svc="$1" client="$2" db="$3" expected_opts="$4" grants opts
+  grants="$(my_sql "$svc" "$client" "SHOW GRANTS FOR 'databastion'@'%'" | sort | tr '\n' '|')" \
+    || fail "$svc: cannot read the grants of databastion"
+  grants="${grants//\`/}"
+  case "$grants" in
+    "GRANT SELECT ON ${db}.* TO databastion@%|GRANT USAGE ON *.* TO databastion@%"*"|") ;;
+    *) fail "$svc: databastion has unexpected grants: $grants" ;;
+  esac
+  [ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 2 ] || fail "$svc: databastion has extra grants: $grants"
+  opts="$(my_sql "$svc" "$client" "$5")" || fail "$svc: cannot read the options of databastion"
+  [ "$opts" = "$expected_opts" ] || fail "$svc: databastion has unexpected account options: $opts"
+  # The account logs in over TLS, and is refused without it (REQUIRE SSL: error 1045, the same
+  # command otherwise). The password is read inside the target, never on a command line.
+  my_agent_login "$svc" "$client" "$6" >/dev/null 2>&1 \
+    || fail "$svc: databastion cannot log in over TLS"
+  if my_agent_login "$svc" "$client" "$7" >"$E2E_WORK_DIR/no-tls.err" 2>&1; then
+    fail "$svc: databastion logged in without TLS"
+  fi
+  grep -q '^ERROR 1045 ' "$E2E_WORK_DIR/no-tls.err" \
+    || fail "$svc: the login without TLS failed for another reason than the account (not 1045)"
+  rm -f -- "$E2E_WORK_DIR/no-tls.err"
+}
+# my_agent_login SERVICE CLIENT TLS_OPTION: `SELECT 1` as databastion over TCP.
+my_agent_login() {
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T "$1" sh -c \
+    'MYSQL_PWD="$(cat /run/secrets/agent_password)" exec '"$2"' -h 127.0.0.1 -u databastion '"$3"' -N -e "SELECT 1"'
+}
+log "checking the agents' MySQL / MariaDB accounts (ADR-0018 minimal variant, read-only: I4)"
+check_my_account target-mysql mysql hr "ANY	4	0	0" \
+  "SELECT ssl_type, max_user_connections,
+     (SELECT count(*) FROM mysql.user WHERE user = 'databastion') - 1,
+     (SELECT count(*) FROM mysql.role_edges WHERE to_user = 'databastion')
+   FROM mysql.user WHERE user = 'databastion' AND host = '%'" --ssl-mode=REQUIRED --ssl-mode=DISABLED
+check_my_account target-mariadb mariadb support "ANY	4	30.000000	0	0" \
+  "SELECT ssl_type, max_user_connections, max_statement_time,
+     (SELECT count(*) FROM mysql.user WHERE user = 'databastion') - 1,
+     (SELECT count(*) FROM mysql.roles_mapping WHERE user = 'databastion')
+   FROM mysql.user WHERE user = 'databastion' AND host = '%'" --ssl --skip-ssl
+
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
   const t = require("fs").readFileSync("/run/secrets/metrics_token", "utf8").trim();
@@ -433,42 +575,54 @@ console_sql() {
 }
 [[ "$AGENT_ID" =~ $UUID_RE ]] || fail "agent id is not a UUID"
 
-log "launching a discovery.scan of pg-e2e through the user API"
+# One scan per declared target, launched together: the MySQL / MariaDB / PostgreSQL scans overlap.
 printf '{"sample_rows":100,"max_duration_s":300,"statement_timeout_ms":5000}' \
   >"$E2E_WORK_DIR/scan-req.json"
-r="$(api POST "/api/agents/${AGENT_ID}/targets/pg-e2e/scan" "$E2E_WORK_DIR/scan-req.json")"
-[ "$(status_of "$r")" = 202 ] \
-  || fail "scan request: HTTP $(status_of "$r") ($(body_of "$r" | jq -r '.error // empty' 2>/dev/null || true))"
-SCAN_JOB_ID="$(body_of "$r" | jq -r '.job_id')"
-[[ "$SCAN_JOB_ID" =~ $UUID_RE ]] || fail "scan request: no job id"
+declare -A SCAN_JOB_IDS=()
+for t in "${E2E_TARGETS[@]}"; do
+  read -r target _ _ <<<"$t"
+  log "launching a discovery.scan of $target through the user API"
+  r="$(api POST "/api/agents/${AGENT_ID}/targets/${target}/scan" "$E2E_WORK_DIR/scan-req.json")"
+  [ "$(status_of "$r")" = 202 ] \
+    || fail "scan request ($target): HTTP $(status_of "$r") ($(body_of "$r" | jq -r '.error // empty' 2>/dev/null || true))"
+  job_id="$(body_of "$r" | jq -r '.job_id')"
+  [[ "$job_id" =~ $UUID_RE ]] || fail "scan request ($target): no job id"
+  SCAN_JOB_IDS[$target]="$job_id"
+done
+SCAN_JOB_LIST="$(printf "'%s'," "${SCAN_JOB_IDS[@]}")"
+SCAN_JOB_LIST="${SCAN_JOB_LIST%,}"
 
-log "waiting for scan job $SCAN_JOB_ID to succeed (at most ${SCAN_TIMEOUT_S} s)"
+log "waiting for the ${#SCAN_JOB_IDS[@]} scan jobs to succeed (at most ${SCAN_TIMEOUT_S} s)"
 t_scan="$(date +%s)"
 deadline=$(( t_scan + SCAN_TIMEOUT_S ))
-while :; do
-  job="$(console_sql "SELECT status || ',' || coalesce(error->>'code', '') FROM jobs WHERE id = '${SCAN_JOB_ID}'")" \
-    || fail "cannot read the scan job status"
-  case "$job" in
-    succeeded,*) break ;;
-    failed,* | cancelled,* | expired,*) fail "scan job ended '$job'" ;;
-  esac
-  [ "$(date +%s)" -lt "$deadline" ] || fail "scan job not succeeded within ${SCAN_TIMEOUT_S} s (status '$job')"
-  sleep 2
+for target in "${!SCAN_JOB_IDS[@]}"; do
+  while :; do
+    job="$(console_sql "SELECT status || ',' || coalesce(error->>'code', '') FROM jobs WHERE id = '${SCAN_JOB_IDS[$target]}'")" \
+      || fail "cannot read the scan job status ($target)"
+    case "$job" in
+      succeeded,*) break ;;
+      failed,* | cancelled,* | expired,*) fail "scan job of $target ended '$job'" ;;
+    esac
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "scan job of $target not succeeded within ${SCAN_TIMEOUT_S} s (status '$job')"
+    sleep 2
+  done
+  log "scan job of $target succeeded ($(( $(date +%s) - t_scan )) s since launch)"
 done
-log "scan job succeeded in $(( $(date +%s) - t_scan )) s"
 
 # The agent reports the job status before its spooled findings batches are uploaded (the console
-# accepts them in a late window). Deterministic signal: a heartbeat received after the job ended
-# (its SpoolStatus is stored in agents.spool) reports an empty spool and no dropped batch or item.
-# Findings are spooled before the status is sent, so that heartbeat saw them.
-log "waiting for a heartbeat after the scan that reports an empty spool (at most ${SPOOL_TIMEOUT_S} s)"
+# accepts them in a late window). Deterministic signal: a heartbeat received after the last job
+# ended (its SpoolStatus is stored in agents.spool) reports an empty spool and no dropped batch or
+# item. Findings are spooled before the status is sent, so that heartbeat saw them all.
+log "waiting for a heartbeat after the scans that reports an empty spool (at most ${SPOOL_TIMEOUT_S} s)"
 deadline=$(( $(date +%s) + SPOOL_TIMEOUT_S ))
 while :; do
-  spool="$(console_sql "SELECT concat_ws(',', a.last_seen_at > j.finished_at + interval '1 second',
+  spool="$(console_sql "SELECT concat_ws(',', a.last_seen_at > max(j.finished_at) + interval '1 second',
       coalesce(a.spool->>'batches', 'none'), coalesce(a.spool->>'dropped_batches', '0'),
       coalesce(a.spool->>'dropped_items', '0'))
     FROM agents a JOIN jobs j ON j.agent_id = a.id
-    WHERE a.id = '${AGENT_ID}' AND j.id = '${SCAN_JOB_ID}' AND j.finished_at IS NOT NULL")" \
+    WHERE a.id = '${AGENT_ID}' AND j.id IN (${SCAN_JOB_LIST})
+    GROUP BY a.id HAVING count(j.finished_at) = ${#SCAN_JOB_IDS[@]}")" \
     || fail "cannot read the agent spool status"
   case "$spool" in
     t,*,*,*) IFS=, read -r _ batches dropped_batches dropped_items <<<"$spool"
@@ -477,7 +631,7 @@ while :; do
       [ "$batches" = 0 ] && break ;;
   esac
   [ "$(date +%s)" -lt "$deadline" ] \
-    || fail "no heartbeat with an empty spool within ${SPOOL_TIMEOUT_S} s after the scan ('$spool')"
+    || fail "no heartbeat with an empty spool within ${SPOOL_TIMEOUT_S} s after the scans ('$spool')"
   sleep 2
 done
 # Secondary: the agent log has no lost, dropped or rejected result batch.
@@ -486,37 +640,53 @@ lost="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" logs --no-color 
 [ "$lost" = 0 ] || fail "the agent log shows $lost lost / dropped / rejected result batch line(s)"
 unset spool batches dropped_batches dropped_items lost
 
-# Secondary: the stored findings are non-zero and stable for 6 s.
+# Secondary: the stored findings of every target are non-zero and stable for 6 s.
 deadline=$(( $(date +%s) + 60 ))
-prev=-1
+prev=""
 stable=0
 while :; do
-  n="$(console_sql "SELECT count(*) FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = 'pg-e2e'")" \
+  n="$(console_sql "SELECT string_agg(t.id || '=' || (SELECT count(*) FROM findings f
+        WHERE f.agent_id = '${AGENT_ID}' AND f.target_id = t.id), ',' ORDER BY t.id)
+      FROM (VALUES ('pg-e2e'), ('mysql-e2e'), ('mariadb-e2e')) AS t(id)")" \
     || fail "cannot count the findings"
-  if [ "$n" -gt 0 ] && [ "$n" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+  if [[ ! "$n" =~ =0(,|$) ]] && [ "$n" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
   [ "$stable" -ge 3 ] && break
-  [ "$(date +%s)" -lt "$deadline" ] || fail "findings not stable within 60 s ($n stored)"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "findings not stable (or none for a target) within 60 s ($n)"
   prev="$n"
   sleep 2
 done
-log "$n finding(s) stored for pg-e2e"
+log "findings stored per target: $n"
 
+# findings_check TARGET ENGINE [i2_check options...]: the target's findings against the ground truth.
+findings_check() {
+  local target="$1" engine="$2"
+  shift 2
+  # Written under the private work directory, never into the uploaded logs.
+  console_sql "SELECT coalesce(json_agg(json_build_object('database_name', database_name,
+      'schema_name', schema_name, 'object_name', object_name, 'field_name', field_name,
+      'classifier', classifier) ORDER BY location_key, classifier), '[]')
+    FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
+    >"$E2E_WORK_DIR/findings-$target.json" || fail "cannot read the findings of $target"
+  timeout 60 python3 "$I2_CHECK" findings --ground-truth "$GROUND_TRUTH" --engine "$engine" "$@" \
+    "$E2E_WORK_DIR/findings-$target.json" >&2 || fail "findings check of $target failed (see above)"
+  rm -f -- "$E2E_WORK_DIR/findings-$target.json"
+}
 log "checking the ingested findings against dev/ground-truth.json (normalized value-bearing names)"
-# Written under the private work directory, never into the uploaded logs.
-console_sql "SELECT coalesce(json_agg(json_build_object('database_name', database_name,
-    'schema_name', schema_name, 'object_name', object_name, 'field_name', field_name,
-    'classifier', classifier) ORDER BY location_key, classifier), '[]')
-  FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = 'pg-e2e'" \
-  >"$E2E_WORK_DIR/findings.json" || fail "cannot read the findings"
-timeout 60 python3 "$I2_CHECK" findings --ground-truth "$GROUND_TRUTH" --engine postgresql \
+findings_check pg-e2e postgresql \
   --require-classifier pii.email --require-classifier pii.card_number \
-  --require-classifier pii.iban --require-classifier secret.aws_key \
-  "$E2E_WORK_DIR/findings.json" >&2 || fail "findings check failed (see above)"
+  --require-classifier pii.iban --require-classifier secret.aws_key
+# MySQL / MariaDB: every classifier the ground truth expects for the engine must have a finding
+# (the connector's seed recall is 100 %, agent/crates/connector-mysql integration tests), and no
+# finding may stand on a negative-control location. MariaDB's value-bearing table (an e-mail in the
+# table name) is a negative control: its raw name must not be stored anywhere.
+findings_check mysql-e2e mysql --require-expected-classifiers --forbid-negative-controls
+findings_check mariadb-e2e mariadb --require-expected-classifiers --forbid-negative-controls
 
 # The findings page renders the masked samples decrypted (they are encrypted at rest, so the
 # database dump cannot show a masking failure): it is scanned too, below. It must be complete
-# (every finding listed, under the listing cap; every finding with samples shows them; none
-# `unavailable`) and no masked sample may keep more than 4 digits (partial masking regression).
+# (every finding of every target listed, under the listing cap; every finding with samples shows
+# them; none `unavailable`) and no masked sample may keep more than 4 digits (partial masking
+# regression).
 listed="$(console_sql "SELECT count(*) FROM findings WHERE false_positive_at IS NULL")" \
   || fail "cannot count the listed findings"
 sampled="$(console_sql "SELECT count(*) FROM findings WHERE false_positive_at IS NULL
@@ -599,7 +769,9 @@ timeout 120 docker compose -f "$HERE/docker-compose.yml" exec -T db \
   || fail "pg_dump of the console database failed"
 grep -q '^CREATE TABLE ' "$db_dump" || fail "the console database dump holds no table"
 db_leaks=0
-for name in agent_secret enrollment_token admin_password target_pg_password target_agent_password; do
+for name in agent_secret enrollment_token admin_password target_pg_password target_agent_password \
+    target_mysql_password target_mysql_agent_password target_mariadb_password \
+    target_mariadb_agent_password; do
   [ -s "$P/$name" ] || fail "secret $name was never registered"
   if LC_ALL=C grep -qFf "$P/$name" -- "$db_dump"; then
     log "LEAK: $name stored in clear text in the console database"
@@ -609,35 +781,42 @@ done
 [ "$db_leaks" -eq 0 ] || fail "$db_leaks secret(s) in clear text in the console database"
 
 # --------------------------------------------------------------------------- invariant I2 (P2-E)
-# No value of dev/ground-truth.json (engine postgresql), and no value-bearing table name, in clear
-# text (definition in i2_check.py) in: the plain pg_dump of the whole console database (every
-# schema: public, pgboss...), every console / agent / proxy log, and the rendered findings page.
-# target-pg's own log (the source database) and all.log (which includes it) are not console or
-# agent output. Only counts, needle ids and file names are printed, never a value.
+# For each engine (postgresql, mysql, mariadb): no value of dev/ground-truth.json, and no
+# value-bearing table name, in clear text (definition in i2_check.py) in: the plain pg_dump of the
+# whole console database (every schema: public, pgboss...), every console / agent / proxy log, and
+# the rendered findings page. The targets' own logs (the source databases) and all.log (which
+# includes them) are not console or agent output. Only counts, needle ids and file names are
+# printed, never a value.
 log "invariant I2: no ground-truth value in clear text in the console database, logs or findings page"
 i2_scan() {
-  timeout 300 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine postgresql "$@" >&2
+  local engine="$1"
+  shift
+  timeout 300 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine "$engine" "$@" >&2
 }
 grep -q '^CREATE SCHEMA pgboss;' "$db_dump" || fail "the console database dump has no pgboss schema"
 grep -q '^COPY public.findings ' "$db_dump" || fail "the console database dump has no findings table"
 i2_failed=0
-i2_scan --label console-db "$db_dump" || i2_failed=1
-# Positive control of the log scan: a canary file holding one ground-truth value, next to the
-# logs (in the private work directory), must be reported.
-mkdir -p "$E2E_WORK_DIR/i2-canary"
-jq -r '[.locations[] | select(.engine == "postgresql") | .values[]?] | .[0]' "$GROUND_TRUTH" \
-  >"$E2E_WORK_DIR/i2-canary/zz-i2-canary.log"
-canary_rc=0
-i2_scan --label log-canary --exclude target-pg.log --exclude all.log \
-  "$E2E_LOG_DIR" "$E2E_WORK_DIR/i2-canary" 2>"$E2E_WORK_DIR/i2-canary.out" || canary_rc=$?
-if [ "$canary_rc" -ne 1 ] || ! grep -q 'file=zz-i2-canary.log$' "$E2E_WORK_DIR/i2-canary.out"; then
-  fail "I2 log scan positive control: canary not detected"
-fi
-rm -rf -- "$E2E_WORK_DIR/i2-canary" "$E2E_WORK_DIR/i2-canary.out"
-i2_scan --label logs --exclude target-pg.log --exclude all.log "$E2E_LOG_DIR" || i2_failed=1
-i2_scan --label findings-page "$E2E_WORK_DIR/findings-page.html" || i2_failed=1
-rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err" "$E2E_WORK_DIR/findings-page.html" \
-  "$E2E_WORK_DIR/findings.json"
+for t in "${E2E_TARGETS[@]}"; do
+  read -r _ engine _ <<<"$t"
+  i2_scan "$engine" --label "$engine console-db" "$db_dump" || i2_failed=1
+  # Positive control of the log scan: a canary file holding one ground-truth e-mail of the engine
+  # (long enough to be a needle), next to the logs (in the private work directory), must be reported.
+  mkdir -p "$E2E_WORK_DIR/i2-canary"
+  jq -r --arg e "$engine" '[.locations[] | select(.engine == $e and any(.expected_classifiers[]?; . == "pii.email"))
+      | .values[]?] | .[0]' "$GROUND_TRUTH" \
+    >"$E2E_WORK_DIR/i2-canary/zz-i2-canary.log"
+  canary_rc=0
+  i2_scan "$engine" --label "$engine log-canary" --exclude 'target-*.log' --exclude all.log \
+    "$E2E_LOG_DIR" "$E2E_WORK_DIR/i2-canary" 2>"$E2E_WORK_DIR/i2-canary.out" || canary_rc=$?
+  if [ "$canary_rc" -ne 1 ] || ! grep -q 'file=zz-i2-canary.log$' "$E2E_WORK_DIR/i2-canary.out"; then
+    fail "I2 log scan positive control ($engine): canary not detected"
+  fi
+  rm -rf -- "$E2E_WORK_DIR/i2-canary" "$E2E_WORK_DIR/i2-canary.out"
+  i2_scan "$engine" --label "$engine logs" --exclude 'target-*.log' --exclude all.log "$E2E_LOG_DIR" \
+    || i2_failed=1
+  i2_scan "$engine" --label "$engine findings-page" "$E2E_WORK_DIR/findings-page.html" || i2_failed=1
+done
+rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err" "$E2E_WORK_DIR/findings-page.html"
 [ "$i2_failed" -eq 0 ] || fail "invariant I2: ground-truth value(s) in clear text (ids above)"
 
 log "all checks passed (revocation latency ${latency} ms)"
