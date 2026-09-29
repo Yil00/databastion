@@ -164,6 +164,9 @@ async fn main() -> ExitCode {
     if init_logging().is_err() {
         return ExitCode::FAILURE;
     }
+    // Panics are logged by location only (their message can quote data),
+    // from here on, enrollment included.
+    databastion_core::install_panic_hook();
 
     let engines: Vec<&str> = compiled_engines().into_iter().map(Engine::as_str).collect();
     tracing::info!(

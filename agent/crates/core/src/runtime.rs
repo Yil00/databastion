@@ -367,8 +367,9 @@ enum AuditEnd {
     Stopped,
     /// The connector returned (an error, or unexpectedly).
     Failed(Option<crate::ConnectorError>),
-    /// The connector panicked (caught, see `crate::panics`).
-    Panicked,
+    /// The connector panicked (caught, see `crate::panics`), with the
+    /// hook's panic id.
+    Panicked(u64),
 }
 
 /// Panics in a row after which a target's audit stream is stopped until
@@ -585,7 +586,7 @@ pub async fn run(
     // stops the agent here with the pattern name, never silently disabling
     // a detector during a scan.
     databastion_classifiers::detect::check_patterns();
-    crate::panics::install_hook();
+    crate::panics::install_panic_hook();
     let config = AgentConfig::load(config_path)?;
     let runtime = Runtime::new(config_path, config, connectors)?;
     runtime.run(shutdown).await
@@ -753,9 +754,13 @@ impl Runtime {
             .await
             {
                 Ok(Ok(h)) => (h.reachable, h.audit_level, h.failure, h.notes),
-                Ok(Err(crate::panics::Panicked)) => {
+                Ok(Err(p)) => {
                     bump(&self.counters.connector_panics, 1);
-                    tracing::error!(target_id = %target.id, "target check failed: internal error");
+                    tracing::error!(
+                        target_id = %target.id,
+                        panic_id = p.id,
+                        "target check failed: internal error"
+                    );
                     (
                         false,
                         AuditLevel::None,
@@ -1743,6 +1748,11 @@ impl Runtime {
         let sensitive = params_sensitive_count(&job.params);
         self.lock_audits()
             .set(&target.id, enabled.then_some(params));
+        if !enabled {
+            // Audit removed: a stream stopped after repeated panics no
+            // longer reports its note nor forces the level (review N2).
+            self.lock_audit_parked().remove(&target.id);
+        }
         self.audit_changed.notify_one();
         tracing::info!(
             job_id = %id,
@@ -1953,7 +1963,7 @@ impl Runtime {
                     tracing::warn!(target_id, "audit is not implemented for this target");
                     return;
                 }
-                AuditEnd::Panicked => {
+                AuditEnd::Panicked(panic_id) => {
                     bump(&self.counters.connector_panics, 1);
                     bump(&self.counters.audit_stream_failures, 1);
                     panics = if began.elapsed() >= AUDIT_PANIC_RESET {
@@ -1964,6 +1974,7 @@ impl Runtime {
                     if panics >= AUDIT_MAX_PANICS {
                         tracing::error!(
                             target_id,
+                            panic_id,
                             panics,
                             "audit stream stopped after repeated internal errors: reconfigure \
                              Audit or restart the agent"
@@ -1977,6 +1988,7 @@ impl Runtime {
                         .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
                     tracing::error!(
                         target_id,
+                        panic_id,
                         retry_s = delay.as_secs(),
                         "audit stream failed: internal error; restarting"
                     );
@@ -2051,7 +2063,7 @@ impl Runtime {
                 r = &mut stream => {
                     break match r {
                         Ok(r) => AuditEnd::Failed(r.err()),
-                        Err(crate::panics::Panicked) => AuditEnd::Panicked,
+                        Err(p) => AuditEnd::Panicked(p.id),
                     };
                 }
                 ev = rx.recv(), if can_emit && !agg.is_full() => {
@@ -2330,8 +2342,9 @@ impl Runtime {
             let run = async {
                 let r = match crate::panics::guard(connector.discover(&scan, &sink)).await {
                     Ok(r) => r,
-                    Err(crate::panics::Panicked) => {
+                    Err(p) => {
                         bump(&self.counters.connector_panics, 1);
+                        tracing::error!(panic_id = p.id, "scan failed: internal error");
                         Err(crate::ConnectorError::Target {
                             engine: connector.engine(),
                             code: FailureCode::Internal,

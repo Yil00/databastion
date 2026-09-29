@@ -2975,6 +2975,15 @@ async fn connector_panics_fail_the_call_not_the_agent() {
         rt.lock_audit_parked().get("pg-main"),
         Some(&AUDIT_MAX_PANICS)
     );
+    // Audit removed: the stopped stream is forgotten (review N2).
+    let body = serde_json::json!({ "jobs": [audit_job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6fa3",
+        serde_json::json!({"enabled": false}),
+    )]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
 }
 
 // ------------------------------------------------------------------ audit
