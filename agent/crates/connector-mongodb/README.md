@@ -64,7 +64,7 @@ reported: they are not needed for Discovery.
 
 | Edition | Source (`audit_source`) | Level |
 |---|---|---|
-| Enterprise, Percona Server for MongoDB | `auditLog` JSON file (`mongodb_audit_log`) | Partial once a successful `authCheck` was read in the last 24 h, Limited before |
+| Enterprise, Percona Server for MongoDB | `auditLog` JSON file (`mongodb_audit_log`) | Partial once a successful `authCheck` was read in the last 24 h, Limited once any record was read in the last 24 h, None before (ADR-0030) |
 | Any | structured JSON server log (`mongodb_log`) | Limited once a record was read in the last 24 h, None before |
 | Any (not a `mongos`) | profiler, `system.profile` (`mongodb_profiler`) | Limited once an entry was read in the last 24 h, None before |
 
@@ -123,7 +123,7 @@ reports it as `privilege.system_collections` otherwise.
 | `audit.auditlog_on_community` | an `auditLog` is declared, but the server is Community: not used |
 | `audit.log_without_row_counts` | the `auditLog` has no document counts |
 | `audit.slow_operations_only` | server log or profiler: slow or sampled operations only |
-| `audit.limited_pending_first_record` | server log or profiler: nothing read in the last 24 h (None) |
+| `audit.limited_pending_first_record` | `auditLog`, server log or profiler: nothing read in the last 24 h (None) |
 | `audit.source_not_configured` | no usable source (level None) |
 | `audit.log_not_readable` | the declared file cannot be read by the agent |
 | `audit.records_dropped` | records that did not parse, oversized or damaged, in the last 24 h |

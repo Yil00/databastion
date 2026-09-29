@@ -1,7 +1,8 @@
-//! MongoDB Audit (P5-B, P5-C, ADR-0027): access events from the
+//! MongoDB Audit (P5-B, P5-C, ADR-0027, ADR-0030): access events from the
 //! Enterprise / Percona `auditLog` JSON file (Partial once a successful
-//! `authCheck` was read, Limited before), the structured JSON server log
-//! (Limited) or the profiler (Limited). Full is never reported.
+//! `authCheck` was read, Limited once any record was read, None before),
+//! the structured JSON server log (Limited) or the profiler (Limited).
+//! Full is never reported.
 //!
 //! - The files are read locally from `targets[].mongodb.audit_log`,
 //!   incrementally, with a cursor persisted through the core
@@ -93,6 +94,9 @@ pub(crate) struct FileState {
     /// In the last 24 h, the stream parsed a successful `authCheck` record
     /// (`auditLog`), or an audit record (server log).
     pub(crate) recent: bool,
+    /// In the last 24 h, the stream parsed a record of the file, of any
+    /// kind (ADR-0030: the `auditLog` is None until then).
+    pub(crate) seen: bool,
 }
 
 /// What the server and the account allow.
@@ -114,9 +118,11 @@ impl Probe {
     }
 }
 
-/// The level and source of a target (ADR-0027 decisions 1 and 2): the
-/// `auditLog` on Enterprise / Percona when readable (Partial once a
-/// successful `authCheck` was read, Limited before), the server log when
+/// The level and source of a target (ADR-0027 decisions 1 and 2, refined
+/// by ADR-0030): the `auditLog` on Enterprise / Percona when readable
+/// (Partial once a successful `authCheck` was read, Limited once any
+/// record was read, None before: a stale file proves nothing), the server
+/// log when
 /// readable, the profiler when the account can read it and the target is
 /// not a `mongos`, else none. The server log and the profiler are Limited
 /// once the stream read a record of them in the last 24 h, None before
@@ -128,8 +134,10 @@ pub(crate) fn choose(probe: Probe, file: Option<FileState>) -> (AuditLevel, Sour
             MongodbLogFormat::AuditLog if probe.audit_log_edition() => {
                 let level = if f.recent {
                     AuditLevel::Partial
-                } else {
+                } else if f.seen {
                     AuditLevel::Limited
+                } else {
+                    AuditLevel::None
                 };
                 return (level, Source::AuditLog);
             }
@@ -184,6 +192,14 @@ pub(crate) fn explain(
     out.push(format!("audit source: {}", source.describe()));
     match source {
         Source::AuditLog => {
+            if !file.is_some_and(|f| f.seen || f.recent) {
+                out.push(
+                    "Limited once the Audit stream has read an auditLog record (none in the \
+                     last 24 h; the agent's own authentication at each check writes one)"
+                        .to_owned(),
+                );
+                codes.push(TargetNote::new(NoteCode::AuditLimitedPendingFirstRecord));
+            }
             if !file.is_some_and(|f| f.recent) {
                 out.push(
                     "Partial once the Audit stream has read a successful authCheck record \
@@ -238,14 +254,21 @@ pub(crate) async fn file_state(state: &CheckState, target: &TargetConfig) -> Opt
         tokio::task::spawn_blocking(move || databastion_core::audit::tail::readable(&path))
             .await
             .unwrap_or(false);
-    let recent = match log.format {
-        MongodbLogFormat::AuditLog => state.recent_authcheck(&target.id),
-        MongodbLogFormat::ServerLog => state.recent_record(&target.id, Source::ServerLog),
+    let (recent, seen) = match log.format {
+        MongodbLogFormat::AuditLog => (
+            state.recent_authcheck(&target.id),
+            state.recent_record(&target.id, Source::AuditLog),
+        ),
+        MongodbLogFormat::ServerLog => {
+            let seen = state.recent_record(&target.id, Source::ServerLog);
+            (seen, seen)
+        }
     };
     Some(FileState {
         format: log.format,
         readable,
         recent,
+        seen,
     })
 }
 
@@ -503,6 +526,39 @@ pub(crate) async fn audit_stream(
     }
 }
 
+/// Records of one poll of a log file.
+struct Parsed {
+    records: Vec<Record>,
+    /// Records that do not parse (dropped, counted).
+    unparsed: u64,
+    /// Valid records, those that yield nothing included (another
+    /// `atype`): ADR-0030's proof that the `auditLog` is written.
+    valid: u64,
+}
+
+fn parse_all<R: AsRef<[u8]>>(format: MongodbLogFormat, raw: &[R]) -> Parsed {
+    let mut out = Parsed {
+        records: Vec::with_capacity(raw.len()),
+        unparsed: 0,
+        valid: 0,
+    };
+    for r in raw {
+        let parsed = match format {
+            MongodbLogFormat::AuditLog => records::parse_audit_log(r.as_ref()),
+            MongodbLogFormat::ServerLog => records::parse_server_log(r.as_ref()),
+        };
+        match parsed {
+            Ok(Some(rec)) => {
+                out.valid += 1;
+                out.records.push(rec);
+            }
+            Ok(None) => out.valid += 1,
+            Err(()) => out.unparsed += 1,
+        }
+    }
+    out
+}
+
 /// Whether a record proves that reads are logged (a successful
 /// `authCheck` of a read or write).
 fn proves_reads(r: &Record) -> bool {
@@ -528,29 +584,23 @@ async fn file_run(
         let mut t = st.tailer.take().ok_or_else(internal)?;
         let (t, polled) = tokio::task::spawn_blocking(move || {
             let polled = t.poll().map(|p| {
-                let mut unparsed = 0u64;
-                let mut records = Vec::with_capacity(p.records.len());
-                for r in &p.records {
-                    let parsed = match format {
-                        MongodbLogFormat::AuditLog => records::parse_audit_log(r),
-                        MongodbLogFormat::ServerLog => records::parse_server_log(r),
-                    };
-                    match parsed {
-                        Ok(Some(rec)) => records.push(rec),
-                        Ok(None) => {}
-                        Err(()) => unparsed += 1,
-                    }
-                }
-                (records, p.more, unparsed)
+                let parsed = parse_all(format, &p.records);
+                (parsed.records, p.more, parsed.unparsed, parsed.valid)
             });
             (t, polled)
         })
         .await
         .map_err(|_| internal())?;
-        let (records, more, unparsed) = match polled {
+        let (records, more, unparsed, valid) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
         };
+        // ADR-0030: any valid `auditLog` record (the agent's own
+        // `authenticate` at each check included) proves the file is
+        // written; Limited from then on.
+        if format == MongodbLogFormat::AuditLog && valid > 0 {
+            state.note_record(&target.id, Source::AuditLog);
+        }
         if format == MongodbLogFormat::AuditLog && records.iter().any(proves_reads) {
             state.note_authcheck(&target.id);
         }
@@ -713,7 +763,74 @@ mod tests {
             format,
             readable,
             recent,
+            seen: recent,
         })
+    }
+
+    /// A readable `auditLog` with a record, but no successful `authCheck`,
+    /// in the last 24 h.
+    fn seen_only() -> Option<FileState> {
+        Some(FileState {
+            format: MongodbLogFormat::AuditLog,
+            readable: true,
+            recent: false,
+            seen: true,
+        })
+    }
+
+    /// ADR-0030: every valid `auditLog` record counts as a proof that the
+    /// file is written (the agent's own `authenticate` at each check, a
+    /// `logout`, an `atype` that yields no event); a damaged one does not.
+    #[test]
+    fn valid_audit_log_records_prove_the_file_is_written() {
+        let auth = br#"{"atype":"authenticate","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.15","port":51000},"users":[{"user":"databastion","db":"admin"}],"param":{"user":"databastion","db":"admin","mechanism":"SCRAM-SHA-256"},"result":0}"#;
+        let other = br#"{"atype":"shutdown","ts":{"$date":"2026-09-29T10:00:00.000Z"},"users":[],"param":{},"result":0}"#;
+        let damaged = br#"{"atype":"authCheck","ts":"#;
+        let p = parse_all(
+            MongodbLogFormat::AuditLog,
+            &[&auth[..], &other[..], &damaged[..]],
+        );
+        assert_eq!((p.records.len(), p.valid, p.unparsed), (1, 2, 1));
+        assert!(!p.records.iter().any(proves_reads));
+        let p = parse_all(MongodbLogFormat::AuditLog, &[&damaged[..]]);
+        assert_eq!(p.valid, 0);
+    }
+
+    /// ADR-0030: the `auditLog` is None until a record of it was parsed in
+    /// the last 24 h, Limited then, Partial with a successful `authCheck`.
+    #[test]
+    fn a_stale_audit_log_is_none() {
+        use MongodbLogFormat::AuditLog;
+        let enterprise = probe(Some("enterprise"), false);
+        let codes = |f| {
+            let (_, s) = choose(enterprise, f);
+            explain(enterprise, f, s)
+                .1
+                .iter()
+                .map(|n| n.code())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            choose(enterprise, file(AuditLog, true, false)),
+            (AuditLevel::None, Source::AuditLog)
+        );
+        let stale = codes(file(AuditLog, true, false));
+        assert!(stale.contains(&NoteCode::AuditLimitedPendingFirstRecord));
+        assert!(stale.contains(&NoteCode::AuditAuthcheckSuccessPending));
+        assert_eq!(
+            choose(enterprise, seen_only()),
+            (AuditLevel::Limited, Source::AuditLog)
+        );
+        let seen = codes(seen_only());
+        assert!(!seen.contains(&NoteCode::AuditLimitedPendingFirstRecord));
+        assert!(seen.contains(&NoteCode::AuditAuthcheckSuccessPending));
+        assert_eq!(
+            choose(enterprise, file(AuditLog, true, true)),
+            (AuditLevel::Partial, Source::AuditLog)
+        );
+        let proven = codes(file(AuditLog, true, true));
+        assert!(!proven.contains(&NoteCode::AuditLimitedPendingFirstRecord));
+        assert!(!proven.contains(&NoteCode::AuditAuthcheckSuccessPending));
     }
 
     #[test]
@@ -725,7 +842,7 @@ mod tests {
             (AuditLevel::Partial, Source::AuditLog)
         );
         assert_eq!(
-            choose(enterprise, file(AuditLog, true, false)),
+            choose(enterprise, seen_only()),
             (AuditLevel::Limited, Source::AuditLog)
         );
         assert_eq!(
@@ -804,6 +921,14 @@ mod tests {
                 probe(Some("enterprise"), false),
                 file(AuditLog, true, false)
             ),
+            [
+                "audit.limited_pending_first_record",
+                "audit.authcheck_success_pending",
+                "audit.log_without_row_counts"
+            ]
+        );
+        assert_eq!(
+            codes(probe(Some("enterprise"), false), seen_only()),
             [
                 "audit.authcheck_success_pending",
                 "audit.log_without_row_counts"

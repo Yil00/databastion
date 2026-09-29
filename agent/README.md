@@ -405,11 +405,13 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
 - sources, one per target, chosen by the same rule as `check()` and re-evaluated every 5 minutes:
   the Enterprise / Percona `auditLog` JSON file (`mongodb.audit_log` with `format: audit_log`;
   **Partial** once a successful `authCheck` record was read in the last 24 h, which needs
-  `auditAuthorizationSuccess`, Limited before; no document counts), the structured JSON server
+  `auditAuthorizationSuccess`, Limited once any `auditLog` record was read in the last 24 h, None
+  before ([ADR-0030](../docs/adr/0030-mongodb-auditlog-freshness.md); the agent's own
+  authentication at each check writes one); no document counts), the structured JSON server
   log (`format: server_log`; **Limited**), or, without a usable file, the profiler of the
   databases whose `system.profile` the account can `find` (**Limited**; not on a `mongos`); the
-  server log and the profiler report None (`audit.limited_pending_first_record`) until the stream
-  read a record of them in the last 24 h.
+  three sources report None (`audit.limited_pending_first_record`) until the stream read a record
+  of them in the last 24 h.
   **Full is never reported**;
 - files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
