@@ -114,6 +114,10 @@ pub enum NoteCode {
     AuditAuditLogFilterNotRead,
     /// `audit.audit_log_plugin_not_read`.
     AuditAuditLogPluginNotRead,
+    /// `audit.auditlog_on_community`.
+    AuditAuditlogOnCommunity,
+    /// `audit.authcheck_success_pending`.
+    AuditAuthcheckSuccessPending,
     /// `audit.full_pending_first_record`.
     AuditFullPendingFirstRecord,
     /// `audit.general_log_enabled`.
@@ -144,6 +148,10 @@ pub enum NoteCode {
     AuditRecordsDroppedSeverity,
     /// `audit.server_audit_not_read`.
     AuditServerAuditNotRead,
+    /// `audit.slow_operations_only`.
+    AuditSlowOperationsOnly,
+    /// `audit.source_not_configured`.
+    AuditSourceNotConfigured,
     /// `audit.statement_consumers_disabled`.
     AuditStatementConsumersDisabled,
     /// `audit.stream_not_available`.
@@ -223,6 +231,8 @@ impl NoteCode {
     pub const ALL: &'static [Self] = &[
         Self::AuditAuditLogFilterNotRead,
         Self::AuditAuditLogPluginNotRead,
+        Self::AuditAuditlogOnCommunity,
+        Self::AuditAuthcheckSuccessPending,
         Self::AuditFullPendingFirstRecord,
         Self::AuditGeneralLogEnabled,
         Self::AuditHistoryLongConsumerDisabled,
@@ -238,6 +248,8 @@ impl NoteCode {
         Self::AuditRecordsDropped,
         Self::AuditRecordsDroppedSeverity,
         Self::AuditServerAuditNotRead,
+        Self::AuditSlowOperationsOnly,
+        Self::AuditSourceNotConfigured,
         Self::AuditStatementConsumersDisabled,
         Self::AuditStreamNotAvailable,
         Self::CheckServerIsMariadb,
@@ -282,6 +294,8 @@ impl NoteCode {
         match self {
             Self::AuditAuditLogFilterNotRead => "audit.audit_log_filter_not_read",
             Self::AuditAuditLogPluginNotRead => "audit.audit_log_plugin_not_read",
+            Self::AuditAuditlogOnCommunity => "audit.auditlog_on_community",
+            Self::AuditAuthcheckSuccessPending => "audit.authcheck_success_pending",
             Self::AuditFullPendingFirstRecord => "audit.full_pending_first_record",
             Self::AuditGeneralLogEnabled => "audit.general_log_enabled",
             Self::AuditHistoryLongConsumerDisabled => "audit.history_long_consumer_disabled",
@@ -297,6 +311,8 @@ impl NoteCode {
             Self::AuditRecordsDropped => "audit.records_dropped",
             Self::AuditRecordsDroppedSeverity => "audit.records_dropped_severity",
             Self::AuditServerAuditNotRead => "audit.server_audit_not_read",
+            Self::AuditSlowOperationsOnly => "audit.slow_operations_only",
+            Self::AuditSourceNotConfigured => "audit.source_not_configured",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
             Self::AuditStreamNotAvailable => "audit.stream_not_available",
             Self::CheckServerIsMariadb => "check.server_is_mariadb",

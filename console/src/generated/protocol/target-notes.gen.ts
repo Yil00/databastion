@@ -15,6 +15,18 @@ export const TARGET_NOTE_REGISTRY = {
       "mysql"
     ]
   },
+  "audit.auditlog_on_community": {
+    "description": "The auditLog configured in agent.yaml (mongodb.audit_log, format audit_log) needs MongoDB Enterprise or Percona Server for MongoDB, but the server is MongoDB Community: it is not used.",
+    "engines": [
+      "mongodb"
+    ]
+  },
+  "audit.authcheck_success_pending": {
+    "description": "Partial once the Audit stream has read a successful authCheck record of the auditLog (auditAuthorizationSuccess enabled; none in the last 24 h): reported Limited until then.",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "audit.full_pending_first_record": {
     "description": "Full once the Audit stream has read a pgaudit record (none in the last 24 h): reported Partial until then.",
     "engines": [
@@ -47,7 +59,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "audit.log_plugin_mismatch": {
@@ -61,7 +74,8 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "The audit log carries no row counts: result volumes are unknown.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "audit.partial_pending_first_record": {
@@ -101,7 +115,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "audit.records_dropped_severity": {
@@ -115,6 +130,18 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "audit.slow_operations_only": {
+    "description": "The audit source only records the operations the server logs or profiles (slower than slowms, or sampled): fast reads, such as a quick dump of a small collection, can go unseen.",
+    "engines": [
+      "mongodb"
+    ]
+  },
+  "audit.source_not_configured": {
+    "description": "No MongoDB Audit source: declare the auditLog or the server log file in agent.yaml (mongodb.audit_log), or grant find on system.profile of the monitored databases.",
+    "engines": [
+      "mongodb"
     ]
   },
   "audit.statement_consumers_disabled": {
