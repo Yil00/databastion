@@ -764,9 +764,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   later events of the key are added to it (`match_count`, total rows, highest score, signals,
   anomaly, and a link in `incident_events`). Once it is a **false positive**, a later event of the
   hour opens a new incident (`reopened_from` in the notification) only when it is clearly worse
-  than what was judged: a `signature.*` signal the incident did not have, or a strictly higher
-  score (ADR-0031 decision 2; a new `shape.*` / `volume.*` signal alone, or being above the
-  baseline, does not count); otherwise it is only linked to it. Once it is **resolved**, a
+  than what was judged: a `signature.*` signal the incident did not have, a strictly higher
+  score, or more rows in total than the incident had when judged (the rows of the events linked
+  to it since it was marked, this one included, above its rows: an extraction split into small
+  reads still opens an incident); ADR-0031 decision 2. A new `shape.*` / `volume.*` signal alone,
+  or being above the baseline, does not count; otherwise the event is only linked to it. The same
+  holds for a false-positive overflow incident. Once it is **resolved**, a
   later event of the hour opens a new incident (`reopened_from`) only when it is worse: a higher
   score, above the baseline while the incident was not, or a signal the incident did not have;
   otherwise it is linked to the resolved incident. The next hour opens a new incident. A `pg_dump` (one event per table) thus
@@ -822,8 +825,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `agent.batches_dropped`, `channel.test`, `notifications.suppressed`,
-  `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `agent.audit_stream_stopped`, `channel.test`,
+  `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -910,7 +913,7 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   episode, one integrity alert per agent, kind and hour, one dropped-batches alert per agent and
   hour) do not bound a fleet: N misbehaving agents would send N alerts an hour to each channel.
   So all system alerts (`agent.silent`, `agent.recovered`, `agent.integrity`,
-  `agent.batches_dropped`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
+  `agent.batches_dropped`, `agent.audit_stream_stopped`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
   20) per channel and UTC clock hour, whatever the agent. It is a hard limit, shared by every
   console process: the count lives in `system_alert_budgets`, one row per (channel, hour), charged
   by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <
@@ -954,6 +957,22 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   numbers, timestamps and ids: no agent-provided text (not even the host name). Revoked and locked
   agents are not alerted. The agent page shows the spool counters of the latest heartbeat, the
   last five alerts and the drops held back for the next one.
+- **Audit stream stopped** (P7, ADR-0031 decision 3, end-of-phase-6 review M2): an Audit stream
+  that panics 3 times in a row is stopped by the agent until Audit is reconfigured or the agent
+  restarts; its target reports level None with the note `audit.stream_stopped`. Each heartbeat
+  records, in its transaction, how many targets carry that note
+  (`agents.audit_stream_stops_unalerted`, the highest count since the last alert). At most once per
+  agent and hour (conditional update on `agents.audit_stream_stops_alerted_at`), this becomes a
+  `security_events` row `agent.audit_stream_stopped` (`medium`: monitoring of the target is lost,
+  as for a silent agent, but it is no evidence of an attack by itself), an audit entry (system)
+  and an `agent.audit_stream_stopped` notification to the system-alert channels, with
+  `stopped_streams`, `since`, `min_interval_s` and the security event id. The alert is **repeated
+  every hour while a stream stays stopped** (every heartbeat counts, not only the first); stops
+  seen within the hour are reported by the next alert, raised by the next heartbeat after the hour
+  or by the worker's minute schedule. No target id or other agent-provided text is copied into the
+  event, the audit entry or the notification; the agent page names the stopped targets (a "stream
+  stopped" badge on each, and a card with the last five alerts). Revoked and locked agents are not
+  alerted.
 
 ## Layout
 ```

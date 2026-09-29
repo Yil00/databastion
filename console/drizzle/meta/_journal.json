@@ -239,6 +239,13 @@
       "when": 1790721075087,
       "tag": "0033_p7_system_alert_budget_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790721948298,
+      "tag": "0034_p7_audit_stream_stopped_alert",
+      "breakpoints": true
     }
   ]
 }

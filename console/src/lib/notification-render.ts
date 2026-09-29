@@ -121,6 +121,26 @@ export interface AgentBatchesDroppedPayload {
   security_event_id: string;
 }
 
+/**
+ * P7 (ADR-0031 decision 3, end-of-phase-6 review M2): the agent stopped the Audit stream of one or
+ * more targets after repeated internal errors (target note `audit.stream_stopped`): Audit of those
+ * targets is off until Audit is reconfigured or the agent restarts. Console-computed counts and
+ * timestamps only: no target id or other agent-provided text.
+ */
+export interface AgentAuditStreamStoppedPayload {
+  event: "agent.audit_stream_stopped";
+  occurred_at: string;
+  url: string | null;
+  agent_id: string;
+  /** Targets reported with a stopped Audit stream: the most in one heartbeat since `since`. */
+  stopped_streams: number;
+  /** First heartbeat reporting a stopped stream since the previous alert of the agent. */
+  since: string;
+  /** At most one alert per agent in this many seconds; later stops are counted in the next one. */
+  min_interval_s: number;
+  security_event_id: string;
+}
+
 export interface ChannelTestPayload {
   event: "channel.test";
   occurred_at: string;
@@ -153,7 +173,7 @@ export interface SystemAlertsSuppressedPayload {
   window_start: string;
   window_end: string;
   suppressed: number;
-  /** Suppressed alerts per event (`agent.silent`, `agent.recovered`, `agent.integrity`, `agent.batches_dropped`); absent events are 0. */
+  /** Suppressed alerts per system-alert event (`SYSTEM_ALERT_EVENTS`); absent events are 0. */
   by_event: Partial<Record<SystemAlertEvent, number>>;
   /** Distinct agents of the suppressed alerts. */
   agents: number;
@@ -169,6 +189,7 @@ export type NotificationPayload =
   | AgentRecoveredPayload
   | AgentIntegrityPayload
   | AgentBatchesDroppedPayload
+  | AgentAuditStreamStoppedPayload
   | ChannelTestPayload;
 
 /** Webhook body: the payload plus the format version and the delivery id. */
@@ -191,6 +212,7 @@ const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
   "agent.recovered": "Agents reporting again",
   "agent.integrity": "Agent-integrity events",
   "agent.batches_dropped": "Dropped batches",
+  "agent.audit_stream_stopped": "Audit streams stopped",
 };
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
@@ -303,6 +325,18 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
       return {
         subject: `[DataBastion] ${p.suppressed} incident notification${p.suppressed > 1 ? "s" : ""} suppressed`,
         text: `The channel ${one(p.channel, 64)} reached its limit of ${p.limit_per_hour} incident notifications per hour between ${p.window_start} and ${p.window_end}: ${p.suppressed} more incident${p.suppressed > 1 ? "s were" : " was"} opened without a notification. See the incidents in the console.\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "agent.audit_stream_stopped": {
+      const p = payload;
+      const n = `${p.stopped_streams} target${p.stopped_streams === 1 ? "" : "s"}`;
+      return {
+        subject: `[DataBastion] Audit stopped on ${n}: agent ${p.agent_id}`,
+        text: [
+          `The agent ${p.agent_id} reports the Audit stream of ${n} stopped after repeated internal errors, since ${p.since} (security event ${p.security_event_id}).`,
+          "Audit of these targets is off (level None): database accesses there are not monitored until Audit is reconfigured on the target or the agent restarts. The agent log names the code location of the errors; the agent page shows which targets are concerned.",
+          `This alert is repeated every ${Math.round(p.min_interval_s / 60)} minutes while a stream stays stopped (at most one per agent in that time).`,
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
     case "system_alerts.suppressed": {

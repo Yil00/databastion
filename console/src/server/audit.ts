@@ -44,6 +44,7 @@ export type AuditAction =
   | "agent.silent"
   | "agent.recovered"
   | "agent.batches_dropped"
+  | "agent.audit_stream_stopped"
   | "job.timeout"
   | "user.access_denied";
 

@@ -156,6 +156,15 @@ export const agents = pgTable(
     droppedBatchesUnalerted: integer("dropped_batches_unalerted").notNull().default(0),
     droppedBatchesSince: tsz("dropped_batches_since"),
     droppedBatchesAlertedAt: tsz("dropped_batches_alerted_at"),
+    /**
+     * P7 "Audit stream stopped" alert (ADR-0031 decision 3, end-of-phase-6 review M2): target
+     * streams newly reported stopped (note `audit.stream_stopped` absent from the target's
+     * previous heartbeat) and not alerted yet; when the first of them was seen; when the last
+     * alert was raised (at most one per agent and hour, see `src/server/audit-stream-alerts.ts`).
+     */
+    auditStreamStopsUnalerted: integer("audit_stream_stops_unalerted").notNull().default(0),
+    auditStreamStopsSince: tsz("audit_stream_stops_since"),
+    auditStreamStopsAlertedAt: tsz("audit_stream_stops_alerted_at"),
     revokedAt: tsz("revoked_at"),
     revokedBy: uuid("revoked_by").references(() => users.id, { onDelete: "set null" }),
   },

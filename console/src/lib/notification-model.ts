@@ -63,6 +63,7 @@ export const NOTIFICATION_EVENTS = [
   "agent.recovered",
   "agent.integrity",
   "agent.batches_dropped",
+  "agent.audit_stream_stopped",
   "channel.test",
   "notifications.suppressed",
   "system_alerts.suppressed",
@@ -73,7 +74,13 @@ export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
  * System alerts (P3-C, P7): the events notified to the channels flagged `system_alerts`, counted
  * by the global per-channel hourly budget (`DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR`).
  */
-export const SYSTEM_ALERT_EVENTS = ["agent.silent", "agent.recovered", "agent.integrity", "agent.batches_dropped"] as const;
+export const SYSTEM_ALERT_EVENTS = [
+  "agent.silent",
+  "agent.recovered",
+  "agent.integrity",
+  "agent.batches_dropped",
+  "agent.audit_stream_stopped",
+] as const;
 export type SystemAlertEvent = (typeof SYSTEM_ALERT_EVENTS)[number];
 
 /**
