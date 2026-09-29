@@ -336,9 +336,72 @@ pub(crate) const COLUMN_PRIVILEGES: &str = concat!(
     " LIMIT 100000"
 );
 
-/// Roles granted to the account (their privileges are not listed in the
-/// tables above).
-pub(crate) const ROLES: &str = "SELECT COUNT(*) FROM information_schema.APPLICABLE_ROLES";
+/// Roles applicable to the account, MySQL 8.0.19+ (granted directly,
+/// through another role, or mandatory). Columns: role name, role host,
+/// grantable (`WITH ADMIN OPTION`), mandatory, granted to the account
+/// itself (`1`) rather than to one of its roles.
+pub(crate) const APPLICABLE_ROLES_MYSQL: &str = "SELECT r.ROLE_NAME, r.ROLE_HOST, r.IS_GRANTABLE, \
+     r.IS_MANDATORY, r.GRANTEE = r.USER AND r.GRANTEE_HOST = r.HOST \
+     FROM information_schema.APPLICABLE_ROLES r LIMIT 1001";
+
+/// Roles applicable to the account, MariaDB (granted directly or through
+/// another role, the default role included). Columns: role name,
+/// grantable (`WITH ADMIN OPTION`).
+pub(crate) const APPLICABLE_ROLES_MARIADB: &str =
+    "SELECT r.ROLE_NAME, r.IS_GRANTABLE FROM information_schema.APPLICABLE_ROLES r LIMIT 1001";
+
+/// Rows of `APPLICABLE_ROLES_*` read at most: the statements ask for one
+/// more, and more rows than this means the list is cut (every role is
+/// then reported as not evaluated).
+pub(crate) const MAX_ROLE_ROWS: usize = 1000;
+
+/// Whether a role name or host from `APPLICABLE_ROLES` may be written into
+/// a statement: a short allow-listed charset, on top of the quoting, so a
+/// name chosen by whoever administers the server cannot shape the SQL text.
+fn role_part_ok(part: &str, may_be_empty: bool) -> bool {
+    (may_be_empty || !part.is_empty())
+        && part.len() <= 255
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_$.%-:/".contains(&b))
+}
+
+/// MySQL: the privileges of the account and of `roles` (`(name, host)`,
+/// the roles granted to it directly or mandatory; the server expands the
+/// roles they grant). `SHOW GRANTS` about the current user needs no
+/// privilege. `None` for an empty list or a name outside the allow-list.
+pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
+    if roles.is_empty() {
+        return None;
+    }
+    let mut out = String::from("SHOW GRANTS FOR CURRENT_USER() USING ");
+    for (i, (name, host)) in roles.iter().enumerate() {
+        if !role_part_ok(name, false) || !role_part_ok(host, true) {
+            return None;
+        }
+        if i > 0 {
+            out.push_str(", ");
+        }
+        // `'name'@'host'`: the account-name form of the MySQL manual
+        // ("Specifying Account Names"); an empty host is `''` (a quoted
+        // identifier cannot be empty).
+        out.push_str(&quote_str(name)?);
+        out.push('@');
+        out.push_str(&quote_str(host)?);
+    }
+    Some(out)
+}
+
+/// MariaDB: the role enabled in the session (the default role at login),
+/// or NULL.
+pub(crate) const CURRENT_ROLE: &str = "SELECT CURRENT_ROLE()";
+
+/// MariaDB: the privileges of the role enabled in the session. MariaDB
+/// shows a role's grants without `SELECT` on the `mysql` database only for
+/// the session's current role (`SHOW GRANTS FOR <other role>` is refused),
+/// and `SET ROLE` is not used (it would enable the role's privileges, write
+/// privileges included, on the agent's session).
+pub(crate) const SHOW_GRANTS_CURRENT_ROLE: &str = "SHOW GRANTS FOR CURRENT_ROLE";
 
 /// Whether `init_connect` is set (SQL run at every login of an account
 /// without `SUPER` / `CONNECTION_ADMIN`: user code at connection). The text
@@ -561,7 +624,11 @@ mod tests {
             SCHEMA_PRIVILEGES.to_owned(),
             TABLE_PRIVILEGES.to_owned(),
             COLUMN_PRIVILEGES.to_owned(),
-            ROLES.to_owned(),
+            APPLICABLE_ROLES_MYSQL.to_owned(),
+            APPLICABLE_ROLES_MARIADB.to_owned(),
+            show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
+            CURRENT_ROLE.to_owned(),
+            SHOW_GRANTS_CURRENT_ROLE.to_owned(),
             INIT_CONNECT.to_owned(),
             AUDIT_PLUGINS.to_owned(),
             SERVER_AUDIT_SETTINGS.to_owned(),
@@ -672,6 +739,46 @@ mod tests {
                 "INSERT ", "UPDATE ", "DELETE ", "REPLACE ", "CREATE ", "DROP ", "GRANT ",
             ] {
                 assert!(!upper.contains(w), "{w} in {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn role_statements_quote_allow_listed_names_only() {
+        assert_eq!(
+            show_grants_using(&[
+                ("app_read".to_owned(), "%".to_owned()),
+                ("ops".to_owned(), "10.0.0.0/255.0.0.0".to_owned()),
+                ("r".to_owned(), String::new()),
+            ])
+            .as_deref(),
+            Some(
+                "SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
+                 'ops'@'10.0.0.0/255.0.0.0', 'r'@''"
+            )
+        );
+        assert_eq!(show_grants_using(&[]), None);
+        for bad in [
+            "",
+            "a`b",
+            "a'b",
+            "a b",
+            "a;b",
+            "r\\",
+            "caf\u{e9}",
+            &"x".repeat(256),
+        ] {
+            assert_eq!(
+                show_grants_using(&[(bad.to_owned(), "%".to_owned())]),
+                None,
+                "{bad}"
+            );
+            if !bad.is_empty() {
+                assert_eq!(
+                    show_grants_using(&[("r".to_owned(), bad.to_owned())]),
+                    None,
+                    "{bad}"
+                );
             }
         }
     }

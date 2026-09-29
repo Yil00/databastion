@@ -89,7 +89,14 @@ binary: `cargo build --no-default-features --features postgres`.
   wait behind a scan. A scan is stopped at its clamped duration (`timeout`)
   and when the agent is suspended or revoked (`cancelled`); findings are
   spooled per chunk of 500, the partial chunk is flushed on every exit, and
-  findings that cannot be spooled are counted (`findings_lost_total`).
+  findings that cannot be spooled are counted (`findings_lost_total`). The
+  terminal status of a scan waits until the console has answered every
+  findings batch of the job (P2-G), for at most 2 minutes; it does not wait
+  for a cancelled scan, while `/findings` is parked after a `501`, while the
+  spool worker is backing off (console unreachable, `5xx`, `429`), once the
+  agent is suspended, or on shutdown. A status sent with batches still
+  spooled is counted (`scan_status_before_flush_total`); the batches are
+  sent later (the console accepts them for 24 h after the status).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
   removed at startup, unreadable files are moved to `spool/quarantine/` (32
@@ -178,7 +185,13 @@ review remain the primary controls.
   1 s plus jittered backoff. A config reload that changes `console.*` or
   `state_dir` is refused (`invalid_params`).
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
-  `<= 0` are ignored. At most 16 jobs are handled per poll, each parsed on
+  `<= 0` are ignored. The heartbeat runs the targets' `check()`
+  concurrently under one 10 s deadline, so it waits at most 10 s for all of
+  them (P2-G); targets reaching the same account (engine, host or socket,
+  port, account) are checked one at a time, to stay within the ADR-0018
+  `MAX_USER_CONNECTIONS` budget. A check still running or waiting for its
+  turn at the deadline is reported unreachable with `timeout` and the
+  `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
@@ -289,7 +302,19 @@ Behavior:
   see [crates/connector-mysql/README.md](crates/connector-mysql/README.md));
   over-privilege (any global privilege including `SELECT ON *.*`, privileges beyond `SELECT`,
   `WITH GRANT OPTION`, `SELECT` on `mysql` / `sys`, `SELECT` on `performance_schema` while no
-  Audit stream runs, roles), `init_connect`, and coverage (views, engines);
+  Audit stream runs; a database grant is a `LIKE` pattern, so `%`, `m%` or
+  `performance\_schema` count as the system database they match), `init_connect`, and
+  coverage (views, engines). A privilege list that is cut at its `LIMIT` or has an unreadable
+  row leaves the privileges not evaluated. The same rules apply to
+  the privileges held through roles (P4-D): every role in `information_schema.APPLICABLE_ROLES`
+  (granted directly or through a role, MySQL mandatory roles, the MariaDB default role; enabled
+  or not). MySQL: `SHOW GRANTS FOR CURRENT_USER() USING …` with the direct and mandatory roles
+  (at most 16; names written into the statement only when they match an allow-listed charset),
+  which covers every role. MariaDB shows a role's grants to a least-privilege account only for
+  the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
+  every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
+  grant option. A role whose grants cannot be read or parsed is reported as
+  `privilege.roles_not_evaluated`;
 - Audit (P4-B): access events from the `server_audit` log or the `audit_log` /
   `audit_log_filter` JSON file (`mysql.audit_log`, tailed by the core with a persisted cursor),
   or from `performance_schema` (`DIGEST_TEXT` first); statement text analyzed by the MySQL

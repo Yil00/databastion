@@ -3581,3 +3581,427 @@ async fn spooled_events_carry_bytes_only_while_accepted() {
         spool.remove(&key);
     }
 }
+
+// ------------------------------------- findings flushed before the status
+
+/// Answers a job status with `204` and records how many findings batches
+/// were still in the agent's spool when the status arrived.
+struct SpoolAtStatus {
+    dir: PathBuf,
+    seen: Arc<StdMutex<Vec<usize>>>,
+}
+
+impl wiremock::Respond for SpoolAtStatus {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let pending = std::fs::read_dir(&self.dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-f.json")
+            })
+            .count();
+        self.seen.lock().unwrap().push(pending);
+        ResponseTemplate::new(204)
+    }
+}
+
+/// A runtime whose connector submits 450 findings (three batches), with
+/// the job queued; statuses are answered by [`SpoolAtStatus`].
+async fn flushed_scan_runtime(
+    server: &MockServer,
+    findings: impl wiremock::Respond + 'static,
+) -> (Env, Runtime, Arc<StdMutex<Vec<usize>>>) {
+    let env = enrolled(server).await;
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(SpoolAtStatus {
+            dir: env.config.state_dir.join("spool"),
+            seen: Arc::clone(&seen),
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(findings)
+        .mount(server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Flood(Some(450)))],
+    )
+    .unwrap();
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    (env, rt, seen)
+}
+
+/// Runs the scan worker and the spool worker until the job's status is
+/// sent (at most 20 s), then stops them.
+async fn run_scan_and_spool_workers(rt: &Runtime, server: &MockServer) {
+    let (stop, shutdown) = watch::channel(false);
+    let spool = rt.spool_loop(shutdown.clone());
+    let scans = rt.scan_loop(shutdown);
+    let driver = async {
+        for _ in 0..2000 {
+            if statuses(server).await.iter().any(|(i, _)| i == JOB) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop.send(true).unwrap();
+    };
+    let (a, b, ()) = tokio::join!(spool, scans, driver);
+    a.unwrap();
+    b.unwrap();
+}
+
+/// Acknowledges a findings batch after a delay (a slow console).
+struct SlowAck;
+
+impl wiremock::Respond for SlowAck {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        ResponseTemplate::new(202)
+            .set_body_json(serde_json::json!({"batch_id": body["batch_id"], "duplicate": false}))
+            .set_delay(Duration::from_millis(150))
+    }
+}
+
+#[tokio::test]
+async fn scan_status_is_sent_only_after_its_findings_are_acknowledged() {
+    let server = MockServer::start().await;
+    let (_env, rt, seen) = flushed_scan_runtime(&server, SlowAck).await;
+    run_scan_and_spool_workers(&rt, &server).await;
+    let got = statuses(&server).await;
+    let update = &got.iter().find(|(i, _)| i == JOB).unwrap().1;
+    assert_eq!(update["status"], "succeeded");
+    // Every batch of the job was acknowledged before the status arrived.
+    assert_eq!(sent_findings(&sent_batches(&server).await), 450);
+    assert_eq!(sent_batches(&server).await.len(), 3);
+    assert_eq!(*seen.lock().unwrap(), [0]);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+    assert_eq!(metric(&rt, "scan_status_before_flush_total"), 0.0);
+    // The request order on the wire: the three batches, then the status.
+    let order: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().rsplit('/').next().unwrap().to_owned())
+        .filter(|p| p == "findings" || p == "status")
+        .collect();
+    assert_eq!(order, ["findings", "findings", "findings", "status"]);
+}
+
+/// Acknowledges a findings batch only after 2 s (a console slower than
+/// the flush wait of the test).
+struct StalledAck;
+
+impl wiremock::Respond for StalledAck {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        SlowAck.respond(request).set_delay(Duration::from_secs(2))
+    }
+}
+
+#[tokio::test]
+async fn scan_status_waits_for_its_findings_only_up_to_the_bound() {
+    let server = MockServer::start().await;
+    let (_env, mut rt, seen) = flushed_scan_runtime(&server, StalledAck).await;
+    rt.status_flush_wait = Duration::from_millis(300);
+    let started = Instant::now();
+    run_scan_and_spool_workers(&rt, &server).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let got = statuses(&server).await;
+    assert_eq!(
+        got.iter().find(|(i, _)| i == JOB).unwrap().1["status"],
+        "succeeded"
+    );
+    // Sent at the bound with the batches still spooled, never dropped.
+    assert_eq!(*seen.lock().unwrap(), [3]);
+    assert!(rt.lock_spool().status().batches.0 >= 2);
+    assert_eq!(metric(&rt, "scan_status_before_flush_total"), 1.0);
+}
+
+#[tokio::test]
+async fn scan_status_is_not_held_while_the_console_is_down() {
+    let server = MockServer::start().await;
+    // The console keeps answering 503: the spool worker backs off, and
+    // the status does not wait for the (2 min) bound.
+    let (_env, rt, seen) = flushed_scan_runtime(&server, error_body(503, "unavailable")).await;
+    let started = Instant::now();
+    run_scan_and_spool_workers(&rt, &server).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let got = statuses(&server).await;
+    assert_eq!(
+        got.iter().find(|(i, _)| i == JOB).unwrap().1["status"],
+        "succeeded"
+    );
+    assert_eq!(*seen.lock().unwrap(), [3]);
+    assert_eq!(rt.lock_spool().status().batches.0, 3);
+    assert_eq!(metric(&rt, "scan_status_before_flush_total"), 1.0);
+}
+
+#[tokio::test]
+async fn scan_status_does_not_wait_for_a_parked_findings_endpoint() {
+    let server = MockServer::start().await;
+    let (_env, rt, seen) = flushed_scan_runtime(&server, not_implemented(Some("3600"))).await;
+    // The default bound (2 min) would time the test out: the park ends the
+    // wait instead.
+    let started = Instant::now();
+    run_scan_and_spool_workers(&rt, &server).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(*seen.lock().unwrap(), [3]);
+    assert!(rt.endpoint_parked(true));
+    assert_eq!(metric(&rt, "scan_status_before_flush_total"), 1.0);
+}
+
+#[tokio::test]
+async fn scan_status_does_not_wait_without_a_spool_worker() {
+    let server = MockServer::start().await;
+    let (_env, rt, seen) = flushed_scan_runtime(&server, ResponseTemplate::new(202)).await;
+    let started = Instant::now();
+    run_queued_scans(&rt).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(*seen.lock().unwrap(), [3]);
+    assert!(sent_batches(&server).await.is_empty());
+}
+
+// ------------------------------------------------ concurrent target checks
+
+/// `check()` per target: targets named `hung-*` never answer; the others
+/// answer once every one of them is checking at the same time (a barrier:
+/// sequential checks would never get past it).
+struct Mixed(tokio::sync::Barrier);
+
+#[async_trait::async_trait]
+impl Connector for Mixed {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        if target.id.starts_with("hung-") {
+            return std::future::pending().await;
+        }
+        self.0.wait().await;
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Limited,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+/// `env.config` with its target copied under each of `ids`, each with an
+/// account of its own, or the `shared` one for ids starting `shared-`.
+fn with_targets(env: &Env, ids: &[&str]) -> AgentConfig {
+    let mut config = env.config.clone();
+    let template = config.targets[0].clone();
+    config.targets = ids
+        .iter()
+        .map(|id| {
+            let mut t = template.clone();
+            t.id = (*id).to_owned();
+            t.account = if id.starts_with("shared-") {
+                "shared".to_owned()
+            } else {
+                (*id).to_owned()
+            };
+            t
+        })
+        .collect();
+    config
+}
+
+/// Takes 200 ms per `check()`; records the most checks of the `shared`
+/// account running at once.
+#[derive(Default)]
+struct Turns {
+    running: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Turns {
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        let shared = target.account == "shared";
+        if shared {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if shared {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::None,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+}
+
+struct SharedTurns(Arc<Turns>);
+
+#[async_trait::async_trait]
+impl Connector for SharedTurns {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        self.0.check(target).await
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn targets_sharing_an_account_are_checked_one_at_a_time() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let ids = ["shared-a", "own-a", "shared-b", "own-b", "shared-c"];
+    let config = with_targets(&env, &ids);
+    let turns = Arc::new(Turns::default());
+    let mut rt = Runtime::new(
+        &env.config_path,
+        config.clone(),
+        vec![Box::new(SharedTurns(Arc::clone(&turns)))],
+    )
+    .unwrap();
+    // Room for two 200 ms checks of the shared account, not three.
+    rt.check_timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let statuses = rt.target_statuses(&config).await;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    // ADR-0018 connection budget: one check per account at a time.
+    assert_eq!(turns.most.load(Ordering::SeqCst), 1);
+    let got: Vec<(&str, bool, Option<FailureCode>)> = statuses
+        .iter()
+        .map(|s| (s.target_id.as_str(), s.reachable, s.last_error))
+        .collect();
+    // Other accounts run next to them; the third check of the shared
+    // account is still waiting for its turn at the deadline.
+    assert_eq!(
+        got,
+        [
+            ("shared-a", true, None),
+            ("own-a", true, None),
+            ("shared-b", true, None),
+            ("own-b", true, None),
+            ("shared-c", false, Some(FailureCode::Timeout)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_target_checks_run_concurrently_within_one_bound() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let ids = [
+        "hung-a", "ok-a", "hung-b", "ok-b", "hung-c", "ok-c", "hung-d", "ok-d",
+    ];
+    let config = with_targets(&env, &ids);
+    let mut rt = Runtime::new(
+        &env.config_path,
+        config.clone(),
+        vec![Box::new(Mixed(tokio::sync::Barrier::new(4)))],
+    )
+    .unwrap();
+    rt.check_timeout = Duration::from_millis(400);
+    let started = Instant::now();
+    let statuses = rt.target_statuses(&config).await;
+    let elapsed = started.elapsed();
+    // One bound for all targets: sequential checks would take at least
+    // 4 x 400 ms (and the barrier would never open).
+    assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+    // In the declared order, each with its own result.
+    let got: Vec<(&str, bool, Option<FailureCode>)> = statuses
+        .iter()
+        .map(|s| (s.target_id.as_str(), s.reachable, s.last_error))
+        .collect();
+    let expected: Vec<(&str, bool, Option<FailureCode>)> = ids
+        .iter()
+        .map(|id| {
+            if id.starts_with("hung-") {
+                (*id, false, Some(FailureCode::Timeout))
+            } else {
+                (*id, true, None)
+            }
+        })
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn a_heartbeat_is_never_held_longer_than_one_check_bound() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    let ids: Vec<String> = (0..16).map(|i| format!("hung-{i}")).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let config = with_targets(&env, &ids);
+    let mut rt = Runtime::new(
+        &env.config_path,
+        config,
+        vec![Box::new(Mixed(tokio::sync::Barrier::new(1)))],
+    )
+    .unwrap();
+    rt.check_timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    rt.heartbeat_once().await.unwrap();
+    let elapsed = started.elapsed();
+    // 16 hung targets: 16 x 300 ms sequentially, one bound concurrently.
+    assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    let bodies = heartbeat_bodies(&server.received_requests().await.unwrap());
+    let targets = bodies[0]["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 16);
+    assert!(targets.iter().all(|t| t["last_error"] == "timeout"));
+}

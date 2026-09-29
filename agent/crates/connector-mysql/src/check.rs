@@ -26,9 +26,16 @@
 //! column privilege other than `SELECT`, `SELECT` on the `mysql` or `sys`
 //! database, `SELECT` on `performance_schema` while no Audit stream runs
 //! for the target (ADR-0018: the statement text of every session, only
-//! granted for Audit), and roles (whose privileges are not listed). `init_connect`
-//! (SQL run at every login) is reported. Coverage: views and tables of
-//! engines that are not sampled.
+//! granted for Audit). The same rules apply to the privileges held through
+//! roles (P4-D): every role applicable to the account (granted directly,
+//! through another role, as MySQL mandatory role or MariaDB default role),
+//! enabled or not, since the account can enable any of them itself. Their
+//! privileges come from `SHOW GRANTS` (see [`role_privileges`]); a role
+//! that cannot be evaluated is reported as such (on MariaDB, every role
+//! but the default role: MariaDB shows no other role's grants to a
+//! least-privilege account). `init_connect` (SQL run at
+//! every login) is reported. Coverage: views and tables of engines that are
+//! not sampled.
 //!
 //! The detailed report is recomputed at most every [`REPORT_INTERVAL`] per
 //! target and logged when it changes; the reachability and the audit level
@@ -55,6 +62,7 @@ use crate::catalog::{self, Coverage, EngineSkip};
 use crate::conn::{Flavor, Rows, Session, Timeouts};
 use crate::discover::normalize;
 use crate::error::{MyError, Stage};
+use crate::grants::{self as grant_lines, Line, Scope};
 use crate::sql;
 
 /// Statement timeout of `check()` queries.
@@ -65,6 +73,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
 pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 /// Most names listed in a log line.
 const MAX_LOGGED_NAMES: usize = 20;
+/// Most roles named in the MySQL `SHOW GRANTS … USING` statement; with
+/// more, the roles are reported as not evaluated.
+const MAX_EVALUATED_ROLES: usize = 16;
 
 /// Audit prerequisites.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -320,7 +331,14 @@ pub(crate) struct Grants {
     /// (database, privilege, grantable) at database, table and column
     /// level.
     pub(crate) scoped: Vec<(String, String, bool)>,
-    pub(crate) roles: i64,
+    /// Roles applicable to the account.
+    pub(crate) roles: u64,
+    /// Of them, the roles whose privileges could not be read or understood
+    /// (their privileges are unknown).
+    pub(crate) roles_unevaluated: u64,
+    /// A grant with `WITH GRANT OPTION` / `WITH ADMIN OPTION` that is not
+    /// in the lists above (a role, or `USAGE`).
+    pub(crate) other_grantable: bool,
 }
 
 /// A privilege name as a closed label: `[A-Z ]{1,40}` (server constants,
@@ -339,6 +357,50 @@ fn label(privilege: &str) -> String {
     }
 }
 
+/// Whether a database name from a grant covers the database `name`.
+///
+/// Database-level grants are stored as `LIKE` patterns: `_` and `%` are
+/// wildcards unless escaped with `\` (`performance\_schema`, `%`, `mysq_`
+/// and `m%` all cover a system database). The comparison is a `LIKE`
+/// match, case-insensitive, with `\` escapes; it over-reports on purpose
+/// for a name that is literal on the server (a table-level grant, or a
+/// database grant with `partial_revokes` ON), never under-reports.
+pub(crate) fn db_matches(pattern: &str, name: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum P {
+        Char(char),
+        One,
+        Any,
+    }
+    let mut p = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        p.push(match c {
+            '\\' => match chars.next() {
+                Some(e) => P::Char(e),
+                None => P::Char('\\'),
+            },
+            '_' => P::One,
+            '%' => P::Any,
+            c => P::Char(c),
+        });
+    }
+    let n: Vec<char> = name.chars().collect();
+    // `m[i][j]`: the first `i` pattern items match the first `j` chars.
+    let mut m = vec![vec![false; n.len() + 1]; p.len() + 1];
+    m[0][0] = true;
+    for i in 1..=p.len() {
+        for j in 0..=n.len() {
+            m[i][j] = match p[i - 1] {
+                P::Any => m[i - 1][j] || (j > 0 && m[i][j - 1]),
+                P::One => j > 0 && m[i - 1][j - 1],
+                P::Char(c) => j > 0 && m[i - 1][j - 1] && c.eq_ignore_ascii_case(&n[j - 1]),
+            };
+        }
+    }
+    m[p.len()][n.len()]
+}
+
 /// Evaluates over-privilege. Returns (over-privileged, expected) closed
 /// labels for the logs, and the same as closed notes; with the
 /// extended-variant flag, a global `SELECT` is expected.
@@ -355,7 +417,7 @@ pub(crate) fn evaluate_privileges(
     let mut expected = Vec::new();
     let mut notes = Vec::new();
     let mut global: BTreeSet<String> = BTreeSet::new();
-    let mut grantable = false;
+    let mut grantable = g.other_grantable;
     for (p, gr) in &g.global {
         grantable |= *gr;
         let p = p.to_ascii_uppercase();
@@ -397,10 +459,10 @@ pub(crate) fn evaluate_privileges(
         grantable |= *gr;
         let p = p.to_ascii_uppercase();
         if p == "SELECT" {
-            if db.eq_ignore_ascii_case("mysql") || db.eq_ignore_ascii_case("sys") {
+            if db_matches(db, "mysql") || db_matches(db, "sys") {
                 system_select = true;
             }
-            if db.eq_ignore_ascii_case("performance_schema") {
+            if db_matches(db, "performance_schema") {
                 ps_select = true;
             }
         } else {
@@ -443,14 +505,13 @@ pub(crate) fn evaluate_privileges(
         over.push("WITH GRANT OPTION".to_owned());
         notes.push(TargetNote::new(NoteCode::PrivilegeGrantOption));
     }
-    if g.roles > 0 {
+    if g.roles_unevaluated > 0 {
         over.push(format!(
-            "granted {} role(s) (their privileges are not evaluated)",
-            g.roles
+            "granted {} role(s), {} of them not evaluated (their privileges are unknown)",
+            g.roles, g.roles_unevaluated
         ));
         notes.push(
-            TargetNote::new(NoteCode::PrivilegeRolesNotEvaluated)
-                .with_count(g.roles.unsigned_abs()),
+            TargetNote::new(NoteCode::PrivilegeRolesNotEvaluated).with_count(g.roles_unevaluated),
         );
     }
     (over, expected, notes)
@@ -862,7 +923,10 @@ fn summary(r: &Report) -> Vec<String> {
         out.push(format!("extended variant: {}", r.expected.join(", ")));
     }
     if r.privileges_unknown {
-        out.push("privileges not evaluated (account name not matched)".to_owned());
+        out.push(
+            "privileges not evaluated (account name not matched, or a privilege list incomplete)"
+                .to_owned(),
+        );
     }
     if r.init_connect {
         out.push("init_connect is set: SQL runs at every agent login".to_owned());
@@ -951,6 +1015,21 @@ async fn optional(session: &mut Session, statement: &str) -> Result<Option<Rows>
     }
 }
 
+/// Like [`optional`], for reads that must see every row: `Some(None)`
+/// when a row was skipped (a value not UTF-8), so the caller treats the
+/// result as not understood.
+async fn optional_complete(
+    session: &mut Session,
+    statement: &str,
+) -> Result<Option<Option<Rows>>, MyError> {
+    match session.query_counted(Stage::Check, statement).await {
+        Ok((rows, 0)) => Ok(Some(Some(rows))),
+        Ok(_) => Ok(Some(None)),
+        Err(e) if !e.fatal => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn cell(rows: &Rows, row: usize, col: usize) -> Option<&str> {
     rows.get(row)?.get(col)?.as_deref()
 }
@@ -1030,6 +1109,148 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
     Ok(p)
 }
 
+/// Adds the privileges held through roles to `grants` (P4-D).
+///
+/// `information_schema` shows the privileges of the account itself only;
+/// without a grant on the `mysql` database, the account can read those of
+/// its roles through `SHOW GRANTS` only:
+/// - MySQL: `SHOW GRANTS FOR CURRENT_USER() USING <roles>` with the roles
+///   granted to the account itself and the mandatory roles; the server
+///   expands the roles those grant.
+/// - MariaDB: `SHOW GRANTS FOR CURRENT_ROLE`, the only role whose grants
+///   MariaDB shows without `SELECT` on `mysql`: the default role enabled at
+///   login. Every other applicable role is reported as not evaluated.
+///
+/// Read-only statements, bounded like every `check()` statement: at most
+/// [`MAX_EVALUATED_ROLES`] roles (MySQL), rows and bytes capped by
+/// `Session::query`, cancelled with `KILL QUERY` when the `check()` bound
+/// drops them (MySQL's `max_execution_time` does not apply to `SHOW`).
+/// Role names are written into the statement only after an allow-list
+/// check (`sql::show_grants_using`). A role whose grants cannot be read (a
+/// refused name, a server error, a line the parser does not understand) is
+/// counted in `roles_unevaluated`; on MySQL, where one statement covers
+/// every role, all of them are.
+async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
+    match session.flavor() {
+        Flavor::Mysql => mysql_role_privileges(session, grants).await,
+        Flavor::Mariadb => mariadb_role_privileges(session, grants).await,
+    }
+}
+
+async fn mysql_role_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
+    // No such table before MySQL 8.0.19: the roles are not known.
+    let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MYSQL).await? else {
+        return Ok(());
+    };
+    // A row skipped or a list cut: some roles are unknown.
+    let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
+    let rows = read.unwrap_or_default();
+    let mut all: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut using: BTreeSet<(String, String)> = BTreeSet::new();
+    for row in &rows {
+        let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let role = (v(0), v(1));
+        grants.other_grantable |= v(2) == "YES";
+        if v(3) == "YES" || v(4) == "1" {
+            using.insert(role.clone());
+        }
+        all.insert(role);
+    }
+    grants.roles = all.len() as u64;
+    if !complete {
+        // At least one role more than listed.
+        grants.roles += 1;
+        grants.roles_unevaluated = grants.roles;
+        return Ok(());
+    }
+    if all.is_empty() {
+        return Ok(());
+    }
+    let using: Vec<(String, String)> = using.into_iter().collect();
+    let mut evaluated = false;
+    if using.len() <= MAX_EVALUATED_ROLES {
+        if let Some(statement) = sql::show_grants_using(&using) {
+            if let Some(Some(rows)) = optional_complete(session, &statement).await? {
+                evaluated = merge_grant_lines(&rows, grants);
+            }
+        }
+    }
+    if !evaluated {
+        grants.roles_unevaluated = grants.roles;
+    }
+    Ok(())
+}
+
+async fn mariadb_role_privileges(
+    session: &mut Session,
+    grants: &mut Grants,
+) -> Result<(), MyError> {
+    let Some(read) = optional_complete(session, sql::APPLICABLE_ROLES_MARIADB).await? else {
+        return Ok(());
+    };
+    // A row skipped or a list cut: some roles are unknown.
+    let complete = read.as_ref().is_some_and(|r| r.len() <= sql::MAX_ROLE_ROWS);
+    let rows = read.unwrap_or_default();
+    let mut roles: BTreeSet<String> = BTreeSet::new();
+    for row in &rows {
+        let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        grants.other_grantable |= v(1) == "YES";
+        roles.insert(v(0));
+    }
+    grants.roles = roles.len() as u64;
+    if !complete {
+        grants.roles += 1;
+        grants.roles_unevaluated = grants.roles;
+        return Ok(());
+    }
+    if roles.is_empty() {
+        return Ok(());
+    }
+    // Only the session's current role (the default role) is readable; the
+    // other applicable roles, including those it grants, are counted as not
+    // evaluated (never assumed harmless).
+    let current = optional(session, sql::CURRENT_ROLE)
+        .await?
+        .and_then(|r| cell(&r, 0, 0).map(str::to_owned));
+    let mut evaluated = false;
+    if current.as_ref().is_some_and(|c| roles.contains(c)) {
+        if let Some(Some(rows)) = optional_complete(session, sql::SHOW_GRANTS_CURRENT_ROLE).await? {
+            evaluated = merge_grant_lines(&rows, grants);
+        }
+    }
+    grants.roles_unevaluated = grants.roles - u64::from(evaluated);
+    Ok(())
+}
+
+/// Adds the privileges of `SHOW GRANTS` rows to `grants`; `false` when a
+/// line is not understood (its privileges are then unknown).
+fn merge_grant_lines(rows: &Rows, grants: &mut Grants) -> bool {
+    let mut understood = true;
+    for row in rows {
+        let line = row.first().and_then(|v| v.as_deref());
+        match line.and_then(grant_lines::parse_line) {
+            None => understood = false,
+            Some(Line::Ignored) => {}
+            Some(Line::Roles { grantable }) => grants.other_grantable |= grantable,
+            Some(Line::Privileges {
+                privileges,
+                scope,
+                grantable,
+            }) => {
+                for p in privileges {
+                    match &scope {
+                        Scope::Global => grants.global.push((p, grantable)),
+                        Scope::Proxy => grants.global.push(("PROXY".to_owned(), grantable)),
+                        Scope::Database(_) if p == "USAGE" => grants.other_grantable |= grantable,
+                        Scope::Database(db) => grants.scoped.push((db.clone(), p, grantable)),
+                    }
+                }
+            }
+        }
+    }
+    understood
+}
+
 async fn report(
     session: &mut Session,
     extended: bool,
@@ -1044,28 +1265,31 @@ async fn report(
     let mut grants = Grants::default();
     let mut privileges_unknown = !matchable;
     if matchable {
-        let global = probe(session, sql::USER_PRIVILEGES).await?;
-        // Every account has at least `USAGE`: no row means no match.
-        privileges_unknown = global.is_empty();
+        let (global, skipped) = session
+            .query_counted(Stage::Check, sql::USER_PRIVILEGES)
+            .await?;
+        // Every account has at least `USAGE`: no row means no match. A row
+        // skipped (not UTF-8) or a list cut at its `LIMIT` leaves the
+        // privileges unknown (fail closed).
+        privileges_unknown = global.is_empty() || skipped > 0 || global.len() >= 1000;
         for row in &global {
             let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
             grants.global.push((v(0), v(1) == "YES"));
         }
-        for statement in [
-            sql::SCHEMA_PRIVILEGES,
-            sql::TABLE_PRIVILEGES,
-            sql::COLUMN_PRIVILEGES,
+        for (statement, limit) in [
+            (sql::SCHEMA_PRIVILEGES, 10_000),
+            (sql::TABLE_PRIVILEGES, 100_000),
+            (sql::COLUMN_PRIVILEGES, 100_000),
         ] {
-            for row in &probe(session, statement).await? {
+            let (rows, skipped) = session.query_counted(Stage::Check, statement).await?;
+            privileges_unknown |= skipped > 0 || rows.len() >= limit;
+            for row in &rows {
                 let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
                 grants.scoped.push((v(0), v(1), v(2) == "YES"));
             }
         }
     }
-    grants.roles = optional(session, sql::ROLES)
-        .await?
-        .and_then(|r| cell(&r, 0, 0).and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+    role_privileges(session, &mut grants).await?;
     let init_connect = optional(session, sql::INIT_CONNECT)
         .await?
         .is_some_and(|r| truthy(cell(&r, 0, 0)));
@@ -1112,7 +1336,7 @@ mod tests {
         let grants = Grants {
             global: vec![g("USAGE")],
             scoped: vec![s("hr", "SELECT"), s("performance_schema", "SELECT")],
-            roles: 0,
+            ..Grants::default()
         };
         // performance_schema is the Audit grant while Audit runs...
         assert_eq!(
@@ -1138,7 +1362,7 @@ mod tests {
         let hr_only = Grants {
             global: vec![g("USAGE")],
             scoped: vec![s("hr", "SELECT")],
-            roles: 0,
+            ..Grants::default()
         };
         assert_eq!(
             evaluate_privileges(&hr_only, false, false, false),
@@ -1152,7 +1376,7 @@ mod tests {
         let grants = Grants {
             global: vec![g("SELECT"), g("PROCESS"), g("SHOW VIEW")],
             scoped: vec![s("performance_schema", "SELECT")],
-            roles: 0,
+            ..Grants::default()
         };
         let (over, expected, notes) = evaluate_privileges(&grants, false, true, false);
         assert_eq!(over.len(), 2, "{over:?}");
@@ -1206,7 +1430,7 @@ mod tests {
         let grants = Grants {
             global: names.iter().map(|n| g(n)).collect(),
             scoped: vec![],
-            roles: 0,
+            ..Grants::default()
         };
         let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
         assert_registered(&notes);
@@ -1232,7 +1456,9 @@ mod tests {
                 s("mysql", "SELECT"),
                 s("hr", "weird-SECRET"),
             ],
-            roles: 2,
+            roles: 3,
+            roles_unevaluated: 2,
+            other_grantable: false,
         };
         let (over, _, notes) = evaluate_privileges(&grants, true, true, false);
         assert_registered(&notes);
@@ -1253,11 +1479,219 @@ mod tests {
             "SELECT on the mysql or sys system database",
             "privileges beyond SELECT on databases / tables / columns: EXECUTE, INSERT, OTHER",
             "WITH GRANT OPTION",
-            "granted 2 role(s) (their privileges are not evaluated)",
+            "granted 3 role(s), 2 of them not evaluated (their privileges are unknown)",
         ] {
             assert!(over.iter().any(|o| o == label), "{label}: {over:?}");
         }
         assert!(!over.iter().any(|o| o.contains("SECRET")));
+    }
+
+    fn rows(lines: &[&str]) -> Rows {
+        lines.iter().map(|l| vec![Some((*l).to_owned())]).collect()
+    }
+
+    #[test]
+    fn role_privileges_are_evaluated_like_direct_ones() {
+        // MySQL `SHOW GRANTS FOR CURRENT_USER() USING …`: the account's own
+        // grants, its role grants, and the privileges of the roles.
+        let mut grants = Grants {
+            global: vec![g("USAGE")],
+            scoped: vec![s("hr", "SELECT")],
+            roles: 2,
+            ..Grants::default()
+        };
+        assert!(merge_grant_lines(
+            &rows(&[
+                "GRANT USAGE ON *.* TO `databastion`@`%`",
+                "GRANT SELECT ON `hr`.* TO `databastion`@`%`",
+                "GRANT INSERT, UPDATE ON `hr`.* TO `databastion`@`%`",
+                "GRANT SELECT ON `mysql`.`user` TO `databastion`@`%`",
+                "GRANT PROCESS ON *.* TO `databastion`@`%`",
+                "GRANT `app_read`@`%`,`app_write`@`%` TO `databastion`@`%`",
+                "REVOKE INSERT ON `hr`.`t` FROM `databastion`@`%`",
+            ]),
+            &mut grants
+        ));
+        let (over, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_registered(&notes);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "privilege.global_privileges", "count": 1, "labels": ["process"]},
+                {"code": "privilege.system_database_select"},
+                {"code": "privilege.beyond_select", "count": 2, "labels": ["insert", "update"]}
+            ])
+        );
+        // Every role evaluated: no "not evaluated" note.
+        assert!(!over.iter().any(|o| o.contains("role")), "{over:?}");
+
+        // A role granting SELECT on the application database only (the
+        // ADR-0018 minimal variant through a role) is not over-privilege.
+        let mut grants = Grants {
+            roles: 1,
+            ..Grants::default()
+        };
+        assert!(merge_grant_lines(
+            &rows(&[
+                "GRANT USAGE ON *.* TO `app_read`",
+                "GRANT SELECT ON `support`.* TO `app_read`",
+                "GRANT SELECT (`id`) ON `support`.`t` TO `app_read`",
+            ]),
+            &mut grants
+        ));
+        assert_eq!(
+            evaluate_privileges(&grants, false, false, false),
+            (vec![], vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn grant_and_admin_options_through_roles_are_reported() {
+        for lines in [
+            &["GRANT SELECT ON `hr`.* TO `r` WITH GRANT OPTION"][..],
+            &["GRANT USAGE ON `hr`.* TO `r` WITH GRANT OPTION"],
+            &["GRANT `nested` TO `r` WITH ADMIN OPTION"],
+            &["GRANT PROXY ON ``@`` TO `r` WITH GRANT OPTION"],
+        ] {
+            let mut grants = Grants {
+                roles: 1,
+                ..Grants::default()
+            };
+            assert!(merge_grant_lines(&rows(lines), &mut grants));
+            let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+            assert_registered(&notes);
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.code() == NoteCode::PrivilegeGrantOption),
+                "{lines:?}: {notes:?}"
+            );
+        }
+        // Admin option from `APPLICABLE_ROLES.IS_GRANTABLE`.
+        let grants = Grants {
+            roles: 1,
+            other_grantable: true,
+            ..Grants::default()
+        };
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.grant_option"}])
+        );
+    }
+
+    #[test]
+    fn roles_that_cannot_be_evaluated_are_reported() {
+        // A line the parser does not understand: the output is not trusted
+        // to be complete.
+        let mut grants = Grants {
+            roles: 1,
+            ..Grants::default()
+        };
+        assert!(!merge_grant_lines(
+            &rows(&[
+                "GRANT SELECT ON `hr`.* TO `r`",
+                "GRANT SELECT ON `a`.`b`.`c` TO `r`",
+            ]),
+            &mut grants
+        ));
+        assert!(!merge_grant_lines(&vec![vec![None]], &mut grants));
+        grants.roles_unevaluated = 1;
+        let (over, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.roles_not_evaluated", "count": 1}])
+        );
+        assert_eq!(
+            over,
+            ["granted 1 role(s), 1 of them not evaluated (their privileges are unknown)"]
+        );
+        // Nothing from the server text reaches the notes.
+        let mut grants = Grants::default();
+        assert!(merge_grant_lines(
+            &rows(&["GRANT SECRET_marker ON `hr_secret`.* TO `r`"]),
+            &mut grants
+        ));
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        let json = notes_json(&notes).to_string();
+        assert!(
+            !json.contains("secret") && !json.contains("SECRET"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn database_patterns_cover_the_system_databases() {
+        for (pattern, name) in [
+            ("mysql", "mysql"),
+            ("MySQL", "mysql"),
+            ("performance\\_schema", "performance_schema"),
+            ("performance_schema", "performance_schema"),
+            ("%", "mysql"),
+            ("%", "sys"),
+            ("mysq_", "mysql"),
+            ("m%", "mysql"),
+            ("%_schema", "performance_schema"),
+            ("s_s", "sys"),
+            ("\\%", "%"),
+        ] {
+            assert!(db_matches(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("hr", "mysql"),
+            ("mysql\\_", "mysql"),
+            ("my\\%", "mysql"),
+            ("\\_ys", "sys"),
+            ("mysq", "mysql"),
+            ("mysql_", "mysql"),
+            ("", "sys"),
+            ("h%", "sys"),
+        ] {
+            assert!(!db_matches(pattern, name), "{pattern} {name}");
+        }
+    }
+
+    #[test]
+    fn select_through_a_database_pattern_is_reported() {
+        for (db, codes) in [
+            (
+                "%",
+                &[
+                    "privilege.system_database_select",
+                    "privilege.performance_schema_without_audit",
+                ][..],
+            ),
+            ("m%", &["privilege.system_database_select"]),
+            ("mysq_", &["privilege.system_database_select"]),
+            (
+                "performance\\_schema",
+                &["privilege.performance_schema_without_audit"],
+            ),
+            ("hr\\_%", &[]),
+        ] {
+            let grants = Grants {
+                scoped: vec![s(db, "SELECT")],
+                ..Grants::default()
+            };
+            let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+            assert_registered(&notes);
+            let got: Vec<&str> = notes.iter().map(|n| n.code().as_str()).collect();
+            assert_eq!(got, codes, "{db}");
+        }
+        // The same through a role's `SHOW GRANTS` line.
+        let mut grants = Grants {
+            roles: 1,
+            ..Grants::default()
+        };
+        assert!(merge_grant_lines(
+            &rows(&["GRANT SELECT ON `performance\\_schema`.* TO `r`"]),
+            &mut grants
+        ));
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([{"code": "privilege.performance_schema_without_audit"}])
+        );
     }
 
     /// A note as the console receives it: `code`, `count`, `labels` only.

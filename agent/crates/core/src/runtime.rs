@@ -309,6 +309,10 @@ struct Counters {
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
+    /// Scans whose terminal status was sent while some of their findings
+    /// batches were still spooled (flush wait elapsed, or `/findings`
+    /// parked).
+    scan_status_before_flush: AtomicU64,
 }
 
 /// Capacity of the event channel between a connector and the core.
@@ -390,6 +394,14 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Scans queued at most; more are left unacknowledged and redelivered.
 const MAX_QUEUED_SCANS: usize = 16;
 
+/// Longest wait, after a scan ends, for the console to acknowledge the
+/// scan's findings batches before its terminal status is sent (P2-G). A
+/// job capped at 50 000 findings makes 250 batches of 200; at the usual
+/// round trip they leave well within it. Past it the status is sent anyway:
+/// the batches stay durably spooled, and the console accepts them for 24 h
+/// after the terminal status (docs/09, "Console-side checks on findings").
+const STATUS_FLUSH_WAIT: Duration = Duration::from_secs(120);
+
 fn bump(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
 }
@@ -432,6 +444,21 @@ struct Runtime {
     audits: Mutex<AuditTable>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
+    /// Longest wait for a scan's findings to be acknowledged before its
+    /// terminal status ([`STATUS_FLUSH_WAIT`]; lowered in tests).
+    status_flush_wait: Duration,
+    /// Whether the spool worker runs (it always does under `run`): without
+    /// it nothing sends the spool, so a terminal status never waits.
+    spool_worker: std::sync::atomic::AtomicBool,
+    /// Woken after every spool send attempt (a scan waiting for its
+    /// findings to be acknowledged re-checks the spool).
+    spool_changed: tokio::sync::Notify,
+    /// Wakes an idle spool worker when a batch is spooled.
+    spool_pushed: tokio::sync::Notify,
+    /// The spool worker's last send attempt ended in a retry backoff
+    /// (console unreachable, `5xx`, `429`…): a terminal status is then not
+    /// held for the findings.
+    spool_backing_off: std::sync::atomic::AtomicBool,
 }
 
 /// A result endpoint parked after a `501` (not implemented by this
@@ -594,6 +621,11 @@ impl Runtime {
             check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_changed: tokio::sync::Notify::new(),
+            status_flush_wait: STATUS_FLUSH_WAIT,
+            spool_worker: std::sync::atomic::AtomicBool::new(false),
+            spool_changed: tokio::sync::Notify::new(),
+            spool_pushed: tokio::sync::Notify::new(),
+            spool_backing_off: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -629,67 +661,120 @@ impl Runtime {
 
     // ------------------------------------------------------------ heartbeat
 
+    /// Target statuses of a heartbeat, from each connector's `check()`.
+    ///
+    /// The checks run **concurrently**, under one deadline of
+    /// `check_timeout` ([`CHECK_TIMEOUT`]) from the start of the heartbeat:
+    /// the heartbeat waits at most one `check_timeout` for all targets,
+    /// whatever their number (at most `MAX_TARGETS`) and however many are
+    /// slow or hung (P2-G: sequential checks delayed it by up to N x 10 s
+    /// and could raise a false `agent.silent`). A check still running, or
+    /// still waiting for its turn, at the deadline is dropped and reported
+    /// unreachable with `timeout` and `check.timed_out`; the connectors
+    /// cancel their statements server-side when dropped.
+    ///
+    /// Targets reaching the same account (engine family, host or socket,
+    /// port, account) are checked **one at a time**: a check may hold two
+    /// connections (its session and a `KILL QUERY` one), and ADR-0018 sizes
+    /// the MySQL / MariaDB `MAX_USER_CONNECTIONS` for one check next to a
+    /// scan. Targets naming the same server differently (an alias, an IP
+    /// and a name) are not recognized as the same.
+    ///
+    /// Chosen over a cache refreshed in the background: every heartbeat
+    /// still reports what was checked for it (no stale reachability or
+    /// audit level), no extra task or lifecycle is needed, and the bound is
+    /// the same.
     async fn target_statuses(&self, config: &AgentConfig) -> Vec<TargetStatus> {
-        let mut out = Vec::with_capacity(config.targets.len());
-        for target in &config.targets {
-            let Ok(target_id) = TargetId::try_from(target.id.as_str()) else {
-                continue; // validated by config; unreachable in practice
-            };
-            let connector = self
-                .connectors
-                .iter()
-                .find(|c| c.engine() == target.engine.connector());
-            let (reachable, level, last_error, notes) = match connector {
-                None => (
+        type Account = (Engine, Option<String>, Option<u16>, Option<PathBuf>, String);
+        let deadline = tokio::time::Instant::now() + self.check_timeout;
+        let mut turns: std::collections::HashMap<Account, Arc<tokio::sync::Mutex<()>>> =
+            std::collections::HashMap::new();
+        let checks = config
+            .targets
+            .iter()
+            .filter_map(|target| {
+                // Validated by config; unreachable in practice.
+                let target_id = TargetId::try_from(target.id.as_str()).ok()?;
+                let account = (
+                    target.engine.connector(),
+                    target.host.as_ref().map(|h| h.to_ascii_lowercase()),
+                    target.port,
+                    target.socket.clone(),
+                    target.account.clone(),
+                );
+                let turn = Arc::clone(turns.entry(account).or_default());
+                Some(self.target_status(target, target_id, turn, deadline))
+            })
+            .collect::<Vec<_>>();
+        futures_util::future::join_all(checks).await
+    }
+
+    /// One target's status (see [`target_statuses`](Self::target_statuses)).
+    async fn target_status(
+        &self,
+        target: &crate::config::TargetConfig,
+        target_id: TargetId,
+        turn: Arc<tokio::sync::Mutex<()>>,
+        deadline: tokio::time::Instant,
+    ) -> TargetStatus {
+        let connector = self
+            .connectors
+            .iter()
+            .find(|c| c.engine() == target.engine.connector());
+        let (reachable, level, last_error, notes) = match connector {
+            None => (
+                false,
+                AuditLevel::None,
+                Some(FailureCode::Unsupported),
+                Vec::new(),
+            ),
+            Some(c) => match tokio::time::timeout_at(deadline, async {
+                let _turn = turn.lock().await;
+                c.check(target).await
+            })
+            .await
+            {
+                Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
+                Err(_) => (
                     false,
                     AuditLevel::None,
-                    Some(FailureCode::Unsupported),
-                    Vec::new(),
+                    Some(FailureCode::Timeout),
+                    vec![TargetNote::new(NoteCode::CheckTimedOut)],
                 ),
-                Some(c) => match tokio::time::timeout(self.check_timeout, c.check(target)).await {
-                    Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
-                    Err(_) => (
-                        false,
-                        AuditLevel::None,
-                        Some(FailureCode::Timeout),
-                        vec![TargetNote::new(NoteCode::CheckTimedOut)],
-                    ),
-                },
-            };
-            let audit_source = match connector {
-                Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
-                    serde_json::from_value::<databastion_protocol::AuditSource>(
-                        serde_json::Value::from(s.as_str()),
-                    )
-                    .ok()
-                }),
-                _ => None,
-            };
-            // Closed notes from the connector's `check()`, sent only when the
-            // console's latest heartbeat response listed `target_status.notes`
-            // (ADR-0022): an older console rejects the whole heartbeat otherwise.
-            let notes = if self
-                .console_caps
-                .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
-            {
-                crate::notes::to_protocol(&notes)
-            } else {
-                Vec::new()
-            };
-            out.push(TargetStatus {
-                audit_level: proto_audit_level(level),
-                audit_source,
-                edition: None,
-                engine: proto_engine(target.engine),
-                last_error,
-                metrics: None,
-                notes,
-                reachable,
-                server_version: None,
-                target_id,
-            });
+            },
+        };
+        let audit_source = match connector {
+            Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
+                serde_json::from_value::<databastion_protocol::AuditSource>(
+                    serde_json::Value::from(s.as_str()),
+                )
+                .ok()
+            }),
+            _ => None,
+        };
+        // Closed notes from the connector's `check()`, sent only when the
+        // console's latest heartbeat response listed `target_status.notes`
+        // (ADR-0022): an older console rejects the whole heartbeat otherwise.
+        let notes = if self
+            .console_caps
+            .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
+        {
+            crate::notes::to_protocol(&notes)
+        } else {
+            Vec::new()
+        };
+        TargetStatus {
+            audit_level: proto_audit_level(level),
+            audit_source,
+            edition: None,
+            engine: proto_engine(target.engine),
+            last_error,
+            metrics: None,
+            notes,
+            reachable,
+            server_version: None,
+            target_id,
         }
-        out
     }
 
     fn metrics(&self) -> MetricsMap {
@@ -728,6 +813,10 @@ impl Runtime {
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
+            (
+                "scan_status_before_flush_total",
+                &c.scan_status_before_flush,
+            ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1031,10 +1120,22 @@ impl Runtime {
         for batch in &built.batches {
             spool.push(batch)?;
         }
+        drop(spool);
+        self.spool_pushed.notify_one();
         Ok(())
     }
 
     async fn spool_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
+        /// Clears `spool_worker` however the loop ends.
+        struct Running<'a>(&'a Runtime);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.spool_worker.store(false, Ordering::Relaxed);
+                self.0.spool_changed.notify_waiters();
+            }
+        }
+        self.spool_worker.store(true, Ordering::Relaxed);
+        let _running = Running(self);
         let mut state = self.state.subscribe();
         let mut failures: u32 = 0;
         loop {
@@ -1047,19 +1148,26 @@ impl Runtime {
                     _ = shutdown.changed() => continue,
                 }
             }
-            let delay = match self.flush_once(failures.saturating_add(1)).await? {
+            let flushed = self.flush_once(failures.saturating_add(1)).await;
+            self.spool_backing_off
+                .store(matches!(flushed, Ok(Flush::Retry(_))), Ordering::Relaxed);
+            // A scan waiting for its findings re-checks the spool.
+            self.spool_changed.notify_waiters();
+            let (delay, idle) = match flushed? {
                 Flush::Progress => {
                     failures = 0;
                     continue;
                 }
-                Flush::Idle => Duration::from_secs(2),
+                Flush::Idle => (Duration::from_secs(2), true),
                 Flush::Retry(d) => {
                     failures = failures.saturating_add(1);
-                    d
+                    (d, false)
                 }
             };
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
+                // A new batch ends an idle wait (never a retry backoff).
+                () = self.spool_pushed.notified(), if idle => {}
                 _ = shutdown.changed() => {}
             }
         }
@@ -1676,6 +1784,8 @@ impl Runtime {
                 );
             }
         }
+        drop(spool);
+        self.spool_pushed.notify_one();
     }
 
     /// Filters and spools what the aggregator holds.
@@ -1925,16 +2035,101 @@ impl Runtime {
         }
     }
 
-    /// Runs one prepared scan and reports its outcome.
+    /// Runs one prepared scan and reports its outcome, after the scan's
+    /// findings batches have been acknowledged (P2-G, see
+    /// [`await_findings_sent`](Self::await_findings_sent)).
     async fn run_prepared_scan(
         &self,
         prepared: PreparedScan,
         shutdown: impl std::future::Future<Output = ()>,
     ) {
+        use futures_util::FutureExt as _;
         let id = prepared.id;
-        let outcome = self.discovery_scan(prepared, shutdown).await;
+        // Fused: polled again after the scan, it stays pending once it has
+        // fired (the scan then ends `cancelled`, which skips the wait).
+        let shutdown = shutdown.fuse();
+        tokio::pin!(shutdown);
+        // Scans run one at a time and only scans spool findings: the
+        // findings batches spooled between these two readings are this
+        // job's (their splits and resends keep the sequence number).
+        let first = self.lock_spool().next_seq();
+        let outcome = self.discovery_scan(prepared, shutdown.as_mut()).await;
+        let seqs = first..self.lock_spool().next_seq();
+        if outcome.error != Some(FailureCode::Cancelled) {
+            self.await_findings_sent(id, &seqs, shutdown.as_mut()).await;
+        }
         self.lock_scans().in_flight.remove(&id);
         self.finish(id, outcome).await;
+    }
+
+    /// Holds a scan's terminal status until the console has answered every
+    /// findings batch of the scan (P2-G): the spool worker removes a batch
+    /// on its `BatchAck` (or drops it on a contract rejection), so a status
+    /// never overtakes the findings it concludes. The findings are already
+    /// durably spooled when this runs; the wait is only about ordering, and
+    /// it is bounded:
+    /// - at most `status_flush_wait` ([`STATUS_FLUSH_WAIT`]);
+    /// - not at all without a running spool worker, nor for a cancelled
+    ///   scan (shutdown or suspension: nothing is sent meanwhile);
+    /// - it ends when `/findings` is parked after a `501`, when the spool
+    ///   worker's last attempt ended in a retry backoff (console
+    ///   unreachable, `5xx`, `429`: queued scans are not held for an
+    ///   outage), when the agent stops being active, and on shutdown.
+    ///
+    /// Past these bounds the status is sent anyway and counted
+    /// (`scan_status_before_flush_total`); the batches stay spooled and are
+    /// sent later (the console accepts them for 24 h after the status).
+    async fn await_findings_sent(
+        &self,
+        id: Uuid,
+        seqs: &std::ops::Range<u64>,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
+        let pending = || self.lock_spool().findings_pending(seqs);
+        if seqs.is_empty() || pending() == 0 {
+            return;
+        }
+        let wait = async {
+            loop {
+                let changed = self.spool_changed.notified();
+                tokio::pin!(changed);
+                // Registered before the checks: a send completing in
+                // between still wakes this loop.
+                changed.as_mut().enable();
+                if pending() == 0 {
+                    return true;
+                }
+                // No point holding the status while the console does not
+                // take batches: parked `/findings`, or the spool worker in
+                // a retry backoff (console down: the status report would
+                // wait on it too, and queued scans behind it).
+                if !self.spool_worker.load(Ordering::Relaxed)
+                    || self.endpoint_parked(true)
+                    || self.spool_backing_off.load(Ordering::Relaxed)
+                {
+                    return false;
+                }
+                tokio::select! {
+                    () = changed => {}
+                    // Re-check the park and the worker even without a send.
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        };
+        let flushed = tokio::select! {
+            r = tokio::time::timeout(self.status_flush_wait, wait) => r.unwrap_or(false),
+            () = self.inactive() => false,
+            () = shutdown => false,
+        };
+        if !flushed {
+            bump(&self.counters.scan_status_before_flush, 1);
+            tracing::warn!(
+                job_id = %id,
+                batches = pending(),
+                "scan status sent before all of its findings batches were acknowledged; \
+                 they stay spooled"
+            );
+        }
     }
 
     /// Resolves once the agent leaves [`RunState::Active`] (suspension
