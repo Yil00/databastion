@@ -126,8 +126,11 @@ Heuristic signals are evadable by design.
   their own text.
 - **Objects**: from the table records (`server_audit` `TABLE`,
   `audit_log_filter` `table_access`) when present, otherwise from the text
-  (the legacy `audit_log` and `performance_schema` log no table). An
-  unqualified name is in the statement's current database. A name holding
+  (the legacy `audit_log` and `performance_schema` log no table), for reads
+  and writes only: DDL and DCL events take no name from the text (it can
+  hold program bodies, such as MySQL JavaScript routines, that the SQL
+  lexer does not delimit). An unqualified name is in the statement's
+  current database. A name holding
   a dot is sent as `*` (as in Discovery). A text that does not lex (cut at
   the server's limit, an ambiguous `sql_mode` reading) and `CALL` are
   reported against `*`. Under `ANSI_QUOTES`, a `"…"` name is not read
