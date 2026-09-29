@@ -43,13 +43,13 @@ lives in `tmpfs`) and `no-new-privileges`.
    private temporary directory,
    write `agent.yaml`. The agent connects to the target as `databastion_agent` (minimal
    variant of [ADR-0012](../docs/adr/0012-postgresql-agent-grants.md): `LOGIN`, no superuser /
-   createdb / createrole / replication / bypassrls, `CONNECTION LIMIT 4`, `CONNECT`,
+   createdb / createrole / replication / bypassrls, `CONNECTION LIMIT 5`, `CONNECT`,
    `pg_read_all_stats`, role defaults `default_transaction_read_only = on` and statement / lock /
    idle-in-transaction timeouts; Discovery grants `USAGE` + `SELECT` on `crm`, `billing`, `ops`
    and default privileges, after the seed: I4); the superuser password never leaves `target-pg`.
    The MySQL / MariaDB agents connect as `databastion`, the [ADR-0018](../docs/adr/0018-mysql-mariadb-grants-and-connector.md)
    minimal variant as the dev scripts create it ([ADR-0020](../docs/adr/0020-mysql-mariadb-connector-as-merged.md)):
-   `SELECT` on the application database only, `REQUIRE SSL`, `MAX_USER_CONNECTIONS 4` (MariaDB:
+   `SELECT` on the application database only, `REQUIRE SSL`, `MAX_USER_CONNECTIONS 5` (MariaDB:
    `MAX_STATEMENT_TIME 30`); root passwords stay in the targets.
    Before anything starts, the I2 scanner's positive control checks, per engine, that every
    searchable value of the ground truth is visible in the committed seed.
@@ -78,7 +78,7 @@ lives in `tmpfs`) and `no-new-privileges`.
    Targets `mysql-e2e` and `mariadb-e2e` must be `reachable` too (`tls: verify_full` with the
    pinned test CA; audit level `none` without a `performance_schema` grant, printed only). As
    root in each target: the grants of `databastion` are exactly `USAGE ON *.*` and
-   `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 4` (MariaDB
+   `SELECT ON <db>.*`, with `ssl_type = ANY`, `max_user_connections = 5` (MariaDB
    `max_statement_time = 30`), no role and no other `databastion` account; it logs in over TLS
    and is refused without TLS (error 1045).
 6. Audit setup (P4-D), through the user API as a user would: an e-mail channel to Mailpit

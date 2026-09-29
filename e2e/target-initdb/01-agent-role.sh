@@ -5,7 +5,7 @@
 # grant variant of ADR-0012 (docs/adr/0012-postgresql-agent-grants.md).
 #
 # databastion_agent: LOGIN, no superuser / createdb / createrole / replication / bypassrls,
-# CONNECTION LIMIT 4; CONNECT on the database and pg_read_all_stats (Audit: other users'
+# CONNECTION LIMIT 5; CONNECT on the database and pg_read_all_stats (Audit: other users'
 # statements in pg_stat_statements / pg_stat_activity). Role defaults, a safety net only (the
 # client can override them; the connector sets its own values in each transaction): read-only
 # transactions, statement / lock / idle-in-transaction timeouts. Never pg_read_all_data nor
@@ -29,7 +29,7 @@ SET pg_stat_statements.track_utility = off;
 SET log_min_error_statement = panic;
 \set agent_password `cat /run/secrets/target_agent_password`
 CREATE ROLE databastion_agent LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
-  CONNECTION LIMIT 4 PASSWORD :'agent_password';
+  CONNECTION LIMIT 5 PASSWORD :'agent_password';
 \unset agent_password
 ALTER ROLE databastion_agent SET default_transaction_read_only = on;
 ALTER ROLE databastion_agent SET statement_timeout = '30s';

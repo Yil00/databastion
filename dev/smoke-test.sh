@@ -29,9 +29,9 @@ check "read-only account cannot write" must_fail ex postgres "$PSQL -c 'DELETE F
 check "read-only account cannot read pg_authid / pg_user_mapping" ex postgres \
   "$PSQL -c \"SELECT has_table_privilege('pg_catalog.pg_authid', 'SELECT')
      OR has_table_privilege('pg_catalog.pg_user_mapping', 'SELECT')\" | grep -qx f"
-check "read-only account attributes (no superuser / createdb / createrole / replication / bypassrls, limit 4)" \
+check "read-only account attributes (no superuser / createdb / createrole / replication / bypassrls, limit 5)" \
   ex postgres "$PSQL -c \"SELECT concat_ws(',', rolsuper, rolcreatedb, rolcreaterole, rolreplication,
-     rolbypassrls, rolconnlimit) FROM pg_roles WHERE rolname = current_user\" | grep -qx 'f,f,f,f,f,4'"
+     rolbypassrls, rolconnlimit) FROM pg_roles WHERE rolname = current_user\" | grep -qx 'f,f,f,f,f,5'"
 check "read-only account role defaults (read-only, timeouts)" ex postgres \
   "$PSQL -c \"SELECT current_setting('default_transaction_read_only') = 'on'
      AND current_setting('statement_timeout')::interval = '30s'
