@@ -97,7 +97,8 @@ struct Row {
     event: u64,
     timer_end: u64,
     schema: String,
-    text: Option<Zeroizing<String>>,
+    /// Raw bytes (analyzed by `query::analyze_raw`).
+    text: Option<Zeroizing<Vec<u8>>>,
     /// The text may have been cut at the server's limit.
     truncated: bool,
     rows: u64,
@@ -179,6 +180,12 @@ impl PsPoller {
         })
     }
 
+    /// The agent's address as the server sees it (refreshed at each
+    /// re-probe).
+    pub(crate) fn set_own_addr(&mut self, addr: Option<ClientAddr>) {
+        self.builder.set_own_addr(addr);
+    }
+
     /// Re-attaches the poller to a new session (reconnection): the
     /// cursor is kept, the own thread is read again.
     pub(crate) async fn reattach(&mut self, session: &mut Session) -> Result<(), MyError> {
@@ -223,14 +230,9 @@ impl PsPoller {
                 else {
                     return Flow::Continue;
                 };
-                let digest =
-                    get(4).map(|d| Zeroizing::new(String::from_utf8_lossy(d).into_owned()));
-                let (body, is_digest) = match digest {
-                    Some(d) => (Some(d), true),
-                    None => (
-                        get(5).map(|t| Zeroizing::new(String::from_utf8_lossy(t).into_owned())),
-                        false,
-                    ),
+                let (body, is_digest) = match get(4) {
+                    Some(d) => (Some(Zeroizing::new(d.to_vec())), true),
+                    None => (get(5).map(|t| Zeroizing::new(t.to_vec())), false),
                 };
                 let limit = if is_digest { digest_limit } else { text_limit };
                 let body = body.filter(|t| t.len() <= MAX_TEXT_BYTES);
@@ -245,7 +247,11 @@ impl PsPoller {
                     event,
                     timer_end,
                     schema: text(get(3), 1024).unwrap_or_default(),
-                    truncated: body.as_ref().is_some_and(|t| t.len() + 4 >= limit),
+                    // At the server's limit, or a digest the server cut
+                    // (it ends with `...`).
+                    truncated: body.as_ref().is_some_and(|t| {
+                        t.len() + 4 >= limit || (is_digest && t.ends_with(b"..."))
+                    }),
                     text: body,
                     rows: num(get(6)).unwrap_or(0).max(num(get(7)).unwrap_or(0)),
                     errno: num(get(8)).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
@@ -353,7 +359,8 @@ impl PsPoller {
                     client: ClientSeen::Logged(client),
                     application: info.as_ref().and_then(|i| i.program.as_deref()),
                     database: &r.schema,
-                    text: r.text.as_deref().map(String::as_str),
+                    text: r.text.as_deref().map(Vec::as_slice),
+                    opaque: false,
                     truncated: r.truncated,
                     tables: Vec::new(),
                     rows: Some(r.rows),

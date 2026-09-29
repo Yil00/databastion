@@ -45,7 +45,7 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze,
+    AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze_raw,
 };
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
 
@@ -62,8 +62,18 @@ pub(crate) const LARGE_ROWS: u64 = 10_000;
 const MAX_SESSIONS: usize = 4096;
 /// Tables remembered per session (`SHOW CREATE TABLE`).
 const MAX_SESSION_RELATIONS: usize = 256;
+/// Longest table or database name remembered from `SHOW CREATE TABLE`.
+const MAX_SHOWN_NAME_CHARS: usize = 64;
 /// Server errors of a statement it could not parse: the text is not SQL.
 const PARSE_ERRORS: [u32; 2] = [1064, 1149];
+/// Server errors raised before a statement reads anything: unknown
+/// database / table / column (1049, 1051, 1054, 1109, 1146), ambiguous or
+/// duplicate names (1052, 1066), access denied (1044, 1142, 1143, 1227,
+/// 1370), unknown routine (1305). A failed statement with another error
+/// may have sent rows before it failed, and is reported.
+const PRE_EXECUTION_ERRORS: [u32; 13] = [
+    1044, 1049, 1051, 1052, 1054, 1066, 1109, 1142, 1143, 1146, 1227, 1305, 1370,
+];
 
 fn analyze_opts(truncated: bool) -> AnalyzeOptions {
     let mut o = AnalyzeOptions::mysql().truncated(truncated);
@@ -130,34 +140,65 @@ struct SessionState {
     program: Option<String>,
 }
 
-/// Sessions followed for the dump patterns, bounded.
+/// Sessions followed for the dump patterns, bounded: at most
+/// [`MAX_SESSIONS`] states, oldest evicted first. The eviction queue holds
+/// (key, generation) pairs; a removed or re-created session leaves a stale
+/// pair behind, skipped at eviction and dropped by a compaction once the
+/// queue reaches twice the bound.
 #[derive(Default)]
 pub(crate) struct Sessions {
-    map: HashMap<String, SessionState>,
-    order: VecDeque<String>,
+    map: HashMap<String, (SessionState, u64)>,
+    order: VecDeque<(String, u64)>,
+    generation: u64,
 }
 
 impl Sessions {
+    fn live(&self, key: &str, generation: u64) -> bool {
+        self.map.get(key).is_some_and(|(_, g)| *g == generation)
+    }
+
+    fn compact(&mut self) {
+        if self.order.len() >= 2 * MAX_SESSIONS {
+            let map = &self.map;
+            self.order
+                .retain(|(k, g)| map.get(k).is_some_and(|(_, live)| live == g));
+        }
+    }
+
     fn entry(&mut self, key: &str) -> &mut SessionState {
         if !self.map.contains_key(key) {
             if self.map.len() >= MAX_SESSIONS {
-                while let Some(old) = self.order.pop_front() {
-                    if self.map.remove(&old).is_some() {
+                while let Some((old, g)) = self.order.pop_front() {
+                    if self.live(&old, g) {
+                        self.map.remove(&old);
                         break;
                     }
                 }
             }
-            self.order.push_back(key.to_owned());
+            self.generation += 1;
+            self.order.push_back((key.to_owned(), self.generation));
+            self.compact();
         }
-        self.map.entry(key.to_owned()).or_default()
+        let generation = self.generation;
+        &mut self
+            .map
+            .entry(key.to_owned())
+            .or_insert_with(|| (SessionState::default(), generation))
+            .0
     }
 
     fn get(&self, key: &str) -> Option<&SessionState> {
-        self.map.get(key)
+        self.map.get(key).map(|(s, _)| s)
     }
 
     fn remove(&mut self, key: &str) {
         self.map.remove(key);
+        self.compact();
+    }
+
+    #[cfg(test)]
+    fn sizes(&self) -> (usize, usize) {
+        (self.map.len(), self.order.len())
     }
 }
 
@@ -173,7 +214,11 @@ pub(crate) struct Access<'a> {
     pub(crate) application: Option<&'a str>,
     /// Current database of the statement.
     pub(crate) database: &'a str,
-    pub(crate) text: Option<&'a str>,
+    /// Statement text as raw bytes (never decoded lossily for analysis).
+    pub(crate) text: Option<&'a [u8]>,
+    /// The text is only good for its statement kind (see
+    /// `records::FileRecord::opaque`).
+    pub(crate) opaque: bool,
     pub(crate) truncated: bool,
     /// Table-access records of the statement.
     pub(crate) tables: Vec<(&'a str, &'a str, TableOp)>,
@@ -216,7 +261,11 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
             ["lock", "tables" | "table", ..] => s.snapshot = true,
             ["show", "create", "table", ..] => {
                 for r in &p.relations {
-                    if s.shown.len() < MAX_SESSION_RELATIONS {
+                    let short = r.name.chars().count() <= MAX_SHOWN_NAME_CHARS
+                        && r.schema
+                            .as_deref()
+                            .is_none_or(|s| s.chars().count() <= MAX_SHOWN_NAME_CHARS);
+                    if short && s.shown.len() < MAX_SESSION_RELATIONS {
                         s.shown.insert(r.clone());
                     }
                 }
@@ -243,9 +292,21 @@ impl EventBuilder {
         }
     }
 
+    /// The agent's address as the server sees it, refreshed at each
+    /// re-probe of the source.
+    pub(crate) fn set_own_addr(
+        &mut self,
+        addr: Option<databastion_classifiers::masking::ClientAddr>,
+    ) {
+        self.own.set_addr(addr);
+    }
+
     /// The event of one statement, if any (see the module documentation).
     pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
-        let analysis: Option<QueryAnalysis> = a.text.map(|t| analyze(t, analyze_opts(a.truncated)));
+        let opaque = a.opaque || a.text.is_some_and(|t| std::str::from_utf8(t).is_err());
+        let analysis: Option<QueryAnalysis> = a
+            .text
+            .map(|t| analyze_raw(t, analyze_opts(a.truncated).opaque(a.opaque)));
         let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
         let parsed = !parts.is_empty();
         if let Some(app) = a.application {
@@ -254,11 +315,18 @@ impl EventBuilder {
                 s.program = Some(app.to_owned());
             }
         }
-        note_utility(self.sessions.entry(&a.session), parts);
+        if a.status == 0 {
+            note_utility(self.sessions.entry(&a.session), parts);
+        }
         let outfile = parts.iter().any(|p| p.outfile);
-        if a.status != 0 && (PARSE_ERRORS.contains(&a.status) || !outfile) {
-            self.failed += 1;
-            return None;
+        // A failed statement is skipped only when it failed before reading
+        // anything (and sent no row); an INTO OUTFILE attempt is kept.
+        if a.status != 0 && a.rows.unwrap_or(0) == 0 {
+            let pre = PRE_EXECUTION_ERRORS.contains(&a.status) && !outfile;
+            if PARSE_ERRORS.contains(&a.status) || pre {
+                self.failed += 1;
+                return None;
+            }
         }
         let lead0 = parts
             .first()
@@ -289,7 +357,12 @@ impl EventBuilder {
             StatementKind::Ddl => EventAction::Ddl,
             StatementKind::Dcl => EventAction::Dcl,
             _ if call => EventAction::Read,
-            _ => table_action?,
+            _ => match (table_action, opaque) {
+                (Some(t), _) => t,
+                // A text that cannot be read: reported against `*`.
+                (None, true) => EventAction::Read,
+                (None, false) => return None,
+            },
         };
         let rw = matches!(action, EventAction::Read | EventAction::Write);
         let mut objects: Vec<(String, String)> = Vec::new();
@@ -492,7 +565,8 @@ impl EventBuilder {
             client: ClientSeen::Logged(client),
             application: program.as_deref(),
             database: query.map_or(first.database.as_str(), |q| q.database.as_str()),
-            text: text_record.and_then(|r| r.text.as_deref().map(String::as_str)),
+            text: text_record.and_then(|r| r.text.as_deref().map(Vec::as_slice)),
+            opaque: text_record.is_some_and(|r| r.opaque),
             truncated: text_record.is_some_and(|r| r.truncated),
             tables,
             rows: None,
@@ -514,7 +588,7 @@ fn same_statement(g: &FileRecord, r: &FileRecord) -> bool {
         && match (g.query_id, r.query_id) {
             (Some(a), Some(b)) => a == b,
             (None, None) => match (&g.text, &r.text) {
-                (Some(a), Some(b)) => a.as_str() == b.as_str(),
+                (Some(a), Some(b)) => a.as_slice() == b.as_slice(),
                 _ => false,
             },
             _ => false,
@@ -767,7 +841,8 @@ mod tests {
                 client: ClientSeen::Logged(None),
                 application: None,
                 database: "support",
-                text: Some("select a from `escalations_jean.richard@example.com` where x = 1"),
+                text: Some(b"select a from `escalations_jean.richard@example.com` where x = 1"),
+                opaque: false,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(20_000),
@@ -794,6 +869,107 @@ mod tests {
             ]),
         );
         assert_eq!(out, ["ddl [] None []", "ddl [] None []"], "{out:#?}");
+    }
+
+    #[test]
+    fn sessions_stay_bounded_across_connect_disconnect_cycles() {
+        let mut b = EventBuilder::new(own());
+        for c in 0..100_000u64 {
+            let recs = sa(&[
+                &format!("20260929 09:40:35,h,app,10.0.0.9,{c},0,CONNECT,shop,,0"),
+                &format!("20260929 09:40:35,h,app,10.0.0.9,{c},0,DISCONNECT,shop,,0"),
+            ]);
+            b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now());
+            let (map, order) = b.sessions.sizes();
+            assert!(
+                map <= MAX_SESSIONS && order <= 2 * MAX_SESSIONS,
+                "{map} {order}"
+            );
+        }
+        // Sessions that never disconnect are evicted oldest first.
+        let mut s = Sessions::default();
+        for c in 0..3 * MAX_SESSIONS {
+            s.entry(&format!("t{c}")).snapshot = true;
+            s.remove(&format!("t{}", c / 2));
+            let (map, order) = s.sizes();
+            assert!(
+                map <= MAX_SESSIONS && order <= 2 * MAX_SESSIONS,
+                "{map} {order}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_statements_are_skipped_only_before_execution() {
+        let q = |id: u64, text: &str, status: u32| {
+            format!(
+                "20260929 09:40:35,h,app,10.0.0.7,30,{id},QUERY,hr,'{}',{status}",
+                text.replace('\'', "\\'")
+            )
+        };
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa(&[
+                // Unknown table, access denied, syntax: nothing was read.
+                &q(1, "select * from nope", 1146),
+                &q(2, "select * from employees", 1142),
+                &q(3, "selec * from employees", 1064),
+                // Killed or timed out while sending rows: reported.
+                &q(4, "select email from employees where id > 0", 3024),
+                &q(5, "select email from employees where id > 0", 1317),
+                // A failed statement records no session state.
+                &q(6, "SHOW CREATE TABLE `employees`", 1146),
+                &q(7, "select * from employees", 0),
+            ]),
+        );
+        assert_eq!(
+            out,
+            [
+                "read [\"hr.employees\"] None []",
+                "read [\"hr.employees\"] None []",
+                "read [\"hr.employees\"] None [\"shape.full_table_read\"]",
+            ],
+            "{out:#?}"
+        );
+        assert_eq!(b.failed, 4);
+        // performance_schema: rows were sent before the error, even an
+        // access error: reported.
+        let ev = b.statement(
+            Access {
+                session: "t9".into(),
+                user: "app",
+                principal: EventPrincipal::account("app"),
+                client: ClientSeen::Logged(None),
+                application: None,
+                database: "hr",
+                text: Some(b"select email from employees where id > 0"),
+                opaque: false,
+                truncated: false,
+                tables: Vec::new(),
+                rows: Some(99),
+                status: 1142,
+                ts: SystemTime::now(),
+                source: EventSource::PerformanceSchema,
+            },
+            SystemTime::now(),
+        );
+        assert_eq!(ev.unwrap().rows(), Some(99));
+    }
+
+    #[test]
+    fn unreadable_texts_are_reported_against_a_wildcard() {
+        let mut b = EventBuilder::new(own());
+        // gbk trail byte 0x5c after 0xbf: the text keeps its kind only.
+        let mut line = b"20260929 09:40:35,h,app,10.0.0.7,30,1,QUERY,hr,'select \\'\xbf\\\\\\' , 1 from t where x = \\' from payroll.S3cr3t \\'',0".to_vec();
+        let recs = vec![parse_server_audit(&line, 0, 1024).unwrap()];
+        let out = file(&mut b, recs);
+        assert_eq!(out, ["read [\"hr.*\"] None []"], "{out:#?}");
+        // An escape the format does not define: kept, against `*`.
+        line = br"20260929 09:40:35,h,app,10.0.0.7,30,2,QUERY,hr,'SET @x = \q',0".to_vec();
+        let r = parse_server_audit(&line, 0, 1024).unwrap();
+        assert!(r.opaque);
+        assert_eq!(file(&mut b, vec![r]), ["read [\"hr.*\"] None []"]);
     }
 
     #[test]

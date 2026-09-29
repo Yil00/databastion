@@ -14,8 +14,14 @@
 //! `server_audit` line: `YYYYMMDD HH:MM:SS,serverhost,user,host,connid,
 //! queryid,OPERATION,database,object,retcode`, the time in the server's
 //! local time zone; `object` is the table of a table event, or the
-//! statement quoted with `'` and the escapes `\'`, `\\`, `\n`, `\r`
-//! (any other escape fails closed: the text is dropped).
+//! statement quoted with `'` and the escapes `\'`, `\\`, `\n`, `\r`,
+//! `\t`, `\b` and `\f`. Any other escape keeps the record, with a text
+//! that is only used for its statement kind (the event names `*`).
+//!
+//! Statement texts are kept as raw bytes: bytes that are not UTF-8 (a
+//! client in a legacy character set) make the text opaque (kind only), and
+//! JSON records that are not UTF-8 are parsed from a lossy decoding with
+//! their text opaque, rather than dropped.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -62,7 +68,12 @@ pub(crate) struct FileRecord {
     pub(crate) database: String,
     /// `(database, table)` of a table-access record.
     pub(crate) table: Option<(String, String)>,
-    pub(crate) text: Option<Zeroizing<String>>,
+    /// Statement text as raw bytes (analyzed by `query::analyze_raw`).
+    pub(crate) text: Option<Zeroizing<Vec<u8>>>,
+    /// The text is not in a form the lexer can trust (an unknown
+    /// `server_audit` escape, JSON bytes that were not UTF-8): only its
+    /// statement kind is used.
+    pub(crate) opaque: bool,
     /// The text may have been cut by the server
     /// (`server_audit_query_log_limit`).
     pub(crate) truncated: bool,
@@ -164,26 +175,45 @@ fn json_time(raw: &str) -> Option<SystemTime> {
     )?)
 }
 
-/// Unescapes a `server_audit` quoted statement starting at `s[0] == '\''`.
-/// Returns the text and the rest after the closing quote; `None` when the
-/// quote is not closed or an unknown escape is met.
-fn server_audit_text(s: &str) -> Option<(Zeroizing<String>, &str)> {
-    let b = s.as_bytes();
+/// A `server_audit` quoted statement, unescaped.
+struct QuotedText<'a> {
+    text: Zeroizing<Vec<u8>>,
+    /// An escape this format does not define was met: the text is kept
+    /// raw, for its statement kind only.
+    opaque: bool,
+    /// Bytes between the quotes, as written (escaped).
+    escaped_len: usize,
+    rest: &'a [u8],
+}
+
+/// Unescapes a `server_audit` quoted statement starting at `b[0] == '\''`.
+/// MariaDB escapes `'`, `\`, newline, carriage return, tab, backspace and
+/// form feed. `None` when the quote is not closed.
+fn server_audit_text(b: &[u8]) -> Option<QuotedText<'_>> {
     if b.first() != Some(&b'\'') {
         return None;
     }
-    let mut out = Zeroizing::new(Vec::with_capacity(s.len()));
+    let mut out = Zeroizing::new(Vec::with_capacity(b.len()));
+    let mut opaque = false;
     let mut i = 1;
     loop {
         match *b.get(i)? {
             b'\\' => {
-                out.push(match *b.get(i + 1)? {
-                    b'\\' => b'\\',
-                    b'\'' => b'\'',
-                    b'n' => b'\n',
-                    b'r' => b'\r',
-                    _ => return None,
-                });
+                let next = *b.get(i + 1)?;
+                match next {
+                    b'\\' => out.push(b'\\'),
+                    b'\'' => out.push(b'\''),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    other => {
+                        opaque = true;
+                        out.push(b'\\');
+                        out.push(other);
+                    }
+                }
                 i += 2;
             }
             b'\'' => break,
@@ -193,37 +223,45 @@ fn server_audit_text(s: &str) -> Option<(Zeroizing<String>, &str)> {
             }
         }
     }
-    let text = Zeroizing::new(String::from_utf8_lossy(&out).into_owned());
-    Some((text, s.get(i + 1..)?))
+    Some(QuotedText {
+        text: out,
+        opaque,
+        escaped_len: i - 1,
+        rest: b.get(i + 1..)?,
+    })
+}
+
+fn lossy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
 }
 
 /// Parses one `server_audit` line. `utc_offset`: seconds the server's
 /// local time is ahead of UTC; `query_limit`: `server_audit_query_log_limit`
-/// (a text reaching it may be cut).
+/// (a text reaching it may be cut). The statement text is kept as raw
+/// bytes (never decoded lossily for analysis); names are decoded lossily.
 pub(crate) fn parse_server_audit(
     line: &[u8],
     utc_offset: i64,
     query_limit: usize,
 ) -> Option<FileRecord> {
-    let line = std::str::from_utf8(line)
-        .ok()
-        .map(std::borrow::Cow::Borrowed)
-        .unwrap_or_else(|| String::from_utf8_lossy(line));
-    let (ts, rest) = line.split_once(',')?;
-    let ts = server_audit_time(ts, utc_offset);
-    let (_serverhost, rest) = rest.split_once(',')?;
+    let comma = |b: &u8| *b == b',';
+    let mut head = line.splitn(3, comma);
+    let ts = server_audit_time(&lossy(head.next()?), utc_offset);
+    let _serverhost = head.next()?;
+    let rest = head.next()?;
     // `user,host,connid,queryid,OP,` — the user may hold commas: find the
     // first `,host,<digits>,<digits>,<OP>,` sequence.
-    let fields: Vec<&str> = rest.splitn(64, ',').collect();
+    let fields: Vec<&[u8]> = rest.splitn(64, comma).collect();
+    let digits = |f: &[u8]| !f.is_empty() && f.iter().all(u8::is_ascii_digit);
+    let op_at = |f: &[u8]| std::str::from_utf8(f).ok().and_then(op_of);
     let k = (1..fields.len().saturating_sub(4)).find(|&k| {
-        let digits = |f: &str| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit());
-        digits(fields[k + 1]) && digits(fields[k + 2]) && op_of(fields[k + 3]).is_some()
+        digits(fields[k + 1]) && digits(fields[k + 2]) && op_at(fields[k + 3]).is_some()
     })?;
-    let user = bounded(&fields[..k].join(","))?;
-    let host = bounded(fields[k])?;
-    let connection: u64 = fields[k + 1].parse().ok()?;
-    let query_id: u64 = fields[k + 2].parse().ok()?;
-    let op = op_of(fields[k + 3])?;
+    let user = bounded(&lossy(&fields[..k].join(&b',')))?;
+    let host = bounded(&lossy(fields[k]))?;
+    let connection: u64 = std::str::from_utf8(fields[k + 1]).ok()?.parse().ok()?;
+    let query_id: u64 = std::str::from_utf8(fields[k + 2]).ok()?.parse().ok()?;
+    let op = op_at(fields[k + 3])?;
     // Everything after `OP,`.
     let consumed: usize = fields[..=k + 3].iter().map(|f| f.len() + 1).sum();
     let tail = rest.get(consumed..)?;
@@ -237,34 +275,42 @@ pub(crate) fn parse_server_audit(
         database: String::new(),
         table: None,
         text: None,
+        opaque: false,
         truncated: false,
         status: 0,
         program: None,
     };
+    let status_of =
+        |b: &[u8]| -> Option<u32> { std::str::from_utf8(b).ok()?.trim_end().parse().ok() };
     match op {
         Op::Query => {
             // `database,'text',retcode`: the database ends at the first
             // `,'` (a database name with `,'` is not supported).
-            let q = tail.find(",'")?;
-            record.database = bounded(&tail[..q])?;
-            let (text, after) = server_audit_text(&tail[q + 1..])?;
-            let status = after.strip_prefix(',')?;
-            record.status = status.trim_end().parse().ok()?;
-            record.truncated = text.len() >= query_limit.saturating_sub(4);
-            record.text = Some(text);
+            let q = tail.windows(2).position(|w| w == b",'")?;
+            record.database = bounded(&lossy(&tail[..q]))?;
+            let quoted = server_audit_text(&tail[q + 1..])?;
+            let status = quoted.rest.strip_prefix(b",")?;
+            record.status = status_of(status)?;
+            // The limit applies to the escaped text.
+            record.truncated = quoted.escaped_len >= query_limit.saturating_sub(2);
+            record.opaque = quoted.opaque;
+            record.text = Some(quoted.text);
         }
         Op::Table(_) => {
             // `database,table,` (no return code).
-            let body = tail.strip_suffix(',').unwrap_or(tail);
-            let (db, table) = body.split_once(',')?;
-            record.database = bounded(db)?;
-            record.table = Some((bounded(db)?, bounded(table)?));
+            let body = tail.strip_suffix(b",").unwrap_or(tail);
+            let c = body.iter().position(comma)?;
+            let (db, table) = (&body[..c], &body[c + 1..]);
+            record.database = bounded(&lossy(db))?;
+            record.table = Some((bounded(&lossy(db))?, bounded(&lossy(table))?));
         }
         Op::Connect | Op::FailedConnect | Op::Disconnect => {
             // `database,,retcode`
-            let (db, rest) = tail.split_once(',')?;
-            record.database = bounded(db)?;
-            let status = rest.rsplit(',').next()?.trim_end();
+            let c = tail.iter().position(comma)?;
+            record.database = bounded(&lossy(&tail[..c]))?;
+            let status = tail[c + 1..].rsplit(comma).next()?;
+            let status = lossy(status);
+            let status = status.trim_end();
             record.status = if status.is_empty() {
                 0
             } else {
@@ -391,14 +437,23 @@ struct TableAccess {
 
 /// Parses one JSON record of either layout.
 pub(crate) fn parse_json(record: &[u8]) -> Option<FileRecord> {
-    let value: serde_json::Value = serde_json::from_slice(record).ok()?;
-    if value.get("audit_record").is_some() {
+    // A client in a legacy character set writes bytes that are not UTF-8
+    // into the statement: the structure is read from a lossy decoding and
+    // the text is opaque (kind only), rather than the record dropped.
+    let (json, utf8) = match std::str::from_utf8(record) {
+        Ok(s) => (std::borrow::Cow::Borrowed(s), true),
+        Err(_) => (String::from_utf8_lossy(record), false),
+    };
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let mut parsed = if value.get("audit_record").is_some() {
         let line: LegacyLine = serde_json::from_value(value).ok()?;
         parse_legacy(line.audit_record)
     } else {
         let r: FilterRecord = serde_json::from_value(value).ok()?;
         parse_filter(r)
-    }
+    }?;
+    parsed.opaque = !utf8;
+    Some(parsed)
 }
 
 /// The login user of a legacy `Query` record: `user[priv_user] @ host
@@ -448,9 +503,10 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
         database: bounded(r.db.as_deref().unwrap_or(""))?,
         table: None,
         text: match op {
-            Op::Query => Some(Zeroizing::new(r.sqltext?)),
+            Op::Query => Some(Zeroizing::new(r.sqltext?.into_bytes())),
             _ => None,
         },
+        opaque: false,
         truncated: false,
         status,
         program: None,
@@ -474,6 +530,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
         database: String::new(),
         table: None,
         text: None,
+        opaque: false,
         truncated: false,
         status: 0,
         program: None,
@@ -500,7 +557,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
                 return None;
             }
             record.status = g.status.unwrap_or(0);
-            record.text = Some(Zeroizing::new(g.query?));
+            record.text = Some(Zeroizing::new(g.query?.into_bytes()));
         }
         ("table_access", event) => {
             let t = r.table_access_data?;
@@ -512,7 +569,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
             let db = bounded(t.db.as_deref()?)?;
             record.table = Some((db.clone(), bounded(t.table.as_deref()?)?));
             record.database = db;
-            record.text = t.query.map(Zeroizing::new);
+            record.text = t.query.map(|q| Zeroizing::new(q.into_bytes()));
         }
         _ => return None,
     }
@@ -536,9 +593,12 @@ mod tests {
         assert_eq!((r.user.as_str(), r.host.as_str()), ("root", "localhost"));
         assert_eq!(r.database, "support");
         assert_eq!(
-            r.text.as_deref().map(String::as_str),
+            r.text
+                .as_deref()
+                .map(|t| String::from_utf8_lossy(t).into_owned()),
             Some(
                 "SELECT /*!40001 SQL_NO_CACHE */ `id` FROM `tickets` WHERE a = 'x\\'y' -- c\nfrom"
+                    .to_owned()
             )
         );
         assert_eq!(r.status, 0);
@@ -592,8 +652,7 @@ mod tests {
     #[test]
     fn server_audit_texts_fail_closed() {
         for bad in [
-            &br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'select \t',0"[..],
-            br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'unterminated,0",
+            &br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'unterminated,0"[..],
             br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'x',notanumber",
             br"20260929 09:42:04,h,root,localhost,x,174,QUERY,db,'x',0",
             br"garbage",
@@ -601,20 +660,70 @@ mod tests {
         ] {
             assert!(parse_server_audit(bad, 0, 1024).is_none(), "{bad:?}");
         }
-        // A text at the limit may have been cut.
-        let long = format!(
-            "20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'select {}',0",
-            "x".repeat(1100)
+        // An escape the format does not define: the record is kept, its
+        // text only good for the statement kind.
+        let r = parse_server_audit(
+            br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'select \q from t',0",
+            0,
+            1024,
+        )
+        .unwrap();
+        assert!(r.opaque && r.text.is_some());
+        // The limit applies to the escaped text: 1022 escaped bytes (511
+        // escaped quotes) reach a 1024-byte limit.
+        let escaped = format!(
+            "20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'{}',0",
+            r"\'".repeat(511)
         );
-        assert!(
-            parse_server_audit(long.as_bytes(), 0, 1024)
-                .unwrap()
-                .truncated
-        );
+        let r = parse_server_audit(escaped.as_bytes(), 0, 1024).unwrap();
+        assert!(r.truncated);
+        assert_eq!(r.text.as_ref().map(|t| t.len()), Some(511));
+        let short = parse_server_audit(
+            br"20260929 09:42:04,h,root,localhost,51,174,QUERY,db,'select 1',0",
+            0,
+            1024,
+        )
+        .unwrap();
+        assert!(!short.truncated);
         // A bad time keeps the record without a time.
         let r =
             parse_server_audit(b"2026 bad,h,root,localhost,51,174,READ,db,t,", 0, 1024).unwrap();
         assert!(r.ts.is_none());
+    }
+
+    #[test]
+    fn server_audit_tab_backspace_and_form_feed_escapes() {
+        // A real MariaDB 11.4.13 line (dev image).
+        let line = br"20260929 11:24:12,a7eb24276602,root,localhost,1803,7166,QUERY,support,'select \'a\tb\bc\fd\', id from support.tickets where id = 1',0";
+        let r = parse_server_audit(line, 0, 1024).unwrap();
+        assert!(!r.opaque);
+        assert_eq!(
+            r.text.as_deref().map(Vec::as_slice),
+            Some(&b"select 'a\tb\x08c\x0cd', id from support.tickets where id = 1"[..])
+        );
+    }
+
+    #[test]
+    fn non_utf8_texts_are_kept_opaque() {
+        // A latin1 client: `é` written as 0xE9.
+        let mut json = br#"{"audit_record":{"name":"Query","record":"5_x","timestamp":"2026-09-29T09:45:20Z","connection_id":"11","status":0,"sqltext":"select 'caf"#.to_vec();
+        json.push(0xe9);
+        json.extend_from_slice(
+            br#"' from hr.t","user":"root[root] @  [127.0.0.1]","ip":"127.0.0.1","db":"hr"}}"#,
+        );
+        let r = parse_json(&json).unwrap();
+        assert!(r.opaque);
+        assert_eq!(r.op, Op::Query);
+        let mut line = br"20260929 09:42:04,h,root,10.0.0.1,51,174,QUERY,db,'select \'caf".to_vec();
+        line.push(0xe9);
+        line.extend_from_slice(br"\' from t',0");
+        let r = parse_server_audit(&line, 0, 1024).unwrap();
+        // Kept raw: the analyzer sees bytes that are not UTF-8.
+        assert!(
+            r.text
+                .as_deref()
+                .is_some_and(|t| std::str::from_utf8(t).is_err())
+        );
     }
 
     #[test]
@@ -628,8 +737,10 @@ mod tests {
             ("root", "127.0.0.1", "hr")
         );
         assert_eq!(
-            r.text.as_deref().map(String::as_str),
-            Some("select 'multi\nline' from hr.t")
+            r.text
+                .as_deref()
+                .map(|t| String::from_utf8_lossy(t).into_owned()),
+            Some("select 'multi\nline' from hr.t".to_owned())
         );
         assert_eq!(r.ts, at(1_790_675_120));
         let c = br#"{"audit_record":{"name":"Connect","record":"1_x","timestamp":"2026-09-29T09:45:20Z","connection_id":"12","status":1045,"user":"wrong","priv_user":"","os_login":"","proxy_user":"","host":"","ip":"127.0.0.1","db":""}}"#;

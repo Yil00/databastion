@@ -93,6 +93,12 @@ impl OwnAccount {
         }
     }
 
+    /// Replaces the agent's own address (re-read by the connector at each
+    /// re-probe of its source).
+    pub fn set_addr(&mut self, addr: Option<ClientAddr>) {
+        self.addr = addr;
+    }
+
     /// Charges `rows` to an object; `true` when its 24 h total exceeds the
     /// budget (or it cannot be tracked).
     fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
