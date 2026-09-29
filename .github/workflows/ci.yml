@@ -388,7 +388,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.e2e == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     env:
       E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
     steps:

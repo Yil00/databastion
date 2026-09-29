@@ -236,6 +236,23 @@ services:
     tmpfs: [/tmp]
     networks: [agent-net]
 
+  # One-shot MariaDB client of the Audit test (run.sh only): mariadb-dump and queries as the test
+  # accounts e2e_exporter / e2e_analyst of target-mariadb (never the agent's account), over TLS
+  # verified against the target's dev CA (copied out by run.sh). Output goes to /dev/null.
+  my-client:
+    <<: *hardening
+    profiles: [tools]
+    image: *mariadb-image
+    user: "10002:10002"
+    entrypoint: ["/bin/sh", "-euc"]
+    environment:
+      HOME: /tmp
+    secrets: [target_client_password]
+    volumes:
+      - ${E2E_WORK_DIR:?set by run.sh}/tls/mariadb-ca.pem:/etc/e2e/mariadb-ca.pem:ro
+    tmpfs: [/tmp]
+    networks: [agent-net]
+
   # MySQL / MariaDB targets: the dev images and configuration (dev/mysql, dev/mariadb, mounted
   # read-only), loaded with the committed dev seed (dev/seed/out/{mysql,mariadb}.sql, value-bearing
   # table name included). target-initdb/15-agent-password.sh reads the agent password from its
@@ -282,20 +299,30 @@ services:
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     environment:
       MARIADB_ROOT_PASSWORD_FILE: /run/secrets/root_password
+      # Files the server creates are 0640 (group mysql, gid 999): the server_audit log is readable
+      # by the agent through its supplementary group 999 only (the e2e stand-in for the production
+      # ACL of ADR-0023 "Grants and file access"; dev uses 0644).
+      UMASK: "0640"
     secrets:
       # Same in-container names in both targets (15-agent-password.sh, run.sh account checks).
       - source: target_mariadb_password
         target: root_password
       - source: target_mariadb_agent_password
         target: agent_password
+      # Audit test client roles e2e_exporter / e2e_analyst (target-initdb/35-mariadb-clients.sh).
+      - source: target_client_password
+        target: client_password
     volumes:
       - ../dev/mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
       - ../dev/seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./target-initdb/15-agent-password.sh:/docker-entrypoint-initdb.d/15-agent-password.sh:ro
       - ../dev/mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
       - ../dev/mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
-    # /var/log/databastion: server_audit file output (dev/mariadb/databastion.cnf).
-    tmpfs: [/var/lib/mysql, /run/mysqld, /tmp, /var/log/databastion]
+      - ./target-initdb/35-mariadb-clients.sh:/docker-entrypoint-initdb.d/35-mariadb-clients.sh:ro
+      # server_audit file output (dev/mariadb/databastion.cnf), read-only in the agent
+      # (mysql.audit_log); run.sh hands the volume to mysql 999:999, 0750.
+      - target-mariadb-log:/var/log/databastion
+    tmpfs: [/var/lib/mysql, /run/mysqld, /tmp]
     networks:
       agent-net:
         aliases: [mariadb]
@@ -312,7 +339,8 @@ services:
       context: ../agent
     image: ${E2E_AGENT_IMAGE:-databastion-agent:e2e}
     user: "10001:10001"
-    # gid of the target's postgres user: read access to its log files (0640), nothing else.
+    # gid of the targets' postgres and mysql users (both 999 in the pinned images): read access to
+    # their audit log files (0640), nothing else.
     group_add: ["999"]
     hostname: e2e-agent
     command: ["run", "--config", "/etc/databastion/agent.yaml"]
@@ -331,6 +359,8 @@ services:
       - ${E2E_WORK_DIR:?set by run.sh}/tls/mariadb-ca.pem:/etc/databastion/mariadb-ca.pem:ro
       # pgaudit jsonlog of target-pg (postgres.audit_log in agent.yaml), read-only.
       - target-pg-log:/var/log/target-pg:ro
+      # server_audit log of target-mariadb (mysql.audit_log in agent.yaml), read-only.
+      - target-mariadb-log:/var/log/target-mariadb:ro
     # No ports: the agent is outbound-only (I1).
     networks: [agent-net]
     depends_on:
@@ -346,8 +376,8 @@ services:
   # Test helper (run.sh only), no network. As root (CHOWN only): hands the secrets volume to
   # the agent user and checks the state volume owner / mode. As 10001: writes the enrollment
   # token and the agent's target password, received on stdin, as 0600 files; reads
-  # identity.json and checks its owner / mode. Also hands the target-pg log volume to the postgres
-# user (uid / gid 999, mode 0750) before target-pg starts.
+  # identity.json and checks its owner / mode. Also hands the target-pg and target-mariadb log volumes
+# to the postgres / mysql user (uid / gid 999 in both images, mode 0750) before the targets start.
   agent-files:
     <<: *hardening
     profiles: [tools]
@@ -360,6 +390,7 @@ services:
       - agent-state:/state
       - agent-secrets:/secrets
       - target-pg-log:/pglog
+      - target-mariadb-log:/mylog
 
 networks:
   console-net: {}
@@ -370,6 +401,7 @@ volumes:
   agent-state: {}
   agent-secrets: {}
   target-pg-log: {}
+  target-mariadb-log: {}
 
 secrets:
   db_password:

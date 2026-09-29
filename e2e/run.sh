@@ -30,8 +30,11 @@ SEED_DIR="$HERE/../dev/seed/out"
 E2E_TARGETS=("pg-e2e postgresql postgres.sql" "mysql-e2e mysql mysql.sql" "mariadb-e2e mariadb mariadb.sql")
 # Audit targets (P4-D): "<target id> <ground-truth engine> <client> <agent account> <dump signal>".
 # <client> selects the audit_client_<client> helpers below (dump, literal queries, the target's own
-# audit log). A MySQL / MariaDB case (P4-B) adds one line here and its three helpers.
-E2E_AUDIT_TARGETS=("pg-e2e postgresql pg databastion_agent signature.pg_dump")
+# audit log). MariaDB (P4-B, ADR-0023): the server_audit log file, read by the agent. MySQL
+# Community has only performance_schema, which needs a grant the minimal e2e account must not have
+# (ADR-0023 decision 3); Percona's audit_log_filter would need a fourth target (not covered here).
+E2E_AUDIT_TARGETS=("pg-e2e postgresql pg databastion_agent signature.pg_dump"
+  "mariadb-e2e mariadb my databastion signature.mysqldump")
 AUDIT_POLICY_DUMP="e2e dump signature"    # access_event policy: the target's dump signal
 AUDIT_POLICY_READS="e2e reads"            # access_event policy: every read of an Audit target
 AUDIT_CHANNEL="e2e-mail"                  # e-mail channel to Mailpit
@@ -318,6 +321,8 @@ targets:
     mysql:
       tls: verify_full
       ca_file: /etc/databastion/mariadb-ca.pem
+      # Audit (P4-D): the server_audit log, mounted read-only from the target-mariadb-log volume.
+      audit_log: {path: /var/log/target-mariadb/server_audit.log, format: server_audit}
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -375,11 +380,13 @@ files_agent() {
     --user 10001:10001 agent-files "$1"
 }
 
-# The target-pg log volume belongs to the postgres user of the target (uid / gid 999), 0750: the
-# server writes its 0640 jsonlog there, the agent reads it through its supplementary group 999.
-log "preparing the target-pg log volume (postgres 999:999, 0750)"
-files_root 'chmod 0750 /pglog && chown 999:999 /pglog && stat -c "%u:%g %a" /pglog' \
-  | grep -qx '999:999 750' || fail "cannot prepare the target-pg log volume"
+# The target-pg and target-mariadb log volumes belong to the server user of the target (postgres /
+# mysql, uid / gid 999 in both images), 0750: the servers write their 0640 audit logs there, the
+# agent reads them through its supplementary group 999.
+log "preparing the target-pg and target-mariadb log volumes (999:999, 0750)"
+# shellcheck disable=SC2016 # expanded by the container shell, on purpose
+files_root 'for d in /pglog /mylog; do chmod 0750 "$d" && chown 999:999 "$d" && stat -c "%u:%g %a" "$d"; done' \
+  | tr '\n' ' ' | grep -qx '999:999 750 999:999 750 ' || fail "cannot prepare the target log volumes"
 
 log "starting console DB, migrate, web, worker, TLS proxy, Mailpit and the target PostgreSQL, MySQL, MariaDB"
 # No `--wait`: it treats the exited one-shot `migrate` as a failure on some Compose versions.
@@ -660,16 +667,19 @@ console_sql() {
 # --------------------------------------------------------------------------- Audit clients (P4-D)
 # Per <client> of E2E_AUDIT_TARGETS: how the agent reports its Audit stream, the expected audit
 # level(s) and source, the database accesses of the test (run from a separate one-shot container,
-# never with the agent's account), and the target's own audit log (source side). A MySQL / MariaDB
-# case (P4-B) adds audit_client_my_* functions and a line in E2E_AUDIT_TARGETS.
+# never with the agent's account), and the target's own audit log (source side).
 #
 # audit_client_<c>_started        agent log message of a started Audit stream
 # audit_client_<c>_levels         heartbeat audit levels accepted once events flow (space-separated)
 # audit_client_<c>_source         heartbeat audit source expected
 # audit_client_<c>_principals     "<dump principal> <query principal>" (test roles on the target)
+# audit_client_<c>_object_sets    distinct object sets the queries read (events to wait for)
+# audit_client_<c>_query_signal   signal the query principal's events must carry, or empty
 # audit_client_<c>_dump           runs the dump tool on the whole seeded database, output discarded
-# audit_client_<c>_queries ENGINE queries whose text holds ground-truth literals, a filtered COPY
-#                                 and a whole-table COPY; prints the needle ids of the literals
+# audit_client_<c>_queries ENGINE queries whose text holds ground-truth literals (PostgreSQL: a
+#                                 filtered and a whole-table COPY too; MariaDB: a refused INTO
+#                                 OUTFILE and a CREATE USER whose password is a ground-truth value);
+#                                 prints the needle ids of the literals
 # audit_client_<c>_target_log OUT copies the target's own audit log to OUT; returns 3 when the
 #                                 source keeps no statement text (no positive control possible)
 # Client output never reaches a log: result rows go to /dev/null in the container, and errors
@@ -683,17 +693,21 @@ audit_client_pg_started() { printf '%s' "$PG_AUDIT_STARTED"; }
 audit_client_pg_levels() { printf '%s' "$PG_AUDIT_LEVELS"; }
 audit_client_pg_source() { printf '%s' "$PG_AUDIT_SOURCE"; }
 audit_client_pg_principals() { printf 'e2e_exporter e2e_analyst'; }
+audit_client_pg_object_sets() { printf 3; }  # filtered SELECT, filtered COPY, whole-table COPY
+audit_client_pg_query_signal() { printf ''; }
 audit_client_pg_dump() {
   # shellcheck disable=SC2016 # expanded by the container shell, on purpose
   pg_client 'PGPASSWORD="$(cat /run/secrets/target_client_password)" exec pg_dump -U e2e_exporter -f /dev/null' \
     </dev/null >/dev/null 2>"$E2E_WORK_DIR/client.err"
 }
-# gt_needle ENGINE CONTAINER OBJECT FIELD: "L<i>.v0<TAB><value>" of the first value of a location.
+# gt_needle ENGINE CONTAINER OBJECT FIELD [INDEX]: "L<i>.v<INDEX><TAB><value>" of a value of a
+# location (CONTAINER `-` for an engine without schemas).
 gt_needle() {
-  jq -r --arg e "$1" --arg c "$2" --arg o "$3" --arg f "$4" '.locations | to_entries[]
-    | select(.value.engine == $e and .value.container == $c and .value.object == $o
-             and .value.field == $f and ((.value.values // []) | length) > 0)
-    | "L\(.key).v0\t\(.value.values[0])"' "$GROUND_TRUTH" | head -n 1
+  jq -r --arg e "$1" --arg c "$2" --arg o "$3" --arg f "$4" --argjson n "${5:-0}" '.locations
+    | to_entries[]
+    | select(.value.engine == $e and (.value.container // "-") == $c and .value.object == $o
+             and .value.field == $f and ((.value.values // []) | length) > $n)
+    | "L\(.key).v\($n)\t\(.value.values[$n])"' "$GROUND_TRUTH" | head -n 1
 }
 audit_client_pg_queries() {
   local engine="$1" email iban email_id iban_id sql="$E2E_WORK_DIR/client.sql"
@@ -718,6 +732,71 @@ audit_client_pg_target_log() {
   [ "$E2E_PG_AUDIT" = pgaudit ] || return 3
   timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-pg \
     cat /var/log/databastion/postgresql.json >"$1"
+}
+
+# MariaDB (target-mariadb, server_audit log). The accounts e2e_exporter / e2e_analyst come from
+# target-initdb/35-mariadb-clients.sh; the client verifies the server's TLS certificate.
+my_client() {
+  timeout 300 docker compose -f "$HERE/docker-compose.yml" --profile tools run --rm -T --no-deps \
+    my-client "$1"
+}
+# my_root SQL_FILE: runs SQL (stdin) as root inside target-mariadb (password read there).
+my_root() {
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-mariadb sh -c \
+    'MYSQL_PWD="$(cat /run/secrets/root_password)" exec mariadb -h 127.0.0.1 -u root -N -B' <"$1"
+}
+audit_client_my_started() { printf 'audit source: audit log file'; }
+# File sources are Limited until the stream parsed a record, then Partial; never Full (ADR-0023).
+audit_client_my_levels() { printf 'partial'; }
+audit_client_my_source() { printf 'mariadb_server_audit'; }
+audit_client_my_principals() { printf 'e2e_exporter e2e_analyst'; }
+audit_client_my_object_sets() { printf 1; }  # support.tickets (filtered SELECTs, INTO OUTFILE)
+audit_client_my_query_signal() { printf 'signature.into_outfile'; }
+audit_client_my_dump() {
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb-dump -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_exporter --single-transaction --no-tablespaces support' \
+    </dev/null >/dev/null 2>"$E2E_WORK_DIR/client.err"
+}
+audit_client_my_queries() {
+  local engine="$1" email phone secret email_id phone_id secret_id rc sql="$E2E_WORK_DIR/client.sql"
+  IFS=$'\t' read -r email_id email < <(gt_needle "$engine" - tickets requester_email 0)
+  IFS=$'\t' read -r phone_id phone < <(gt_needle "$engine" - tickets requester_phone 0)
+  IFS=$'\t' read -r secret_id secret < <(gt_needle "$engine" - tickets requester_email 1)
+  [ -n "$email" ] && [ -n "$phone" ] && [ -n "$secret" ] \
+    || fail "no ground-truth e-mail / phone for the MariaDB literal queries"
+  # Written to the private work directory, fed on stdin: the literals are on no command line.
+  {
+    printf "SELECT * FROM tickets WHERE requester_email = '%s';\n" "${email//\'/\'\'}"
+    printf "SELECT id, subject FROM tickets WHERE requester_phone = '%s';\n" "${phone//\'/\'\'}"
+  } >"$sql"
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_analyst support' \
+    <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
+  # INTO OUTFILE: must be refused (no FILE privilege), and still carry signature.into_outfile.
+  printf "SELECT * FROM tickets INTO OUTFILE '/tmp/e2e-outfile.txt';\n" >"$sql"
+  rc=0
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_analyst support' \
+    <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || rc=$?
+  [ "$rc" = 1 ] && grep -qE '^ERROR [0-9]+ ' "$E2E_WORK_DIR/client.err" || return 2
+  # A password holding a ground-truth value, as root in the target: MariaDB performance_schema
+  # keeps it in clear in SQL_TEXT (server_audit logs no DCL with QUERY_DML, and masks it anyway).
+  printf "CREATE USER 'e2e_probe'@'localhost' IDENTIFIED BY '%s';\n" "${secret//\'/\'\'}" >"$sql"
+  my_root "$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 3
+  unset email phone secret
+  rm -f -- "$sql"
+  printf '%s %s %s' "$email_id" "$phone_id" "$secret_id"
+}
+audit_client_my_target_log() {
+  local sql="$E2E_WORK_DIR/pfs.sql"
+  # The source side: the server_audit log (the WHERE literals) and, as root, the statement texts
+  # performance_schema keeps (the CREATE USER password, in clear on MariaDB).
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-mariadb \
+    cat /var/log/databastion/server_audit.log >"$1" || return 1
+  printf 'SELECT SQL_TEXT FROM performance_schema.events_statements_history_long;\n' >"$sql"
+  my_root "$sql" >>"$1" || return 1
+  rm -f -- "$sql"
 }
 
 # --------------------------------------------------------------------------- Audit setup (P4-D)
@@ -795,6 +874,30 @@ wait_audit_stream() {
   sleep 3
 }
 
+# Policy-engine wake-up (bug fixed in #63, ADR-0021 "wake-up and 2 s worker polling"): after a
+# policy change or an accepted events batch, the web process queues a `policies.evaluate` pg-boss
+# job. A wake-up is proven by a job created within [T - 3 s, T + 5 s] and not started before T (the
+# queue is stately: a job still queued at T takes the wake-up). The worker's one-minute schedule
+# could match by chance, so every policy creation and every events batch is checked, and web.log
+# must hold no "wake-up not sent" warning.
+WAKEUP_JOB_SQL="EXISTS (SELECT 1 FROM pgboss.job j WHERE j.name = 'policies.evaluate'
+  AND j.created_on BETWEEN %s - interval '3 seconds' AND %s + interval '5 seconds'
+  AND (j.started_on IS NULL OR j.started_on >= %s))"
+db_now() { console_sql "SELECT now()"; }
+# assert_wakeup LABEL T: waits up to 6 s for a wake-up job for an action at DB time T.
+assert_wakeup() {
+  local label="$1" t="$2" cond deadline
+  # shellcheck disable=SC2059 # the format is the SQL template above
+  cond="$(printf "$WAKEUP_JOB_SQL" "'$t'::timestamptz" "'$t'::timestamptz" "'$t'::timestamptz")"
+  deadline=$(( $(date +%s) + 6 ))
+  until [ "$(console_sql "SELECT $cond")" = t ]; do
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "no policies.evaluate job within 5 s of $label (policy-engine wake-up lost)"
+    sleep 1
+  done
+  log "policy-engine wake-up after $label: job queued"
+}
+
 log "Audit: creating the e-mail channel ${AUDIT_CHANNEL} (Mailpit, STARTTLS verified against the test CA)"
 r="$(api_json POST /api/notification-channels "$(jq -nc --arg slug "$AUDIT_CHANNEL" '{slug: $slug,
   type: "email", config: {host: "mailpit", port: 2525, tls: "starttls",
@@ -807,6 +910,7 @@ AUDIT_TARGET_IDS="$(for at in "${E2E_AUDIT_TARGETS[@]}"; do read -r t _ <<<"$at"
 AUDIT_SIGNALS="$(for at in "${E2E_AUDIT_TARGETS[@]}"; do read -r _ _ _ _ sig _ <<<"$at"; printf '%s\n' "$sig"; done \
   | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
 log "Audit: creating the access_event policies '${AUDIT_POLICY_DUMP}' (critical) and '${AUDIT_POLICY_READS}' (medium)"
+t_policy="$(db_now)"
 r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_DUMP" --arg ch "$AUDIT_CHANNEL" \
   --argjson targets "$AUDIT_TARGET_IDS" --argjson signals "$AUDIT_SIGNALS" '{name: $name,
   description: "Dump tool signature on an Audit target (e2e)", source: "access_event",
@@ -814,8 +918,10 @@ r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_DUMP" --arg
   actions: [{type: "create_incident", severity: "critical"}, {type: "notify", channel: $ch}]}')")"
 [ "$(status_of "$r")" = 201 ] \
   || fail "policy '${AUDIT_POLICY_DUMP}': HTTP $(status_of "$r") ($(body_of "$r" | jq -c '{error, field}' 2>/dev/null || true))"
+assert_wakeup "the creation of policy '${AUDIT_POLICY_DUMP}'" "$t_policy"
 # Every read of an Audit target, whoever reads: the agent's own Discovery reads would open one too
 # if they surfaced as events.
+t_policy="$(db_now)"
 r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_READS" --arg ch "$AUDIT_CHANNEL" \
   --argjson targets "$AUDIT_TARGET_IDS" '{name: $name,
   description: "Any read on an Audit target (e2e)", source: "access_event",
@@ -823,6 +929,7 @@ r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_READS" --ar
   actions: [{type: "create_incident", severity: "medium"}, {type: "notify", channel: $ch}]}')")"
 [ "$(status_of "$r")" = 201 ] \
   || fail "policy '${AUDIT_POLICY_READS}': HTTP $(status_of "$r") ($(body_of "$r" | jq -c '{error, field}' 2>/dev/null || true))"
+assert_wakeup "the creation of policy '${AUDIT_POLICY_READS}'" "$t_policy"
 
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
   read -r target _ client _ <<<"$at"
@@ -1003,8 +1110,10 @@ mailpit_fetch() {
 audit_run() {
   local target="$1" engine="$2" client="$3" account="$4" signal="$5"
   local dump_p query_p prev cover n_sent n_missing n0 n t0 t_dump t_inc latency ids deadline st
-  local n_sets n_pending n_inc n_notif level source rc
+  local n_sets n_pending n_inc n_notif level source rc min_sets query_signal
   read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
+  min_sets="$("audit_client_${client}_object_sets")"
+  query_signal="$("audit_client_${client}_query_signal")"
 
   prev="$(agent_log_count "$("audit_client_${client}_started")" "$target")"
   log "Audit ($target): configuring Audit again, sensitive objects derived from the findings"
@@ -1024,7 +1133,7 @@ audit_run() {
   wait_audit_stream "$target" "$prev" "$client"
 
   n0="$(critical_incidents)" || fail "cannot read the critical incident count on the incidents page"
-  log "Audit ($target): dump of the seeded database as $dump_p, from the pg-client container"
+  log "Audit ($target): dump of the seeded database as $dump_p, from the ${client}-client container"
   t0="$(now_ms)"
   "audit_client_${client}_dump" || fail "the dump of $target failed (exit $?; client output kept private)"
   t_dump="$(now_ms)"
@@ -1043,9 +1152,9 @@ audit_run() {
   [ "$latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] \
     || fail "Audit ($target): dump -> incident took ${latency} ms, not under ${DUMP_INCIDENT_LIMIT_MS} ms"
 
-  log "Audit ($target): queries with ground-truth literals, a filtered COPY and a whole-table COPY as $query_p"
+  log "Audit ($target): queries with ground-truth literals as $query_p (see audit_client_${client}_queries)"
   ids="$("audit_client_${client}_queries" "$engine")" \
-    || fail "the literal queries on $target failed (client output kept private)"
+    || fail "the literal queries on $target failed (step $?; client output kept private)"
   [ -n "$ids" ] || fail "the literal queries on $target returned no needle id"
   AUDIT_LITERALS[$engine]="${AUDIT_LITERALS[$engine]:-} $ids"
 
@@ -1061,8 +1170,7 @@ audit_run() {
         (SELECT count(*) FROM notification_deliveries WHERE status IN ('pending', 'sending')))")" \
       || fail "cannot read the Audit state of $target"
     IFS=, read -r n_sets n_pending n_inc n_notif <<<"$st"
-    # Three object sets: the filtered SELECT, the filtered COPY and the whole-table COPY.
-    [ "$n_sets" -ge 3 ] && [ "$n_pending" = 0 ] && [ "$n_inc" -ge 1 ] && [ "$n_notif" = 0 ] && break
+    [ "$n_sets" -ge "$min_sets" ] && [ "$n_pending" = 0 ] && [ "$n_inc" -ge 1 ] && [ "$n_notif" = 0 ] && break
     [ "$(date +%s)" -lt "$deadline" ] || fail "Audit ($target): events of $query_p not all stored, evaluated and notified within ${AUDIT_EVENTS_TIMEOUT_S} s (object sets $n_sets, not evaluated $n_pending, incidents $n_inc, notifications pending $n_notif)"
     sleep 2
   done
@@ -1107,7 +1215,7 @@ audit_run() {
   timeout 60 python3 "$I2_CHECK" audit --ground-truth "$GROUND_TRUTH" --engine "$engine" \
     --agent-account "$account" --events "$E2E_WORK_DIR/audit-events.json" \
     --incidents "$E2E_WORK_DIR/audit-incidents.json" \
-    --require-event "${dump_p}:${signal}" --require-event "$query_p" \
+    --require-event "${dump_p}:${signal}" --require-event "${query_p}${query_signal:+:$query_signal}" \
     --require-incident "${AUDIT_POLICY_DUMP}:${dump_p}:${signal}" \
     --require-incident "${AUDIT_POLICY_READS}:${query_p}" >&2 \
     || fail "Audit check of $target failed (see above)"
@@ -1142,6 +1250,18 @@ for at in "${E2E_AUDIT_TARGETS[@]}"; do
   audit_run "$target" "$engine" "$client" "$account" "$signal"
 done
 log "Audit: dump -> incident latency: ${AUDIT_LATENCIES}"
+# Every accepted events batch woke the policy engine (see assert_wakeup).
+# shellcheck disable=SC2059 # the format is the SQL template above
+wake="$(console_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE NOT $(printf "$WAKEUP_JOB_SQL" \
+    b.received_at b.received_at b.received_at)) FROM events_batches b WHERE b.agent_id = '${AGENT_ID}'")" \
+  || fail "cannot check the wake-ups of the events batches"
+IFS=, read -r n_batches n_lost <<<"$wake"
+[ "$n_batches" -gt 0 ] || fail "no events batch stored: the wake-up check would prove nothing"
+[ "$n_lost" = 0 ] || fail "$n_lost of $n_batches events batch(es) queued no policies.evaluate job within 5 s (policy-engine wake-up lost)"
+log "policy-engine wake-up after each of the $n_batches events batch(es): job queued"
+lost="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" logs --no-color web 2>/dev/null \
+  | grep -c 'wake-up not sent' || true)"
+[ "$lost" = 0 ] || fail "web.log shows $lost 'wake-up not sent' warning(s)"
 phase_done audit
 
 # --------------------------------------------------------------------------- revocation
