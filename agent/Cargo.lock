@@ -319,6 +319,7 @@ dependencies = [
  "async-trait",
  "databastion-classifiers",
  "databastion-core",
+ "futures-util",
  "proptest",
  "rustls",
  "rustls-native-certs",

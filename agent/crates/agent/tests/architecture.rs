@@ -346,7 +346,8 @@ fn only_core_depends_on_protocol_types() {
 /// The tailer's test switch that accepts log files owned by the agent's
 /// own user (end-of-phase-4 review L4) is only called from test code: the
 /// connectors' integration-test modules (compiled under `#[cfg(test)]`)
-/// and the tests module of the tailer itself.
+/// and `mod tests` modules. The function itself only exists for tests and
+/// the core's `test-support` feature.
 #[test]
 fn agent_owned_logs_are_allowed_in_tests_only() {
     const SWITCH: &str = "allow_agent_owned_logs_for_tests(";
@@ -367,13 +368,11 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
         if calls.is_empty() {
             continue;
         }
-        if shown.ends_with("core/src/audit/tail.rs") {
-            // Only inside its `mod tests`.
-            let tests_at = code_lines(&text)
-                .position(|l| l.trim() == "mod tests {")
-                .expect("tail.rs has a tests module");
-            assert!(calls.iter().all(|i| *i > tests_at), "{shown}");
-            continue;
+        // Inside a `mod tests` (compiled under `#[cfg(test)]`).
+        if let Some(tests_at) = code_lines(&text).position(|l| l.trim() == "mod tests {") {
+            if calls.iter().all(|i| *i > tests_at) {
+                continue;
+            }
         }
         assert!(
             TEST_ONLY.iter().any(|t| shown.contains(t)),

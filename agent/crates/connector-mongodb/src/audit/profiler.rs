@@ -556,9 +556,11 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         };
         let h = hash_of(d.as_bytes());
-        let Some((ts, r)) = (match record_of(&d) {
-            Ok(r) => r,
-            Err(Malformed) => {
+        // Per-record isolation: an entry that makes the reader panic is
+        // dropped alone (phase-7 review H1).
+        let Some((ts, r)) = (match databastion_core::isolate(|| record_of(&d)) {
+            Some(Ok(r)) => r,
+            Some(Err(Malformed)) | None => {
                 dropped += 1;
                 continue;
             }

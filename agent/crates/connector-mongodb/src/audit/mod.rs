@@ -543,10 +543,18 @@ fn parse_all<R: AsRef<[u8]>>(format: MongodbLogFormat, raw: &[R]) -> Parsed {
         valid: 0,
     };
     for r in raw {
-        let parsed = match format {
-            MongodbLogFormat::AuditLog => records::parse_audit_log(r.as_ref()),
-            MongodbLogFormat::ServerLog => records::parse_server_log(r.as_ref()),
-        };
+        // Per-record isolation: a record that makes the parser panic is
+        // dropped alone, counted like one that does not parse (phase-7
+        // review H1).
+        let parsed = databastion_core::isolate(|| {
+            #[cfg(test)]
+            test_poison(r.as_ref());
+            match format {
+                MongodbLogFormat::AuditLog => records::parse_audit_log(r.as_ref()),
+                MongodbLogFormat::ServerLog => records::parse_server_log(r.as_ref()),
+            }
+        })
+        .unwrap_or(Err(()));
         match parsed {
             Ok(Some(rec)) => {
                 out.valid += 1;
@@ -557,6 +565,19 @@ fn parse_all<R: AsRef<[u8]>>(format: MongodbLogFormat, raw: &[R]) -> Parsed {
         }
     }
     out
+}
+
+/// Tests: a record holding this marker makes the parsing panic (a parser
+/// bug on one server record).
+#[cfg(test)]
+const TEST_POISON: &[u8] = b"TEST-PARSER-PANIC";
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+fn test_poison(record: &[u8]) {
+    if record.windows(TEST_POISON.len()).any(|w| w == TEST_POISON) {
+        panic!("parser bug on a record");
+    }
 }
 
 /// Whether a record proves that reads are logged (a successful
@@ -590,7 +611,12 @@ async fn file_run(
             (t, polled)
         })
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
         let (records, more, unparsed, valid) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
@@ -639,7 +665,12 @@ async fn file_run(
             t
         })
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
         st.tailer = Some(t);
         if !more {
             if started.elapsed() >= REPROBE {
@@ -776,6 +807,92 @@ mod tests {
             recent: false,
             seen: true,
         })
+    }
+
+    /// Phase-7 review H1: a record that makes the parser panic inside the
+    /// blocking parse task is dropped alone and counted; the records after
+    /// it still give events, and the stream goes on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parser_panic_drops_one_record_only() {
+        use std::io::Write as _;
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-mongo-poison-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auditLog.json");
+        std::fs::write(&path, b"").unwrap();
+        let target = databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: t, \
+             engine: mongodb, host: 127.0.0.1, account: databastion, secret: {{env: PW}}, \
+             mongodb: {{tls: disable, audit_log: {{path: \"{}\", format: audit_log}}}}}}]}}",
+            path.display()
+        ))
+        .unwrap()
+        .targets[0]
+            .clone();
+        let limits = databastion_core::config::Limits {
+            min_audit_poll_interval_s: 1,
+            ..databastion_core::config::Limits::default()
+        };
+        let cfg = AuditConfig::local(&target, 1, &limits);
+        let state = CheckState::default();
+        let (sink, mut rx) = EventSink::channel(64);
+        let mut st = FileStream {
+            format: MongodbLogFormat::AuditLog,
+            tailer: Some(Tailer::new(path.clone(), Framing::JsonObjects, None)),
+            builder: EventBuilder::new(
+                OwnAccount::new(
+                    "databastion@admin",
+                    Some(APP_NAME),
+                    None,
+                    200,
+                    databastion_core::audit::own::SharedOwnUsage::default(),
+                ),
+                "databastion@admin".to_owned(),
+                200,
+            ),
+            reported: (0, 0),
+        };
+        let run = tokio::spawn(async move {
+            let _ = file_run(&cfg, &target, &sink, &state, &mut st).await;
+            state
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let find = |coll: &str| {
+            format!(
+                r#"{{"atype":"authCheck","ts":{{"$date":"2026-09-29T10:00:01.000Z"}},"remote":{{"ip":"10.0.0.9","port":51000}},"users":[{{"user":"alice","db":"admin"}}],"param":{{"command":"find","ns":"app.{coll}","args":{{"find":"{coll}","filter":{{"a":1}},"$db":"app"}}}},"result":0}}"#
+            )
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{}", find("before")).unwrap();
+        writeln!(
+            f,
+            r#"{{"atype":"authCheck","param":{{"command":"TEST-PARSER-PANIC"}},"result":0}}"#
+        )
+        .unwrap();
+        writeln!(f, "{}", find("after")).unwrap();
+        drop(f);
+        let mut objects = Vec::new();
+        while objects.len() < 2 {
+            let e = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the records around the poison one give events")
+                .unwrap();
+            objects.extend(e.objects().iter().map(|o| o.object().as_str().to_owned()));
+        }
+        assert_eq!(objects, ["before", "after"]);
+        assert!(!run.is_finished(), "the stream goes on");
+        run.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-0030: every valid `auditLog` record counts as a proof that the

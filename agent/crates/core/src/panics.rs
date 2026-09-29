@@ -36,6 +36,29 @@ pub(crate) async fn guard<F: Future>(fut: F) -> Result<F::Output, Panicked> {
         })
 }
 
+/// Runs the synchronous handling of **one** audit record (parsing,
+/// reduction to closed facts), turning a panic into `None`: the caller
+/// counts that record as dropped and goes on with the next one, so a
+/// record that crashes a parser costs that record only (per-record
+/// isolation, phase-7 security review H1). The hook logs the panic
+/// without its message. `f` must not leave shared state half-updated
+/// beyond the record itself (connectors keep per-record work local, or
+/// accept that bounded maps keep a partial entry).
+pub fn isolate<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
+/// For a `spawn_blocking` task that failed: a panic in it is resumed on
+/// the awaiting task (so the core's guard of the connector call sees it,
+/// never an ordinary error that restarts the stream in a loop); any other
+/// join error (cancellation) is returned.
+pub fn resume_panic(e: tokio::task::JoinError) -> tokio::task::JoinError {
+    if e.is_panic() {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    e
+}
+
 /// Replaces the default panic hook (which prints the message) with one
 /// that logs the code location, the thread name and a panic id, never the
 /// message. Installed once per process: by the binary right after its
@@ -63,6 +86,16 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::panic)]
+    #[tokio::test]
+    async fn records_are_isolated_and_blocking_panics_resumed() {
+        assert_eq!(isolate(|| 3), Some(3));
+        assert_eq!(isolate(|| -> u8 { panic!("record SECRET") }), None);
+        let joined = tokio::task::spawn_blocking(|| -> u8 { panic!("record SECRET") }).await;
+        let r = guard(async move { joined.map_err(resume_panic) }).await;
+        assert!(r.is_err(), "the panic reaches the guard");
+    }
 
     #[tokio::test]
     async fn panics_become_errors() {

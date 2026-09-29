@@ -209,6 +209,54 @@ review remain the primary controls.
   graph, dev-dependencies included.
 
 ### Audit streams that panic
+A connector call that panics fails that call only (`crate::panics`).
+Connectors parse every audit record in isolation (`databastion_core::isolate`):
+a record that makes a parser panic is dropped alone and counted
+(`audit.records_dropped`); a panic in a blocking parse task is resumed on the
+stream, never turned into an ordinary error that restarts it in a loop
+(`databastion_core::resume_panic`).
+
+A panic that still ends the stream is handled by the core: a stream with a
+saved position (the cursor files it uses) is restarted in **isolation mode**
+(`CursorStore::isolate`: it hands over and saves its position after every
+record), so a panic that comes again is at the exact record at fault; after 3
+panics at that exact position, the stream is asked to skip **that one record**
+(`CursorStore::skip_records`, applied only when the saved position is still
+the one the panics happened at; counted as dropped, and in
+`audit_records_skipped_total`). The OpenLDAP accesslog stream implements both;
+the file sources rely on per-record isolation (the tailer does not skip). More
+than 8 skips or 64 panics within an hour, or 3 panics in a row on a source
+whose position is in memory (restarted afresh anyway), stop the stream until
+Audit is reconfigured or the agent restarts (`audit.stream_stopped`).
+
+### Logs
+`DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
+capped at `warn`: drivers and HTTP clients may log parameters or payloads at
+debug/trace level.
+
+### Audit log files
+Every file source (the PostgreSQL server log, the MariaDB `server_audit` log,
+the MySQL `audit_log` / `audit_log_filter` JSON file, the MongoDB `auditLog` and
+server log) is read by the core tailer (`crates/core/src/audit/tail.rs`):
+opened without blocking, it must be a regular file, and it must **not be
+writable by the agent's own account**: not owned by the agent's effective uid,
+not world-writable, and not group-writable when its group is one of the
+agent's (effective or supplementary groups). This is checked on the opened
+handle, so after following symlinks (end-of-phase-4 review L4). An audit log is
+the database server's evidence: a file the agent's account could write could
+have been forged or rewritten by it. Such a file is refused like an unreadable
+one: `check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
+its source, and the agent logs `audit log refused`. **Consequently, an agent
+running as root while the log belongs to root, or running as the database's
+own user, gets `audit.log_not_readable`**: run the agent as its own user and
+give it read access through a group without write permission or an ACL on a
+file the server owns (for instance `0640`, owner `mysql`, group
+`databastion`). Tests enable their own files through
+`allow_agent_owned_logs_for_tests()`, compiled only for tests and the core's
+`test-support` feature (enabled from the connectors' `[dev-dependencies]`),
+and only test code calls it (guarded by `crates/agent/tests/architecture.rs`).
+
+### Audit streams that panic
 A connector call that panics fails that call only (`crate::panics`). An
 Audit stream that panics is restarted from its persisted read position. When
 it panics again and again **at the same saved position** (a record that

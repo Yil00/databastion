@@ -29,6 +29,11 @@ rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
 
 [dev-dependencies]
+# Test helpers of the core (owned log files, the contract conversion for
+# the interim I2 checks): tests only.
+databastion-core = { workspace = true, features = ["test-support"] }
+# Catches the panic of a poll in the poison-record tests.
+futures-util = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
 tracing-subscriber.workspace = true
 serde_json = { version = "1", default-features = false, features = ["std"] }

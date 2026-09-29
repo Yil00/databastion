@@ -41,6 +41,8 @@ pub struct CursorStore {
     /// Records to skip from the saved position (see
     /// [`Self::skip_records`]).
     skip: u32,
+    /// Isolation mode (see [`Self::isolate`]).
+    isolate: bool,
 }
 
 /// Why a cursor could not be read or written (logged by kind only).
@@ -67,6 +69,7 @@ impl CursorStore {
         (ok(target_id) && ok(name)).then(|| Self {
             path: dir.join(format!("{target_id}.{name}.cursor")),
             skip: 0,
+            isolate: false,
         })
     }
 
@@ -79,17 +82,34 @@ impl CursorStore {
         self
     }
 
+    /// In isolation mode (see [`Self::isolate`]). Set by the core; public
+    /// for the connectors' tests.
+    #[must_use]
+    pub fn with_isolation(mut self) -> Self {
+        self.isolate = true;
+        self
+    }
+
     /// Records the core asks the stream to skip from the saved position,
-    /// normally 0. The stream panicked repeatedly at this position (a
-    /// record that crashes a parser would otherwise stop Audit of the
-    /// target for good): the connector drops the first `n` records it
-    /// reads from the saved position, counts them as dropped
-    /// (`audit.records_dropped`), and goes on. The core raises `n` (1, 2,
-    /// 4…) while the stream keeps panicking at the same position, and
-    /// stops the stream when panics go on at different positions.
+    /// normally 0, else 1: the stream panicked repeatedly **at exactly this
+    /// saved position** (the request is dropped when the saved bytes
+    /// differ from those the panics happened at), in isolation mode, so the
+    /// record at fault is the first one read from it. The connector drops
+    /// that record without handling it, counts it as dropped
+    /// (`audit.records_dropped`), and goes on.
     #[must_use]
     pub fn skip_records(&self) -> u32 {
         self.skip
+    }
+
+    /// Isolation mode: the stream panicked after this position; for its
+    /// next read (at least the entries a normal read from here would
+    /// cover), it hands over and saves its position after **every
+    /// record**, so a panic that comes again is at the exact record at
+    /// fault, and a skip ([`Self::skip_records`]) drops that record only.
+    #[must_use]
+    pub fn isolate(&self) -> bool {
+        self.isolate
     }
 
     /// Reads the cursor. `Ok(None)` when none was saved yet.
@@ -130,31 +150,79 @@ impl CursorStore {
     }
 }
 
-/// A fingerprint of the saved read positions of `target_id` (every
-/// cursor file of the target in `dir`, names and contents): equal while
-/// the stream has not moved. `None` when the target has no saved cursor
-/// (a source whose position is in memory, or nothing saved yet).
-pub(crate) fn position_fingerprint(dir: &Path, target_id: &str) -> Option<u64> {
+/// The cursors one audit stream uses (every `AuditConfig::cursor` it
+/// asked for), shared by the core across the restarts of that stream: the
+/// stream's position is the content of these files only, and a skip
+/// request is bound to their exact content when the panics happened.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PositionRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<PositionState>>,
+}
+
+#[derive(Debug, Default)]
+struct PositionState {
+    /// Cursor files used by the stream.
+    used: std::collections::BTreeSet<PathBuf>,
+    /// Their content hashes at the last panic.
+    at_panic: HashMap<PathBuf, u64>,
+}
+
+fn content_hash(path: &Path) -> Option<u64> {
     use std::hash::{Hash as _, Hasher as _};
-    let prefix = format!("{target_id}.");
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| n.starts_with(&prefix) && n.ends_with(".cursor"))
-        .collect();
-    if names.is_empty() {
+    let bytes = fsutil::read_private(path).ok()?;
+    if bytes.len() > MAX_CURSOR_BYTES {
         return None;
     }
-    names.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for n in &names {
-        n.hash(&mut h);
-        match fsutil::read_private(&dir.join(n)) {
-            Ok(bytes) if bytes.len() <= MAX_CURSOR_BYTES => bytes.hash(&mut h),
-            _ => 0u8.hash(&mut h),
-        }
-    }
+    bytes.hash(&mut h);
     Some(h.finish())
+}
+
+impl PositionRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PositionState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registers `store` as used by the stream and applies the core's
+    /// request: isolation mode, and the skip only when the file holds the
+    /// exact position the panics happened at.
+    pub(crate) fn register(&self, store: CursorStore, isolate: bool, skip: u32) -> CursorStore {
+        let mut state = self.lock();
+        state.used.insert(store.path.clone());
+        let mut store = store;
+        if isolate {
+            store = store.with_isolation();
+        }
+        if skip > 0 {
+            let expected = state.at_panic.get(&store.path).copied();
+            if expected.is_some() && expected == content_hash(&store.path) {
+                store = store.with_skip(skip);
+            }
+        }
+        store
+    }
+
+    /// The stream's saved position after a panic (a hash of its cursor
+    /// files, remembered for [`Self::register`]); `None` when it saved
+    /// none (a position in memory, or nothing saved yet).
+    pub(crate) fn snapshot(&self) -> Option<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut state = self.lock();
+        let hashes: Vec<(PathBuf, u64)> = state
+            .used
+            .iter()
+            .filter_map(|p| content_hash(p).map(|h| (p.clone(), h)))
+            .collect();
+        state.at_panic = hashes.iter().cloned().collect();
+        if hashes.is_empty() {
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        hashes.hash(&mut h);
+        Some(h.finish())
+    }
 }
 
 /// Most groups held by one aggregator; a full aggregator is flushed early.

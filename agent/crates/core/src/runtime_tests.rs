@@ -2987,9 +2987,10 @@ async fn connector_panics_fail_the_call_not_the_agent() {
 }
 
 /// A stream over a list of records whose position (the next index) is
-/// saved in a cursor after each record; the record at `poison` makes it
-/// panic (a parser bug on one server record). It honours the core's skip
-/// request from the saved position (`CursorStore::skip_records`).
+/// saved **once per batch** (after the whole list), like a connector that
+/// commits after a poll; in isolation mode it saves after every record.
+/// The records at `poison` make it panic (outside any per-record
+/// isolation). It honours the core's skip request.
 struct Poisoned {
     records: usize,
     poison: Vec<usize>,
@@ -3029,25 +3030,32 @@ impl Connector for Poisoned {
         sink: &crate::EventSink,
     ) -> Result<(), crate::ConnectorError> {
         let store = cfg.cursor("poisoned").unwrap();
-        let mut next: usize = store
-            .load()
-            .unwrap()
-            .map_or(0, |b| String::from_utf8(b).unwrap().parse().unwrap());
+        let mut next: usize = match store.load().unwrap() {
+            Some(b) => String::from_utf8(b).unwrap().parse().unwrap(),
+            None => {
+                store.save(b"0").unwrap();
+                0
+            }
+        };
         for _ in 0..store.skip_records() {
             if next < self.records {
                 self.skipped.lock().unwrap().push(next);
                 next += 1;
+                store.save(next.to_string().as_bytes()).unwrap();
             }
         }
         while next < self.records {
             if self.poison.contains(&next) {
-                panic!("parser panicked on SECRET-VALUE");
+                panic!("stream panicked on SECRET-VALUE");
             }
             let _ = sink.submit(fake_event(1)).await;
             self.delivered.lock().unwrap().push(next);
             next += 1;
-            store.save(next.to_string().as_bytes()).unwrap();
+            if store.isolate() {
+                store.save(next.to_string().as_bytes()).unwrap();
+            }
         }
+        store.save(next.to_string().as_bytes()).unwrap();
         std::future::pending::<()>().await;
         Ok(())
     }
@@ -3057,67 +3065,79 @@ impl Connector for Poisoned {
     }
 }
 
-/// Poison records (phase-7 security review): panics at one saved position lead to a skip there
-/// (1, then 2, 4… records), not to a stopped stream; panics that go on at
-/// different positions still stop it.
+/// Poison records (phase-7 security review): a stream with a saved
+/// position is restarted record by record, and after AUDIT_MAX_PANICS
+/// panics at one exact position one record is skipped there; it is stopped
+/// after too many skips or panics within the window. Without a saved
+/// position, AUDIT_MAX_PANICS panics in a row stop it, as before.
 #[test]
-fn panics_at_one_position_skip_records_there() {
+fn panics_lead_to_isolation_then_one_skip() {
+    let now = Instant::now();
     let mut t = PanicTracker::default();
     let p = Some(7);
-    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 0 });
-    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 0 });
-    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 1 });
-    t.moved(p);
-    assert_eq!(t.skip(), 1);
-    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 2 });
-    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 4 });
-    // The stream moved past the position: the request ends.
-    t.moved(Some(8));
-    assert_eq!(t.skip(), 0);
-    // Past the last skip round at one position: stopped.
+    let iso = |skip| PanicAction::Restart {
+        isolate: true,
+        skip,
+    };
+    assert_eq!(t.on_panic(p, false, now), iso(0));
+    assert_eq!(t.on_panic(p, false, now), iso(0));
+    assert_eq!(t.on_panic(p, false, now), iso(1));
+    assert_eq!(t.request(), (true, 1));
+    // The stream moved record by record: a new position.
+    assert_eq!(t.on_panic(Some(8), false, now), iso(0));
+    // More than AUDIT_MAX_SKIPS skips within the window: stopped.
     let mut t = PanicTracker::default();
-    let mut last = PanicAction::Restart { skip: 0 };
-    for _ in 0..(AUDIT_MAX_PANICS - 1 + AUDIT_MAX_SKIP_LEVEL) {
-        last = t.on_panic(p, false);
-        assert!(matches!(last, PanicAction::Restart { .. }), "{last:?}");
-    }
-    assert_eq!(
-        last,
-        PanicAction::Restart {
-            skip: 1 << (AUDIT_MAX_SKIP_LEVEL - 1)
+    let mut last = iso(0);
+    for i in 0..(AUDIT_MAX_PANICS as usize * (AUDIT_MAX_SKIPS + 1)) {
+        last = t.on_panic(Some(i as u64 / 3), false, now);
+        if matches!(last, PanicAction::Park(_)) {
+            break;
         }
-    );
-    assert!(matches!(t.on_panic(p, false), PanicAction::Park(_)));
-    // Different positions (or none: a position in memory): stopped after
-    // AUDIT_MAX_PANICS in a row, as before.
-    for positions in [[Some(1), Some(2), Some(3)], [None, None, None]] {
-        let mut t = PanicTracker::default();
-        assert_eq!(
-            t.on_panic(positions[0], false),
-            PanicAction::Restart { skip: 0 }
-        );
-        assert_eq!(
-            t.on_panic(positions[1], false),
-            PanicAction::Restart { skip: 0 }
-        );
-        assert_eq!(
-            t.on_panic(positions[2], false),
-            PanicAction::Park(AUDIT_MAX_PANICS)
-        );
     }
+    assert!(matches!(last, PanicAction::Park(_)), "{last:?}");
+    // Skips spread over more than the window: never stopped by skips.
+    let mut t = PanicTracker::default();
+    for i in 0..(AUDIT_MAX_SKIPS as u64 * 3) {
+        let at = now + AUDIT_POISON_WINDOW * u32::try_from(i).unwrap();
+        for _ in 0..AUDIT_MAX_PANICS {
+            assert!(matches!(
+                t.on_panic(Some(i), false, at),
+                PanicAction::Restart { .. }
+            ));
+        }
+    }
+    // Panics at ever new positions (never getting through): stopped past
+    // AUDIT_MAX_POSITIONED_PANICS within the window.
+    let mut t = PanicTracker::default();
+    let parked = (0..=AUDIT_MAX_POSITIONED_PANICS as u64)
+        .map(|i| t.on_panic(Some(1000 + i), false, now))
+        .last();
+    assert!(matches!(parked, Some(PanicAction::Park(_))));
+    // No saved position: AUDIT_MAX_PANICS in a row, as before.
+    let mut t = PanicTracker::default();
+    let plain = PanicAction::Restart {
+        isolate: false,
+        skip: 0,
+    };
+    assert_eq!(t.on_panic(None, false, now), plain);
+    assert_eq!(t.on_panic(None, false, now), plain);
+    assert_eq!(
+        t.on_panic(None, false, now),
+        PanicAction::Park(AUDIT_MAX_PANICS)
+    );
     // A long session resets that count.
     let mut t = PanicTracker::default();
-    t.on_panic(Some(1), false);
-    t.on_panic(Some(2), false);
-    assert_eq!(t.on_panic(Some(3), true), PanicAction::Restart { skip: 0 });
+    t.on_panic(None, false, now);
+    t.on_panic(None, false, now);
+    assert_eq!(t.on_panic(None, true, now), plain);
 }
 
-/// A record that always makes the stream panic is skipped after
-/// AUDIT_MAX_PANICS panics at its position; the records after it are
-/// delivered and the stream is not stopped. Two more such records at other
-/// positions (three positions in a row) stop it.
+/// A record that always makes the stream panic is found (isolation mode)
+/// and skipped alone: every other record is delivered, the stream is not
+/// stopped. The stream saves its position once per batch outside
+/// isolation, so a skip there would have dropped the batch head.
 #[tokio::test]
-async fn a_poison_record_is_skipped_not_a_stopped_stream() {
+async fn a_poison_record_is_skipped_alone() {
     let server = MockServer::start().await;
     let mut env = enrolled(&server).await;
     env.config.limits.min_audit_poll_interval_s = 1;
@@ -3134,7 +3154,7 @@ async fn a_poison_record_is_skipped_not_a_stopped_stream() {
             env.config.clone(),
             vec![Box::new(Poisoned {
                 records: 6,
-                poison: vec![2],
+                poison: vec![3],
                 delivered: Arc::clone(&delivered),
                 skipped: Arc::clone(&skipped),
             })],
@@ -3155,7 +3175,7 @@ async fn a_poison_record_is_skipped_not_a_stopped_stream() {
         tokio::spawn(async move { rt.run_audit("pg-main".to_owned(), params, stop_rx).await })
     };
     tokio::time::timeout(Duration::from_secs(60), async {
-        while delivered.lock().unwrap().len() < 5 {
+        while !delivered.lock().unwrap().contains(&5) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -3163,46 +3183,14 @@ async fn a_poison_record_is_skipped_not_a_stopped_stream() {
     .expect("the records after the poison one are delivered");
     let _ = stop.send(true);
     run.await.unwrap();
-    assert_eq!(*delivered.lock().unwrap(), [0, 1, 3, 4, 5]);
-    assert_eq!(*skipped.lock().unwrap(), [2]);
-    assert_eq!(
-        rt.counters.connector_panics.load(Ordering::Relaxed),
-        u64::from(AUDIT_MAX_PANICS)
-    );
+    // Exactly the poison record skipped; every other one delivered (the
+    // batch head more than once: at least once after a panic).
+    assert_eq!(*skipped.lock().unwrap(), [3]);
+    let got: std::collections::BTreeSet<usize> =
+        delivered.lock().unwrap().iter().copied().collect();
+    assert_eq!(got, [0, 1, 2, 4, 5].into_iter().collect());
     assert_eq!(rt.counters.audit_records_skipped.load(Ordering::Relaxed), 1);
     assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
-    // The panic payload never reached the logs of the agent (the hook
-    // keeps an id only): nothing here to read but the counters.
-
-    // Poison records at three positions in a row (each skipped after its
-    // panics, the stream moving between them): stopped at the third.
-    let dir = env.config.state_dir.join("audit");
-    let _ = std::fs::remove_file(dir.join("pg-main.poisoned.cursor"));
-    let delivered: Arc<StdMutex<Vec<usize>>> = Arc::default();
-    let rt = Runtime::new(
-        &env.config_path,
-        env.config.clone(),
-        vec![Box::new(Poisoned {
-            records: 6,
-            poison: vec![1, 3, 5],
-            delivered: Arc::clone(&delivered),
-            skipped: Arc::default(),
-        })],
-    )
-    .unwrap();
-    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
-        .await
-        .unwrap();
-    let params = rt.lock_audits().snapshot().into_iter().next().unwrap().2;
-    let (_stop, stop_rx) = watch::channel(false);
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        rt.run_audit("pg-main".to_owned(), params, stop_rx),
-    )
-    .await
-    .expect("the stream is stopped, not restarted forever");
-    assert!(rt.lock_audit_parked().get("pg-main").is_some());
-    assert_eq!(*delivered.lock().unwrap(), [0, 2, 4]);
 }
 
 // ------------------------------------------------------------------ audit

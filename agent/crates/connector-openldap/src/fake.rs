@@ -592,73 +592,69 @@ mod proofs {
     }
 }
 
-/// Poison records (phase-7 security review): resuming from a saved accesslog position where the
-/// stream panicked, the entries the core asks to skip are dropped (counted)
-/// and marked read, and the stream goes on with the next ones.
-#[tokio::test]
-async fn accesslog_entries_are_skipped_on_the_cores_request() {
-    use databastion_classifiers::masking::MaskedEvent;
+/// A scripted `cn=accesslog` serving searches of the tree: entry `n` has
+/// CSN `csn(n)` and `reqDN` `dns[n - 1]`.
+fn accesslog(dns: Vec<&'static str>) -> Handler {
+    directory(AGENT, move |id, req| {
+        let Request::Search { base, .. } = req else {
+            return vec![encode::done(id, 53)];
+        };
+        assert_eq!(base, "cn=accesslog");
+        let mut out: Vec<Vec<u8>> = dns
+            .iter()
+            .enumerate()
+            .map(|(i, dn)| {
+                let c = log_csn(u32::try_from(i + 1).unwrap());
+                encode::entry(
+                    id,
+                    &format!("reqStart={c},cn=accesslog"),
+                    &[
+                        ("reqStart", &[b"20260929202642.000001Z"]),
+                        ("reqType", &[b"search"]),
+                        ("reqAuthzID", &[b"cn=admin,dc=example,dc=org"]),
+                        ("reqDN", &[dn.as_bytes()]),
+                        ("reqResult", &[b"0"]),
+                        ("reqScope", &[b"sub"]),
+                        ("reqFilter", &[b"(objectClass=*)"]),
+                        ("reqAttr", &[b"mail"]),
+                        ("reqEntries", &[b"3"]),
+                        ("entryCSN", &[c.as_bytes()]),
+                    ],
+                )
+            })
+            .collect();
+        out.push(encode::done(id, 0));
+        out
+    })
+}
+
+fn log_csn(n: u32) -> String {
+    format!("20260929202642.{n:06}Z#000000#000#000000")
+}
+
+/// One accesslog poll from the saved position of `store`, with the core's
+/// request applied to it (`isolate`, `skip`): the events, or `None` when
+/// the poll panicked.
+async fn poll_log(
+    dns: Vec<&'static str>,
+    store: &databastion_core::audit::CursorStore,
+    isolate: bool,
+    skip: u32,
+    state: &crate::check::CheckState,
+) -> Option<Vec<databastion_classifiers::masking::MaskedEvent>> {
     use databastion_core::EventSink;
-    use databastion_core::audit::CursorStore;
     use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
 
     use crate::audit::events::EventBuilder;
-    use crate::audit::{CURSOR, Position, poll};
-    use crate::check::CheckState;
+    use crate::audit::{Position, poll};
 
-    let csn = |n: u32| format!("20260929202642.{n:06}Z#000000#000#000000");
-    let entries: Vec<String> = (1..=3).map(csn).collect();
-    let handler = {
-        let entries = entries.clone();
-        directory(AGENT, move |id, req| {
-            let Request::Search { base, .. } = req else {
-                return vec![encode::done(id, 53)];
-            };
-            assert_eq!(base, "cn=accesslog");
-            let mut out: Vec<Vec<u8>> = entries
-                .iter()
-                .map(|c| {
-                    encode::entry(
-                        id,
-                        &format!("reqStart={c},cn=accesslog"),
-                        &[
-                            ("reqStart", &[b"20260929202642.000001Z"]),
-                            ("reqType", &[b"search"]),
-                            ("reqAuthzID", &[b"cn=admin,dc=example,dc=org"]),
-                            ("reqDN", &[b"dc=example,dc=org"]),
-                            ("reqResult", &[b"0"]),
-                            ("reqScope", &[b"sub"]),
-                            ("reqFilter", &[b"(objectClass=*)"]),
-                            ("reqAttr", &[b"mail"]),
-                            ("reqEntries", &[b"3"]),
-                            ("entryCSN", &[c.as_bytes()]),
-                        ],
-                    )
-                })
-                .collect();
-            out.push(encode::done(id, 0));
-            out
-        })
-    };
-    let (s, _) = session(handler).await;
+    let (s, _) = session(accesslog(dns)).await;
     let mut s = s.unwrap();
-    let dir = std::env::temp_dir().join(format!(
-        "databastion-ldap-skip-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    // Saved position: before the three entries.
-    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
-    store
-        .save(format!("v2\ncursor {}\n", csn(0)).as_bytes())
-        .unwrap();
-    // The core's request (after repeated panics there): skip one.
-    let mut position = Position::load(Some(&store.clone().with_skip(1)));
-    let state = CheckState::default();
+    let mut request = store.clone().with_skip(skip);
+    if isolate {
+        request = request.with_isolation();
+    }
+    let mut position = Position::load(Some(&request));
     let t = target();
     let (sink, mut rx) = EventSink::channel(64);
     let mut builder = EventBuilder::new(
@@ -667,28 +663,126 @@ async fn accesslog_entries_are_skipped_on_the_cores_request() {
         1000,
         Vec::new(),
     );
-    poll(
-        &t,
-        &sink,
-        &state,
-        &mut s,
-        &mut builder,
-        &mut position,
-        Some(&store),
-        "cn=accesslog",
-    )
-    .await
-    .unwrap();
+    let store = store.clone();
+    let polled = {
+        use futures_util::FutureExt as _;
+        std::panic::AssertUnwindSafe(poll(
+            &t,
+            &sink,
+            state,
+            &mut s,
+            &mut builder,
+            &mut position,
+            Some(&store),
+            "cn=accesslog",
+        ))
+        .catch_unwind()
+        .await
+    };
     drop(sink);
-    let mut events: Vec<MaskedEvent> = Vec::new();
+    let mut events = Vec::new();
     while let Some(e) = rx.recv().await {
         events.push(e);
     }
-    // Two of the three searches reported; the first one skipped, counted.
+    match polled {
+        Ok(r) => {
+            r.unwrap();
+            Some(events)
+        }
+        Err(_) => None,
+    }
+}
+
+fn skip_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-ldap-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Phase-7 review H1: an entry that makes the parser panic is dropped
+/// alone and counted; the entries around it give events.
+#[tokio::test]
+async fn an_entry_that_crashes_the_parser_is_dropped_alone() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::{CURSOR, TEST_PARSE_POISON};
+    let dir = skip_dir("parse");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(format!("v2\ncursor {}\n", log_csn(0)).as_bytes())
+        .unwrap();
+    let poison: &'static str =
+        Box::leak(format!("{TEST_PARSE_POISON},dc=example,dc=org").into_boxed_str());
+    let state = crate::check::CheckState::default();
+    let events = poll_log(
+        vec!["dc=example,dc=org", poison, "dc=example,dc=org"],
+        &store,
+        false,
+        0,
+        &state,
+    )
+    .await
+    .expect("a parser panic does not fail the poll");
     assert_eq!(events.len(), 2);
-    assert_eq!(state.dropped(&t.id), 1);
-    // The cursor moved past all three.
-    let saved = String::from_utf8(store.load().unwrap().unwrap()).unwrap();
-    assert!(saved.contains(&format!("cursor {}", csn(3))), "{saved}");
+    assert_eq!(state.dropped(&target().id), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Poison records (phase-7 security review M1): a panic outside the
+/// parser (here in the event conversion) reaches the core, which restarts
+/// the stream in isolation mode (entries handed over and saved one by
+/// one), then asks it to skip one entry at the exact position: only the
+/// entry at fault is lost, never the entries before it in its page.
+#[tokio::test]
+async fn isolation_mode_then_a_skip_drop_the_entry_at_fault_only() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::{CURSOR, TEST_CONVERT_POISON};
+    let dir = skip_dir("isolate");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(format!("v2\ncursor {}\n", log_csn(0)).as_bytes())
+        .unwrap();
+    let poison: &'static str =
+        Box::leak(format!("{TEST_CONVERT_POISON},dc=example,dc=org").into_boxed_str());
+    let dns = || {
+        vec![
+            "dc=example,dc=org",
+            "dc=example,dc=org",
+            poison,
+            "dc=example,dc=org",
+            "dc=example,dc=org",
+        ]
+    };
+    let state = crate::check::CheckState::default();
+    // A normal poll panics before saving anything.
+    assert!(poll_log(dns(), &store, false, 0, &state).await.is_none());
+    let saved = || String::from_utf8(store.load().unwrap().unwrap()).unwrap();
+    assert!(saved().contains(&format!("cursor {}", log_csn(0))));
+    // Isolation mode: the two entries before it are handed over and saved.
+    assert!(poll_log(dns(), &store, true, 0, &state).await.is_none());
+    assert!(
+        saved().contains(&format!("cursor {}", log_csn(2))),
+        "{}",
+        saved()
+    );
+    // One skip at that exact position: the entry at fault only.
+    let events = poll_log(dns(), &store, true, 1, &state)
+        .await
+        .expect("the entry at fault is skipped");
+    assert_eq!(events.len(), 2);
+    assert_eq!(state.dropped(&target().id), 1);
+    assert!(
+        saved().contains(&format!("cursor {}", log_csn(5))),
+        "{}",
+        saved()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -34,6 +34,13 @@ futures-util = { workspace = true, features = ["std"] }
 # Safe syscalls for state files: open with O_NOFOLLOW, effective uid.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
+[features]
+# Test helpers for the connectors' tests (enabled from their
+# [dev-dependencies] only, never by the agent binary): tailing log files the
+# test's own user owns, and the masked -> contract conversion as JSON for
+# the interim I2 checks.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
 # HTTP mock server for tests only (bound to 127.0.0.1 by wiremock). It pulls

@@ -23,6 +23,7 @@ pub(crate) mod records;
 use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
+use databastion_classifiers::masking::MaskedEvent;
 use databastion_classifiers::names::normalize_ldap_dn;
 use databastion_core::audit::CursorStore;
 use databastion_core::audit::own::OwnAccount;
@@ -82,6 +83,9 @@ pub(crate) struct Position {
     /// request after the stream panicked repeatedly there
     /// (`CursorStore::skip_records`); counted as dropped.
     skip: u32,
+    /// Isolation mode (`CursorStore::isolate`): entries still to hand over
+    /// and save one by one.
+    isolate_left: u32,
 }
 
 impl Position {
@@ -94,6 +98,9 @@ impl Position {
         let mut p = Self::load_saved(store);
         if p.cursor.is_some() {
             p.skip = store.map_or(0, CursorStore::skip_records);
+        }
+        if store.is_some_and(CursorStore::isolate) {
+            p.isolate_left = PAGE;
         }
         p
     }
@@ -223,14 +230,13 @@ struct Polled {
     max_csn: Option<String>,
 }
 
-/// One search of the log from `from` (inclusive). The first unread
-/// entries are skipped (not parsed, counted as dropped, marked read) while
-/// `position` holds a skip request.
+/// One search of the log from `from` (inclusive). Each entry is parsed in
+/// isolation: one that makes the parser panic is dropped alone and
+/// counted (phase-7 review H1).
 async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     base: &str,
     from: &str,
-    position: &mut Position,
 ) -> Result<Polled, LdError> {
     let search = Search {
         base,
@@ -247,26 +253,13 @@ async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
         more: false,
         max_csn: None,
     };
-    let mut skipped_max: Option<String> = None;
-    let mut on_entry = |e: Entry| {
-        if position.skip > 0 {
-            if let Some(csn) = e
-                .first_str("entryCSN")
-                .filter(|c| time::valid_csn(c) && position.unread(c))
-            {
-                position.skip -= 1;
-                position.fresh(csn);
-                if skipped_max.as_deref().is_none_or(|m| csn > m) {
-                    skipped_max = Some(csn.to_owned());
-                }
-                out.dropped += 1;
-                return;
-            }
-        }
-        match records::parse(&e) {
-            Ok(r) => out.records.push(r),
-            Err(()) => out.dropped += 1,
-        }
+    let mut on_entry = |e: Entry| match databastion_core::isolate(|| {
+        #[cfg(test)]
+        test_poison(&e);
+        records::parse(&e)
+    }) {
+        Some(Ok(r)) => out.records.push(r),
+        Some(Err(())) | None => out.dropped += 1,
     };
     let outcome = s.search(Stage::Audit, &search, &mut on_entry).await?;
     if let Some(e) = outcome.error(Stage::Audit) {
@@ -274,9 +267,35 @@ async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
     }
     out.more = outcome.cut();
     out.records.sort_by(|a, b| a.csn.cmp(&b.csn));
-    // A skipped entry moves the cursor too.
-    out.max_csn = out.records.last().map(|r| r.csn.clone()).max(skipped_max);
+    out.max_csn = out.records.last().map(|r| r.csn.clone());
     Ok(out)
+}
+
+/// Tests: an entry whose `reqDN` holds this marker makes the parsing panic
+/// (a parser bug on one log entry); one whose `reqDN` holds
+/// [`TEST_CONVERT_POISON`] makes the event conversion panic.
+#[cfg(test)]
+pub(crate) const TEST_PARSE_POISON: &str = "cn=test-parser-panic";
+/// See [`TEST_PARSE_POISON`].
+#[cfg(test)]
+pub(crate) const TEST_CONVERT_POISON: &str = "cn=test-convert-panic";
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+fn test_poison(e: &Entry) {
+    if e.first_str("reqDN")
+        .is_some_and(|d| d.contains(TEST_PARSE_POISON))
+    {
+        panic!("parser bug on a log entry");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+fn test_convert_poison(r: &Record) {
+    if r.target.contains(TEST_CONVERT_POISON) {
+        panic!("conversion bug on a log entry");
+    }
 }
 
 /// What the stream needs from the server, re-read at each re-probe.
@@ -399,7 +418,7 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), ConnectorError> {
     let mut from = position.from(SystemTime::now());
     for _ in 0..MAX_ROUNDS {
-        let polled = read_log(session, base, &from, position)
+        let polled = read_log(session, base, &from)
             .await
             .map_err(LdError::into_connector_error)?;
         if polled.dropped > 0 {
@@ -412,8 +431,30 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let mut fresh = Vec::with_capacity(polled.records.len());
         let mut proven: HashSet<String> = HashSet::new();
+        let save = |position: &Position| {
+            if let (Some(store), Some(c)) = (store, position.encode()) {
+                if let Err(e) = store.save(c.as_bytes()) {
+                    tracing::warn!(target_id = %target.id, error = %e, "audit cursor not saved");
+                }
+            }
+        };
         for r in polled.records {
             if !position.fresh(&r.csn) {
+                continue;
+            }
+            if position.skip > 0 {
+                // The core's request: the stream panicked at this exact
+                // position, in isolation mode, so the first unread entry
+                // (in CSN order) is the one at fault. Dropped, counted,
+                // and the position saved past it.
+                position.skip -= 1;
+                state.note_dropped(&target.id, 1);
+                tracing::warn!(
+                    target_id = %target.id,
+                    "accesslog entry skipped: the stream failed on it repeatedly"
+                );
+                position.advance(&r.csn);
+                save(position);
                 continue;
             }
             if r.op == Op::Search {
@@ -429,23 +470,31 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             }
+            if position.isolate_left > 0 {
+                // Isolation mode: handed over and saved one by one, so a
+                // panic is at the exact entry at fault.
+                position.isolate_left -= 1;
+                let csn = r.csn.clone();
+                for e in convert(builder, vec![r]) {
+                    sink.submit(e).await?;
+                }
+                position.advance(&csn);
+                save(position);
+                continue;
+            }
             fresh.push(r);
         }
         for c in proven {
             state.note_search(&target.id, &c);
         }
-        let events = builder.convert(fresh, Instant::now());
+        let events = convert(builder, fresh);
         for e in events {
             sink.submit(e).await?;
         }
         // Everything read so far was handed over: move the cursor.
         if let Some(max) = &polled.max_csn {
             position.advance(max);
-            if let (Some(store), Some(c)) = (store, position.encode()) {
-                if let Err(e) = store.save(c.as_bytes()) {
-                    tracing::warn!(target_id = %target.id, error = %e, "audit cursor not saved");
-                }
-            }
+            save(position);
         }
         if !polled.more {
             return Ok(());
@@ -461,6 +510,17 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         "accesslog backlog larger than one poll: continuing at the next poll"
     );
     Ok(())
+}
+
+/// The events of `records` (a panic here reaches the core's guard: the
+/// core then restarts the stream in isolation mode, see
+/// `CursorStore::isolate`).
+fn convert(builder: &mut EventBuilder, records: Vec<Record>) -> Vec<MaskedEvent> {
+    #[cfg(test)]
+    for r in &records {
+        test_convert_poison(r);
+    }
+    builder.convert(records, Instant::now())
 }
 
 /// The canonical naming context of a record's `reqDN`, if known.

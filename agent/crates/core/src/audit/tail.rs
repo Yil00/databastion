@@ -18,13 +18,14 @@
 //! - Each poll reads at most [`MAX_POLL_BYTES`]; records are bounded by the
 //!   splitter. The path must be a regular file (checked before and after
 //!   opening, so a FIFO or a device is never read).
-//! - The file must **not be owned by the agent's own user** (effective
-//!   uid), checked on the opened handle, so after following symlinks
-//!   (end-of-phase-4 review L4): an audit log is written by the database
-//!   server; one the agent's user owns could have been written, or be
-//!   rewritten, by the agent's account itself, and would not be evidence
-//!   of what the server did. Such a file is refused like an unreadable one
-//!   (`PermissionDenied`: `audit.log_not_readable` in `check()`).
+//! - The file must **not be writable by the agent's own account**: not
+//!   owned by its effective uid, not world-writable, not group-writable
+//!   for one of its groups; checked on the opened handle, so after
+//!   following symlinks (end-of-phase-4 review L4). An audit log is
+//!   written by the database server; one the agent's account could write
+//!   would not be evidence of what the server did. Such a file is refused
+//!   like an unreadable one (`PermissionDenied`: `audit.log_not_readable`
+//!   in `check()`).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -299,31 +300,53 @@ pub struct Tailer {
     pub oversized: u64,
     /// Rotations or truncations seen.
     pub rotations: u64,
-    /// Records still to skip after resuming from the saved cursor (the
-    /// core's request after repeated panics there,
-    /// [`CursorStore::skip_records`]).
-    skip_pending: u32,
-    /// Records skipped on that request (counted in [`Self::malformed`]).
-    skipped: u64,
 }
 
-/// Test support only: accept log files owned by the agent's own user
-/// (every file a test creates is). Never set by the agent binary (checked
-/// by the architecture tests).
+/// Test support only: accept log files the agent's user could write
+/// (every file a test creates is its own). Compiled only for tests and the
+/// `test-support` feature (enabled from the connectors'
+/// `[dev-dependencies]`), never set by the agent binary (checked by the
+/// architecture tests).
+#[cfg(any(test, feature = "test-support"))]
 static ALLOW_OWN_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Test support only (see [`ALLOW_OWN_FILES`]): lets the tests of this
 /// crate and of the connectors tail files they created themselves.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn allow_agent_owned_logs_for_tests() {
     ALLOW_OWN_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether a file owned by `owner` is refused: it belongs to the agent's
-/// own (effective) user.
-fn owned_by_agent(owner: u32) -> bool {
-    owner == rustix::process::geteuid().as_raw()
-        && !ALLOW_OWN_FILES.load(std::sync::atomic::Ordering::Relaxed)
+#[cfg(any(test, feature = "test-support"))]
+fn own_files_allowed() -> bool {
+    ALLOW_OWN_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn own_files_allowed() -> bool {
+    false
+}
+
+/// Whether a log file is refused because the agent's own account could
+/// have written it: owned by the agent's effective user, writable by
+/// anyone (`S_IWOTH`), or writable by its group when that group is one of
+/// the agent's (effective or supplementary).
+fn writable_by_agent(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    if own_files_allowed() {
+        return false;
+    }
+    let mode = meta.permissions().mode();
+    if meta.uid() == rustix::process::geteuid().as_raw() || mode & 0o002 != 0 {
+        return true;
+    }
+    mode & 0o020 != 0 && {
+        let gid = meta.gid();
+        gid == rustix::process::getegid().as_raw()
+            || rustix::process::getgroups()
+                .map_or(true, |groups| groups.iter().any(|g| g.as_raw() == gid))
+    }
 }
 
 /// Opens the log without blocking (a FIFO or device planted at the path
@@ -345,10 +368,11 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
     if !meta.file_type().is_file() {
         return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
     }
-    if owned_by_agent(meta.uid()) {
+    if writable_by_agent(&meta) {
         tracing::warn!(
-            "audit log refused: the file is owned by the agent's own user; it must be written \
-             and owned by the database server (see the agent README, audit log files)"
+            "audit log refused: the agent's own user owns it or can write it (owner, a group of \
+             the agent's with write access, or world-writable); it must be written and owned by \
+             the database server (see the agent README, audit log files)"
         );
         return Err(TailError::Unreadable(std::io::ErrorKind::PermissionDenied));
     }
@@ -380,17 +404,14 @@ impl Tailer {
             store,
             oversized: 0,
             rotations: 0,
-            skip_pending: 0,
-            skipped: 0,
         }
     }
 
-    /// Damaged records dropped: by the splitter ([`Framing::JsonObjects`]),
-    /// and those skipped at the core's request after repeated panics at
-    /// the saved position ([`CursorStore::skip_records`]).
+    /// Damaged records dropped by the splitter
+    /// ([`Framing::JsonObjects`]).
     #[must_use]
     pub fn malformed(&self) -> u64 {
-        self.splitter.malformed.saturating_add(self.skipped)
+        self.splitter.malformed
     }
 
     /// Framing of the log records.
@@ -419,13 +440,7 @@ impl Tailer {
             return Ok(());
         }
         let (mut file, dev, ino, len) = open_regular(&self.path)?;
-        let cursor = self.load_cursor();
-        if cursor.is_some() {
-            // Resuming from a saved position the stream panicked at: the
-            // first records read from it are skipped.
-            self.skip_pending = self.store.as_ref().map_or(0, CursorStore::skip_records);
-        }
-        let start = match cursor {
+        let start = match self.load_cursor() {
             Some(c) if c.dev == dev && c.ino == ino && c.offset <= len => c.offset,
             Some(c) if c.dev == dev && c.ino == ino => {
                 self.rotations += 1;
@@ -459,27 +474,6 @@ impl Tailer {
     /// [`TailError`] when the file is missing, not a regular file or not
     /// readable.
     pub fn poll(&mut self) -> Result<Polled, TailError> {
-        let mut polled = self.poll_records()?;
-        if self.skip_pending > 0 && !polled.records.is_empty() {
-            let n = polled
-                .records
-                .len()
-                .min(usize::try_from(self.skip_pending).unwrap_or(usize::MAX));
-            // Dropped records are zeroized.
-            polled.records.drain(..n);
-            self.skip_pending = self
-                .skip_pending
-                .saturating_sub(u32::try_from(n).unwrap_or(u32::MAX));
-            self.skipped = self.skipped.saturating_add(n as u64);
-            tracing::warn!(
-                skipped = n,
-                "audit log records skipped at a position where the stream failed repeatedly"
-            );
-        }
-        Ok(polled)
-    }
-
-    fn poll_records(&mut self) -> Result<Polled, TailError> {
         self.ensure_open()?;
         let mut records = Vec::new();
         let mut read_total: u64 = 0;
@@ -688,52 +682,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("opening a FIFO blocked");
         assert!(!ok && err);
-    }
-
-    /// Poison records (phase-7 security review): resuming from a saved position where the stream
-    /// panicked, the records the core asks to skip are dropped and counted.
-    #[test]
-    fn skips_the_requested_records_after_the_saved_position() {
-        let d = Dir::new("skip");
-        std::fs::create_dir_all(&d.0).unwrap();
-        let log = d.0.join("audit.log");
-        std::fs::write(&log, b"old\n").unwrap();
-        let store = || CursorStore::new(&d.0, "t", "log").unwrap();
-        // First start: at the end of the file; then two records, read and
-        // committed.
-        let mut t = Tailer::new(log.clone(), Framing::Lines, Some(store()));
-        assert!(t.poll().unwrap().records.is_empty());
-        t.commit();
-        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-        f.write_all(b"poison\nnext\nlast\n").unwrap();
-        // A restart asked to skip one record from the saved position.
-        let mut t = Tailer::new(log.clone(), Framing::Lines, Some(store().with_skip(1)));
-        let got: Vec<Vec<u8>> = t
-            .poll()
-            .unwrap()
-            .records
-            .iter()
-            .map(|r| r.to_vec())
-            .collect();
-        assert_eq!(got, [b"next".to_vec(), b"last".to_vec()]);
-        assert_eq!(t.malformed(), 1);
-        // Only once.
-        f.write_all(b"more\n").unwrap();
-        assert_eq!(t.poll().unwrap().records.len(), 1);
-        assert_eq!(t.malformed(), 1);
-        // Without a saved position (first start at the end), nothing is
-        // skipped.
-        let other = d.0.join("other.log");
-        std::fs::write(&other, b"x\n").unwrap();
-        let fresh = CursorStore::new(&d.0, "t", "other").unwrap().with_skip(4);
-        let mut t = Tailer::new(other.clone(), Framing::Lines, Some(fresh));
-        assert!(t.poll().unwrap().records.is_empty());
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&other)
-            .unwrap();
-        f.write_all(b"y\n").unwrap();
-        assert_eq!(t.poll().unwrap().records.len(), 1);
     }
 
     #[test]
