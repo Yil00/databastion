@@ -559,6 +559,91 @@ class NeedleFilterTest(Base):
             self.assertIn(bad, out)
 
 
+
+class SecretScanTest(Base):
+    """`scan --secret-file` / `--literal-file`: ad-hoc secrets (DCL passwords, unkeyed hashes)."""
+
+    SECRET = "4f9c2e7a1b3d5f60a8c4e2b9d7f1a3c5e6b8d0f2a4c6e8b1"  # 48 hex, like rand_hex 24
+
+    def secret(self, name: str, value: str) -> str:
+        path = os.path.join(self.tmp.name, "secrets", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(value + "\n")  # as run.sh writes them (printf '%s\\n')
+        return path
+
+    def scan_secret(self, text: str, *extra: str, name: str = "dcl_password_1") -> tuple[int, str]:
+        return run(["scan", "--secret-file", self.secret(name, self.SECRET), *extra,
+                    self.write("out.txt", text)])
+
+    def test_forms_are_detected_and_never_printed(self) -> None:
+        import base64
+        s = self.SECRET
+        forms = {
+            "plain": f"x {s} y",
+            "upper case": f"x {s.upper()} y",
+            "16-character window": f"prefix{s[20:36]}suffix",
+            "json escapes": "".join(f"\\u{ord(c):04x}" for c in s),
+            # Every character escaped / split: no 16-character window in the raw text.
+            "url escapes": "".join(f"%{ord(c):02X}" for c in s),
+            "hex": s.encode().hex(),
+        }
+        for o in range(3):
+            for p in range(3):
+                raw = b"k" * p + s.encode() + b"z" * o
+                forms[f"base64, {p} byte(s) before"] = base64.b64encode(raw).decode()
+                forms[f"base64url, {p} byte(s) before"] = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        for label, text in forms.items():
+            with self.subTest(label):
+                rc, out = self.scan_secret(text)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("LEAK S.dcl_password_1", out)
+                self.assertIn("(secret) S dcl_password_1 ", out)
+                self.assertNotIn(s, out)
+                self.assertNotIn(s[20:36], out)
+
+    def test_whole_secret_has_its_own_id(self) -> None:
+        rc, out = self.scan_secret(f"x {self.SECRET} y")
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"(?m)^LEAK S\.dcl_password_1 \(secret\)")
+        rc, out = self.scan_secret(f"x {self.SECRET[:30]} y")
+        self.assertEqual(rc, 1, out)
+        self.assertNotRegex(out, r"(?m)^LEAK S\.dcl_password_1 ")  # a window only
+
+    def test_clean_text_and_short_fragments(self) -> None:
+        rc, out = self.scan_secret(CLEAN + "\n" + self.SECRET[:15] + " " + self.SECRET[-15:])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no secret in clear text", out)
+
+    def test_short_secret_is_a_usage_error(self) -> None:
+        rc, out = run(["scan", "--secret-file", self.secret("short", "0123456789abcde"),
+                       self.write("out.txt", "x")])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("short: shorter than 16 characters", out)
+        self.assertNotIn("0123456789abcde", out)
+
+    def test_literal_file_is_searched_whole_only(self) -> None:
+        lit = self.secret("dn_sha256", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+        rc, out = run(["scan", "--literal-file", lit,
+                       self.write("out.txt", "x 9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("LEAK S.dn_sha256 (secret) S dn_sha256 ", out)
+        rc, out = run(["scan", "--literal-file", lit, self.write("out.txt", "x 9f86d081884c7d659a2feaa0c55ad015")])
+        self.assertEqual(rc, 0, out)
+
+    def test_with_the_ground_truth_and_usage_errors(self) -> None:
+        rc, out = self.scan(self.write("both.txt", f"manon.bernard@example.com {self.SECRET}"),
+                            extra=["--secret-file", self.secret("dcl_password_2", self.SECRET)])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("LEAK L0.v0 ", out)
+        self.assertIn("LEAK S.dcl_password_2 ", out)
+        rc, out = run(["scan", self.write("x.txt", "x")])
+        self.assertEqual(rc, 2, out)
+        rc, out = run(["scan", "--needle", "L0.v0", "--secret-file", self.secret("a", self.SECRET),
+                       self.write("x.txt", "x")])
+        self.assertEqual(rc, 2, out)
+
+
 # MongoDB and OpenLDAP shapes: the value-bearing part is the field (dynamic keys) or the container.
 GT_NOSQL = {
     "locations": [
@@ -785,6 +870,52 @@ class AuditFingerprintTest(Base):
         self.assertEqual(rc, 1, out)
         self.assertIn("no access event of principal '@fingerprint' with shape.bulk_search", out)
         self.assertIn("no incident of policy 'e2e reads', principal '@fingerprint'", out)
+
+
+    def test_at_most_the_test_clients_fingerprints(self) -> None:
+        extra = ["--max-fingerprints", "2"]
+        rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                       "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                       "--events", self.write("events.json", json.dumps(self.events())),
+                       "--incidents", self.write("incidents.json", json.dumps(self.INCIDENTS)),
+                       *self.REQUIRED, *extra])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 distinct fingerprinted principal(s) over the events and incidents", out)
+        # A third fingerprint (e.g. the agent's own read, not filtered), even on a connect event.
+        ev = self.events() + [{"db_user": None, "db_user_fingerprint": "c" * 64, "action": "connect",
+                               "objects": [], "signals": [], "source": "openldap_accesslog"}]
+        rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                       "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                       "--events", self.write("events.json", json.dumps(ev)),
+                       "--incidents", self.write("incidents.json", json.dumps(self.INCIDENTS)),
+                       *self.REQUIRED, *extra])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("3 distinct fingerprinted principal(s) over the events and incidents", out)
+        self.assertNotIn("c" * 64, out)
+
+    def test_principal_without_the_dump_signal(self) -> None:
+        analyst = "@fingerprint!shape.bulk_search"
+        req = ["--require-event", analyst, "--require-incident", f"e2e reads:{analyst}"]
+        # The reads incident is the exporter's (FP1, which has a bulk search): not the analyst's.
+        rc, out = self.check(self.events(), self.INCIDENTS)
+        self.assertEqual(rc, 0, out)
+        ev = self.write("events.json", json.dumps(self.events()))
+        base = ["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                "--agent-account", "cn=databastion,ou=services,dc=example,dc=org", "--events", ev]
+        rc, out = run([*base, "--incidents", self.write("incidents.json", json.dumps(self.INCIDENTS)),
+                       *req])
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"no incident of policy 'e2e reads', principal '{analyst}'", out)
+        self.assertIn(f"1 event(s) of principal '{analyst}'", out)
+        inc = self.INCIDENTS + [{"policy_name": "e2e reads", "principal": self.FP2, "event_signals": []}]
+        rc, out = run([*base, "--incidents", self.write("incidents.json", json.dumps(inc)), *req])
+        self.assertEqual(rc, 0, out)
+        # Only the exporter left: no principal without the signal.
+        only = self.write("events.json", json.dumps(self.events()[:2]))
+        rc, out = run([*base[:-1], only, "--incidents", self.write("incidents.json", json.dumps(inc)),
+                       *req])
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"no access event of principal '{analyst}'", out)
 
 
 class HtmlTextViewTest(Base):
