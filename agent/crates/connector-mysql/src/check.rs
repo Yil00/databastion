@@ -293,11 +293,13 @@ fn label(privilege: &str) -> String {
 /// Evaluates over-privilege. Returns (over-privileged, expected) closed
 /// labels; with the extended-variant flag, a global `SELECT` is expected.
 /// `audit`: an Audit stream runs for the target, so `SELECT` on
-/// `performance_schema` is the documented Audit grant (ADR-0018).
+/// `performance_schema` is the documented Audit grant (ADR-0018), unless
+/// `file_source`: the audit log is the source, and the grant is unused.
 pub(crate) fn evaluate_privileges(
     g: &Grants,
     extended: bool,
     audit: bool,
+    file_source: bool,
 ) -> (Vec<String>, Vec<String>) {
     let mut over = Vec::new();
     let mut expected = Vec::new();
@@ -351,6 +353,12 @@ pub(crate) fn evaluate_privileges(
              session readable)"
                 .to_owned(),
         );
+    } else if ps_select && file_source {
+        over.push(
+            "SELECT on performance_schema unused (the audit log is the source; statement text \
+             of every session readable, clear-text passwords on MariaDB)"
+                .to_owned(),
+        );
     }
     if !beyond_select.is_empty() {
         over.push(format!(
@@ -398,6 +406,9 @@ pub(crate) struct CheckState {
     records: Mutex<HashMap<String, Instant>>,
     streams: Mutex<HashMap<String, usize>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
+    /// Per target: audit log records dropped (not parsable, oversized or
+    /// damaged), and when the count started (reported for 24 h).
+    dropped: Mutex<HashMap<String, (u64, Instant)>>,
 }
 
 /// An audit log record parsed within this period makes the log source
@@ -465,6 +476,30 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(target_id.to_owned(), Instant::now());
+    }
+
+    /// Audit log records of `target_id` dropped by the stream.
+    pub(crate) fn note_dropped(&self, target_id: &str, n: u64) {
+        let mut map = self
+            .dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map
+            .entry(target_id.to_owned())
+            .or_insert((0, Instant::now()));
+        if entry.1.elapsed() >= RECORD_FRESHNESS {
+            *entry = (0, Instant::now());
+        }
+        entry.0 = entry.0.saturating_add(n);
+    }
+
+    fn dropped(&self, target_id: &str) -> u64 {
+        self.dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)
+            .map_or(0, |(n, _)| *n)
     }
 
     /// Whether an audit log record of `target_id` was parsed recently.
@@ -641,11 +676,19 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         Source::Ps(t) => format!("audit source: performance_schema.{}", t.name()),
         Source::None => "no audit source".to_owned(),
     });
+    let dropped = state.dropped(&target.id);
+    if dropped > 0 {
+        notes.push(format!(
+            "{dropped} audit log record(s) dropped in the last 24 h (not parsable, oversized or \
+             damaged)"
+        ));
+    }
     if state.due(&target.id) && !session.is_poisoned() {
         match report(
             &mut session,
             target.mysql_settings().extended_grants,
             state.stream_running(&target.id),
+            matches!(source, Source::File(_)),
         )
         .await
         {
@@ -861,7 +904,12 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
     Ok(p)
 }
 
-async fn report(session: &mut Session, extended: bool, audit: bool) -> Result<Report, MyError> {
+async fn report(
+    session: &mut Session,
+    extended: bool,
+    audit: bool,
+    file_source: bool,
+) -> Result<Report, MyError> {
     let current = probe(session, sql::CURRENT_USER).await?;
     let current = cell(&current, 0, 0).unwrap_or_default().to_owned();
     // The grantee expression cannot match names with quotes or
@@ -909,7 +957,7 @@ async fn report(session: &mut Session, extended: bool, audit: bool) -> Result<Re
         }
     };
     let (_, coverage) = catalog::plan(&tables, |_, _| true);
-    let (over_privileged, expected) = evaluate_privileges(&grants, extended, audit);
+    let (over_privileged, expected) = evaluate_privileges(&grants, extended, audit, file_source);
     Ok(Report {
         over_privileged,
         expected,
@@ -939,18 +987,25 @@ mod tests {
             roles: 0,
         };
         // performance_schema is the Audit grant while Audit runs...
-        assert_eq!(evaluate_privileges(&grants, false, true), (vec![], vec![]));
+        assert_eq!(
+            evaluate_privileges(&grants, false, true, false),
+            (vec![], vec![])
+        );
         // ...and over-privilege otherwise (ADR-0018).
-        let (over, _) = evaluate_privileges(&grants, false, false);
+        let (over, _) = evaluate_privileges(&grants, false, false, false);
         assert_eq!(over.len(), 1, "{over:?}");
         assert!(over[0].starts_with("SELECT on performance_schema without Audit"));
+        // With an audit log as the source, the grant is unused.
+        let (over, _) = evaluate_privileges(&grants, false, true, true);
+        assert_eq!(over.len(), 1, "{over:?}");
+        assert!(over[0].starts_with("SELECT on performance_schema unused"));
         let hr_only = Grants {
             global: vec![g("USAGE")],
             scoped: vec![s("hr", "SELECT")],
             roles: 0,
         };
         assert_eq!(
-            evaluate_privileges(&hr_only, false, false),
+            evaluate_privileges(&hr_only, false, false, false),
             (vec![], vec![])
         );
     }
@@ -963,13 +1018,13 @@ mod tests {
             scoped: vec![s("performance_schema", "SELECT")],
             roles: 0,
         };
-        let (over, expected) = evaluate_privileges(&grants, false, true);
+        let (over, expected) = evaluate_privileges(&grants, false, true, false);
         assert_eq!(over.len(), 2, "{over:?}");
         assert!(expected.is_empty());
         assert!(over[0].starts_with("global SELECT"));
         assert_eq!(over[1], "global privileges: PROCESS, SHOW VIEW");
         // Extended variant: global SELECT expected, PROCESS / SHOW VIEW not.
-        let (over, expected) = evaluate_privileges(&grants, true, true);
+        let (over, expected) = evaluate_privileges(&grants, true, true, false);
         assert_eq!(over, ["global privileges: PROCESS, SHOW VIEW"]);
         assert!(expected[0].starts_with("global SELECT"));
     }
@@ -986,7 +1041,7 @@ mod tests {
             ],
             roles: 2,
         };
-        let (over, _) = evaluate_privileges(&grants, true, true);
+        let (over, _) = evaluate_privileges(&grants, true, true, false);
         for label in [
             "global privileges: FILE, SUPER",
             "SELECT on the mysql or sys system database",

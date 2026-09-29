@@ -207,6 +207,9 @@ pub(crate) async fn audit_stream(
                         })
                     }
                 };
+                // The agent's address may change (a new route, a DHCP
+                // lease): refreshed at each re-probe.
+                st.builder.set_own_addr(pre.own_addr);
                 if let Err(kind) = file_run(cfg, target, sink, state, st, &pre).await? {
                     tracing::warn!(
                         target_id = %target.id,
@@ -239,6 +242,7 @@ pub(crate) async fn audit_stream(
                     });
                 }
                 if let Some(st) = ps.as_mut() {
+                    st.poller.set_own_addr(pre.own_addr);
                     ps_run(cfg, target, sink, st, timeouts).await?;
                 }
             }
@@ -299,6 +303,7 @@ async fn file_run(
             state.note_record(&target.id);
         }
         if unparsed > 0 {
+            state.note_dropped(&target.id, unparsed);
             st.unparsed += unparsed;
             tracing::warn!(
                 target_id = %target.id,
@@ -307,6 +312,9 @@ async fn file_run(
             );
         }
         if (t.oversized, t.malformed()) != st.reported {
+            let skipped = (t.oversized - st.reported.0)
+                .saturating_add(t.malformed().saturating_sub(st.reported.1));
+            state.note_dropped(&target.id, skipped);
             tracing::warn!(
                 target_id = %target.id,
                 oversized = t.oversized - st.reported.0,
