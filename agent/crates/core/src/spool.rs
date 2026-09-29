@@ -444,6 +444,22 @@ impl Spool {
         }
     }
 
+    /// Sequence number the next [`push`](Self::push) gets. Batches pushed
+    /// between two readings of it have their first key part in that range;
+    /// their replacements (splits, resends) keep it.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Findings batches still spooled whose first key part is in `seqs`
+    /// (see [`next_seq`](Self::next_seq)).
+    pub(crate) fn findings_pending(&self, seqs: &std::ops::Range<u64>) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.findings && e.key.first().is_some_and(|s| seqs.contains(s)))
+            .count()
+    }
+
     /// Number of spooled batches.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

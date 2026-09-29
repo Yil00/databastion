@@ -303,3 +303,34 @@ fn front_where_skips_a_parked_endpoint_and_keeps_each_fifo() {
     }
     assert!(spool.front().is_none());
 }
+
+#[test]
+fn findings_pending_tracks_a_sequence_range_through_replacements() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    // An earlier job's batch, then an events batch and two batches of the
+    // job under watch.
+    spool.push(&batches(1)[0]).unwrap();
+    let first = spool.next_seq();
+    spool.push(&events_batch()).unwrap();
+    let job = batches(400);
+    for b in &job {
+        spool.push(b).unwrap();
+    }
+    let seqs = first..spool.next_seq();
+    assert_eq!(spool.findings_pending(&seqs), 2);
+    // Events and older findings never count.
+    assert_eq!(spool.findings_pending(&(0..first)), 1);
+    // A split keeps the first key part: still pending.
+    let key = vec![first + 1];
+    let (a, b) = job[0].halves().unwrap().unwrap();
+    spool.replace(&key, &[a, b], 0).unwrap();
+    assert_eq!(spool.findings_pending(&seqs), 3);
+    // Acknowledged or dropped batches are no longer pending.
+    spool.remove(&[first + 1, 0]);
+    spool.drop_batch(&[first + 1, 1]);
+    spool.remove(&[first + 2]);
+    assert_eq!(spool.findings_pending(&seqs), 0);
+    assert_eq!(spool.findings_pending(&(0..first)), 1);
+    assert_eq!(spool.len(), 2);
+}

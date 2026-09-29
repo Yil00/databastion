@@ -89,7 +89,13 @@ binary: `cargo build --no-default-features --features postgres`.
   wait behind a scan. A scan is stopped at its clamped duration (`timeout`)
   and when the agent is suspended or revoked (`cancelled`); findings are
   spooled per chunk of 500, the partial chunk is flushed on every exit, and
-  findings that cannot be spooled are counted (`findings_lost_total`).
+  findings that cannot be spooled are counted (`findings_lost_total`). The
+  terminal status of a scan waits until the console has answered every
+  findings batch of the job (P2-G), for at most 2 minutes; it does not wait
+  for a cancelled scan, while `/findings` is parked after a `501`, once the
+  agent is suspended, or on shutdown. A status sent with batches still
+  spooled is counted (`scan_status_before_flush_total`); the batches are
+  sent later (the console accepts them for 24 h after the status).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
   removed at startup, unreadable files are moved to `spool/quarantine/` (32
@@ -178,7 +184,10 @@ review remain the primary controls.
   1 s plus jittered backoff. A config reload that changes `console.*` or
   `state_dir` is refused (`invalid_params`).
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
-  `<= 0` are ignored. At most 16 jobs are handled per poll, each parsed on
+  `<= 0` are ignored. The heartbeat runs the targets' `check()`
+  concurrently, each bounded at 10 s, so it waits at most 10 s for all of
+  them (P2-G); a check still running then is reported unreachable with
+  `timeout` and the `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
 - HTTP tests use `wiremock` (dev-dependency, 127.0.0.1, test code only).
