@@ -196,7 +196,7 @@ impl CheckState {
         entry.0 = entry.0.saturating_add(n);
     }
 
-    fn dropped(&self, target_id: &str) -> u64 {
+    pub(crate) fn dropped(&self, target_id: &str) -> u64 {
         lock(&self.dropped)
             .get(target_id)
             .filter(|(_, since)| since.elapsed() < RECORD_FRESHNESS)

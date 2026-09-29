@@ -38,6 +38,9 @@ pub(crate) const AUDIT_DIR: &str = "audit";
 #[derive(Debug, Clone)]
 pub struct CursorStore {
     path: PathBuf,
+    /// Records to skip from the saved position (see
+    /// [`Self::skip_records`]).
+    skip: u32,
 }
 
 /// Why a cursor could not be read or written (logged by kind only).
@@ -63,7 +66,30 @@ impl CursorStore {
         };
         (ok(target_id) && ok(name)).then(|| Self {
             path: dir.join(format!("{target_id}.{name}.cursor")),
+            skip: 0,
         })
+    }
+
+    /// With a request to skip `n` records (see [`Self::skip_records`]).
+    /// Set by the core through the `AuditConfig`; public for the
+    /// connectors' tests.
+    #[must_use]
+    pub fn with_skip(mut self, n: u32) -> Self {
+        self.skip = n;
+        self
+    }
+
+    /// Records the core asks the stream to skip from the saved position,
+    /// normally 0. The stream panicked repeatedly at this position (a
+    /// record that crashes a parser would otherwise stop Audit of the
+    /// target for good): the connector drops the first `n` records it
+    /// reads from the saved position, counts them as dropped
+    /// (`audit.records_dropped`), and goes on. The core raises `n` (1, 2,
+    /// 4…) while the stream keeps panicking at the same position, and
+    /// stops the stream when panics go on at different positions.
+    #[must_use]
+    pub fn skip_records(&self) -> u32 {
+        self.skip
     }
 
     /// Reads the cursor. `Ok(None)` when none was saved yet.
@@ -102,6 +128,33 @@ impl CursorStore {
             kind: e.kind(),
         })
     }
+}
+
+/// A fingerprint of the saved read positions of `target_id` (every
+/// cursor file of the target in `dir`, names and contents): equal while
+/// the stream has not moved. `None` when the target has no saved cursor
+/// (a source whose position is in memory, or nothing saved yet).
+pub(crate) fn position_fingerprint(dir: &Path, target_id: &str) -> Option<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+    let prefix = format!("{target_id}.");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".cursor"))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for n in &names {
+        n.hash(&mut h);
+        match fsutil::read_private(&dir.join(n)) {
+            Ok(bytes) if bytes.len() <= MAX_CURSOR_BYTES => bytes.hash(&mut h),
+            _ => 0u8.hash(&mut h),
+        }
+    }
+    Some(h.finish())
 }
 
 /// Most groups held by one aggregator; a full aggregator is flushed early.

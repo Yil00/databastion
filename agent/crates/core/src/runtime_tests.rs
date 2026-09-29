@@ -2986,6 +2986,225 @@ async fn connector_panics_fail_the_call_not_the_agent() {
     assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
 }
 
+/// A stream over a list of records whose position (the next index) is
+/// saved in a cursor after each record; the record at `poison` makes it
+/// panic (a parser bug on one server record). It honours the core's skip
+/// request from the saved position (`CursorStore::skip_records`).
+struct Poisoned {
+    records: usize,
+    poison: Vec<usize>,
+    /// Records handed over, and records skipped.
+    delivered: Arc<StdMutex<Vec<usize>>>,
+    skipped: Arc<StdMutex<Vec<usize>>>,
+}
+
+#[async_trait::async_trait]
+impl Connector for Poisoned {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Limited,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    #[allow(clippy::panic)]
+    async fn audit_stream(
+        &self,
+        cfg: &crate::AuditConfig,
+        sink: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        let store = cfg.cursor("poisoned").unwrap();
+        let mut next: usize = store
+            .load()
+            .unwrap()
+            .map_or(0, |b| String::from_utf8(b).unwrap().parse().unwrap());
+        for _ in 0..store.skip_records() {
+            if next < self.records {
+                self.skipped.lock().unwrap().push(next);
+                next += 1;
+            }
+        }
+        while next < self.records {
+            if self.poison.contains(&next) {
+                panic!("parser panicked on SECRET-VALUE");
+            }
+            let _ = sink.submit(fake_event(1)).await;
+            self.delivered.lock().unwrap().push(next);
+            next += 1;
+            store.save(next.to_string().as_bytes()).unwrap();
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+}
+
+/// Poison records (phase-7 security review): panics at one saved position lead to a skip there
+/// (1, then 2, 4… records), not to a stopped stream; panics that go on at
+/// different positions still stop it.
+#[test]
+fn panics_at_one_position_skip_records_there() {
+    let mut t = PanicTracker::default();
+    let p = Some(7);
+    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 0 });
+    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 0 });
+    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 1 });
+    t.moved(p);
+    assert_eq!(t.skip(), 1);
+    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 2 });
+    assert_eq!(t.on_panic(p, false), PanicAction::Restart { skip: 4 });
+    // The stream moved past the position: the request ends.
+    t.moved(Some(8));
+    assert_eq!(t.skip(), 0);
+    // Past the last skip round at one position: stopped.
+    let mut t = PanicTracker::default();
+    let mut last = PanicAction::Restart { skip: 0 };
+    for _ in 0..(AUDIT_MAX_PANICS - 1 + AUDIT_MAX_SKIP_LEVEL) {
+        last = t.on_panic(p, false);
+        assert!(matches!(last, PanicAction::Restart { .. }), "{last:?}");
+    }
+    assert_eq!(
+        last,
+        PanicAction::Restart {
+            skip: 1 << (AUDIT_MAX_SKIP_LEVEL - 1)
+        }
+    );
+    assert!(matches!(t.on_panic(p, false), PanicAction::Park(_)));
+    // Different positions (or none: a position in memory): stopped after
+    // AUDIT_MAX_PANICS in a row, as before.
+    for positions in [[Some(1), Some(2), Some(3)], [None, None, None]] {
+        let mut t = PanicTracker::default();
+        assert_eq!(
+            t.on_panic(positions[0], false),
+            PanicAction::Restart { skip: 0 }
+        );
+        assert_eq!(
+            t.on_panic(positions[1], false),
+            PanicAction::Restart { skip: 0 }
+        );
+        assert_eq!(
+            t.on_panic(positions[2], false),
+            PanicAction::Park(AUDIT_MAX_PANICS)
+        );
+    }
+    // A long session resets that count.
+    let mut t = PanicTracker::default();
+    t.on_panic(Some(1), false);
+    t.on_panic(Some(2), false);
+    assert_eq!(t.on_panic(Some(3), true), PanicAction::Restart { skip: 0 });
+}
+
+/// A record that always makes the stream panic is skipped after
+/// AUDIT_MAX_PANICS panics at its position; the records after it are
+/// delivered and the stream is not stopped. Two more such records at other
+/// positions (three positions in a row) stop it.
+#[tokio::test]
+async fn a_poison_record_is_skipped_not_a_stopped_stream() {
+    let server = MockServer::start().await;
+    let mut env = enrolled(&server).await;
+    env.config.limits.min_audit_poll_interval_s = 1;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let delivered: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let skipped: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let rt = Arc::new(
+        Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(Poisoned {
+                records: 6,
+                poison: vec![2],
+                delivered: Arc::clone(&delivered),
+                skipped: Arc::clone(&skipped),
+            })],
+        )
+        .unwrap(),
+    );
+    let body = serde_json::json!({ "jobs": [audit_job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6fb2",
+        serde_json::json!({"enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1}),
+    )]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let params = rt.lock_audits().snapshot().into_iter().next().unwrap().2;
+    let (stop, stop_rx) = watch::channel(false);
+    let run = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run_audit("pg-main".to_owned(), params, stop_rx).await })
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while delivered.lock().unwrap().len() < 5 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the records after the poison one are delivered");
+    let _ = stop.send(true);
+    run.await.unwrap();
+    assert_eq!(*delivered.lock().unwrap(), [0, 1, 3, 4, 5]);
+    assert_eq!(*skipped.lock().unwrap(), [2]);
+    assert_eq!(
+        rt.counters.connector_panics.load(Ordering::Relaxed),
+        u64::from(AUDIT_MAX_PANICS)
+    );
+    assert_eq!(rt.counters.audit_records_skipped.load(Ordering::Relaxed), 1);
+    assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
+    // The panic payload never reached the logs of the agent (the hook
+    // keeps an id only): nothing here to read but the counters.
+
+    // Poison records at three positions in a row (each skipped after its
+    // panics, the stream moving between them): stopped at the third.
+    let dir = env.config.state_dir.join("audit");
+    let _ = std::fs::remove_file(dir.join("pg-main.poisoned.cursor"));
+    let delivered: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Poisoned {
+            records: 6,
+            poison: vec![1, 3, 5],
+            delivered: Arc::clone(&delivered),
+            skipped: Arc::default(),
+        })],
+    )
+    .unwrap();
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let params = rt.lock_audits().snapshot().into_iter().next().unwrap().2;
+    let (_stop, stop_rx) = watch::channel(false);
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        rt.run_audit("pg-main".to_owned(), params, stop_rx),
+    )
+    .await
+    .expect("the stream is stopped, not restarted forever");
+    assert!(rt.lock_audit_parked().get("pg-main").is_some());
+    assert_eq!(*delivered.lock().unwrap(), [0, 2, 4]);
+}
+
 // ------------------------------------------------------------------ audit
 
 /// An Audit connector: records the configuration it gets and submits

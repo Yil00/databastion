@@ -78,6 +78,10 @@ pub(crate) struct Position {
     /// (a bare CSN, without the CSNs read), or the newest CSN left out of
     /// a persisted overlap past [`MAX_PERSISTED_SEEN`].
     floor: Option<String>,
+    /// Log entries still to skip from the saved position: the core's
+    /// request after the stream panicked repeatedly there
+    /// (`CursorStore::skip_records`); counted as dropped.
+    skip: u32,
 }
 
 impl Position {
@@ -87,6 +91,14 @@ impl Position {
     /// not read (committed out of CSN order just before the restart) are
     /// reported.
     pub(crate) fn load(store: Option<&CursorStore>) -> Self {
+        let mut p = Self::load_saved(store);
+        if p.cursor.is_some() {
+            p.skip = store.map_or(0, CursorStore::skip_records);
+        }
+        p
+    }
+
+    fn load_saved(store: Option<&CursorStore>) -> Self {
         let text = store
             .and_then(|s| match s.load() {
                 Ok(v) => v,
@@ -105,7 +117,7 @@ impl Position {
             return Self {
                 floor: cursor.clone(),
                 cursor,
-                seen: BTreeSet::new(),
+                ..Self::default()
             };
         }
         let mut p = Self::default();
@@ -168,9 +180,14 @@ impl Position {
         }
     }
 
+    /// Whether `csn` was not read yet (nothing marked).
+    fn unread(&self, csn: &str) -> bool {
+        !self.seen.contains(csn) && self.floor.as_deref().is_none_or(|f| csn > f)
+    }
+
     /// Whether `csn` is new; marks it read.
     fn fresh(&mut self, csn: &str) -> bool {
-        if self.seen.contains(csn) || self.floor.as_deref().is_some_and(|f| csn <= f) {
+        if !self.unread(csn) {
             return false;
         }
         self.seen.insert(csn.to_owned());
@@ -206,11 +223,14 @@ struct Polled {
     max_csn: Option<String>,
 }
 
-/// One search of the log from `from` (inclusive).
+/// One search of the log from `from` (inclusive). The first unread
+/// entries are skipped (not parsed, counted as dropped, marked read) while
+/// `position` holds a skip request.
 async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     base: &str,
     from: &str,
+    position: &mut Position,
 ) -> Result<Polled, LdError> {
     let search = Search {
         base,
@@ -227,9 +247,26 @@ async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
         more: false,
         max_csn: None,
     };
-    let mut on_entry = |e: Entry| match records::parse(&e) {
-        Ok(r) => out.records.push(r),
-        Err(()) => out.dropped += 1,
+    let mut skipped_max: Option<String> = None;
+    let mut on_entry = |e: Entry| {
+        if position.skip > 0 {
+            if let Some(csn) = e
+                .first_str("entryCSN")
+                .filter(|c| time::valid_csn(c) && position.unread(c))
+            {
+                position.skip -= 1;
+                position.fresh(csn);
+                if skipped_max.as_deref().is_none_or(|m| csn > m) {
+                    skipped_max = Some(csn.to_owned());
+                }
+                out.dropped += 1;
+                return;
+            }
+        }
+        match records::parse(&e) {
+            Ok(r) => out.records.push(r),
+            Err(()) => out.dropped += 1,
+        }
     };
     let outcome = s.search(Stage::Audit, &search, &mut on_entry).await?;
     if let Some(e) = outcome.error(Stage::Audit) {
@@ -237,7 +274,8 @@ async fn read_log<S: AsyncRead + AsyncWrite + Unpin>(
     }
     out.more = outcome.cut();
     out.records.sort_by(|a, b| a.csn.cmp(&b.csn));
-    out.max_csn = out.records.last().map(|r| r.csn.clone());
+    // A skipped entry moves the cursor too.
+    out.max_csn = out.records.last().map(|r| r.csn.clone()).max(skipped_max);
     Ok(out)
 }
 
@@ -361,7 +399,7 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), ConnectorError> {
     let mut from = position.from(SystemTime::now());
     for _ in 0..MAX_ROUNDS {
-        let polled = read_log(session, base, &from)
+        let polled = read_log(session, base, &from, position)
             .await
             .map_err(LdError::into_connector_error)?;
         if polled.dropped > 0 {

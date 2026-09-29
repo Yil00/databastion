@@ -522,6 +522,9 @@ pub struct AuditConfig {
     min_rows: Option<u64>,
     sensitive_objects: Vec<SensitiveObject>,
     max_sample_rows: u32,
+    /// Records to skip from the saved positions (see
+    /// [`crate::audit::CursorStore::skip_records`]).
+    skip_records: u32,
 }
 
 impl std::fmt::Debug for AuditConfig {
@@ -551,6 +554,7 @@ impl Default for AuditConfig {
             min_rows: None,
             sensitive_objects: Vec::new(),
             max_sample_rows: limits.max_sample_rows,
+            skip_records: 0,
         }
     }
 }
@@ -574,6 +578,7 @@ impl AuditConfig {
             min_rows: params.min_rows,
             sensitive_objects: params.sensitive_objects,
             max_sample_rows: limits.max_sample_rows,
+            skip_records: 0,
         }
     }
 
@@ -627,6 +632,16 @@ impl AuditConfig {
     #[must_use]
     pub fn cursor(&self, name: &str) -> Option<crate::audit::CursorStore> {
         crate::audit::CursorStore::new(self.state_dir.as_deref()?, &self.target_id, name)
+            .map(|c| c.with_skip(self.skip_records))
+    }
+
+    /// Asks the stream to skip `n` records from its saved positions (set
+    /// by the core after repeated panics at one position; see
+    /// [`crate::audit::CursorStore::skip_records`]).
+    #[must_use]
+    pub(crate) fn with_skip_records(mut self, n: u32) -> Self {
+        self.skip_records = n;
+        self
     }
 
     /// Target id.

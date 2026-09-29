@@ -208,6 +208,20 @@ review remain the primary controls.
   the shipped graph. `deny-dev.toml` checks licenses and sources of the full
   graph, dev-dependencies included.
 
+### Audit streams that panic
+A connector call that panics fails that call only (`crate::panics`). An
+Audit stream that panics is restarted from its persisted read position. When
+it panics again and again **at the same saved position** (a record that
+crashes a parser), the core asks it to skip records there: after 3 panics, 1
+record, then 2, 4… at each further panic there (at most 12 rounds); the
+connector drops them without parsing, counts them as dropped
+(`audit.records_dropped`, and `audit_records_skipped_total` in the heartbeat
+metrics), and goes on. File sources do it in the core tailer, the OpenLDAP
+accesslog on its own entries (`CursorStore::skip_records`). Panics at
+different positions (3 in a row), or on a source whose position is in memory
+(restarted afresh anyway), still stop the stream until Audit is reconfigured
+or the agent restarts (`audit.stream_stopped`).
+
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
 capped at `warn`: drivers and HTTP clients may log parameters or payloads at

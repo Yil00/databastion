@@ -591,3 +591,104 @@ mod proofs {
         assert!(probes.iter().all(|p| p.ends_with(OUTER)));
     }
 }
+
+/// Poison records (phase-7 security review): resuming from a saved accesslog position where the
+/// stream panicked, the entries the core asks to skip are dropped (counted)
+/// and marked read, and the stream goes on with the next ones.
+#[tokio::test]
+async fn accesslog_entries_are_skipped_on_the_cores_request() {
+    use databastion_classifiers::masking::MaskedEvent;
+    use databastion_core::EventSink;
+    use databastion_core::audit::CursorStore;
+    use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+
+    use crate::audit::events::EventBuilder;
+    use crate::audit::{CURSOR, Position, poll};
+    use crate::check::CheckState;
+
+    let csn = |n: u32| format!("20260929202642.{n:06}Z#000000#000#000000");
+    let entries: Vec<String> = (1..=3).map(csn).collect();
+    let handler = {
+        let entries = entries.clone();
+        directory(AGENT, move |id, req| {
+            let Request::Search { base, .. } = req else {
+                return vec![encode::done(id, 53)];
+            };
+            assert_eq!(base, "cn=accesslog");
+            let mut out: Vec<Vec<u8>> = entries
+                .iter()
+                .map(|c| {
+                    encode::entry(
+                        id,
+                        &format!("reqStart={c},cn=accesslog"),
+                        &[
+                            ("reqStart", &[b"20260929202642.000001Z"]),
+                            ("reqType", &[b"search"]),
+                            ("reqAuthzID", &[b"cn=admin,dc=example,dc=org"]),
+                            ("reqDN", &[b"dc=example,dc=org"]),
+                            ("reqResult", &[b"0"]),
+                            ("reqScope", &[b"sub"]),
+                            ("reqFilter", &[b"(objectClass=*)"]),
+                            ("reqAttr", &[b"mail"]),
+                            ("reqEntries", &[b"3"]),
+                            ("entryCSN", &[c.as_bytes()]),
+                        ],
+                    )
+                })
+                .collect();
+            out.push(encode::done(id, 0));
+            out
+        })
+    };
+    let (s, _) = session(handler).await;
+    let mut s = s.unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-ldap-skip-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Saved position: before the three entries.
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(format!("v2\ncursor {}\n", csn(0)).as_bytes())
+        .unwrap();
+    // The core's request (after repeated panics there): skip one.
+    let mut position = Position::load(Some(&store.clone().with_skip(1)));
+    let state = CheckState::default();
+    let t = target();
+    let (sink, mut rx) = EventSink::channel(64);
+    let mut builder = EventBuilder::new(
+        OwnAccount::new(AGENT, None, None, 1000, SharedOwnUsage::default()),
+        AGENT.to_owned(),
+        1000,
+        Vec::new(),
+    );
+    poll(
+        &t,
+        &sink,
+        &state,
+        &mut s,
+        &mut builder,
+        &mut position,
+        Some(&store),
+        "cn=accesslog",
+    )
+    .await
+    .unwrap();
+    drop(sink);
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    while let Some(e) = rx.recv().await {
+        events.push(e);
+    }
+    // Two of the three searches reported; the first one skipped, counted.
+    assert_eq!(events.len(), 2);
+    assert_eq!(state.dropped(&t.id), 1);
+    // The cursor moved past all three.
+    let saved = String::from_utf8(store.load().unwrap().unwrap()).unwrap();
+    assert!(saved.contains(&format!("cursor {}", csn(3))), "{saved}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -309,6 +309,9 @@ struct Counters {
     /// Connector calls (`check`, `discover`, `audit_stream`) that panicked
     /// and were turned into a failure of that call.
     connector_panics: AtomicU64,
+    /// Audit records the core asked streams to skip after repeated panics
+    /// at one read position ([`PanicTracker`]).
+    audit_records_skipped: AtomicU64,
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
@@ -379,6 +382,97 @@ const AUDIT_MAX_PANICS: u32 = 3;
 /// A session that ran this long resets the panic count (the next panic is
 /// likely on another record).
 const AUDIT_PANIC_RESET: Duration = Duration::from_secs(600);
+/// Skip rounds at one saved position before the stream is stopped: the
+/// stream is asked to skip 1, 2, 4… records (at most 2^11 = 2048).
+const AUDIT_MAX_SKIP_LEVEL: u32 = 12;
+
+/// What to do after an audit stream panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicAction {
+    /// Restart (with backoff), asking the stream to skip this many records
+    /// from its saved position (0: none).
+    Restart { skip: u32 },
+    /// Stop the stream until Audit is reconfigured or the agent restarts,
+    /// with the count of panics reported.
+    Park(u32),
+}
+
+/// Panics of one audit stream, and the saved position they happened at
+/// (phase-7 security review: a record that always makes a parser panic must not
+/// blind Audit of the target for good).
+///
+/// - At the **same saved position** (the fingerprint of the target's
+///   cursor files, [`audit::position_fingerprint`]): after
+///   [`AUDIT_MAX_PANICS`] panics there, the stream is restarted with a
+///   request to skip 1 record from it, then 2, 4… at each further panic
+///   there (the records skipped are counted as dropped by the connector);
+///   past [`AUDIT_MAX_SKIP_LEVEL`] rounds, it is stopped.
+/// - At **different positions** (the stream moved between panics), or
+///   without a saved position (a source whose position is in memory
+///   starts afresh at each restart): [`AUDIT_MAX_PANICS`] panics in a row
+///   stop the stream, as before; a session that ran
+///   [`AUDIT_PANIC_RESET`] resets that count.
+#[derive(Debug, Default)]
+struct PanicTracker {
+    /// Panics at different positions (or without one), in a row.
+    panics: u32,
+    /// Panics at the current position.
+    same: u32,
+    /// Skip rounds at the current position.
+    level: u32,
+    position: Option<u64>,
+}
+
+impl PanicTracker {
+    /// Records a panic of a session that ran `long` (at least
+    /// [`AUDIT_PANIC_RESET`]) at the saved `position`.
+    fn on_panic(&mut self, position: Option<u64>, long: bool) -> PanicAction {
+        let same = position.is_some() && position == self.position;
+        if !same {
+            self.position = position;
+            self.same = 0;
+            self.level = 0;
+            self.panics = if long {
+                1
+            } else {
+                self.panics.saturating_add(1)
+            };
+        }
+        self.same = self.same.saturating_add(1);
+        if same && (self.level > 0 || self.same >= AUDIT_MAX_PANICS) {
+            self.level = self.level.saturating_add(1);
+            if self.level > AUDIT_MAX_SKIP_LEVEL {
+                return PanicAction::Park(self.panics.saturating_add(self.same - 1));
+            }
+            return PanicAction::Restart {
+                skip: 1 << (self.level - 1),
+            };
+        }
+        if self.panics >= AUDIT_MAX_PANICS && !same {
+            return PanicAction::Park(self.panics);
+        }
+        PanicAction::Restart { skip: self.skip() }
+    }
+
+    /// The skip still requested at the current position (0 once the
+    /// stream moved: see [`Self::moved`]).
+    fn skip(&self) -> u32 {
+        if self.level == 0 {
+            0
+        } else {
+            1 << (self.level - 1)
+        }
+    }
+
+    /// The saved position is now `position`: a skip request ends once the
+    /// stream moved past it.
+    fn moved(&mut self, position: Option<u64>) {
+        if self.level > 0 && position != self.position {
+            self.level = 0;
+            self.same = 0;
+        }
+    }
+}
 
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
 struct PreparedScan {
@@ -859,6 +953,7 @@ impl Runtime {
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
             ("connector_panics_total", &c.connector_panics),
+            ("audit_records_skipped_total", &c.audit_records_skipped),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
             (
                 "scan_status_before_flush_total",
@@ -1916,7 +2011,7 @@ impl Runtime {
         mut stop: watch::Receiver<bool>,
     ) {
         let mut failures: u32 = 0;
-        let mut panics: u32 = 0;
+        let mut panics = PanicTracker::default();
         // New settings (or an agent restart) give a stopped stream another
         // chance.
         self.lock_audit_parked().remove(&target_id);
@@ -1940,9 +2035,11 @@ impl Runtime {
                 return;
             };
             let dir = Self::audit_dir(&config);
-            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits);
+            panics.moved(audit::position_fingerprint(&dir, &target_id));
+            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits)
+                .with_skip_records(panics.skip());
             match crate::fsutil::ensure_private_dir(&dir) {
-                Ok(()) => cfg = cfg.with_state_dir(dir),
+                Ok(()) => cfg = cfg.with_state_dir(dir.clone()),
                 Err(e) => tracing::warn!(
                     target_id,
                     kind = %e.kind(),
@@ -1966,21 +2063,36 @@ impl Runtime {
                 AuditEnd::Panicked(panic_id) => {
                     bump(&self.counters.connector_panics, 1);
                     bump(&self.counters.audit_stream_failures, 1);
-                    panics = if began.elapsed() >= AUDIT_PANIC_RESET {
-                        1
-                    } else {
-                        panics.saturating_add(1)
+                    let position = audit::position_fingerprint(&dir, &target_id);
+                    let skip = match panics.on_panic(position, began.elapsed() >= AUDIT_PANIC_RESET)
+                    {
+                        PanicAction::Park(n) => {
+                            tracing::error!(
+                                target_id,
+                                panic_id,
+                                panics = n,
+                                "audit stream stopped after repeated internal errors: \
+                                 reconfigure Audit or restart the agent"
+                            );
+                            self.lock_audit_parked().insert(target_id.clone(), n);
+                            return;
+                        }
+                        PanicAction::Restart { skip } => skip,
                     };
-                    if panics >= AUDIT_MAX_PANICS {
+                    // The backoff grows with the panics at one position;
+                    // a new position or a skip is progress.
+                    if skip > 0 || panics.same == 1 {
+                        failures = 0;
+                    }
+                    if skip > 0 {
+                        bump(&self.counters.audit_records_skipped, u64::from(skip));
                         tracing::error!(
                             target_id,
                             panic_id,
-                            panics,
-                            "audit stream stopped after repeated internal errors: reconfigure \
-                             Audit or restart the agent"
+                            skip,
+                            "audit stream failed repeatedly at the same read position: \
+                             skipping records there (counted as dropped)"
                         );
-                        self.lock_audit_parked().insert(target_id.clone(), panics);
-                        return;
                     }
                     failures = failures.saturating_add(1);
                     let delay = backoff::Backoff::CONSOLE
