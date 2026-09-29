@@ -332,7 +332,9 @@ export interface components {
          *     `signature.mysqldump` for a future connector) is a new entry added by a compatible
          *     contract change; an id is never removed, renamed or given another meaning.
          *
-         *     This schema checks the **form** only (pattern), not registration, so that a console
+         *     The name after the family is 1 to 6 words of 1 to 16 lowercase letters joined by `_`: no
+         *     digit, so an id cannot carry a number (an account, card or phone number). This schema
+         *     checks the **form** only (pattern), not registration, so that a console
          *     accepts a signal registered after it was built; it stores such a signal and matches it by
          *     exact id or family (`signature.*`). The console computes its own baseline verdict and
          *     does not rely on any `volume.*` signal for it (ADR-0021).
@@ -618,7 +620,8 @@ export interface components {
          *     schema checks the form only, so an older console accepts a code registered later and
          *     shows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,
          *     `privilege.*` privileges of the agent's account, `security.*` insecure settings,
-         *     `check.*` the check itself.
+         *     `check.*` the check itself. The name after the family is 1 to 6 words of 1 to 16
+         *     lowercase letters joined by `_`: no digit, so a code cannot carry a number.
          */
         TargetNoteCode: string;
         /**

@@ -40,17 +40,26 @@ def load_head(path):
         return {}
 
 
+def show(value):
+    """A registry key or ref as printed: JSON-quoted (no newline or control character survives,
+    so a key cannot start a `::` workflow command) and with `%` escaped as GitHub annotations
+    expect."""
+    return json.dumps(str(value)).replace("%", "%25")
+
+
 def engines(entry):
-    return set(entry.get("engines", [])) if isinstance(entry, dict) else set()
+    if not isinstance(entry, dict) or not isinstance(entry.get("engines"), list):
+        return set()
+    return {e for e in entry["engines"] if isinstance(e, str)}
 
 
 def lock_errors(base, head):
     errors = []
     for version, digest in base.items():
         if version not in head:
-            errors.append(f"published version {version} was removed")
+            errors.append(f"published version {show(version)} was removed")
         elif head[version] != digest:
-            errors.append(f"published version {version} was changed")
+            errors.append(f"published version {show(version)} was changed")
     return errors
 
 
@@ -58,11 +67,11 @@ def id_errors(base, head):
     errors = []
     for key, entry in base.items():
         if key not in head:
-            errors.append(f"registered id {key} was removed or renamed")
+            errors.append(f"registered id {show(key)} was removed or renamed")
         else:
             lost = sorted(engines(entry) - engines(head[key]))
             if lost:
-                errors.append(f"registered id {key} lost engine(s) {', '.join(lost)}")
+                errors.append(f"registered id {show(key)} lost engine(s) {', '.join(show(e) for e in lost)}")
     return errors
 
 
@@ -72,13 +81,13 @@ def main(refs):
     failed = False
     for ref in refs:
         if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).returncode != 0:
-            print(f"::error::append-only check: {ref} does not resolve")
+            print(f"::error::append-only check: {show(ref)} does not resolve")
             failed = True
             continue
         for path, check in [(LOCK, lock_errors)] + [(p, id_errors) for p in ID_REGISTRIES]:
             base = load_at(ref, path)
             if base is None:
-                print(f"{path}: absent at {ref}, nothing to compare")
+                print(f"{path}: absent at {show(ref)}, nothing to compare")
                 continue
             head = load_head(path)
             if not isinstance(base, dict) or not isinstance(head, dict):
@@ -87,11 +96,12 @@ def main(refs):
                 continue
             errors = check(base, head)
             for e in errors:
-                print(f"::error file={path}::{e} since {ref} (append-only: add a new entry instead)")
+                print(f"::error file={path}::{e} since {show(ref)} (append-only: add a new entry instead)")
             failed |= bool(errors)
             if not errors:
                 added = sorted(set(head) - set(base))
-                print(f"{path}: {len(base)} entr(y/ies) of {ref} kept; added: {', '.join(added) or 'none'}")
+                shown = ", ".join(show(k) for k in added) or "none"
+                print(f"{path}: {len(base)} entr(y/ies) of {show(ref)} kept; added: {shown}")
     sys.exit(1 if failed else 0)
 
 

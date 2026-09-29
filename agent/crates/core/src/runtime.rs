@@ -785,7 +785,7 @@ impl Runtime {
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
         let body = serde_json::to_vec(&request)
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let response: HeartbeatResponse = self
+        let result: Result<HeartbeatResponse, CallError> = self
             .session
             .call(
                 Method::POST,
@@ -795,7 +795,22 @@ impl Runtime {
                 uplink::REQUEST_TIMEOUT,
                 uplink::accept::heartbeat,
             )
-            .await?;
+            .await;
+        let response = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if matches!(
+                    e,
+                    CallError::Uplink(UplinkError::Rejected { status: 400, .. })
+                ) {
+                    // The console may not accept a negotiated field any more
+                    // (rolled back): send none until a response lists them
+                    // again (ADR-0022).
+                    self.console_caps.clear();
+                }
+                return Err(e);
+            }
+        };
         self.console_caps.record(response.accepts.as_ref());
         let value = response.heartbeat_interval_s.0;
         let clamped = backoff::clamp_heartbeat_interval(value);
@@ -830,14 +845,6 @@ impl Runtime {
                 Err(e) => {
                     bump(&self.counters.heartbeat_failures, 1);
                     failures = failures.saturating_add(1);
-                    if matches!(
-                        e,
-                        CallError::Uplink(UplinkError::Rejected { status: 400, .. })
-                    ) {
-                        // The console may not accept a negotiated field any more
-                        // (rolled back): send none until a response lists them.
-                        self.console_caps.clear();
-                    }
                     self.on_call_error("heartbeat", &e, failures, interval)?
                 }
             };

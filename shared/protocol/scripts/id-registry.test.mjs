@@ -21,6 +21,7 @@ const cases = {
     good: "signature.mysqldump",
     badForm: ["exfil.dump", "signature.PgDump", "pg_dump"],
     fixture: (...ids) => ({ events: [{ signals: ids }] }),
+    digits: ["signature.4111111111111111", "volume.rows_1250000", "shape.full_table_copy2"],
     required: [
       "signature.pg_dump",
       "signature.copy_to_file",
@@ -35,6 +36,7 @@ const cases = {
     good: "audit.binlog_not_readable",
     badForm: ["note.x", "audit.Upper", "audit.", "audit"],
     fixture: (...ids) => ({ targets: [{ notes: ids.map((code) => ({ code })) }] }),
+    digits: ["coverage.fr7630006000011234567890189", "audit.4111111111111111", "check.10_20_30_40_5432"],
     required: ["security.tls_disabled", "coverage.relations_rls_skipped", "privilege.role_attributes", "check.timed_out"],
   },
 };
@@ -79,6 +81,16 @@ for (const [kind, c] of Object.entries(cases)) {
   test(`${kind}: fixture consistency: registered ids pass, others fail`, () => {
     assert.deepEqual(fixtureIdProblems(c.fixture(someId), kind, registry, "x"), []);
     assert.equal(fixtureIdProblems(c.fixture(someId, c.good), kind, registry, "x").length, 1);
+  });
+
+  test(`${kind}: every registered id matches the ${c.schema} schema`, () => {
+    const validate = ajv.getSchema(`${ROOT_ID}#/$defs/${c.schema}`);
+    for (const id of Object.keys(registry)) assert.equal(validate(id), true, id);
+  });
+
+  test(`${kind}: the ${c.schema} schema rejects ids carrying digits`, () => {
+    const validate = ajv.getSchema(`${ROOT_ID}#/$defs/${c.schema}`);
+    for (const bad of c.digits) assert.equal(validate(bad), false, bad);
   });
 
   test(`${kind}: the ${c.schema} schema checks the form only (an id registered later is accepted)`, () => {

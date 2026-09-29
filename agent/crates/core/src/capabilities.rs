@@ -14,6 +14,10 @@ use std::sync::RwLock;
 
 use databastion_protocol::CapabilityList;
 
+/// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
+/// generated type does not enforce `maxItems`).
+pub(crate) const MAX_CAPABILITIES: usize = 64;
+
 /// Tokens of the optional request fields the agent may send (contract
 /// `Capability`). No producer uses them yet.
 #[allow(dead_code)]
@@ -34,10 +38,16 @@ pub(crate) struct ConsoleCapabilities {
 
 impl ConsoleCapabilities {
     /// Replaces the set with the `accepts` of a heartbeat response (absent:
-    /// nothing is accepted).
+    /// nothing is accepted). Only the first [`MAX_CAPABILITIES`] tokens are
+    /// kept, so a hostile or buggy console cannot grow the set.
     pub(crate) fn record(&self, accepts: Option<&CapabilityList>) {
         let set = accepts
-            .map(|list| list.iter().map(|c| c.as_str().to_owned()).collect())
+            .map(|list| {
+                list.iter()
+                    .take(MAX_CAPABILITIES)
+                    .map(|c| c.as_str().to_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         *self
             .accepted
@@ -101,6 +111,20 @@ mod tests {
         assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
         caps.record(Some(&list(&[token::TARGET_STATUS_NOTES])));
         caps.clear();
+        assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
+    }
+
+    #[test]
+    fn tokens_past_the_contract_bound_are_ignored() {
+        let mut tokens: Vec<String> = (0..MAX_CAPABILITIES)
+            .map(|i| format!("filler.f{i}"))
+            .collect();
+        tokens.push(token::TARGET_STATUS_NOTES.to_owned());
+        let list: CapabilityList = serde_json::from_value(serde_json::json!(tokens)).unwrap();
+        let caps = ConsoleCapabilities::default();
+        caps.record(Some(&list));
+        assert!(caps.console_accepts("filler.f0"));
+        assert!(caps.console_accepts(&format!("filler.f{}", MAX_CAPABILITIES - 1)));
         assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
     }
 

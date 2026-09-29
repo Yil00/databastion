@@ -27,6 +27,12 @@ Optional fields added after protocol 0.1.0 are therefore **negotiated** ([ADR-00
 - **Response and job fields (console → agent).** The agent lists the ones it accepts in `HeartbeatRequest.accepts`. The console sends a console → agent field introduced after 0.1.0, in any response or job, only when the agent's latest heartbeat named it. None exists yet, so the agent omits the list.
 - **New enum values** in a request field (e.g. a new `TargetNoteLabel`) are negotiated with a revision token; until then the agent sends the fallback value (`other`).
 - **Form-only registries** (`signals.json`, `target-notes.json`) need no negotiation: an older console accepts a well-formed id it does not know.
+- **Multi-replica consoles** list a token only once **every** replica accepts the field. During a rolling upgrade, the build that accepts a field ships first without listing it; the listing follows once no older replica remains.
+- **The agent keeps at most 64 tokens** of a list, the contract bound.
+- **Obligations of the first gated producer** (none exists yet; [ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 9):
+  - clear the capabilities on any `400` from `/events`, `/findings` or `/jobs/{id}/status` whose body carried a gated field, not only on a heartbeat;
+  - resend the items pointed at with the gated fields stripped, rather than dropping them;
+  - hold note codes as a closed Rust enum (`NoteCode::ALL`) with a contract test against `target-notes.json`, never built with `format!`.
 
 Today the agent populates none of the negotiated fields: `TargetStatus.notes`, `AccessEvent.bytes` and the `objects_sampled` / `skipped_*` counters are always absent.
 
@@ -313,7 +319,7 @@ An `objects[]` entry whose `object` is `*` means the agent does not name the obj
 | `shape.full_table_read` | Read of whole relations: no filter, no aggregation, no or a large limit (heuristic) |
 | `volume.large_result` | Rows returned or affected above the agent's large-result threshold |
 
-The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z0-9_]+$`), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; CI (every push and pull request) compares the registry with `dev`, `main` and, on push, the previous tip, and rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
+The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`, no digit), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; CI (every push and pull request) compares the registry with `dev`, `main` and, on push, the previous tip, and rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
 
 ### Console-side checks on events
 *Implemented by the console in P4-C (#54); listed in `openapi.yaml` ("Console-side checks", `POST /events`).* In this order:
@@ -349,7 +355,7 @@ No field can carry a sampled value, a credential, a connection string, a host na
 ]
 ```
 
-**Rendering rule:** the console renders each note from a phrase catalog keyed by code (the registry's descriptions, with `{count}` and `{labels}` placeholders), escaping the labels. A code missing from the catalog, e.g. registered after the console was built, is shown as the raw code with its count and labels, never rejected; the schema checks its form only (`^(audit|coverage|privilege|security|check)\.[a-z0-9_]{1,48}$`). The console never derives a decision from notes: `reachable`, `audit_level` and `last_error` are the machine-readable status.
+**Rendering rule:** the console renders each note from a phrase catalog keyed by code (the registry's descriptions, with `{count}` and `{labels}` placeholders), escaping the labels. A code missing from the catalog, e.g. registered after the console was built, is shown as the raw code with its count and labels, never rejected; the schema checks its form only (`^(audit|coverage|privilege|security|check)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`, no digit). The console never derives a decision from notes: `reachable`, `audit_level` and `last_error` are the machine-readable status.
 
 Notes are sent only when the console accepts `target_status.notes`. The agent does not produce them yet: turning the connectors' `check()` messages into notes is ROADMAP P2-G.
 

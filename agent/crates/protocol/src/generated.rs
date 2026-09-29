@@ -3226,7 +3226,9 @@ volume threshold of the agent. The registry is **append-only**: a new signal (e.
 `signature.mysqldump` for a future connector) is a new entry added by a compatible
 contract change; an id is never removed, renamed or given another meaning.
 
-This schema checks the **form** only (pattern), not registration, so that a console
+The name after the family is 1 to 6 words of 1 to 16 lowercase letters joined by `_`: no
+digit, so an id cannot carry a number (an account, card or phone number). This schema
+checks the **form** only (pattern), not registration, so that a console
 accepts a signal registered after it was built; it stores such a signal and matches it by
 exact id or family (`signature.*`). The console computes its own baseline verdict and
 does not rely on any `volume.*` signal for it (ADR-0021).
@@ -3256,14 +3258,14 @@ impl ::std::str::FromStr for Signal {
         static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
         {
             ::regress::Regex::with_flags(
-                    "^[\\s\\S]*?(?:^(signature|shape|volume)\\.[a-z0-9_]+$)",
+                    "^[\\s\\S]*?(?:^(signature|shape|volume)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$)",
                     "u",
                 )
                 .unwrap()
         });
         if PATTERN.find(value).is_none() {
             return Err(
-                "doesn't match pattern \"^[\\s\\S]*?(?:^(signature|shape|volume)\\.[a-z0-9_]+$)\""
+                "doesn't match pattern \"^[\\s\\S]*?(?:^(signature|shape|volume)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$)\""
                     .into(),
             );
         }
@@ -3413,7 +3415,8 @@ pub struct TargetNote {
 schema checks the form only, so an older console accepts a code registered later and
 shows it raw. Families: `audit.*` audit collection, `coverage.*` Discovery coverage,
 `privilege.*` privileges of the agent's account, `security.*` insecure settings,
-`check.*` the check itself.
+`check.*` the check itself. The name after the family is 1 to 6 words of 1 to 16
+lowercase letters joined by `_`: no digit, so a code cannot carry a number.
 */
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
@@ -3440,14 +3443,14 @@ impl ::std::str::FromStr for TargetNoteCode {
         static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
         {
             ::regress::Regex::with_flags(
-                    "^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z0-9_]{1,48}$)",
+                    "^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$)",
                     "u",
                 )
                 .unwrap()
         });
         if PATTERN.find(value).is_none() {
             return Err(
-                "doesn't match pattern \"^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z0-9_]{1,48}$)\""
+                "doesn't match pattern \"^[\\s\\S]*?(?:^(audit|coverage|privilege|security|check)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$)\""
                     .into(),
             );
         }

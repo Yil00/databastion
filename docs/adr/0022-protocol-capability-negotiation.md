@@ -26,7 +26,16 @@ The P4-D protocol change adds the first optional request fields meant for later 
 4. **New enum values** in a request field (e.g. a new `TargetNoteLabel`) are negotiated like a field, with a revision token. Until the console lists it, the agent sends the fallback value (`other`).
 5. **Form-only registries need no negotiation.** For ids whose schema checks the form only (`Signal` with `signals.json`, `TargetNoteCode` with `target-notes.json`), an older console accepts a well-formed id it does not know. It stores the id and shows it raw. Such registries are append-only; CI compares them with `dev`, `main` and, on push, the previous tip.
 6. **Still incompatible** (unchanged from ADR-0013): removing or renaming a field, making a field required, narrowing a pattern or an enum, and adding an `Error.code` value. These need a new ADR and `/api/agent/v2`.
-7. **Agent implementation.** The agent's `ConsoleCapabilities` holds the set, and `console_accepts(token)` is the only way a producer may decide to send a gated field.
+7. **Agent implementation.** The agent's `ConsoleCapabilities` holds the set, keeping at most the first 64 tokens (`CapabilityList.maxItems`). `console_accepts(token)` is the only way a producer may decide to send a gated field.
+8. **Multi-replica consoles.** A console running several replicas (web processes behind a load balancer) lists a token only once **every** replica accepts the field. Otherwise an agent told by one replica could send the field to another replica that rejects it. During a rolling upgrade:
+   - first roll out the build that accepts the field without listing its token;
+   - once no replica runs an older build, roll out (or switch on) the listing.
+
+   The single-process MVP console lists its constant directly.
+9. **Obligations of the first gated producer.** No producer exists yet. The first change that makes the agent send a gated field must also:
+   - **Clear the capabilities on any `400` whose body carried a gated field**, not only on a heartbeat. This covers `POST /events`, `POST /findings` and `POST /jobs/{id}/status`: the console that rejected it may be an older replica or a rolled-back build.
+   - **Resend the items pointed at with the gated fields stripped**, rather than dropping them. A `400` on an item that carried a gated field is more likely an old console than a bad item, so dropping it would lose data that an older console accepts without the field.
+   - **Hold target-note codes as a closed Rust enum** (`NoteCode`, with `NoteCode::ALL` and `as_str`). A contract test against `target-notes.json` checks both directions, as `contract_signals.rs` does for signals. A code is never built with `format!` or from engine text.
 
 ## Consequences
 - Agents and consoles can be upgraded in either order without losing heartbeats. A new optional request field simply stays unsent until the console announces it.
@@ -34,6 +43,7 @@ The P4-D protocol change adds the first optional request fields meant for later 
 - Each new optional field now needs a token, a console constant entry and a producer gate. Reviewers check all three.
 - `accepts` is informational and bounded. It cannot widen what the agent collects (I2, I4): it only allows the agent to send fields that the contract already defines.
 - The console may accept a field before it uses it: `access_event.bytes` is accepted but not stored yet. "Accepts" means "does not reject".
+- The form-only id patterns (`Signal`, `TargetNoteCode`) are narrowed before 0.1.0 to letters and `_` only: 1 to 6 words of 1 to 16 letters, no digits, so an id cannot carry a number such as an account, card or phone number. After 0.1.0, narrowing them further would be an incompatible change.
 
 ## Rejected alternatives
 - **Upgrade the console first, as a documented procedure only**: an operator mistake loses every heartbeat of the upgraded agents, and nothing detects it early.
