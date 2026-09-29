@@ -18,7 +18,7 @@ const sortedObject = (o) => Object.fromEntries(Object.entries(o).sort(([a], [b])
 const cases = {
   signals: {
     schema: "Signal",
-    good: "signature.mysqldump",
+    good: "signature.unregistered_example",
     badForm: ["exfil.dump", "signature.PgDump", "pg_dump"],
     fixture: (...ids) => ({ events: [{ signals: ids }] }),
     digits: ["signature.4111111111111111", "volume.rows_1250000", "shape.full_table_copy2"],

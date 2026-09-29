@@ -320,7 +320,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
     it("stores unregistered signal ids and counts them on /metrics", async () => {
       const auth = await agentWithTargets();
       const before = eventStats.unregisteredSignals;
-      const unknown = { ...PG_DUMP, signals: ["signature.mysqldump", "signature.pg_dump", "volume.huge_result"] };
+      const unknown = { ...PG_DUMP, signals: ["signature.unregistered_example", "signature.pg_dump", "volume.huge_result"] };
       expect((await post(auth, batch([unknown, PG_DUMP]))).status).toBe(202);
       expect((await storedEvents(auth.agentId)).map((r) => r.signals)).toEqual([unknown.signals, PG_DUMP.signals]);
       expect(eventStats.unregisteredSignals - before).toBe(2);
@@ -332,7 +332,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
     it("counts unexpected targets and unregistered signals after the commit only (duplicate, aborted)", async () => {
       const auth = await agentWithTargets();
       await getDb().execute(sql`update agent_targets set present = false where agent_id = ${auth.agentId} and target_id = 'mysql-crm'`);
-      const odd = { ...PG_DUMP, target_id: "mysql-crm", signals: ["signature.mysqldump"] };
+      const odd = { ...PG_DUMP, target_id: "mysql-crm", signals: ["signature.unregistered_example"] };
       const counters = () => ({ unexpected: eventStats.unexpectedTarget, unregistered: eventStats.unregisteredSignals });
       const b = batch([odd]);
       const before = counters();

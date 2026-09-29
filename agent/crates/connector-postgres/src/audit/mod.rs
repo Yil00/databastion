@@ -4,7 +4,8 @@
 //!
 //! - The pgaudit log is read locally from `targets[].postgres.audit_log`
 //!   (`jsonlog` or `csvlog`), incrementally, with a cursor persisted
-//!   through the core ([`tail`]); only `AUDIT:` records are parsed
+//!   through the core (`databastion_core::audit::tail`); only `AUDIT:`
+//!   records are parsed
 //!   ([`records`], ADR-0012 obligation 7).
 //! - Statement text never leaves the agent (the contract `AccessEvent` has
 //!   no field for it): it is only analyzed locally by
@@ -22,7 +23,6 @@
 pub(crate) mod events;
 pub(crate) mod pss;
 pub(crate) mod records;
-pub(crate) mod tail;
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -32,8 +32,9 @@ use databastion_core::{AuditConfig, AuditLevel, ConnectorError, EventSink, Failu
 use crate::check::{self, CheckState};
 use crate::conn::Timeouts;
 use crate::error::{PgError, Stage};
+use databastion_core::audit::own::OwnAccount;
+use databastion_core::audit::tail::{self, TailError, Tailer};
 use records::{AuditRecord, Format, Skip, parse_record_checked};
-use tail::{TailError, Tailer};
 
 /// Name of the pgaudit cursor in the core's cursor store.
 const CURSOR: &str = "pgaudit";
@@ -79,15 +80,17 @@ pub(crate) fn source_for(level: AuditLevel) -> Source {
     }
 }
 
-/// The agent's own activity for this target (see `events::OwnAccount`).
+/// The agent's own activity for this target (see
+/// `databastion_core::audit::own`).
 fn own_account(
     cfg: &AuditConfig,
     target: &TargetConfig,
     pre: &check::Prerequisites,
     state: &CheckState,
-) -> events::OwnAccount {
-    events::OwnAccount::new(
+) -> OwnAccount {
+    OwnAccount::new(
         &target.account,
+        Some(crate::conn::APPLICATION_NAME),
         pre.own_addr,
         u64::from(cfg.max_sample_rows()),
         state.own_usage(&target.id),
@@ -97,6 +100,7 @@ fn own_account(
 /// State kept across source re-evaluations.
 struct PgauditState {
     tailer: Option<Tailer>,
+    format: Format,
     builder: events::PgauditEvents,
     reported_oversized: u64,
 }
@@ -128,12 +132,14 @@ pub(crate) async fn audit_stream(
                     None => {
                         let log = target.postgres_settings().audit_log.ok_or_else(internal)?;
                         tracing::info!(target_id = %target.id, "audit source: pgaudit log");
+                        let format = format_of(log.format);
                         pgaudit.insert(PgauditState {
                             tailer: Some(Tailer::new(
                                 log.path,
-                                format_of(log.format),
+                                format.framing(),
                                 cfg.cursor(CURSOR),
                             )),
+                            format,
                             builder: events::PgauditEvents::new(own_account(
                                 cfg, target, &pre, state,
                             )),
@@ -185,11 +191,7 @@ async fn pgaudit_run(
     severity: &str,
 ) -> Result<Result<(), std::io::ErrorKind>, ConnectorError> {
     let started = Instant::now();
-    let format = st
-        .tailer
-        .as_ref()
-        .map(Tailer::format)
-        .ok_or_else(internal)?;
+    let format = st.format;
     loop {
         let mut t = st.tailer.take().ok_or_else(internal)?;
         let severity_owned = severity.to_owned();

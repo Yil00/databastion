@@ -27,7 +27,9 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{OwnAccount, StatementDelta, analyze_pss, pss_events};
+use databastion_core::audit::own::OwnAccount;
+
+use super::events::{StatementDelta, analyze_pss, pss_events};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};

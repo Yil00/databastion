@@ -38,6 +38,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime};
 
+use databastion_core::audit::own::{ClientSeen, OwnAccount};
+
 use databastion_classifiers::masking::{
     ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
 };
@@ -48,7 +50,6 @@ use databastion_classifiers::query::{
 };
 
 use super::records::AuditRecord;
-use crate::conn::APPLICATION_NAME;
 use crate::discover::normalize;
 
 /// A limit above this many rows reads a whole relation.
@@ -261,151 +262,6 @@ impl DumpTracker {
             }
         }
         set.len() >= DUMP_MIN_RELATIONS
-    }
-}
-
-/// Period over which the agent's own reads of one object are budgeted.
-const OWN_PERIOD_HOURS: u64 = 24;
-/// Objects budgeted at most; beyond, the agent's own reads of a new
-/// object are reported.
-const OWN_MAX_OBJECTS: usize = 10_000;
-
-/// Where the client address of an event comes from.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ClientSeen {
-    /// The source logs it (pgaudit); `None`: not logged.
-    Logged(Option<ClientAddr>),
-    /// The source never shows it (`pg_stat_statements`).
-    NotVisible,
-}
-
-/// Rows the agent's own account read per object, per hour, over the
-/// last 24 hours. Kept per target by the connector (`CheckState`), so it
-/// outlives streams: a restarted stream (failure, source switch, the
-/// agent's sessions terminated on purpose) does not get a fresh budget.
-/// Not persisted: an agent restart resets it.
-pub(crate) struct OwnUsage {
-    start: Instant,
-    usage: HashMap<String, VecDeque<(u64, u64)>>,
-}
-
-impl Default for OwnUsage {
-    fn default() -> Self {
-        Self {
-            start: Instant::now(),
-            usage: HashMap::new(),
-        }
-    }
-}
-
-/// Shared handle on a target's [`OwnUsage`].
-pub(crate) type SharedOwnUsage = std::sync::Arc<std::sync::Mutex<OwnUsage>>;
-
-/// The agent's own activity, which may be left out of the events.
-pub(crate) struct OwnAccount {
-    account: String,
-    /// Client address the server sees for the agent (`None`: could not be
-    /// read; then nothing is left out).
-    addr: Option<ClientAddr>,
-    /// Rows per object over [`OWN_PERIOD_HOURS`] above which the agent's
-    /// own reads are reported anyway (`limits.max_sample_rows`: one
-    /// Discovery scan never reads more per object).
-    budget: u64,
-    /// Per object: rows per hour (hour index, rows), last 24 hours.
-    usage: SharedOwnUsage,
-}
-
-impl OwnAccount {
-    pub(crate) fn new(
-        account: &str,
-        addr: Option<ClientAddr>,
-        budget: u64,
-        usage: SharedOwnUsage,
-    ) -> Self {
-        Self {
-            account: account.to_owned(),
-            addr,
-            budget,
-            usage,
-        }
-    }
-
-    /// Charges `rows` to an object; `true` when its 24 h total exceeds the
-    /// budget (or it cannot be tracked).
-    fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
-        let mut guard = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let hour = now.saturating_duration_since(guard.start).as_secs() / 3600;
-        let usage = &mut guard.usage;
-        if !usage.contains_key(&key) && usage.len() >= OWN_MAX_OBJECTS {
-            // Drop objects with no use in the period, then fail open to
-            // reporting.
-            usage.retain(|_, v| {
-                v.back()
-                    .is_some_and(|(h, _)| hour.saturating_sub(*h) < OWN_PERIOD_HOURS)
-            });
-            if usage.len() >= OWN_MAX_OBJECTS {
-                return true;
-            }
-        }
-        let buckets = usage.entry(key).or_default();
-        while buckets
-            .front()
-            .is_some_and(|(h, _)| hour.saturating_sub(*h) >= OWN_PERIOD_HOURS)
-        {
-            buckets.pop_front();
-        }
-        match buckets.back_mut() {
-            Some((h, n)) if *h == hour => *n = n.saturating_add(rows),
-            _ => buckets.push_back((hour, rows)),
-        }
-        let total = buckets
-            .iter()
-            .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
-        total > self.budget
-    }
-
-    /// Whether an event may be left out: the agent's account, its
-    /// `application_name` (pgaudit), its own client address (pgaudit; the
-    /// agent's address must be known), no signal, and at most `budget`
-    /// rows per object over 24 hours (unknown rows are charged the whole
-    /// budget). With stolen agent credentials, reads from elsewhere, reads
-    /// that look like exports, and reading more of a table than one
-    /// Discovery scan per day are still reported.
-    fn routine(
-        &mut self,
-        user: &str,
-        application: Option<&str>,
-        client: ClientSeen,
-        e: &MaskedEvent,
-        now: Instant,
-    ) -> bool {
-        if user != self.account {
-            return false;
-        }
-        let rows = e.rows().unwrap_or(self.budget);
-        let mut over = false;
-        for o in e.objects() {
-            let key = format!(
-                "{}\u{0}{}\u{0}{}",
-                o.database().as_str(),
-                o.schema().map_or("", |s| s.as_str()),
-                o.object().as_str()
-            );
-            over |= self.charge(key, rows, now);
-        }
-        let addr_ok = match (self.addr, client) {
-            (None, _) => false,
-            (Some(own), ClientSeen::Logged(Some(c))) => own == c,
-            (Some(_), ClientSeen::Logged(None)) => false,
-            (Some(_), ClientSeen::NotVisible) => true,
-        };
-        application.is_none_or(|a| a == APPLICATION_NAME)
-            && addr_ok
-            && e.signals().is_empty()
-            && !over
     }
 }
 
@@ -741,9 +597,12 @@ mod tests {
         }
     }
 
+    use databastion_core::audit::own::SharedOwnUsage;
+
     fn own() -> OwnAccount {
         OwnAccount::new(
             "databastion",
+            Some(crate::conn::APPLICATION_NAME),
             ClientAddr::parse("192.0.2.14"),
             1000,
             SharedOwnUsage::default(),
@@ -1071,6 +930,7 @@ mod tests {
         // Another client address than the agent's.
         let mut b = PgauditEvents::new(OwnAccount::new(
             "databastion",
+            Some(crate::conn::APPLICATION_NAME),
             ClientAddr::parse("198.51.100.7"),
             1000,
             SharedOwnUsage::default(),
@@ -1079,6 +939,7 @@ mod tests {
         // The agent's address could not be read: nothing is left out.
         let mut b = PgauditEvents::new(OwnAccount::new(
             "databastion",
+            Some(crate::conn::APPLICATION_NAME),
             None,
             1000,
             SharedOwnUsage::default(),
@@ -1121,6 +982,7 @@ mod tests {
         let own_on = |u: &SharedOwnUsage| {
             OwnAccount::new(
                 "databastion",
+                Some(crate::conn::APPLICATION_NAME),
                 ClientAddr::parse("192.0.2.14"),
                 1000,
                 std::sync::Arc::clone(u),
@@ -1155,20 +1017,6 @@ mod tests {
         assert_eq!(pss_events(&deltas, &mut own_on(&shared), t0, t0).len(), 1);
         // A fresh usage (what a per-stream counter did) would have skipped it.
         assert!(pss_events(&deltas, &mut own_on(&SharedOwnUsage::default()), t0, t0).is_empty());
-    }
-
-    #[test]
-    fn own_budget_spans_a_day_not_a_window() {
-        let mut o = own();
-        let t0 = Instant::now();
-        let key = || "shop\u{0}crm\u{0}t".to_owned();
-        assert!(!o.charge(key(), 600, t0));
-        // An hour later (past any aggregation window): still counted.
-        assert!(o.charge(key(), 600, t0 + std::time::Duration::from_secs(3600)));
-        // A day later: the first charges have aged out.
-        let mut o = own();
-        assert!(!o.charge(key(), 600, t0));
-        assert!(!o.charge(key(), 600, t0 + std::time::Duration::from_secs(25 * 3600)));
     }
 
     #[test]

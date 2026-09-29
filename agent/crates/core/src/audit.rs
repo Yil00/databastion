@@ -1,5 +1,7 @@
 //! Audit collection support (P4-A): persisted cursors for connectors,
-//! pre-aggregation and the `audit.configure` reporting filter.
+//! pre-aggregation and the `audit.configure` reporting filter, plus the
+//! engine-agnostic pieces connectors share: the log file tailer
+//! ([`tail`]) and the agent's own-account rule ([`own`]).
 //!
 //! - [`CursorStore`]: a small private file (`0600`, atomic write, no
 //!   symlink) under `<state_dir>/audit/`, where a connector keeps its read
@@ -12,6 +14,9 @@
 //!   `sensitive_objects`, is not a `read` / `write` (connections, DDL,
 //!   DCL), or when `min_rows` is absent or reached. It is applied after
 //!   aggregation, so many small reads of one group add up.
+
+pub mod own;
+pub mod tail;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
