@@ -18,7 +18,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-classifiers` | `crates/classifiers` | Classifiers and `masking` (the only producer of uplink-bound data) |
 | `databastion-connector-postgres` | `crates/connector-postgres` | PostgreSQL connector: Discovery and `check()` (P2-B), Audit (P4-A, [README](crates/connector-postgres/README.md)) |
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
-| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); no Audit yet |
+| `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector (stub) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
@@ -368,7 +368,8 @@ Behavior:
 
 - a closed set of commands built in code (`hello`, `saslStart`, `saslContinue`, `buildInfo`,
   `connectionStatus`, `listDatabases`, `listCollections`, `count`, `find`, `aggregate` with
-  `[{$sample}]` only and `allowDiskUse: false`, `killCursors`); `maxTimeMS` (clamped job
+  `[{$sample}]` only and `allowDiskUse: false`, `killCursors`; for Audit, `whatsmyuri` and the
+  profiler `find` of ADR-0027 decision 8); `maxTimeMS` (clamped job
   parameter, never `0`) and `$readPreference: secondaryPreferred` on every read; a client-side
   deadline on every exchange; no `getMore`: `find` uses `singleBatch`, `aggregate` a batch of
   `n + 1`, and a reply with an open cursor is followed by `killCursors`; no session id, so no
@@ -392,16 +393,54 @@ Behavior:
   `Decimal128`; dates as `YYYY-MM-DD`; generic and user binaries only when they are UTF-8 text;
   UUID, encrypted, compressed, sensitive and vector binaries, ObjectIds, booleans, code and
   timestamps are never read;
-- `check()`: reachability; audit level **None** with `audit.stream_not_available` (no Audit
-  stream in this build; P5-B, P5-C); version and edition from `buildInfo` in the log only;
+- `check()`: reachability; the audit level and source of ADR-0027 (below); version and edition
+  from `buildInfo` (the edition decides whether an `auditLog` can be used);
   over-privilege from `connectionStatus` (resolved privileges of every role): write or
   administration actions, read actions beyond `find` / `listCollections`, cluster-wide actions,
   privileges on every database, system collections or the `admin` / `local` / `config`
   databases; views not sampled. Recomputed at most every 10 minutes per target.
 
+Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
+
+- sources, one per target, chosen by the same rule as `check()` and re-evaluated every 5 minutes:
+  the Enterprise / Percona `auditLog` JSON file (`mongodb.audit_log` with `format: audit_log`;
+  **Partial** once a successful `authCheck` record was read in the last 24 h, which needs
+  `auditAuthorizationSuccess`, Limited before; no document counts), the structured JSON server
+  log (`format: server_log`; **Limited**), or, without a usable file, the profiler of the
+  databases whose `system.profile` the account can `find` (**Limited**; not on a `mongos`); the
+  server log and the profiler report None (`audit.limited_pending_first_record`) until the stream
+  read a record of them in the last 24 h.
+  **Full is never reported**;
+- files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
+  bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
+  position in memory, starting at the newest entry;
+- closed-shape facts only: command name (closed list), namespace (normalized), `name@authdb`,
+  client IP, application name, document counts, a failure flag, and whether the filter has keys,
+  a numeric limit and pass-through pipeline stages. Command documents are skipped by a `serde`
+  visitor (`IgnoredAny`) in the files, and reduced by a fixed server-side projection on the
+  profiler, so their literals are never kept, logged or sent;
+- the server log has no user on slow-query lines: connections are followed by `ctx` (accept,
+  client metadata and authentication lines, at most 4096); an operation on a connection that
+  authenticated before the agent started reading is reported as an unidentified account;
+- signals: `signature.mongodump` / `signature.mongoexport` (the client's `appName`),
+  `shape.full_table_read` (a `find` without filter keys and without a limit or above 10 000, a
+  pass-through `aggregate`, a `getMore` of such a cursor), `volume.large_result` (more than
+  10 000 documents; log and profiler only);
+- the agent's own reads are left out only for `account@auth_source`, `appName`
+  `databastion-agent`, the address `whatsmyuri` returns, no signal, and the Discovery budget per
+  collection and day, and only for reads (writes, DDL and DCL are always reported, for every
+  engine); on the `auditLog`, only a `find` with a limit within the budget; its `count` without
+  filter and, on the profiler source, its exact profiler polls (no more than it sent per database) are not charged;
+- `check()` counts `find` on `<db>.system.profile` as the Audit grant only while a stream reads
+  the profiler (otherwise `privilege.system_collections`); notes `audit.auditlog_on_community`,
+  `audit.authcheck_success_pending`, `audit.slow_operations_only`, `audit.source_not_configured`,
+  `audit.log_not_readable`, `audit.log_without_row_counts`, `audit.records_dropped`.
+
 Target settings: the `mongodb` block of a target in `agent.example.yaml`. Integration tests
-(`src/it.rs`) run against the dev `mongo` service when `DATABASTION_TEST_MONGO_URL` (and
-`DATABASTION_TEST_MONGO_ADMIN_URL` for the probes) are set, and are skipped otherwise; the handshake,
+(`src/it.rs`, `src/it_audit.rs`) run against the dev `mongo` service when
+`DATABASTION_TEST_MONGO_URL` (and `DATABASTION_TEST_MONGO_ADMIN_URL` for the probes and the Audit
+tests, `DATABASTION_TEST_MONGO_LOG` for the server-log source, `DATABASTION_TEST_MONGO_DUMP_CMD` /
+`_EXPORT_CMD` for real tool runs) are set, and are skipped otherwise; the handshake,
 hostile SCRAM answers, cursor handling and a whole scan of the dev seed (checked against
 `dev/ground-truth.json`) also run against a scripted server over an in-memory stream
 (`src/fake.rs`).

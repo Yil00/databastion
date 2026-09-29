@@ -765,6 +765,25 @@ mod tests {
     }
 
     #[test]
+    fn own_writes_ddl_and_dcl_are_always_reported() {
+        let line = |q: u64, text: &str| {
+            format!("20260929 09:40:35,h,databastion,172.18.0.1,20,{q},QUERY,support,'{text}',0")
+        };
+        let mut b = EventBuilder::new(own());
+        for (q, text) in [
+            (
+                1,
+                "UPDATE `support`.`tickets` SET `status` = 1 WHERE `id` = 2",
+            ),
+            (2, "DROP TABLE `support`.`tickets`"),
+            (3, "GRANT SELECT ON `support`.* TO `x`@`%`"),
+        ] {
+            let ev = file(&mut b, sa(&[&line(q, text)]));
+            assert_eq!(ev.len(), 1, "{text}");
+        }
+    }
+
+    #[test]
     fn own_account_is_left_out_only_when_routine() {
         let sample = r"20260929 09:40:35,h,databastion,172.18.0.1,20,{q},QUERY,support,'SELECT LEFT(`requester_email`, 4096) FROM `support`.`tickets` LIMIT 1000',0";
         let line = |q: u64| sample.replace("{q}", &q.to_string());

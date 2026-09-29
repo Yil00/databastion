@@ -10,11 +10,12 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "shape.full_table_read": {
-    "description": "A read (SELECT, TABLE) of whole relations: no top-level filter, no aggregation, and no limit or a limit above the agent's large-result threshold. Heuristic: evadable by design.",
+    "description": "A read (SELECT, TABLE; a MongoDB find or aggregate) of whole relations or collections: no top-level filter, no aggregation, and no limit or a limit above the agent's large-result threshold. Heuristic: evadable by design.",
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   },
   "signature.copy_to_file": {
@@ -36,6 +37,18 @@ export const SIGNAL_REGISTRY = {
       "mariadb"
     ]
   },
+  "signature.mongodump": {
+    "description": "A mongodump run: a read of a collection (find, aggregate, getMore) by a client whose application name (appName) is mongodump. Heuristic: the application name is declared by the client, so evadable by design.",
+    "engines": [
+      "mongodb"
+    ]
+  },
+  "signature.mongoexport": {
+    "description": "A mongoexport run: a read of a collection (find, aggregate, getMore) by a client whose application name (appName) is mongoexport. Heuristic: the application name is declared by the client, so evadable by design.",
+    "engines": [
+      "mongodb"
+    ]
+  },
   "signature.mysqldump": {
     "description": "A mysqldump, mariadb-dump, mysqlpump or mydumper run: a whole-table read with SQL_NO_CACHE (what these tools send), by a client whose program_name is one of them, or in a session that took a consistent snapshot, a global read lock or LOCK TABLES, or ran SHOW CREATE TABLE on that table. Heuristic: evadable by design.",
     "engines": [
@@ -54,7 +67,8 @@ export const SIGNAL_REGISTRY = {
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "mongodb"
     ]
   }
 } as const;

@@ -892,11 +892,17 @@ pub enum Signal {
     /// `signature.into_outfile`: `SELECT … INTO OUTFILE` / `INTO DUMPFILE`
     /// (rows written to a file on the database server).
     IntoOutfile,
+    /// `signature.mongodump`: a read of a MongoDB collection (`find`,
+    /// `aggregate`, `getMore`) by a client whose application name is
+    /// `mongodump` (client-declared).
+    Mongodump,
+    /// `signature.mongoexport`: the same with `mongoexport`.
+    Mongoexport,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -905,6 +911,8 @@ impl Signal {
         Self::LargeResult,
         Self::Mysqldump,
         Self::IntoOutfile,
+        Self::Mongodump,
+        Self::Mongoexport,
     ];
 
     /// Contract value.
@@ -919,6 +927,8 @@ impl Signal {
             Self::LargeResult => "volume.large_result",
             Self::Mysqldump => "signature.mysqldump",
             Self::IntoOutfile => "signature.into_outfile",
+            Self::Mongodump => "signature.mongodump",
+            Self::Mongoexport => "signature.mongoexport",
         }
     }
 }

@@ -113,9 +113,9 @@ fn endpoint(target: &TargetConfig) -> Result<Endpoint, MgError> {
     }
 }
 
-fn client_metadata() -> DocBuf {
+fn client_metadata(app: &str) -> DocBuf {
     DocBuf::new()
-        .doc("application", DocBuf::new().str("name", APP_NAME))
+        .doc("application", DocBuf::new().str("name", app))
         .doc(
             "driver",
             DocBuf::new()
@@ -131,6 +131,25 @@ impl Session<Transport> {
     pub(crate) async fn connect(
         target: &TargetConfig,
         timeouts: Timeouts,
+    ) -> Result<Self, MgError> {
+        Self::connect_with_app(target, timeouts, APP_NAME).await
+    }
+
+    /// [`Self::connect`] declaring another application name (the
+    /// integration tests play dump tools with it).
+    #[cfg(test)]
+    pub(crate) async fn connect_as(
+        target: &TargetConfig,
+        timeouts: Timeouts,
+        app: &str,
+    ) -> Result<Self, MgError> {
+        Self::connect_with_app(target, timeouts, app).await
+    }
+
+    async fn connect_with_app(
+        target: &TargetConfig,
+        timeouts: Timeouts,
+        app: &str,
     ) -> Result<Self, MgError> {
         let settings = target.mongodb_settings();
         let password = target.secret.read().map_err(|e| {
@@ -172,12 +191,11 @@ impl Session<Transport> {
             };
             MgError::new(code, stage)
         })?;
-        Self::establish(
+        Self::establish_as(
             Wire::new(transport),
             timeouts,
-            &target.account,
-            &password,
-            &settings.auth_source,
+            (&target.account, &password, &settings.auth_source),
+            app,
         )
         .await
     }
@@ -185,12 +203,24 @@ impl Session<Transport> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// `hello` (minimum wire version checked), then SCRAM-SHA-256.
+    #[cfg(test)]
     pub(crate) async fn establish(
         wire: Wire<S>,
         timeouts: Timeouts,
         user: &str,
         password: &str,
         auth_source: &str,
+    ) -> Result<Self, MgError> {
+        Self::establish_as(wire, timeouts, (user, password, auth_source), APP_NAME).await
+    }
+
+    /// `hello` declaring `app`, then SCRAM-SHA-256 as `(user, password,
+    /// auth_source)`.
+    async fn establish_as(
+        wire: Wire<S>,
+        timeouts: Timeouts,
+        (user, password, auth_source): (&str, &str, &str),
+        app: &str,
     ) -> Result<Self, MgError> {
         let mut s = Self {
             wire,
@@ -202,7 +232,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         let hello = DocBuf::new()
             .i32("hello", 1)
             .bool("helloOk", true)
-            .doc("client", client_metadata())
+            .doc("client", client_metadata(app))
             .str("$db", "admin")
             .finish();
         let reply = s.exchange(Stage::SessionSetup, &hello).await?;

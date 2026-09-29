@@ -210,3 +210,150 @@ proptest! {
         prop_assert!(wire::parse(&payload).is_ok());
     }
 }
+
+// ---- Audit records (P5-B, P5-C, ADR-0027). ----
+
+use databastion_classifiers::masking::EventSource;
+use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+
+use crate::audit::events::EventBuilder;
+use crate::audit::profiler;
+use crate::audit::records::{self, iso_time, parse_audit_log, parse_server_log};
+
+fn builder() -> EventBuilder {
+    EventBuilder::new(
+        OwnAccount::new(
+            "databastion@admin",
+            Some("databastion-agent"),
+            None,
+            200,
+            SharedOwnUsage::default(),
+        ),
+        "databastion@admin".to_owned(),
+        200,
+    )
+}
+
+/// A literal a client could put in a command: marked so a leak is found.
+fn literal() -> impl Strategy<Value = String> {
+    "[A-Za-z0-9@. _-]{4,24}".prop_map(|s| format!("LEAK{s}"))
+}
+
+/// JSON-escapes a string (the literal may hold nothing to escape, but the
+/// escaped form is what a log holds).
+fn js(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_default()
+}
+
+/// A command document holding `lit` in its filter (as a value and as a
+/// key), a nested operator, a limit and a pipeline.
+fn command(lit: &str, shape: u8) -> String {
+    let l = js(lit);
+    match shape % 4 {
+        0 => format!(
+            r#"{{"find":"users","filter":{{"email":{l},{l}:{{"$in":[{l},1,{{"x":{l}}}]}}}},"limit":5,"$db":"app"}}"#
+        ),
+        1 => format!(
+            r#"{{"aggregate":"users","pipeline":[{{"$match":{{"k":{l}}}}},{{{l}:1}},{{"$project":{{{l}:1}}}}],"cursor":{{}},"$db":"app"}}"#
+        ),
+        2 => format!(
+            r#"{{"update":"users","updates":[{{"q":{{"a":{l}}},"u":{{"$set":{{"b":{l}}}}}}}],"$db":"app"}}"#
+        ),
+        _ => format!(r#"{{"count":"users","query":{{"n":{l}}},"$db":"app"}}"#),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Hostile log lines and audit records never panic the parsers.
+    #[test]
+    fn hostile_log_lines_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+        let _ = parse_server_log(&bytes);
+        let _ = parse_audit_log(&bytes);
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            let _ = iso_time(s);
+            let _ = records::namespace(s);
+            let _ = records::address(s);
+        }
+    }
+
+    /// Structured JSON with arbitrary values in the fields the parsers
+    /// read never panics either.
+    #[test]
+    fn hostile_field_types_never_panic(
+        id in prop_oneof![Just(51803i64), Just(22943), Just(22944), Just(51800), Just(5_286_306), Just(5_286_307), any::<i64>()],
+        atype in prop_oneof![Just("authCheck"), Just("authenticate"), Just("clientMetadata"), Just("dropCollection"), Just("createUser"), Just("x")],
+        value in prop_oneof![
+            Just("null".to_owned()), Just("1".to_owned()), Just("-1".to_owned()), Just("1e400".to_owned()),
+            Just("[]".to_owned()), Just("{}".to_owned()), Just("\"x\"".to_owned()), Just("true".to_owned()),
+            Just(r#"{"$date":"2026-99-99T00:00:00Z"}"#.to_owned()), Just(r#"{"$numberLong":"x"}"#.to_owned()),
+        ],
+    ) {
+        for field in ["t", "ctx", "attr"] {
+            let line = format!(r#"{{"t":{{"$date":"2026-09-29T10:00:00Z"}},"id":{id},"ctx":"conn1","attr":{{"type":"command","ns":"app.users","command":{{"find":"users"}}}},"{field}":{value}}}"#);
+            let _ = parse_server_log(line.as_bytes());
+        }
+        for field in ["type", "ns", "appName", "command", "originatingCommand", "nreturned", "remote", "user", "db", "doc", "connectionId", "errCode"] {
+            let line = format!(r#"{{"t":{{"$date":"2026-09-29T10:00:00Z"}},"id":{id},"ctx":"conn1","attr":{{"{field}":{value},"type":"command","command":{{"find":"users","filter":{value},"limit":{value},"pipeline":{value}}}}}}}"#);
+            let _ = parse_server_log(line.as_bytes());
+        }
+        for field in ["ts", "remote", "users", "param", "result"] {
+            let line = format!(r#"{{"atype":"{atype}","ts":{{"$date":"2026-09-29T10:00:00Z"}},"param":{{"command":"find","ns":"app.users","args":{{"find":"users","filter":{value}}},"user":"u","db":"admin"}},"{field}":{value}}}"#);
+            let _ = parse_audit_log(line.as_bytes());
+        }
+    }
+
+    /// I2: literals of command documents never reach a record nor an
+    /// event, on either file source, whatever the command.
+    #[test]
+    fn command_literals_never_reach_records_or_events(lit in literal(), shape in any::<u8>()) {
+        let cmd = command(&lit, shape);
+        let errmsg = js(&format!("error near {lit}"));
+        let slow = format!(
+            r#"{{"t":{{"$date":"2026-09-29T10:00:00.000+00:00"}},"s":"I","c":"COMMAND","id":51803,"ctx":"conn4","msg":"Slow query","attr":{{"type":"command","ns":"app.users","appName":"mongodump","command":{cmd},"originatingCommand":{cmd},"planSummary":{errmsg},"errMsg":{errmsg},"nreturned":3,"remote":"10.0.0.9:5000"}}}}"#
+        );
+        let audit = format!(
+            r#"{{"atype":"authCheck","ts":{{"$date":"2026-09-29T10:00:00.000Z"}},"remote":{{"ip":"10.0.0.9","port":5000}},"users":[{{"user":"alice","db":"admin"}}],"param":{{"command":"find","ns":"app.users","args":{cmd}}},"result":0}}"#
+        );
+        let app_msg = format!(
+            r#"{{"atype":"applicationMessage","ts":{{"$date":"2026-09-29T10:00:00.000Z"}},"users":[],"param":{{"msg":{}}},"result":0}}"#,
+            js(&lit)
+        );
+        let mut all = Vec::new();
+        for (source, line, parse) in [
+            (EventSource::MongodbLog, slow, parse_server_log as fn(&[u8]) -> Result<Option<records::Record>, ()>),
+            (EventSource::MongodbAuditLog, audit, parse_audit_log),
+            (EventSource::MongodbAuditLog, app_msg, parse_audit_log),
+        ] {
+            let parsed = parse(line.as_bytes());
+            prop_assert!(parsed.is_ok(), "{}", line);
+            if let Ok(Some(r)) = parsed {
+                let debug = format!("{r:?}");
+                prop_assert!(!debug.contains("LEAK"));
+                prop_assert!(r.user.as_ref().is_none_or(|u| !u.contains("LEAK")));
+                prop_assert!(r.app.as_deref().is_none_or(|u| !u.contains("LEAK")));
+                prop_assert!(r.ns.as_ref().is_none_or(|(d, c)| !d.contains("LEAK") && c.as_deref().is_none_or(|c| !c.contains("LEAK"))));
+                all.extend(builder().convert(vec![r], source, std::time::SystemTime::now()));
+            }
+        }
+        for e in &all {
+            let debug = format!("{e:?}");
+            prop_assert!(!debug.contains("LEAK"), "{}", debug);
+        }
+    }
+
+    /// Arbitrary profiler documents never panic the record reader.
+    #[test]
+    fn hostile_profiler_documents_never_panic(bytes in prop::collection::vec(any::<u8>(), 5..256)) {
+        let mut b = bytes;
+        let len = i32::try_from(b.len()).unwrap_or(i32::MAX);
+        b[..4].copy_from_slice(&len.to_le_bytes());
+        if let Some(last) = b.last_mut() {
+            *last = 0;
+        }
+        if let Ok(doc) = Doc::new(&b) {
+            let _ = profiler::record_of(&doc);
+        }
+    }
+}

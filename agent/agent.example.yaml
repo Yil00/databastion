@@ -108,6 +108,13 @@ targets:
       # ca_file: /etc/databastion/mongo-ca.pem   # only trusted root for this target
       # Database holding the account (SCRAM-SHA-256 only). Default: admin.
       auth_source: admin
+      # Audit source file, read locally (ADR-0027); readable by the agent user,
+      # never world-readable (it holds other users' literals):
+      #   audit_log: Enterprise / Percona auditLog (destination: file, format: JSON)
+      #   server_log: the structured JSON server log (systemLog.path)
+      # Without it, Audit reads the profiler when the account holds find on
+      # <db>.system.profile (Limited).
+      # audit_log: {path: /var/log/mongodb/auditLog.json, format: audit_log}
   - id: ldap-main
     engine: openldap
     socket: /run/slapd/ldapi

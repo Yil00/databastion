@@ -1158,6 +1158,49 @@ mod tests {
     }
 
     #[test]
+    fn own_writes_ddl_and_dcl_are_always_reported() {
+        let mut b = PgauditEvents::new(own());
+        let recs = vec![
+            rec(
+                "b1",
+                1,
+                1,
+                "WRITE",
+                "UPDATE",
+                "crm.t",
+                "UPDATE crm.t SET a = $1 WHERE id = $2",
+                Some(1),
+                "databastion-agent",
+            ),
+            rec(
+                "b1",
+                2,
+                1,
+                "DDL",
+                "ALTER TABLE",
+                "crm.t",
+                "ALTER TABLE crm.t ADD COLUMN b int",
+                None,
+                "databastion-agent",
+            ),
+            rec(
+                "b1",
+                3,
+                1,
+                "ROLE",
+                "GRANT",
+                "",
+                "GRANT SELECT ON crm.t TO x",
+                None,
+                "databastion-agent",
+            ),
+        ];
+        let events = b.convert(recs, SystemTime::now());
+        let all: Vec<String> = events.iter().map(json).collect();
+        assert_eq!(events.len(), 3, "{all:?}");
+    }
+
+    #[test]
     fn own_account_is_reported_unless_routine() {
         let mut b = PgauditEvents::new(own());
         let recs = vec![

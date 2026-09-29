@@ -7,10 +7,17 @@
 //!   documents walked into normalized field paths (arrays as `[]`,
 //!   dynamic keys as `*`, ADR-0009), classification through
 //!   `ScanJob::classify`; only masked findings reach the sink (I2).
-//! - [`check`](Connector::check): reachability, audit level **None** (no
-//!   Audit stream in this build: P5-B, P5-C), over-privilege from the
-//!   account's resolved privileges, views not covered.
-//! - Audit: not implemented (`supports_audit` is `false`).
+//! - [`check`](Connector::check): reachability, the audit level proven
+//!   from what the agent can read (ADR-0027: Partial at best, Limited on
+//!   Community), over-privilege from the account's resolved privileges,
+//!   views not covered.
+//! - Audit ([`audit_stream`](Connector::audit_stream), P5-B, P5-C): access
+//!   events from the Enterprise / Percona `auditLog` JSON file or the
+//!   structured JSON server log (`mongodb.audit_log`, cursor persisted),
+//!   or from the profiler; command documents are never kept (closed-shape
+//!   facts only; on the profiler they are computed by the server), and
+//!   `mongodump` / `mongoexport` runs are flagged from their application
+//!   name.
 //!
 //! The connector only reads (I4): a closed set of commands built in code,
 //! `maxTimeMS` on every read (never `0`), no `getMore`, cursors killed at
@@ -22,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod bson;
 mod catalog;
 mod check;
@@ -85,14 +93,21 @@ impl Connector for MongodbConnector {
 
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
-        _sink: &EventSink,
+        cfg: &AuditConfig,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        // P5-B / P5-C.
-        Err(ConnectorError::NotImplemented {
-            engine: Engine::Mongodb,
-            operation: "audit_stream",
-        })
+        audit::audit_stream(cfg, sink, &self.check_state).await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        self.check_state.audit_source(&target.id)
     }
 }
 
@@ -127,10 +142,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_job_without_target_fails_closed_and_audit_is_not_supported() {
+    async fn default_job_without_target_fails_closed() {
         let connector = MongodbConnector::new();
         assert_eq!(connector.engine(), Engine::Mongodb);
-        assert!(!connector.supports_audit());
+        assert!(connector.supports_audit());
         let (findings, _rx) = FindingSink::channel(1);
         let r = connector.discover(&ScanJob::default(), &findings).await;
         assert!(matches!(
@@ -146,9 +161,10 @@ mod tests {
             connector
                 .audit_stream(&AuditConfig::default(), &events)
                 .await,
-            Err(ConnectorError::NotImplemented {
+            Err(ConnectorError::Target {
                 engine: Engine::Mongodb,
-                operation: "audit_stream"
+                code: FailureCode::Internal,
+                ..
             })
         ));
     }

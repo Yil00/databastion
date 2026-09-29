@@ -378,6 +378,10 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                 }
             }
             "killCursors" => DocBuf::new().i32("ok", 1).finish(),
+            "whatsmyuri" => DocBuf::new()
+                .str("you", "10.0.0.15:40000")
+                .i32("ok", 1)
+                .finish(),
             _ => error_reply(59),
         };
         if stream.write_all(&frame(id, &reply)).await.is_err() {
@@ -827,7 +831,7 @@ async fn check_reports_privileges_and_views() {
     assert_eq!(r.databases, 1);
     assert_eq!(r.views, 1);
     let codes: Vec<(&str, Option<u64>)> = r
-        .notes()
+        .notes(false)
         .iter()
         .map(|n| (n.code().as_str(), n.count()))
         .collect();
@@ -1070,7 +1074,7 @@ async fn privileges_not_evaluated_and_coverage_failures() {
         .array_str("actions", &["inprog"])
         .finish();
     let codes = |r: &crate::check::Report| -> Vec<&'static str> {
-        r.notes().iter().map(|n| n.code().as_str()).collect()
+        r.notes(false).iter().map(|n| n.code().as_str()).collect()
     };
     // connectionStatus refused.
     let script = Script {
@@ -1135,4 +1139,106 @@ async fn an_open_cursor_is_killed_when_the_batch_is_malformed() {
             "{received:?}"
         );
     }
+}
+
+/// A projected profiler entry (what the server returns for the fixed
+/// projection).
+fn profile_entry(ts: i64, user: &str, app: &str, filter_keys: i32) -> Vec<u8> {
+    DocBuf::new()
+        .raw(0x09, "ts", &ts.to_le_bytes())
+        .str("op", "query")
+        .str("ns", "app.users")
+        .i32("nreturned", 20_000)
+        .str("appName", app)
+        .str("client", "10.0.0.9")
+        .str("user", user)
+        .str("cmd", "find")
+        .i32("fk", filter_keys)
+        .finish()
+}
+
+/// The profiler source: the poll command (fixed projection, bounded,
+/// single batch, `maxTimeMS`), the read position, and the events.
+#[tokio::test]
+async fn profiler_polls_are_bounded_and_resume_after_what_was_read() {
+    use crate::audit::profiler::{self, DbCursor};
+    let entries = vec![
+        profile_entry(1_000, "alice@admin", "mongodump", 0),
+        profile_entry(2_000, "bob@admin", "mongosh", 1),
+        profile_entry(2_000, "carol@admin", "mongosh", 2),
+    ];
+    let script = Script {
+        databases: vec![(
+            "app".to_owned(),
+            vec![FakeColl::new("system.profile", entries)],
+        )],
+        ..Script::default()
+    };
+    let (s, log) = session(script, PASSWORD).await;
+    let mut s = s.unwrap();
+    assert_eq!(
+        crate::audit::whoami(&mut s).await,
+        databastion_classifiers::masking::ClientAddr::parse("10.0.0.15")
+    );
+    let mut cursor = DbCursor::after(0);
+    let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();
+    assert_eq!(polled.records.len(), 3);
+    assert!(!polled.more);
+    let sent = log.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(sent.name, "find");
+    assert_eq!(sent.collection.as_deref(), Some("system.profile"));
+    assert_eq!(sent.db, "app");
+    assert_eq!(sent.size, Some(profiler::BATCH));
+    assert_eq!(sent.read_preference.as_deref(), Some("secondaryPreferred"));
+    assert!(sent.max_time_ms.is_some_and(|t| t > 0));
+    for key in ["filter", "projection", "sort", "singleBatch"] {
+        assert!(sent.keys.contains(&key.to_owned()), "{key}");
+    }
+    assert!(!sent.keys.contains(&"batchSize".to_owned()));
+    // The scripted server ignores the filter: what was read is not read
+    // again.
+    let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();
+    assert!(polled.records.is_empty(), "{:?}", polled.records);
+    // Events: the tool's whole read with its volume; the filtered reads
+    // without signatures.
+    let mut b = crate::audit::events::EventBuilder::new(
+        databastion_core::audit::own::OwnAccount::new(
+            "databastion@admin",
+            Some("databastion-agent"),
+            None,
+            200,
+            databastion_core::audit::own::SharedOwnUsage::default(),
+        ),
+        "databastion@admin".to_owned(),
+        200,
+    );
+    let mut cursor = DbCursor::after(0);
+    let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();
+    let events = b.convert(
+        polled.records,
+        databastion_classifiers::masking::EventSource::MongodbProfiler,
+        std::time::SystemTime::now(),
+    );
+    let signals: Vec<Vec<&str>> = events
+        .iter()
+        .map(|e| e.signals().iter().map(|s| s.as_str()).collect())
+        .collect();
+    assert_eq!(
+        signals,
+        [
+            vec![
+                "shape.full_table_read",
+                "volume.large_result",
+                "signature.mongodump"
+            ],
+            vec!["volume.large_result"],
+            vec!["volume.large_result"],
+        ]
+    );
+    // An unauthorized database: a non-fatal error.
+    let e = profiler::poll(&mut s, "other", &mut DbCursor::after(0))
+        .await
+        .unwrap_err();
+    assert!(!e.fatal);
+    s.close().await;
 }

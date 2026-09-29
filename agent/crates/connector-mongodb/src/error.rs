@@ -26,6 +26,8 @@ pub(crate) enum Stage {
     /// `count`, `find`, `aggregate`.
     Sample,
     Check,
+    /// Audit: prerequisites and profiler polls.
+    Audit,
     /// `killCursors`.
     Kill,
 }
@@ -41,6 +43,7 @@ impl Stage {
             Self::Introspection => "introspection",
             Self::Sample => "sample",
             Self::Check => "check",
+            Self::Audit => "audit",
             Self::Kill => "kill",
         }
     }

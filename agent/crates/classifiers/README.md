@@ -224,10 +224,12 @@ this agent emits only the closed set below (`masking::Signal::ALL`):
 | `signature.copy_to_file` | `COPY … TO '<server file>'` |
 | `signature.copy_to_program` | `COPY … TO PROGRAM` |
 | `shape.full_table_copy` | `COPY` out of a whole relation, or of a query without filter, aggregation or small limit |
-| `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit above 10 000 rows |
-| `volume.large_result` | more than 10 000 rows returned or affected by one statement (or one counter delta); on the pgaudit source only with `pgaudit.log_rows = on`; on MySQL / MariaDB only from `performance_schema` (the audit log files carry no row count) |
+| `shape.full_table_read` | a read without top-level `WHERE`, aggregation, derived table, and without a limit or with a limit above 10 000 rows; on MongoDB, a `find` whose filter has no key (same limit rule) or an `aggregate` made of pass-through stages only |
+| `volume.large_result` | more than 10 000 rows returned or affected by one statement (or one counter delta); on the pgaudit source only with `pgaudit.log_rows = on`; on MySQL / MariaDB only from `performance_schema` (the audit log files carry no row count); on MongoDB only from the server log and the profiler (`nreturned`, or the documents written) |
 | `signature.mysqldump` | MySQL / MariaDB: the client's `program_name` is `mysqldump` / `mariadb-dump` (`performance_schema` only), or a whole-table read with `SQL_NO_CACHE` (`SELECT /*!40001 SQL_NO_CACHE */ … FROM t`), or one session reading whole tables after `SHOW CREATE TABLE` of the same table, after a consistent snapshot or global read lock, or of at least 3 distinct tables (P4-B) |
 | `signature.into_outfile` | MySQL / MariaDB `SELECT … INTO OUTFILE` / `INTO DUMPFILE`, also when the server refused it (P4-B) |
+| `signature.mongodump` | MongoDB: a read of a collection (`find`, `aggregate`, `getMore`) by a client whose `appName` is `mongodump` (P5-B / P5-C, ADR-0027) |
+| `signature.mongoexport` | MongoDB: the same with `mongoexport` |
 
 The thresholds sit above the agent's own maximum sample (10 000 rows), so
 its Discovery never raises them. `shape.*` and `signature.*` are heuristics
