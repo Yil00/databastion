@@ -225,7 +225,7 @@ export function handleRotate(req: Request): Promise<Response> {
     // no per-agent attempt, and never a lock (a slow network is not a rotation conflict). It counts
     // against the per-IP failure limit so trickled bodies cannot hold handlers without a cost.
     if (!raw.ok && raw.timedOut) {
-      await countTimedOutBody(pre.ipKey);
+      await countTimedOutBody(pre.cheapKey);
       return invalidRequest();
     }
     const auth = await preamble(req, { allowPrevious: true, staleCandidate: rotateCandidate(raw) });

@@ -12,6 +12,9 @@ import { argon2Stats } from "./crypto";
 import { eventStats } from "./events";
 import { rateLimitStoreStats } from "./rate-limit";
 
+/** Cap of the `databastion_console_rate_limit_counters_rows` count (bounded scrape cost). */
+export const RATE_LIMIT_ROWS_CAP = 1_000_000;
+
 /**
  * Prometheus `/metrics` (ADR-0004): console metrics plus the agent metrics received in heartbeats.
  * Prometheus scrapes only the console; agents are never scraped.
@@ -33,6 +36,7 @@ import { rateLimitStoreStats } from "./rate-limit";
  * - `databastion_agents{status}`, `databastion_jobs{status}`, `databastion_enrollment_tokens_active`,
  *   `databastion_security_events`, `databastion_console_argon2_operations_total` (this process),
  *   `databastion_console_rate_limit_store_errors_total` (this process),
+ *   `databastion_console_rate_limit_counters_rows` (capped at `RATE_LIMIT_ROWS_CAP`),
  *   `databastion_metrics_series_dropped` (series dropped by the caps of the last scrape).
  *
  * Agent-provided names are restricted by the contract to `^[a-z][a-z0-9_]{0,63}$` (values: numbers).
@@ -231,6 +235,11 @@ export async function collectMetrics(db: Database): Promise<string> {
   x.add("databastion_enrollment_tokens_active", "gauge", "Unused, unrevoked, unexpired enrollment tokens.", tokens);
   const [[, events] = ["", 0]] = await counts(sql`select 'all' as k, count(*) as n from security_events`);
   x.add("databastion_security_events", "gauge", "Security events recorded (e.g. rotation conflicts).", events);
+  // Review L3: size of the shared rate-limit table (expired rows included), to alarm on floods of
+  // distinct keys between two prunes. Counted up to a cap so a huge table cannot slow the scrape.
+  const [[, rateLimitRows] = ["", 0]] = await counts(sql`
+    select 'all' as k, count(*) as n from (select 1 from rate_limit_counters limit ${RATE_LIMIT_ROWS_CAP}) t`);
+  x.add("databastion_console_rate_limit_counters_rows", "gauge", `Rows of the shared rate-limit table, expired ones included (counted up to ${RATE_LIMIT_ROWS_CAP}).`, rateLimitRows);
   x.add("databastion_console_events_unexpected_target_total", "counter", "Access events received for a target not reported anymore or with Audit disabled (this process).", eventStats.unexpectedTarget);
   x.add("databastion_console_events_expired_total", "counter", "Access events refused as older than the retention period (this process).", eventStats.expired);
   x.add("databastion_console_events_backpressure_total", "counter", "POST /events answered 429 because the agent's backlog was not evaluated yet (this process).", eventStats.backpressure);

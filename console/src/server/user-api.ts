@@ -143,8 +143,13 @@ export const LOGIN_IPV6_PREFIX = 56;
  * degrades the login).
  */
 export const loginFailuresPerIp = RateLimiter.shared("login.failures_per_ip", 20, 15 * 60_000, "closed");
-export const loginFailuresPerUser = RateLimiter.shared("login.failures_per_user_ip", 5, 15 * 60_000, "closed");
-export const loginFailuresPerUserGlobal = RateLimiter.shared("login.failures_per_user", 100, 15 * 60_000, "closed");
+/*
+ * The username-derived keys (`username|IP`, username) are shared only with a server key (HMAC):
+ * without one they stay per process, as before P4-D, rather than store an unkeyed hash of what was
+ * typed in the username field, possibly a password (review M1; `startupErrors` says so).
+ */
+export const loginFailuresPerUser = RateLimiter.shared("login.failures_per_user_ip", 5, 15 * 60_000, "closed", { requiresServerKey: true });
+export const loginFailuresPerUserGlobal = RateLimiter.shared("login.failures_per_user", 100, 15 * 60_000, "closed", { requiresServerKey: true });
 /** Failed logins per device cookie (nonce): beyond, the cookie gives no bypass (a stolen cookie). */
 export const loginFailuresPerDevice = RateLimiter.shared("login.failures_per_device", 5, 15 * 60_000, "closed");
 /**
@@ -158,7 +163,9 @@ export const loginSlowdown = {
   sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)),
 };
 /** Failed degraded logins per username with an unknown IP (drives the growing slow-down). */
-export const loginDegradedFailures = RateLimiter.shared("login.degraded_failures", Number.MAX_SAFE_INTEGER, 15 * 60_000, "closed");
+export const loginDegradedFailures = RateLimiter.shared("login.degraded_failures", Number.MAX_SAFE_INTEGER, 15 * 60_000, "closed", {
+  requiresServerKey: true,
+});
 
 /**
  * Slow-down before a degraded login of `userKey` (see {@link loginSlowdown}). `failures`: the
@@ -279,11 +286,17 @@ async function verifyLogin(
 ): Promise<Response> {
   const refundAll = () => refunds.forEach((refund) => refund());
   const db = getDb();
-  const user = preloaded ? preloaded.user : await findLoginUser(db, username);
   // N1: failures on unknown usernames share one budget (all console processes), so random-username
-  // floods (fresh per-username buckets, unknown IP) are bounded.
-  if (!user) {
-    const reserved = await loginFailuresUnknownUser.reserveShared("global");
+  // floods (fresh per-username buckets, unknown IP) are bounded. Review L1: the reservation runs for
+  // EVERY login, concurrently with the user lookup, so known and unknown usernames pay the same
+  // store latency (no timing oracle); a known user gives it back (or ignores a refusal).
+  const [user, reserved] = await Promise.all([
+    preloaded ? Promise.resolve(preloaded.user) : findLoginUser(db, username),
+    loginFailuresUnknownUser.reserveShared("global"),
+  ]);
+  if (user) {
+    if (reserved.ok) reserved.refund();
+  } else {
     if (!reserved.ok) {
       // L2: same answer as a wrong password, after a delay close to an argon2id verification,
       // without running one (no username enumeration through 429 vs 401 during a flood).

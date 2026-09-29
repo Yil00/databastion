@@ -50,7 +50,7 @@ function warnBadForwardedFor(): void {
  * /64), or by /56 (`v6Prefix = 56`: logins, P1-D N1, where a customer allocation often is a /56),
  * IPv4-mapped IPv6 addresses are reduced to their IPv4 address.
  */
-export function ipBucket(ip: string, v6Prefix: 56 | 64 = 64): string {
+export function ipBucket(ip: string, v6Prefix: 48 | 56 | 64 = 64): string {
   if (isIP(ip) !== 6) return ip;
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
   if (mapped?.[1]) return mapped[1];
@@ -67,6 +67,7 @@ export function ipBucket(ip: string, v6Prefix: 56 | 64 = 64): string {
   const groups = [...headGroups, ...Array<string>(Math.max(0, missing)).fill("0"), ...tailGroups];
   const prefix = groups.slice(0, 4).map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : 0));
   if (v6Prefix === 56) prefix[3] = (prefix[3] ?? 0) & 0xff00;
+  if (v6Prefix === 48) prefix[3] = 0;
   return `${prefix.map((g) => g.toString(16)).join(":")}::/${v6Prefix}`;
 }
 

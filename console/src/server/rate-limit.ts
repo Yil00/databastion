@@ -1,6 +1,6 @@
 import { sql, type SQL } from "drizzle-orm";
 
-import { getDb, type Database } from "@/db/client";
+import { getRateLimitDb, RATE_LIMIT_POOL, type Database } from "@/db/client";
 import { errorSummary, logger } from "@/lib/logger";
 
 import { hmacSha256Hex, serverSubkey, sha256Hex } from "./crypto";
@@ -22,19 +22,30 @@ import { processGlobal } from "./process-global";
  *
  * Each limiter also keeps the in-memory counters it always had (the synchronous `check` / `hit` /
  * `reserve` / `charge` / `count`, bounded to `maxKeys` keys). For a shared limiter they are a
- * per-process PRE-CHECK only: they count this process's own hits, a subset of the shared ones, so
- * they can only reject earlier (at worst at the pre-P4-D per-process limit), never admit more. They
- * are instance fields on purpose, not `processGlobal` state: a bundled copy of this module with its
- * own pre-check counters is still bounded by the shared store. Production code uses the
- * asynchronous `*Shared` methods; the synchronous ones only touch this process (tests, and the
- * limiters that are local by design).
+ * per-process PRE-CHECK: they count this process's own hits, a subset of the shared ones, so they
+ * can only reject earlier (at worst at the pre-P4-D per-process limit), never admit more. A key the
+ * store reports at its limit (a refused reservation, a hit or check at the limit) is also recorded
+ * there as limited until the end of the store's window (a negative entry), so a flood on one key
+ * costs each process at most about `limit + 1` store statements per window, not one per request
+ * (security review H1). They are instance fields on purpose, not `processGlobal` state: a bundled
+ * copy of this module with its own pre-check counters is still bounded by the shared store.
+ * Production code uses the asynchronous `*Shared` methods; the synchronous ones only touch this
+ * process (tests, and the limiters that are local by design).
+ *
+ * The store runs on a dedicated small pool (`getRateLimitPool`: 3 connections, `lock_timeout` and
+ * `statement_timeout`), so contention on a hot counter row cannot starve the main pool, and a
+ * statement the limiter gave up on is cancelled by the server instead of committing late.
+ *
+ * Limiters declared with `requiresServerKey` (the username-derived keys of the login) are kept per
+ * process, as before P4-D, when no server key is available: their keys would otherwise be stored as
+ * an unkeyed hash of what was typed in the username field (possibly a password; review M1).
  *
  * Refunds give the hit back in the shared store (and in the pre-check) only while its window is
  * still the current one; they are idempotent. A refund is fire-and-forget for the caller, but a
  * later operation of the same limiter on the same key waits for it, so it is never overtaken by the
  * next request of the same process.
  *
- * Store failures (an error, or no answer within `STORE_TIMEOUT_MS`) follow the limiter's failure
+ * Store failures (an error, a server-side timeout, or no answer within `STORE_GUARD_MS`) follow the limiter's failure
  * mode; either way a warning is logged at most once per minute per limiter, and
  * `databastion_console_rate_limit_store_errors_total` counts them:
  * - `closed` (agent authentication, login, enrollment, rotation, test sends): the key is treated as
@@ -61,8 +72,12 @@ export type StoreFailureMode = "closed" | "local";
 
 /** `Retry-After` of a request refused because the shared store failed (fail-closed limiters). */
 export const FAIL_CLOSED_RETRY_AFTER_S = 5;
-/** A store operation not answered within this delay counts as a store failure. */
-export const STORE_TIMEOUT_MS = 2_000;
+/**
+ * Client-side guard: a store operation not answered within this delay counts as a store failure.
+ * Longer than the dedicated pool's connection wait plus its statement timeout, so for the
+ * PostgreSQL store the server cancels the statement first (it never commits after the guard).
+ */
+export const STORE_GUARD_MS = RATE_LIMIT_POOL.connectionTimeoutMs + RATE_LIMIT_POOL.statementTimeoutMs + 1_000;
 /** At most one store-failure warning per limiter per this period. */
 export const STORE_WARNING_INTERVAL_MS = 60_000;
 const MAX_RETRY_AFTER_S = 3600;
@@ -131,9 +146,12 @@ const toWindow = (r: Row): StoreWindow => ({
   remainingMs: Math.max(0, Number(r.remaining_ms)),
 });
 
-/** The counters in the console's PostgreSQL (`rate_limit_counters`, migrations `0029`, `0030`). */
+/**
+ * The counters in the console's PostgreSQL (`rate_limit_counters`, migrations `0029`, `0030`), on
+ * the dedicated rate-limit pool by default.
+ */
 export class PgRateLimitStore implements RateLimitStore {
-  constructor(private readonly db: () => Database = getDb) {}
+  constructor(private readonly db: () => Database = getRateLimitDb) {}
 
   /** The upsert of `hit` and `reserve` (`guard`: the reservation condition, or none). */
   private upsert(k: StoreKey, windowMs: number, guard: SQL | null): SQL {
@@ -170,8 +188,10 @@ export class PgRateLimitStore implements RateLimitStore {
       from rate_limit_counters c
       where c.limiter = ${k.limiter} and c.key_hash = ${k.keyHash} and not exists (select 1 from up)`);
     const row = res.rows[0];
-    // No row: the window was created by a transaction that committed after this statement's
-    // snapshot and is already full (limit 1). Not counted; `Retry-After` falls back to the window.
+    // No row: the upsert did not count (the conflicting row was locked and re-checked at its
+    // latest version) and the row is not visible in this statement's snapshot, because a
+    // concurrent transaction created or re-created it after the snapshot was taken. Not counted;
+    // `Retry-After` falls back to the whole window.
     if (!row) return { counted: false, window: null };
     return { counted: row.counted === true, window: toWindow(row) };
   }
@@ -260,13 +280,19 @@ interface SharedConfig {
   onStoreError: StoreFailureMode;
   store: RateLimitStore;
   timeoutMs: number;
+  requiresServerKey: boolean;
 }
 
 export interface SharedOptions {
   /** Test hook: another store (e.g. one that fails). Default: the console's PostgreSQL. */
   store?: RateLimitStore;
-  /** Default {@link STORE_TIMEOUT_MS}. */
+  /** Client-side guard, default {@link STORE_GUARD_MS}. */
   timeoutMs?: number;
+  /**
+   * Keys derived from what a user typed (usernames): shared only when a server key is available
+   * (HMAC), per process otherwise (review M1).
+   */
+  requiresServerKey?: boolean;
   /** Bound of the per-process pre-check counters (default 100 000 keys). */
   maxKeys?: number;
 }
@@ -303,7 +329,8 @@ export class RateLimiter {
       name,
       onStoreError,
       store: opts.store ?? defaultStore,
-      timeoutMs: opts.timeoutMs ?? STORE_TIMEOUT_MS,
+      timeoutMs: opts.timeoutMs ?? STORE_GUARD_MS,
+      requiresServerKey: opts.requiresServerKey ?? false,
     });
   }
 
@@ -410,7 +437,7 @@ export class RateLimiter {
     const out: RateLimitDecision[] = entries.map(([rl, key]) => rl.check(key));
     const pending: { i: number; key: string; rl: RateLimiter; cfg: SharedConfig; sk: StoreKey }[] = [];
     entries.forEach(([rl, key], i) => {
-      const cfg = rl.sharedConfig;
+      const cfg = rl.activeShared();
       if (cfg && !out[i]?.limited) pending.push({ i, key, rl, cfg, sk: rl.storeKey(cfg, key) });
     });
     const first = pending[0];
@@ -423,6 +450,7 @@ export class RateLimiter {
         continue;
       }
       const w = found.get(storeKeyId(p.sk));
+      if (w && w.count >= p.rl.limit) p.rl.markLimited(p.key, w.remainingMs);
       out[p.i] = w ? { limited: w.count >= p.rl.limit, retryAfterS: toRetryAfterS(w.remainingMs) } : { limited: false, retryAfterS: 1 };
     }
     return out;
@@ -430,12 +458,16 @@ export class RateLimiter {
 
   /** Counts one hit across all processes and returns the decision after it. */
   async hitShared(key: string): Promise<RateLimitDecision> {
-    const cfg = this.sharedConfig;
+    const cfg = this.activeShared();
     if (!cfg) return this.hit(key);
+    // Already limited here: the request is refused anyway, so it is counted in this process only
+    // (H1: a flood on a limited key costs no store statement).
+    if (this.check(key).limited) return this.hit(key);
     await this.settled(key);
     const w = await this.storeCall(() => cfg.store.hit(this.storeKey(cfg, key), this.windowMs));
     const local = this.hit(key);
     if (w === FAILED) return this.failedDecision(local);
+    if (w.count >= this.limit) this.markLimited(key, w.remainingMs);
     return combine({ limited: w.count >= this.limit, retryAfterS: toRetryAfterS(w.remainingMs) }, local);
   }
 
@@ -444,7 +476,7 @@ export class RateLimiter {
    * its limit. Returns a `refund` to call if the attempt turns out not to count (success, duplicate).
    */
   async reserveShared(key: string): Promise<Reservation> {
-    const cfg = this.sharedConfig;
+    const cfg = this.activeShared();
     const local = this.check(key);
     if (local.limited) return { ok: false, retryAfterS: local.retryAfterS };
     if (!cfg) return { ok: true, refund: this.charge(key) };
@@ -456,14 +488,16 @@ export class RateLimiter {
       return refund ? { ok: true, refund } : { ok: false, retryAfterS: this.check(key).retryAfterS };
     }
     if (!r.counted || !r.window) {
-      return { ok: false, retryAfterS: toRetryAfterS(r.window?.remainingMs ?? this.windowMs) };
+      const remainingMs = r.window?.remainingMs ?? this.windowMs;
+      this.markLimited(key, remainingMs);
+      return { ok: false, retryAfterS: toRetryAfterS(remainingMs) };
     }
     return { ok: true, refund: this.sharedRefund(cfg, key, r.window.windowStartMs, this.charge(key)) };
   }
 
   /** Counts an attempt across all processes even when over the limit (never refuses); returns its refund. */
   async chargeShared(key: string): Promise<Refund> {
-    const cfg = this.sharedConfig;
+    const cfg = this.activeShared();
     if (!cfg) return this.charge(key);
     await this.settled(key);
     const w = await this.storeCall(() => cfg.store.hit(this.storeKey(cfg, key), this.windowMs));
@@ -473,7 +507,7 @@ export class RateLimiter {
 
   /** Hits counted for `key` in its current window across all processes (at least this process's). */
   async countShared(key: string): Promise<number> {
-    const cfg = this.sharedConfig;
+    const cfg = this.activeShared();
     if (!cfg) return this.count(key);
     await this.settled(key);
     const sk = this.storeKey(cfg, key);
@@ -484,6 +518,41 @@ export class RateLimiter {
   }
 
   // ---- Internals ---------------------------------------------------------------------------------
+
+  /**
+   * The shared configuration in effect, or null when this limiter runs per process: a local
+   * limiter, or a `requiresServerKey` limiter without a server key (review M1).
+   */
+  private activeShared(): SharedConfig | null {
+    const cfg = this.sharedConfig;
+    if (cfg?.requiresServerKey && serverSubkey(RATE_LIMIT_KEY_DOMAIN) === null) return null;
+    return cfg;
+  }
+
+  /** Whether this limiter uses the shared store right now (see `activeShared`). */
+  get isSharedNow(): boolean {
+    return this.activeShared() !== null;
+  }
+
+  /**
+   * Negative entry (H1): the store reported `key` at its limit; record it here as limited until the
+   * end of the store's window, so later requests of this process are refused without a statement.
+   * Only ever raises the local count: it can refuse earlier, never admit more.
+   */
+  private markLimited(key: string, remainingMs: number): void {
+    const resetAt = this.now() + Math.max(1, remainingMs);
+    const w = this.current(key);
+    if (w) {
+      w.count = Math.max(w.count, this.limit);
+      w.resetAt = Math.max(w.resetAt, resetAt);
+      return;
+    }
+    if (this.windows.size >= this.maxKeys) {
+      const oldest = this.windows.keys().next();
+      if (!oldest.done) this.windows.delete(oldest.value);
+    }
+    this.windows.set(key, { count: this.limit, resetAt });
+  }
 
   private storeKey(cfg: SharedConfig, key: string): StoreKey {
     return { limiter: cfg.name, keyHash: rateLimitKeyHash(cfg.name, key) };
@@ -525,7 +594,7 @@ export class RateLimiter {
   private async storeCall<T>(op: () => Promise<T>): Promise<T | typeof FAILED> {
     const cfg = this.sharedConfig;
     try {
-      return await withTimeout(op(), cfg?.timeoutMs ?? STORE_TIMEOUT_MS);
+      return await withTimeout(op(), cfg?.timeoutMs ?? STORE_GUARD_MS);
     } catch (err) {
       rateLimitStoreStats.errors++;
       const name = cfg?.name ?? "local";

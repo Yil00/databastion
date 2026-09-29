@@ -376,8 +376,18 @@ export async function promotePending(
   await getDb().execute(sql`select pg_notify(${REVOKED_CHANNEL}, ${agentId})`);
 }
 
+/**
+ * IPv6 prefix of the cheap per-IP failure limit (review L3): /48, wider than the /64 of the
+ * argon2id-backed limits, so a single IPv6 allocation cannot multiply the cheap budget (and the
+ * shared-store rows it writes) by rotating /64s. Agents behind that /48 are not held by it when their
+ * secret is exempt (verified cache, known good), and it only gates reaching argon2id.
+ */
+export const CHEAP_FAILURES_IPV6_PREFIX = 48;
+
 interface Limits {
   ipKey: string | null;
+  /** `cheapFailuresPerIp` key: the source IP bucketed by {@link CHEAP_FAILURES_IPV6_PREFIX}. */
+  cheapKey: string | null;
 }
 
 const retryAfter = (...decisions: (RateLimitDecision | undefined)[]) =>
@@ -387,9 +397,10 @@ const retryAfter = (...decisions: (RateLimitDecision | undefined)[]) =>
  * The limits that gate the argon2id path for a non-exempt secret: argon2id-backed failures per IP,
  * cheap failures per IP (M1), argon2id-backed failures per (agent, IP). `null` when none is reached.
  */
-async function argon2PathLimited(ipKey: string | null, key: string | null): Promise<Response | null> {
+async function argon2PathLimited(ipKey: string | null, cheapKey: string | null, key: string | null): Promise<Response | null> {
   const entries: [RateLimiter, string][] = [];
-  if (ipKey) entries.push([failuresPerIp, ipKey], [cheapFailuresPerIp, ipKey]);
+  if (ipKey) entries.push([failuresPerIp, ipKey]);
+  if (cheapKey) entries.push([cheapFailuresPerIp, cheapKey]);
   if (key) entries.push([failuresPerAgent, key]);
   // One round-trip to the shared store for the three limits.
   const decisions = await RateLimiter.checkAll(entries);
@@ -402,17 +413,17 @@ async function argon2PathLimited(ipKey: string | null, key: string | null): Prom
  * neither `failuresPerIp` nor the per-(agent, IP) limit, so junk requests that need no secret cannot
  * block an agent (not even one not yet known good) behind the same source IP.
  */
-async function cheapFailure({ ipKey }: Limits): Promise<{ ok: false; response: Response }> {
-  if (ipKey) {
+async function cheapFailure({ cheapKey }: Limits): Promise<{ ok: false; response: Response }> {
+  if (cheapKey) {
     // Check and count in one atomic step: over the limit, `429` and nothing counted.
-    const cheapByIp = await cheapFailuresPerIp.reserveShared(ipKey);
+    const cheapByIp = await cheapFailuresPerIp.reserveShared(cheapKey);
     if (!cheapByIp.ok) return { ok: false, response: rateLimited(cheapByIp.retryAfterS) };
   }
   return { ok: false, response: unauthorized() };
 }
 
 export type Precheck =
-  | { ok: true; agentId: string; secret: string; ipKey: string | null; key: string }
+  | { ok: true; agentId: string; secret: string; ipKey: string | null; cheapKey: string | null; key: string }
   | { ok: false; response: Response };
 
 /**
@@ -420,8 +431,8 @@ export type Precheck =
  * per agent: a trickled body proves nothing about the agent, and must not eat its budget; and no
  * argon2id ran, so not `failuresPerIp` either, M1).
  */
-export async function countTimedOutBody(ipKey: string | null): Promise<void> {
-  if (ipKey) await cheapFailuresPerIp.hitShared(ipKey);
+export async function countTimedOutBody(cheapKey: string | null): Promise<void> {
+  if (cheapKey) await cheapFailuresPerIp.hitShared(cheapKey);
 }
 
 const knownGoodFor = (row: KnownGoodHint, secret: string) =>
@@ -441,13 +452,13 @@ function exemptWithoutRead(agentId: string, secret: string): boolean {
   return !!hint && knownGoodFor(hint, secret);
 }
 
-async function exemptFromLimits(agentId: string, secret: string, ipKey: string | null): Promise<boolean> {
+async function exemptFromLimits(agentId: string, secret: string, cheapKey: string | null): Promise<boolean> {
   if (exemptWithoutRead(agentId, secret)) return true;
-  if (ipKey && (await cheapFailuresPerIp.checkShared(ipKey)).limited) return false;
+  if (cheapKey && (await cheapFailuresPerIp.checkShared(cheapKey)).limited) return false;
   exemptionLookupStats.lookups++;
   const agent = await loadAgent(agentId);
   const exempt = active(agent) && knownGoodFor(agent, secret);
-  if (!exempt && ipKey) await cheapFailuresPerIp.hitShared(ipKey);
+  if (!exempt && cheapKey) await cheapFailuresPerIp.hitShared(cheapKey);
   return exempt;
 }
 
@@ -460,7 +471,7 @@ async function exemptFromLimits(agentId: string, secret: string, ipKey: string |
  */
 export async function authPrecheck(req: Request): Promise<Precheck> {
   const ip = clientIp(req);
-  const limits: Limits = { ipKey: ip ? ipBucket(ip) : null };
+  const limits: Limits = { ipKey: ip ? ipBucket(ip) : null, cheapKey: ip ? ipBucket(ip, CHEAP_FAILURES_IPV6_PREFIX) : null };
   const headerId = req.headers.get("x-databastion-agent-id");
   const agentId = headerId !== null && UUID.test(headerId) ? headerId : null;
   const secret = BEARER.exec(req.headers.get("authorization") ?? "")?.[1];
@@ -470,17 +481,17 @@ export async function authPrecheck(req: Request): Promise<Precheck> {
   // A secret exempt without any database read (verified cache, known-good hint) is held by no
   // limit whatever the counters say: the shared store is not consulted for it (P4-D).
   if (!exemptWithoutRead(agentId, secret)) {
-    const limited = await argon2PathLimited(limits.ipKey, key);
-    if (limited && !(await exemptFromLimits(agentId, secret, limits.ipKey))) return { ok: false, response: limited };
+    const limited = await argon2PathLimited(limits.ipKey, limits.cheapKey, key);
+    if (limited && !(await exemptFromLimits(agentId, secret, limits.cheapKey))) return { ok: false, response: limited };
   }
-  return { ok: true, agentId, secret, ipKey: limits.ipKey, key };
+  return { ok: true, agentId, secret, ipKey: limits.ipKey, cheapKey: limits.cheapKey, key };
 }
 
 export async function authenticateAgent(req: Request, opts: AuthOptions = {}): Promise<AuthResult> {
   const pre = await authPrecheck(req);
   if (!pre.ok) return pre;
-  const { agentId, secret, ipKey, key } = pre;
-  const limits: Limits = { ipKey };
+  const { agentId, secret, ipKey, cheapKey, key } = pre;
+  const limits: Limits = { ipKey, cheapKey };
   const denied = (): AuthResult => ({ ok: false, response: unauthorized() });
 
   let agent = await loadAgent(agentId);
@@ -508,8 +519,8 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
   // M1: a known-good secret is held by no failure limit (it only uses the reserved pool). Any other
   // secret reaches argon2id only below the cheap per-IP limit, and its attempt is reserved against
   // the argon2id-backed per-IP and per-(agent, IP) limits.
-  if (!exempt && ipKey && (await cheapFailuresPerIp.checkShared(ipKey)).limited) {
-    return { ok: false, response: (await argon2PathLimited(ipKey, key)) ?? rateLimited(1) };
+  if (!exempt && cheapKey && (await cheapFailuresPerIp.checkShared(cheapKey)).limited) {
+    return { ok: false, response: (await argon2PathLimited(ipKey, cheapKey, key)) ?? rateLimited(1) };
   }
   const noRefund: Reservation = { ok: true, refund: () => undefined };
   const [byIp, byAgent] = await Promise.all([
@@ -520,7 +531,7 @@ export async function authenticateAgent(req: Request, opts: AuthOptions = {}): P
     if (byIp.ok) byIp.refund();
     if (byAgent.ok) byAgent.refund();
     const retry = Math.max(byIp.ok ? 1 : byIp.retryAfterS, byAgent.ok ? 1 : byAgent.retryAfterS);
-    return { ok: false, response: (await argon2PathLimited(ipKey, key)) ?? rateLimited(retry) };
+    return { ok: false, response: (await argon2PathLimited(ipKey, cheapKey, key)) ?? rateLimited(retry) };
   }
   const refundIp = byIp.refund;
   const refundAgent = byAgent.refund;
