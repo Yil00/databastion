@@ -57,7 +57,7 @@ jobs:
           esac
           if [ -z "$changed" ]; then
             e2e=true
-          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|dev/postgres/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|dev/postgres/|dev/mongo/|dev/openldap/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
             e2e=true
           else
             e2e=false
@@ -464,14 +464,16 @@ jobs:
         run: docker compose -f dev/docker-compose.yml down -v
 
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
-  # MySQL and MariaDB targets (ADR-0012 / ADR-0018 minimal accounts), a Discovery scan of each
-  # (in parallel), the Audit path on the PostgreSQL target (dev/postgres image with pgaudit) and the
-  # MariaDB target (server_audit log): a real pg_dump / mariadb-dump must open an incident in under
-  # 2 minutes, the agent's own reads none, and the policy engine must be woken up; revocation
-  # < 60 s, and invariant I2: no ground-truth value in clear text in the console database, the logs,
-  # the console pages or the notification e-mails, for every engine; no secret in the targets'
-  # audit logs. run.sh prints the phase timings and the dump -> incident times. Required through
-  # ci-result.
+  # MySQL, MariaDB, MongoDB and OpenLDAP targets (ADR-0012 / ADR-0018 / ADR-0026 / ADR-0029
+  # accounts), a Discovery scan of each (in parallel), the Audit path on the PostgreSQL target
+  # (dev/postgres image with pgaudit), the MariaDB target (server_audit log), the MongoDB target
+  # (server log) and the OpenLDAP target (dev/openldap image, cn=accesslog): a real pg_dump /
+  # mariadb-dump / mongodump / bulk ldapsearch must open an incident in under 2 minutes, the agent's
+  # own reads none, and the policy engine must be woken up; password-bearing DCL on PostgreSQL and
+  # MariaDB; revocation < 60 s, and invariant I2: no ground-truth value (nor DCL password) in clear
+  # text in the console database, the logs, the console pages or the notification e-mails, for every
+  # engine; no secret in the targets' audit logs. run.sh prints the phase timings and the
+  # dump -> incident times. Required through ci-result.
   e2e:
     name: E2E (enrollment, Discovery, Audit, invariant I2)
     needs: detect

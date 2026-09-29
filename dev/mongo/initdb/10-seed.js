@@ -5,7 +5,14 @@
 // system.js), no `clusterMonitor` (other sessions' operations, system.profile of every database).
 // Dev-only deviation: no `authenticationRestrictions`, since the agent connects through the
 // published port and its source address is the Docker gateway.
+// The agent password comes from DATABASTION_DB_PASSWORD (dev/.env) or, when
+// DATABASTION_DB_PASSWORD_FILE is set, from that file as it is (the e2e harness passes a Docker
+// secret, which then never is in the environment).
 const fs = require("fs");
+const agentPassword = process.env.DATABASTION_DB_PASSWORD_FILE
+  ? fs.readFileSync(process.env.DATABASTION_DB_PASSWORD_FILE, "utf8")
+  : process.env.DATABASTION_DB_PASSWORD;
+if (!agentPassword) throw new Error("DATABASTION_DB_PASSWORD or DATABASTION_DB_PASSWORD_FILE is required");
 const seed = JSON.parse(fs.readFileSync("/seed/mongo.json", "utf8"));
 const app = db.getSiblingDB("app");
 for (const [name, docs] of Object.entries(seed.collections)) {
@@ -19,7 +26,7 @@ admin.createRole({
 });
 admin.createUser({
   user: "databastion",
-  pwd: process.env.DATABASTION_DB_PASSWORD,
+  pwd: agentPassword,
   mechanisms: ["SCRAM-SHA-256"],
   roles: [{ role: "databastionDiscovery", db: "admin" }],
 });

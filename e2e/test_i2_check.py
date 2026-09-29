@@ -20,6 +20,8 @@ GROUND_TRUTH = os.path.join(REPO, "dev", "ground-truth.json")
 SEED_PG = os.path.join(REPO, "dev", "seed", "out", "postgres.sql")
 SEED_MYSQL = os.path.join(REPO, "dev", "seed", "out", "mysql.sql")
 SEED_MARIADB = os.path.join(REPO, "dev", "seed", "out", "mariadb.sql")
+SEED_MONGO = os.path.join(REPO, "dev", "seed", "out", "mongo.json")
+SEED_LDAP = os.path.join(REPO, "dev", "seed", "out", "openldap.ldif")
 
 # A small ground truth with the shapes of dev/ground-truth.json (fake values).
 GT = {
@@ -302,6 +304,34 @@ class CoverageTest(Base):
                 rc, out = run(["coverage", "--ground-truth", GROUND_TRUTH, "--engine", engine, seed])
                 self.assertEqual(rc, 0, out)
 
+    @unittest.skipUnless(os.path.exists(SEED_MONGO) and os.path.exists(SEED_LDAP),
+                         "committed seeds not found")
+    def test_every_mongodb_and_openldap_value_is_visible_in_the_committed_seeds(self) -> None:
+        # The LDIF seed base64-encodes its non-ASCII values: the `ldif` view decodes them.
+        for engine, seed in (("mongodb", SEED_MONGO), ("openldap", SEED_LDAP)):
+            with self.subTest(engine=engine):
+                rc, out = run(["coverage", "--ground-truth", GROUND_TRUTH, "--engine", engine, seed])
+                self.assertEqual(rc, 0, out)
+
+
+class LdifViewTest(Base):
+    def test_base64_and_folded_values_are_decoded(self) -> None:
+        # "Lefèvre" base64-encoded, and an e-mail folded over two lines.
+        b64 = "TGVmw6h2cmU="
+        for text in (f"dn: uid=x,dc=example,dc=org\nsn:: {b64}\n",
+                     "dn: uid=x,dc=example,dc=org\nreqFilter: (mail=manon.ber\n nard@example.com)\n"):
+            with self.subTest(text=text):
+                rc, out = self.scan(self.write("accesslog.ldif", text))
+                self.assertEqual(rc, 1, out)
+                self.assertIn("view=ldif", out)
+
+    def test_only_for_ldif_and_bad_base64_is_kept(self) -> None:
+        # Not LDIF (no dn: line): no join, no decoding; bad base64 does not fail the scan.
+        rc, out = self.scan(self.write("a.log", "sn:: TGVmw6h2cmU=\nmanon.ber\n nard@example.com\n"))
+        self.assertEqual(rc, 0, out)
+        rc, out = self.scan(self.write("b.ldif", "dn: x=y\nsn:: !!!notbase64\n"))
+        self.assertEqual(rc, 0, out)
+
 
 class FindingsTest(Base):
     ROWS = [
@@ -529,6 +559,85 @@ class NeedleFilterTest(Base):
             self.assertIn(bad, out)
 
 
+# MongoDB and OpenLDAP shapes: the value-bearing part is the field (dynamic keys) or the container.
+GT_NOSQL = {
+    "locations": [
+        {"engine": "mongodb", "database": "app", "container": None, "object": "users",
+         "field": "email", "expected_classifiers": ["pii.email"], "name_contains_value": False,
+         "negative_control": False, "values": ["a.b@example.com"]},
+        {"engine": "mongodb", "database": "app", "container": None, "object": "address_books",
+         "field": "contacts.<email>.phone", "expected_classifiers": ["pii.phone"],
+         "expected_normalized_name": "contacts.*.phone", "name_contains_value": True,
+         "name_value_classifiers": ["pii.email"], "name_values": ["mia.nielsen@example.net"],
+         "negative_control": False, "values": ["+33 6 39 98 78 79"]},
+        {"engine": "mongodb", "database": "app", "container": None, "object": "daily_stats",
+         "field": "hourly.<hour>", "expected_classifiers": [], "expected_normalized_name": "hourly.*",
+         "name_contains_value": False, "negative_control": True},
+        {"engine": "openldap", "database": "dc=example,dc=org",
+         "container": "ou=Oliver O'Connor,ou=teams,dc=example,dc=org", "object": "inetOrgPerson",
+         "field": "mail", "expected_classifiers": ["pii.email"],
+         "expected_normalized_name": "ou=*,ou=teams,dc=example,dc=org", "name_contains_value": True,
+         "name_value_classifiers": ["pii.person_name"], "name_values": ["Oliver O'Connor"],
+         "negative_control": False, "values": ["o.oconnor@example.com"]},
+    ]
+}
+
+
+class FindingsNoSqlTest(Base):
+    MONGO = [
+        {"database_name": "app", "schema_name": None, "object_name": "users", "field_name": "email",
+         "classifier": "pii.email"},
+        {"database_name": "app", "schema_name": None, "object_name": "address_books",
+         "field_name": "contacts.*.phone", "classifier": "pii.phone"},
+    ]
+    LDAP = [
+        {"database_name": "dc=example,dc=org", "schema_name": "ou=*,ou=teams,dc=example,dc=org",
+         "object_name": "inetOrgPerson", "field_name": "mail", "classifier": "pii.email"},
+    ]
+
+    def check(self, engine: str, rows: list[dict]) -> tuple[int, str]:
+        gt = self.write("gt-nosql.json", json.dumps(GT_NOSQL))
+        path = self.write("rows.json", json.dumps(rows))
+        return run(["findings", "--ground-truth", gt, "--engine", engine,
+                    "--require-expected-classifiers", "--forbid-negative-controls", path])
+
+    def test_value_part(self) -> None:
+        self.assertEqual([i2_check.value_part(loc) for loc in GT_NOSQL["locations"]],
+                         ["object", "field", "field", "container"])
+
+    def test_ok(self) -> None:
+        rc, out = self.check("mongodb", self.MONGO)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("expected normalized name 'contacts.*.phone'", out)
+        rc, out = self.check("openldap", self.LDAP)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("expected normalized name 'ou=*,ou=teams,dc=example,dc=org'", out)
+
+    def test_field_not_normalized_or_raw(self) -> None:
+        rc, out = self.check("mongodb", [self.MONGO[0], dict(self.MONGO[1], field_name="contacts.phone")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no finding stored under the expected normalized name", out)
+        rc, out = self.check("mongodb", self.MONGO + [
+            dict(self.MONGO[1], field_name="contacts.mia.nielsen@example.net.phone")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stores the raw value-bearing name", out)
+        self.assertNotIn("nielsen", out)
+
+    def test_placeholder_negative_control(self) -> None:
+        rc, out = self.check("mongodb", self.MONGO + [
+            {"database_name": "app", "schema_name": None, "object_name": "daily_stats",
+             "field_name": "hourly.*", "classifier": "pii.phone"}])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("negative control has finding(s): pii.phone", out)
+
+    def test_raw_container(self) -> None:
+        rc, out = self.check("openldap", self.LDAP + [
+            dict(self.LDAP[0], schema_name="ou=oliver o'connor,ou=teams,dc=example,dc=org")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stores the raw value-bearing name", out)
+        self.assertNotIn("oliver", out.lower())
+
+
 class AuditTest(Base):
     EVENTS = [
         {"db_user": "e2e_exporter", "action": "read", "source": "pgaudit", "rows": 150,
@@ -606,6 +715,76 @@ class AuditTest(Base):
         rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
                        "--agent-account", "a", "--events", ev, "--incidents", inc])
         self.assertEqual(rc, 2, out)
+
+
+    def test_required_action(self) -> None:
+        dcl = {"db_user": "e2e_admin", "action": "dcl", "source": "pgaudit", "objects": [],
+               "signals": [], "aggregated_count": 2}
+        rc, out = self.check(self.EVENTS + [dcl], self.INCIDENTS, ["--require-action", "e2e_admin:dcl"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 event(s) (2 statement(s)) of principal 'e2e_admin' with action dcl", out)
+        rc, out = self.check(self.EVENTS, self.INCIDENTS, ["--require-action", "e2e_admin:dcl"])
+        self.assertEqual(rc, 1, out)
+        rc, out = self.check(self.EVENTS, self.INCIDENTS, ["--require-action", "e2e_admin"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("bad --require-action", out)
+
+
+class AuditFingerprintTest(Base):
+    FP1, FP2 = "a" * 64, "b" * 64
+    DN = "cn=manon bernard,ou=services,dc=example,dc=org"
+
+    def events(self) -> list[dict]:
+        obj = [{"database": "dc=example,dc=org", "schema": "ou=people,dc=example,dc=org", "object": "*"}]
+        return [
+            {"db_user": None, "db_user_fingerprint": self.FP1, "action": "read", "objects": obj,
+             "signals": ["shape.bulk_search"], "source": "openldap_accesslog"},
+            {"db_user": None, "db_user_fingerprint": self.FP1, "action": "connect", "objects": [],
+             "signals": [], "source": "openldap_accesslog"},
+            {"db_user": None, "db_user_fingerprint": self.FP2, "action": "read", "objects": obj,
+             "signals": [], "source": "openldap_accesslog"},
+        ]
+
+    INCIDENTS = [
+        {"policy_name": "e2e dump signature", "principal": "a" * 64, "event_signals": ["shape.bulk_search"]},
+        {"policy_name": "e2e reads", "principal": "a" * 64, "event_signals": ["shape.bulk_search"]},
+    ]
+    REQUIRED = ["--fingerprinted-only", "--min-fingerprints", "2",
+                "--require-event", "@fingerprint:shape.bulk_search",
+                "--require-incident", "e2e dump signature:@fingerprint:shape.bulk_search",
+                "--require-incident", "e2e reads:@fingerprint"]
+
+    def check(self, events: list[dict], incidents: list[dict]) -> tuple[int, str]:
+        ev = self.write("events.json", json.dumps(events))
+        inc = self.write("incidents.json", json.dumps(incidents))
+        return run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                    "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                    "--events", ev, "--incidents", inc, *self.REQUIRED])
+
+    def test_ok(self) -> None:
+        rc, out = self.check(self.events(), self.INCIDENTS)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("every principal is a fingerprint", out)
+        self.assertIn("2 distinct fingerprinted principal(s) read", out)
+
+    def test_principal_in_clear_is_counted_never_printed(self) -> None:
+        ev = self.events()
+        ev[2] = dict(ev[2], db_user=self.DN, db_user_fingerprint=None)
+        rc, out = self.check(ev, self.INCIDENTS + [
+            {"policy_name": "e2e reads", "principal": self.DN, "event_signals": []}])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 access event(s) carry a principal that is not a fingerprint", out)
+        self.assertIn("1 incident(s) name a principal that is not a fingerprint", out)
+        self.assertIn("1 distinct fingerprinted principal(s) read, at least 2 expected", out)
+        self.assertNotIn("manon", out)
+
+    def test_fingerprint_requirements(self) -> None:
+        ev = [e for e in self.events() if "shape.bulk_search" not in e["signals"]]
+        inc = [dict(i, principal="not-a-fingerprint") for i in self.INCIDENTS]
+        rc, out = self.check(ev, inc)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no access event of principal '@fingerprint' with shape.bulk_search", out)
+        self.assertIn("no incident of policy 'e2e reads', principal '@fingerprint'", out)
 
 
 class HtmlTextViewTest(Base):

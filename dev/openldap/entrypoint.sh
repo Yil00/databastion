@@ -2,8 +2,27 @@
 # First start: build cn=config, load the seed and the service account offline, then run slapd.
 set -euo pipefail
 
-: "${LDAP_ADMIN_PASSWORD:?LDAP_ADMIN_PASSWORD is required (dev/.env)}"
-: "${DATABASTION_DB_PASSWORD:?DATABASTION_DB_PASSWORD is required (dev/.env)}"
+# Each password comes from the environment (dev/.env) or, when <VAR>_FILE is set, from that file (the
+# e2e harness passes Docker secrets: the password is then neither in the environment nor on a
+# command line, `slappasswd -T` hashes the file's contents as they are, so no trailing newline).
+if [ -z "${LDAP_ADMIN_PASSWORD_FILE:-}" ]; then
+  : "${LDAP_ADMIN_PASSWORD:?LDAP_ADMIN_PASSWORD is required (dev/.env)}"
+fi
+if [ -z "${DATABASTION_DB_PASSWORD_FILE:-}" ]; then
+  : "${DATABASTION_DB_PASSWORD:?DATABASTION_DB_PASSWORD is required (dev/.env)}"
+fi
+# ssha VAR: the {SSHA} hash of the password in $VAR, or in the file named by $VAR_FILE.
+ssha() {
+  local file_var="${1}_FILE" h
+  if [ -n "${!file_var:-}" ]; then
+    # slappasswd warns on stderr about a file readable by others (Docker secrets are).
+    h=$(slappasswd -h '{SSHA}' -T "${!file_var}" 2>/dev/null)
+  else
+    h=$(slappasswd -h '{SSHA}' -s "${!1}")
+  fi
+  [ -n "$h" ] || { echo "databastion-ldap: cannot hash $1" >&2; return 1; }
+  printf '%s' "$h"
+}
 SEED_LDIF=${SEED_LDIF:-/seed/openldap.ldif}
 SERVICE_DN="cn=databastion,ou=services,dc=example,dc=org"
 CONF_DIR=/etc/ldap/slapd.d
@@ -11,8 +30,8 @@ CONF_DIR=/etc/ldap/slapd.d
 if [ ! -e "$CONF_DIR/cn=config.ldif" ]; then
   echo "databastion-ldap: initializing configuration and seed" >&2
   tmp=$(mktemp -d)
-  admin_hash=$(slappasswd -h '{SSHA}' -s "$LDAP_ADMIN_PASSWORD")
-  service_hash=$(slappasswd -h '{SSHA}' -s "$DATABASTION_DB_PASSWORD")
+  admin_hash=$(ssha LDAP_ADMIN_PASSWORD)
+  service_hash=$(ssha DATABASTION_DB_PASSWORD)
   sed -e "s|@ADMIN_PW_HASH@|${admin_hash}|" -e "s|@SERVICE_DN@|${SERVICE_DN}|g" \
     /usr/local/share/databastion/config.ldif > "$tmp/config.ldif"
   mkdir -p /var/lib/ldap/accesslog /var/lib/ldap/data /run/slapd
