@@ -28,6 +28,7 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - Next.js App Router; the agent API server code lives in `console/src/app/api/agent/v1/`
 - Every agent API input is validated against the schema generated from `shared/protocol/` (rejected on unknown fields)
 - Versioned Drizzle migrations; never modify the schema by hand
+- Process-wide mutable state in the web process uses `processGlobal` / `processSlot` (`console/src/server/process-global.ts`), never module-level variables: Turbopack gives each layer its own module instance (#63)
 - pnpm; commands (to be filled in as soon as they exist): `pnpm lint`, `pnpm test`, `pnpm build`
 
 ## Conventions – Agent (`agent/`)

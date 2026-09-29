@@ -310,16 +310,18 @@ An `objects[]` entry whose `object` is `*` means the agent does not name the obj
 ### Signal registry
 [`shared/protocol/signals.json`](../shared/protocol/signals.json) lists the signal ids a conforming agent emits, with their meaning and the engines whose connector emits them:
 
-| Signal | Meaning (PostgreSQL connector, P4-A) |
+| Signal | Meaning (PostgreSQL connector P4-A, MySQL / MariaDB connector P4-B) |
 |--------|---------|
 | `signature.pg_dump` | A `pg_dump` / `pg_dumpall` run: that application name on a whole-relation read or copy, or one session copying several whole relations to the client |
 | `signature.copy_to_file` | Server-side export to a file (`COPY … TO '<file>'`), also from dynamic SQL |
 | `signature.copy_to_program` | Server-side export to a program (`COPY … TO PROGRAM`) |
+| `signature.mysqldump` | A `mysqldump`, `mariadb-dump`, `mysqlpump` or `mydumper` run (MySQL / MariaDB; heuristic) |
+| `signature.into_outfile` | Server-side export to a file on the database server (`SELECT … INTO OUTFILE` / `INTO DUMPFILE`), also when refused (MySQL / MariaDB) |
 | `shape.full_table_copy` | `COPY` out of a whole relation, or of an unfiltered query (heuristic) |
 | `shape.full_table_read` | Read of whole relations: no filter, no aggregation, no or a large limit (heuristic) |
 | `volume.large_result` | Rows returned or affected above the agent's large-result threshold |
 
-The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (e.g. `signature.mysqldump` for the MySQL Audit connector) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`, no digit), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; CI (every push and pull request) compares the registry with `dev`, `main` and, on push, the previous tip, and rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
+The registry is **append-only**: an id is never removed, renamed or given another meaning, and a new signal (as `signature.mysqldump` and `signature.into_outfile` were for the MySQL / MariaDB Audit connector, #64) is a new entry added by a compatible contract change. The `Signal` schema checks the form only (`^(signature|shape|volume)\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$`, no digit), not registration, so a console accepts a signal registered after it was built, stores it and matches it by exact id or family (`signature.*`); every `signature.*` signal makes an event severe (it bypasses the hourly incident cap). The protocol tests check the registry and that valid fixtures only use registered ids; CI (every push and pull request) compares the registry with `dev`, `main` and, on push, the previous tip, and rejects the removal or renaming of an id, or the loss of one of its engines; the agent contract test `contract_signals.rs` checks that every signal the agent can emit is registered and that every registered signal of an engine with an Audit connector can be emitted.
 
 ### Console-side checks on events
 *Implemented by the console in P4-C (#54); listed in `openapi.yaml` ("Console-side checks", `POST /events`).* In this order:
