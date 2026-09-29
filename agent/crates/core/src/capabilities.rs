@@ -61,7 +61,6 @@ impl ConsoleCapabilities {
     }
 
     /// Whether the latest heartbeat response listed `token`.
-    #[allow(dead_code)]
     pub(crate) fn console_accepts(&self, token: &str) -> bool {
         self.accepted
             .read()

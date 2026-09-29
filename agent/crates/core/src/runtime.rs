@@ -29,6 +29,7 @@ use crate::engine::{AuditLevel, Engine};
 use crate::identity::{Identity, IdentityError, StateDir};
 use crate::job::{AuditConfig, AuditParams, ScanJob, ScanParams};
 use crate::jobs::{self, Ledger, LedgerEntry, Outcome, PolledJob};
+use crate::notes::{NoteCode, TargetNote};
 use crate::session::{CallError, RotateOutcome, Session};
 use crate::sink::{EventSink, FindingSink};
 use crate::spool::Spool;
@@ -380,6 +381,9 @@ struct ScanQueue {
     in_flight: std::collections::HashSet<Uuid>,
 }
 
+/// Bound of one target's `check()` in a heartbeat.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Scans queued at most; more are left unacknowledged and redelivered.
 const MAX_QUEUED_SCANS: usize = 16;
 
@@ -418,6 +422,9 @@ struct Runtime {
     /// Findings emitted per job at most ([`MAX_FINDINGS_PER_JOB`]; lowered
     /// in tests).
     findings_cap: usize,
+    /// Bound of one target's `check()` ([`CHECK_TIMEOUT`]; lowered in
+    /// tests).
+    check_timeout: Duration,
     /// Audit settings per target.
     audits: Mutex<AuditTable>,
     /// Wakes the audit worker when `audits` changes.
@@ -581,6 +588,7 @@ impl Runtime {
             console_caps: crate::capabilities::ConsoleCapabilities::default(),
             parked: Mutex::new(Parked::default()),
             findings_cap: MAX_FINDINGS_PER_JOB,
+            check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_changed: tokio::sync::Notify::new(),
         })
@@ -628,14 +636,22 @@ impl Runtime {
                 .connectors
                 .iter()
                 .find(|c| c.engine() == target.engine.connector());
-            let (reachable, level, last_error) = match connector {
-                None => (false, AuditLevel::None, Some(FailureCode::Unsupported)),
-                Some(c) => {
-                    match tokio::time::timeout(Duration::from_secs(10), c.check(target)).await {
-                        Ok(h) => (h.reachable, h.audit_level, h.failure),
-                        Err(_) => (false, AuditLevel::None, Some(FailureCode::Timeout)),
-                    }
-                }
+            let (reachable, level, last_error, notes) = match connector {
+                None => (
+                    false,
+                    AuditLevel::None,
+                    Some(FailureCode::Unsupported),
+                    Vec::new(),
+                ),
+                Some(c) => match tokio::time::timeout(self.check_timeout, c.check(target)).await {
+                    Ok(h) => (h.reachable, h.audit_level, h.failure, h.notes),
+                    Err(_) => (
+                        false,
+                        AuditLevel::None,
+                        Some(FailureCode::Timeout),
+                        vec![TargetNote::new(NoteCode::CheckTimedOut)],
+                    ),
+                },
             };
             let audit_source = match connector {
                 Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
@@ -646,9 +662,17 @@ impl Runtime {
                 }),
                 _ => None,
             };
-            // `notes` (closed codes from the connector's `check()`) are not produced yet
-            // (ROADMAP P2-G); when they are, they are sent only if the console accepts
-            // `target_status.notes` (ADR-0022, `capabilities`).
+            // Closed notes from the connector's `check()`, sent only when the
+            // console's latest heartbeat response listed `target_status.notes`
+            // (ADR-0022): an older console rejects the whole heartbeat otherwise.
+            let notes = if self
+                .console_caps
+                .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
+            {
+                crate::notes::to_protocol(&notes)
+            } else {
+                Vec::new()
+            };
             out.push(TargetStatus {
                 audit_level: proto_audit_level(level),
                 audit_source,
@@ -656,7 +680,7 @@ impl Runtime {
                 engine: proto_engine(target.engine),
                 last_error,
                 metrics: None,
-                notes: Vec::new(),
+                notes,
                 reachable,
                 server_version: None,
                 target_id,

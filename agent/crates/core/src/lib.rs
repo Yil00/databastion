@@ -9,6 +9,8 @@
 //!   They only carry masked types from `databastion_classifiers::masking`.
 //! - [`audit`]: persisted audit cursors ([`audit::CursorStore`]), and
 //!   (crate-private) pre-aggregation and the `audit.configure` filter.
+//! - [`notes`]: closed target notes ([`NoteCode`], [`TargetNote`]) that
+//!   `check()` reports with [`TargetHealth`].
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
 //!   limits).
 //! - [`runtime`]: enrollment and the heartbeat / jobs loops. This is all the
@@ -42,6 +44,7 @@ mod fsutil;
 pub mod identity;
 pub mod job;
 mod jobs;
+pub mod notes;
 pub mod runtime;
 mod sanitize;
 mod session;
@@ -53,5 +56,6 @@ pub use config::AgentConfig;
 pub use connector::{Connector, ConnectorError};
 pub use engine::{AuditLevel, Engine, FailureCode, TargetHealth};
 pub use job::{AuditConfig, AuditParams, ParamsError, ScanJob, ScanParams};
+pub use notes::{CountMerge, NoteCode, NoteLabel, Notes, TargetNote};
 pub use runtime::{AgentError, EnrollOptions, enroll, run};
 pub use sink::{EventSink, FindingSink};

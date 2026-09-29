@@ -591,6 +591,7 @@ fn unreachable(e: &MyError) -> TargetHealth {
             e.stage.as_str(),
             e.engine_code().unwrap_or_else(|| "none".to_owned())
         )),
+        notes: Vec::new(),
     }
 }
 
@@ -608,6 +609,7 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
                 audit_level: AuditLevel::None,
                 failure: Some(FailureCode::Timeout),
                 detail: Some("check timed out".to_owned()),
+                notes: Vec::new(),
             }
         }
     }
@@ -722,6 +724,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
                 if notes.is_empty() { "" } else { "; " },
                 notes.join("; ")
             )),
+            notes: Vec::new(),
         },
         source,
     )

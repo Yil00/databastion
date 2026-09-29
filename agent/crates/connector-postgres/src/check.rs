@@ -357,6 +357,7 @@ fn unreachable(e: &PgError) -> TargetHealth {
             e.stage.as_str(),
             e.sqlstate().unwrap_or("none")
         )),
+        notes: Vec::new(),
     }
 }
 
@@ -369,6 +370,7 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
             audit_level: AuditLevel::None,
             failure: Some(FailureCode::Timeout),
             detail: Some("check timed out".to_owned()),
+            notes: Vec::new(),
         },
     };
     state.set_source(&target.id, health.audit_level);
@@ -476,6 +478,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             if notes.is_empty() { "" } else { "; " },
             notes.join("; ")
         )),
+        notes: Vec::new(),
     }
 }
 

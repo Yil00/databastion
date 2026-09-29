@@ -1799,12 +1799,14 @@ async fn connector_failure_code_is_reported_as_last_error() {
         audit_level: AuditLevel::None,
         failure: Some(FailureCode::TargetUnreachable),
         detail: None,
+        notes: Vec::new(),
     };
     let healthy = TargetHealth {
         reachable: true,
         audit_level: AuditLevel::Limited,
         failure: None,
         detail: None,
+        notes: Vec::new(),
     };
     for (health, expected) in [
         (
@@ -1825,6 +1827,141 @@ async fn connector_failure_code_is_reported_as_last_error() {
         assert_eq!(statuses[0].last_error, expected);
         assert_eq!(statuses[0].reachable, health.reachable);
     }
+}
+
+fn accepts_response(tokens: &[&str]) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "console_min_protocol": 1,
+        "heartbeat_interval_s": 30,
+        "server_time": "2026-09-28T14:02:00Z",
+        "accepts": tokens
+    }))
+}
+
+fn heartbeat_bodies(requests: &[Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/heartbeat"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn target_notes_are_sent_only_while_the_console_accepts_them() {
+    use crate::capabilities::token;
+    use crate::notes::{NoteLabel, TargetNote};
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // 1: no capability yet; 2: the console lists the notes; 3: it rejects
+    // the heartbeat (rolled back); 4: nothing accepted any more.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(accepts_response(&[token::TARGET_STATUS_NOTES]))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(error_body(400, "invalid_request"))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: Some("free text stays local: hunter2".to_owned()),
+        notes: vec![
+            TargetNote::new(NoteCode::CoverageRelationsWithoutSelect).with_count(3),
+            TargetNote::new(NoteCode::PrivilegeRoleAttributes).with_labels([
+                NoteLabel::parse("bypassrls"),
+                NoteLabel::parse("app_owner_hunter2"),
+            ]),
+            TargetNote::new(NoteCode::SecurityTlsDisabled),
+        ],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(health))],
+    )
+    .unwrap();
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap_err();
+    rt.heartbeat_once().await.unwrap();
+    let bodies = heartbeat_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 4);
+    for b in &bodies {
+        serde_json::from_value::<HeartbeatRequest>(b.clone()).unwrap();
+        let text = b.to_string();
+        assert!(
+            !text.contains("hunter2") && !text.contains("free text"),
+            "{text}"
+        );
+    }
+    assert!(bodies[0]["targets"][0].get("notes").is_none());
+    assert_eq!(
+        bodies[1]["targets"][0]["notes"],
+        serde_json::json!([
+            {"code": "security.tls_disabled"},
+            {"code": "privilege.role_attributes", "labels": ["other", "bypassrls"]},
+            {"code": "coverage.relations_without_select", "count": 3}
+        ])
+    );
+    // Rejected, then no capability: no notes until a response lists them.
+    assert!(bodies[2]["targets"][0].get("notes").is_some());
+    assert!(bodies[3]["targets"][0].get("notes").is_none());
+}
+
+#[tokio::test]
+async fn a_check_timed_out_by_the_core_is_noted() {
+    struct Slow;
+    #[async_trait::async_trait]
+    impl Connector for Slow {
+        fn engine(&self) -> Engine {
+            Engine::Postgres
+        }
+        async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+            std::future::pending().await
+        }
+        async fn discover(
+            &self,
+            _: &crate::ScanJob,
+            _: &crate::FindingSink,
+        ) -> Result<(), crate::ConnectorError> {
+            Ok(())
+        }
+        async fn audit_stream(
+            &self,
+            _: &crate::AuditConfig,
+            _: &crate::EventSink,
+        ) -> Result<(), crate::ConnectorError> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let mut rt = Runtime::new(&env.config_path, env.config.clone(), vec![Box::new(Slow)]).unwrap();
+    rt.check_timeout = Duration::from_millis(50);
+    rt.console_caps.record(Some(
+        &serde_json::from_value(serde_json::json!([
+            crate::capabilities::token::TARGET_STATUS_NOTES
+        ]))
+        .unwrap(),
+    ));
+    let statuses = rt.target_statuses(&env.config).await;
+    assert_eq!(statuses[0].last_error, Some(FailureCode::Timeout));
+    assert_eq!(statuses[0].notes.len(), 1);
+    assert_eq!(statuses[0].notes[0].code.as_str(), "check.timed_out");
 }
 
 // ------------------------------------------------------- discovery scans
@@ -2767,6 +2904,7 @@ impl Connector for FakeAudit {
             audit_level: AuditLevel::Full,
             failure: None,
             detail: None,
+            notes: Vec::new(),
         }
     }
     async fn discover(
