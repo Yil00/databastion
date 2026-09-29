@@ -313,4 +313,5 @@ Signatures are easy to forge (`application_name` and `program_name` are chosen b
 | MariaDB `server_audit` | Low to medium | Filter out service accounts |
 | `performance_schema` | Low | OK |
 | MongoDB profiler level 2 | **High** | Avoid in production; level 1 with a suitable `slowms` |
+| MongoDB profiler polling by the agent | Low to medium: each poll scans `system.profile` from the start in natural order (no `ts` index), bounded by `maxTimeMS` (at most 30 s) | A failing poll (for example a `maxTimeMS` expiry) is logged by the agent; with no entry read for 24 h the target shows the level None |
 | OpenLDAP `accesslog` | Low | Purge with `olcAccessLogPurge` |
