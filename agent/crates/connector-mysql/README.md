@@ -140,10 +140,12 @@ becomes the stream's session when `performance_schema` is chosen. A
 file-source stream holds no session: its re-probe opens one and closes it.
 The only other Audit connection is the `KILL QUERY` sent when a guarded
 Audit statement is cancelled (the stream stopped or reconfigured
-mid-statement). ADR-0025 decision 11 sized `MAX_USER_CONNECTIONS` with one
-more connection for the re-probe and the reconnect; that connection is no
-longer opened (the recommended limits in docs/05 are unchanged until the
-documentation follows).
+mid-statement), opened while the Audit session still exists. ADR-0025
+decision 11 counts that connection in the same slot as the re-probe and
+the reconnect, so the sizing is unchanged: keep `MAX_USER_CONNECTIONS 6`
+with a `performance_schema` stream (5 with an audit log file), plus one per
+additional Audit target on the account. What changed is that a re-probe or
+a reconnect no longer competes with a `KILL QUERY` for that slot.
 
 ## Known limits
 
