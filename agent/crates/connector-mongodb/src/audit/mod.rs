@@ -777,6 +777,11 @@ async fn profiler_run(
                 let panicked = st.builder.panicked.saturating_sub(panicked_before);
                 if panicked > 0 {
                     state.note_dropped(&target.id, panicked);
+                    tracing::warn!(
+                        target_id = %target.id,
+                        dropped = panicked,
+                        "profiler entries whose conversion failed dropped (internal error)"
+                    );
                 }
                 for e in events {
                     sink.submit(e).await?;

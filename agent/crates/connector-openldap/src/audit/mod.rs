@@ -105,6 +105,11 @@ impl Position {
         }
         if store.is_some_and(CursorStore::isolate) {
             p.isolate_left = PAGE;
+        } else if p.skip == 0 {
+            // Neither isolation nor a skip: a saved `handing` entry is read
+            // like any other (never left out of `seen` again, never a
+            // later skip's target).
+            p.handing = None;
         }
         p
     }
@@ -498,6 +503,10 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
                 position.advance(&csn);
                 save(position);
                 continue;
+            }
+            // Read outside isolation: no longer the entry being handed over.
+            if position.handing.as_deref() == Some(r.csn.as_str()) {
+                position.handing = None;
             }
             fresh.push(r);
         }

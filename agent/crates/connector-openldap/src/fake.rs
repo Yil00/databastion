@@ -786,3 +786,38 @@ async fn isolation_mode_then_a_skip_drop_the_entry_at_fault_only() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// PR #83 round-3 review L-1: a `handing` entry left in the saved position
+/// (a failed hand-over) is read like any other by a session without
+/// isolation nor skip: reported once, then marked read, and the `handing`
+/// line is gone.
+#[tokio::test]
+async fn a_stale_handing_entry_is_read_once_and_cleared() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::CURSOR;
+    let dir = skip_dir("handing");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(
+            format!(
+                "v2\ncursor {}\nhanding {}\nseen {}\n",
+                log_csn(1),
+                log_csn(2),
+                log_csn(1)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let dns = || vec!["dc=example,dc=org", "dc=example,dc=org"];
+    let state = crate::check::CheckState::default();
+    let events = poll_log(dns(), &store, false, 0, &state).await.unwrap();
+    assert_eq!(events.len(), 1, "entry 2 reported once");
+    let saved = String::from_utf8(store.load().unwrap().unwrap()).unwrap();
+    assert!(!saved.contains("handing"), "{saved}");
+    assert!(saved.contains(&format!("seen {}", log_csn(2))), "{saved}");
+    // Not reported again.
+    let events = poll_log(dns(), &store, false, 0, &state).await.unwrap();
+    assert!(events.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

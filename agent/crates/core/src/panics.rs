@@ -52,10 +52,12 @@ pub fn isolate<T>(f: impl FnOnce() -> T) -> Option<T> {
     r
 }
 
-/// Records whose handling panicked, dropped by [`isolate`] (process-wide).
+/// Failures caught by [`isolate`] (process-wide): one per isolated unit,
+/// a record or a statement's group of records, not per record.
 static RECORD_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Records whose handling panicked so far (the heartbeat metric
+/// Failures caught by [`isolate`] so far, one per isolated unit (a record
+/// or a statement's group of records; the heartbeat metric
 /// `audit_record_panics_total`).
 pub(crate) fn record_panics() -> u64 {
     RECORD_PANICS.load(std::sync::atomic::Ordering::Relaxed)

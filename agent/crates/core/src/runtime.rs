@@ -1020,9 +1020,10 @@ impl Runtime {
                 map.insert(key, value.load(Ordering::Relaxed) as f64);
             }
         }
-        // Audit records whose handling panicked (dropped alone by
-        // `crate::isolate`): a crafted-record campaign stands out from
-        // malformed input (PR #83 re-review L-C).
+        // Isolated units (a record, or a statement's group of records)
+        // whose handling panicked, one count each (`crate::isolate`): a
+        // crafted-record campaign stands out from malformed input (PR #83
+        // re-review L-C).
         if let Ok(key) = MetricsMapKey::try_from("audit_record_panics_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::panics::record_panics() as f64);

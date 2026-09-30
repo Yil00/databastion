@@ -213,9 +213,10 @@ A connector call that panics fails that call only (`crate::panics`).
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's
 group of records) to events in isolation: a record that makes that code panic
-is dropped alone and counted (`audit.records_dropped`, and the heartbeat metric
-`audit_record_panics_total`, which tells crafted-record campaigns apart from
-malformed input). A panic in a blocking parse task is resumed on the stream,
+is dropped alone and counted (`audit.records_dropped`, per record; and the
+heartbeat metric `audit_record_panics_total`, one per isolated unit that
+failed, a record or a statement's group, which tells crafted-record campaigns
+apart from malformed input). A panic in a blocking parse task is resumed on the stream,
 never turned into an ordinary error that restarts it in a loop
 (`databastion_core::resume_panic`).
 
@@ -229,7 +230,7 @@ record** (`CursorStore::skip_records`, applied only when the saved position is
 still the one the panics happened at; counted as dropped, and in
 `audit_records_skipped_total`). Only the OpenLDAP accesslog stream can skip;
 the file sources rely on per-record isolation. A stream is stopped until Audit
-is reconfigured or the agent restarts (`audit.stream_stopped`) after 6 panics
+is reconfigured or the agent restarts (`audit.stream_stopped`) after 7 panics
 at one position with no progress between them, more than 8 skips or 64
 panics within an hour, or 3 panics in a row on a source whose position is in
 memory (restarted afresh anyway). A stream that fails is restarted after its
