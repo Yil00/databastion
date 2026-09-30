@@ -263,7 +263,7 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     // Running without coverage: nothing reported yet.
     expect((await status({ status: "running", ts: new Date().toISOString(), progress: { ratio: 0.2 } })).status).toBe(204);
     let view = (await latestScans(getDb(), auth.agentId)).get("pg-prod-1");
-    expect(view?.coverage).toEqual({ sampled: null, total: null, skipped: [], unreached: 0, notSampled: 0, reported: false });
+    expect(view?.coverage).toEqual({ sampled: null, total: null, skipped: [], unreached: 0, notSampled: 0, gap: 0, reported: false });
     // A paced scan stopped at its deadline: it succeeds with skipped_limit (ADR-0035).
     const progress = { ratio: 1, batches: 1, findings: 3, objects_sampled: 180, skipped_limit: 12, skipped_error: 0, skipped_remote: 1 };
     expect((await status({ status: "succeeded", ts: new Date().toISOString(), progress })).status).toBe(204);
@@ -271,7 +271,7 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     expect(row?.progress).toEqual(progress);
     view = (await latestScans(getDb(), auth.agentId)).get("pg-prod-1");
     expect(view?.status).toBe("succeeded");
-    expect(view?.coverage).toMatchObject({ sampled: 180, notSampled: 13, unreached: 0, reported: true });
+    expect(view?.coverage).toMatchObject({ sampled: 180, notSampled: 13, gap: 12, unreached: 0, reported: true });
     expect(view?.coverage.skipped.map((s) => [s.key, s.count])).toEqual([
       ["skipped_limit", 12],
       ["skipped_remote", 1],

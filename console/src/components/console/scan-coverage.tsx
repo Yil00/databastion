@@ -5,8 +5,9 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 /**
  * Coverage of a target's latest Discovery scan (see src/lib/scan-coverage.ts): a "partial
- * coverage" warning on a succeeded scan that did not sample every object, then the non-zero
- * counters with their reason. Counts and fixed labels only; every string is a React text node.
+ * coverage" warning on a succeeded scan with an actionable gap (budget, errors, privileges,
+ * row-level security, objects never reached), then the non-zero counters with their reason,
+ * by-design ones (views, foreign tables) included but without the warning. Counts and fixed labels only; every string is a React text node.
  * Renders nothing when the scan reported no coverage and nothing was skipped.
  */
 export function ScanCoverageView({ status, coverage }: { status: string; coverage: ScanCoverage }) {

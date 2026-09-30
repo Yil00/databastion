@@ -271,8 +271,12 @@ on read (safe non-negative integers only; counts, never a name or a value, I2). 
 (`skipped_limit` time budget or connector limit, `skipped_error` sampling failed,
 `skipped_not_readable`, `skipped_row_level_security`, `skipped_unsupported`, `skipped_remote`;
 a `skipped_*` counter unknown to this console is shown raw), plus `objects_total - objects_done`
-objects never reached when the agent reports both. A **succeeded** scan with any object not sampled
-gets a "partial coverage" badge and warning: since Discovery pacing (ADR-0035), a scan that would
+objects never reached when the agent reports both. A **succeeded** scan with an actionable gap
+(`skipped_limit`, `skipped_error`, `skipped_not_readable`, `skipped_row_level_security`, objects
+never reached, or a `skipped_*` reason unknown to this console, treated as a gap to be safe) gets a
+"partial coverage" badge and warning. By-design skips (`skipped_unsupported`: views, merge tables;
+`skipped_remote`: foreign tables, never read under I5) are listed without the badge, so a target
+with views is not flagged on every scan. The warning matters because, since Discovery pacing (ADR-0035), a scan that would
 run past its budget stops before the next object, reports the objects left as `skipped_limit` and
 still succeeds, so "succeeded" alone does not mean the whole target was covered. The remedy is a
 larger "Scan budget" (and the agent's `limits.max_scan_duration_s`), a higher
