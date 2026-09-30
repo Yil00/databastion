@@ -13,7 +13,7 @@ It is separate from the dev seed ([../seed/generate.py](../seed/generate.py), [.
 ## Files
 | File | Content |
 |------|---------|
-| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `5318027` |
+| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `860592072` |
 | `corpus.json` (**not committed**, git-ignored, about 8 MB) | `{"generator", "seed", "version", "rows_per_column", "columns": [...]}`. Each column is `{id, engine, database, container, object, field, values}`, with 200 string `values` |
 | `labels.json` (committed, the reviewable artifact) | `{"generator", "seed", "version", "classifiers", "notes", "corpus_sha256", "locations": [...]}`, one location per column, joined on `id`. `corpus_sha256` is the SHA-256 of the exact bytes of `corpus.json` |
 | [test_generate.py](test_generate.py) | Unit tests: check-digit validators, determinism, validation, committed `labels.json` and pinned corpus SHA-256 up to date, minimum counts |
@@ -72,7 +72,7 @@ The Wilson lower bound for a perfect score is n / (n + 3.84). **With 30 positive
 
 For precision (LB ≥ 0.85): with TP = 62 the gate tolerates up to 4 FP, with TP = 78 up to 6 FP. So in practice the gate asks for about 98 % recall at column level. Anyone who wants more slack should raise `TARGET_POSITIVES` (for example 100 allows 4 misses) and not lower the bar.
 
-## Counts (seed 5318027)
+## Counts (seed 860592072)
 1416 columns × 200 rows: 643 positive columns, 759 hard-negative columns and 14 ambiguous columns (excluded).
 
 Non-ambiguous positive columns per classifier:
