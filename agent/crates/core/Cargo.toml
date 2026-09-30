@@ -1,0 +1,53 @@
+[package]
+name = "databastion-core"
+description = "DataBastion agent core: connector trait, engine model, sinks and HTTPS uplink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+databastion-classifiers.workspace = true
+# Used by the crate-private uplink only; never re-exported.
+databastion-protocol.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tracing.workspace = true
+# HTTPS uplink. rustls only (no OpenSSL / native-tls), `ring` crypto provider
+# (reqwest's `__rustls-ring`), trust roots from the system store
+# (`rustls-native-certs`) or a pinned CA file (`console.ca_file`). No http2,
+# no system-proxy feature (HTTP(S)_PROXY / NO_PROXY environment variables are
+# still honoured, except for the loopback dev console), no cookies, no
+# compression.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_yaml_ng = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+getrandom = { version = "0.4", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+futures-util = { workspace = true, features = ["std"] }
+# Safe syscalls for state files: open with O_NOFOLLOW, effective uid.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+
+[features]
+# Test helpers for the connectors' tests (enabled from their
+# [dev-dependencies] only, never by the agent binary): tailing log files the
+# test's own user owns, and the masked -> contract conversion as JSON for
+# the interim I2 checks.
+test-support = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+# HTTP mock server for tests only (bound to 127.0.0.1 by wiremock). It pulls
+# hyper's `server` feature: deny.toml excludes dev-dependencies from the
+# graph (`exclude-dev`), the shipped binary never links it.
+wiremock = "0.6"
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

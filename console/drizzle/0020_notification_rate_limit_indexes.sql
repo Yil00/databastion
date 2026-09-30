@@ -1,0 +1,2 @@
+CREATE INDEX "notification_deliveries_channel_created_idx" ON "notification_deliveries" USING btree ("channel_id","created_at");--> statement-breakpoint
+CREATE INDEX "notification_deliveries_rate_limited_idx" ON "notification_deliveries" USING btree ("created_at") WHERE "notification_deliveries"."last_error" = 'rate_limited';

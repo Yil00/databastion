@@ -1,0 +1,17 @@
+{
+  "status": "succeeded",
+  "ts": "2026-09-28T14:12:00Z",
+  "progress": {
+    "ratio": 1,
+    "objects_done": 420,
+    "objects_total": 420,
+    "findings": 31,
+    "batches": 2,
+    "objects_sampled": 412,
+    "skipped_not_readable": 3,
+    "skipped_row_level_security": 2,
+    "skipped_remote": 1,
+    "skipped_unsupported": 1,
+    "skipped_error": 1
+  }
+}

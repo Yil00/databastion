@@ -1,24 +1,28 @@
-# Example docker-compose for DataBastion (MVP)
-# Adapt to the actual implementation. Images are published on GHCR (see RELEASE.md).
+# Docker Compose deployment of the DataBastion console (MVP). Step by step: deploy/README.md.
+# Images are published on GHCR, signed with cosign (RELEASE.md, deploy/README.md).
 #
-# Only the console exposes a port, and it must be placed behind an
-# HTTPS reverse proxy. Agents expose NO port (outbound-only).
+# Settings come from `.env` next to this file (copy .env.example); secrets from ./secrets
+# (./init-secrets.sh). Only the console is reachable, through an HTTPS reverse proxy: the bundled
+# Caddy (`--profile proxy`), or your own in front of 127.0.0.1:8080 published by
+# docker-compose.own-proxy.example.yml. Agents expose NO port (outbound-only).
 
 name: databastion
 
+# Console image, pinned by version tag AND the verified digest (`...:<tag>@sha256:<digest>`, from
+# the release's signed image-digests.txt, see deploy/README.md): one place to change on upgrade.
+x-console-image: &console-image ${DATABASTION_CONSOLE_IMAGE:?set DATABASTION_CONSOLE_IMAGE in .env}
+
 services:
-  console:
-    image: ghcr.io/yil00/databastion-console:latest
-    command: ["web"]
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:3000"   # to be published through the HTTPS reverse proxy
+  # One image (console/Dockerfile), four commands: web (default), worker, migrate, bootstrap-admin.
+
+  # One-shot: applies the console migrations as the database OWNER role, then exits.
+  migrate:
+    image: *console-image
+    command: ["migrate"]         # src/db/migrate.ts (pnpm db:migrate)
+    restart: "no"
     environment:
-      DATABASE_URL_FILE: /run/secrets/db_url
-      DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
-      DATABASTION_PUBLIC_URL: https://databastion.example.com
-      TZ: Europe/Paris
-    secrets: [db_url, encryption_key]
+      DATABASE_MIGRATION_URL_FILE: /run/secrets/db_owner_url
+    secrets: [db_owner_url]
     user: "10001:10001"
     read_only: true
     tmpfs: [/tmp]
@@ -28,13 +32,69 @@ services:
       db:
         condition: service_healthy
 
-  worker:
-    image: ghcr.io/yil00/databastion-console:latest
-    command: ["worker"]          # policies, correlation, alerting
+  console:
+    image: *console-image
+    command: ["web"]
     restart: unless-stopped
+    # No published port: the bundled proxy reaches console:3000 on the Compose network. With your own
+    # reverse proxy, add docker-compose.own-proxy.example.yml (127.0.0.1:8080). Never both: with
+    # DATABASTION_TRUST_PROXY=1, a local client of a published port could choose its X-Forwarded-For.
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      DATABASTION_PUBLIC_URL: https://${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
+      # The console runs behind ONE HTTPS reverse proxy that sets / overwrites X-Forwarded-For.
+      # Remove this line if nothing in front of the console does (clients could spoof their IP).
+      # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
+      DATABASTION_TRUST_PROXY: "1"
+      # Prometheus scrape token for GET /metrics (ADR-0004); /metrics answers 404 when unset.
+      DATABASTION_METRICS_TOKEN_FILE: /run/secrets/metrics_token
+      # /metrics on a dedicated listener, never on port 3000 (which then answers 404 there).
+      # 0.0.0.0 inside the container, but the port is NOT published ("ports:" above): a Prometheus
+      # on this compose network scrapes http://console:9464/metrics with
+      # authorization.credentials_file = the metrics_token secret.
+      DATABASTION_METRICS_PORT: "9464"
+      DATABASTION_METRICS_HOST: 0.0.0.0
+      # System alerts per notification channel and hour, all agents together (default 20).
+      # Heartbeats and integrity events raise them here too: keep the worker's value.
+      # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
+      TZ: Europe/Paris
+    secrets: [db_url, encryption_key, metrics_token]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:                 # liveness only, no database access (readiness: /api/health/ready)
+      test: ["CMD", "/nodejs/bin/node", "/usr/local/lib/databastion/healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: *console-image
+    command: ["worker"]          # policies, correlation, alerting
+    restart: unless-stopped
+    # Alerting (P3-C): the worker is the only process that connects out (SMTP relay, webhook
+    # receivers), directly (no proxy); allow that egress in your firewall. Webhooks to private or
+    # loopback addresses are refused (SSRF defense).
+    environment:
+      DATABASE_URL_FILE: /run/secrets/db_url
+      # Also decrypts the channel secrets (SMTP password, webhook URL and signing secret).
+      DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      # Links to incidents / agents in the notifications.
+      DATABASTION_PUBLIC_URL: https://${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
+      # "Silent agent" alert after N heartbeat intervals of 30 s (default 10 = 5 min).
+      # DATABASTION_SILENT_AGENT_INTERVALS: "10"
+      # Audit access events are deleted after N days (default 90, 7 to 3650).
+      # DATABASTION_EVENTS_RETENTION_DAYS: "90"
+      # System alerts per notification channel and hour, all agents together (default 20; same
+      # value as the console service). Beyond: one digest per channel and hour.
+      # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
       TZ: Europe/Paris
     secrets: [db_url, encryption_key]
     user: "10001:10001"
@@ -43,53 +103,103 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     depends_on:
-      db:
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot, once after the first `up`: creates the first administrator (refused once a user
+  # exists). `docker compose run --rm bootstrap-admin`, then delete secrets/admin_password.
+  bootstrap-admin:
+    image: *console-image
+    profiles: [tools]
+    command: ["bootstrap-admin"]
+    restart: "no"
+    environment:
+      DATABASE_URL_FILE: /run/secrets/db_url
+      DATABASTION_BOOTSTRAP_ADMIN_USERNAME: ${DATABASTION_ADMIN_USERNAME:-admin}
+      DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+    secrets: [db_url, admin_password]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Optional HTTPS reverse proxy (`docker compose --profile proxy up -d`), configured by ./Caddyfile:
+  # certificate from Let's Encrypt (DATABASTION_TLS = your e-mail; the DNS name must reach this host
+  # on ports 80 and 443) or from Caddy's own CA (DATABASTION_TLS=internal; agents then pin that CA,
+  # deploy/README.md). TLS 1.2+ (agents require 1.3), HSTS, /metrics not served. Skip this service
+  # if another reverse proxy fronts 127.0.0.1:8080.
+  proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    profiles: [proxy]
+    restart: unless-stopped
+    ports:
+      - "80:80"                  # ACME HTTP challenge and redirect to HTTPS
+      - "443:443"
+    environment:
+      DATABASTION_DOMAIN: ${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
+      DATABASTION_TLS: ${DATABASTION_TLS:-internal}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data         # certificates and keys (Caddy's CA with DATABASTION_TLS=internal)
+      - caddy-config:/config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      console:
         condition: service_healthy
 
   db:
-    image: postgres:17-alpine
+    # Pinned by tag AND digest (multi-arch index of postgres:17-alpine = 17.11 on Alpine 3.24,
+    # resolved 2026-09-28). Update both together, to a digest you have checked.
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
-      POSTGRES_USER: databastion
+      # Bootstrap superuser: used only by the initdb script below, never by the console.
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: databastion
-    secrets: [db_password]
+    secrets: [db_password, db_owner_password, db_app_password]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates the owner and runtime roles at first initialization (see the script).
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     # No "ports:": the internal database is never exposed.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U databastion -d databastion"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d databastion"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 secrets:
   db_password:
-    file: ./secrets/db_password
+    file: ./secrets/db_password       # bootstrap superuser (POSTGRES_USER), initdb only
+  db_owner_password:
+    file: ./secrets/db_owner_password # databastion_owner (NOSUPERUSER), used only by `migrate`
+  db_owner_url:
+    file: ./secrets/db_owner_url      # postgresql://databastion_owner:<db_owner_password>@db:5432/databastion
+  db_app_password:
+    file: ./secrets/db_app_password   # runtime role databastion_runtime (web + worker)
   db_url:
-    file: ./secrets/db_url            # postgresql://databastion:<password>@db:5432/databastion
+    file: ./secrets/db_url            # postgresql://databastion_runtime:<db_app_password>@db:5432/databastion
   encryption_key:
     file: ./secrets/encryption_key    # openssl rand -base64 32
+  metrics_token:
+    file: ./secrets/metrics_token     # openssl rand -base64 32 (>= 32 chars); also given to Prometheus
+                                      # (scrape_configs: authorization.credentials_file)
+  admin_password:
+    file: ./secrets/admin_password    # first administrator (bootstrap-admin only); delete it afterwards
 
 volumes:
   postgres-data:
+  caddy-data:
+  caddy-config:
 
 # ---------------------------------------------------------------------------
-# Agent example: deploy on the host / network of the monitored databases,
-# NOT alongside the console. No port exposed.
-#
-#  agent:
-#    image: ghcr.io/yil00/databastion-agent:latest
-#    restart: unless-stopped
-#    environment:
-#      DATABASTION_CONSOLE_URL: https://databastion.example.com
-#      DATABASTION_ENROLLMENT_TOKEN_FILE: /run/secrets/enrollment_token  # single use
-#    volumes:
-#      - ./agent.yaml:/etc/databastion/agent.yaml:ro     # targets + secret refs
-#      - agent-state:/var/lib/databastion                # identity, HMAC key, spool
-#      - /var/log/postgresql:/logs/postgresql:ro         # native logs (Audit)
-#    secrets: [enrollment_token, pg_password]
-#    user: "10001:10001"
-#    read_only: true
-#    cap_drop: [ALL]
-#    security_opt: ["no-new-privileges:true"]
+# The agent runs on the database hosts, not here: .deb package, or agent-compose.example.yml.

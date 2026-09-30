@@ -1,0 +1,23 @@
+# Prometheus for the DataBastion dev environment.
+# Per ADR-0004, Prometheus scrapes ONE target: the console /metrics endpoint, which re-exposes the
+# agent metrics received in heartbeats (prefix databastion_agent_reported_). Agents are never scraped.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The console runs on the host (`pnpm dev`, port 3000) and is not containerized yet: this target is
+  # DOWN until the console is started. `/metrics` requires a bearer token (ADR-0004): `make dev`
+  # generates dev/.state/metrics_token (never committed), copied by the metrics-token-init service; start the host console with
+  # DATABASTION_METRICS_TOKEN_FILE=dev/.state/metrics_token (see dev/README.md).
+  - job_name: databastion-console
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics_token
+    static_configs:
+      - targets: ["host.docker.internal:3000"]

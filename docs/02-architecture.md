@@ -37,8 +37,15 @@ PostgreSQL MariaDB      MongoDB           OpenLDAP
 | Process | Role |
 |-----------|------|
 | `web` | UI, user API, agent API (`/api/agent/v1/*`) |
-| `worker` | Same image, different command. Applies policies, correlates events, creates incidents, sends alerts |
+| `worker` | Same image, different command. Applies policies, creates incidents, sends alerts, checks for silent agents, scores and correlates access events (P4-C) and purges them after the retention period |
 | `postgres` | Internal database. Also serves as the job queue (pg-boss) → **no Redis** |
+
+**Worker queues** (pg-boss, `stately`, no payload): the pending work is recorded in console tables, and a job only wakes the worker, so a lost or repeated job loses or repeats nothing.
+- `policies.evaluate`: evaluates pending access events first, within 60 % of the run's time budget and interleaving agents, then pending findings and policies that need a full pass, and creates incidents ([ADR-0014](adr/0014-policy-and-incident-model.md), [ADR-0021](adr/0021-access-event-correlation.md)). Woken by the web process after an accepted findings or events batch or a policy change, and scheduled every minute.
+- `events.purge`: deletes the access events older than `DATABASTION_EVENTS_RETENTION_DAYS` (default 90) through an owner-defined database function, never an event not evaluated yet ([ADR-0021](adr/0021-access-event-correlation.md)). Hourly and at worker start; re-queued while rows remain after its time budget.
+- `notifications.deliver`: sends the due rows of the notification outbox and runs the silent-agent check ([ADR-0017](adr/0017-alerting.md)). Woken after new incidents, integrity events and channel tests, and scheduled every minute.
+
+**Console outbound connections**: the worker is the only console process that connects out, to the webhook endpoints and SMTP relays of the notification channels, under the outbound address policy of [ADR-0017](adr/0017-alerting.md) (every resolved address checked, connections pinned to the checked addresses). The web process never connects to them; it validates settings and queues tests. None of this involves the agents, which still accept no inbound connection (I1).
 
 ### Agent
 A **single Rust binary** ([ADR-0002](adr/0002-single-agent-connectors.md)) made up of:
@@ -58,7 +65,7 @@ An agent can monitor several targets, of different engines, on the same host.
 2. **Data minimization at the source** ([ADR-0003](adr/0003-data-minimization-at-source.md)): the agent only sends metadata (location, detected type, volume, **masked** sample, HMAC fingerprint). If the console is compromised, no sensitive data and no database credential is exposed.
 3. **Database credentials local to the agent**: the console never knows the database passwords.
 4. **Declared targets + local detection** ([ADR-0006](adr/0006-target-discovery.md)): no network scanning.
-5. **Observability via the console** ([ADR-0004](adr/0004-observability-via-console.md)): agents expose no port; their metrics travel in the heartbeat.
+5. **Observability via the console** ([ADR-0004](adr/0004-observability-via-console.md)): agents expose no port; their metrics travel in the heartbeat. The console re-exposes them on its `/metrics` endpoint under the distinct prefix `databastion_agent_reported_` (labels `agent_id`, and `target_id` for target metrics), and ignores names on a reserved-name blocklist (e.g. `last_seen_seconds`, `up`, `revoked`), so an agent cannot shadow a console-computed metric.
 
 ## Agent operating modes
 1. **Discovery**: periodic traversal of schemas / collections / entries, sampling, classification. Produces *findings* ("column `clients.email` contains email addresses, confidence 0.97").
@@ -76,14 +83,14 @@ Detecting an export combines three signals, from simplest to most robust:
 | **Shape** | `COPY … TO`, sequential read of every table in a schema, LDAP subtree search `(objectClass=*)` from the root | Medium |
 | **Volume × sensitivity** | rows returned from locations classified as sensitive, above a per-account baseline | High |
 
-An event's score = f(signals, location sensitivity, deviation from baseline). Policies turn scores into incidents.
+As implemented (P4-C, [ADR-0021](adr/0021-access-event-correlation.md)), the console keeps the three apart: an event's **score** is its sensitivity (from the Discovery findings of the objects it reaches) × log10(1 + rows); the **baseline** verdict (`anomaly`) compares its volume with the principal's usual volume; **signals** are computed by the agent. Policies combine them as conditions (`signals`, `min_score`, `anomaly`, …) and turn matching events into incidents. Volume is rows only: a source that reports no row count gives a score of 0 and feeds no baseline.
 
 ## Console ↔ agent communication
 Detailed specification: [09-agent-protocol.md](09-agent-protocol.md).
 
-- **Transport**: HTTPS (TLS 1.3), versioned JSON, OpenAPI contract in `shared/protocol/`
+- **Transport**: HTTPS (TLS 1.3), versioned JSON; the OpenAPI contract [`shared/protocol/openapi.yaml`](../shared/protocol/openapi.yaml) is the source of truth
 - **Responsiveness**: *long-poll* on `GET /jobs` (request held for up to 25 s), which gives near-real-time responsiveness without WebSocket or gRPC
-- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable. mTLS as an option (phase 2).
+- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable (the agent generates the new secret, [ADR-0008](adr/0008-agent-generated-secret-rotation.md)). mTLS as an option (phase 2).
 - **Resilience**: if the console is unreachable, the agent queues to disk (bounded spool) and resends on reconnection.
 
 ## Agent deployment modes

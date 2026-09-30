@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1377a52817985d7e49a882f82c6d1a68cc7ccdf4cd690c2584ba5d94128e3bd5 # shrinks to (text, m, d) = ("do $zq$ begin perform a, 'x\\' from ZqAAAAAA_t where \\' from crm.t where b = 'x\\' from ZqAAAAAA_t where \\'; end $zq$", "ZqAAAAAA", "100000000")
+cc 4fc784dd050899e15b7e6f94e8f9d21237dd02cab45a7883f42d6f92c2a3b120 # shrinks to (text, m, d) = ("do $zq$ begin perform a, 'x\\' from ZqAAAAAA_t where \\' from crm.t where b = 'x\\' from ZqAAAAAA_t where \\'; end $zq$", "ZqAAAAAA", "100000000"), cut = 115

@@ -1,0 +1,15 @@
+{
+  "_comment": "Console production dependencies whose license is outside the agent/deny.toml allow-list, accepted with a written reason (scripts/check_console_licenses.py). Package name (glob) and exact license string must both match. Keep this list short; every entry is reviewed like code.",
+  "exceptions": [
+    {
+      "package": "tslib",
+      "license": "0BSD",
+      "reason": "Zero-Clause BSD: public-domain equivalent, more permissive than MIT / ISC (no notice required), compatible with Apache-2.0 distribution. Absent from deny.toml only because no Rust dependency uses it. Pulled by next (@swc/helpers)."
+    },
+    {
+      "package": "caniuse-lite",
+      "license": "CC-BY-4.0",
+      "reason": "Browser-support data tables (no code), pulled by next / browserslist. CC-BY-4.0 is permissive (attribution only; ASF category B for data), compatible with an Apache-2.0 distribution provided the attribution is kept in the published image."
+    }
+  ]
+}

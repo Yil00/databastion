@@ -1,0 +1,144 @@
+name: Advisories
+
+# Dependency advisory scanning (P1-C review follow-up L3): RustSec for the agent, npm registry
+# advisories for the console production dependencies and for the root release tooling
+# (release-it, which runs with RELEASE_TOKEN; end-of-phase-7 review M2).
+#
+# Deliberately NOT part of the "CI result" aggregate in ci.yml and not a required check: a new
+# upstream advisory would otherwise block every unrelated PR. Failures here are triaged by the
+# maintainers (upgrade, or a reasoned ignore in agent/deny.toml with a security-reviewer review).
+#
+# An unreachable advisory source is reported as such (a failed "fetch" step, or an explicit
+# "::error::" annotation), never as a vulnerability finding.
+
+on:
+  schedule:
+    - cron: "17 5 * * *" # daily, 05:17 UTC
+  push:
+    branches: [main, dev]
+    paths:
+      - agent/Cargo.lock
+      - agent/fuzz/Cargo.lock
+      - console/pnpm-lock.yaml
+      - package-lock.json
+      - shared/protocol/package-lock.json
+      - .github/workflows/advisories.yml
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - agent/Cargo.lock
+      - agent/fuzz/Cargo.lock
+      - console/pnpm-lock.yaml
+      - package-lock.json
+      - shared/protocol/package-lock.json
+      - .github/workflows/advisories.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent:
+    name: Agent advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2
+      # Everything that needs the network (crate metadata and the RustSec advisory database) is
+      # fetched in its own step, with retries, so that a network failure fails this step and never
+      # the checks below, which then run with --offline.
+      - name: Fetch crate metadata and the RustSec advisory database
+        run: |
+          for attempt in 1 2 3; do
+            if cargo fetch --locked && cargo fetch --locked --manifest-path fuzz/Cargo.toml \
+              && cargo deny --locked fetch db; then exit 0; fi
+            echo "fetch attempt $attempt failed, retrying" >&2
+            sleep $((attempt * 15))
+          done
+          echo "::error title=Advisory DB unreachable::Could not fetch crate metadata or the RustSec advisory database. This is an infrastructure failure, not a vulnerability finding."
+          exit 1
+      # agent/deny.toml: the graph linked into the shipped binary (dev-dependencies excluded).
+      - name: cargo-deny advisories (shipped graph)
+        run: cargo deny --locked --offline check advisories
+      # agent/deny-dev.toml: the full graph, dev-dependencies included (test tooling).
+      - name: cargo-deny advisories (dev-dependencies included)
+        run: cargo deny --config deny-dev.toml --locked --offline check advisories
+      # agent/fuzz: the fuzz harness, its own workspace and lockfile (libfuzzer-sys); never shipped.
+      - name: cargo-deny advisories (fuzz harness)
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny-dev.toml --locked --offline check advisories
+
+  console:
+    name: Console advisories (pnpm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: console/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # `pnpm audit` reads the lockfile only (no install) and retries registry errors itself. It
+      # exits non-zero both for findings and for registry errors: only an output carrying the
+      # findings summary ("N vulnerabilities found") is reported as vulnerable dependencies; any
+      # other failure (ECONNREFUSED, FetchError, ERR_PNPM_AUDIT_*…) is an infrastructure failure.
+      - name: pnpm audit (production dependencies, high and critical)
+        run: |
+          set +e
+          pnpm audit --prod --audit-level high > audit.log 2>&1
+          rc=$?
+          set -e
+          cat audit.log
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if grep -qE '[0-9]+ vulnerabilit(y|ies) found' audit.log; then
+            echo "::error title=Vulnerable dependencies::pnpm audit reported high or critical advisories in the console production dependencies."
+          else
+            echo "::error title=Advisory source unreachable::pnpm audit failed without a findings report (registry or network error). This is an infrastructure failure, not a vulnerability finding."
+          fi
+          exit "$rc"
+
+  release-tooling:
+    name: Release tooling advisories (npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # Root package-lock.json: release-it and its plugins, run by release.yml with RELEASE_TOKEN.
+      # All of them are devDependencies, so the whole graph is audited (no --omit=dev). `npm audit`
+      # reads the lockfile only (no install). As for the console, only an output carrying the
+      # findings summary ("N vulnerabilities (…)" or "N high severity vulnerabilities") is reported
+      # as vulnerable dependencies; any other failure is an infrastructure failure.
+      - name: npm audit (release tooling, high and critical)
+        run: |
+          set +e
+          npm audit --audit-level=high > audit.log 2>&1
+          rc=$?
+          set -e
+          cat audit.log
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if grep -qE '^[0-9]+ ([a-z]+ severity )?vulnerabilit(y|ies)' audit.log; then
+            echo "::error title=Vulnerable dependencies::npm audit reported high or critical advisories in the root release tooling (package-lock.json)."
+          else
+            echo "::error title=Advisory source unreachable::npm audit failed without a findings report (registry or network error). This is an infrastructure failure, not a vulnerability finding."
+          fi
+          exit "$rc"

@@ -1,0 +1,265 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1790603047807,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790607582849,
+      "tag": "0001_p1a_agents_auth",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790608724492,
+      "tag": "0002_audit_log_append_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790609210242,
+      "tag": "0003_runtime_role_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790609649760,
+      "tag": "0004_pgboss_schema_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790610489276,
+      "tag": "0005_security_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790611831213,
+      "tag": "0006_promoted_grace_deadline",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790613191969,
+      "tag": "0007_agent_known_good",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790613977736,
+      "tag": "0008_agent_known_good_pending",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790615605991,
+      "tag": "0009_pgboss_owner_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790615607485,
+      "tag": "0010_security_events_no_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790617189173,
+      "tag": "0011_p2d_findings",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790618345257,
+      "tag": "0012_findings_runtime_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790618346796,
+      "tag": "0013_findings_false_positive_snapshot",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790623217659,
+      "tag": "0014_p3_policies_incidents",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790623229361,
+      "tag": "0015_incidents_runtime_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790624432368,
+      "tag": "0016_incidents_update_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790625436847,
+      "tag": "0017_jobs_first_delivered_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790626026745,
+      "tag": "0018_p3c_alerting",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790626036835,
+      "tag": "0019_notification_deliveries_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790628183929,
+      "tag": "0020_notification_rate_limit_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790631838089,
+      "tag": "0021_p4c_access_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790631854042,
+      "tag": "0022_p4c_events_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790645107594,
+      "tag": "0023_p4c_review_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790645123734,
+      "tag": "0024_p4c_review_purge",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790671843871,
+      "tag": "0025_p4c_pending_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790671845692,
+      "tag": "0026_p4c_evict_by_cap",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790678226852,
+      "tag": "0027_p4d_access_events_bytes",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790678689541,
+      "tag": "0028_p4d_target_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790690722244,
+      "tag": "0029_p4d_rate_limit_counters",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790690723967,
+      "tag": "0030_p4d_rate_limit_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790707851101,
+      "tag": "0031_p7_dropped_batches_alert",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790721073734,
+      "tag": "0032_p7_system_alert_budgets",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790721075087,
+      "tag": "0033_p7_system_alert_budget_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790721948298,
+      "tag": "0034_p7_audit_stream_stopped_alert",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1790722885633,
+      "tag": "0035_p7_system_alert_agent_budgets",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1790722887018,
+      "tag": "0036_p7_system_alert_agent_budget_grants",
+      "breakpoints": true
+    }
+  ]
+}

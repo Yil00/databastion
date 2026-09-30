@@ -1,0 +1,34 @@
+[package]
+name = "databastion-agent"
+description = "DataBastion agent: single binary with per-engine connectors (ADR-0002)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["postgres", "mysql", "mongodb", "openldap"]
+postgres = ["dep:databastion-connector-postgres"]
+mysql = ["dep:databastion-connector-mysql"]
+mongodb = ["dep:databastion-connector-mongodb"]
+openldap = ["dep:databastion-connector-openldap"]
+
+[dependencies]
+databastion-core.workspace = true
+databastion-connector-postgres = { workspace = true, optional = true }
+databastion-connector-mysql = { workspace = true, optional = true }
+databastion-connector-mongodb = { workspace = true, optional = true }
+databastion-connector-openldap = { workspace = true, optional = true }
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# tests/architecture.rs parses `cargo metadata`.
+serde_json = "1"
+
+[lints]
+workspace = true

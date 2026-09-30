@@ -1,0 +1,13 @@
+{
+  "token": "dbe_EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE0",
+  "hostname": "db-host-1.example.com",
+  "agent_version": "0.1.0-alpha.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap"
+  ],
+  "os": "linux",
+  "arch": "x86_64"
+}

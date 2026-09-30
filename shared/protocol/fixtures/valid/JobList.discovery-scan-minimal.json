@@ -1,0 +1,15 @@
+{
+  "jobs": [
+    {
+      "job_id": "01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a",
+      "type": "discovery.scan",
+      "created_at": "2026-09-28T14:00:00Z",
+      "target_id": "mongo-app",
+      "classifiers_version": "2026.09.1",
+      "params": {
+        "sample_rows": 100,
+        "max_duration_s": 600
+      }
+    }
+  ]
+}

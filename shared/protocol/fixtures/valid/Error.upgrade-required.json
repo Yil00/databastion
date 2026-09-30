@@ -1,0 +1,5 @@
+{
+  "code": "protocol_unsupported",
+  "message": "Protocol version not supported by this console.",
+  "min_protocol": 2
+}

@@ -1,0 +1,66 @@
+# cargo-deny policy for the agent workspace, run by CI:
+#   cargo deny --locked check bans licenses sources
+# Complements crates/agent/tests/architecture.rs. Lifting a ban requires a
+# security-reviewer review (and an ADR when it touches an invariant).
+
+[graph]
+all-features = true
+# Dev-dependencies are never linked into the shipped binary. Test-only HTTP
+# mock servers (wiremock, bound to 127.0.0.1 inside tests) pull hyper's
+# `server` feature; excluding dev-dependencies keeps the bans below strict
+# for everything the binary links. `cargo tree -e normal` (no dev edges) is
+# the graph checked here.
+exclude-dev = true
+
+[licenses]
+# Licenses compatible with distributing the agent under Apache-2.0 (ADR-0005).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+# The allow-list anticipates future dependencies (sqlx, reqwest, rustls…).
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+# Internal crates are path dependencies without a version (publish = false).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+deny = [
+    # TLS: rustls only (AGENTS.md).
+    { name = "openssl", reason = "rustls only" },
+    { name = "openssl-sys", reason = "rustls only" },
+    { name = "openssl-src", reason = "rustls only" },
+    { name = "native-tls", reason = "rustls only" },
+    # I1: the agent opens no inbound port, so no HTTP / RPC server frameworks.
+    { name = "axum", reason = "I1: no inbound port" },
+    { name = "actix-web", reason = "I1: no inbound port" },
+    { name = "warp", reason = "I1: no inbound port" },
+    { name = "tiny_http", reason = "I1: no inbound port" },
+    { name = "tonic", reason = "I1: no inbound port; gRPC is post-MVP and needs an ADR" },
+    # Opens a listener (tokio-console gRPC server).
+    { name = "console-subscriber", reason = "I1: opens a listening port" },
+    # ADR-0004: agent metrics go through the heartbeat. The future opt-in
+    # `metrics.local_listen` (127.0.0.1 only) gets a reviewed exception.
+    { name = "metrics-exporter-prometheus", reason = "ADR-0004: no scrape endpoint on the agent" },
+]
+
+# HTTP server side of hyper / hyper-util (the client side stays allowed for reqwest).
+features = [
+    { crate = "hyper", deny = ["server"] },
+    { crate = "hyper-util", deny = ["server", "server-auto", "server-graceful"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

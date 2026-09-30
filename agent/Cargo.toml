@@ -1,0 +1,94 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent",
+    "crates/core",
+    "crates/classifiers",
+    "crates/connector-postgres",
+    "crates/connector-mysql",
+    "crates/connector-mongodb",
+    "crates/connector-openldap",
+    "crates/protocol",
+    "crates/protocol-codegen",
+]
+
+# `version` is rewritten by scripts/bump-version.mjs: keep it the first
+# `version` key of this section.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Yil00/databastion"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+databastion-core = { path = "crates/core" }
+databastion-classifiers = { path = "crates/classifiers" }
+databastion-connector-postgres = { path = "crates/connector-postgres" }
+databastion-connector-mysql = { path = "crates/connector-mysql" }
+databastion-connector-mongodb = { path = "crates/connector-mongodb" }
+databastion-connector-openldap = { path = "crates/connector-openldap" }
+databastion-protocol = { path = "crates/protocol" }
+databastion-protocol-codegen = { path = "crates/protocol-codegen" }
+
+# Third-party crates: default features off, opt in explicitly.
+# TLS policy: rustls only. openssl / native-tls are forbidden (see
+# crates/agent/tests/architecture.rs).
+async-trait = "0.1"
+# RustCrypto HMAC-SHA256 for value fingerprints (classifiers::masking).
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# MySQL connector (P2-C): SHA-1 scramble of mysql_native_password only (a
+# protocol requirement, not used for any other purpose).
+sha1 = { version = "0.11", default-features = false }
+# NFC normalization of names and addresses before fingerprinting.
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+# Linear-time regex engine (no backtracking, no ReDoS) for the classifiers.
+# `unicode-case`: case-insensitive groups (`(?i:…)`, password-hash schemes)
+# fail to compile without it. Test builds got it through proptest's
+# regex-syntax features, hiding the failure (found in P2-B).
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-gencat", "unicode-case"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "json", "env-filter", "registry"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# PostgreSQL connector (P2-B). tokio-postgres: extended query protocol for
+# every statement, binary results decoded in Rust, and a `CancelToken` to
+# cancel a running statement server-side (sqlx has no cancel request). TLS
+# through the connector's own rustls adapter (no OpenSSL, no `unsafe`).
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.12", default-features = false, features = ["std"] }
+rustls-native-certs = "0.8"
+futures-util = { version = "0.3", default-features = false }
+# The MySQL / MariaDB connector (P2-C) has no driver crate: it speaks the
+# client protocol itself (crates/connector-mysql/src/proto.rs) over tokio and
+# the TLS crates above.
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# No panics in agent code paths: stubs return errors instead.
+todo = "warn"
+unimplemented = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+# No println!/eprintln!: structured `tracing` logs only (AGENTS.md).
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,11 @@
+# Standalone pnpm project (not a monorepo workspace): this file only holds pnpm settings.
+# Dependencies whose install scripts are NOT run (prebuilt binaries are used instead).
+ignoredBuiltDependencies:
+  - unrs-resolver
+onlyBuiltDependencies:
+  - esbuild
+# Optional dependencies never installed. sharp (next image optimization, disabled by
+# images.unoptimized in next.config.ts) ships prebuilt LGPL-3.0 libvips binaries (@img/sharp-libvips-*),
+# not allowed in the Apache-2.0 console image (I7, ADR-0005).
+ignoredOptionalDependencies:
+  - sharp

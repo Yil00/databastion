@@ -1,0 +1,165 @@
+# Example configuration for databastion-agent (agent.yaml).
+#
+# - The agent only connects to the console (HTTPS, TLS 1.3) and to the
+#   targets declared below (I1, I5). It never listens on a port.
+# - Database credentials stay on this host (I3): give a *reference* to each
+#   secret (an environment variable name or a 0600 file), never the secret.
+# - Unknown keys are rejected.
+
+console:
+  # Base URL of the console; the agent API path /api/agent/v1 is appended.
+  url: https://console.example.internal
+  # Optional: PEM CA certificate of the console. When set, it is the only
+  # trusted root (pinning); otherwise the system trust store is used.
+  # ca_file: /etc/databastion/console-ca.pem
+  # Long-poll wait for GET /jobs (5..=25 s). Lower it behind a proxy with a
+  # short idle timeout.
+  long_poll_wait_s: 25
+  # Development only: allows http:// for a console on 127.0.0.1 or [::1]
+  # (IP literals only). Refused for any other host.
+  # insecure_dev_http: false
+
+# Identity (0600), pending rotation secret, local HMAC key and spool.
+state_dir: /var/lib/databastion
+
+# Local hard limits (I4). Console job parameters are first checked against
+# the protocol ranges (an out-of-range or empty filter list fails the job
+# with invalid_params), then clamped to these values. A statement timeout of
+# 0 (unlimited on PostgreSQL / MySQL) is never sent: it becomes
+# statement_timeout_ms.
+limits:
+  max_sample_rows: 1000        # 1..=10000; rows sampled per object
+  statement_timeout_ms: 30000  # 100..=600000, never 0; cap of every query
+  max_scan_duration_s: 3600    # 60..=86400; cap of a whole scan
+  min_audit_poll_interval_s: 5 # 1..=3600; floor of audit polling
+  # Discovery duty cycle, in percent (1..=100; 100: no pacing). After each
+  # object's sampling, the scan pauses so that its time in queries is at
+  # most this share of the scan's time: at most 1 % of one database core per
+  # scan (scans run one at a time), under the 2 % MVP criterion even on a
+  # one-core server. A scan then lasts about 100 times its query time
+  # (400 tables: minutes). Objects left when the scan budget would run out
+  # are reported as skipped (limit): raise max_duration_s /
+  # max_scan_duration_s for large databases, or this value where the server
+  # has spare cores.
+  discovery_duty_cycle_percent: 1
+
+# Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,
+# files 0600). When full, the oldest batches are dropped first and counted
+# (heartbeat spool.dropped_batches / dropped_items).
+spool:
+  max_bytes: 268435456         # 256 MiB; 2097152..=68719476736
+  max_batches: 10000           # 1..=1000000
+
+targets:
+  - id: pg-main                # slug reported to the console (no host name)
+    engine: postgres           # postgres | mysql | mariadb | mongodb | openldap
+    host: 127.0.0.1            # or `socket: /var/run/postgresql/.s.PGSQL.5432`
+    port: 5432
+    account: databastion       # dedicated read-only account (docs/05-security.md)
+    secret:
+      env: DATABASTION_PG_MAIN_PASSWORD
+    # Optional: region of national phone numbers written without `+`, so
+    # that `06 12 34 56 78` and `+33 6 12 34 56 78` get the same fingerprint.
+    # `fr` only for now; absent = unknown (digits fingerprinted as is).
+    phone_region: fr
+    # PostgreSQL settings (optional block).
+    postgres:
+      databases: [app]         # 1..=16 databases to connect to (default: [postgres])
+      # verify_full (default; rustls, certificate + host name)
+      # disable: Unix socket or loopback IP literal only (required for a socket)
+      # disable_insecure: no TLS on a network, explicit opt-in (warned); SCRAM only
+      tls: verify_full
+      # ca_file: /etc/databastion/pg-ca.pem   # only trusted root for this target
+      # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
+      # the membership as an expected warning instead of over-privilege.
+      extended_grants: false
+      # pgaudit server log file (P4-A), read by the agent on this host (never
+      # through SQL); a fixed log_filename, rotation by rename or truncation
+      # is followed. Readable by the agent user, never writable by it:
+      #   jsonlog: log_destination = jsonlog (PostgreSQL 15+)
+      #   csvlog:  log_destination = csvlog
+      # Without it, Audit uses pg_stat_statements (Limited).
+      # audit_log: {path: /var/log/postgresql/postgresql.json, format: jsonlog}
+  - id: mariadb-support
+    engine: mariadb            # or mysql: same connector, flavor detected at connection
+    host: db2.internal         # or `socket: /run/mysqld/mysqld.sock` (with tls: disable)
+    port: 3306
+    account: databastion       # SELECT-only account (docs/05-security.md)
+    secret:
+      file: /etc/databastion/secrets/mariadb-support   # 0600, owned by the agent user
+    # MySQL / MariaDB settings (optional block).
+    mysql:
+      # verify_full (default; rustls, certificate + host name). Self-signed
+      #   server certificates need their CA pinned with ca_file, and must name
+      #   the host.
+      # disable: Unix socket or loopback IP literal only (required for a socket)
+      # disable_insecure: no TLS on a network, explicit opt-in (warned); only
+      #   the caching_sha2_password fast path is accepted, and its scramble can
+      #   be brute-forced offline by an observer
+      tls: verify_full
+      # ca_file: /etc/databastion/mariadb-ca.pem   # only trusted root for this target
+      # ADR-0018 extended grant variant (SELECT ON *.*): check() then reports the
+      # global SELECT as an expected warning instead of over-privilege.
+      extended_grants: false
+      # Audit log file (P4-B), read by the agent on this host (never through SQL):
+      #   server_audit: MariaDB server_audit plugin (server_audit_output_type=file)
+      #   json: Percona audit_log (audit_log_format=JSON) or audit_log_filter
+      #         (audit_log_filter.format=JSON); XML and CSV are not supported
+      # Without it, Audit uses performance_schema (needs SELECT on it, ADR-0018).
+      # audit_log: {path: /var/log/mysql/server_audit.log, format: server_audit}
+  - id: mongo-app
+    engine: mongodb
+    host: db3.internal         # one member (or a mongos); other replica-set members
+                               # are never contacted, mongodb+srv is not supported;
+                               # or `socket: /tmp/mongodb-27017.sock` (with tls: disable)
+    port: 27017
+    account: databastion       # find + listCollections role (ADR-0026, docs/05-security.md)
+    secret:
+      file: /etc/databastion/secrets/mongo-app   # 0600, owned by the agent user
+    # MongoDB settings (optional block).
+    mongodb:
+      # verify_full (default; rustls, certificate + host name, TLS from the first byte)
+      # disable: Unix socket or loopback IP literal only (required for a socket)
+      # disable_insecure: no TLS on a network, explicit opt-in (warned)
+      tls: verify_full
+      # ca_file: /etc/databastion/mongo-ca.pem   # only trusted root for this target
+      # Database holding the account (SCRAM-SHA-256 only). Default: admin.
+      auth_source: admin
+      # Audit source file, read locally (ADR-0027); readable by the agent user,
+      # never world-readable (it holds other users' literals):
+      #   audit_log: Enterprise / Percona auditLog (destination: file, format: JSON)
+      #   server_log: the structured JSON server log (systemLog.path)
+      # Without it, Audit reads the profiler when the account holds find on
+      # <db>.system.profile (Limited).
+      # audit_log: {path: /var/log/mongodb/auditLog.json, format: audit_log}
+  - id: ldap-main
+    engine: openldap
+    host: ldap1.internal       # or `socket: /run/slapd/ldapi` (with tls: disable)
+    port: 636
+    account: cn=databastion,ou=services,dc=example,dc=com   # read-only service DN (ADR-0029)
+    secret:
+      file: /etc/databastion/secrets/ldap-main   # 0600, owned by the agent user
+    # OpenLDAP settings (optional block, ADR-0029).
+    openldap:
+      # verify_full (default): LDAPS, TLS from the first byte (port 636)
+      # start_tls: StartTLS on the LDAP port (389), then verified the same way;
+      #   no fallback to cleartext
+      # disable: ldapi:// socket or loopback IP literal only (required for a socket)
+      # There is no disable_insecure: a simple bind sends the password itself.
+      tls: verify_full
+      # ca_file: /etc/databastion/ldap-ca.pem   # only trusted root for this target
+      # simple (default): the service DN above and its password;
+      # sasl_external: SASL EXTERNAL over the ldapi:// socket (no secret; account
+      #   is the authorization DN slapd maps the agent's uid to)
+      bind: simple
+      # slapo-accesslog database read by Audit (olcAccessLogDB); never scanned
+      # by Discovery. The service DN needs read on it.
+      accesslog_base: cn=accesslog
+      # Audit events carry a principal's DN by name only for this list (service and
+      # administrator accounts, at most 64) and the agent's own DN; every other DN
+      # usually names a person and is sent as a keyed fingerprint (ADR-0029).
+      # clear_principals: ["cn=admin,dc=example,dc=com"]
+
+# metrics.local_listen is not implemented yet: a local listener is an
+# exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
+# it is rejected.

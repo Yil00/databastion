@@ -1,0 +1,50 @@
+[package]
+name = "databastion-connector-openldap"
+description = "DataBastion agent: OpenLDAP connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rule: a connector depends on `databastion-core` (trait, sinks)
+# and `databastion-classifiers` (masking) only. Never on an HTTP client: it has
+# no access to the uplink (checked by crates/agent/tests/architecture.rs).
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Client for a closed subset of LDAPv3 (`ber`, `proto`, `conn`), no LDAP
+# library (ADR-0029 decision 1): bounded messages, no write operation, no
+# server text kept, referrals never followed.
+# TLS: rustls only, `ring` provider, system roots or a pinned CA file.
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+
+[dev-dependencies]
+# Test helpers of the core (owned log files, the contract conversion for
+# the interim I2 checks): tests only.
+databastion-core = { workspace = true, features = ["test-support"] }
+# Catches the panic of a poll in the poison-record tests.
+futures-util = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+tracing-subscriber.workspace = true
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Property tests of the BER reader, the LDAP response parser, DNs and
+# filters (src/proptests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

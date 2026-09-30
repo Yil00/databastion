@@ -1,0 +1,7 @@
+{
+  "status": "running",
+  "ts": "2026-09-28T14:01:00Z",
+  "error": {
+    "code": "timeout"
+  }
+}

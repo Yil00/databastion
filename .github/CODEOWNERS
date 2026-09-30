@@ -1,0 +1,19 @@
+# Code owners (https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners).
+# The last matching pattern wins, so the specific paths come after the general ones.
+#
+# AGENTS.md requires a `security-reviewer` review for every change under shared/protocol/. That role
+# is a Claude Code subagent (.claude/agents/security-reviewer.md), not a GitHub account: there is no
+# separate user or team to request. The repository owner is therefore the required code owner for
+# the protocol, and records the security-reviewer's review in the pull request before approving.
+# Enforced only when branch protection has "Require review from Code Owners" enabled.
+
+# Agent <-> console contract (invariant I6): schemas, fixtures, scripts.
+/shared/protocol/ @Yil00
+
+# Classifier registry and its lock: published classifier sets are immutable. CI also rejects a
+# pull request that changes or removes an existing lock entry (.github/workflows/ci.yml, Protocol).
+/shared/protocol/classifiers.json @Yil00
+/shared/protocol/classifiers.lock.json @Yil00
+
+# This file and the CI definitions guard the rules above.
+/.github/ @Yil00

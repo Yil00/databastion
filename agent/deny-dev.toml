@@ -1,0 +1,31 @@
+# cargo-deny policy for the FULL graph, dev-dependencies included:
+#   cargo deny --config deny-dev.toml --locked check licenses sources
+# deny.toml excludes dev-dependencies (`exclude-dev = true`) so that the
+# test-only mock server (wiremock -> hyper `server`) does not trip the I1
+# bans that protect the shipped binary. This file keeps licenses and
+# sources checked for dev-dependencies too. Bans are not checked here on
+# purpose: they only matter for what the binary links.
+
+[graph]
+all-features = true
+exclude-dev = false
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

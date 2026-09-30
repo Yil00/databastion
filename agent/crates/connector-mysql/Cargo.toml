@@ -1,0 +1,47 @@
+[package]
+name = "databastion-connector-mysql"
+description = "DataBastion agent: MySQL / MariaDB connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rule: a connector depends on `databastion-core` (trait, sinks)
+# and `databastion-classifiers` (masking) only. Never on an HTTP client: it has
+# no access to the uplink (checked by crates/agent/tests/architecture.rs).
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Client protocol implemented in `proto` / `auth` (no driver crate: the
+# connector must control capability flags and authentication exchanges).
+# TLS: rustls only, `ring` provider, system roots or a pinned CA file.
+# Scrambles: SHA-1 (mysql_native_password), SHA-256 (caching_sha2_password).
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+# Audit: audit_log JSON records (serde only; no protocol types). The log
+# file is tailed by the core (`databastion_core::audit::tail`).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Test helpers of the core (owned log files, the contract conversion for
+# the interim I2 checks): tests only.
+databastion-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+tracing-subscriber.workspace = true
+# Property tests of the protocol parsers and exchanges (src/proptests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

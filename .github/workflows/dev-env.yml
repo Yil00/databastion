@@ -1,0 +1,53 @@
+name: Dev environment
+
+# Builds and smoke-tests the dev environment (dev/). Independent of ci.yml: not part of the required
+# "CI result" check for now.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "dev/**"
+      - "Makefile"
+      - ".github/workflows/dev-env.yml"
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "dev/**"
+      - "Makefile"
+      - ".github/workflows/dev-env.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-env-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-env:
+    name: Dev environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Dev credentials (dev-only example values)
+        run: cp dev/.env.example dev/.env
+      - name: Seed generator tests
+        run: timeout 300 python3 -m unittest discover -s dev/seed -v
+      - name: Seed files up to date
+        run: timeout 120 python3 dev/seed/generate.py --check
+      - name: Compose file valid
+        run: docker compose -f dev/docker-compose.yml config -q
+      - name: Start (build, up --wait)
+        run: make dev UP_TIMEOUT=900 WAIT_TIMEOUT=600
+      - name: Smoke tests
+        run: make dev-smoke
+      - name: Service status and logs
+        if: failure()
+        run: |
+          docker compose -f dev/docker-compose.yml ps -a
+          timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300
+      - name: Stop
+        if: always()
+        run: make dev-reset

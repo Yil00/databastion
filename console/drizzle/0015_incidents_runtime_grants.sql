@@ -1,0 +1,11 @@
+-- Custom SQL migration file, put your code below! --
+-- Created with `drizzle-kit generate --custom --name incidents_runtime_grants` (P3-A / P3-B). Every
+-- name is schema-qualified.
+--
+-- Incidents are the record of what a policy raised and how it was handled: the runtime role
+-- inserts them (worker) and updates their status (lifecycle), but never deletes them, so a
+-- compromised console process cannot erase an incident. DELETE and TRUNCATE are revoked. Foreign-key
+-- actions (`ON DELETE SET NULL` from policies, findings, agents and users) run as the table owner.
+-- `policies` and `policy_exceptions` keep the plain DML of the default privileges (migration 0003):
+-- administrators delete them through the console, audited.
+REVOKE DELETE, TRUNCATE ON TABLE public.incidents FROM databastion_app;

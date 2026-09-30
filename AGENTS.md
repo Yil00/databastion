@@ -17,6 +17,7 @@ This file is for every coding agent (Claude Code, Codex, Cursor…) and the huma
 | `agent/` | Cargo workspace (core, classifiers, connectors) | `agent-engineer` |
 | `shared/protocol/` | OpenAPI + JSON Schemas + fixtures | `agent-engineer`, `security-reviewer` review **required** |
 | `dev/` | Dev environment, seeded databases, ground truth | `agent-engineer` |
+| `e2e/` | End-to-end harness (containers: console, agent, target) | `agent-engineer`, `security-reviewer` review for TLS / secrets changes |
 | `deploy/` | Compose, Helm later | `console-engineer` |
 | `docs/`, root `*.md` | Documentation, ROADMAP, ADRs | `docs-keeper` |
 
@@ -27,6 +28,9 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - Next.js App Router; the agent API server code lives in `console/src/app/api/agent/v1/`
 - Every agent API input is validated against the schema generated from `shared/protocol/` (rejected on unknown fields)
 - Versioned Drizzle migrations; never modify the schema by hand
+  - Only exception: the migrate runner steps of [ADR-0028](docs/adr/0028-online-constraint-validation.md) (migration `0027` applied `NOT VALID` then validated on installs at `0026`, and `VALIDATE CONSTRAINT` for `DEFERRED_VALIDATIONS`)
+  - A `CHECK` or foreign key added to a table that may be large is written `NOT VALID` in a custom migration and listed in `DEFERRED_VALIDATIONS` (`console/src/db/online-constraints.ts`, plain lower-case names), never validated in the migration itself
+- Process-wide mutable state in the web process uses `processGlobal` / `processSlot` (`console/src/server/process-global.ts`), never module-level variables: Turbopack gives each layer its own module instance (#63)
 - pnpm; commands (to be filled in as soon as they exist): `pnpm lint`, `pnpm test`, `pnpm build`
 
 ## Conventions – Agent (`agent/`)
@@ -64,6 +68,14 @@ An agent does **not** modify files belonging to another owner, unless the task e
   3. Decisions made that would warrant an ADR
   4. Files from other owners that should be modified
 - The `docs-keeper` updates `docs/ROADMAP.md` and `CONTEXT.md` (current phase) after each merge.
+
+## Long-running tasks
+- Every task has a time budget, set by whoever launches it. When it runs out: stop, commit what is consistent, and report what is left.
+- Wrap potentially long commands in `timeout` (e.g. `timeout 300 cargo test`).
+- No watch modes (`vitest` without `run`, `cargo watch`, `next dev` left running).
+- Stop any server or container started for a test before ending the task.
+- If a command keeps failing, report the partial result instead of retrying in a loop.
+- Every CI job sets `timeout-minutes`.
 
 ## Definition of Done
 - [ ] Lint + tests green for the affected component

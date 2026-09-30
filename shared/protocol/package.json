@@ -1,0 +1,24 @@
+{
+  "name": "@databastion/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DataBastion agent <-> console protocol contract (OpenAPI 3.1) and its fixtures.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "lint": "npx --yes @redocly/cli@2.54.3 lint --config redocly.yaml openapi.yaml",
+    "test:schema-lint": "node --test scripts/schema-lint.test.mjs",
+    "test:registry": "node --test scripts/classifier-registry.test.mjs scripts/id-registry.test.mjs",
+    "validate": "node scripts/validate-fixtures.mjs",
+    "test": "npm run test:schema-lint && npm run test:registry && npm run validate",
+    "check": "npm run lint && npm test"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "yaml": "2.9.1"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  }
+}

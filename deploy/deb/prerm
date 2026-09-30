@@ -1,0 +1,17 @@
+#!/bin/sh
+# databastion-agent prerm: stop and disable the service when the package is removed (not on
+# upgrade: postinst restarts it).
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      systemctl stop databastion-agent.service >/dev/null 2>&1 || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl disable databastion-agent.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

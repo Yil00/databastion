@@ -1,0 +1,12 @@
+# MySQL Community audit prerequisites (docs/08-engine-capabilities.md): performance_schema with the
+# statement history consumers. Level reached: Partial (no audit plugin in Community edition).
+[mysqld]
+performance_schema = ON
+performance-schema-consumer-events-statements-current = ON
+performance-schema-consumer-events-statements-history = ON
+performance-schema-consumer-events-statements-history-long = ON
+performance_schema_events_statements_history_long_size = 10000
+# Test fixture only: the FEDERATED engine (compiled in, disabled by default) is enabled so that the
+# connector integration test can prove a FEDERATED table is never read (I5: the server would connect
+# to another host). Nothing in the seed uses it.
+federated

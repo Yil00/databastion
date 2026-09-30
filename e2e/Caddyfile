@@ -1,0 +1,28 @@
+# TLS reverse proxy of the e2e harness. Certificates come from the throwaway CA that
+# e2e/run.sh generates at test time; nothing is obtained from the network.
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+https://console.e2e.internal:{$E2E_HTTPS_PORT} {
+	tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key {
+		protocols tls1.3
+	}
+	# Access log on stdout (JSON): run.sh uses it to check that the agent stops polling after
+	# revocation. Caddy redacts Authorization / Cookie / Set-Cookie by default; the CSRF header
+	# is not covered, so it is deleted here (run.sh fails on any secret in the logs).
+	log {
+		output stdout
+		format filter {
+			wrap json
+			request>headers>X-Csrf-Token delete
+		}
+	}
+	header Strict-Transport-Security "max-age=31536000"
+	# /metrics stays on the internal network (console README, ADR-0004).
+	@metrics path /metrics /metrics/*
+	respond @metrics 404
+	reverse_proxy web:3000
+}

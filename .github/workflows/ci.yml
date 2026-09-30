@@ -5,6 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,12 +19,19 @@ jobs:
   detect:
     name: Component detection
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       console: ${{ steps.detect.outputs.console }}
       agent: ${{ steps.detect.outputs.agent }}
       protocol: ${{ steps.detect.outputs.protocol }}
+      e2e: ${{ steps.e2e.outputs.e2e }}
+      packaging: ${{ steps.e2e.outputs.packaging }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pull requests: the merge commit and its first parent (the base tip), for the diff below.
+          fetch-depth: 2
+          persist-credentials: false
       - id: detect
         run: |
           has() { [ -f "$1" ] && echo true || echo false; }
@@ -32,18 +40,58 @@ jobs:
             echo "agent=$(has agent/Cargo.toml)"
             echo "protocol=$(has shared/protocol/openapi.yaml)"
           } | tee -a "$GITHUB_OUTPUT"
+      # The E2E job (a few minutes of image builds) runs when something it exercises changed. When
+      # the changed files cannot be listed (new branch, force push, shallow history), it runs.
+      # Same rule for the packaging jobs (.deb, publish build dry run, installation test), on
+      # everything that goes into the images or the .deb, and always on pull requests into main (a
+      # release merge): a failure must show up before a release tag exists.
+      - id: e2e
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          changed=""
+          case "$EVENT" in
+            pull_request) changed="$(git diff --name-only HEAD^1 HEAD 2>/dev/null)" || changed="" ;;
+            push)
+              if [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+                  && git fetch --no-tags --depth=1 origin "$BEFORE" 2>/dev/null; then
+                changed="$(git diff --name-only "$BEFORE" HEAD 2>/dev/null)" || changed=""
+              fi ;;
+          esac
+          if [ -z "$changed" ]; then
+            e2e=true
+          elif grep -qE '^(agent/|console/|shared/|e2e/|deploy/|dev/seed/out/|dev/ground-truth\.json$|dev/mysql/|dev/mariadb/|dev/postgres/|dev/mongo/|dev/openldap/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e=true
+          else
+            e2e=false
+          fi
+          echo "e2e=$e2e" | tee -a "$GITHUB_OUTPUT"
+          if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
+              || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
+            packaging=true
+          else
+            packaging=false
+          fi
+          echo "packaging=$packaging" | tee -a "$GITHUB_OUTPUT"
 
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Internal Markdown links
         run: python3 scripts/check-md-links.py
+      # Release settings guard of release.yml / publish.yml (ADR-0034) on fixture rulesets.
+      - name: Release settings check (fixtures)
+        run: timeout 60 .github/scripts/test_check_release_settings.sh
 
   secrets:
     name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       GITLEAKS_VERSION: 8.30.1
     steps:
@@ -65,6 +113,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.console == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: console
@@ -79,8 +128,57 @@ jobs:
           cache: pnpm
           cache-dependency-path: console/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      # Invariant I7: production dependencies only under licenses of the agent/deny.toml allow-list
+      # (or a reasoned entry of scripts/console-license-exceptions.json).
+      - name: License gate (production dependencies)
+        run: |
+          timeout 60 python3 -m unittest discover -s ../scripts -p 'test_check_console_licenses.py'
+          pnpm licenses list --prod --json > "$RUNNER_TEMP/console-licenses.json"
+          python3 ../scripts/check_console_licenses.py "$RUNNER_TEMP/console-licenses.json"
       - run: pnpm lint
+      - run: pnpm typecheck
+      # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
+      # rotation, metrics, migrations). A `docker run` step rather than a job service, because the
+      # server needs `-c max_connections=200` (parallel test files) and services cannot pass
+      # server arguments. Loopback only, trust auth: CI-only, no data. The tests create their own
+      # databases and non-superuser owner / runtime roles from this admin URL (src/test/db.ts).
+      - name: Start PostgreSQL 17 (DB test suites)
+        env:
+          PG_IMAGE: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+        run: |
+          docker run -d --name databastion-test-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            "$PG_IMAGE" -c max_connections=200 -c fsync=off
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' databastion-test-pg)" = healthy ]; then exit 0; fi
+            sleep 2
+          done
+          docker logs databastion-test-pg
+          exit 1
+      # Mailpit (same pinned image as dev/docker-compose.yml) for the real-SMTP alerting test
+      # (P3-C). With DATABASTION_TEST_SMTP set, that test fails instead of skipping when Mailpit
+      # is unreachable. Loopback only.
+      - name: Start Mailpit (SMTP alerting test)
+        env:
+          MAILPIT_IMAGE: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
+        run: |
+          docker run -d --name databastion-test-mailpit -p 127.0.0.1:1025:1025 -p 127.0.0.1:8025:8025 \
+            -e MP_MAX_MESSAGES=500 "$MAILPIT_IMAGE"
+          for _ in $(seq 1 60); do
+            if curl -sSf http://127.0.0.1:8025/readyz >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs databastion-test-mailpit
+          exit 1
       - run: pnpm test
+        env:
+          # Admin URL used by src/test/pg-global-setup.ts; src/test/ci-guard.test.ts fails the job
+          # when the DB suites would be skipped (CI=true without a database).
+          TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+          DATABASTION_TEST_SMTP: 127.0.0.1:1025
+          DATABASTION_TEST_MAILPIT_API: http://127.0.0.1:8025
       - run: pnpm build
 
   agent:
@@ -88,6 +186,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: agent
@@ -103,25 +202,414 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
+      # Phase 2 exit criterion (ROADMAP P2-F, dev/holdout/README.md): Wilson 95 % lower bound of
+      # recall >= 0.90 and precision >= 0.85 per classifier on the held-out corpus. `--check` first
+      # (labels.json and the pinned corpus SHA-256 up to date), then write the git-ignored
+      # corpus.json; the scorer refuses a corpus whose SHA-256 differs from labels.json. Output is
+      # aggregates plus column ids / tags of the errors, never a value.
+      # Blocking: phase 2 exit criterion.
+      - name: Holdout classifier gate
+        run: |
+          timeout 120 python3 ../dev/holdout/generate.py --check
+          timeout 120 python3 ../dev/holdout/generate.py > /dev/null
+          cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture
+      - name: Minimal build (no connector)
+        run: cargo build --no-default-features --locked
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2
+      # Policy in agent/deny.toml: banned crates (OpenSSL, native-tls, HTTP servers…),
+      # licenses compatible with Apache-2.0, crates.io only.
+      - name: cargo-deny (bans, licenses, sources)
+        run: cargo deny --locked check bans licenses sources
+      # agent/deny-dev.toml: licenses and sources for the full graph, dev-dependencies
+      # included (deny.toml excludes them so that test-only crates do not trip the bans).
+      - name: cargo-deny dev-dependencies (licenses, sources)
+        run: cargo deny --config deny-dev.toml --locked check licenses sources
 
+  # Always runs: the contract is the synchronization point, so a missing openapi.yaml fails the job
+  # instead of skipping it.
   protocol:
     name: Protocol
-    needs: detect
-    if: needs.detect.outputs.protocol == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The contract exists
+        run: |
+          if [ ! -f shared/protocol/openapi.yaml ]; then
+            echo "::error file=shared/protocol/openapi.yaml::the protocol contract is missing"
+            exit 1
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
+      # The protocol registries are append-only (shared/protocol/README.md): classifiers.lock.json
+      # (published classifier sets are immutable), signals.json and target-notes.json (ids never
+      # removed or renamed, engines never dropped). `npm test` checks each registry on its own, but a
+      # change could edit a registry and its lock together, so the working tree is compared with dev
+      # and main whatever the base branch, and on push also with the previous tip. Every event runs
+      # it; only a push that creates the branch (all-zero `before`) skips that last comparison.
+      - name: Registries are append-only
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "+refs/heads/dev:refs/remotes/origin/dev" "+refs/heads/main:refs/remotes/origin/main"
+          refs=(origin/dev origin/main)
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            git fetch --no-tags --depth=1 origin "$BEFORE"
+            refs+=("$BEFORE")
+          fi
+          python3 shared/protocol/scripts/append-only.py "${refs[@]}"
+      - name: Contract tests (schemas + fixtures)
+        working-directory: shared/protocol
+        run: |
+          npm ci --ignore-scripts
+          npm test
+
+  # PostgreSQL connector integration tests (P2-B) against the dev image (dev/postgres: PostgreSQL
+  # 17 + pgaudit, seed, agent role with the ADR-0012 minimal grants), so that the pgaudit probe of
+  # ADR-0012 runs. Dev-only credentials from dev/.env.example; the server listens on 127.0.0.1.
+  agent-pg:
+    name: Agent PostgreSQL integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev PostgreSQL service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 postgres
+      # DATABASTION_TEST_REQUIRE turns the listed skips into failures: each run must exercise
+      # what only its server provides (pgaudit in the dev image; TLS with a pinned CA and the
+      # md5 / cleartext refusal on the local cluster).
+      - name: Connector integration tests (dev image, pgaudit)
+        working-directory: agent
+        run: |
+          set -a; . ../dev/.env; set +a
+          export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
+          export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
+          # Audit (P4-A): the pgaudit jsonlog of the dev image (bind-mounted, 0644 in dev only).
+          export DATABASTION_TEST_PG_AUDIT_LOG="$PWD/../dev/.state/logs/postgres/postgresql.json"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
+          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
+      - name: Connector integration tests (local cluster, TLS and weak authentication)
+        run: |
+          if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends postgresql
+          fi
+          # pgaudit for the host cluster: jsonlog and csvlog Audit tests (P4-A).
+          major="$(ls /usr/lib/postgresql | sort -V | tail -n 1)"
+          if [ ! -f "/usr/lib/postgresql/$major/lib/pgaudit.so" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends "postgresql-$major-pgaudit"
+          fi
+          eval "$(dev/postgres/local-cluster.sh start)"
+          export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls,pgaudit-log
+          (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
+          dev/postgres/local-cluster.sh stop
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 postgres
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
+  # MySQL / MariaDB connector integration tests (P2-C) against the dev images (dev/mysql: MySQL
+  # 8.4 with FEDERATED enabled as a fixture; dev/mariadb: MariaDB 11.4 with server_audit), seeded,
+  # with the documented agent grants and the dev-only TLS material of initdb/30-tls.sh. Every probe
+  # is required (DATABASTION_TEST_REQUIRE): kill on drop, no transaction across submit, views,
+  # FEDERATED, generated columns, read-only, over-privilege, TLS and authentication refusals.
+  # Audit (P4-B) too: the MariaDB server_audit log, the Percona audit_log_filter JSON log
+  # (dev/percona) and performance_schema, with real mysqldump / mariadb-dump runs inside the
+  # containers.
+  agent-mysql:
+    name: Agent MySQL / MariaDB integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev MySQL and MariaDB services
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 mysql mariadb percona
+      - name: Connector integration tests (dev images, all probes required)
+        run: |
+          set -a; . dev/.env; set +a
+          compose() { timeout 60 docker compose -f dev/docker-compose.yml "$@"; }
+          mkdir -p dev/.state/tls
+          compose exec -T mysql cat /var/lib/mysql/ca.pem > dev/.state/tls/mysql-ca.pem
+          compose exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
+          export DATABASTION_TEST_MYSQL_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MYSQL_PORT}/hr"
+          export DATABASTION_TEST_MYSQL_ADMIN_URL="mysql://root:${MYSQL_ROOT_PASSWORD}@127.0.0.1:${MYSQL_PORT}/"
+          export DATABASTION_TEST_MYSQL_CA_FILE="$PWD/dev/.state/tls/mysql-ca.pem"
+          export DATABASTION_TEST_MARIADB_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MARIADB_PORT}/support"
+          export DATABASTION_TEST_MARIADB_ADMIN_URL="mysql://root:${MARIADB_ROOT_PASSWORD}@127.0.0.1:${MARIADB_PORT}/"
+          export DATABASTION_TEST_MARIADB_CA_FILE="$PWD/dev/.state/tls/mariadb-ca.pem"
+          DATABASTION_TEST_MARIADB_NETWORK_HOST="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(compose ps -q mariadb)")"
+          export DATABASTION_TEST_MARIADB_NETWORK_HOST
+          # Audit (P4-B): the audit logs as the agent host sees them (bind mounts, 0644 in dev only),
+          # the Percona service, and the real dump tools run inside the containers.
+          compose exec -T percona cat /var/lib/mysql/ca.pem > dev/.state/tls/percona-ca.pem
+          export DATABASTION_TEST_MARIADB_AUDIT_LOG="$PWD/dev/.state/logs/mariadb/server_audit.log"
+          export DATABASTION_TEST_PERCONA_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PERCONA_PORT}/hr"
+          export DATABASTION_TEST_PERCONA_ADMIN_URL="mysql://root:${PERCONA_ROOT_PASSWORD}@127.0.0.1:${PERCONA_PORT}/"
+          export DATABASTION_TEST_PERCONA_CA_FILE="$PWD/dev/.state/tls/percona-ca.pem"
+          export DATABASTION_TEST_PERCONA_AUDIT_LOG="$PWD/dev/.state/logs/percona/audit_filter.log"
+          exec_in="timeout 120 docker compose -f $PWD/dev/docker-compose.yml exec -T"
+          export DATABASTION_TEST_MARIADB_DUMP_CMD="$exec_in -e MYSQL_PWD=${MARIADB_ROOT_PASSWORD} mariadb mariadb-dump -uroot --single-transaction support"
+          export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
+          export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
+          export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
+          (cd agent && cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mysql mariadb percona
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
+  # MongoDB connector integration tests (P5-A, ADR-0026) against the dev image (MongoDB 8.0
+  # Community, seeded `app` database, profiler level 1 with slowms 0), with the ADR-0026 account of
+  # dev/mongo/initdb/10-seed.js (find + listCollections on app, SCRAM-SHA-256 only). Every probe is
+  # required: seed recall against dev/ground-truth.json, $sample on a large collection, views never
+  # read, time-series collections, maxTimeMS on every read (from the profiler), no cursor left open,
+  # over-privilege notes, the SCRAM-SHA-1-only account refused. Audit (P5-B, P5-C, ADR-0027): the
+  # server-log source and the profiler source (Limited), the real mongodump / mongoexport flagged,
+  # the agent's own reads left out, no filter literal in events or logs.
+  agent-mongodb:
+    name: Agent MongoDB integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev MongoDB service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 mongo
+      - name: Connector integration tests (dev image, all probes required)
+        run: |
+          set -a; . dev/.env; set +a
+          export DATABASTION_TEST_MONGO_URL="mongodb://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MONGO_PORT}/app?authSource=admin"
+          export DATABASTION_TEST_MONGO_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${MONGO_PORT}/?authSource=admin"
+          # Audit (P5-B, P5-C, ADR-0027): the server log as the runner sees it (mongod may create it
+          # 0600), and the real mongodump / mongoexport of the image, run inside the container.
+          sudo chmod a+r dev/.state/logs/mongodb/mongod.log
+          export DATABASTION_TEST_MONGO_LOG="$PWD/dev/.state/logs/mongodb/mongod.log"
+          export DATABASTION_TEST_MONGO_DUMP_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongodump --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --archive=/dev/null"
+          export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
+          export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+      # Phase 7 (#74 review): verify_full against a real TLS-only MongoDB server, with a test CA
+      # generated at run time in $RUNNER_TEMP (never committed) and removed afterwards.
+      - name: Connector TLS integration test (real server, verify_full, runtime test CA)
+        run: |
+          eval "$(timeout 300 dev/mongo/tls-test-server.sh start)"
+          export DATABASTION_TEST_REQUIRE=mongo-tls
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
+      - name: Stop the TLS test server
+        if: always()
+        run: dev/mongo/tls-test-server.sh stop
+      # Phase 7 (P5-B follow-up): the auditLog source against a real Percona Server for MongoDB
+      # (opt-in dev service `psmdb`: JSON auditLog file, auditAuthorizationSuccess).
+      - name: Percona Server for MongoDB auditLog integration test
+        run: |
+          set -a; . dev/.env; set +a
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 psmdb
+          sudo chmod a+r dev/.state/logs/psmdb/auditLog.json
+          export DATABASTION_TEST_PSMDB_URL="mongodb://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PSMDB_PORT}/app?authSource=admin"
+          export DATABASTION_TEST_PSMDB_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${PSMDB_PORT}/?authSource=admin"
+          export DATABASTION_TEST_PSMDB_AUDIT_LOG="$PWD/dev/.state/logs/psmdb/auditLog.json"
+          export DATABASTION_TEST_REQUIRE=psmdb-audit
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
+      - name: PSMDB logs and stop
+        if: always()
+        run: |
+          if [ "${{ job.status }}" != success ]; then
+            timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb logs --no-color --tail=300 psmdb || true
+          fi
+          docker compose -f dev/docker-compose.yml --profile psmdb rm -fsv psmdb || true
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mongo
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
+  agent-openldap:
+    name: Agent OpenLDAP integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev OpenLDAP service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 openldap
+      - name: Connector integration tests (dev image, all probes required)
+        run: |
+          set -a; . dev/.env; set +a
+          # ADR-0029: the service DN, the root DN for the over-privilege and export checks, the
+          # dev-only CA of the LDAPS / StartTLS listener, and a real paged ldapsearch export run
+          # inside the container.
+          docker compose -f dev/docker-compose.yml exec -T openldap cat /var/lib/ldap/tls/ca.pem > "$RUNNER_TEMP/ldap-ca.pem"
+          export DATABASTION_TEST_LDAP_URL="ldap://127.0.0.1:${LDAP_PORT}"
+          export DATABASTION_TEST_LDAP_PASSWORD="$DATABASTION_DB_PASSWORD"
+          export DATABASTION_TEST_LDAP_ADMIN_PASSWORD="$LDAP_ADMIN_PASSWORD"
+          export DATABASTION_TEST_LDAPS_URL="ldaps://localhost:${LDAPS_PORT}"
+          export DATABASTION_TEST_LDAP_CA_FILE="$RUNNER_TEMP/ldap-ca.pem"
+          export DATABASTION_TEST_LDAP_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapsearch -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}' -b dc=example,dc=org -E pr=20/noprompt '(objectClass=*)'"
+          export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls
+          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
+      # Phase 7: SASL EXTERNAL over ldapi:// against the real slapd. The socket directory is published
+      # to the runner (compose override) and olcAuthzRegexp maps the runner's uid to the service DN.
+      - name: SASL EXTERNAL over ldapi:// (runner uid mapped to the service DN)
+        run: |
+          set -a; . dev/.env; set +a
+          mkdir -p dev/.state/ldapi
+          timeout 600 docker compose -f dev/docker-compose.yml -f dev/openldap/compose.ldapi.yml up -d --wait --wait-timeout 300 openldap
+          sudo chmod 0755 dev/.state/ldapi
+          sudo chmod 0777 dev/.state/ldapi/ldapi
+          printf 'dn: cn=config\nchangetype: modify\nadd: olcAuthzRegexp\nolcAuthzRegexp: "gidNumber=%s\\+uidNumber=%s,cn=peercred,cn=external,cn=auth" "cn=databastion,ou=services,dc=example,dc=org"\n' "$(id -g)" "$(id -u)" \
+            | docker compose -f dev/docker-compose.yml exec -T openldap ldapmodify -Q -Y EXTERNAL -H ldapi:///
+          export DATABASTION_TEST_LDAPI_PATH="$PWD/dev/.state/ldapi/ldapi"
+          export DATABASTION_TEST_LDAPI_DN="cn=databastion,ou=services,dc=example,dc=org"
+          export DATABASTION_TEST_REQUIRE=ldapi
+          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 openldap
+      - name: Stop
+        if: always()
+        run: docker compose -f dev/docker-compose.yml down -v
+
+  # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
+  # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,
+  # accesslog entries. Coverage-instrumented, no sanitizer (nightly only), 10 s per target.
+  agent-fuzz-smoke:
+    name: Agent fuzz smoke
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent/fuzz
+      - name: Fuzz targets, 10 s each
+        run: agent/fuzz/smoke.sh 10
+
+  # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
+  # MySQL, MariaDB, MongoDB and OpenLDAP targets (ADR-0012 / ADR-0018 / ADR-0026 / ADR-0029
+  # accounts), a Discovery scan of each (in parallel), the Audit path on the PostgreSQL target
+  # (dev/postgres image with pgaudit), the MariaDB target (server_audit log), the MongoDB target
+  # (server log) and the OpenLDAP target (dev/openldap image, cn=accesslog): a real pg_dump /
+  # mariadb-dump / mongodump / bulk ldapsearch must open an incident in under 2 minutes, the agent's
+  # own reads none, and the policy engine must be woken up; password-bearing DCL on PostgreSQL and
+  # MariaDB; revocation < 60 s, and invariant I2: no ground-truth value (nor DCL password) in clear
+  # text in the console database, the logs, the console pages or the notification e-mails, for every
+  # engine; no secret in the targets' audit logs. run.sh prints the phase timings and the
+  # dump -> incident times. Required through ci-result.
+  e2e:
+    name: E2E (enrollment, Discovery, Audit, invariant I2)
+    needs: detect
+    if: needs.detect.outputs.e2e == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+      - name: Unit tests of the I2 leak scanner
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_*.py' -v
+      - name: Run e2e/run.sh
+        run: e2e/run.sh
+      # run.sh redacts every generated secret from the logs on exit, whatever the result (and
+      # masks them in the job log); the secrets are random, for this run only, and destroyed
+      # with the containers. If the invariant I2 check fails, the logs may hold seeded values:
+      # they are fake (dev/seed/generate.py) and already public in the repository; the job log
+      # itself only holds needle ids and file names.
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Agent .deb (reproducible build, install in Debian 12 / Ubuntu 24.04 containers, systemd unit
+  # checks) and the "Installation < 15 min" test on the runner (deploy/README.md), when packaging
+  # files change. Required through ci-result.
+  packaging:
+    name: Packaging
+    needs: detect
+    if: needs.detect.outputs.packaging == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    uses: ./.github/workflows/packaging.yml
+    permissions:
+      contents: read
+      packages: read
 
   # Single status check required by branch protection.
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, protocol]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: All jobs are green or skipped
         env:

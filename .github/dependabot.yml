@@ -1,4 +1,6 @@
-# The console (npm/pnpm) and agent (cargo) ecosystems will be added once those folders exist.
+# All updates target `dev` (see RELEASE.md). Commit prefixes follow Conventional Commits.
+# /shared/protocol arrives with P0-B: until then Dependabot reports a missing manifest for it,
+# which is harmless.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -21,4 +23,42 @@ updates:
       prefix: chore
     groups:
       release-tooling:
+        patterns: ["*"]
+
+  # Console (pnpm: Dependabot's npm ecosystem reads pnpm-lock.yaml).
+  - package-ecosystem: npm
+    directory: /console
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(console)
+    ignore:
+      # ESLint stays on 9: eslint-plugin-react (via eslint-config-next) does not support 10 yet.
+      - dependency-name: eslint
+        versions: [">=10"]
+    groups:
+      console:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /agent
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(agent)
+    groups:
+      agent:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /shared/protocol
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(protocol)
+    groups:
+      protocol:
         patterns: ["*"]
