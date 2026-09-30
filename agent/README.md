@@ -105,8 +105,9 @@ binary: `cargo build --no-default-features --features postgres`.
   kept) and counted (`quarantined`), never crash the agent and are never
   logged. Bounded by `spool.max_bytes` (default 256 MiB) and
   `spool.max_batches` (default 10000). When full, a batch is dropped by
-  priority (phase 7): findings and events each keep up to 3/4 of the bounds
-  against the other, so an events flood cannot evict the findings; within
+  priority (phase 7): each class (findings, events) can grow to 3/4 of the
+  bounds, so the other always keeps at least 1/4 and an events flood cannot
+  evict the findings; within
   the events, batches holding a `signature.*` signal (packed apart from the
   others) are dropped last, and a new batch without one is dropped rather
   than evict them; within a class, the oldest goes first. A findings or
@@ -281,9 +282,9 @@ unidentified account (a `db_user` fingerprint, as for any failed login),
 per client address for at most 16 addresses, then one without address,
 whose `aggregated_count` is the number of attempts and whose `ts` /
 `ts_last` span them. Attempts beyond the named groups are first counted per
-principal (at most 256, the least attempted joining the overflow first, the
-most recently seen among ties, so fresh junk names evict each other rather
-than an older account); a
+principal (at most 256, the least attempted joining the overflow first and, among
+ties, the most recently added one is evicted, so fresh junk names evict each
+other rather than an older account); a
 principal attempted more often than the least attempted named group takes
 its place, that group joining the overflow with its count, so junk names
 sent first cannot hide which account is brute-forced (#88 review M1). No attempt goes uncounted, and a flood gives at most
