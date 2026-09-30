@@ -210,7 +210,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   is ignored, one of another table is reported (with the statement record
   when it comes, or at the next flush), and a late statement record alone
   yields a second event only when its text shows a signal (a whole-table
-  read by a dump that ran longer than 5 minutes).
+  read by a dump that ran longer than 5 minutes). That memory is kept 10
+  minutes.
   Residual: table records waiting when the agent stops are lost (the
   cursor has moved past them; delivery is at most once); their statement
   record, if written after the restart, is still reported, with the

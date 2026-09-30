@@ -221,6 +221,12 @@ const MAX_PENDING_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// A pending statement whose statement record has not come after this
 /// long is reported from its table-access records alone.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
+/// A statement flushed early is forgotten after this long: its late
+/// records are then handled as a new statement (security review of #93,
+/// L4: the memory of `reported` does not outlive the statements it is for,
+/// and a connection id reused after a server restart is not mistaken for
+/// the old one for long).
+const REPORTED_TTL: Duration = Duration::from_secs(2 * 300);
 
 /// Table-access records of one statement waiting for its statement
 /// record.
@@ -272,6 +278,7 @@ struct Pending {
 struct Reported {
     query_id: u64,
     seq: u64,
+    since: Instant,
     /// Tables already reported for it (at most [`MAX_PENDING_RECORDS`]).
     tables: Vec<(Option<(String, String)>, Op)>,
 }
@@ -322,7 +329,7 @@ impl Pending {
 
     /// Takes a statement out before its statement record, remembering it
     /// with its tables (merged with those of an earlier part of it).
-    fn take_early(&mut self, connection: u64) -> Option<Vec<FileRecord>> {
+    fn take_early(&mut self, connection: u64, mono: Instant) -> Option<Vec<FileRecord>> {
         let records = self.take(connection)?;
         if let Some(q) = records.first().and_then(|r| r.query_id) {
             let mut tables = match self.reported.remove(&connection) {
@@ -351,6 +358,7 @@ impl Pending {
                 Reported {
                     query_id: q,
                     seq,
+                    since: mono,
                     tables,
                 },
             );
@@ -358,14 +366,14 @@ impl Pending {
         Some(records)
     }
 
-    fn evict_oldest(&mut self) -> Option<Vec<FileRecord>> {
+    fn evict_oldest(&mut self, mono: Instant) -> Option<Vec<FileRecord>> {
         let oldest = self
             .map
             .iter()
             .min_by_key(|(_, p)| p.seq)
             .map(|(c, _)| *c)?;
         self.evicted = self.evicted.saturating_add(1);
-        self.take_early(oldest)
+        self.take_early(oldest, mono)
     }
 
     /// Adds a table-access record (of the connection's pending statement,
@@ -390,7 +398,7 @@ impl Pending {
             return flushed;
         }
         while self.map.len() >= MAX_PENDING_CONNECTIONS {
-            match self.evict_oldest() {
+            match self.evict_oldest(mono) {
                 Some(p) => flushed.push(p),
                 None => break,
             }
@@ -408,7 +416,7 @@ impl Pending {
             },
         );
         while self.text_bytes > MAX_PENDING_TEXT_BYTES {
-            match self.evict_oldest() {
+            match self.evict_oldest(mono) {
                 Some(p) => flushed.push(p),
                 None => break,
             }
@@ -416,8 +424,11 @@ impl Pending {
         flushed
     }
 
-    /// Statements pending for [`PENDING_TIMEOUT`] or more, oldest first.
+    /// Statements pending for [`PENDING_TIMEOUT`] or more, oldest first;
+    /// early-flushed statements older than [`REPORTED_TTL`] are forgotten.
     fn expired(&mut self, mono: Instant) -> Vec<Vec<FileRecord>> {
+        self.reported
+            .retain(|_, rep| mono.saturating_duration_since(rep.since) < REPORTED_TTL);
         let mut old: Vec<(u64, u64)> = self
             .map
             .iter()
@@ -426,7 +437,7 @@ impl Pending {
             .collect();
         old.sort_unstable();
         old.into_iter()
-            .filter_map(|(_, c)| self.take_early(c))
+            .filter_map(|(_, c)| self.take_early(c, mono))
             .collect()
     }
 
@@ -1638,6 +1649,23 @@ mod tests {
         );
         assert!(out.is_empty(), "{out:#?}");
         assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn early_flushed_statements_are_forgotten_after_their_ttl() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        assert!(at(&mut b, &[rd(1, 50, "a")], t0).is_empty());
+        assert_eq!(at(&mut b, &[], t0 + PENDING_TIMEOUT).len(), 1);
+        assert_eq!(b.pending.sizes().3, 1);
+        let late = t0 + PENDING_TIMEOUT + REPORTED_TTL;
+        assert!(at(&mut b, &[], late).is_empty());
+        assert_eq!(b.pending.sizes().3, 0);
+        // A record after that is a statement of its own.
+        assert_eq!(
+            at(&mut b, &[qy(1, 50, "select v from a where id = 1")], late),
+            ["read [\"shop.a\"] None []"]
+        );
     }
 
     #[test]
