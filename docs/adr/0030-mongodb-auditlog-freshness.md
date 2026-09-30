@@ -1,6 +1,6 @@
 # ADR-0030: MongoDB `auditLog` freshness: None until a record is read
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-29
 - **Refines**: [ADR-0027](0027-mongodb-audit.md) (which stays Accepted), decision 2 (levels), `auditLog` bullet
 - **Context references**: end-of-phase-5 review L1, phase 7 (`agent/crates/connector-mongodb/src/audit/mod.rs`: `choose`, `explain`, `file_state`, `parse_all`)
