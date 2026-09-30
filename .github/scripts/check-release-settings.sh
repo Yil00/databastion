@@ -3,8 +3,10 @@
 # "Release prerequisites"). A defence against a forgotten or undone setup only: it reads the
 # settings with the workflow's GITHUB_TOKEN, and whoever can change the workflow can remove it.
 #
-#   check-release-settings.sh environment NAME tag            # reviewers + version-tag rule only
-#   check-release-settings.sh environment NAME branch BRANCH  # reviewers + that branch only
+#   check-release-settings.sh environment NAME tag            # reviewers, no admin bypass,
+#                                                             # version-tag rule only
+#   check-release-settings.sh environment NAME branch BRANCH  # reviewers, no admin bypass,
+#                                                             # that branch only
 #   check-release-settings.sh tag-ruleset                     # active tag ruleset restricting
 #                                                             # creation, update and deletion
 # Requires gh and jq; GH_TOKEN and GITHUB_REPOSITORY set (the job needs `actions: read`).
@@ -20,6 +22,8 @@ case "${1:-}" in
       || fail "environment '$name' not found (or not readable)"
     jq -e '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length > 0' \
       <<<"$env_json" >/dev/null || fail "environment '$name' has no required reviewers"
+    jq -e '.can_admins_bypass == false' <<<"$env_json" >/dev/null \
+      || fail "environment '$name' lets administrators bypass its protection rules"
     jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env_json" >/dev/null \
       || fail "environment '$name' is not limited to selected branches and tags"
     policies="$(gh api --paginate "repos/$repo/environments/$name/deployment-branch-policies" \
@@ -33,7 +37,7 @@ case "${1:-}" in
           || fail "environment '$name' must admit only branch '$branch', has: $policies" ;;
       *) fail "unknown kind '$kind'" ;;
     esac
-    echo "environment '$name': required reviewers, deployment rules: $(tr '\n' ',' <<<"$policies")"
+    echo "environment '$name': required reviewers, no admin bypass, deployment rules: $(tr '\n' ',' <<<"$policies")"
     ;;
   tag-ruleset)
     ids="$(gh api --paginate "repos/$repo/rulesets" \
