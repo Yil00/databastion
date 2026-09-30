@@ -338,8 +338,12 @@ jobs:
           git archive --format=tar --prefix="databastion-deploy-${VERSION}/" HEAD deploy \
             | gzip -n -9 > "$RUNNER_TEMP/assets/databastion-deploy-${VERSION}.tar.gz"
           cd "$RUNNER_TEMP/assets"
-          cat image-*.txt > image-digests.txt
+          # Merge the per-image references, then remove them. Written after the removal: the name
+          # image-digests.txt matches image-*.txt, so an earlier write would be deleted with them.
+          digests="$(cat image-*.txt)"
+          [ -n "$digests" ] || { echo "::error::no image reference to publish"; exit 1; }
           rm -f image-*.txt
+          printf '%s\n' "$digests" > image-digests.txt
           files=(image-digests.txt "databastion-deploy-${VERSION}.tar.gz")
           for f in *.deb; do [ -e "$f" ] && files+=("$f"); done
           sha256sum "${files[@]}" > SHA256SUMS
