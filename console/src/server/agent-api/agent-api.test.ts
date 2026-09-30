@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { Client } from "pg";
 import { PgBoss } from "pg-boss";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +22,16 @@ import {
 } from "@/server/crypto";
 import { handleLogin, loginFailuresUnknownUser } from "@/server/user-api";
 import { AGENT_ONLINE_WINDOW_S, claimJobs, enqueueJob, MAX_JOB_ATTEMPTS, QUEUED_SCAN_MARGIN_S } from "@/server/jobs";
-import { HELD_SCAN_EXPIRY_MS, latestScans, SCAN_GRACE_MS, SCAN_JOB_TTL_MS, scanStatusLabel } from "@/server/scans";
+import {
+  HELD_SCAN_EXPIRY_MS,
+  HELD_SCAN_MAX_AGE_MS,
+  latestScans,
+  SCAN_GRACE_MS,
+  SCAN_JOB_TTL_MS,
+  scanStatusLabel,
+  sweepDeadScans,
+} from "@/server/scans";
+import { lockAgentForConflict } from "@/server/rotation";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { pgBossOptions } from "@/worker/queues";
@@ -53,6 +62,7 @@ import {
   handleHeartbeat,
   handleJobStatus,
   handlePollJobs,
+  jobsPollsPerAgent,
   pollClock,
 } from "./handlers";
 import { jobHub } from "./job-hub";
@@ -88,6 +98,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     cheapFailuresPerIp.clear();
     enrollPerIp.clear();
     pollClock.msPerSecond = 1000;
+    jobsPollsPerAgent.clear();
   });
 
   describe("POST /enroll", () => {
@@ -1231,7 +1242,8 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
         const list = (await res.json()) as { jobs: { job_id: string; expires_at?: string }[] };
         expect(list.jobs.map((j) => j.job_id)).toEqual([second]);
-        expect(new Date(list.jobs[0]?.expires_at ?? 0).getTime()).toBe(refreshed);
+        // Raised again at delivery (L3): now + 1 h.
+        expect(new Date(list.jobs[0]?.expires_at ?? 0).getTime()).toBeGreaterThanOrEqual(refreshed);
       });
 
       it("expires a held scan of an offline agent, and never revives an expired one", async () => {
@@ -1248,6 +1260,115 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         await seen(auth.agentId, AGENT_ONLINE_WINDOW_S + 60);
         expect(await poll(auth)).toEqual([]);
         expect((await row(offline))?.status).toBe("expired");
+      });
+
+      it("caps the refresh of a held scan at created_at + HELD_SCAN_MAX_AGE_MS (L2), then expires it", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        const first = await scan(auth.agentId, "pg-prod-1");
+        expect(await poll(auth)).toEqual([first]);
+        await report(auth, first, { status: "running" });
+        const near = await scan(auth.agentId, "pg-prod-2", new Date(Date.now() + 10 * MIN));
+        const old = await scan(auth.agentId, "pg-prod-3", new Date(Date.now() + 10 * MIN));
+        const bound = Date.now() + 40 * MIN;
+        await getDb()
+          .update(jobs)
+          .set({ createdAt: new Date(bound - HELD_SCAN_MAX_AGE_MS) })
+          .where(eq(jobs.id, near));
+        await getDb()
+          .update(jobs)
+          .set({ createdAt: new Date(Date.now() + 5 * MIN - HELD_SCAN_MAX_AGE_MS) })
+          .where(eq(jobs.id, old));
+        expect(await poll(auth)).toEqual([]);
+        // Refreshed only up to the bound (40 min ahead, not 1 h).
+        expect(Math.abs(((await row(near))?.expiresAt?.getTime() ?? 0) - bound)).toBeLessThan(2000);
+        // Already beyond its bound: left as is, then expires as before.
+        expect(Math.abs(((await row(old))?.expiresAt?.getTime() ?? 0) - (Date.now() + 10 * MIN))).toBeLessThan(MIN);
+        await getDb().update(jobs).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(jobs.id, old));
+        expect(await poll(auth)).toEqual([]);
+        expect((await row(old))?.status).toBe("expired");
+      });
+
+      it("does not refresh a held scan of a revoked or locked agent (I1)", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        const first = await scan(auth.agentId, "pg-prod-1");
+        expect(await poll(auth)).toEqual([first]);
+        await report(auth, first, { status: "running" });
+        const held = await scan(auth.agentId, "pg-prod-2", new Date(Date.now() + 10 * MIN));
+        await getDb().update(agents).set({ lockedAt: new Date() }).where(eq(agents.id, auth.agentId));
+        await getDb().transaction((tx) => sweepDeadScans(tx, auth.agentId));
+        expect(Math.abs(((await row(held))?.expiresAt?.getTime() ?? 0) - (Date.now() + 10 * MIN))).toBeLessThan(MIN);
+      });
+
+      it("raises a short expires_at when a scan is delivered, within the absolute bound (L3)", async () => {
+        const auth = await enroll();
+        const short = await scan(auth.agentId, "pg-prod-1", new Date(Date.now() + 10 * MIN));
+        expect(await poll(auth)).toEqual([short]);
+        const raised = (await row(short))?.expiresAt?.getTime() ?? 0;
+        expect(raised).toBeGreaterThan(Date.now() + HELD_SCAN_EXPIRY_MS - MIN);
+        expect(raised).toBeLessThanOrEqual(Date.now() + HELD_SCAN_EXPIRY_MS + MIN);
+        // Never lowered: a later expiry is kept.
+        await report(auth, short, { status: "succeeded" });
+        const later = await scan(auth.agentId, "pg-prod-2", new Date(Date.now() + 5 * 3600_000));
+        expect(await poll(auth)).toEqual([later]);
+        expect(Math.abs(((await row(later))?.expiresAt?.getTime() ?? 0) - (Date.now() + 5 * 3600_000))).toBeLessThan(MIN);
+        // Capped at created_at + HELD_SCAN_MAX_AGE_MS.
+        await report(auth, later, { status: "succeeded" });
+        const aged = await scan(auth.agentId, "pg-prod-3", new Date(Date.now() + 10 * MIN));
+        const bound = Date.now() + 20 * MIN;
+        await getDb().update(jobs).set({ createdAt: new Date(bound - HELD_SCAN_MAX_AGE_MS) }).where(eq(jobs.id, aged));
+        expect(await poll(auth)).toEqual([aged]);
+        expect(Math.abs(((await row(aged))?.expiresAt?.getTime() ?? 0) - bound)).toBeLessThan(2000);
+        // Other job types: unchanged.
+        const reload = await enqueueJob(getDb(), {
+          agentId: auth.agentId,
+          type: "agent.config.reload",
+          params: {},
+          expiresAt: new Date(Date.now() + 10 * MIN),
+        });
+        expect(await poll(auth)).toEqual([reload]);
+        expect(Math.abs(((await row(reload))?.expiresAt?.getTime() ?? 0) - (Date.now() + 10 * MIN))).toBeLessThan(MIN);
+      });
+
+      it.each(["revoke", "lock"] as const)(
+        "a %s concurrent with claims always succeeds and cancels every open job (L1)",
+        async (kind) => {
+          const userId = await adminUser();
+          for (let round = 0; round < 8; round++) {
+            const auth = await enroll();
+            await seen(auth.agentId, 10);
+            const first = await scan(auth.agentId, "pg-prod-1");
+            expect(await poll(auth)).toEqual([first]);
+            await report(auth, first, { status: "running" });
+            for (const t of ["pg-prod-2", "pg-prod-3", "pg-prod-4"]) await scan(auth.agentId, t);
+            await enqueueJob(getDb(), { agentId: auth.agentId, type: "agent.config.reload", params: {} });
+            const end =
+              kind === "revoke"
+                ? revokeAgent(getDb(), auth.agentId, { userId, ip: "direct" })
+                : lockAgentForConflict(getDb(), auth.agentId, "stale_secret", null);
+            const [ended] = await Promise.all([end, ...[1, 2, 3].map(() => claimJobs(getDb(), auth.agentId))]);
+            expect(ended).toBe(true);
+            const open = await getDb()
+              .select()
+              .from(jobs)
+              .where(and(eq(jobs.agentId, auth.agentId), inArray(jobs.status, ["pending", "delivered", "running"])));
+            expect(open).toHaveLength(0);
+          }
+        },
+      );
+
+      it("limits GET /jobs per agent (L4)", async () => {
+        const auth = await enroll();
+        for (let i = 0; i < jobsPollsPerAgent.limit; i++) {
+          expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(204);
+        }
+        const limited = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+        expect(limited.status).toBe(429);
+        expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+        // Per agent: another agent still polls.
+        const other = await enroll();
+        expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth: other }))).status).toBe(204);
       });
 
       it("wakes the agent's held poll when its scan ends, with the next scan", async () => {

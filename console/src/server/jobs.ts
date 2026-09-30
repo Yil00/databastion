@@ -6,7 +6,8 @@ import { logger } from "@/lib/logger";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
-import { AGENT_ONLINE_WINDOW_S, scanAnchorSql, scanBudgetSql, scanInFlightSql, sweepDeadScans } from "./scans";
+import { lockAgentJobs } from "./job-lock";
+import { AGENT_ONLINE_WINDOW_S, heldScanExpirySql, scanAnchorSql, scanBudgetSql, scanInFlightSql, sweepDeadScans } from "./scans";
 
 export { AGENT_ONLINE_WINDOW_S };
 
@@ -138,10 +139,13 @@ async function claimOnce(
   limit: number,
 ): Promise<{ jobs: Schemas["Job"][]; rejectedScan: boolean }> {
   const { givenUp, claimed } = await db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`jobs.claim:${agentId}`}, 0))`);
+    await lockAgentJobs(tx, agentId);
     // Scans that died silently (past their deadline) are failed first: they must not hold the
-    // agent's next scan back. Held scans of an online agent do not expire while held.
-    await sweepDeadScans(tx, agentId);
+    // agent's next scan back. Held scans of an online agent do not expire while held. Nothing to
+    // sweep or hold without a scan in flight (pending scans expire below).
+    const inFlight = await tx.execute(sql`select 1 from jobs where agent_id = ${agentId}
+      and type = 'discovery.scan' and status in ('delivered', 'running') limit 1`);
+    if (inFlight.rows.length > 0) await sweepDeadScans(tx, agentId);
     await tx.execute(sql`
       update jobs set status = 'expired', finished_at = now()
       where agent_id = ${agentId} and status in ('pending', 'delivered')
@@ -160,7 +164,9 @@ async function claimOnce(
         lease_until = now() + make_interval(secs => ${JOB_LEASE_S}),
         attempts = attempts + 1,
         delivered_at = now(),
-        first_delivered_at = coalesce(first_delivered_at, now())
+        first_delivered_at = coalesce(first_delivered_at, now()),
+        expires_at = case when type = 'discovery.scan' and status = 'pending' and expires_at is not null
+          then greatest(expires_at, ${heldScanExpirySql}) else expires_at end
       where id in (
         select id from jobs
         where agent_id = ${agentId}
@@ -201,7 +207,8 @@ async function claimOnce(
     await db
       .update(jobs)
       .set({ status: "failed", error: { code: "internal" }, finishedAt: sql`now()` })
-      .where(eq(jobs.id, row.id));
+      // Only while still delivered: never over a concurrent `cancelled` (revocation).
+      .where(and(eq(jobs.id, row.id), eq(jobs.status, "delivered")));
     if (row.type === "discovery.scan") rejectedScan = true;
   }
   return { jobs: out, rejectedScan };
