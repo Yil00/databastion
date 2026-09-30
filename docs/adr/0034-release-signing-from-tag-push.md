@@ -77,7 +77,9 @@ compromised action in either workflow (PR #86 security review, H1).
   run stops at the settings check; the repository-level copy of `RELEASE_TOKEN` must be deleted by
   hand, and nothing checks that it is gone.
 - A maintainer with admin rights can still push a version tag and start a signing run: the
-  approval of the `release` environment is then the remaining control.
+  approval of the `release` environment is then the remaining control (unless
+  `RELEASE_ALLOW_ADMIN_BYPASS` is `true`: an administrator can then also bypass that approval, see
+  decision 5).
 - A regular release now needs an approval of the `release-it` environment, then of the `release`
   environment jobs in up to three waves (image builds, signature, release assets).
 - Release builds take longer without a cache (the Rust and Next.js builds run in full).

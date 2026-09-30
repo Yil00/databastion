@@ -3,15 +3,15 @@
 # "Release prerequisites"). A defence against a forgotten or undone setup only: it reads the
 # settings with the workflow's GITHUB_TOKEN, and whoever can change the workflow can remove it.
 #
-#   check-release-settings.sh environment NAME tag            # reviewers, no admin bypass,
+#   check-release-settings.sh environment NAME tag            # reviewers, no admin bypass (*),
 #                                                             # version-tag rule only
-#   check-release-settings.sh environment NAME branch BRANCH  # reviewers, no admin bypass,
+#   check-release-settings.sh environment NAME branch BRANCH  # reviewers, no admin bypass (*),
 #                                                             # that branch only
 #   check-release-settings.sh tag-ruleset                     # active tag ruleset: version tags,
 #                                                             # creation / update / deletion
 #                                                             # restricted, admins-only bypass
 # RELEASE_APP_ID (optional): id of the release GitHub App allowed in the bypass list.
-# RELEASE_ALLOW_ADMIN_BYPASS (optional, repository variable): `true` accepts an environment that lets
+# (*) RELEASE_ALLOW_ADMIN_BYPASS (optional, repository variable): `true` accepts an environment that lets
 #   administrators bypass its protection rules, with a warning (the maintainer's choice while there
 #   is a single maintainer, RELEASE.md section 6); any other value refuses it.
 # Requires gh and jq; GH_TOKEN and GITHUB_REPOSITORY set (the job needs `actions: read`).
