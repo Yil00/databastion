@@ -28,6 +28,11 @@ on:
 permissions:
   contents: read
 
+# One publish run at a time, none cancelled: two tag pushes must not race on next / X.Y / latest.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: Preparation
@@ -61,6 +66,7 @@ jobs:
       - name: Release settings in place
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
         run: |
           .github/scripts/check-release-settings.sh environment release tag
           .github/scripts/check-release-settings.sh tag-ruleset

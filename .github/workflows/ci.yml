@@ -42,11 +42,14 @@ jobs:
           } | tee -a "$GITHUB_OUTPUT"
       # The E2E job (a few minutes of image builds) runs when something it exercises changed. When
       # the changed files cannot be listed (new branch, force push, shallow history), it runs.
-      # Same rule for the packaging jobs (.deb, installation test), on the packaging files.
+      # Same rule for the packaging jobs (.deb, publish build dry run, installation test), on
+      # everything that goes into the images or the .deb, and always on pull requests into main (a
+      # release merge): a failure must show up before a release tag exists.
       - id: e2e
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           changed=""
           case "$EVENT" in
@@ -65,7 +68,8 @@ jobs:
             e2e=false
           fi
           echo "e2e=$e2e" | tee -a "$GITHUB_OUTPUT"
-          if [ -z "$changed" ] || grep -qE '^(deploy/|agent/Dockerfile$|agent/agent\.example\.yaml$|console/Dockerfile$|console/docker/|\.github/workflows/(ci|packaging|publish)\.yml$)' <<<"$changed"; then
+          if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
+              || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
           else
             packaging=false
@@ -80,6 +84,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Internal Markdown links
         run: python3 scripts/check-md-links.py
+      # Release settings guard of release.yml / publish.yml (ADR-0034) on fixture rulesets.
+      - name: Release settings check (fixtures)
+        run: timeout 60 .github/scripts/test_check_release_settings.sh
 
   secrets:
     name: Secret scanning (gitleaks)
@@ -600,7 +607,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, protocol, e2e, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

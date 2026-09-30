@@ -52,6 +52,7 @@ jobs:
       - name: Release settings in place
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
         run: |
           settings-guard/.github/scripts/check-release-settings.sh environment release-it branch main
           settings-guard/.github/scripts/check-release-settings.sh tag-ruleset
