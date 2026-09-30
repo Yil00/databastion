@@ -2,10 +2,10 @@ import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 
 import { getDb } from "@/db/client";
-import { users } from "@/db/schema";
+import { jobs, users } from "@/db/schema";
 import bundle from "@/generated/protocol/schemas.gen.json";
 import { validateSchema } from "@/lib/protocol/validate";
 import { bootstrapAdmin } from "@/server/auth/users";
@@ -129,4 +129,16 @@ export function uuidv7(now = Date.now()): string {
   bytes[8] = 0x80 | ((bytes[8] ?? 0) & 0x3f);
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Ends (`succeeded`) the agent's `discovery.scan` jobs that are delivered or running, as the agent
+ * would before its next scan: the console delivers one scan per agent at a time (M1). Their
+ * findings are still accepted for 24 h (late spooled batches).
+ */
+export async function endInFlightScans(agentId: string): Promise<void> {
+  await getDb()
+    .update(jobs)
+    .set({ status: "succeeded", finishedAt: new Date(), leaseUntil: null })
+    .where(and(eq(jobs.agentId, agentId), eq(jobs.type, "discovery.scan"), inArray(jobs.status, ["delivered", "running"])));
 }
