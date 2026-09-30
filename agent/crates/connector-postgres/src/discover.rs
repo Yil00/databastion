@@ -19,7 +19,7 @@
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FindingSink, ScanCoverage, ScanJob};
+use databastion_core::{ConnectorError, FindingSink, Paced, ScanCoverage, ScanJob};
 use futures_util::StreamExt;
 use tokio_postgres::types::Type;
 
@@ -81,11 +81,16 @@ async fn scan_database(
     sink: &FindingSink,
 ) -> Result<(), ConnectorError> {
     let db_name = normalize(database);
+    if job.out_of_time() {
+        // Paced out of the scan's time: this database is not covered.
+        job.skip_out_of_time(sink, 1);
+        return Ok(());
+    }
     let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
     // Paced (ADR-0035 proposed): the introspection, then each object.
-    let relations = job
+    let relations = match job
         .paced(async {
             let tx = first
                 .begin(timeouts)
@@ -102,15 +107,30 @@ async fn scan_database(
                 }
             }
         })
-        .await??;
+        .await?
+    {
+        Paced::Done(r) => r?,
+        Paced::OutOfTime => {
+            job.skip_out_of_time(sink, 1);
+            return Ok(());
+        }
+    };
     let mut session = Some(first);
-    let (units, coverage) = catalog::plan(&relations, |schema, name| {
+    let (mut units, coverage) = catalog::plan(&relations, |schema, name| {
         job.includes_schema(schema) && job.includes_object(name)
     });
+    // Another starting object at each scan (security review of #93, M3).
+    job.rotate(&mut units);
     log_coverage(target, &db_name, &coverage);
     sink.add_coverage(planned_coverage(&coverage));
     let mut skipped = 0usize;
-    for unit in &units {
+    for (i, unit) in units.iter().enumerate() {
+        // The pause the previous objects owe, before the session is
+        // reused or reopened (M3 of the #93 security review).
+        if job.turn().await? == Paced::OutOfTime {
+            job.skip_out_of_time(sink, units.len() - i);
+            break;
+        }
         let current = match session.take() {
             Some(s) => s,
             // Replaced after a budget stop.
@@ -120,9 +140,16 @@ async fn scan_database(
         };
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sampled = job
+        let sampled = match job
             .paced(sample_unit(&current, unit, job.sample_rows(), timeouts))
-            .await?;
+            .await?
+        {
+            Paced::Done(s) => s,
+            Paced::OutOfTime => {
+                job.skip_out_of_time(sink, units.len() - i);
+                break;
+            }
+        };
         // A poisoned session (budget stop: cancel in flight, aborted
         // transaction still open, AccessShareLock held) is closed here,
         // before any submit (L-new-1); the next object reconnects.

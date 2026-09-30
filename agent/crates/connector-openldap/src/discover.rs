@@ -17,7 +17,7 @@ use databastion_classifiers::names::{
     NormalizedName, normalize_ldap_attribute, normalize_ldap_dn, normalize_path,
 };
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FailureCode, FindingSink, ScanCoverage, ScanJob};
+use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
@@ -179,7 +179,7 @@ where
     // container listing and each container's sampling.
     let (dse, schema) = {
         let s = ensure(&mut slot, target, &mut connect).await?;
-        job.paced(async {
+        let read = job.paced(async {
             let dse = catalog::root_dse(s, Stage::Introspection)
                 .await
                 .map_err(|e| fail(target, e))?;
@@ -190,8 +190,14 @@ where
                 .await
                 .map_err(|e| fail(target, e))?;
             Ok::<_, ConnectorError>((dse, schema))
-        })
-        .await??
+        });
+        match read.await? {
+            Paced::Done(r) => r?,
+            Paced::OutOfTime => {
+                job.skip_out_of_time(sink, 1);
+                return Ok(());
+            }
+        }
     };
     if dse.naming_contexts_cut {
         tracing::warn!(
@@ -226,9 +232,21 @@ where
             continue;
         }
         totals.contexts += 1;
+        // The pause owed is paid (`turn`) before a session is checked or
+        // opened, so a session never goes stale during it.
+        if job.turn().await? == Paced::OutOfTime {
+            job.skip_out_of_time(sink, 1);
+            continue;
+        }
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
-            job.paced(catalog::containers(s, suffix)).await?
+            match job.paced(catalog::containers(s, suffix)).await? {
+                Paced::Done(l) => l,
+                Paced::OutOfTime => {
+                    job.skip_out_of_time(sink, 1);
+                    continue;
+                }
+            }
         };
         let (containers, cut, references) = match listed {
             Ok(l) => l,
@@ -279,12 +297,21 @@ where
             .filter(|(name, _)| job.includes_schema(name.as_str()))
             .collect();
         ordered.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        // Another starting container at each scan (security review of
+        // #93, M3), at a boundary between normalized names so a pooled
+        // group stays in one run.
+        rotate_groups(job, &mut ordered);
+        let total = ordered.len();
         let mut current: Option<(NormalizedName, Groups)> = None;
-        for (container, raw) in ordered {
+        for (i, (container, raw)) in ordered.into_iter().enumerate() {
             if current.as_ref().is_some_and(|(name, _)| *name != container) {
                 if let Some((name, groups)) = current.take() {
                     flush(job, sink, &database, &name, groups, &mut totals).await?;
                 }
+            }
+            if job.turn().await? == Paced::OutOfTime {
+                job.skip_out_of_time(sink, total - i);
+                break;
             }
             let groups = &mut current
                 .get_or_insert_with(|| (container.clone(), Groups::new()))
@@ -292,16 +319,24 @@ where
             totals.containers += 1;
             let read = {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                job.paced(sample_container(
-                    s,
-                    &schema,
-                    &raw,
-                    &attributes,
-                    n,
-                    job,
-                    groups,
-                ))
-                .await?
+                match job
+                    .paced(sample_container(
+                        s,
+                        &schema,
+                        &raw,
+                        &attributes,
+                        n,
+                        job,
+                        groups,
+                    ))
+                    .await?
+                {
+                    Paced::Done(r) => r,
+                    Paced::OutOfTime => {
+                        job.skip_out_of_time(sink, total - i);
+                        break;
+                    }
+                }
             };
             match read {
                 Ok((entries, references)) => {
@@ -359,6 +394,25 @@ where
         "target scanned"
     );
     Ok(())
+}
+
+/// Rotates the containers (sorted by normalized name) to start at the
+/// scan's rotation offset, moved on to the next boundary between
+/// normalized names so a pooled group stays in one run.
+fn rotate_groups<T>(job: &ScanJob, ordered: &mut [(NormalizedName, T)]) {
+    let Some(k) = job.rotation_offset(ordered.len()) else {
+        return;
+    };
+    let boundary =
+        (k..ordered.len()).find(
+            |&i| match (ordered.get(i.wrapping_sub(1)), ordered.get(i)) {
+                (Some(a), Some(b)) => a.0 != b.0,
+                _ => false,
+            },
+        );
+    if let Some(b) = boundary {
+        ordered.rotate_left(b);
+    }
 }
 
 /// One one-level search of `container`, its entries added to `groups`.
@@ -448,6 +502,45 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_groups_rotate_at_a_name_boundary() {
+        use databastion_classifiers::names::normalize_path;
+        let job = |seed: u64| {
+            ScanJob::new(
+                databastion_core::ScanParams::contract_defaults(),
+                &databastion_core::AgentConfig::parse(
+                    "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                     engine: openldap, host: 127.0.0.1, account: a, secret: {env: PW}, \
+                     openldap: {tls: disable}}]}",
+                )
+                .unwrap()
+                .targets[0],
+                &databastion_core::config::Limits::default(),
+                std::sync::Arc::new(
+                    databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap(),
+                ),
+            )
+            .with_rotation(seed)
+        };
+        let names = ["a", "b", "b", "b", "c"];
+        let list = || -> Vec<(NormalizedName, usize)> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (normalize_path(n), i))
+                .collect()
+        };
+        let order = |seed: u64| {
+            let mut v = list();
+            rotate_groups(&job(seed), &mut v);
+            v.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), [0, 1, 2, 3, 4]);
+        // Offset 2 is inside the `b` group: moved on to `c`.
+        assert_eq!(order(2), [4, 0, 1, 2, 3]);
+        assert_eq!(order(1), [1, 2, 3, 4, 0]);
+    }
 
     #[test]
     fn values_are_text_or_dates() {

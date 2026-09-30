@@ -64,6 +64,7 @@ pub use connector::{Connector, ConnectorError};
 pub use engine::{AuditLevel, Engine, FailureCode, TargetHealth};
 pub use job::{AuditConfig, AuditParams, ParamsError, ScanJob, ScanParams};
 pub use notes::{CountMerge, NoteCode, NoteLabel, Notes, TargetNote};
+pub use pacing::Paced;
 pub use panics::{install_panic_hook, isolate, resume_panic};
 pub use runtime::{AgentError, EnrollOptions, enroll, run};
 pub use sink::{EventSink, FindingSink, ScanCoverage};

@@ -37,8 +37,10 @@ limits:
   # most this share of the scan's time: at most 1 % of one database core per
   # scan (scans run one at a time), under the 2 % MVP criterion even on a
   # one-core server. A scan then lasts about 100 times its query time
-  # (400 tables: minutes); raise max_duration_s / max_scan_duration_s for
-  # large databases, or this value where the server has spare cores.
+  # (400 tables: minutes). Objects left when the scan budget would run out
+  # are reported as skipped (limit): raise max_duration_s /
+  # max_scan_duration_s for large databases, or this value where the server
+  # has spare cores.
   discovery_duty_cycle_percent: 1
 
 # Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,

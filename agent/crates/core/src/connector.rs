@@ -74,8 +74,11 @@ pub trait Connector: Send + Sync {
     /// with `databastion_classifiers::names` (`normalize_field_path` for
     /// document keys), and submit `ColumnFinding::into_finding(location)`.
     /// Run each object's sampling and each catalog read through
-    /// `job.paced(…)` (Discovery duty cycle, `crate::pacing`) and stop on
-    /// its `Cancelled` error (`?`).
+    /// `job.paced(…)` (Discovery duty cycle, `crate::pacing`; `job.turn()`
+    /// first when the unit's setup must follow the pause), stop on its
+    /// `Cancelled` error (`?`), and on `Paced::OutOfTime` stop sampling and
+    /// report the objects left with `job.skip_out_of_time`. Rotate object
+    /// lists with `job.rotate`.
     /// The core stops the scan after `job.max_duration()`, or when the
     /// agent is suspended or revoked, by dropping this future.
     ///

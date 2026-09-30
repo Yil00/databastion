@@ -18,7 +18,7 @@
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FailureCode, FindingSink, ScanCoverage, ScanJob};
+use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 
 use crate::catalog::{self, Coverage, EngineSkip, Table};
 use crate::conn::{Flow, ReadTx, Session, Streamed, Timeouts};
@@ -80,11 +80,15 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         return Err(MyError::new(FailureCode::Internal, Stage::Connect).into_connector_error());
     };
     let timeouts = Timeouts::new(job.statement_timeout());
+    if job.out_of_time() {
+        job.skip_out_of_time(sink, 1);
+        return Ok(());
+    }
     let mut first = Session::connect(target, timeouts)
         .await
         .map_err(|e| fail(target, e))?;
     // Paced (ADR-0035 proposed): the introspection, then each table.
-    let tables = job
+    let tables = match job
         .paced(async {
             let mut tx = first.begin().await.map_err(|e| fail(target, e))?;
             match catalog::introspect(&mut tx).await {
@@ -98,18 +102,41 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                 }
             }
         })
-        .await??;
-    let (units, coverage) = catalog::plan(&tables, |schema, name| {
+        .await?
+    {
+        Paced::Done(t) => t?,
+        Paced::OutOfTime => {
+            job.skip_out_of_time(sink, 1);
+            return Ok(());
+        }
+    };
+    let (mut units, coverage) = catalog::plan(&tables, |schema, name| {
         // MySQL has no schema level: the job's `schemas` filter
         // (PostgreSQL) does not apply.
         job.includes_database(schema) && job.includes_object(name)
     });
+    // Another starting table at each scan (security review of #93, M3).
+    job.rotate(&mut units);
     log_coverage(target, &coverage);
     sink.add_coverage(planned_coverage(&coverage));
     let mut session = Some(first);
     let mut skipped = 0usize;
     let mut not_readable = 0usize;
-    for unit in &units {
+    for (i, unit) in units.iter().enumerate() {
+        // An idle session is closed before a long pause rather than kept
+        // open through it (L6 of the #93 security review; it would be
+        // stale after it anyway).
+        if job.pacer().debt() >= crate::conn::STALE_AFTER {
+            if let Some(s) = session.take() {
+                s.close().await;
+            }
+        }
+        // The pause the previous tables owe, before the session is
+        // checked for staleness and reused or reopened.
+        if job.turn().await? == Paced::OutOfTime {
+            job.skip_out_of_time(sink, units.len() - i);
+            break;
+        }
         let mut current = match session.take() {
             Some(s) if !s.is_poisoned() && !s.is_stale() => s,
             stale => {
@@ -123,9 +150,17 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         };
         let db = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sampled = job
+        let sampled = match job
             .paced(sample_table(&mut current, unit, job.sample_rows()))
-            .await?;
+            .await?
+        {
+            Paced::Done(s) => s,
+            Paced::OutOfTime => {
+                current.close().await;
+                job.skip_out_of_time(sink, units.len() - i);
+                break;
+            }
+        };
         // A poisoned session (budget stop: kill in flight, unread result)
         // is closed here, before any submit; the next table reconnects.
         if current.is_poisoned() {

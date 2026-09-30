@@ -99,34 +99,49 @@ binary: `cargo build --no-default-features --features postgres`.
   agent is suspended, or on shutdown. A status sent with batches still
   spooled is counted (`scan_status_before_flush_total`); the batches are
   sent later (the console accepts them for 24 h after the status).
-- Discovery pacing (`core::pacing`, phase 7, ADR-0035 proposed): after each
-  object's sampling and each catalog read, a connector pauses through
-  `ScanJob::paced` so that the agent's wall-clock time in queries is at
-  most `limits.discovery_duty_cycle_percent` (default 1, range 1 to 100,
-  `100`: no pacing) of the scan's time: a pause of `busy × (100 − d) / d`.
+- Discovery pacing (`core::pacing`, phase 7, ADR-0035 proposed): each
+  object's sampling and each catalog read goes through `ScanJob::paced`,
+  which charges its wall-clock time as a debt of `busy × (100 − d) / d`
+  (`d` = `limits.discovery_duty_cycle_percent`, default 1, range 1 to 100,
+  `100`: no pacing), **paid before the next unit** (`ScanJob::turn` pays it
+  ahead of a unit's session check or reconnection), never after the last
+  one: the agent's time in queries is at most `d` % of the scan's time.
   That time bounds the server CPU the scan's queries used on its one
   connection, so a scan costs the server at most `d` % of one core (MVP
   criterion: under 2 %, docs/04; the load harness of #92 measured 20 to
-  25 % of one core without pacing). Scans run one at a time per agent, so
-  scans of several targets on one server never add up. Not paced: the
-  connection setup (once per scan or database, and after a budget stop or
-  an idle session). Cost: a scan lasts about `100 / d` times its query
-  time; a 400-table database whose sampling queries take 2 to 7 ms each
-  takes about 1.5 to 5 minutes at 1 % (measured on MariaDB 11.4, 200
-  tables, debug build: 120 s and 0.42 s of server CPU, i.e. 0.35 % of one
-  core, against 6.6 s and 0.36 s unpaced). The scan budget (console
-  `max_duration_s`, default 900 s, capped by `limits.max_scan_duration_s`,
-  default 3600 s) must cover it: at 1 %, 900 s covers about 9 s of query
-  time (some 1 800 objects at 5 ms), 3600 s about 36 s; a larger database
-  needs a larger budget, or a higher duty cycle where the server has the
-  capacity (e.g. 2 % on a 4-core server is 0.5 % of it). A pause ends at
-  once when the scan stops (cancelled, timeout, shutdown, suspension): the
-  core fires the scan's cancel token and drops the connector future.
-  Before the scan starts, the agent acknowledges the job with a `running`
-  status (contract: a delivered job without a status is delivered again
-  after 120 s, and the console gives it up after 5 deliveries, so an
+  25 % of one core without pacing). Units that failed or timed out are
+  charged too. Connectors release what a unit held (a poisoned session,
+  the samples, and on MySQL / MariaDB an idle session when the debt
+  reaches its 45 s staleness bound) before the pause. Scans run one at a
+  time per agent, so scans of several targets on one server never add up.
+  Not paced: the connection setup (once per scan or database, and after a
+  budget stop or an idle session). The bound is never relaxed: when the
+  debt, plus the last unit's time and a 2 s margin, would reach the scan's
+  deadline, the next unit does not run (`Paced::OutOfTime`); the connector
+  reports the objects left as skipped for a limit (`skipped_limit` in the
+  job's coverage, a warning in the log) and the scan **succeeds** instead
+  of ending in `timeout`. Each scan starts its object list at another
+  position, derived from the job id (`ScanJob::rotate`; OpenLDAP rotates at
+  a boundary between normalized container names), so a slow or hostile
+  object cannot hide the same tail at every scan. Cost: a scan lasts about
+  `100 / d` times its query time; a 400-table database whose sampling
+  queries take 2 to 7 ms each takes about 1.5 to 5 minutes at 1 %
+  (measured on MariaDB 11.4, 200 tables, debug build: 120 s and 0.42 s of
+  server CPU, i.e. 0.35 % of one core, against 6.6 s and 0.36 s unpaced).
+  The scan budget (console `max_duration_s`, default 900 s, capped by
+  `limits.max_scan_duration_s`, default 3600 s) should cover it: at 1 %,
+  900 s covers about 9 s of query time (some 1 800 objects at 5 ms), 3600 s
+  about 36 s; beyond, objects are reported skipped (limit), and a larger
+  budget, or a higher duty cycle where the server has the capacity (e.g.
+  2 % on a 4-core server is 0.5 % of it), covers them. A pause ends at once
+  when the scan stops (cancelled, timeout, shutdown, suspension): the core
+  fires the scan's cancel token and drops the connector future. Before the
+  scan starts, the agent acknowledges the job with a `running` status
+  (contract: a delivered job without a status is delivered again after
+  120 s, and the console gives it up after 5 deliveries, so an
   unacknowledged scan longer than about 10 minutes was failed by the
-  console). The scan's end logs its busy and paused time (`scan pacing`).
+  console). The scan's end logs its busy and paused time and whether it
+  ran out of time (`scan pacing`).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
   removed at startup, unreadable files are moved to `spool/quarantine/` (32

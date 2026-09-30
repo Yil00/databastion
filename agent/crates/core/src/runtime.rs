@@ -2704,7 +2704,10 @@ impl Runtime {
         // Ends the scan's Discovery pauses when it stops (fired below, and
         // by its drop on every return path).
         let (cancel, token) = crate::pacing::ScanCancel::channel();
-        let scan = scan.with_cancel(token);
+        // The object order starts elsewhere at each scan (M3 of the #93
+        // security review): derived from the job id.
+        let seed = id.get().as_u64_pair().1;
+        let scan = scan.with_cancel(token).with_rotation(seed);
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
@@ -2861,6 +2864,7 @@ impl Runtime {
             duty_cycle_percent = scan.pacer().duty_percent(),
             busy_ms = u64::try_from(busy.as_millis()).unwrap_or(u64::MAX),
             paused_ms = u64::try_from(paused.as_millis()).unwrap_or(u64::MAX),
+            out_of_time = scan.pacer().out_of_time(),
             "scan pacing"
         );
         // The connector future (and its sink) is dropped: drain what it

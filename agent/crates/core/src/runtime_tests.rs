@@ -2292,6 +2292,86 @@ impl Connector for Paced {
     }
 }
 
+/// Samples five objects of 100 ms through the job's pacer, reporting what
+/// it could not sample in time as a connector does.
+struct PacedObjects;
+
+#[async_trait::async_trait]
+impl Connector for PacedObjects {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        let objects = 5;
+        for i in 0..objects {
+            let r = job
+                .paced(async { tokio::time::sleep(Duration::from_millis(100)).await })
+                .await?;
+            if r == crate::Paced::OutOfTime {
+                job.skip_out_of_time(sink, objects - i);
+                break;
+            }
+            sink.add_coverage(crate::ScanCoverage {
+                sampled: 1,
+                ..crate::ScanCoverage::default()
+            });
+        }
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+/// Security review of #93, M3: a scan whose pacing debt would pass its
+/// deadline stops sampling first and succeeds, the objects left reported
+/// as skipped for a limit, instead of ending in `timeout`.
+#[tokio::test]
+async fn a_paced_scan_out_of_time_succeeds_with_skipped_objects() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(PacedObjects)],
+    )
+    .unwrap();
+    accept_tokens(&rt, &[token::JOB_PROGRESS_COVERAGE]);
+    // 10 s window at 1 %: the first object owes about 10 s.
+    let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({"max_duration_s": 10}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let started = Instant::now();
+    run_queued_scans(&rt).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["status"], "succeeded");
+    assert_eq!(sent[0]["progress"]["objects_sampled"], 1);
+    assert_eq!(sent[0]["progress"]["skipped_limit"], 4);
+}
+
 #[tokio::test]
 async fn a_paced_scan_is_acknowledged_and_its_pause_ends_at_shutdown() {
     let server = MockServer::start().await;

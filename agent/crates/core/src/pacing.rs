@@ -4,13 +4,25 @@
 //! MVP criterion (docs/04): the monitored database spends less than 2 % of
 //! its CPU on Discovery. Sampling is bounded per object, but objects sampled
 //! back to back keep one server core busy for the whole scan (load harness,
-//! PR #92: 20 to 25 % of one core). So after each unit of work (an object's
-//! sampling, a catalog read), [`Pacer::pause`] waits
-//! `busy × (100 − d) / d`, `d` being `limits.discovery_duty_cycle_percent`:
-//! the agent's wall-clock time in queries is then at most `d` % of the
-//! scan's time. That wall-clock time bounds the server CPU the queries
-//! used on the scan's one connection (a statement runs on one core; waits
-//! for I/O, locks and the network only make the bound looser).
+//! PR #92: 20 to 25 % of one core). So each unit of work (an object's
+//! sampling, a catalog read) run through [`Pacer::paced`] leaves a **debt**
+//! of `busy × (100 − d) / d`, `d` being `limits.discovery_duty_cycle_percent`,
+//! paid (slept) **before the next unit**: the agent's wall-clock time in
+//! queries is then at most `d` % of the scan's time, and there is no pause
+//! after the last unit (a complete scan ends at once). That wall-clock time
+//! bounds the server CPU the queries used on the scan's one connection (a
+//! statement runs on one core; waits for I/O, locks and the network only
+//! make the bound looser). A unit that failed or timed out is charged too.
+//! Connectors release what a unit held (a poisoned session, the samples)
+//! before the next paced call, so nothing is held during a pause.
+//!
+//! The bound is never relaxed. When the debt, plus the last unit's time and
+//! a margin, would reach the scan's deadline, the next unit does not run:
+//! [`Paced::OutOfTime`], and the connector reports the objects it did not
+//! sample as skipped for a limit (`skipped_limit`), ending the scan without
+//! a timeout (security review of #93, M3). So that a slow or hostile object
+//! cannot hide the same tail at every scan, connectors rotate their object
+//! order per scan ([`crate::ScanJob::rotate`]).
 //!
 //! Scans run one at a time per agent (the runtime's scan worker), so the
 //! bound holds per agent and server, whatever the number of targets.
@@ -23,8 +35,7 @@
 //! pause itself cancellable.
 
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -97,20 +108,41 @@ impl ScanCancel {
     }
 }
 
-/// Time the paced work took and the pauses, for the scan's end log.
+/// Kept free before the scan's deadline when deciding whether the next
+/// unit can run: the last unit's time plus this.
+pub const DEADLINE_MARGIN: Duration = Duration::from_secs(2);
+
+/// Outcome of a paced unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paced<T> {
+    /// The unit ran.
+    Done(T),
+    /// Not run: paying the debt would reach the scan's deadline. Every later
+    /// unit is refused too; the connector reports what it did not sample as
+    /// skipped for a limit.
+    OutOfTime,
+}
+
 #[derive(Debug, Default)]
-struct Totals {
-    busy_ns: AtomicU64,
-    paused_ns: AtomicU64,
+struct State {
+    /// Pause owed before the next unit.
+    debt: Duration,
+    /// Time of the last unit (the estimate of the next one).
+    last: Duration,
+    /// Out of time (sticky).
+    out_of_time: bool,
+    busy: Duration,
+    paused: Duration,
 }
 
 /// Paces one scan (see the module documentation). Cheap to clone: clones
-/// share the totals and the cancellation.
+/// share the debt, the totals and the cancellation.
 #[derive(Debug, Clone)]
 pub struct Pacer {
     duty_percent: u8,
     cancel: Option<ScanCancel>,
-    totals: Arc<Totals>,
+    deadline: Option<Instant>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Default for Pacer {
@@ -119,13 +151,9 @@ impl Default for Pacer {
     }
 }
 
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
-
 impl Pacer {
     /// A pacer at `duty_percent` % (clamped to
-    /// [`DUTY_CYCLE_PERCENT_RANGE`]), without cancellation.
+    /// [`DUTY_CYCLE_PERCENT_RANGE`]), without cancellation or deadline.
     #[must_use]
     pub fn new(duty_percent: u8) -> Self {
         Self {
@@ -133,7 +161,8 @@ impl Pacer {
                 .max(DUTY_CYCLE_PERCENT_RANGE.0)
                 .min(DUTY_CYCLE_PERCENT_RANGE.1),
             cancel: None,
-            totals: Arc::default(),
+            deadline: None,
+            state: Arc::default(),
         }
     }
 
@@ -144,71 +173,135 @@ impl Pacer {
         self
     }
 
+    /// The same pacer, with the scan's deadline.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// The duty cycle, in percent.
     #[must_use]
     pub const fn duty_percent(&self) -> u8 {
         self.duty_percent
     }
 
-    /// Waits after `busy` of work (see [`pause_after`]).
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(ScanCancel::is_cancelled)
+    }
+
+    /// Pays the debt before a unit, unless that would reach the deadline.
+    async fn before_unit(&self) -> Result<bool, Cancelled> {
+        if self.cancelled() {
+            return Err(Cancelled);
+        }
+        let (debt, last) = {
+            let st = self.lock();
+            if st.out_of_time {
+                return Ok(false);
+            }
+            (st.debt, st.last)
+        };
+        if let Some(deadline) = self.deadline {
+            let needed = debt.saturating_add(last).saturating_add(DEADLINE_MARGIN);
+            if Instant::now()
+                .checked_add(needed)
+                .is_none_or(|t| t >= deadline)
+            {
+                self.lock().out_of_time = true;
+                return Ok(false);
+            }
+        }
+        if !debt.is_zero() {
+            let started = Instant::now();
+            let r = match &self.cancel {
+                Some(cancel) => tokio::select! {
+                    () = tokio::time::sleep(debt) => Ok(()),
+                    () = cancel.cancelled() => Err(Cancelled),
+                },
+                None => {
+                    tokio::time::sleep(debt).await;
+                    Ok(())
+                }
+            };
+            let mut st = self.lock();
+            st.paused = st.paused.saturating_add(started.elapsed());
+            r?;
+            st.debt = Duration::ZERO;
+        }
+        Ok(true)
+    }
+
+    /// Charges `busy` of work: the debt paid before the next unit.
+    fn charge(&self, busy: Duration) {
+        let mut st = self.lock();
+        st.busy = st.busy.saturating_add(busy);
+        st.last = busy;
+        st.debt = st.debt.saturating_add(pause_after(busy, self.duty_percent));
+    }
+
+    /// Pays the debt of the previous units, runs `work` and charges the
+    /// time it took (failed or not). No pause follows: the next paced call
+    /// pays it, so the last unit of a scan is not followed by one.
     ///
     /// # Errors
     /// [`Cancelled`] when the scan is (or gets) cancelled: the pause ends
     /// at once and the connector must stop.
-    pub async fn pause(&self, busy: Duration) -> Result<(), Cancelled> {
-        self.totals
-            .busy_ns
-            .fetch_add(nanos(busy), Ordering::Relaxed);
-        if self.cancel.as_ref().is_some_and(ScanCancel::is_cancelled) {
-            return Err(Cancelled);
-        }
-        let pause = pause_after(busy, self.duty_percent);
-        if pause.is_zero() {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let r = match &self.cancel {
-            Some(cancel) => tokio::select! {
-                () = tokio::time::sleep(pause) => Ok(()),
-                () = cancel.cancelled() => Err(Cancelled),
-            },
-            None => {
-                tokio::time::sleep(pause).await;
-                Ok(())
-            }
-        };
-        self.totals
-            .paused_ns
-            .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
-        r
-    }
-
-    /// Runs `work`, then pauses after the time it took.
-    ///
-    /// # Errors
-    /// [`Cancelled`] (see [`Self::pause`]); `work`'s own result is inside.
-    pub async fn paced<F: Future>(&self, work: F) -> Result<F::Output, Cancelled> {
-        if self.cancel.as_ref().is_some_and(ScanCancel::is_cancelled) {
-            return Err(Cancelled);
+    pub async fn paced<F: Future>(&self, work: F) -> Result<Paced<F::Output>, Cancelled> {
+        if !self.before_unit().await? {
+            return Ok(Paced::OutOfTime);
         }
         let started = Instant::now();
         let out = work.await;
-        self.pause(started.elapsed()).await?;
-        Ok(out)
+        self.charge(started.elapsed());
+        Ok(Paced::Done(out))
+    }
+
+    /// Pays the debt now, before a unit whose setup must follow the pause
+    /// (a session that may have gone stale meanwhile is checked or opened
+    /// after it). The unit itself then goes through [`Self::paced`], which
+    /// owes nothing more.
+    ///
+    /// # Errors
+    /// [`Cancelled`], as [`Self::paced`].
+    pub async fn turn(&self) -> Result<Paced<()>, Cancelled> {
+        Ok(if self.before_unit().await? {
+            Paced::Done(())
+        } else {
+            Paced::OutOfTime
+        })
+    }
+
+    /// Pause owed before the next unit.
+    #[must_use]
+    pub fn debt(&self) -> Duration {
+        self.lock().debt
+    }
+
+    /// Whether a unit was refused for the deadline.
+    #[must_use]
+    pub fn out_of_time(&self) -> bool {
+        self.lock().out_of_time
     }
 
     /// Time spent in paced work and in pauses so far.
     #[must_use]
     pub fn totals(&self) -> (Duration, Duration) {
-        (
-            Duration::from_nanos(self.totals.busy_ns.load(Ordering::Relaxed)),
-            Duration::from_nanos(self.totals.paused_ns.load(Ordering::Relaxed)),
-        )
+        let st = self.lock();
+        (st.busy, st.paused)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     #[test]
@@ -252,36 +345,88 @@ mod tests {
         assert_eq!(Pacer::default().duty_percent(), DEFAULT_DUTY_CYCLE_PERCENT);
     }
 
-    #[tokio::test]
-    async fn paced_work_waits_its_share() {
-        let pacer = Pacer::new(50);
-        let started = Instant::now();
-        let out = pacer
-            .paced(async {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                7
-            })
-            .await;
-        assert_eq!(out, Ok(7));
-        assert!(started.elapsed() >= Duration::from_millis(60));
-        let (busy, paused) = pacer.totals();
-        assert!(busy >= Duration::from_millis(30), "{busy:?}");
-        assert!(paused >= Duration::from_millis(30), "{paused:?}");
-        // 100 %: no pause at all.
-        let unpaced = Pacer::new(100);
-        let started = Instant::now();
-        unpaced.pause(Duration::from_secs(3600)).await.unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+    async fn unit(pacer: &Pacer, ms: u64) -> Paced<()> {
+        // Lazy: a `sleep` future's deadline is set when it is created.
+        pacer
+            .paced(async move { tokio::time::sleep(Duration::from_millis(ms)).await })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn a_long_pause_ends_at_cancellation() {
+    async fn the_debt_is_paid_before_the_next_unit_never_after_the_last() {
+        let pacer = Pacer::new(50);
+        // The first unit returns right after its work: no pause after it.
+        let started = Instant::now();
+        assert_eq!(unit(&pacer, 40).await, Paced::Done(()));
+        assert!(
+            started.elapsed() < Duration::from_millis(75),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(pacer.debt() >= Duration::from_millis(40));
+        // The next one pays it first.
+        let started = Instant::now();
+        assert_eq!(unit(&pacer, 1).await, Paced::Done(()));
+        assert!(started.elapsed() >= Duration::from_millis(38));
+        let (busy, paused) = pacer.totals();
+        assert!(busy >= Duration::from_millis(41), "{busy:?}");
+        assert!(paused >= Duration::from_millis(38), "{paused:?}");
+        // A unit that failed is charged too.
+        let failed = pacer
+            .paced(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Err::<(), ()>(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed, Paced::Done(Err(())));
+        assert!(pacer.debt() >= Duration::from_millis(20));
+        // `turn` pays the debt ahead of a unit's setup.
+        assert_eq!(unit(&pacer, 30).await, Paced::Done(()));
+        let started = Instant::now();
+        assert_eq!(pacer.turn().await, Ok(Paced::Done(())));
+        // (Tokio timers have a millisecond granularity.)
+        assert!(started.elapsed() >= Duration::from_millis(28));
+        assert_eq!(pacer.debt(), Duration::ZERO);
+        // 100 %: never any debt.
+        let unpaced = Pacer::new(100);
+        assert_eq!(unit(&unpaced, 5).await, Paced::Done(()));
+        assert_eq!(unpaced.debt(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn units_stop_before_the_deadline_instead_of_passing_it() {
+        // 1 %: 50 ms of work owe about 5 s; the deadline is 3 s away.
+        let pacer = Pacer::new(1).with_deadline(Instant::now() + Duration::from_secs(3));
+        assert_eq!(unit(&pacer, 50).await, Paced::Done(()));
+        let started = Instant::now();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let r = pacer
+            .paced(async { ran.store(true, Ordering::Relaxed) })
+            .await
+            .unwrap();
+        assert_eq!(r, Paced::OutOfTime);
+        assert!(!ran.load(Ordering::Relaxed));
+        // Refused at once, without sleeping; and for good.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(pacer.out_of_time());
+        assert_eq!(unit(&pacer, 0).await, Paced::OutOfTime);
+        // Far enough from the deadline: the unit runs.
+        let pacer = Pacer::new(1).with_deadline(Instant::now() + Duration::from_secs(60));
+        assert_eq!(unit(&pacer, 5).await, Paced::Done(()));
+        assert_eq!(unit(&pacer, 0).await, Paced::Done(()));
+    }
+
+    #[tokio::test]
+    async fn a_long_debt_ends_at_cancellation() {
         let (handle, cancel) = ScanCancel::channel();
         let pacer = Pacer::new(1).with_cancel(cancel);
+        // 100 ms of work: a debt of 9.9 s.
+        assert_eq!(unit(&pacer, 100).await, Paced::Done(()));
         let task = {
             let pacer = pacer.clone();
-            // 10 s of work: a pause of 990 s.
-            tokio::spawn(async move { pacer.pause(Duration::from_secs(10)).await })
+            tokio::spawn(async move { pacer.paced(async {}).await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!task.is_finished());
@@ -310,7 +455,8 @@ mod tests {
     async fn a_dropped_handle_cancels() {
         let (handle, cancel) = ScanCancel::channel();
         let pacer = Pacer::new(1).with_cancel(cancel);
-        let task = tokio::spawn(async move { pacer.pause(Duration::from_secs(10)).await });
+        assert_eq!(unit(&pacer, 100).await, Paced::Done(()));
+        let task = tokio::spawn(async move { pacer.paced(async {}).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(handle);
         let r = tokio::time::timeout(Duration::from_secs(5), task)
