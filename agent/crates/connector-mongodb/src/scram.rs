@@ -7,8 +7,10 @@
 //!   be between [`MIN_ITERATIONS`] and [`MAX_ITERATIONS`], and its final
 //!   signature is verified (mutual authentication) before the caller runs
 //!   any other command.
-//! - The password is SASLprepped; the salted password, the keys and the
-//!   proof are zeroized on drop. No message of the exchange is logged.
+//! - The password is SASLprepped; the salted password, the keys, the HMAC
+//!   states and outputs (the `hmac` / `sha2` `zeroize` features), the proof
+//!   and its base64 text are zeroized on drop. No message of the exchange
+//!   is logged.
 //! - No channel binding (`c=biws`): MongoDB offers no `-PLUS` mechanism.
 
 use base64::Engine as _;
@@ -84,7 +86,10 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
         for p in parts {
             mac.update(p);
         }
-        out.copy_from_slice(&mac.finalize().into_bytes());
+        // Copied from the output, which zeroizes itself on drop (no
+        // `into_bytes` copy left on the stack).
+        let tag = mac.finalize();
+        out.copy_from_slice(tag.as_bytes());
     }
     out
 }
@@ -102,16 +107,25 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
     let mut mac = keyed.clone();
     mac.update(salt);
     mac.update(&1u32.to_be_bytes());
-    u.copy_from_slice(&mac.finalize().into_bytes());
+    u.copy_from_slice(mac.finalize().as_bytes());
     out.copy_from_slice(&u[..]);
     for _ in 1..iterations {
         let mut mac = keyed.clone();
         mac.update(&u[..]);
-        u.copy_from_slice(&mac.finalize().into_bytes());
+        u.copy_from_slice(mac.finalize().as_bytes());
         for (o, x) in out.iter_mut().zip(u.iter()) {
             *o ^= x;
         }
     }
+    out
+}
+
+/// SHA-256 of `data`, written straight into a zeroized buffer.
+fn sha256(data: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    let mut h = Sha256::new();
+    h.update(data);
+    Digest::finalize_into(h, (&mut *out).into());
     out
 }
 
@@ -199,8 +213,7 @@ impl Scram {
         let prepped = Zeroizing::new(prepped.into_owned());
         let salted = hi(prepped.as_bytes(), &salt, iterations);
         let client_key = hmac(&salted[..], &[b"Client Key"]);
-        let mut stored_key = Zeroizing::new([0u8; 32]);
-        stored_key.copy_from_slice(&Sha256::digest(&client_key[..]));
+        let stored_key = sha256(&client_key[..]);
         let without_proof = format!("c=biws,r={nonce}");
         let auth_message = format!(
             "{},{},{without_proof}",
@@ -218,9 +231,14 @@ impl Scram {
         }
         let server_key = hmac(&salted[..], &[b"Server Key"]);
         let server_signature = hmac(&server_key[..], &[auth_message.as_bytes()]);
-        let mut message = Zeroizing::new(without_proof.into_bytes());
+        let proof_text = Zeroizing::new(B64.encode(&proof[..]));
+        // Sized once: no reallocation leaves a copy of the proof behind.
+        let mut message = Zeroizing::new(Vec::with_capacity(
+            without_proof.len() + 3 + proof_text.len(),
+        ));
+        message.extend_from_slice(without_proof.as_bytes());
         message.extend_from_slice(b",p=");
-        message.extend_from_slice(B64.encode(&proof[..]).as_bytes());
+        message.extend_from_slice(proof_text.as_bytes());
         Ok((message, Expected { server_signature }))
     }
 }
@@ -308,6 +326,21 @@ pub(crate) mod server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The HMAC and hash states and the MAC outputs zeroize themselves on
+    /// drop (the `zeroize` features of `hmac` and `sha2`, end-of-phase-5
+    /// review I4), checked at compile time: `Hmac<Sha256>` holds two
+    /// SHA-256 cores (inner and outer pads) and an eager block buffer,
+    /// each zeroized on drop; `hmac` 0.13 does not declare the marker on
+    /// `Hmac` itself.
+    #[test]
+    fn hmac_and_hash_states_zeroize_on_drop() {
+        use hmac::digest::block_api::EagerHash;
+        fn zeroized_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        zeroized_on_drop::<<Sha256 as EagerHash>::Core>();
+        zeroized_on_drop::<Sha256>();
+        zeroized_on_drop::<hmac::digest::CtOutput<HmacSha256>>();
+    }
 
     /// RFC 7677 section 3 test vector (user `user`, password `pencil`).
     #[test]

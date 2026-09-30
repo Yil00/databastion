@@ -381,6 +381,8 @@ async fn discovery_over_the_scripted_directory() {
         Arc::new(HmacKey::new(&[7u8; 32]).unwrap()),
     );
     let (sink, mut rx) = FindingSink::channel(1024);
+    let logs = crate::i2::Logs::default();
+    let _guard = logs.capture();
     let r = crate::discover::scan(&job, &sink, &t, || async {
         let (client, _) = serve(directory(AGENT, tree));
         Session::establish(
@@ -437,4 +439,385 @@ async fn discovery_over_the_scripted_directory() {
             .iter()
             .all(|f| f.classifier().as_str() == "pii.email")
     );
+    // Interim I2 check (end-of-phase-6 review L2): none of the served
+    // values (nor of the dev ground truth) and no entry DN in the
+    // serialized findings nor in the logs.
+    let mut values = crate::i2::ground_truth_values(&crate::i2::ground_truth());
+    values.extend((0..30).map(|i| format!("person{i}@example.org")));
+    values.extend((0..10).map(|i| format!("team{i}@example.com")));
+    values.push("c2VjcmV0c2VjcmV0c2VjcmV0".to_owned());
+    crate::i2::assert_clean(
+        "serialized findings",
+        &crate::i2::findings_text(&findings),
+        &values,
+        &[],
+    );
+    crate::i2::assert_clean("scan logs", &logs.text(), &values, &[AGENT]);
+}
+
+/// `check()`'s audit proofs against a scripted `cn=accesslog`.
+mod proofs {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::check::{CheckState, prove};
+
+    const OUTER: &str = "dc=example,dc=org";
+    const NESTED: &str = "ou=nested,dc=example,dc=org";
+
+    fn contexts() -> Vec<(String, String)> {
+        [OUTER, NESTED]
+            .iter()
+            .map(|c| ((*c).to_owned(), (*c).to_owned()))
+            .collect()
+    }
+
+    /// A directory whose log holds successful searches below the nested
+    /// context only, and records the absent-entry probes while `failures`
+    /// is on.
+    fn log_server(failures: Arc<AtomicBool>, probes: Arc<Mutex<Vec<String>>>) -> Handler {
+        let logged: Arc<Mutex<HashSet<String>>> = Arc::default();
+        directory(AGENT, move |id, req| {
+            let Request::Search { base, filter, .. } = req else {
+                return vec![encode::done(id, 53)];
+            };
+            if base == "cn=accesslog" {
+                // The proof of a probe: its exact DN.
+                if let Some(rest) = filter.split("(reqDN=").nth(1) {
+                    let dn = rest.split(')').next().unwrap_or_default();
+                    if logged.lock().unwrap().contains(dn) {
+                        return vec![
+                            encode::entry(id, "reqStart=1,cn=accesslog", &[]),
+                            encode::done(id, 0),
+                        ];
+                    }
+                    return vec![encode::done(id, 0)];
+                }
+                // A proof of logged reads: the only records are below the
+                // nested context, so a search that leaves it out finds
+                // nothing.
+                let excludes_nested =
+                    filter.contains(&format!("(!(reqDN:dnSubtreeMatch:={NESTED}))"));
+                if filter.contains("(reqResult=0)") && !excludes_nested {
+                    return vec![
+                        encode::entry(id, "reqStart=2,cn=accesslog", &[]),
+                        encode::done(id, 0),
+                    ];
+                }
+                return vec![encode::done(id, 0)];
+            }
+            if base.starts_with(crate::check::ABSENT_RDN) {
+                probes.lock().unwrap().push(base.clone());
+                if failures.load(Ordering::SeqCst) {
+                    logged.lock().unwrap().insert(base.clone());
+                }
+                return vec![encode::done(id, 32)];
+            }
+            vec![encode::entry(id, base, &[]), encode::done(id, 0)]
+        })
+    }
+
+    /// #79 round-3 review L2: a context does not borrow the read proof of
+    /// a naming context nested in it.
+    #[tokio::test]
+    async fn a_context_never_borrows_a_nested_contexts_proof() {
+        let (s, seen) = session(log_server(Arc::default(), Arc::default())).await;
+        let mut s = s.unwrap();
+        let state = CheckState::default();
+        let t = target();
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert!(state.proven(&t.id, NESTED));
+        assert!(!state.proven(&t.id, OUTER));
+        // The outer context's proof searches leave the nested one out; the
+        // nested one's leave nothing out.
+        let filters: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                Request::Search { base, filter, .. } if base == "cn=accesslog" => {
+                    Some(filter.clone())
+                }
+                _ => None,
+            })
+            .filter(|f| f.contains("(reqResult=0)"))
+            .collect();
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.contains(&format!("(reqDN:dnSubtreeMatch:={OUTER})"))
+                    && f.contains(&format!("(!(reqDN:dnSubtreeMatch:={NESTED}))")))
+        );
+        assert!(
+            filters
+                .iter()
+                .filter(|f| f.contains(&format!("(reqDN:dnSubtreeMatch:={NESTED})"))
+                    && !f.contains("(!("))
+                .count()
+                >= 1
+        );
+    }
+
+    /// #79 round-3 review L1: the absent-entry probe runs at every report,
+    /// with a DN of its own, and only its latest answer counts.
+    #[tokio::test]
+    async fn the_failed_operation_probe_keeps_only_the_latest_answer() {
+        let failures = Arc::new(AtomicBool::new(true));
+        let probes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (s, _) = session(log_server(Arc::clone(&failures), Arc::clone(&probes))).await;
+        let mut s = s.unwrap();
+        let state = CheckState::default();
+        let t = target();
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert_eq!(state.failures_logged(&t.id, OUTER), Some(true));
+        assert_eq!(state.failures_logged(&t.id, NESTED), Some(true));
+        // `olcAccessLogSuccess: TRUE` from now on: the next report sees it,
+        // although the earlier probes' records are still in the log.
+        failures.store(false, Ordering::SeqCst);
+        prove(&state, &t, &mut s, &contexts(), "cn=accesslog")
+            .await
+            .unwrap();
+        assert_eq!(state.failures_logged(&t.id, OUTER), Some(false));
+        assert_eq!(state.failures_logged(&t.id, NESTED), Some(false));
+        // Every probe has its own DN, below its context.
+        let probes = probes.lock().unwrap();
+        assert_eq!(probes.len(), 4);
+        assert_eq!(probes.iter().collect::<HashSet<_>>().len(), 4);
+        assert!(probes.iter().all(|p| p.ends_with(OUTER)));
+    }
+}
+
+/// A scripted `cn=accesslog` serving searches of the tree: entry `n` has
+/// CSN `csn(n)` and `reqDN` `dns[n - 1]`.
+fn accesslog(dns: Vec<&'static str>) -> Handler {
+    directory(AGENT, move |id, req| {
+        let Request::Search { base, .. } = req else {
+            return vec![encode::done(id, 53)];
+        };
+        assert_eq!(base, "cn=accesslog");
+        let mut out: Vec<Vec<u8>> = dns
+            .iter()
+            .enumerate()
+            .map(|(i, dn)| {
+                let c = log_csn(u32::try_from(i + 1).unwrap());
+                encode::entry(
+                    id,
+                    &format!("reqStart={c},cn=accesslog"),
+                    &[
+                        ("reqStart", &[b"20260929202642.000001Z"]),
+                        ("reqType", &[b"search"]),
+                        ("reqAuthzID", &[b"cn=admin,dc=example,dc=org"]),
+                        ("reqDN", &[dn.as_bytes()]),
+                        ("reqResult", &[b"0"]),
+                        ("reqScope", &[b"sub"]),
+                        ("reqFilter", &[b"(objectClass=*)"]),
+                        ("reqAttr", &[b"mail"]),
+                        ("reqEntries", &[b"3"]),
+                        ("entryCSN", &[c.as_bytes()]),
+                    ],
+                )
+            })
+            .collect();
+        out.push(encode::done(id, 0));
+        out
+    })
+}
+
+fn log_csn(n: u32) -> String {
+    format!("20260929202642.{n:06}Z#000000#000#000000")
+}
+
+/// One accesslog poll from the saved position of `store`, with the core's
+/// request applied to it (`isolate`, `skip`): the events, or `None` when
+/// the poll panicked.
+async fn poll_log(
+    dns: Vec<&'static str>,
+    store: &databastion_core::audit::CursorStore,
+    isolate: bool,
+    skip: u32,
+    state: &crate::check::CheckState,
+) -> Option<Vec<databastion_classifiers::masking::MaskedEvent>> {
+    use databastion_core::EventSink;
+    use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+
+    use crate::audit::events::EventBuilder;
+    use crate::audit::{Position, poll};
+
+    let (s, _) = session(accesslog(dns)).await;
+    let mut s = s.unwrap();
+    let mut request = store.clone().with_skip(skip);
+    if isolate {
+        request = request.with_isolation();
+    }
+    let mut position = Position::load(Some(&request));
+    let t = target();
+    let (sink, mut rx) = EventSink::channel(64);
+    let mut builder = EventBuilder::new(
+        OwnAccount::new(AGENT, None, None, 1000, SharedOwnUsage::default()),
+        AGENT.to_owned(),
+        1000,
+        Vec::new(),
+    );
+    let store = store.clone();
+    let polled = {
+        use futures_util::FutureExt as _;
+        std::panic::AssertUnwindSafe(poll(
+            &t,
+            &sink,
+            state,
+            &mut s,
+            &mut builder,
+            &mut position,
+            Some(&store),
+            "cn=accesslog",
+        ))
+        .catch_unwind()
+        .await
+    };
+    drop(sink);
+    let mut events = Vec::new();
+    while let Some(e) = rx.recv().await {
+        events.push(e);
+    }
+    match polled {
+        Ok(r) => {
+            r.unwrap();
+            Some(events)
+        }
+        Err(_) => None,
+    }
+}
+
+fn skip_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-ldap-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Phase-7 review H1: an entry that makes the parser panic is dropped
+/// alone and counted; the entries around it give events.
+#[tokio::test]
+async fn an_entry_that_crashes_the_parser_is_dropped_alone() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::{CURSOR, TEST_PARSE_POISON};
+    let dir = skip_dir("parse");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(format!("v2\ncursor {}\n", log_csn(0)).as_bytes())
+        .unwrap();
+    let poison: &'static str =
+        Box::leak(format!("{TEST_PARSE_POISON},dc=example,dc=org").into_boxed_str());
+    let state = crate::check::CheckState::default();
+    let events = poll_log(
+        vec!["dc=example,dc=org", poison, "dc=example,dc=org"],
+        &store,
+        false,
+        0,
+        &state,
+    )
+    .await
+    .expect("a parser panic does not fail the poll");
+    assert_eq!(events.len(), 2);
+    assert_eq!(state.dropped(&target().id), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Poison records (phase-7 security review M1): a panic outside the
+/// parser (here in the event conversion) reaches the core, which restarts
+/// the stream in isolation mode (entries handed over and saved one by
+/// one), then asks it to skip one entry at the exact position: only the
+/// entry at fault is lost, never the entries before it in its page.
+#[tokio::test]
+async fn isolation_mode_then_a_skip_drop_the_entry_at_fault_only() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::{CURSOR, TEST_CONVERT_POISON};
+    let dir = skip_dir("isolate");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(format!("v2\ncursor {}\n", log_csn(0)).as_bytes())
+        .unwrap();
+    let poison: &'static str =
+        Box::leak(format!("{TEST_CONVERT_POISON},dc=example,dc=org").into_boxed_str());
+    let dns = || {
+        vec![
+            "dc=example,dc=org",
+            "dc=example,dc=org",
+            poison,
+            "dc=example,dc=org",
+            "dc=example,dc=org",
+        ]
+    };
+    let state = crate::check::CheckState::default();
+    // A normal poll panics before saving anything.
+    assert!(poll_log(dns(), &store, false, 0, &state).await.is_none());
+    let saved = || String::from_utf8(store.load().unwrap().unwrap()).unwrap();
+    assert!(saved().contains(&format!("cursor {}", log_csn(0))));
+    // Isolation mode: the two entries before it are handed over and saved.
+    assert!(poll_log(dns(), &store, true, 0, &state).await.is_none());
+    assert!(
+        saved().contains(&format!("cursor {}", log_csn(2))),
+        "{}",
+        saved()
+    );
+    // One skip at that exact position: the entry at fault only.
+    let events = poll_log(dns(), &store, true, 1, &state)
+        .await
+        .expect("the entry at fault is skipped");
+    assert_eq!(events.len(), 2);
+    assert_eq!(state.dropped(&target().id), 1);
+    assert!(
+        saved().contains(&format!("cursor {}", log_csn(5))),
+        "{}",
+        saved()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PR #83 round-3 review L-1: a `handing` entry left in the saved position
+/// (a failed hand-over) is read like any other by a session without
+/// isolation nor skip: reported once, then marked read, and the `handing`
+/// line is gone.
+#[tokio::test]
+async fn a_stale_handing_entry_is_read_once_and_cleared() {
+    use databastion_core::audit::CursorStore;
+
+    use crate::audit::CURSOR;
+    let dir = skip_dir("handing");
+    let store = CursorStore::new(&dir, "t", CURSOR).unwrap();
+    store
+        .save(
+            format!(
+                "v2\ncursor {}\nhanding {}\nseen {}\n",
+                log_csn(1),
+                log_csn(2),
+                log_csn(1)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let dns = || vec!["dc=example,dc=org", "dc=example,dc=org"];
+    let state = crate::check::CheckState::default();
+    let events = poll_log(dns(), &store, false, 0, &state).await.unwrap();
+    assert_eq!(events.len(), 1, "entry 2 reported once");
+    let saved = String::from_utf8(store.load().unwrap().unwrap()).unwrap();
+    assert!(!saved.contains("handing"), "{saved}");
+    assert!(saved.contains(&format!("seen {}", log_csn(2))), "{saved}");
+    // Not reported again.
+    let events = poll_log(dns(), &store, false, 0, &state).await.unwrap();
+    assert!(events.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

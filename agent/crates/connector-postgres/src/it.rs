@@ -1301,6 +1301,9 @@ const AUDIT_MARKER: &str = "it-audit-marker-7Qz@example.test";
 /// The pgaudit log files of the test server (`DATABASTION_TEST_PG_AUDIT_LOG`
 /// for jsonlog, `DATABASTION_TEST_PG_AUDIT_CSVLOG` for csvlog).
 fn audit_logs() -> Vec<(PathBuf, &'static str)> {
+    // `dev/postgres/local-cluster.sh` run without root writes the log as
+    // the test's own user, which the tailer refuses in production.
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
     let mut out = Vec::new();
     for (var, format) in [
         ("DATABASTION_TEST_PG_AUDIT_LOG", "jsonlog"),

@@ -522,6 +522,11 @@ pub struct AuditConfig {
     min_rows: Option<u64>,
     sensitive_objects: Vec<SensitiveObject>,
     max_sample_rows: u32,
+    /// The cursors used by the stream, and the core's isolation / skip
+    /// request (see [`crate::audit::CursorStore::skip_records`]).
+    positions: Option<crate::audit::PositionRegistry>,
+    isolate: bool,
+    skip_records: u32,
 }
 
 impl std::fmt::Debug for AuditConfig {
@@ -551,6 +556,9 @@ impl Default for AuditConfig {
             min_rows: None,
             sensitive_objects: Vec::new(),
             max_sample_rows: limits.max_sample_rows,
+            positions: None,
+            isolate: false,
+            skip_records: 0,
         }
     }
 }
@@ -574,6 +582,9 @@ impl AuditConfig {
             min_rows: params.min_rows,
             sensitive_objects: params.sensitive_objects,
             max_sample_rows: limits.max_sample_rows,
+            positions: None,
+            isolate: false,
+            skip_records: 0,
         }
     }
 
@@ -626,7 +637,29 @@ impl AuditConfig {
     /// `None` without a state directory (tests) or for an invalid name.
     #[must_use]
     pub fn cursor(&self, name: &str) -> Option<crate::audit::CursorStore> {
-        crate::audit::CursorStore::new(self.state_dir.as_deref()?, &self.target_id, name)
+        let store =
+            crate::audit::CursorStore::new(self.state_dir.as_deref()?, &self.target_id, name)?;
+        Some(match &self.positions {
+            Some(p) => p.register(store, self.isolate, self.skip_records),
+            None => store,
+        })
+    }
+
+    /// The core's registry of the cursors this stream uses, and its
+    /// request after panics (isolation mode, one record to skip at the
+    /// exact position it panicked at; see
+    /// [`crate::audit::CursorStore::skip_records`]).
+    #[must_use]
+    pub(crate) fn with_positions(
+        mut self,
+        positions: crate::audit::PositionRegistry,
+        isolate: bool,
+        skip: u32,
+    ) -> Self {
+        self.positions = Some(positions);
+        self.isolate = isolate;
+        self.skip_records = skip;
+        self
     }
 
     /// Target id.

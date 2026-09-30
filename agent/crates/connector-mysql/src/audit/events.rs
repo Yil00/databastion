@@ -281,6 +281,9 @@ pub(crate) struct EventBuilder {
     sessions: Sessions,
     /// Failed statements skipped (no rows were read).
     pub(crate) failed: u64,
+    /// Records dropped because their conversion panicked (PR #83
+    /// re-review M-A).
+    pub(crate) panicked: u64,
 }
 
 impl EventBuilder {
@@ -288,6 +291,7 @@ impl EventBuilder {
         Self {
             own,
             sessions: Sessions::default(),
+            panicked: 0,
             failed: 0,
         }
     }
@@ -480,25 +484,48 @@ impl EventBuilder {
         for r in records {
             match r.op {
                 Op::Connect | Op::FailedConnect | Op::Disconnect => {
-                    self.flush(std::mem::take(&mut group), source, now, &mut out);
-                    if let Some(e) = self.connection(&r, source, now) {
-                        out.push(e);
+                    self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
+                    match databastion_core::isolate(|| self.connection(&r, source, now)) {
+                        Some(Some(e)) => out.push(e),
+                        Some(None) => {}
+                        None => self.panicked = self.panicked.saturating_add(1),
                     }
                 }
                 Op::Query | Op::Table(_) => {
                     if group.last().is_some_and(|g| !same_statement(g, &r)) {
-                        self.flush(std::mem::take(&mut group), source, now, &mut out);
+                        self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
                     }
                     let ends = r.op == Op::Query;
                     group.push(r);
                     if ends {
-                        self.flush(std::mem::take(&mut group), source, now, &mut out);
+                        self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
                     }
                 }
             }
         }
-        self.flush(group, source, now, &mut out);
+        self.flush_isolated(group, source, now, &mut out);
         out
+    }
+
+    /// [`Self::flush`] of one statement in isolation: a statement whose
+    /// conversion panics is dropped alone, its records counted in
+    /// `panicked` (PR #83 re-review M-A).
+    fn flush_isolated(
+        &mut self,
+        group: Vec<FileRecord>,
+        source: EventSource,
+        now: SystemTime,
+        out: &mut Vec<MaskedEvent>,
+    ) {
+        let n = group.len() as u64;
+        match databastion_core::isolate(|| {
+            let mut events = Vec::new();
+            self.flush(group, source, now, &mut events);
+            events
+        }) {
+            Some(events) => out.extend(events),
+            None => self.panicked = self.panicked.saturating_add(n),
+        }
     }
 
     fn connection(

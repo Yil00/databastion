@@ -46,6 +46,8 @@ mod wire;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+mod i2;
+#[cfg(test)]
 mod it;
 #[cfg(test)]
 mod proptests;

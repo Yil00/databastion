@@ -89,8 +89,9 @@ pub(crate) struct Record {
     pub(crate) op: Op,
     pub(crate) start: SystemTime,
     pub(crate) session: Option<u64>,
-    /// `reqAuthzID`, canonical; `None` for anonymous (empty).
-    pub(crate) authz: Option<String>,
+    /// `reqAuthzID`, canonical; `None` for anonymous (empty). A person's
+    /// DN embeds values: memory only, zeroized (end-of-phase-6 review I4).
+    pub(crate) authz: Option<Zeroizing<String>>,
     /// `reqDN` as logged (entry DNs embed values: memory only).
     pub(crate) target: Zeroizing<String>,
     /// Canonical `reqDN`.
@@ -179,7 +180,7 @@ pub(crate) fn parse(e: &Entry) -> Result<Record, ()> {
     });
     let target_canon = Zeroizing::new(dn::canon(&target).unwrap_or_default());
     let authz = match e.first_str("reqAuthzID") {
-        Some(a) if !a.trim().is_empty() => Some(dn::canon(a).ok_or(())?),
+        Some(a) if !a.trim().is_empty() => Some(Zeroizing::new(dn::canon(a).ok_or(())?)),
         _ => None,
     };
     let result = match op {
@@ -269,7 +270,7 @@ pub(crate) mod tests {
         assert_eq!(r.scope, Some(LogScope::Sub));
         assert_eq!(r.session, Some(1000));
         assert_eq!(
-            r.authz.as_deref(),
+            r.authz.as_ref().map(|a| a.as_str()),
             Some("cn=databastion,ou=services,dc=example,dc=org")
         );
         assert_eq!(r.target_canon.as_str(), "ou=people,dc=example,dc=org");

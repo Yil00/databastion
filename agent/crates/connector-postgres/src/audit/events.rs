@@ -478,6 +478,8 @@ pub(crate) struct PgauditEvents {
     own: PgOwn,
     dumps: DumpTracker,
     catalogs: Catalogs,
+    /// Records dropped because their conversion panicked.
+    pub(crate) panicked: u64,
 }
 
 /// Statement text of a pgaudit record after the first one of its
@@ -504,6 +506,27 @@ impl PgauditEvents {
             own,
             dumps: DumpTracker::default(),
             catalogs: Catalogs::default(),
+            panicked: 0,
+        }
+    }
+
+    /// [`Self::flush`] of one statement in isolation: a statement whose
+    /// conversion panics is dropped alone, its records counted in
+    /// `panicked` (PR #83 re-review M-A).
+    fn flush_isolated(
+        &mut self,
+        group: Vec<AuditRecord>,
+        now: SystemTime,
+        out: &mut Vec<MaskedEvent>,
+    ) {
+        let n = group.len() as u64;
+        match databastion_core::isolate(|| {
+            let mut events = Vec::new();
+            self.flush(group, now, &mut events);
+            events
+        }) {
+            Some(events) => out.extend(events),
+            None => self.panicked = self.panicked.saturating_add(n),
         }
     }
 
@@ -527,12 +550,12 @@ impl PgauditEvents {
                 g.session == r.session && g.audit.statement_id == r.audit.statement_id
             });
             if !same && !group.is_empty() {
-                self.flush(std::mem::take(&mut group), now, &mut out);
+                self.flush_isolated(std::mem::take(&mut group), now, &mut out);
             }
             group.push(r);
         }
         if !group.is_empty() {
-            self.flush(group, now, &mut out);
+            self.flush_isolated(group, now, &mut out);
         }
         out
     }

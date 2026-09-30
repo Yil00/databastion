@@ -21,6 +21,15 @@
 //! `ctx`; the `auditLog` ties a record to the application name of a
 //! `clientMetadata` record of the same address and port. Both maps are
 //! bounded ([`MAX_CONNECTIONS`], oldest forgotten first).
+//!
+//! An `auditLog` endpoint (address and port) can be reused by a later
+//! connection, so its application name is forgotten on a `logout` record
+//! (explicit, or the implicit one MongoDB 5.0+ writes when the client
+//! disconnects), and on a successful `authenticate` that no
+//! `clientMetadata` record of the endpoint preceded since the previous one
+//! (a driver sends its metadata in `hello`, before authenticating): a new
+//! connection never inherits a previous one's name, the agent's own
+//! included (end-of-phase-5 review L4).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Instant, SystemTime};
@@ -50,6 +59,9 @@ struct ConnInfo {
     client: Option<ClientAddr>,
     user: Option<String>,
     app: Option<String>,
+    /// `auditLog`: a `clientMetadata` record was seen since the last
+    /// successful `authenticate` of the endpoint.
+    fresh_meta: bool,
 }
 
 /// Bounded map of followed connections (insertion order evicts).
@@ -159,6 +171,8 @@ pub(crate) struct EventBuilder {
     /// entry was not seen yet (at most [`MAX_POLL_CREDITS`]). Only that
     /// many poll-shaped reads of `system.profile` are left out uncharged.
     poll_credits: HashMap<String, u32>,
+    /// Records dropped because their conversion panicked.
+    pub(crate) panicked: u64,
 }
 
 /// Unused poll credits kept per database: polls whose own entry is never
@@ -189,6 +203,7 @@ impl EventBuilder {
             budget,
             conns: Conns::default(),
             poll_credits: HashMap::new(),
+            panicked: 0,
         }
     }
 
@@ -231,8 +246,12 @@ impl EventBuilder {
     ) -> Vec<MaskedEvent> {
         let mut out = Vec::new();
         for r in records {
-            if let Some(e) = self.one(r, source, now) {
-                out.push(e);
+            // Each record in isolation: one whose conversion panics is
+            // dropped alone, counted (PR #83 re-review M-A).
+            match databastion_core::isolate(|| self.one(r, source, now)) {
+                Some(Some(e)) => out.push(e),
+                Some(None) => {}
+                None => self.panicked = self.panicked.saturating_add(1),
             }
         }
         out
@@ -263,6 +282,7 @@ impl EventBuilder {
                 let id = r.conn?;
                 let entry = self.conns.entry(id);
                 entry.app = r.app;
+                entry.fresh_meta = true;
                 if r.client.is_some() {
                     entry.client = r.client;
                 }
@@ -280,6 +300,17 @@ impl EventBuilder {
                         EventPrincipal::failed_account(&user).with_client(client),
                         ts,
                     ));
+                }
+                if let Some(id @ ConnId::Remote(..)) = r.conn {
+                    // A new authentication on the endpoint without a new
+                    // `clientMetadata`: another connection, or one that
+                    // declared no name; the previous name is not its own.
+                    if let Some(entry) = self.conns.map.get_mut(&id) {
+                        if !entry.fresh_meta {
+                            entry.app = None;
+                        }
+                        entry.fresh_meta = false;
+                    }
                 }
                 let app = self.known(r.conn).and_then(|c| c.app.clone());
                 if let Some(ConnId::Log(_)) = r.conn {
@@ -873,6 +904,57 @@ mod tests {
         assert_eq!(ev[0].signals(), [Signal::FullTableRead, Signal::Mongodump]);
         assert!(ev[0].rows().is_none());
         assert_eq!(ev[1].signals(), [Signal::FullTableRead]);
+    }
+
+    /// End-of-phase-5 review L4: an endpoint's application name is
+    /// forgotten on `logout`, and on a new `authenticate` without its own
+    /// `clientMetadata`.
+    #[test]
+    fn audit_log_forgets_a_reused_endpoint_application_name() {
+        let meta = r#"{"atype":"clientMetadata","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"clientMetadata":{"application":{"name":"mongodump"}}},"result":0}"#;
+        let auth = r#"{"atype":"authenticate","ts":{"$date":"2026-09-29T10:00:00.500Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[{"user":"alice","db":"admin"}],"param":{"user":"alice","db":"admin","mechanism":"SCRAM-SHA-256"},"result":0}"#;
+        let find = r#"{"atype":"authCheck","ts":{"$date":"2026-09-29T10:00:01.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[{"user":"alice","db":"admin"}],"param":{"command":"find","ns":"app.customers","args":{"find":"customers","filter":{"a":1},"$db":"app"}},"result":0}"#;
+        let logout = r#"{"atype":"logout","ts":{"$date":"2026-09-29T10:00:02.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"reason":"Client has disconnected","initialUsers":[{"user":"alice","db":"admin"}],"updatedUsers":[]},"result":0}"#;
+        let convert = |lines: &[&str]| {
+            let records: Vec<Record> = lines
+                .iter()
+                .filter_map(|l| parse_audit_log(l.as_bytes()).unwrap())
+                .collect();
+            builder().convert(records, EventSource::MongodbAuditLog, SystemTime::now())
+        };
+        let apps = |ev: &[MaskedEvent]| -> Vec<Option<String>> {
+            ev.iter()
+                .map(|e| e.principal().application().map(str::to_owned))
+                .collect()
+        };
+        // The metadata, then the authentication, of the same connection.
+        let ev = convert(&[meta, auth, find]);
+        assert_eq!(
+            apps(&ev),
+            [Some("mongodump".to_owned()), Some("mongodump".to_owned())]
+        );
+        assert_eq!(ev[1].signals(), [Signal::Mongodump]);
+        // Logged out: the next connection on the same port has no name.
+        let ev = convert(&[meta, auth, logout, auth, find]);
+        assert_eq!(apps(&ev), [Some("mongodump".to_owned()), None, None]);
+        assert!(ev[2].signals().is_empty());
+        // No logout record, but a new authentication without metadata.
+        let ev = convert(&[meta, auth, find, auth, find]);
+        assert_eq!(
+            apps(&ev),
+            [
+                Some("mongodump".to_owned()),
+                Some("mongodump".to_owned()),
+                None,
+                None
+            ]
+        );
+        assert!(ev[3].signals().is_empty());
+        // A new connection with its own metadata keeps its name.
+        let ev = convert(&[meta, auth, logout, meta, auth, find]);
+        assert_eq!(ev[2].signals(), [Signal::Mongodump]);
+        // A logout record parses and yields no event.
+        assert!(convert(&[logout]).is_empty());
     }
 
     #[test]

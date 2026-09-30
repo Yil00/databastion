@@ -38,6 +38,9 @@ const MARKER: &str = "needle-7Qz-FAKE";
 const COLLECTION: &str = "users";
 
 fn env_path(var: &str, key: &str) -> Option<PathBuf> {
+    // A dev log may belong to the test's own user (the tailer refuses it
+    // in production).
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
     match std::env::var(var) {
         Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
         _ => {
@@ -238,6 +241,17 @@ async fn audit_from_the_server_log() {
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
     task.abort();
     let text: Vec<String> = events.iter().map(describe).collect();
+    // Interim I2 check (end-of-phase-5 review M1): no ground-truth value in
+    // the events as the core would send them, nor in the logs.
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    crate::i2::assert_clean(
+        "serialized events",
+        &gt,
+        "app",
+        &crate::i2::serialize_events(&events),
+    );
+    crate::i2::assert_clean("logs", &gt, "app", &logs.text());
     assert!(has(&events, COLLECTION, "signature.mongodump"), "{text:#?}");
     assert!(
         has(&events, COLLECTION, "shape.full_table_read"),
@@ -426,6 +440,17 @@ async fn audit_from_the_profiler() {
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", h.detail);
     task.abort();
     let text: Vec<String> = events.iter().map(describe).collect();
+    // Interim I2 check (end-of-phase-5 review M1): no ground-truth value in
+    // the events as the core would send them, nor in the logs.
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    crate::i2::assert_clean(
+        "serialized events",
+        &gt,
+        "app",
+        &crate::i2::serialize_events(&events),
+    );
+    crate::i2::assert_clean("logs", &gt, "app", &logs.text());
     let export = events
         .iter()
         .find(|e| {

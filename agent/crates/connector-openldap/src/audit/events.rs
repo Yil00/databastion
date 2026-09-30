@@ -24,6 +24,7 @@ use databastion_classifiers::masking::{
 use databastion_classifiers::names::{NormalizedName, normalize_ldap_dn};
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use databastion_core::job::SensitiveObject;
+use zeroize::Zeroizing;
 
 use super::filter::OwnFilter;
 use super::records::{LogScope, Op, Record};
@@ -278,62 +279,68 @@ impl EventBuilder {
 
     fn event(&mut self, r: &Record, now: Instant) -> Option<MaskedEvent> {
         let source = EventSource::OpenldapAccesslog;
-        let (action, principal, user) = match r.op {
-            Op::Unbind => {
-                self.forget_session(r.session);
-                return None;
-            }
-            Op::Other => return None,
-            Op::Bind { sasl } => {
-                // A bind DN that is not a DN (a password typed as the user
-                // name, review L3): fingerprinted, never an identity.
-                let malformed = r.target_canon.is_empty() && !r.target.trim().is_empty();
-                let user = if r.target_canon.is_empty() {
-                    None
-                } else {
-                    Some(r.target_canon.to_string())
-                };
-                match (r.result, sasl, user) {
-                    (14, _, _) => return None,
-                    (0, _, _) if malformed => (
-                        EventAction::Connect,
-                        EventPrincipal::failed_account(&r.target),
-                        None,
-                    ),
-                    (0, true, None) => (EventAction::Connect, EventPrincipal::unidentified(), None),
-                    (0, false, None) => (
-                        EventAction::Connect,
-                        EventPrincipal::account(ANONYMOUS),
-                        Some(ANONYMOUS.to_owned()),
-                    ),
-                    (0, _, Some(u)) => (EventAction::Connect, self.principal(&u), Some(u)),
-                    (_, _, u) => (
-                        EventAction::AuthFailure,
-                        EventPrincipal::failed_account(u.as_deref().unwrap_or(&r.target)),
-                        None,
-                    ),
-                }
-            }
-            Op::Search | Op::Compare | Op::Write => {
-                let reported = match r.op {
-                    // A search that failed but returned entries is kept.
-                    Op::Search => r.result == 0 || r.entries.is_some_and(|n| n > 0),
-                    // compareFalse, compareTrue.
-                    Op::Compare => matches!(r.result, 5 | 6),
-                    _ => r.result == 0,
-                };
-                if !reported {
+        let (action, principal, user): (EventAction, EventPrincipal, Option<Zeroizing<String>>) =
+            match r.op {
+                Op::Unbind => {
+                    self.forget_session(r.session);
                     return None;
                 }
-                let action = if r.op == Op::Write {
-                    EventAction::Write
-                } else {
-                    EventAction::Read
-                };
-                let user = r.authz.clone().unwrap_or_else(|| ANONYMOUS.to_owned());
-                (action, self.principal(&user), Some(user))
-            }
-        };
+                Op::Other => return None,
+                Op::Bind { sasl } => {
+                    // A bind DN that is not a DN (a password typed as the user
+                    // name, review L3): fingerprinted, never an identity.
+                    let malformed = r.target_canon.is_empty() && !r.target.trim().is_empty();
+                    let user = if r.target_canon.is_empty() {
+                        None
+                    } else {
+                        Some(Zeroizing::new(r.target_canon.to_string()))
+                    };
+                    match (r.result, sasl, user) {
+                        (14, _, _) => return None,
+                        (0, _, _) if malformed => (
+                            EventAction::Connect,
+                            EventPrincipal::failed_account(&r.target),
+                            None,
+                        ),
+                        (0, true, None) => {
+                            (EventAction::Connect, EventPrincipal::unidentified(), None)
+                        }
+                        (0, false, None) => (
+                            EventAction::Connect,
+                            EventPrincipal::account(ANONYMOUS),
+                            Some(Zeroizing::new(ANONYMOUS.to_owned())),
+                        ),
+                        (0, _, Some(u)) => (EventAction::Connect, self.principal(&u), Some(u)),
+                        (_, _, u) => (
+                            EventAction::AuthFailure,
+                            EventPrincipal::failed_account(u.as_deref().unwrap_or(&r.target)),
+                            None,
+                        ),
+                    }
+                }
+                Op::Search | Op::Compare | Op::Write => {
+                    let reported = match r.op {
+                        // A search that failed but returned entries is kept.
+                        Op::Search => r.result == 0 || r.entries.is_some_and(|n| n > 0),
+                        // compareFalse, compareTrue.
+                        Op::Compare => matches!(r.result, 5 | 6),
+                        _ => r.result == 0,
+                    };
+                    if !reported {
+                        return None;
+                    }
+                    let action = if r.op == Op::Write {
+                        EventAction::Write
+                    } else {
+                        EventAction::Read
+                    };
+                    let user = r
+                        .authz
+                        .clone()
+                        .unwrap_or_else(|| Zeroizing::new(ANONYMOUS.to_owned()));
+                    (action, self.principal(&user), Some(user))
+                }
+            };
         let mut e = MaskedEvent::new(source, action, principal, r.start);
         if matches!(r.op, Op::Search | Op::Compare | Op::Write) {
             let database = self
@@ -357,7 +364,7 @@ impl EventBuilder {
             Op::Write => e = e.with_rows(Some(1)),
             _ => {}
         }
-        let own = user.as_deref() == Some(self.identity.as_str());
+        let own = user.as_ref().map(|u| u.as_str()) == Some(self.identity.as_str());
         if own {
             let user = self.identity.clone();
             match self.own_shape(r) {

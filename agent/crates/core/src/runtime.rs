@@ -309,6 +309,9 @@ struct Counters {
     /// Connector calls (`check`, `discover`, `audit_stream`) that panicked
     /// and were turned into a failure of that call.
     connector_panics: AtomicU64,
+    /// Audit records the core asked streams to skip after repeated panics
+    /// at one read position ([`PanicTracker`]).
+    audit_records_skipped: AtomicU64,
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
@@ -316,6 +319,16 @@ struct Counters {
     /// batches were still spooled (flush wait elapsed, or `/findings`
     /// parked).
     scan_status_before_flush: AtomicU64,
+}
+
+/// The delay before restarting a failed audit stream: the backoff
+/// `delay`, at least the stream's poll interval and at most
+/// [`AUDIT_MAX_BACKOFF`], or the poll interval when that is longer (up to
+/// 3600 s). Never `Ord::clamp`: with a poll interval above the maximum its
+/// bounds would be inverted, and it would panic outside the connector
+/// guard, stopping the whole agent (PR #83 re-review H-A).
+fn audit_restart_delay(delay: Duration, poll: Duration) -> Duration {
+    delay.max(poll).min(AUDIT_MAX_BACKOFF.max(poll))
 }
 
 /// Capacity of the event channel between a connector and the core.
@@ -379,6 +392,142 @@ const AUDIT_MAX_PANICS: u32 = 3;
 /// A session that ran this long resets the panic count (the next panic is
 /// likely on another record).
 const AUDIT_PANIC_RESET: Duration = Duration::from_secs(600);
+/// Window over which the skips and the panics of a stream that has a
+/// saved position are counted.
+const AUDIT_POISON_WINDOW: Duration = Duration::from_secs(3600);
+/// Records skipped per [`AUDIT_POISON_WINDOW`] before the stream is
+/// stopped.
+const AUDIT_MAX_SKIPS: usize = 8;
+/// Panics per [`AUDIT_POISON_WINDOW`] of a stream that has a saved
+/// position before it is stopped (it moves between them, record by
+/// record, but never gets through).
+const AUDIT_MAX_POSITIONED_PANICS: usize = 64;
+
+/// What to do after an audit stream panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicAction {
+    /// Restart (with backoff). `isolate`: the stream is asked to hand over
+    /// and save its position after every record for a while
+    /// ([`audit::CursorStore::isolate`]), so its next panic is at the
+    /// exact record; `skip`: it is asked to skip that one record, bound to
+    /// the exact saved position ([`audit::CursorStore::skip_records`]).
+    Restart { isolate: bool, skip: u32 },
+    /// Stop the stream until Audit is reconfigured or the agent restarts,
+    /// with the count of panics reported.
+    Park(u32),
+}
+
+/// Panics of one audit stream (phase-7 security review: a record that
+/// always makes a connector panic must not blind Audit of the target for
+/// good, and must cost that record only).
+///
+/// Connectors parse each record in isolation ([`crate::isolate`]): a
+/// record that makes a parser panic is dropped there and counted. What
+/// still reaches this tracker is a panic elsewhere in the stream:
+///
+/// - A stream with a saved position (its cursor files,
+///   [`audit::PositionRegistry`]) is restarted in **isolation mode**
+///   (position saved after every record); after [`AUDIT_MAX_PANICS`]
+///   panics at one exact position it is asked to skip **one** record
+///   there. It is stopped after more than [`AUDIT_MAX_SKIPS`] skips or
+///   [`AUDIT_MAX_POSITIONED_PANICS`] panics within
+///   [`AUDIT_POISON_WINDOW`].
+/// - A stream without a saved position (a source whose position is in
+///   memory, restarted afresh anyway): [`AUDIT_MAX_PANICS`] panics in a
+///   row stop it; a session that ran [`AUDIT_PANIC_RESET`] resets that
+///   count.
+#[derive(Debug, Default)]
+struct PanicTracker {
+    /// Panics without a saved position, in a row.
+    in_row: u32,
+    /// Panics at the current position since the last skip request.
+    same: u32,
+    /// Panics at the current position in all (no progress between them),
+    /// skip requests included: past `2 * AUDIT_MAX_PANICS` the stream is
+    /// stopped whatever the time between them (a source that cannot skip,
+    /// or a skip that did not help).
+    at_position: u32,
+    position: Option<u64>,
+    /// Restart request in force (isolation, skip).
+    request: (bool, u32),
+    skips: std::collections::VecDeque<Instant>,
+    positioned: std::collections::VecDeque<Instant>,
+}
+
+impl PanicTracker {
+    /// Records a panic at the saved `position` of a session that ran
+    /// `long` (at least [`AUDIT_PANIC_RESET`]), at `now`.
+    fn on_panic(&mut self, position: Option<u64>, long: bool, now: Instant) -> PanicAction {
+        if long {
+            self.in_row = 0;
+            self.same = 0;
+            self.request = (false, 0);
+        }
+        for q in [&mut self.skips, &mut self.positioned] {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= AUDIT_POISON_WINDOW)
+            {
+                q.pop_front();
+            }
+        }
+        let Some(p) = position else {
+            self.position = None;
+            self.same = 0;
+            self.request = (false, 0);
+            self.in_row = self.in_row.saturating_add(1);
+            if self.in_row >= AUDIT_MAX_PANICS {
+                return PanicAction::Park(self.in_row);
+            }
+            return PanicAction::Restart {
+                isolate: false,
+                skip: 0,
+            };
+        };
+        self.positioned.push_back(now);
+        let total = u32::try_from(self.positioned.len()).unwrap_or(u32::MAX);
+        if self.positioned.len() > AUDIT_MAX_POSITIONED_PANICS {
+            return PanicAction::Park(total);
+        }
+        if self.position == Some(p) {
+            self.same = self.same.saturating_add(1);
+            self.at_position = self.at_position.saturating_add(1);
+        } else {
+            self.position = Some(p);
+            self.same = 1;
+            self.at_position = 1;
+        }
+        if self.at_position > 2 * AUDIT_MAX_PANICS {
+            return PanicAction::Park(self.at_position);
+        }
+        let mut skip = 0;
+        if self.same >= AUDIT_MAX_PANICS {
+            self.same = 0;
+            self.skips.push_back(now);
+            if self.skips.len() > AUDIT_MAX_SKIPS {
+                return PanicAction::Park(total);
+            }
+            skip = 1;
+        }
+        self.request = (true, skip);
+        PanicAction::Restart {
+            isolate: true,
+            skip,
+        }
+    }
+
+    /// The restart request in force.
+    fn request(&self) -> (bool, u32) {
+        self.request
+    }
+
+    /// A session ended without a panic (an error, or it returned): the
+    /// isolation request ends (it is for locating a record that panics;
+    /// PR #83 re-review L-B).
+    fn ended_without_panic(&mut self) {
+        self.request = (false, 0);
+    }
+}
 
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
 struct PreparedScan {
@@ -859,6 +1008,7 @@ impl Runtime {
             ("events_lost_total", &c.events_lost),
             ("audit_stream_failures_total", &c.audit_stream_failures),
             ("connector_panics_total", &c.connector_panics),
+            ("audit_records_skipped_total", &c.audit_records_skipped),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
             (
                 "scan_status_before_flush_total",
@@ -869,6 +1019,14 @@ impl Runtime {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
                 map.insert(key, value.load(Ordering::Relaxed) as f64);
             }
+        }
+        // Isolated units (a record, or a statement's group of records)
+        // whose handling panicked, one count each (`crate::isolate`): a
+        // crafted-record campaign stands out from malformed input (PR #83
+        // re-review L-C).
+        if let Ok(key) = MetricsMapKey::try_from("audit_record_panics_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::panics::record_panics() as f64);
         }
         let quarantined = self.lock_spool().counters.quarantined;
         if let Ok(key) = MetricsMapKey::try_from("spool_quarantined_total") {
@@ -1916,7 +2074,10 @@ impl Runtime {
         mut stop: watch::Receiver<bool>,
     ) {
         let mut failures: u32 = 0;
-        let mut panics: u32 = 0;
+        let mut panics = PanicTracker::default();
+        // The cursors this stream uses, and the exact positions a skip is
+        // bound to.
+        let positions = audit::PositionRegistry::default();
         // New settings (or an agent restart) give a stopped stream another
         // chance.
         self.lock_audit_parked().remove(&target_id);
@@ -1940,9 +2101,14 @@ impl Runtime {
                 return;
             };
             let dir = Self::audit_dir(&config);
-            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits);
+            let (isolate, skip) = panics.request();
+            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits).with_positions(
+                positions.clone(),
+                isolate,
+                skip,
+            );
             match crate::fsutil::ensure_private_dir(&dir) {
-                Ok(()) => cfg = cfg.with_state_dir(dir),
+                Ok(()) => cfg = cfg.with_state_dir(dir.clone()),
                 Err(e) => tracing::warn!(
                     target_id,
                     kind = %e.kind(),
@@ -1966,26 +2132,57 @@ impl Runtime {
                 AuditEnd::Panicked(panic_id) => {
                     bump(&self.counters.connector_panics, 1);
                     bump(&self.counters.audit_stream_failures, 1);
-                    panics = if began.elapsed() >= AUDIT_PANIC_RESET {
-                        1
-                    } else {
-                        panics.saturating_add(1)
+                    let position = positions.snapshot();
+                    let (isolate, skip) = match panics.on_panic(
+                        position,
+                        began.elapsed() >= AUDIT_PANIC_RESET,
+                        Instant::now(),
+                    ) {
+                        PanicAction::Park(n) => {
+                            tracing::error!(
+                                target_id,
+                                panic_id,
+                                panics = n,
+                                "audit stream stopped after repeated internal errors: \
+                                 reconfigure Audit or restart the agent"
+                            );
+                            self.lock_audit_parked().insert(target_id.clone(), n);
+                            return;
+                        }
+                        PanicAction::Restart { isolate, skip } => (isolate, skip),
                     };
-                    if panics >= AUDIT_MAX_PANICS {
+                    // The backoff grows with the panics at one position;
+                    // a new position or a skip is progress.
+                    if skip > 0 || (isolate && panics.same == 1) {
+                        failures = 0;
+                    }
+                    if skip > 0 && positions.skips_supported() {
+                        bump(&self.counters.audit_records_skipped, u64::from(skip));
                         tracing::error!(
                             target_id,
                             panic_id,
-                            panics,
-                            "audit stream stopped after repeated internal errors: reconfigure \
-                             Audit or restart the agent"
+                            "audit stream failed repeatedly at the same record: skipping that \
+                             record (counted as dropped)"
                         );
-                        self.lock_audit_parked().insert(target_id.clone(), panics);
-                        return;
+                    } else if skip > 0 {
+                        tracing::error!(
+                            target_id,
+                            panic_id,
+                            "audit stream failed repeatedly at the same read position; this \
+                             source cannot skip a record there: it is stopped if it goes on"
+                        );
+                    } else if isolate {
+                        tracing::warn!(
+                            target_id,
+                            panic_id,
+                            "audit stream failed: restarting it record by record to find the \
+                             record at fault"
+                        );
                     }
                     failures = failures.saturating_add(1);
                     let delay = backoff::Backoff::CONSOLE
-                        .delay(failures.saturating_sub(1), backoff::random_fraction())
-                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                        .delay(failures.saturating_sub(1), backoff::random_fraction());
+                    let delay = audit_restart_delay(delay, cfg.poll_interval());
                     tracing::error!(
                         target_id,
                         panic_id,
@@ -1998,11 +2195,12 @@ impl Runtime {
                     }
                 }
                 AuditEnd::Failed(e) => {
+                    panics.ended_without_panic();
                     bump(&self.counters.audit_stream_failures, 1);
                     failures = failures.saturating_add(1);
                     let delay = backoff::Backoff::CONSOLE
-                        .delay(failures.saturating_sub(1), backoff::random_fraction())
-                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                        .delay(failures.saturating_sub(1), backoff::random_fraction());
+                    let delay = audit_restart_delay(delay, cfg.poll_interval());
                     match &e {
                         Some(crate::ConnectorError::Target {
                             code, engine_code, ..
@@ -2712,7 +2910,7 @@ fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
     }
 }
 
-fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine {
+pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine {
     match engine {
         TargetEngine::Postgres => databastion_protocol::Engine::Postgres,
         TargetEngine::Mysql => databastion_protocol::Engine::Mysql,

@@ -2986,6 +2986,222 @@ async fn connector_panics_fail_the_call_not_the_agent() {
     assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
 }
 
+/// A stream over a list of records whose position (the next index) is
+/// saved **once per batch** (after the whole list), like a connector that
+/// commits after a poll; in isolation mode it saves after every record.
+/// The records at `poison` make it panic (outside any per-record
+/// isolation). It honours the core's skip request.
+struct Poisoned {
+    records: usize,
+    poison: Vec<usize>,
+    /// Records handed over, and records skipped.
+    delivered: Arc<StdMutex<Vec<usize>>>,
+    skipped: Arc<StdMutex<Vec<usize>>>,
+}
+
+#[async_trait::async_trait]
+impl Connector for Poisoned {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Limited,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    #[allow(clippy::panic)]
+    async fn audit_stream(
+        &self,
+        cfg: &crate::AuditConfig,
+        sink: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        let store = cfg.cursor("poisoned").unwrap();
+        let mut next: usize = match store.load().unwrap() {
+            Some(b) => String::from_utf8(b).unwrap().parse().unwrap(),
+            None => {
+                store.save(b"0").unwrap();
+                0
+            }
+        };
+        for _ in 0..store.skip_records() {
+            if next < self.records {
+                self.skipped.lock().unwrap().push(next);
+                next += 1;
+                store.save(next.to_string().as_bytes()).unwrap();
+            }
+        }
+        while next < self.records {
+            if self.poison.contains(&next) {
+                panic!("stream panicked on SECRET-VALUE");
+            }
+            let _ = sink.submit(fake_event(1)).await;
+            self.delivered.lock().unwrap().push(next);
+            next += 1;
+            if store.isolate() {
+                store.save(next.to_string().as_bytes()).unwrap();
+            }
+        }
+        store.save(next.to_string().as_bytes()).unwrap();
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+}
+
+/// Poison records (phase-7 security review): a stream with a saved
+/// position is restarted record by record, and after AUDIT_MAX_PANICS
+/// panics at one exact position one record is skipped there; it is stopped
+/// after too many skips or panics within the window. Without a saved
+/// position, AUDIT_MAX_PANICS panics in a row stop it, as before.
+#[test]
+fn panics_lead_to_isolation_then_one_skip() {
+    let now = Instant::now();
+    let mut t = PanicTracker::default();
+    let p = Some(7);
+    let iso = |skip| PanicAction::Restart {
+        isolate: true,
+        skip,
+    };
+    assert_eq!(t.on_panic(p, false, now), iso(0));
+    assert_eq!(t.on_panic(p, false, now), iso(0));
+    assert_eq!(t.on_panic(p, false, now), iso(1));
+    assert_eq!(t.request(), (true, 1));
+    // The stream moved record by record: a new position.
+    assert_eq!(t.on_panic(Some(8), false, now), iso(0));
+    // More than AUDIT_MAX_SKIPS skips within the window: stopped.
+    let mut t = PanicTracker::default();
+    let mut last = iso(0);
+    for i in 0..(AUDIT_MAX_PANICS as usize * (AUDIT_MAX_SKIPS + 1)) {
+        last = t.on_panic(Some(i as u64 / 3), false, now);
+        if matches!(last, PanicAction::Park(_)) {
+            break;
+        }
+    }
+    assert!(matches!(last, PanicAction::Park(_)), "{last:?}");
+    // Skips spread over more than the window: never stopped by skips.
+    let mut t = PanicTracker::default();
+    for i in 0..(AUDIT_MAX_SKIPS as u64 * 3) {
+        let at = now + AUDIT_POISON_WINDOW * u32::try_from(i).unwrap();
+        for _ in 0..AUDIT_MAX_PANICS {
+            assert!(matches!(
+                t.on_panic(Some(i), false, at),
+                PanicAction::Restart { .. }
+            ));
+        }
+    }
+    // Panics at ever new positions (never getting through): stopped past
+    // AUDIT_MAX_POSITIONED_PANICS within the window.
+    let mut t = PanicTracker::default();
+    let parked = (0..=AUDIT_MAX_POSITIONED_PANICS as u64)
+        .map(|i| t.on_panic(Some(1000 + i), false, now))
+        .last();
+    assert!(matches!(parked, Some(PanicAction::Park(_))));
+    // A skip that does not help (a source that cannot skip): stopped after
+    // 2 * AUDIT_MAX_PANICS panics at one position, whatever the time
+    // between them (PR #83 re-review M-A).
+    let mut t = PanicTracker::default();
+    let mut last = iso(0);
+    for i in 0..=(2 * AUDIT_MAX_PANICS) {
+        last = t.on_panic(Some(42), false, now + AUDIT_POISON_WINDOW * i);
+    }
+    assert!(matches!(last, PanicAction::Park(_)), "{last:?}");
+    // No saved position: AUDIT_MAX_PANICS in a row, as before.
+    let mut t = PanicTracker::default();
+    let plain = PanicAction::Restart {
+        isolate: false,
+        skip: 0,
+    };
+    assert_eq!(t.on_panic(None, false, now), plain);
+    assert_eq!(t.on_panic(None, false, now), plain);
+    assert_eq!(
+        t.on_panic(None, false, now),
+        PanicAction::Park(AUDIT_MAX_PANICS)
+    );
+    // A long session resets that count.
+    let mut t = PanicTracker::default();
+    t.on_panic(None, false, now);
+    t.on_panic(None, false, now);
+    assert_eq!(t.on_panic(None, true, now), plain);
+}
+
+/// A record that always makes the stream panic is found (isolation mode)
+/// and skipped alone: every other record is delivered, the stream is not
+/// stopped. The stream saves its position once per batch outside
+/// isolation, so a skip there would have dropped the batch head.
+#[tokio::test]
+async fn a_poison_record_is_skipped_alone() {
+    let server = MockServer::start().await;
+    let mut env = enrolled(&server).await;
+    env.config.limits.min_audit_poll_interval_s = 1;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let delivered: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let skipped: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let rt = Arc::new(
+        Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(Poisoned {
+                records: 6,
+                poison: vec![3],
+                delivered: Arc::clone(&delivered),
+                skipped: Arc::clone(&skipped),
+            })],
+        )
+        .unwrap(),
+    );
+    let body = serde_json::json!({ "jobs": [audit_job(
+        "01920f5f-0c30-7e6f-a043-2b3c4d5e6fb2",
+        serde_json::json!({"enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1}),
+    )]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let params = rt.lock_audits().snapshot().into_iter().next().unwrap().2;
+    let (stop, stop_rx) = watch::channel(false);
+    let run = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run_audit("pg-main".to_owned(), params, stop_rx).await })
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !delivered.lock().unwrap().contains(&5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the records after the poison one are delivered");
+    let _ = stop.send(true);
+    run.await.unwrap();
+    // Exactly the poison record skipped; every other one delivered (the
+    // batch head more than once: at least once after a panic).
+    assert_eq!(*skipped.lock().unwrap(), [3]);
+    let got: std::collections::BTreeSet<usize> =
+        delivered.lock().unwrap().iter().copied().collect();
+    assert_eq!(got, [0, 1, 2, 4, 5].into_iter().collect());
+    assert_eq!(rt.counters.audit_records_skipped.load(Ordering::Relaxed), 1);
+    assert_eq!(rt.lock_audit_parked().get("pg-main"), None);
+}
+
 // ------------------------------------------------------------------ audit
 
 /// An Audit connector: records the configuration it gets and submits
@@ -4118,4 +4334,109 @@ async fn a_heartbeat_is_never_held_longer_than_one_check_bound() {
     let targets = bodies[0]["targets"].as_array().unwrap();
     assert_eq!(targets.len(), 16);
     assert!(targets.iter().all(|t| t["last_error"] == "timeout"));
+}
+
+/// A connector whose Audit stream fails at once (an unreachable target).
+struct FailingAudit;
+
+#[async_trait::async_trait]
+impl Connector for FailingAudit {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: false,
+            audit_level: AuditLevel::None,
+            failure: Some(FailureCode::TargetUnreachable),
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Err(crate::ConnectorError::Target {
+            engine: Engine::Postgres,
+            code: FailureCode::TargetUnreachable,
+            engine_code: None,
+        })
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+}
+
+/// PR #83 re-review H-A: a poll interval above the maximum backoff (up to
+/// 3600 s) never inverts the restart delay bounds: a failing or panicking
+/// stream waits for its poll interval, the agent does not crash.
+#[tokio::test]
+async fn long_poll_intervals_never_crash_the_audit_worker() {
+    assert_eq!(
+        audit_restart_delay(Duration::from_secs(1), Duration::from_secs(3600)),
+        Duration::from_secs(3600)
+    );
+    assert_eq!(
+        audit_restart_delay(Duration::from_secs(900), Duration::from_secs(10)),
+        AUDIT_MAX_BACKOFF
+    );
+    assert_eq!(
+        audit_restart_delay(Duration::from_secs(1), Duration::from_secs(10)),
+        Duration::from_secs(10)
+    );
+    for connector in [
+        Box::new(FailingAudit) as Box<dyn Connector>,
+        Box::new(Panicky) as Box<dyn Connector>,
+    ] {
+        let server = MockServer::start().await;
+        let mut env = enrolled(&server).await;
+        env.config.limits.min_audit_poll_interval_s = 3600;
+        Mock::given(method("POST"))
+            .and(path_regex(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let rt =
+            Arc::new(Runtime::new(&env.config_path, env.config.clone(), vec![connector]).unwrap());
+        let body = serde_json::json!({ "jobs": [audit_job(
+            "01920f5f-0c30-7e6f-a043-2b3c4d5e6fc2",
+            serde_json::json!({"enabled": true, "aggregation_window_s": 1, "poll_interval_s": 3600}),
+        )]});
+        rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+            .await
+            .unwrap();
+        let params = rt.lock_audits().snapshot().into_iter().next().unwrap().2;
+        let (stop, stop_rx) = watch::channel(false);
+        let run = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move { rt.run_audit("pg-main".to_owned(), params, stop_rx).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rt.counters.audit_stream_failures.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stream failed once");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !run.is_finished(),
+            "waiting for the poll interval, not crashed"
+        );
+        let _ = stop.send(true);
+        run.await.expect("the audit worker did not panic");
+    }
 }

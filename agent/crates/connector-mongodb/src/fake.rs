@@ -931,7 +931,8 @@ fn seed_collections() -> Vec<FakeColl> {
 
 /// The dev seed, served over the wire by the scripted server, gives every
 /// ground-truth location of the `app` database and nothing on the
-/// negative controls; value-bearing keys never reach a location.
+/// negative controls; value-bearing keys never reach a location, and no
+/// ground-truth value is in clear in the serialized findings (interim I2).
 #[tokio::test]
 async fn seed_recall_over_the_wire() {
     let gt: serde_json::Value =
@@ -1027,6 +1028,9 @@ async fn seed_recall_over_the_wire() {
         extra.is_empty(),
         "findings outside the ground truth: {extra:?}"
     );
+    // Interim I2 check (end-of-phase-5 review M1): no ground-truth value
+    // (length >= 4) in clear in the serialized masked findings.
+    assert!(crate::i2::assert_no_value(&gt, "app", &findings) > 0);
 }
 
 /// Time-series collections are read through their view (no
@@ -1139,6 +1143,87 @@ async fn an_open_cursor_is_killed_when_the_batch_is_malformed() {
             "{received:?}"
         );
     }
+}
+
+/// End-of-phase-5 review I1: a truncated command has an unknown shape
+/// (no whole-read signal from a filter the server cut off), and an entry
+/// that does not parse is skipped and counted without failing the poll.
+#[tokio::test]
+async fn profiler_truncated_and_odd_entries() {
+    use crate::audit::profiler::{self, DbCursor};
+    let truncated = DocBuf::new()
+        .raw(0x09, "ts", &1_000i64.to_le_bytes())
+        .str("op", "query")
+        .str("ns", "app.users")
+        .i32("nreturned", 20_000)
+        .str("appName", "mongosh")
+        .str("client", "10.0.0.9")
+        .str("user", "alice@admin")
+        .str("cmd", "$truncated")
+        .bool("tr", true)
+        .i32("fk", 0)
+        .finish();
+    // A time, then a string whose length runs past the document.
+    let mut broken = DocBuf::new()
+        .raw(0x09, "ts", &1_500i64.to_le_bytes())
+        .str("op", "query")
+        .finish();
+    // The string length before "query\0" and the terminating NUL.
+    let at = broken.len() - 1 - 6 - 4;
+    broken[at..at + 4].copy_from_slice(&1000i32.to_le_bytes());
+    let entries = vec![
+        truncated,
+        broken,
+        profile_entry(2_000, "bob@admin", "mongodump", 0),
+    ];
+    let script = Script {
+        databases: vec![(
+            "app".to_owned(),
+            vec![FakeColl::new("system.profile", entries)],
+        )],
+        ..Script::default()
+    };
+    let (s, log) = session(script, PASSWORD).await;
+    let mut s = s.unwrap();
+    let mut cursor = DbCursor::after(0);
+    let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();
+    assert_eq!(polled.records.len(), 2);
+    assert_eq!(polled.dropped, 1);
+    // The projection sent flags truncated commands.
+    let sent = log.lock().unwrap().last().cloned().unwrap();
+    assert!(sent.keys.contains(&"projection".to_owned()));
+    let mut b = crate::audit::events::EventBuilder::new(
+        databastion_core::audit::own::OwnAccount::new(
+            "databastion@admin",
+            Some("databastion-agent"),
+            None,
+            200,
+            databastion_core::audit::own::SharedOwnUsage::default(),
+        ),
+        "databastion@admin".to_owned(),
+        200,
+    );
+    let events = b.convert(
+        polled.records,
+        databastion_classifiers::masking::EventSource::MongodbProfiler,
+        std::time::SystemTime::now(),
+    );
+    let signals: Vec<Vec<&str>> = events
+        .iter()
+        .map(|e| e.signals().iter().map(|s| s.as_str()).collect())
+        .collect();
+    assert_eq!(
+        signals,
+        [
+            vec!["volume.large_result"],
+            vec![
+                "shape.full_table_read",
+                "volume.large_result",
+                "signature.mongodump"
+            ],
+        ]
+    );
+    s.close().await;
 }
 
 /// A projected profiler entry (what the server returns for the fixed

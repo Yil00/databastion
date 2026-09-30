@@ -127,8 +127,9 @@ pub(crate) enum Line {
         scope: Scope,
         grantable: bool,
     },
-    /// Roles granted to the grantee (`WITH ADMIN OPTION`: grantable).
-    Roles { grantable: bool },
+    /// Roles granted to the grantee (`WITH ADMIN OPTION`: grantable), and
+    /// how many the line names.
+    Roles { grantable: bool, count: u64 },
     /// `REVOKE` or `SET DEFAULT ROLE`: not a grant.
     Ignored,
 }
@@ -176,7 +177,11 @@ pub(crate) fn parse_line(line: &str) -> Option<Line> {
         {
             return None;
         }
-        return Some(Line::Roles { grantable });
+        let count = 1 + roles
+            .iter()
+            .filter(|t| matches!(t, Tok::Punct(',')))
+            .count() as u64;
+        return Some(Line::Roles { grantable, count });
     };
     let privileges = privilege_list(&toks[1..on])?;
     let target = &toks[on + 1..to];
@@ -330,11 +335,17 @@ mod tests {
         );
         assert_eq!(
             parse_line("GRANT `app_read`@`%`,`app_write`@`%` TO `u`@`%`"),
-            Some(Line::Roles { grantable: false })
+            Some(Line::Roles {
+                grantable: false,
+                count: 2
+            })
         );
         assert_eq!(
             parse_line("GRANT `app_read`@`%` TO `u`@`%` WITH ADMIN OPTION"),
-            Some(Line::Roles { grantable: true })
+            Some(Line::Roles {
+                grantable: true,
+                count: 1
+            })
         );
         assert_eq!(
             parse_line("REVOKE INSERT ON `mysql`.* FROM `u`@`%`"),
@@ -366,7 +377,10 @@ mod tests {
         );
         assert_eq!(
             parse_line("GRANT `nested` TO `app_read`"),
-            Some(Line::Roles { grantable: false })
+            Some(Line::Roles {
+                grantable: false,
+                count: 1
+            })
         );
         assert_eq!(
             parse_line("SET DEFAULT ROLE `app_read` FOR `u`@`%`"),

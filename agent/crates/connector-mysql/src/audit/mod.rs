@@ -278,12 +278,15 @@ async fn file_run(
                 let mut unparsed = 0u64;
                 let mut records = Vec::with_capacity(p.records.len());
                 for r in &p.records {
-                    let parsed = match format {
+                    // Per-record isolation: a record that makes the parser
+                    // panic is dropped alone, counted (phase-7 review H1).
+                    let parsed = databastion_core::isolate(|| match format {
                         MysqlLogFormat::ServerAudit => {
                             records::parse_server_audit(r, utc_offset, query_limit)
                         }
                         MysqlLogFormat::Json => records::parse_json(r),
-                    };
+                    })
+                    .flatten();
                     match parsed {
                         Some(rec) => records.push(rec),
                         None => unparsed += 1,
@@ -294,7 +297,12 @@ async fn file_run(
             (t, polled)
         })
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
         let (records, more, unparsed) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
@@ -323,7 +331,19 @@ async fn file_run(
             );
             st.reported = (t.oversized, t.malformed());
         }
+        let panicked_before = st.builder.panicked;
         let events = st.builder.convert_file(records, source, SystemTime::now());
+        {
+            let panicked = st.builder.panicked.saturating_sub(panicked_before);
+            if panicked > 0 {
+                state.note_dropped(&target.id, panicked);
+                tracing::warn!(
+                    target_id = %target.id,
+                    dropped = panicked,
+                    "audit records whose conversion failed dropped (internal error)"
+                );
+            }
+        }
         for e in events {
             sink.submit(e).await?;
         }
@@ -333,7 +353,12 @@ async fn file_run(
             t
         })
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
         st.tailer = Some(t);
         if !more {
             if started.elapsed() >= REPROBE {

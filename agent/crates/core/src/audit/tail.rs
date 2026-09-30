@@ -18,6 +18,14 @@
 //! - Each poll reads at most [`MAX_POLL_BYTES`]; records are bounded by the
 //!   splitter. The path must be a regular file (checked before and after
 //!   opening, so a FIFO or a device is never read).
+//! - The file must **not be writable by the agent's own account**: not
+//!   owned by its effective uid, not world-writable, not group-writable
+//!   for one of its groups; checked on the opened handle, so after
+//!   following symlinks (end-of-phase-4 review L4). An audit log is
+//!   written by the database server; one the agent's account could write
+//!   would not be evidence of what the server did. Such a file is refused
+//!   like an unreadable one (`PermissionDenied`: `audit.log_not_readable`
+//!   in `check()`).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -294,10 +302,57 @@ pub struct Tailer {
     pub rotations: u64,
 }
 
+/// Test support only: accept log files the agent's user could write
+/// (every file a test creates is its own). Compiled only for tests and the
+/// `test-support` feature (enabled from the connectors'
+/// `[dev-dependencies]`), never set by the agent binary (checked by the
+/// architecture tests).
+#[cfg(any(test, feature = "test-support"))]
+static ALLOW_OWN_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test support only (see [`ALLOW_OWN_FILES`]): lets the tests of this
+/// crate and of the connectors tail files they created themselves.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn allow_agent_owned_logs_for_tests() {
+    ALLOW_OWN_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn own_files_allowed() -> bool {
+    ALLOW_OWN_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn own_files_allowed() -> bool {
+    false
+}
+
+/// Whether a log file is refused because the agent's own account could
+/// have written it: owned by the agent's effective user, writable by
+/// anyone (`S_IWOTH`), or writable by its group when that group is one of
+/// the agent's (effective or supplementary).
+fn writable_by_agent(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    if own_files_allowed() {
+        return false;
+    }
+    let mode = meta.permissions().mode();
+    if meta.uid() == rustix::process::geteuid().as_raw() || mode & 0o002 != 0 {
+        return true;
+    }
+    mode & 0o020 != 0 && {
+        let gid = meta.gid();
+        gid == rustix::process::getegid().as_raw()
+            || rustix::process::getgroups()
+                .map_or(true, |groups| groups.iter().any(|g| g.as_raw() == gid))
+    }
+}
+
 /// Opens the log without blocking (a FIFO or device planted at the path
 /// cannot block the open: `O_NONBLOCK`, `O_NOCTTY`), then checks the
-/// **handle** is a regular file (no stat-then-open race). Blocking I/O:
-/// call from a blocking thread.
+/// **handle** is a regular file (no stat-then-open race) not owned by the
+/// agent's own user. Blocking I/O: call from a blocking thread.
 fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailError> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
@@ -312,6 +367,14 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
         .map_err(|e| TailError::Unreadable(e.kind()))?;
     if !meta.file_type().is_file() {
         return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
+    }
+    if writable_by_agent(&meta) {
+        tracing::warn!(
+            "audit log refused: the agent's own user owns it or can write it (owner, a group of \
+             the agent's with write access, or world-writable); it must be written and owned by \
+             the database server (see the agent README, audit log files)"
+        );
+        return Err(TailError::Unreadable(std::io::ErrorKind::PermissionDenied));
     }
     Ok((file, meta.dev(), meta.ino(), meta.len()))
 }
@@ -520,6 +583,8 @@ mod tests {
     struct Dir(PathBuf);
     impl Dir {
         fn new(tag: &str) -> Self {
+            // The files of these tests are the test's own.
+            allow_agent_owned_logs_for_tests();
             let p = std::env::temp_dir().join(format!(
                 "databastion-tail-{tag}-{}-{}",
                 std::process::id(),

@@ -304,14 +304,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                     return Err(MgError::new(FailureCode::Timeout, Stage::Auth));
                 }
             };
+        // Sized for every element (keys, lengths, types, terminators):
+        // built without reallocating (no stray copy of the proof).
+        let capacity = 128 + last.len() + auth_source.len();
         let body = Zeroizing::new(
-            DocBuf::new()
+            DocBuf::with_capacity(capacity)
                 .i32("saslContinue", 1)
                 .i32("conversationId", conversation)
                 .binary("payload", &last)
                 .str("$db", auth_source)
                 .finish(),
         );
+        debug_assert!(body.len() <= capacity, "the saslContinue body grew");
         let reply = self.exchange(Stage::Auth, &body).await?;
         let (_, done, server_final) = sasl_reply(&reply).ok_or_else(refused)?;
         expected.verify(&server_final).map_err(|e| {

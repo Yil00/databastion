@@ -35,6 +35,9 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Test helpers of the core (owned log files, the contract conversion for
+# the interim I2 checks): tests only.
+databastion-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
 tracing-subscriber.workspace = true
 # Property tests of the protocol parsers and exchanges (src/proptests.rs).

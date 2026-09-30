@@ -11,6 +11,16 @@
 //!   pipeline stage operators (from a closed list, anything else
 //!   `other`). `command` and `originatingCommand`, which hold other users'
 //!   literals, never cross the wire.
+//! - **Truncated or odd commands** (end-of-phase-5 review I1): the server
+//!   replaces a command document over its size limit with
+//!   `{$truncated: "<text>", …}`. The projection flags it (`tr`), as it
+//!   does a `command` or `originatingCommand` that is not an object, and
+//!   the entry has an unknown shape (no whole-read signal from a filter
+//!   that was cut off). A truncated command whose name is lost is still
+//!   reported when it returned (a read) or wrote (a write) documents. A
+//!   `command` that is not an object never makes the projection fail, and
+//!   an entry that does not parse is skipped and counted, never failing
+//!   the whole poll.
 //! - The read position (last `ts` per database, and the entries already
 //!   read at that millisecond) is in memory; the first poll starts at the
 //!   newest entry (no history replay). The profiler is a capped
@@ -114,13 +124,82 @@ fn is_type(path: &str, t: &str) -> DocBuf {
     )
 }
 
+/// `{$cond: [<object at path>, <path>, {}]}`: the document at `path`
+/// when it is an object, else an empty one (`$objectToArray` fails on
+/// anything else, and would fail the whole `find`).
+fn object_or_empty(path: &str) -> DocBuf {
+    DocBuf::new().list(
+        "$cond",
+        DocBuf::new()
+            .doc("0", is_type(path, "object"))
+            .str("1", path)
+            .doc("2", DocBuf::new().doc("$literal", DocBuf::new())),
+    )
+}
+
+/// Whether the command at `path` is not a plain command document: present
+/// but not an object, or an object carrying the server's `$truncated`
+/// key.
+fn odd_command(path: &str) -> DocBuf {
+    let present_not_object = DocBuf::new().list(
+        "$and",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list(
+                    "$ne",
+                    DocBuf::new()
+                        .doc("0", DocBuf::new().str("$type", path))
+                        .str("1", "missing"),
+                ),
+            )
+            .doc(
+                "1",
+                DocBuf::new().list(
+                    "$ne",
+                    DocBuf::new()
+                        .doc("0", DocBuf::new().str("$type", path))
+                        .str("1", "object"),
+                ),
+            ),
+    );
+    // `$truncated` as a literal: a string starting with `$` is a field
+    // path in an expression.
+    let keys = DocBuf::new().doc(
+        "$map",
+        DocBuf::new()
+            .doc(
+                "input",
+                DocBuf::new().doc("$objectToArray", object_or_empty(path)),
+            )
+            .str("as", "t")
+            .str("in", "$$t.k"),
+    );
+    let truncated = DocBuf::new().list(
+        "$in",
+        DocBuf::new()
+            .doc("0", DocBuf::new().str("$literal", "$truncated"))
+            .doc("1", keys),
+    );
+    DocBuf::new().list(
+        "$or",
+        DocBuf::new()
+            .doc("0", present_not_object)
+            .doc("1", truncated),
+    )
+}
+
 /// The fixed projection (see the module documentation).
 pub(crate) fn projection() -> DocBuf {
-    // Command name: the first key of `command`.
-    let cmd = let_path(
-        "f",
-        first_pair(if_null(&["$command"], Some(DocBuf::new()))),
-        "$$f.k",
+    // Command name: the first key of `command` (none when it is not an
+    // object).
+    let cmd = let_path("f", first_pair(object_or_empty("$command")), "$$f.k");
+    // The command or the opening one is truncated or not an object.
+    let tr = DocBuf::new().list(
+        "$or",
+        DocBuf::new()
+            .doc("0", odd_command("$command"))
+            .doc("1", odd_command("$originatingCommand")),
     );
     // Filter keys: `filter` (find), `query` (count, distinct), or the
     // opening command's filter (getMore); -1 when not an object.
@@ -230,6 +309,7 @@ pub(crate) fn projection() -> DocBuf {
         p = p.i32(field, 1);
     }
     p.doc("cmd", cmd)
+        .doc("tr", tr)
         .doc("fk", fk)
         .doc("lim", lim)
         .doc("st", st)
@@ -308,13 +388,29 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
         return Ok(None);
     };
     let op = string(doc, "op")?.unwrap_or_default();
+    // Truncated (or not an object): the shape is unknown.
+    let odd = doc.flag("tr")?.unwrap_or(false);
+    let written = [
+        count(doc, "ninserted")?,
+        count(doc, "nModified")?,
+        count(doc, "ndeleted")?,
+    ];
+    let wrote = written.iter().flatten().any(|n| *n > 0);
+    let returned = count(doc, "nreturned")?.is_some_and(|n| n > 0);
     let cmd = match op.as_str() {
         "query" => Cmd::Find,
         "getmore" => Cmd::GetMore,
         "insert" => Cmd::Insert,
         "update" => Cmd::Update,
         "remove" => Cmd::Delete,
-        "command" => string(doc, "cmd")?.map_or(Cmd::Other, |c| Cmd::from_name(&c)),
+        "command" => match string(doc, "cmd")?.map(|c| Cmd::from_name(&c)) {
+            Some(c) if c != Cmd::Other => c,
+            // A command whose name was cut off: reported by what it did
+            // (a write, else a read of unknown shape), never dropped.
+            _ if odd && wrote => Cmd::Update,
+            _ if odd && returned => Cmd::Find,
+            _ => Cmd::Other,
+        },
         _ => Cmd::Other,
     };
     if cmd == Cmd::Other {
@@ -332,11 +428,6 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
         .and_then(address)
         .map(|(ip, _)| ClientAddr::Ip(ip));
     r.failed = doc.int("errCode")?.is_some_and(|c| c != 0);
-    let written = [
-        count(doc, "ninserted")?,
-        count(doc, "nModified")?,
-        count(doc, "ndeleted")?,
-    ];
     r.rows = match cmd {
         Cmd::Insert | Cmd::Update | Cmd::Delete | Cmd::FindAndModify | Cmd::BulkWrite => written
             .iter()
@@ -375,6 +466,13 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
             None => None,
         },
     };
+    if odd {
+        r.shape = Shape {
+            filter: Filter::Unknown,
+            limit: None,
+            pipeline: None,
+        };
+    }
     if cmd == Cmd::GetMore {
         // The projection took the opening command's shape.
         r.origin = Some(r.shape);
@@ -386,6 +484,8 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
 #[derive(Debug)]
 pub(crate) struct Polled {
     pub(crate) records: Vec<Record>,
+    /// Entries skipped because they do not parse (counted as dropped).
+    pub(crate) dropped: u64,
     /// The batch was full: poll again at once.
     pub(crate) more: bool,
 }
@@ -443,17 +543,28 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(bad)?
         .ok_or_else(|| bad(Malformed))?;
     let mut records = Vec::new();
+    let mut dropped = 0u64;
     let mut n = 0i64;
     let mut new_seen: HashMap<i64, HashSet<u64>> = HashMap::new();
     let mut last = cursor.ts;
     for e in batch.iter() {
         let (_, v) = e.map_err(bad)?;
         n += 1;
+        // One odd entry never fails the whole poll: skipped and counted.
         let Value::Doc(d) = v else {
-            return Err(bad(Malformed));
+            dropped += 1;
+            continue;
         };
         let h = hash_of(d.as_bytes());
-        let Some((ts, r)) = record_of(&d).map_err(bad)? else {
+        // Per-record isolation: an entry that makes the reader panic is
+        // dropped alone (phase-7 review H1).
+        let Some((ts, r)) = (match databastion_core::isolate(|| record_of(&d)) {
+            Some(Ok(r)) => r,
+            Some(Err(Malformed)) | None => {
+                dropped += 1;
+                continue;
+            }
+        }) else {
             continue;
         };
         // Already read (the server filters on `ts` too; this also guards
@@ -484,7 +595,11 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
             strict: false,
         };
     }
-    Ok(Polled { records, more })
+    Ok(Polled {
+        records,
+        dropped,
+        more,
+    })
 }
 
 #[cfg(test)]
@@ -508,8 +623,110 @@ mod tests {
             keys.push(k);
         }
         assert!(keys.contains(&"cmd".to_owned()) && keys.contains(&"st".to_owned()));
+        assert!(keys.contains(&"tr".to_owned()));
+        // `$objectToArray` never sees `command` or `originatingCommand`
+        // unguarded (a string `command` would fail the whole `find`).
+        let text = doc_text(&p);
+        for path in ["$command", "$originatingCommand"] {
+            assert!(!text.contains(&format!("$objectToArray{path}")), "{text}");
+            assert!(
+                text.contains(&format!("$objectToArray$cond$eq$type{path}{path}$literal")),
+                "{text}"
+            );
+        }
+        // `$truncated` is only ever a literal.
+        assert!(text.contains("$literal$truncated"), "{text}");
         assert!(!keys.contains(&"command".to_owned()));
         assert!(!keys.contains(&"originatingCommand".to_owned()));
+    }
+
+    /// The keys and string values of a document, depth first, joined.
+    fn doc_text(bytes: &[u8]) -> String {
+        fn visit(d: Doc<'_>, out: &mut String) {
+            for e in d.iter() {
+                let (k, v) = e.unwrap();
+                let k = std::str::from_utf8(k).unwrap();
+                if k.starts_with('$') {
+                    out.push_str(k);
+                }
+                match v {
+                    Value::Doc(d) | Value::Array(d) => visit(d, out),
+                    Value::Str(s) if s.starts_with(b"$") => {
+                        out.push_str(std::str::from_utf8(s).unwrap());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = String::new();
+        visit(Doc::new(bytes).unwrap(), &mut out);
+        out
+    }
+
+    /// End-of-phase-5 review I1: a truncated command (or one that is not
+    /// an object) has an unknown shape; one whose name was cut off is
+    /// reported by what it did.
+    #[test]
+    fn truncated_commands_have_an_unknown_shape() {
+        let entry = |op: &str, cmd: Option<&str>, tr: bool| {
+            let mut d = DocBuf::new()
+                .date("ts", 5)
+                .str("op", op)
+                .str("ns", "app.customers")
+                .i32("nreturned", 20_000)
+                .str("user", "alice@admin")
+                .i32("fk", 0)
+                .null("lim")
+                .null("st")
+                .bool("tr", tr);
+            if let Some(c) = cmd {
+                d = d.str("cmd", c);
+            }
+            d.finish()
+        };
+        // A `find` whose filter the server cut off: no whole-read shape.
+        let (_, r) = record_of(&Doc::new(&entry("query", Some("$truncated"), true)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert_eq!(r.shape.filter, Filter::Unknown);
+        assert_eq!(r.rows, Some(20_000));
+        // The same entry, not truncated: an empty filter.
+        let (_, r) = record_of(&Doc::new(&entry("query", Some("find"), false)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.shape.filter, Filter::Keys(0));
+        // A command whose name was cut off, that returned documents: a
+        // read of unknown shape.
+        let (_, r) = record_of(&Doc::new(&entry("command", Some("$truncated"), true)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert_eq!(r.shape.filter, Filter::Unknown);
+        // No name at all (`command` not an object).
+        let (_, r) = record_of(&Doc::new(&entry("command", None, true)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        // A getMore of a truncated cursor: no shape either.
+        let (_, r) = record_of(&Doc::new(&entry("getmore", None, true)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.origin.unwrap().filter, Filter::Unknown);
+        // Not truncated and not a known command: no event.
+        let (_, r) = record_of(&Doc::new(&entry("command", Some("hello"), false)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Other));
+        // A truncated command that did nothing: no event.
+        let nothing = DocBuf::new()
+            .date("ts", 5)
+            .str("op", "command")
+            .str("cmd", "$truncated")
+            .bool("tr", true)
+            .finish();
+        let (_, r) = record_of(&Doc::new(&nothing).unwrap()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Other));
     }
 
     #[test]

@@ -204,22 +204,33 @@ async fn pgaudit_run(
                 let more = p.more;
                 let mut mismatched = 0u64;
                 let mut forged = 0u64;
+                let mut panicked = 0u64;
                 let mut records: Vec<AuditRecord> = Vec::new();
                 for r in &p.records {
-                    match parse_record_checked(format, r, &severity_owned) {
-                        Ok(rec) => records.push(rec),
-                        Err(Skip::Severity) => mismatched += 1,
-                        Err(Skip::Context) => forged += 1,
-                        Err(Skip::NotAudit) => {}
+                    // Per-record isolation: a record that makes the parser
+                    // panic is dropped alone (phase-7 review H1).
+                    match databastion_core::isolate(|| {
+                        parse_record_checked(format, r, &severity_owned)
+                    }) {
+                        Some(Ok(rec)) => records.push(rec),
+                        Some(Err(Skip::Severity)) => mismatched += 1,
+                        Some(Err(Skip::Context)) => forged += 1,
+                        Some(Err(Skip::NotAudit)) => {}
+                        None => panicked += 1,
                     }
                 }
-                (records, more, mismatched, forged)
+                (records, more, mismatched, forged, panicked)
             });
             (t, polled)
         })
         .await
-        .map_err(|_| internal())?;
-        let (records, more, mismatched, forged) = match polled {
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
+        let (records, more, mismatched, forged, panicked) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
         };
@@ -230,6 +241,14 @@ async fn pgaudit_run(
                 dropped = mismatched,
                 "pgaudit records with another severity than pgaudit.log_level dropped \
                  (check pgaudit.log_level per database and role)"
+            );
+        }
+        if panicked > 0 {
+            state.note_dropped(&target.id, panicked);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = panicked,
+                "log records that make the parser fail dropped (internal error)"
             );
         }
         if forged > 0 {
@@ -252,7 +271,19 @@ async fn pgaudit_run(
             );
             st.reported_oversized = t.oversized;
         }
+        let panicked_before = st.builder.panicked;
         let events = st.builder.convert(records, SystemTime::now());
+        {
+            let panicked = st.builder.panicked.saturating_sub(panicked_before);
+            if panicked > 0 {
+                state.note_dropped(&target.id, panicked);
+                tracing::warn!(
+                    target_id = %target.id,
+                    dropped = panicked,
+                    "audit records whose conversion failed dropped (internal error)"
+                );
+            }
+        }
         for e in events {
             sink.submit(e).await?;
         }
@@ -262,7 +293,12 @@ async fn pgaudit_run(
             t
         })
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| {
+            // A panic in the task reaches the core's guard; anything else
+            // is an internal error.
+            let _ = databastion_core::resume_panic(e);
+            internal()
+        })?;
         st.tailer = Some(t);
         if !more {
             if started.elapsed() >= REPROBE {

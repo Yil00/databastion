@@ -40,7 +40,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use databastion_classifiers::masking::{
@@ -220,35 +220,7 @@ fn located(findings: &[MaskedFinding]) -> BTreeSet<Key> {
         .collect()
 }
 
-/// Captured log output of the connector.
-#[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Logs {
-    fn capture(&self) -> tracing::subscriber::DefaultGuard {
-        let logs = self.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || logs.clone())
-            .finish();
-        tracing::subscriber::set_default(subscriber)
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
+use crate::i2::Logs;
 
 fn codes(notes: &[TargetNote]) -> Vec<&'static str> {
     notes.iter().map(|n| n.code().as_str()).collect()
@@ -431,6 +403,18 @@ async fn seed_recall_regression() {
         }
     }
     assert!(!text.contains("uid="), "an entry DN reached the logs");
+    // Interim I2 check (end-of-phase-6 review L2): no ground-truth value
+    // and no entry DN in the serialized findings nor in the logs.
+    let values = crate::i2::ground_truth_values(&gt);
+    assert!(!values.is_empty());
+    let agent = service_dn();
+    crate::i2::assert_clean(
+        "serialized findings",
+        &crate::i2::findings_text(&findings),
+        &values,
+        &[],
+    );
+    crate::i2::assert_clean("scan logs", &text, &values, &[&agent]);
 }
 
 /// A bulk export of the tree as the administrator: the real `ldapsearch`
@@ -495,10 +479,15 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
     let cfg = AuditConfig::local(&t, 1, &limits).with_state_dir(dir.0.clone());
     let connector = Arc::new(OpenldapConnector::new());
     let (sink, mut rx) = EventSink::channel(4096);
+    let stream_logs = Logs::default();
     let stream = {
+        use tracing::instrument::WithSubscriber as _;
         let connector = Arc::clone(&connector);
         let cfg = cfg.clone();
-        tokio::spawn(async move { connector.audit_stream(&cfg, &sink).await })
+        tokio::spawn(
+            async move { connector.audit_stream(&cfg, &sink).await }
+                .with_subscriber(stream_logs.dispatch()),
+        )
     };
     // Let the stream start. On a first start it also reads the last minute
     // of the log (earlier tests): only what happens from here on counts.
@@ -565,6 +554,19 @@ async fn audit_reports_a_bulk_export_and_leaves_the_agent_out() {
             .ends_with(".cursor")
     }));
     assert!(!logs.text().contains("uid="));
+    // Interim I2 check (end-of-phase-6 review L2): no ground-truth value
+    // and no entry DN in the serialized events (the administrator leaves
+    // as a fingerprint), nor in the logs of the scan and of the stream.
+    let values = crate::i2::ground_truth_values(&crate::i2::ground_truth());
+    let agent = service_dn();
+    crate::i2::assert_clean(
+        "serialized events",
+        &crate::i2::events_text(&events),
+        &values,
+        &[&agent],
+    );
+    crate::i2::assert_clean("scan logs", &logs.text(), &values, &[&agent]);
+    crate::i2::assert_clean("stream logs", &stream_logs.text(), &values, &[&agent]);
 }
 
 #[tokio::test]

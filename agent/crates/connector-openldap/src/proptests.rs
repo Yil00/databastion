@@ -98,6 +98,47 @@ proptest! {
         }
     }
 
+    /// Random bodies inside a valid LDAPMessage frame (SEQUENCE, message
+    /// id, a response application tag) reach the response parser, and
+    /// random filter texts inside valid parentheses reach the accesslog
+    /// filter reader: never a panic (end-of-phase-6 review L5).
+    #[test]
+    fn framed_random_bodies_reach_the_parsers(
+        body in proptest::collection::vec(any::<u8>(), 0..300),
+        op in proptest::sample::select(vec![1u8, 4, 5, 19, 24]),
+        id in 0i64..100_000,
+        constructed in any::<bool>(),
+        text in "[ -~]{0,120}",
+        raw in proptest::collection::vec(any::<u8>(), 0..120),
+    ) {
+        use crate::ber::Enc;
+        let tag = if constructed { ber::app(op) } else { ber::app_primitive(op) };
+        let msg = Enc::constructed(
+            ber::SEQUENCE,
+            &[Enc::int(ber::INTEGER, id), Enc::raw(tag, &body)],
+        );
+        if let Ok(m) = proto::parse(msg.as_bytes()) {
+            prop_assert_eq!(i64::from(m.id), id);
+        }
+        prop_assert_eq!(
+            ber::message_len(msg.as_bytes()).ok().flatten(),
+            Some(msg.as_bytes().len())
+        );
+        walk(msg.as_bytes());
+        for f in [
+            format!("({text})"),
+            format!("(&({text}))"),
+            format!("(|({text})(objectClass=*))"),
+            format!("(!({text}))"),
+        ] {
+            let _ = filter::facts(f.as_bytes());
+        }
+        let mut framed = b"(&(".to_vec();
+        framed.extend_from_slice(&raw);
+        framed.extend_from_slice(b"))");
+        let _ = filter::facts(&framed);
+    }
+
     #[test]
     fn entry_dns_never_reach_a_container_name(
         uid in "[a-z0-9.@+-]{1,24}",

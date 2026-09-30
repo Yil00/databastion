@@ -208,10 +208,97 @@ review remain the primary controls.
   the shipped graph. `deny-dev.toml` checks licenses and sources of the full
   graph, dev-dependencies included.
 
+### Audit streams that panic
+A connector call that panics fails that call only (`crate::panics`).
+Connectors parse every audit record in isolation (`databastion_core::isolate`),
+and the file sources also convert each record (PostgreSQL: each statement's
+group of records) to events in isolation: a record that makes that code panic
+is dropped alone and counted (`audit.records_dropped`, per record; and the
+heartbeat metric `audit_record_panics_total`, one per isolated unit that
+failed, a record or a statement's group, which tells crafted-record campaigns
+apart from malformed input). A panic in a blocking parse task is resumed on the stream,
+never turned into an ordinary error that restarts it in a loop
+(`databastion_core::resume_panic`).
+
+A panic that still ends the stream is handled by the core: a stream with a
+saved position (the cursor files it uses) is restarted in **isolation mode**
+(`CursorStore::isolate`: for its first read round it hands over and saves its
+position after every record, the OpenLDAP stream also saving the entry being
+handed over), so a panic that comes again is at the exact record at fault;
+after 3 panics at that exact position, the stream is asked to skip **that one
+record** (`CursorStore::skip_records`, applied only when the saved position is
+still the one the panics happened at; counted as dropped, and in
+`audit_records_skipped_total`). Only the OpenLDAP accesslog stream can skip;
+the file sources rely on per-record isolation. A stream is stopped until Audit
+is reconfigured or the agent restarts (`audit.stream_stopped`) after 7 panics
+at one position with no progress between them, more than 8 skips or 64
+panics within an hour, or 3 panics in a row on a source whose position is in
+memory (restarted afresh anyway). A stream that fails is restarted after its
+backoff, at least its poll interval (up to 3600 s) and at most 300 s or the
+poll interval when longer.
+
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
 capped at `warn`: drivers and HTTP clients may log parameters or payloads at
 debug/trace level.
+
+### Audit log files
+Every file source (the PostgreSQL server log, the MariaDB `server_audit` log,
+the MySQL `audit_log` / `audit_log_filter` JSON file, the MongoDB `auditLog` and
+server log) is read by the core tailer (`crates/core/src/audit/tail.rs`):
+opened without blocking, it must be a regular file, and it must **not be
+writable by the agent's own account**: not owned by the agent's effective uid,
+not world-writable, and not group-writable when its group is one of the
+agent's (effective or supplementary groups). This is checked on the opened
+handle, so after following symlinks (end-of-phase-4 review L4). An audit log is
+the database server's evidence: a file the agent's account could write could
+have been forged or rewritten by it. Such a file is refused like an unreadable
+one: `check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
+its source, and the agent logs `audit log refused`. **Consequently, an agent
+running as root while the log belongs to root, or running as the database's
+own user, gets `audit.log_not_readable`**: run the agent as its own user and
+give it read access through a group without write permission or an ACL on a
+file the server owns (for instance `0640`, owner `mysql`, group
+`databastion`). Tests enable their own files through
+`allow_agent_owned_logs_for_tests()`, compiled only for tests and the core's
+`test-support` feature (enabled from the connectors' `[dev-dependencies]`),
+and only test code calls it (guarded by `crates/agent/tests/architecture.rs`).
+
+### Audit streams that panic
+A connector call that panics fails that call only (`crate::panics`). An
+Audit stream that panics is restarted from its persisted read position. When
+it panics again and again **at the same saved position** (a record that
+crashes a parser), the core asks it to skip records there: after 3 panics, 1
+record, then 2, 4… at each further panic there (at most 12 rounds); the
+connector drops them without parsing, counts them as dropped
+(`audit.records_dropped`, and `audit_records_skipped_total` in the heartbeat
+metrics), and goes on. File sources do it in the core tailer, the OpenLDAP
+accesslog on its own entries (`CursorStore::skip_records`). Panics at
+different positions (3 in a row), or on a source whose position is in memory
+(restarted afresh anyway), still stop the stream until Audit is reconfigured
+or the agent restarts (`audit.stream_stopped`).
+
+### Logs
+`DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
+capped at `warn`: drivers and HTTP clients may log parameters or payloads at
+debug/trace level.
+
+### Audit log files
+Every file source (the PostgreSQL server log, the MariaDB `server_audit` log,
+the MySQL `audit_log` / `audit_log_filter` JSON file, the MongoDB `auditLog` and
+server log) is read by the core tailer (`crates/core/src/audit/tail.rs`):
+opened without blocking, it must be a regular file, and it must **not be
+owned by the agent's own user** (effective uid), checked on the opened handle,
+so after following symlinks (end-of-phase-4 review L4). An audit log is the
+database server's evidence: a file the agent's account owns could have been
+written or rewritten by that account. Such a file is refused like an unreadable
+one (`check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
+its source, and the agent logs `audit log refused: the file is owned by the
+agent's own user`). Give the agent read access through a group or an ACL on a
+file the server owns (for instance `0640`, owner `mysql`, group
+`databastion`), never ownership. Tests enable owned files through
+`allow_agent_owned_logs_for_tests()`, which only test code calls (guarded by
+`crates/agent/tests/architecture.rs`).
 
 ### PostgreSQL connector
 tokio-postgres with the connector's own rustls adapter
@@ -322,7 +409,11 @@ Behavior:
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as
-  `privilege.roles_not_evaluated`;
+  `privilege.roles_not_evaluated`. When `APPLICABLE_ROLES` cannot be read (MySQL before
+  8.0.19, or any error), the roles are counted from the role lines of the account's own
+  `SHOW GRANTS FOR CURRENT_USER()` (and MySQL's `mandatory_roles`), all as not evaluated; when
+  that cannot be read or has a line the parser does not understand, the privileges are reported
+  as `privilege.not_evaluated` (fail closed);
 - Audit (P4-B): access events from the `server_audit` log or the `audit_log` /
   `audit_log_filter` JSON file (`mysql.audit_log`, tailed by the core with a persisted cursor),
   or from `performance_schema` (`DIGEST_TEXT` first); statement text analyzed by the MySQL
@@ -405,11 +496,13 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
 - sources, one per target, chosen by the same rule as `check()` and re-evaluated every 5 minutes:
   the Enterprise / Percona `auditLog` JSON file (`mongodb.audit_log` with `format: audit_log`;
   **Partial** once a successful `authCheck` record was read in the last 24 h, which needs
-  `auditAuthorizationSuccess`, Limited before; no document counts), the structured JSON server
+  `auditAuthorizationSuccess`, Limited once any `auditLog` record was read in the last 24 h, None
+  before ([ADR-0030](../docs/adr/0030-mongodb-auditlog-freshness.md); the agent's own
+  authentication at each check writes one); no document counts), the structured JSON server
   log (`format: server_log`; **Limited**), or, without a usable file, the profiler of the
   databases whose `system.profile` the account can `find` (**Limited**; not on a `mongos`); the
-  server log and the profiler report None (`audit.limited_pending_first_record`) until the stream
-  read a record of them in the last 24 h.
+  three sources report None (`audit.limited_pending_first_record`) until the stream read a record
+  of them in the last 24 h.
   **Full is never reported**;
 - files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
@@ -502,7 +595,9 @@ Audit (ADR-0029 decisions 7 to 10; `src/audit/`):
   (`audit.accesslog_not_readable`);
 - incremental by `entryCSN` (commit order; `reqStart` would skip long exports), with a 10 s
   overlap and the CSNs already read; `sizeLimit` 1000 per search, repeated while cut; cursor
-  persisted by the core, first start one minute back;
+  and the CSNs read within the overlap (at most 1000) persisted by the core, so an entry
+  committed out of CSN order just before a restart is still read after it; first start one
+  minute back;
 - read: `reqType`, `reqStart`, `reqSession`, `reqAuthzID`, `reqDN`, `reqResult`, `reqScope`,
   `reqFilter`, `reqAttr`, `reqAttrsOnly`, `reqEntries`, `reqSizeLimit`, `reqMethod`,
   `entryCSN`; never `reqMod`, `reqOld`, `reqAssertion`, `reqMessage` or the controls. The filter
