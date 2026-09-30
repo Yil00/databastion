@@ -413,6 +413,11 @@ pub(crate) const MANDATORY_ROLES: &str = "SELECT @@GLOBAL.mandatory_roles";
 /// privileges included, on the agent's session).
 pub(crate) const SHOW_GRANTS_CURRENT_ROLE: &str = "SHOW GRANTS FOR CURRENT_ROLE";
 
+/// MariaDB 10.11 and later: the privileges granted to `PUBLIC`, which every
+/// account holds and `APPLICABLE_ROLES` does not list. MariaDB shows them
+/// without `SELECT` on the `mysql` database.
+pub(crate) const SHOW_GRANTS_PUBLIC: &str = "SHOW GRANTS FOR PUBLIC";
+
 /// Whether `init_connect` is set (SQL run at every login of an account
 /// without `SUPER` / `CONNECTION_ADMIN`: user code at connection). The text
 /// itself is not read.
@@ -645,6 +650,7 @@ mod tests {
             show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
             CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_CURRENT_ROLE.to_owned(),
+            SHOW_GRANTS_PUBLIC.to_owned(),
             SHOW_GRANTS_OWN.to_owned(),
             MANDATORY_ROLES.to_owned(),
             INIT_CONNECT.to_owned(),

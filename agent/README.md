@@ -393,7 +393,11 @@ Behavior:
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as
-  `privilege.roles_not_evaluated`. When `APPLICABLE_ROLES` cannot be read (MySQL before
+  `privilege.roles_not_evaluated`. On MariaDB 10.11 and later, the privileges granted to
+  `PUBLIC` (held by every account, not listed in `APPLICABLE_ROLES`) are read with
+  `SHOW GRANTS FOR PUBLIC` (no privilege needed; "no such grant" means none) and evaluated the
+  same way (phase 7); when they cannot be read or parsed, or `PUBLIC` is granted a role, `PUBLIC`
+  counts as a role not evaluated. When `APPLICABLE_ROLES` cannot be read (MySQL before
   8.0.19, or any error), the roles are counted from the role lines of the account's own
   `SHOW GRANTS FOR CURRENT_USER()` (and MySQL's `mandatory_roles`), all as not evaluated; when
   that cannot be read or has a line the parser does not understand, the privileges are reported
