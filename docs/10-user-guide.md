@@ -128,21 +128,20 @@ Also:
 What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations.
 
 ## 9. Discovery: scans and findings
-1. On the agent page, open **Scan** on a target (administrator). Parameters are optional: rows sampled per object (default 200), maximum duration (900 s), statement timeout (30 s), database / schema / object filters and classifiers. The agent caps them with its local `limits`.
+1. On the agent page, open **Scan** on a target (administrator). Parameters are optional: rows sampled per object (default 200), maximum duration (3600 s since #94, to leave room for paced scans), statement timeout (30 s), database / schema / object filters and classifiers. The agent caps them with its local `limits`.
 2. The agent page shows the last scan of each target and a link to its findings.
 3. **Findings** lists, per target and classifier, the locations (database, schema or container, object, field) that hold a sensitive data type, with masked samples (at most 4 digits kept). Filter by agent, target and classifier.
 4. An administrator can mark a finding as a **false positive**; the mark is cleared automatically when a later scan matches more values or uses another classifier set.
 
 **Scans are paced, and therefore long.** To keep the monitored database under 2 % CPU while a scan runs, the agent pauses after each object's sampling and each catalog read so that its time in queries is at most `limits.discovery_duty_cycle_percent` of the scan's time (`agent.yaml`, default `1`, range 1 to 100, `100` disables pacing; [ADR-0035](adr/0035-discovery-pacing.md), proposed). A scan uses one connection and the agent runs one scan at a time, so a scan costs the server at most about that share of one core. The cost is time: a scan lasts about `100 / d` times its query time, e.g. about 2 minutes instead of 7 seconds for 200 MariaDB tables at the default of 1 %.
 
-Sizing the scan's **maximum duration** (`max_duration_s`, console default 900 s, capped by the agent's `limits.max_scan_duration_s`, default 3600 s):
-- at 1 %, each second of query time needs about 100 s of scan budget. 900 s covers about 9 s of query time (some 1 800 objects at 5 ms each); 3600 s about 36 s;
-- measure first: the agent logs each scan's busy and paused time at its end (`scan pacing`);
-- for a larger database, raise the scan's maximum duration, and `limits.max_scan_duration_s` above it (up to 86 400 s), or narrow the scan with filters;
-- raise `limits.discovery_duty_cycle_percent` only where the server has spare cores: 2 % on a 4-core server is 0.5 % of it;
-- a scan that reaches its maximum duration ends `failed` with `timeout`; the findings produced until then are kept.
+Sizing the scan's **maximum duration** (`max_duration_s`, console default 3600 s, capped by the agent's `limits.max_scan_duration_s`, default 3600 s):
+- at 1 %, each second of query time needs about 100 s of scan budget: 3600 s covers about 36 s of query time (some 7 000 objects at 5 ms each);
+- measure first: the agent logs each scan's busy and paused time at its end, and whether it ran out of time (`scan pacing`);
+- a paced scan that would run past its maximum duration does not end in `timeout`: it stops before the next object, reports the objects left as **`skipped_limit`** in its coverage (and a warning in the agent log), and **succeeds**. `skipped_limit` after a paced scan means the budget was too small: raise the scan's maximum duration, and `limits.max_scan_duration_s` above it (up to 86 400 s), or raise `limits.discovery_duty_cycle_percent` where the server has spare cores (2 % on a 4-core server is 0.5 % of it), or narrow the scan with filters. Each scan starts at another position in the object list, so successive scans do not skip the same objects;
+- the 0.1 console stores the coverage counters with the scan job but does not display them yet: look for the warning in the agent log.
 
-Scans of several targets of one agent run one after the other. The agent acknowledges a scan only when it starts it, and in 0.1 the console fails a scan left unacknowledged for 5 leases of 120 s (about 10 minutes, `timeout`). While a long scan runs, launch the next scan of the same agent after it ends (ROADMAP phase 7 follow-up). A queued scan's maximum duration also counts its time in the queue.
+Scans of several targets of one agent run one after the other, and a queued scan's maximum duration counts its time in the queue. Since #94 the console keeps a queued scan while the agent is online, so several scans can be launched at once.
 
 Classifiers and their semantics: [agent/crates/classifiers/README.md](../agent/crates/classifiers/README.md).
 
@@ -160,7 +159,7 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 - **Notifications** (administrator): e-mail (SMTP with STARTTLS or TLS) and HMAC-signed webhook (`https://` only) channels, with a test button. Webhook receivers must escape the names they render, because a database account name is chosen by the client ([console/README.md](../console/README.md#alerting)). Channels flagged for system alerts also receive the console's own alerts: silent agent, agent integrity, dropped batches, stopped Audit stream, within an hourly budget per channel.
 
 ## 12. Upgrading
-Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment).
+Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment).
 
 ## 13. Reporting a problem
 Bugs: GitHub issues. Vulnerabilities: never in a public issue, see [SECURITY.md](../SECURITY.md).
