@@ -212,8 +212,10 @@ review remain the primary controls.
 A connector call that panics fails that call only (`crate::panics`).
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's
-group of records) to events in isolation: a record that makes that code panic
-is dropped alone and counted (`audit.records_dropped`, per record; and the
+group of records) to events in isolation, as do the polled sources for each
+statement (`performance_schema`: its conversion; `pg_stat_statements`: its
+text's analysis and its conversion; the MongoDB profiler: each entry): a
+record that makes that code panic is dropped alone and counted (`audit.records_dropped`, per record; and the
 heartbeat metric `audit_record_panics_total`, one per isolated unit that
 failed, a record or a statement's group, which tells crafted-record campaigns
 apart from malformed input). A panic in a blocking parse task is resumed on the stream,

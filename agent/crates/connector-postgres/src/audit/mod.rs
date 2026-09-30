@@ -173,7 +173,7 @@ pub(crate) async fn audit_stream(
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
                     poller.set_catalogs(pre.catalogs.clone());
-                    pss_run(cfg, target, sink, session, poller, timeouts).await?;
+                    pss_run(cfg, target, sink, state, session, poller, timeouts).await?;
                 }
             }
             Source::None => {
@@ -315,13 +315,25 @@ async fn pss_run(
     cfg: &AuditConfig,
     target: &TargetConfig,
     sink: &EventSink,
+    state: &CheckState,
     session: &crate::conn::Session,
     poller: &mut pss::PssPoller,
     timeouts: Timeouts,
 ) -> Result<(), ConnectorError> {
     let started = Instant::now();
     loop {
-        match poller.poll(session, timeouts, sink).await {
+        let panicked_before = poller.panicked;
+        let polled = poller.poll(session, timeouts, sink).await;
+        let panicked = poller.panicked.saturating_sub(panicked_before);
+        if panicked > 0 {
+            state.note_dropped(&target.id, panicked);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = panicked,
+                "pg_stat_statements statements whose analysis failed dropped (internal error)"
+            );
+        }
+        match polled {
             Ok(()) => {}
             Err(pss::PollError::Db(e)) => {
                 tracing::warn!(

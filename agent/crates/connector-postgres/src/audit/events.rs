@@ -763,6 +763,7 @@ pub(crate) struct StatementDelta<'a> {
 /// event is the sum over the poll interval of one statement for one role.
 /// The agent's own account is reported only for deltas carrying a signal
 /// (the application name is not visible here).
+#[cfg(test)]
 pub(crate) fn pss_events(
     deltas: &[StatementDelta<'_>],
     own: &mut PgOwn,
@@ -770,97 +771,140 @@ pub(crate) fn pss_events(
     from: SystemTime,
     to: SystemTime,
 ) -> Vec<MaskedEvent> {
+    pss_events_counted(deltas, own, catalogs, from, to).0
+}
+
+/// [`pss_events`], with the number of statements dropped because their
+/// conversion panicked: each statement is converted in isolation
+/// (`databastion_core::isolate`), so one that makes the analysis code
+/// panic is dropped alone (security review of #85).
+pub(crate) fn pss_events_counted(
+    deltas: &[StatementDelta<'_>],
+    own: &mut PgOwn,
+    catalogs: &Catalogs,
+    from: SystemTime,
+    to: SystemTime,
+) -> (Vec<MaskedEvent>, u64) {
     // The pg_dump pattern per role within the poll.
     // No object names here: unqualified `pg_*` names stay catalogs.
     let none = HashSet::new();
+    let mut panicked = 0u64;
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
         let rule = catalogs.rule(d.database, true, &none);
         let all: Vec<&StatementInfo> = d.analysis.parts().iter().collect();
-        let c = copied_to_client(&all, rule);
-        if !c.is_empty() {
-            copied.entry(d.user).or_default().extend(c);
+        // A panic here is counted when the same statement is converted
+        // below (it panics there too, or is converted without this part).
+        if let Some(c) = databastion_core::isolate(|| copied_to_client(&all, rule)) {
+            if !c.is_empty() {
+                copied.entry(d.user).or_default().extend(c);
+            }
         }
     }
     let mut out = Vec::new();
     for d in deltas {
-        let rule = catalogs.rule(d.database, true, &none);
-        let a = d.analysis;
-        let all: Vec<&StatementInfo> = a.parts().iter().collect();
-        let action = match a.kind() {
-            StatementKind::Select | StatementKind::Table | StatementKind::Values => {
-                EventAction::Read
-            }
-            StatementKind::Copy => {
-                if a.copy().is_some_and(|c| c.to) {
-                    EventAction::Read
-                } else {
-                    EventAction::Write
-                }
-            }
-            StatementKind::Insert
-            | StatementKind::Update
-            | StatementKind::Delete
-            | StatementKind::Merge => EventAction::Write,
-            StatementKind::Ddl => EventAction::Ddl,
-            StatementKind::Dcl => EventAction::Dcl,
-            _ => continue,
-        };
-        let (objects, named_any) = user_relations(&all, rule);
-        let rw = matches!(action, EventAction::Read | EventAction::Write);
-        if rw && objects.is_empty() && named_any {
-            continue;
+        match databastion_core::isolate(|| pss_event(d, own, catalogs, &copied, from, to)) {
+            Some(Some(e)) => out.push(e),
+            Some(None) => {}
+            None => panicked += 1,
         }
-        // COPY counts rows in pg_stat_statements too.
-        let rows = Some(d.rows);
-        let mut e = MaskedEvent::new(
-            EventSource::PgStatStatements,
-            action,
-            EventPrincipal::account(d.user),
-            from,
-        )
-        .with_rows(rows)
-        .with_aggregate(d.calls, to);
-        for o in &objects {
-            e = e.with_object(object(d.database, o));
-        }
-        if rw && objects.is_empty() {
-            e = e.with_object(unknown_object(d.database));
-        }
-        if action == EventAction::Read {
-            for s in statement_signals(&all, rows, rule) {
-                e = e.with_signal(s);
-            }
-            if !copied_to_client(&all, rule).is_empty()
-                && copied
-                    .get(d.user)
-                    .is_some_and(|s| s.len() >= DUMP_MIN_RELATIONS)
-            {
-                e = e.with_signal(Signal::PgDump);
-            }
-        } else if d.rows > LARGE_ROWS {
-            e = e.with_signal(Signal::LargeResult);
-        }
-        let kind = if objects.is_empty() && !named_any && own.own_shape(a) {
-            OwnKind::Tableless
-        } else if rw && objects.is_empty() {
-            OwnKind::Unknown
-        } else {
-            OwnKind::Named
-        };
-        if own.routine(
-            d.user,
-            None,
-            ClientSeen::NotVisible,
-            &e,
-            kind,
-            Instant::now(),
-        ) {
-            continue;
-        }
-        out.push(e);
     }
-    out
+    (out, panicked)
+}
+
+/// Tests: a statement of this role makes its conversion panic (a bug on
+/// one statement).
+#[cfg(test)]
+pub(crate) const TEST_POISON_USER: &str = "test-conversion-panic";
+
+/// One statement's event (see [`pss_events`]); `None` when it gives none.
+fn pss_event(
+    d: &StatementDelta<'_>,
+    own: &mut PgOwn,
+    catalogs: &Catalogs,
+    copied: &HashMap<&str, HashSet<RelationName>>,
+    from: SystemTime,
+    to: SystemTime,
+) -> Option<MaskedEvent> {
+    #[cfg(test)]
+    #[allow(clippy::panic)]
+    if d.user == TEST_POISON_USER {
+        panic!("conversion bug on a statement");
+    }
+    let none = HashSet::new();
+    let rule = catalogs.rule(d.database, true, &none);
+    let a = d.analysis;
+    let all: Vec<&StatementInfo> = a.parts().iter().collect();
+    let action = match a.kind() {
+        StatementKind::Select | StatementKind::Table | StatementKind::Values => EventAction::Read,
+        StatementKind::Copy => {
+            if a.copy().is_some_and(|c| c.to) {
+                EventAction::Read
+            } else {
+                EventAction::Write
+            }
+        }
+        StatementKind::Insert
+        | StatementKind::Update
+        | StatementKind::Delete
+        | StatementKind::Merge => EventAction::Write,
+        StatementKind::Ddl => EventAction::Ddl,
+        StatementKind::Dcl => EventAction::Dcl,
+        _ => return None,
+    };
+    let (objects, named_any) = user_relations(&all, rule);
+    let rw = matches!(action, EventAction::Read | EventAction::Write);
+    if rw && objects.is_empty() && named_any {
+        return None;
+    }
+    // COPY counts rows in pg_stat_statements too.
+    let rows = Some(d.rows);
+    let mut e = MaskedEvent::new(
+        EventSource::PgStatStatements,
+        action,
+        EventPrincipal::account(d.user),
+        from,
+    )
+    .with_rows(rows)
+    .with_aggregate(d.calls, to);
+    for o in &objects {
+        e = e.with_object(object(d.database, o));
+    }
+    if rw && objects.is_empty() {
+        e = e.with_object(unknown_object(d.database));
+    }
+    if action == EventAction::Read {
+        for s in statement_signals(&all, rows, rule) {
+            e = e.with_signal(s);
+        }
+        if !copied_to_client(&all, rule).is_empty()
+            && copied
+                .get(d.user)
+                .is_some_and(|s| s.len() >= DUMP_MIN_RELATIONS)
+        {
+            e = e.with_signal(Signal::PgDump);
+        }
+    } else if d.rows > LARGE_ROWS {
+        e = e.with_signal(Signal::LargeResult);
+    }
+    let kind = if objects.is_empty() && !named_any && own.own_shape(a) {
+        OwnKind::Tableless
+    } else if rw && objects.is_empty() {
+        OwnKind::Unknown
+    } else {
+        OwnKind::Named
+    };
+    if own.routine(
+        d.user,
+        None,
+        ClientSeen::NotVisible,
+        &e,
+        kind,
+        Instant::now(),
+    ) {
+        return None;
+    }
+    Some(e)
 }
 
 /// Analysis of a `pg_stat_statements` text (`truncated`: the text reached
@@ -2303,5 +2347,35 @@ mod tests {
         );
         assert!(split_object_name("a..b").is_none());
         assert!(split_object_name("\"open").is_none());
+    }
+
+    /// Security review of #85: on `pg_stat_statements`, a statement whose
+    /// conversion panics is dropped alone and counted; the others give
+    /// their events.
+    #[test]
+    fn a_panicking_pss_conversion_drops_one_statement() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let read = analyze_pss("SELECT * FROM crm.customers", false);
+        let deltas = vec![
+            StatementDelta {
+                user: TEST_POISON_USER,
+                database: "shop",
+                analysis: &read,
+                calls: 1,
+                rows: 5,
+            },
+            StatementDelta {
+                user: "alice",
+                database: "shop",
+                analysis: &read,
+                calls: 1,
+                rows: 5,
+            },
+        ];
+        let (events, panicked) =
+            pss_events_counted(&deltas, &mut own(), &Catalogs::default(), t0, t0);
+        assert_eq!(panicked, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].principal().account_name(), "alice");
     }
 }

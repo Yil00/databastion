@@ -541,10 +541,10 @@ impl PsPoller {
                 // conversion panic is dropped alone and counted (the
                 // cursor is persisted, so a panic that ended the stream
                 // would come back at every restart).
-                match databastion_core::isolate(|| self.builder.statement(access, now)) {
-                    Some(Some(e)) => events.push(e),
-                    Some(None) => {}
-                    None => self.panicked = self.panicked.saturating_add(1),
+                match convert(&mut self.builder, access, now) {
+                    Ok(Some(e)) => events.push(e),
+                    Ok(None) => {}
+                    Err(()) => self.panicked = self.panicked.saturating_add(1),
                 }
             }
             if !full {
@@ -561,6 +561,34 @@ impl PsPoller {
         self.save();
         Ok(())
     }
+}
+
+/// Tests: a statement text holding this marker makes its conversion
+/// panic (a bug on one statement).
+#[cfg(test)]
+const TEST_POISON: &[u8] = b"TEST-ANALYZER-PANIC";
+
+/// One statement's event, converted in isolation
+/// (`databastion_core::isolate`, as the file sources do; security review
+/// of #85): `Err(())` when the conversion panicked (the statement is
+/// dropped alone and counted).
+fn convert(
+    builder: &mut EventBuilder,
+    access: Access<'_>,
+    now: SystemTime,
+) -> Result<Option<databastion_classifiers::masking::MaskedEvent>, ()> {
+    databastion_core::isolate(|| {
+        #[cfg(test)]
+        #[allow(clippy::panic)]
+        if access
+            .text
+            .is_some_and(|t| t.windows(TEST_POISON.len()).any(|w| w == TEST_POISON))
+        {
+            panic!("conversion bug on a statement");
+        }
+        builder.statement(access, now)
+    })
+    .ok_or(())
 }
 
 fn text_of(v: Option<&[u8]>) -> Option<String> {
@@ -634,5 +662,48 @@ mod tests {
             .collect();
         let s = to_save(Some(u64::MAX), Some(u64::MAX), &seen).unwrap();
         assert!(serde_json::to_vec(&s).unwrap().len() <= 64 * 1024);
+    }
+
+    /// Security review of #85: a statement whose conversion panics is
+    /// dropped alone; the next one is converted.
+    #[test]
+    fn a_panicking_statement_is_dropped_alone() {
+        use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+        let mut b = EventBuilder::new(OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("172.18.0.1"),
+            1000,
+            SharedOwnUsage::default(),
+        ));
+        let access = |text: &'static [u8]| Access {
+            session: "t1".into(),
+            user: "app",
+            principal: EventPrincipal::account("app"),
+            client: ClientSeen::Logged(None),
+            application: None,
+            database: "hr",
+            text: Some(text),
+            opaque: false,
+            truncated: false,
+            tables: Vec::new(),
+            rows: Some(5),
+            status: 0,
+            ts: SystemTime::now(),
+            source: EventSource::PerformanceSchema,
+        };
+        let now = SystemTime::now();
+        assert!(
+            convert(
+                &mut b,
+                access(b"select * from employees /* TEST-ANALYZER-PANIC */"),
+                now
+            )
+            .is_err()
+        );
+        let e = convert(&mut b, access(b"select * from employees"), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.principal().account_name(), "app");
     }
 }
