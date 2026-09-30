@@ -351,3 +351,8 @@ agent reports the Limited level from that source, the Audit steps run the same w
 recognized by its `COPY … TO STDOUT` of several whole tables), and the pgaudit-only checks (level,
 source, literal positive control in the target's log) are replaced or skipped, as printed. It is not
 a substitute for the CI run.
+
+## Load / database impact
+The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to
+measure the database CPU impact of Discovery, the Audit path under a sustained workload and the
+agent's resource use. It runs in its own workflow, outside the required `CI result` check.
