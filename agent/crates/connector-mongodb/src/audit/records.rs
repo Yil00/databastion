@@ -932,6 +932,9 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             Some(r)
         }
         "authenticate" => {
+            if head.result == Some(AUTH_ABANDONED) {
+                return Ok(None);
+            }
             let line: AuthenticateLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let ok = head.result == Some(0);
             let mut r = base(Kind::Auth { ok });
@@ -979,6 +982,18 @@ const ID_CLIENT_METADATA: i64 = 51800;
 const ID_AUTH_OK: [i64; 2] = [5_286_306, 20250];
 /// Failed to authenticate (5.0+ / 4.4).
 const ID_AUTH_FAILED: [i64; 2] = [5_286_307, 20249];
+
+/// `AuthenticationAbandoned`: an authentication conversation the client
+/// left unfinished, logged as "Failed to authenticate" (server log) or an
+/// `authenticate` record (`auditLog`) when the connection closes. Drivers
+/// do it routinely: a pool closed while a connection is still in its
+/// handshake (a speculative `saslStart` in `hello`, or a `saslStart`
+/// without its `saslContinue`) abandons that connection's conversation.
+/// The client never sent a proof, so no credential was refused: not a
+/// failed login, and no event (it would be a false `auth_failure`). A
+/// refused proof is `AuthenticationFailed` (18), an unknown account
+/// `UserNotFound` (11): both are still reported.
+const AUTH_ABANDONED: i64 = 337;
 
 #[derive(Deserialize)]
 struct LogHead {
@@ -1068,6 +1083,54 @@ struct AuthAttr {
     remote: Option<String>,
     #[serde(default, rename = "isClusterMember")]
     cluster_member: Option<bool>,
+    /// Error code of the attempt (5.0+; 4.4 logs a status string, never
+    /// copied).
+    #[serde(default)]
+    result: ResultCode,
+}
+
+/// A numeric `result`, or nothing: a status string (MongoDB 4.4, which may
+/// quote the user name) is visited without being copied.
+#[derive(Default)]
+struct ResultCode(Option<i64>);
+
+impl<'de> Deserialize<'de> for ResultCode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ResultCode;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an error code or a status")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ResultCode, E> {
+                Ok(ResultCode(Some(v)))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ResultCode, E> {
+                Ok(ResultCode(i64::try_from(v).ok()))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<ResultCode, E> {
+                Ok(ResultCode(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<ResultCode, E> {
+                Ok(ResultCode(None))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<ResultCode, E> {
+                Ok(ResultCode(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<ResultCode, E> {
+                Ok(ResultCode(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ResultCode, A::Error> {
+                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ResultCode(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ResultCode, A::Error> {
+                while s.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ResultCode(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 fn conn_of(ctx: Option<&str>) -> Option<u64> {
@@ -1170,6 +1233,11 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
         id if ID_AUTH_OK.contains(&id) || ID_AUTH_FAILED.contains(&id) => {
             let line: AuthLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let a = line.attr;
+            // An abandoned conversation (the names may be empty then):
+            // valid, not an audit record.
+            if a.result.0 == Some(AUTH_ABANDONED) {
+                return Ok(None);
+            }
             let mut r = base(Kind::Auth {
                 ok: ID_AUTH_OK.contains(&id),
             });
@@ -1308,6 +1376,49 @@ mod tests {
         // An invalid namespace still drops the record.
         let ns = SLOW_FIND.replace(r#""ns":"app.customers""#, r#""ns":"a\u0000b.c""#);
         assert!(parse_server_log(ns.as_bytes()).is_err());
+    }
+
+    /// Lines as MongoDB 8.0 writes them (addresses and names replaced).
+    const ABANDONED_SPECULATIVE: &str = r#"{"t":{"$date":"2026-09-30T07:25:49.712+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn82","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:47742","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"exporter","db":"admin","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected","result":337,"metrics":{"conversation_duration":{"micros":13582,"summary":{"0":{"step":1,"step_total":2,"duration_micros":247}}}},"doc":{},"extraInfo":{}}}"#;
+    const ABANDONED_UNNAMED: &str = r#"{"t":{"$date":"2026-09-30T07:25:49.571+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn81","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:47732","isSpeculative":false,"isClusterMember":false,"mechanism":"","user":"","db":"","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected","result":337,"metrics":{"conversation_duration":{"micros":19107,"summary":{}}},"doc":{},"extraInfo":{}}}"#;
+    const USER_NOT_FOUND: &str = r#"{"t":{"$date":"2026-09-30T07:29:25.032+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn328","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:51024","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"nobody","db":"admin","error":"UserNotFound: Could not find user \"nobody\" for db \"admin\"","result":11,"metrics":{"conversation_duration":{"micros":541,"summary":{"0":{"step":1,"step_total":2,"duration_micros":510}}}},"doc":{"application":{"name":"mongosh 2.11.1"}},"extraInfo":{}}}"#;
+
+    #[test]
+    fn abandoned_authentications_are_not_failed_logins() {
+        // A driver closing a connection in its handshake: valid lines,
+        // no record (not dropped as unparsable either).
+        assert!(
+            parse_server_log(ABANDONED_SPECULATIVE.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_server_log(ABANDONED_UNNAMED.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        // Refused credentials still are.
+        let r = parse_server_log(USER_NOT_FOUND.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("nobody@admin"));
+        let refused = ABANDONED_SPECULATIVE
+            .replace("AuthenticationAbandoned", "AuthenticationFailed")
+            .replace(r#""result":337"#, r#""result":18"#);
+        let r = parse_server_log(refused.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
+        // MongoDB 4.4: the result is a status string, not a code.
+        let old = r#"{"t":{"$date":"2026-09-29T10:00:00.000+00:00"},"s":"I","c":"ACCESS","id":20249,"ctx":"conn13","msg":"Authentication failed","attr":{"mechanism":"SCRAM-SHA-256","principalName":"mallory","authenticationDatabase":"admin","client":"10.0.0.9:1234","result":"UserNotFound: Could not find user mallory@admin"}}"#;
+        let r = parse_server_log(old.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("mallory@admin"));
+        // `auditLog`: the same code in `result`.
+        let audit = r#"{"atype":"authenticate","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"user":"exporter","db":"admin","mechanism":"SCRAM-SHA-256"},"result":337}"#;
+        assert!(parse_audit_log(audit.as_bytes()).unwrap().is_none());
+        let refused = audit.replace(r#""result":337"#, r#""result":18"#);
+        let r = parse_audit_log(refused.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
     }
 
     #[test]
