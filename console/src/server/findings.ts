@@ -12,7 +12,7 @@ import { registeredClassifiers } from "@/lib/protocol/classifiers";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
 import { decryptMaskedSamples, encryptMaskedSamples, maskedSamplesKey } from "./samples";
-import { scanDeadlineSql } from "./scans";
+import { scanAnchorSql, scanDeadlineSql } from "./scans";
 
 /**
  * Discovery findings (P2-D): ingestion of `POST /findings` batches, the findings view and
@@ -33,11 +33,11 @@ export const FINDINGS_JOB_STATUSES = ["delivered", "running", "succeeded", "fail
 
 /**
  * Late batches (M1). A finished (`succeeded` / `failed`) scan accepts findings for this long after
- * `least(finished_at, delivered_at + max_duration_s + SCAN_GRACE_MS)`: the bound on how long an
+ * `least(finished_at, first_delivered_at + max_duration_s + SCAN_GRACE_MS)`: the bound on how long an
  * agent's spool may hold a batch of a finished scan (e.g. console outage, network partition). The
  * scan's own deadline caps it, so a final status sent long after the deadline does not reopen the
- * window; a null `finished_at` or `delivered_at` closes it (fail closed). A `delivered` / `running` scan accepts them until
- * `delivered_at + max_duration_s + SCAN_GRACE_MS` (see `scans.ts`). Later batches get `404` on
+ * window; a null `finished_at` or delivery instant closes it (fail closed). A `delivered` / `running` scan accepts them until
+ * `first_delivered_at + max_duration_s + SCAN_GRACE_MS`, never moved by a redelivery (see `scans.ts`). Later batches get `404` on
  * `/job_id` (the agent drops them), so an agent cannot write into old jobs forever.
  */
 export const LATE_BATCH_RETENTION_MS = 24 * 3600_000;
@@ -185,7 +185,7 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
                 coalesce(${scanDeadlineSql}, '-infinity'::timestamptz)
               ) >= now() - make_interval(secs => ${LATE_BATCH_RETENTION_MS / 1000})
           when ${jobs.status} in ('delivered', 'running')
-            then ${jobs.deliveredAt} is not null and ${scanDeadlineSql} >= now()
+            then ${scanAnchorSql} is not null and ${scanDeadlineSql} >= now()
           else false end`,
       })
       .from(jobs)

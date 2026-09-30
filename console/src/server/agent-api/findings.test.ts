@@ -514,7 +514,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       const stale = await deliveredScan(auth);
       await getDb()
         .update(jobs)
-        .set({ status: "succeeded", deliveredAt: hoursAgo(30), finishedAt: hoursAgo(1) })
+        .set({ status: "succeeded", deliveredAt: hoursAgo(30), firstDeliveredAt: hoursAgo(30), finishedAt: hoursAgo(1) })
         .where(eq(jobs.id, stale));
       expect((await post(auth, batch(stale))).status).toBe(404);
       await getDb().update(jobs).set({ status: "failed" }).where(eq(jobs.id, stale));
@@ -523,27 +523,46 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       const recent = await deliveredScan(auth);
       await getDb()
         .update(jobs)
-        .set({ status: "failed", deliveredAt: hoursAgo(20), finishedAt: hoursAgo(1) })
+        .set({ status: "failed", deliveredAt: hoursAgo(20), firstDeliveredAt: hoursAgo(20), finishedAt: hoursAgo(1) })
         .where(eq(jobs.id, recent));
       expect((await post(auth, batch(recent))).status).toBe(202);
       // A finished job that was never delivered (no delivered_at): closed.
       const undelivered = await deliveredScan(auth);
       await getDb()
         .update(jobs)
-        .set({ status: "failed", deliveredAt: null, finishedAt: hoursAgo(1) })
+        .set({ status: "failed", deliveredAt: null, firstDeliveredAt: null, finishedAt: hoursAgo(1) })
         .where(eq(jobs.id, undelivered));
       expect((await post(auth, batch(undelivered))).status).toBe(404);
     });
 
-    it("refuses batches of a running scan past delivered_at + max_duration_s + grace", async () => {
+    it("refuses batches of a running scan past first_delivered_at + max_duration_s + grace", async () => {
       const auth = await agentWithTargets();
       const jobId = await deliveredScan(auth, "pg-prod-1", { max_duration_s: 600 });
       await getDb().update(jobs).set({ status: "running" }).where(eq(jobs.id, jobId));
       const past = new Date(Date.now() - 600_000 - SCAN_GRACE_MS - 60_000);
-      await getDb().update(jobs).set({ deliveredAt: new Date(past.getTime() + 120_000) }).where(eq(jobs.id, jobId));
+      const inTime = new Date(past.getTime() + 120_000);
+      await getDb().update(jobs).set({ deliveredAt: inTime, firstDeliveredAt: inTime }).where(eq(jobs.id, jobId));
       expect((await post(auth, batch(jobId))).status).toBe(202);
-      await getDb().update(jobs).set({ deliveredAt: past }).where(eq(jobs.id, jobId));
+      await getDb().update(jobs).set({ deliveredAt: past, firstDeliveredAt: past }).where(eq(jobs.id, jobId));
       expect((await post(auth, batch(jobId))).status).toBe(404);
+    });
+
+    it("anchors the window on the first delivery: a redelivery and a late running ack do not extend it (M1)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth, "pg-prod-1", { max_duration_s: 600 });
+      const past = new Date(Date.now() - 600_000 - SCAN_GRACE_MS - 60_000);
+      // First delivered past the window, redelivered a minute ago, acknowledged `running` late.
+      await getDb()
+        .update(jobs)
+        .set({ status: "running", firstDeliveredAt: past, deliveredAt: new Date(Date.now() - 60_000), leaseUntil: null })
+        .where(eq(jobs.id, jobId));
+      expect((await post(auth, batch(jobId))).status).toBe(404);
+      // Same redelivery, first delivered within the window: accepted.
+      await getDb()
+        .update(jobs)
+        .set({ firstDeliveredAt: new Date(past.getTime() + 120_000) })
+        .where(eq(jobs.id, jobId));
+      expect((await post(auth, batch(jobId))).status).toBe(202);
     });
 
     it("caps the findings of one job: 400 /findings + integrity event beyond the cap", async () => {

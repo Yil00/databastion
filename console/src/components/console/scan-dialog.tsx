@@ -11,7 +11,7 @@ import { userApi } from "./client-api";
 /** Contract `DiscoveryScanParams` bounds and defaults (checked again by the server). */
 export const SCAN_FIELDS = [
   { name: "sample_rows", label: "Rows sampled per object", min: 1, max: 10_000, value: 200 },
-  { name: "max_duration_s", label: "Scan budget (s)", min: 10, max: 86_400, value: 900 },
+  { name: "max_duration_s", label: "Scan budget (s)", min: 10, max: 86_400, value: 3600 },
   { name: "statement_timeout_ms", label: "Per-query timeout (ms)", min: 100, max: 600_000, value: 30_000 },
 ] as const;
 
@@ -128,6 +128,11 @@ export function ScanDialog({
         <p className="mt-1 text-sm text-muted-foreground">
           The agent samples the target with its read-only account, within these bounds and its own local limits. Only
           masked samples and fingerprints reach the console.
+        </p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Scans are paced to spare the database: a scan takes about 100 times its query time (at the agent&apos;s
+          default 1 % duty cycle), and the agent runs its scans one at a time, queued scans included in their budget.
+          The agent caps the budget at its local limit (<code>limits.max_scan_duration_s</code>, 3600 s by default).
         </p>
         <form onSubmit={submit} className="mt-4 flex flex-col gap-3">
           {SCAN_FIELDS.map((f) => (
