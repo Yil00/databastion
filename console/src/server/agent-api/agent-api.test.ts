@@ -1018,6 +1018,27 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         expect((await row(inTime))?.status).toBe("delivered");
       });
 
+      it("falls back to the contract's 900 s on a malformed max_duration_s, without throwing (L1)", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        // Within 86 400 s but past 900 + margin: kept alive only with the old fail-open fallback.
+        const firstAgoMs = (900 + QUEUED_SCAN_MARGIN_S) * 1000 + MIN;
+        const ids: string[] = [];
+        for (const [i, bad] of (["900", 1.5, 1e20, -5, { x: 1 }, null] as unknown[]).entries()) {
+          const id = await unacknowledgedScan(auth.agentId, `pg-prod-${i + 1}`, firstAgoMs, MAX_JOB_ATTEMPTS);
+          await getDb()
+            .update(jobs)
+            .set({ params: { sample_rows: 200, max_duration_s: bad } })
+            .where(eq(jobs.id, id));
+          ids.push(id);
+        }
+        expect(await poll(auth)).toEqual([]);
+        for (const id of ids) {
+          expect((await row(id))?.status).toBe("failed");
+          expect((await row(id))?.error).toEqual({ code: "timeout" });
+        }
+      });
+
       it("still gives up other job types of an online agent after MAX_JOB_ATTEMPTS deliveries", async () => {
         const auth = await enroll();
         await seen(auth.agentId, 10);

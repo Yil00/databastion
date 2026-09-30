@@ -7,6 +7,7 @@ import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/val
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { HEARTBEAT_INTERVAL_S } from "./agent-api/pipeline";
+import { scanAnchorSql, scanBudgetSql } from "./scans";
 
 /** A delivered job with no status is delivered again after this lease (contract: 120 s). */
 export const JOB_LEASE_S = 120;
@@ -39,9 +40,7 @@ export const QUEUED_SCAN_MARGIN_S = MAX_JOB_ATTEMPTS * JOB_LEASE_S;
 const queuedScanSql = sql`(${jobs.type} = 'discovery.scan'
   and exists (select 1 from agents a where a.id = ${jobs.agentId}
     and a.last_seen_at > now() - make_interval(secs => ${AGENT_ONLINE_WINDOW_S}))
-  and coalesce(${jobs.firstDeliveredAt}, ${jobs.deliveredAt})
-    + make_interval(secs => case when ${jobs.type} = 'discovery.scan'
-        then coalesce((${jobs.params}->>'max_duration_s')::int, 86400) else 0 end)
+  and ${scanAnchorSql} + make_interval(secs => ${scanBudgetSql})
     + make_interval(secs => ${QUEUED_SCAN_MARGIN_S}) > now())`;
 
 export type JobType = Schemas["Job"]["type"];
@@ -85,6 +84,7 @@ interface ClaimedRow extends Record<string, unknown> {
   params: Record<string, unknown>;
   created_at: Date | string;
   expires_at: Date | string | null;
+  attempts: number | string;
 }
 
 const iso = (v: Date | string) => (v instanceof Date ? v : new Date(v)).toISOString();
@@ -141,7 +141,16 @@ export async function claimJobs(db: Database, agentId: string): Promise<Schemas[
       order by created_at, id
       limit ${MAX_JOBS_PER_POLL}
       for update skip locked)
-    returning id, type, target_id, classifiers_version, params, created_at, expires_at`);
+    returning id, type, target_id, classifiers_version, params, created_at, expires_at, attempts`);
+  for (const row of result.rows) {
+    // Only a queued scan of an online agent is delivered past MAX_JOB_ATTEMPTS: said once per job.
+    if (row.type === "discovery.scan" && Number(row.attempts) === MAX_JOB_ATTEMPTS + 1) {
+      logger.info(
+        { jobId: row.id, agentId, attempts: Number(row.attempts) },
+        "queued scan kept past its delivery limit: agent online, within the scan budget",
+      );
+    }
+  }
   const out: Schemas["Job"][] = [];
   for (const row of [...result.rows].sort((a, b) => iso(a.created_at).localeCompare(iso(b.created_at)))) {
     // Schema, then the semantic checks (a scan job's classifier set and ids are registered).
