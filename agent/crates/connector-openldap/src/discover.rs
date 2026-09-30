@@ -222,18 +222,13 @@ where
     let mut attributes: Vec<&str> = requested.iter().map(String::as_str).collect();
     attributes.extend(["objectClass", "structuralObjectClass"]);
     let mut totals = Totals::default();
-    for suffix in &dse.naming_contexts {
-        let canon = dn::canon(suffix).unwrap_or_default();
-        if canon.is_empty() || canon == accesslog {
-            continue;
-        }
-        let database = normalize_ldap_dn(suffix);
-        if !job.includes_database(database.as_str()) {
-            continue;
-        }
+    for (suffix, database) in planned_contexts(job, &dse.naming_contexts, &accesslog) {
         totals.contexts += 1;
         // The pause owed is paid (`turn`) before a session is checked or
-        // opened, so a session never goes stale during it.
+        // opened, so a session never goes stale during it. A naming context
+        // not listed for lack of time counts as one skipped object: its
+        // containers are not known without the listing (R2 of the #93
+        // security review; documented in the README).
         if job.turn().await? == Paced::OutOfTime {
             job.skip_out_of_time(sink, 1);
             continue;
@@ -396,6 +391,30 @@ where
     Ok(())
 }
 
+/// The naming contexts this scan covers (not the accesslog database, in
+/// the job's `databases` filter) with their normalized names, in the order
+/// they are scanned: rotated with the job's seed, as the containers of
+/// each context, so that a slow container in one context cannot run every
+/// scan out of time before the contexts after it (security review of #93,
+/// R1).
+fn planned_contexts<'a>(
+    job: &ScanJob,
+    contexts: &'a [String],
+    accesslog: &str,
+) -> Vec<(&'a str, NormalizedName)> {
+    let mut planned: Vec<(&str, NormalizedName)> = contexts
+        .iter()
+        .filter(|suffix| {
+            let canon = dn::canon(suffix).unwrap_or_default();
+            !canon.is_empty() && canon != accesslog
+        })
+        .map(|suffix| (suffix.as_str(), normalize_ldap_dn(suffix)))
+        .filter(|(_, database)| job.includes_database(database.as_str()))
+        .collect();
+    job.rotate(&mut planned);
+    planned
+}
+
 /// Rotates the containers (sorted by normalized name) to start at the
 /// scan's rotation offset, moved on to the next boundary between
 /// normalized names so a pooled group stays in one run.
@@ -540,6 +559,38 @@ mod tests {
         // Offset 2 is inside the `b` group: moved on to `c`.
         assert_eq!(order(2), [4, 0, 1, 2, 3]);
         assert_eq!(order(1), [1, 2, 3, 4, 0]);
+    }
+
+    /// Security review of #93, R1: the naming contexts start at a position
+    /// that changes with the job's seed, after the accesslog database and
+    /// the empty DN are left out.
+    #[test]
+    fn naming_contexts_are_rotated_per_scan() {
+        let contexts: Vec<String> = [
+            "",
+            "dc=a,dc=org",
+            "cn=accesslog",
+            "dc=b,dc=org",
+            "dc=c,dc=org",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let accesslog = dn::canon("cn=accesslog").unwrap();
+        let order = |seed: u64| {
+            planned_contexts(
+                &ScanJob::default().with_rotation(seed),
+                &contexts,
+                &accesslog,
+            )
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), ["dc=a,dc=org", "dc=b,dc=org", "dc=c,dc=org"]);
+        assert_eq!(order(1), ["dc=b,dc=org", "dc=c,dc=org", "dc=a,dc=org"]);
+        assert_eq!(order(2), ["dc=c,dc=org", "dc=a,dc=org", "dc=b,dc=org"]);
+        assert_eq!(order(3), order(0));
     }
 
     #[test]

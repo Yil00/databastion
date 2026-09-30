@@ -127,10 +127,19 @@ binary: `cargo build --no-default-features --features postgres`.
   deadline, the next unit does not run (`Paced::OutOfTime`); the connector
   reports the objects left as skipped for a limit (`skipped_limit` in the
   job's coverage, a warning in the log) and the scan **succeeds** instead
-  of ending in `timeout`. Each scan starts its object list at another
-  position, derived from the job id (`ScanJob::rotate`; OpenLDAP rotates at
-  a boundary between normalized container names), so a slow or hostile
-  object cannot hide the same tail at every scan. Cost: a scan lasts about
+  of ending in `timeout`. A database (PostgreSQL, MongoDB), a naming
+  context (OpenLDAP) or a whole MySQL / MariaDB target left out that way
+  before it was introspected counts as **one** skipped object: its objects
+  are not known without the query the scan has no time left for. When the
+  console does not take the coverage counters (no `job_progress.coverage`
+  in its capabilities), such a scan is reported `failed` with `timeout`
+  instead, since a plain `succeeded` would hide what it left out. Each scan
+  starts its object lists at another position, derived from the job id
+  (`ScanJob::rotate`): the databases (PostgreSQL, MongoDB) or naming
+  contexts (OpenLDAP), then the objects of each (OpenLDAP rotates its
+  containers at a boundary between normalized names), so a slow or hostile
+  object cannot hide the same tail, or the same later databases, at every
+  scan. Cost: a scan lasts about
   `100 / d` times its query time; a 400-table database whose sampling
   queries take 2 to 7 ms each takes about 1.5 to 5 minutes at 1 %
   (measured on MariaDB 11.4, 200 tables, debug build: 120 s and 0.42 s of

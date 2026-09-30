@@ -52,13 +52,25 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         );
     };
     let timeouts = Timeouts::new(job.statement_timeout());
-    for database in &target.postgres_settings().databases {
-        if !job.includes_database(database) {
-            continue;
-        }
+    for database in planned_databases(job, &target.postgres_settings().databases) {
         scan_database(job, target, database, timeouts, sink).await?;
     }
     Ok(())
+}
+
+/// The databases this scan covers (the job's `databases` filter), in the
+/// order they are scanned: rotated with the job's seed, as the objects of
+/// each database, so that a slow object in one database cannot run every
+/// scan out of time before the databases after it (security review of
+/// #93, R1).
+fn planned_databases<'a>(job: &ScanJob, databases: &'a [String]) -> Vec<&'a str> {
+    let mut planned: Vec<&str> = databases
+        .iter()
+        .map(String::as_str)
+        .filter(|d| job.includes_database(d))
+        .collect();
+    job.rotate(&mut planned);
+    planned
 }
 
 fn fail(target: &TargetConfig, database: &NormalizedName, e: PgError) -> ConnectorError {
@@ -82,7 +94,10 @@ async fn scan_database(
 ) -> Result<(), ConnectorError> {
     let db_name = normalize(database);
     if job.out_of_time() {
-        // Paced out of the scan's time: this database is not covered.
+        // Paced out of the scan's time: this database is not covered. Its
+        // objects are not known without introspecting it (a query the scan
+        // has no time left for): it counts as one skipped object (R2 of
+        // the #93 security review; documented in the README).
         job.skip_out_of_time(sink, 1);
         return Ok(());
     }
@@ -515,6 +530,25 @@ mod tests {
             ..Coverage::default()
         };
         assert_eq!(planned_coverage(&cut).limit, 1);
+    }
+
+    /// Security review of #93, R1: the databases start at a position that
+    /// changes with the job's seed, after the `databases` filter, so every
+    /// database comes first in some scan.
+    #[test]
+    fn databases_are_rotated_per_scan() {
+        let all: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        let job = ScanJob::default();
+        assert_eq!(planned_databases(&job, &all), ["a", "b", "c"]);
+        let firsts: std::collections::BTreeSet<&str> = (0..3u64)
+            .map(|seed| planned_databases(&job.clone().with_rotation(seed), &all)[0])
+            .collect();
+        assert_eq!(firsts.len(), 3, "{firsts:?}");
+        assert_eq!(
+            planned_databases(&ScanJob::default().with_rotation(1), &all),
+            ["b", "c", "a"]
+        );
+        assert!(planned_databases(&job.with_rotation(7), &[]).is_empty());
     }
 
     #[test]
