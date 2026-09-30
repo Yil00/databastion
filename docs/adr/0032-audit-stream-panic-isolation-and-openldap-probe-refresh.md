@@ -16,7 +16,13 @@
 - The recommended OpenLDAP ACL of ADR-0029 decision 4 names `authPassword`. A stock `slapd` (Debian / Ubuntu 2.6, the dev and end-to-end image) defines no `authPassword` attribute unless built with `SLAPD_AUTHPASSWD`, and refuses an `olcAccess` clause that names an unknown attribute: the recommended configuration does not load there (found while building the end-to-end OpenLDAP target, #82).
 
 ## Decision
-1. **Per-record isolation, every Audit source.** Each connector parses every audit record inside `databastion_core::isolate` (a `catch_unwind` of the synchronous handling of one record). The file sources (PostgreSQL pgaudit log, MariaDB `server_audit`, the MySQL / Percona JSON logs, the MongoDB `auditLog` and server log) also convert records to events in isolation: one record, or on PostgreSQL one statement's group of records. So do the MongoDB profiler (per entry), MySQL `performance_schema` connection records and the OpenLDAP accesslog (per entry). A unit whose handling panics is dropped alone and the stream goes on:
+1. **Per-record isolation on the log-file sources, the MongoDB profiler and the OpenLDAP accesslog.** These sources handle every audit record inside `databastion_core::isolate` (a `catch_unwind` of the synchronous handling of one record):
+   - the log-file sources (PostgreSQL pgaudit log, MariaDB `server_audit`, the MySQL / Percona JSON logs including their connection lines, the MongoDB `auditLog` and server log) parse each record in isolation and convert records to events in isolation: one record, or one statement's group of records (PostgreSQL, and the MySQL / MariaDB log files);
+   - the MongoDB profiler and the OpenLDAP accesslog parse and convert each entry in isolation.
+
+   **Not isolated**: the PostgreSQL `pg_stat_statements` source (`analyze_pss`) and the MySQL / MariaDB `performance_schema` source (statement analysis in the event builder). A panic there ends the stream, and 3 panics in a row stop it (decision 2). The stop is loud (`audit.stream_stopped`, the `agent.audit_stream_stopped` alert), but Audit of the target stays blind until Audit is reconfigured or the agent restarts, and a client who finds a statement that makes the analysis panic can repeat it. Isolating that analysis per record is a ROADMAP follow-up.
+
+   On the isolated sources, a unit whose handling panics is dropped alone and the stream goes on:
    - its records are counted as dropped (`audit.records_dropped`, per record, reported by `check()` for 24 h);
    - the heartbeat metric **`audit_record_panics_total`** counts one per failed isolated unit (a record or a statement group), which tells a crafted-record campaign apart from malformed input;
    - the panic hook logs the code location and a panic id, never the message.
@@ -29,7 +35,7 @@
    - The restart delay is the backoff, at least the stream's poll interval, and at most 300 s or the poll interval when that is longer. The computation cannot overflow or panic for any accepted poll interval (up to 3600 s).
 3. **Exact skip on OpenLDAP only; isolation mode.** Only the OpenLDAP accesslog stream implements the skip request (`CursorStore::skip_records`). After a panic that reaches the core, it restarts in **isolation mode** (`CursorStore::isolate`): for its first read round (up to 1000 entries) it hands over and saves its position after **every** entry, and saves the CSN of the entry being handed over before converting it (the `handing` line of decision 5). A panic that comes again is therefore at that exact entry, and the skip drops that entry and no other. The skipped entry is counted as dropped and in `audit_records_skipped_total`. An isolation request ends when a session ends without a panic.
    The file sources do not implement the skip: their parsing and conversion are already isolated per record (decision 1), so a panic that still ends the stream happened outside record handling, where skipping a record would not help. Such a stream is stopped by the thresholds of decision 2. This replaces the "every engine" skip of ADR-0031 decision 6.
-4. **Detection gaps are counted, not hidden.** A dropped or skipped record loses its events. On PostgreSQL, a conversion panic drops the whole statement group, so a statement's reads can be lost because of one bad record in its group. Both are counted (decision 1). The console does not alert on these counters yet (see Consequences).
+4. **Detection gaps are counted, not hidden.** A dropped or skipped record loses its events. On PostgreSQL and the MySQL / MariaDB log files, a conversion panic drops the whole statement group, so a statement's reads can be lost because of one bad record in its group. Both are counted (decision 1). The console does not alert on these counters yet (see Consequences).
 5. **OpenLDAP cursor format** (refines ADR-0029 decision 7). The persisted position is a text file:
    - first line `v2`;
    - `cursor <csn>`: the newest CSN read;
@@ -66,10 +72,10 @@
    olcAccess: {0}to attrs=userPassword,userPKCS12 by self =xw by anonymous auth by * none
    ```
 
-   Add `authPassword` only where the server defines it (built with `SLAPD_AUTHPASSWD`), and the Samba (`sambaNTPassword`, `sambaLMPassword`, `sambaPasswordHistory`), Kerberos (`krbPrincipalKey`) and ppolicy (`pwdHistory`) attributes where their schemas are loaded. `slapd` refuses a clause that names an attribute it does not know. The agent's own rule is unchanged: it never requests `userPassword`, `authPassword`, their subtypes or the closed list of credential attributes, whatever the ACL. The dev and end-to-end environments use the rule above (#82).
+   Add `authPassword` only where the server defines it (built with `SLAPD_AUTHPASSWD`), the Samba (`sambaNTPassword`, `sambaLMPassword`, `sambaPasswordHistory`, `sambaClearTextPassword`) and Kerberos (`krbPrincipalKey`, `krbExtraData`) attributes where their schemas are loaded, and `pwdHistory` where the ppolicy overlay module is loaded. `slapd` refuses a clause that names an attribute it does not know. The agent's own rule is unchanged: it never requests `userPassword`, `authPassword`, their subtypes or the closed list of credential attributes, whatever the ACL. The dev and end-to-end environments use the rule above (#82).
 
 ## Consequences
-- A record that crashes a parser costs that record (or, on PostgreSQL conversion, that statement group), not the target's Audit. Streams stop only on repeated panics outside record handling. When they do, operators are alerted (ADR-0031 decision 3).
+- On the isolated sources, a record that crashes a parser costs that record (or, on conversion of PostgreSQL and MySQL / MariaDB log files, that statement group), not the target's Audit. On `pg_stat_statements` and `performance_schema`, a repeated panic stops the stream (decision 1). Streams stop only on repeated panics outside record handling. When they do, operators are alerted (ADR-0031 decision 3).
 - **Detection gap, counted.** A client that can get a record written that makes the parser panic hides that record's events. The loss shows only in `audit.records_dropped` (target note), `audit_record_panics_total` and `audit_records_skipped_total` (heartbeat metrics). The console raises no alert on them. The ADR-0031 decision 3 optional panic-count alert is not implemented. A masked "conversion failed" access event, so dropped statements reach policies, is a ROADMAP follow-up.
 - Per-record isolation assumes the handling of one record leaves no shared state half-updated beyond that record. Connectors keep per-record work local; a bounded map may keep a partial entry.
 - OpenLDAP restarts are exact within the overlap. After a panic, the events of at most one search round may be sent again (at-least-once, ADR-0029), and in isolation mode at most the one entry that was being handed over. Entries committed out of CSN order more than 10 s below the cursor, or beyond the 1000 persisted overlap CSNs, are still lost (the floor).
@@ -78,6 +84,8 @@
 - `docs-keeper` updates [05-security.md](../05-security.md) and [08-engine-capabilities.md](../08-engine-capabilities.md); no protocol change. The metric names travel in the heartbeat `metrics` map, which is open by contract.
 
 ### Residual risks
+- The writability refusal (decision 8) checks mode bits and the owner uid / gid only. A POSIX ACL entry that grants the agent write access is not detected, nor an agent running as root or with `CAP_DAC_OVERRIDE`, which can write a `0640` file owned by the database server. Run the agent as a dedicated non-root user without that capability.
+- `pg_stat_statements` and `performance_schema` analysis is not isolated per record (decision 1): a statement that makes it panic, repeated, stops the target's Audit until an operator acts.
 - A panic outside record handling on a file source is not skippable: the stream stops after 7 panics at one position and stays stopped until Audit is reconfigured or the agent restarts. It resumes from the same cursor, so the same panic can stop it again.
 - `privilege.password_attributes_readable` probes `userPassword` and `authPassword` only: an account that can read `userPKCS12` or the other listed credential attributes is not flagged. The agent still never requests them.
 - The failed-operation proof is as fresh as the last report that probed the context (10 minutes with at most 8 contexts). A server that logs failed operations for the probe's DN only, through an `olcAccessLogBase` covering part of a context, still passes (ADR-0029 residual, unchanged).
@@ -85,7 +93,7 @@
 ## Rejected alternatives
 - **Skip on file sources by byte offset**: the offset is saved after a batch, so a skip from it could drop records that never panicked; per-record isolation already covers the parser and the conversion.
 - **Skip without isolation mode on OpenLDAP**: the position is saved after a search round of up to 1000 entries, so the entry at fault is not known.
-- **Skip the whole statement group instead of isolating conversion per group** (PostgreSQL): same loss when it panics, and no isolation when it does not.
+- **Skip the whole statement group instead of isolating conversion per group** (PostgreSQL, MySQL / MariaDB log files): same loss when it panics, and no isolation when it does not.
 - **Keep the failed-operation proof for 24 h and let any failed search record count**: a change of `olcAccessLogSuccess` stayed unseen for up to 24 h, and other clients' records (or a nested context's) could prove a context.
 - **A fixed probe DN**: its earlier records answered for later probes, so a turned-off setting kept its proof.
 - **Keep only the cursor for OpenLDAP**: loses records committed out of CSN order across a restart (L3).
