@@ -43,6 +43,9 @@ pub struct CursorStore {
     skip: u32,
     /// Isolation mode (see [`Self::isolate`]).
     isolate: bool,
+    /// Set when the connector reads [`Self::skip_records`]: its source can
+    /// skip a record (the core's registry, `None` outside the core).
+    skip_reader: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Why a cursor could not be read or written (logged by kind only).
@@ -70,6 +73,7 @@ impl CursorStore {
             path: dir.join(format!("{target_id}.{name}.cursor")),
             skip: 0,
             isolate: false,
+            skip_reader: None,
         })
     }
 
@@ -99,6 +103,9 @@ impl CursorStore {
     /// (`audit.records_dropped`), and goes on.
     #[must_use]
     pub fn skip_records(&self) -> u32 {
+        if let Some(flag) = &self.skip_reader {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.skip
     }
 
@@ -165,6 +172,8 @@ struct PositionState {
     used: std::collections::BTreeSet<PathBuf>,
     /// Their content hashes at the last panic.
     at_panic: HashMap<PathBuf, u64>,
+    /// The stream's source reads skip requests.
+    skips: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn content_hash(path: &Path) -> Option<u64> {
@@ -192,6 +201,7 @@ impl PositionRegistry {
         let mut state = self.lock();
         state.used.insert(store.path.clone());
         let mut store = store;
+        store.skip_reader = Some(std::sync::Arc::clone(&state.skips));
         if isolate {
             store = store.with_isolation();
         }
@@ -202,6 +212,12 @@ impl PositionRegistry {
             }
         }
         store
+    }
+
+    /// Whether the stream's source reads skip requests
+    /// ([`CursorStore::skip_records`]): only then is a skip announced.
+    pub(crate) fn skips_supported(&self) -> bool {
+        self.lock().skips.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The stream's saved position after a panic (a hash of its cursor

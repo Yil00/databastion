@@ -45,7 +45,20 @@ pub(crate) async fn guard<F: Future>(fut: F) -> Result<F::Output, Panicked> {
 /// beyond the record itself (connectors keep per-record work local, or
 /// accept that bounded maps keep a partial entry).
 pub fn isolate<T>(f: impl FnOnce() -> T) -> Option<T> {
-    std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
+    let r = std::panic::catch_unwind(AssertUnwindSafe(f)).ok();
+    if r.is_none() {
+        RECORD_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    r
+}
+
+/// Records whose handling panicked, dropped by [`isolate`] (process-wide).
+static RECORD_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records whose handling panicked so far (the heartbeat metric
+/// `audit_record_panics_total`).
+pub(crate) fn record_panics() -> u64 {
+    RECORD_PANICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// For a `spawn_blocking` task that failed: a panic in it is resumed on

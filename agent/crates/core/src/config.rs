@@ -198,7 +198,9 @@ impl Limits {
     #[must_use]
     pub fn clamp_sample_rows(&self, requested: u64) -> u32 {
         let requested = u32::try_from(requested).unwrap_or(u32::MAX);
-        requested.clamp(SAMPLE_ROWS_RANGE.0, self.max_sample_rows)
+        // Never `clamp`: its bounds come from the configuration (a panic
+        // if they were ever inverted).
+        requested.min(self.max_sample_rows).max(SAMPLE_ROWS_RANGE.0)
     }
 
     /// Clamps a console-requested statement timeout. `0` (unlimited) and
@@ -209,7 +211,9 @@ impl Limits {
         let ms = if requested_ms == 0 {
             cap
         } else {
-            requested_ms.clamp(u64::from(STATEMENT_TIMEOUT_MS_RANGE.0), cap)
+            requested_ms
+                .min(cap)
+                .max(u64::from(STATEMENT_TIMEOUT_MS_RANGE.0))
         };
         Duration::from_millis(ms)
     }

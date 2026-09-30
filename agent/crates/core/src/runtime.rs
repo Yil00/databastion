@@ -321,6 +321,16 @@ struct Counters {
     scan_status_before_flush: AtomicU64,
 }
 
+/// The delay before restarting a failed audit stream: the backoff
+/// `delay`, at least the stream's poll interval and at most
+/// [`AUDIT_MAX_BACKOFF`], or the poll interval when that is longer (up to
+/// 3600 s). Never `Ord::clamp`: with a poll interval above the maximum its
+/// bounds would be inverted, and it would panic outside the connector
+/// guard, stopping the whole agent (PR #83 re-review H-A).
+fn audit_restart_delay(delay: Duration, poll: Duration) -> Duration {
+    delay.max(poll).min(AUDIT_MAX_BACKOFF.max(poll))
+}
+
 /// Capacity of the event channel between a connector and the core.
 const EVENTS_CHANNEL: usize = 256;
 /// Longest backoff before restarting a failed audit stream.
@@ -430,8 +440,13 @@ enum PanicAction {
 struct PanicTracker {
     /// Panics without a saved position, in a row.
     in_row: u32,
-    /// Panics at the current position.
+    /// Panics at the current position since the last skip request.
     same: u32,
+    /// Panics at the current position in all (no progress between them),
+    /// skip requests included: past `2 * AUDIT_MAX_PANICS` the stream is
+    /// stopped whatever the time between them (a source that cannot skip,
+    /// or a skip that did not help).
+    at_position: u32,
     position: Option<u64>,
     /// Restart request in force (isolation, skip).
     request: (bool, u32),
@@ -476,9 +491,14 @@ impl PanicTracker {
         }
         if self.position == Some(p) {
             self.same = self.same.saturating_add(1);
+            self.at_position = self.at_position.saturating_add(1);
         } else {
             self.position = Some(p);
             self.same = 1;
+            self.at_position = 1;
+        }
+        if self.at_position > 2 * AUDIT_MAX_PANICS {
+            return PanicAction::Park(self.at_position);
         }
         let mut skip = 0;
         if self.same >= AUDIT_MAX_PANICS {
@@ -499,6 +519,13 @@ impl PanicTracker {
     /// The restart request in force.
     fn request(&self) -> (bool, u32) {
         self.request
+    }
+
+    /// A session ended without a panic (an error, or it returned): the
+    /// isolation request ends (it is for locating a record that panics;
+    /// PR #83 re-review L-B).
+    fn ended_without_panic(&mut self) {
+        self.request = (false, 0);
     }
 }
 
@@ -992,6 +1019,13 @@ impl Runtime {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
                 map.insert(key, value.load(Ordering::Relaxed) as f64);
             }
+        }
+        // Audit records whose handling panicked (dropped alone by
+        // `crate::isolate`): a crafted-record campaign stands out from
+        // malformed input (PR #83 re-review L-C).
+        if let Ok(key) = MetricsMapKey::try_from("audit_record_panics_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::panics::record_panics() as f64);
         }
         let quarantined = self.lock_spool().counters.quarantined;
         if let Ok(key) = MetricsMapKey::try_from("spool_quarantined_total") {
@@ -2121,13 +2155,20 @@ impl Runtime {
                     if skip > 0 || (isolate && panics.same == 1) {
                         failures = 0;
                     }
-                    if skip > 0 {
+                    if skip > 0 && positions.skips_supported() {
                         bump(&self.counters.audit_records_skipped, u64::from(skip));
                         tracing::error!(
                             target_id,
                             panic_id,
                             "audit stream failed repeatedly at the same record: skipping that \
                              record (counted as dropped)"
+                        );
+                    } else if skip > 0 {
+                        tracing::error!(
+                            target_id,
+                            panic_id,
+                            "audit stream failed repeatedly at the same read position; this \
+                             source cannot skip a record there: it is stopped if it goes on"
                         );
                     } else if isolate {
                         tracing::warn!(
@@ -2139,8 +2180,8 @@ impl Runtime {
                     }
                     failures = failures.saturating_add(1);
                     let delay = backoff::Backoff::CONSOLE
-                        .delay(failures.saturating_sub(1), backoff::random_fraction())
-                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                        .delay(failures.saturating_sub(1), backoff::random_fraction());
+                    let delay = audit_restart_delay(delay, cfg.poll_interval());
                     tracing::error!(
                         target_id,
                         panic_id,
@@ -2153,11 +2194,12 @@ impl Runtime {
                     }
                 }
                 AuditEnd::Failed(e) => {
+                    panics.ended_without_panic();
                     bump(&self.counters.audit_stream_failures, 1);
                     failures = failures.saturating_add(1);
                     let delay = backoff::Backoff::CONSOLE
-                        .delay(failures.saturating_sub(1), backoff::random_fraction())
-                        .clamp(cfg.poll_interval(), AUDIT_MAX_BACKOFF);
+                        .delay(failures.saturating_sub(1), backoff::random_fraction());
+                    let delay = audit_restart_delay(delay, cfg.poll_interval());
                     match &e {
                         Some(crate::ConnectorError::Target {
                             code, engine_code, ..
