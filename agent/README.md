@@ -251,8 +251,10 @@ apart from malformed input). On `pg_stat_statements`, a statement whose
 analysis or conversion panicked is not dropped: each of its deltas is still
 reported as a read of unknown objects (`*`) with its counts, because
 `queryid` ignores constants and comments and dropping it would hide every
-later execution of that statement shape. A failed analysis is kept in the
-text cache (never analyzed again, counted once). A panic in a blocking parse task is resumed on the stream,
+later execution of that statement shape. A failed analysis or conversion is kept in the
+text cache as poisoned (never analyzed or converted again, counted once).
+The fallback is always a read, on purpose: it over-reports a write rather
+than hide it. A panic in a blocking parse task is resumed on the stream,
 never turned into an ordinary error that restarts it in a loop
 (`databastion_core::resume_panic`).
 

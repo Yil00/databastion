@@ -144,7 +144,12 @@ load otherwise), so a server-wide load is the normal case.
   `$n` numbered after the bound parameters, and the connector's bound
   parameters in place (`audit::events::pss_form`, phase 7). The same
   statement sent with constants instead of parameters has another
-  `queryid` and another text, and is reported. Anything else of
+  `queryid` and another text, and is reported. The text alone is not
+  enough: per role, database and level, the first `queryid` seen with an
+  own text is pinned, and another `queryid` with the same text (the text
+  prepared with every constant bound as a parameter) is reported. If such
+  an entry is seen before the agent's own, the agent's own executions are
+  reported instead: loud, not hidden. Anything else of
   the agent's account whose objects are unknown (`*`: any other function
   call, including `pg_catalog` ones that run SQL such as `query_to_xml`,
   text that does not parse, several statements) is **always reported** and

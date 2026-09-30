@@ -372,6 +372,14 @@ pub(crate) enum OwnKind {
 /// gets another `queryid` and another text, and is reported (#76 review
 /// I2).
 ///
+/// The text alone does not prove the statement is the connector's: a
+/// client can prepare this exact text with every constant bound as a
+/// parameter, which gets another `queryid` and the same stored text. The
+/// `pg_stat_statements` poller therefore also pins, per own statement, the
+/// `(userid, dbid, toplevel)` entry's `queryid` first seen with that text
+/// and treats any other `queryid` with the same text as not the
+/// connector's (`audit::pss`, PR #90 review Low-1).
+///
 /// Only for the connector's own texts (a closed list): `None` on anything
 /// they never hold (a comment, an escape, bit or dollar-quoted string, a
 /// non-integer number), so such a text never matches.
@@ -554,11 +562,19 @@ impl PgOwn {
         self.own_texts.iter().any(|t| t == text)
     }
 
-    /// `text`, read from `pg_stat_statements` (not cut), is exactly one of
-    /// the connector's own table-less statements as `pg_stat_statements`
-    /// stores it ([`pss_form`]).
+    /// Which of the connector's own table-less statements `text`, read
+    /// from `pg_stat_statements` (not cut), is exactly, as
+    /// `pg_stat_statements` stores it ([`pss_form`]). The text is
+    /// necessary, not sufficient: the poller pins the entry's `queryid`
+    /// too.
+    pub(crate) fn own_pss_form(&self, text: &str) -> Option<usize> {
+        self.own_pss.iter().position(|t| t == text)
+    }
+
+    /// [`Self::own_pss_form`] as a test.
+    #[cfg(test)]
     pub(crate) fn own_pss_text(&self, text: &str) -> bool {
-        self.own_pss.iter().any(|t| t == text)
+        self.own_pss_form(text).is_some()
     }
 
     /// Whether an event may be left out (see the type documentation).
@@ -882,8 +898,9 @@ pub(crate) fn pss_events(
     pss_events_counted(deltas, own, catalogs, from, to).0
 }
 
-/// [`pss_events`], with the number of statements whose conversion
-/// panicked: each statement is converted in isolation
+/// [`pss_events`], with the indices (in `deltas`) of the statements whose
+/// conversion panicked, so the caller marks them poisoned and does not
+/// convert them again: each statement is converted in isolation
 /// (`databastion_core::isolate`), so one that makes the analysis code
 /// panic does not stop the others (security review of #85). Its delta is
 /// still reported, against `*` ([`pss_unanalyzed_event`]), so a statement
@@ -894,11 +911,11 @@ pub(crate) fn pss_events_counted(
     catalogs: &Catalogs,
     from: SystemTime,
     to: SystemTime,
-) -> (Vec<MaskedEvent>, u64) {
+) -> (Vec<MaskedEvent>, Vec<usize>) {
     // The pg_dump pattern per role within the poll.
     // No object names here: unqualified `pg_*` names stay catalogs.
     let none = HashSet::new();
-    let mut panicked = 0u64;
+    let mut panicked = Vec::new();
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
         let rule = catalogs.rule(d.database, true, &none);
@@ -912,12 +929,12 @@ pub(crate) fn pss_events_counted(
         }
     }
     let mut out = Vec::new();
-    for d in deltas {
+    for (i, d) in deltas.iter().enumerate() {
         match databastion_core::isolate(|| pss_event(d, own, catalogs, &copied, from, to)) {
             Some(Some(e)) => out.push(e),
             Some(None) => {}
             None => {
-                panicked += 1;
+                panicked.push(i);
                 out.push(pss_unanalyzed_event(
                     d.user, d.database, d.calls, d.rows, from, to,
                 ));
@@ -934,6 +951,10 @@ pub(crate) fn pss_events_counted(
 /// from the counters, the role and the database only: no statement text.
 /// Never left out as the agent's own activity (the connector names every
 /// relation it reads) and never budgeted.
+///
+/// Always a read, on purpose: the statement's kind is unknown, and a read
+/// of `*` over-reports (a write or DDL shows up as a read of unknown
+/// objects) rather than hides; it fails safe (PR #90 review Low-2).
 pub(crate) fn pss_unanalyzed_event(
     user: &str,
     database: &str,
@@ -955,6 +976,12 @@ pub(crate) fn pss_unanalyzed_event(
         e = e.with_signal(Signal::LargeResult);
     }
     e
+}
+
+/// [`pss_form`] for the poller's tests.
+#[cfg(test)]
+pub(crate) fn tests_pss_form(text: &str) -> String {
+    pss_form(text).unwrap_or_default()
 }
 
 /// Tests: a statement of this role makes its conversion panic (a bug on
@@ -2601,7 +2628,7 @@ mod tests {
         ];
         let (events, panicked) =
             pss_events_counted(&deltas, &mut own(), &Catalogs::default(), t0, t0);
-        assert_eq!(panicked, 1);
+        assert_eq!(panicked, [0]);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].principal().account_name(), TEST_POISON_USER);
         // The panicking statement is still reported, against `*`.
