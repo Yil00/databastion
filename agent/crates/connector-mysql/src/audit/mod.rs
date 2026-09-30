@@ -469,6 +469,7 @@ async fn file_run(
         let events = st.builder.convert_file(records, source, SystemTime::now());
         let evicted = st.builder.pending_evicted().saturating_sub(evicted_before);
         if evicted > 0 {
+            databastion_core::audit::count_pending_evicted(evicted);
             tracing::warn!(
                 target_id = %target.id,
                 statements = evicted,

@@ -41,6 +41,23 @@ const MAX_CURSOR_BYTES: usize = 64 * 1024;
 /// Largest counters file (see [`CursorStore::counters`]), in bytes.
 pub(crate) const MAX_COUNTERS_BYTES: usize = 2 * 1024 * 1024;
 
+/// Audit statements reported before their last record because a
+/// connector's pending state was full (heartbeat metric
+/// `audit_pending_evicted_total`).
+static PENDING_EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts `n` audit statements a connector reported before their last
+/// record because its bounded pending state was full (MySQL / MariaDB audit
+/// log grouping): heartbeat metric `audit_pending_evicted_total`.
+pub fn count_pending_evicted(n: u64) {
+    PENDING_EVICTED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_pending_evicted`].
+pub(crate) fn pending_evicted() -> u64 {
+    PENDING_EVICTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Subdirectory of `state_dir` holding audit cursors and settings.
 pub(crate) const AUDIT_DIR: &str = "audit";
 

@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 const MAX_NAME_BYTES: usize = 1024;
 
 /// What a record reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
     Connect,
     FailedConnect,
@@ -45,7 +45,7 @@ pub(crate) enum Op {
 }
 
 /// Access to a table (a table-access record).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TableOp {
     Read,
     Write,

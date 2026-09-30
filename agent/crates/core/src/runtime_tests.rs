@@ -1362,6 +1362,17 @@ async fn payload_too_large_splits_in_halves_with_new_ids() {
 }
 
 #[tokio::test]
+async fn pending_evictions_are_a_heartbeat_metric() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let key = MetricsMapKey::try_from("audit_pending_evicted_total").unwrap();
+    let before = rt.metrics().0[&key];
+    crate::audit::count_pending_evicted(3);
+    assert!(rt.metrics().0[&key] >= before + 3.0);
+}
+
+#[tokio::test]
 async fn batch_conflict_is_dropped_never_resent() {
     let server = MockServer::start().await;
     let (_env, rt) = spooled_runtime(&server, vec![Step::Conflict], 3).await;

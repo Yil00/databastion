@@ -1210,6 +1210,12 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::panics::record_panics() as f64);
         }
+        // Audit statements flushed early because a connector's bounded
+        // pending state was full (security review of #93, L2).
+        if let Ok(key) = MetricsMapKey::try_from("audit_pending_evicted_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::pending_evicted() as f64);
+        }
         let spool = self.lock_spool().counters;
         for (name, value) in [
             ("spool_quarantined_total", spool.quarantined),

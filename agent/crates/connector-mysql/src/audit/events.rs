@@ -41,7 +41,7 @@
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{
@@ -208,16 +208,21 @@ impl Sessions {
 
 /// Connections with a statement pending at most.
 const MAX_PENDING_CONNECTIONS: usize = 1024;
-/// Statements flushed before their statement record that are remembered
-/// (a query id per connection: a few bytes each).
+/// Statements flushed before their statement record that are remembered.
 const MAX_EARLY_REPORTED: usize = 16 * MAX_PENDING_CONNECTIONS;
 /// Table-access records kept per pending statement (distinct tables; an
-/// event names 16 objects at most).
+/// event names 16 objects at most), and tables remembered per statement
+/// flushed early.
 const MAX_PENDING_RECORDS: usize = 64;
-/// Statement text held by all pending statements at most, in bytes (only
-/// the JSON `table_access` records carry one; one record is at most
-/// `databastion_core::audit::tail::MAX_RECORD_BYTES`, 1 MiB).
-const MAX_PENDING_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes held by all pending statements at most: their records' names
+/// (user, host, database, table: at most 1 KiB each, `records`) and
+/// statement text (only the JSON `table_access` records carry one, kept
+/// once per statement; one record is at most
+/// `databastion_core::audit::tail::MAX_RECORD_BYTES`, 1 MiB), plus a fixed
+/// overhead per record.
+const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+/// Fixed overhead counted per pending record.
+const RECORD_OVERHEAD: usize = 256;
 /// A pending statement whose statement record has not come after this
 /// long is reported from its table-access records alone.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
@@ -228,13 +233,23 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 /// the old one for long).
 const REPORTED_TTL: Duration = Duration::from_secs(2 * 300);
 
+/// Bytes a pending record holds (see [`MAX_PENDING_BYTES`]).
+fn record_bytes(r: &FileRecord) -> usize {
+    RECORD_OVERHEAD
+        + r.user.len()
+        + r.host.len()
+        + r.database.len()
+        + r.table.as_ref().map_or(0, |(d, t)| d.len() + t.len())
+        + r.text.as_ref().map_or(0, |t| t.len())
+}
+
 /// Table-access records of one statement waiting for its statement
 /// record.
 struct PendingStatement {
     records: Vec<FileRecord>,
     seq: u64,
     since: Instant,
-    text_bytes: usize,
+    bytes: usize,
 }
 
 /// Statements whose table-access records were read and whose statement
@@ -250,26 +265,35 @@ struct PendingStatement {
 /// still one event.
 ///
 /// Bounded: at most [`MAX_PENDING_CONNECTIONS`] statements of
-/// [`MAX_PENDING_RECORDS`] records, [`MAX_PENDING_TEXT_BYTES`] of text in
-/// all (the oldest statement is flushed first). A statement flushed before
-/// its statement record (timeout, full state) is remembered by its query
-/// id and the tables already reported for it (`reported`, at most
-/// [`MAX_EARLY_REPORTED`]), so its late records do not count it twice: a
-/// late table record of a table already reported is ignored, one of
-/// another table starts a continuation of the statement that is reported
-/// like any pending statement (a `CALL` that reads a harmless table, waits
-/// past the timeout, then reads another one is never hidden), and a late
-/// statement record without a continuation yields an event only when its
-/// text shows a signal (a whole-table read by a dump program that ran
-/// longer than the timeout). Without query ids (`audit_log_filter`)
-/// nothing is remembered.
+/// [`MAX_PENDING_RECORDS`] records, [`MAX_PENDING_BYTES`] in all (the
+/// oldest statement is flushed first, in insertion order: `order`). A
+/// statement flushed before its statement record (timeout, full state) is
+/// remembered by its query id and the tables already reported for it
+/// (`reported`, at most [`MAX_EARLY_REPORTED`], each with at most
+/// [`MAX_PENDING_RECORDS`] tables kept as 8-byte keyed hashes: 8 MiB at
+/// most; forgotten after [`REPORTED_TTL`], oldest first), so its late
+/// records do not count it twice: a late table record of a table already
+/// reported is ignored, one of another table starts a continuation of the
+/// statement that is reported like any pending statement (a `CALL` that
+/// reads a harmless table, waits past the timeout, then reads another one
+/// is never hidden), and a late statement record without a continuation
+/// yields an event only when its text shows a signal (a whole-table read
+/// by a dump program that ran longer than the timeout). Without query ids
+/// (`audit_log_filter`) nothing is remembered.
 #[derive(Default)]
 struct Pending {
     map: HashMap<u64, PendingStatement>,
+    /// Sequence → connection of the pending statements (oldest first).
+    order: BTreeMap<u64, u64>,
     /// Connection → statement flushed early.
     reported: HashMap<u64, Reported>,
+    /// Sequence → connection of `reported` (oldest first).
+    reported_order: BTreeMap<u64, u64>,
+    /// Keys of the table hashes (random per process: names are
+    /// client-controlled).
+    hasher: std::collections::hash_map::RandomState,
     seq: u64,
-    text_bytes: usize,
+    bytes: usize,
     /// Statements flushed early because the state was full.
     evicted: u64,
 }
@@ -279,8 +303,9 @@ struct Reported {
     query_id: u64,
     seq: u64,
     since: Instant,
-    /// Tables already reported for it (at most [`MAX_PENDING_RECORDS`]).
-    tables: Vec<(Option<(String, String)>, Op)>,
+    /// Keyed hashes of the tables (and operation) already reported for it
+    /// (at most [`MAX_PENDING_RECORDS`]).
+    tables: Vec<u64>,
 }
 
 impl Pending {
@@ -289,19 +314,27 @@ impl Pending {
         self.seq
     }
 
+    fn table_key(&self, r: &FileRecord) -> u64 {
+        use std::hash::BuildHasher as _;
+        self.hasher.hash_one((&r.table, r.op))
+    }
+
     fn first(&self, connection: u64) -> Option<&FileRecord> {
         self.map.get(&connection).and_then(|p| p.records.first())
     }
 
     fn take(&mut self, connection: u64) -> Option<Vec<FileRecord>> {
         let p = self.map.remove(&connection)?;
-        self.text_bytes = self.text_bytes.saturating_sub(p.text_bytes);
+        self.order.remove(&p.seq);
+        self.bytes = self.bytes.saturating_sub(p.bytes);
         Some(p.records)
     }
 
     /// Forgets the early-flushed statement of a connection.
     fn forget(&mut self, connection: u64) {
-        self.reported.remove(&connection);
+        if let Some(rep) = self.reported.remove(&connection) {
+            self.reported_order.remove(&rep.seq);
+        }
     }
 
     /// The early-flushed statement `r` belongs to, if any.
@@ -320,11 +353,9 @@ impl Pending {
     /// Whether `r` is a table record of an early-flushed statement whose
     /// table was already reported.
     fn table_reported(&self, r: &FileRecord) -> bool {
-        self.reported_of(r).is_some_and(|rep| {
-            rep.tables
-                .iter()
-                .any(|(t, op)| *t == r.table && *op == r.op)
-        })
+        let key = self.table_key(r);
+        self.reported_of(r)
+            .is_some_and(|rep| rep.tables.contains(&key))
     }
 
     /// Takes a statement out before its statement record, remembering it
@@ -332,27 +363,25 @@ impl Pending {
     fn take_early(&mut self, connection: u64, mono: Instant) -> Option<Vec<FileRecord>> {
         let records = self.take(connection)?;
         if let Some(q) = records.first().and_then(|r| r.query_id) {
-            let mut tables = match self.reported.remove(&connection) {
-                Some(old) if old.query_id == q => old.tables,
+            let mut tables = match self.reported.get(&connection) {
+                Some(old) if old.query_id == q => old.tables.clone(),
                 _ => Vec::new(),
             };
+            self.forget(connection);
             for r in &records {
-                let t = (r.table.clone(), r.op);
-                if !tables.contains(&t) && tables.len() < MAX_PENDING_RECORDS {
-                    tables.push(t);
+                let key = self.table_key(r);
+                if !tables.contains(&key) && tables.len() < MAX_PENDING_RECORDS {
+                    tables.push(key);
                 }
             }
-            if self.reported.len() >= MAX_EARLY_REPORTED {
-                if let Some(old) = self
-                    .reported
-                    .iter()
-                    .min_by_key(|(_, rep)| rep.seq)
-                    .map(|(c, _)| *c)
-                {
-                    self.reported.remove(&old);
+            while self.reported.len() >= MAX_EARLY_REPORTED {
+                match self.reported_order.first_key_value().map(|(_, c)| *c) {
+                    Some(old) => self.forget(old),
+                    None => break,
                 }
             }
             let seq = self.next_seq();
+            self.reported_order.insert(seq, connection);
             self.reported.insert(
                 connection,
                 Reported {
@@ -367,11 +396,7 @@ impl Pending {
     }
 
     fn evict_oldest(&mut self, mono: Instant) -> Option<Vec<FileRecord>> {
-        let oldest = self
-            .map
-            .iter()
-            .min_by_key(|(_, p)| p.seq)
-            .map(|(c, _)| *c)?;
+        let oldest = self.order.first_key_value().map(|(_, c)| *c)?;
         self.evicted = self.evicted.saturating_add(1);
         self.take_early(oldest, mono)
     }
@@ -384,7 +409,7 @@ impl Pending {
         // Another statement than the early-flushed one: the connection
         // moved on (a continuation of it keeps it).
         if !self.reported(&r) {
-            self.reported.remove(&c);
+            self.forget(c);
         }
         let mut flushed = Vec::new();
         if let Some(p) = self.map.get_mut(&c) {
@@ -393,29 +418,33 @@ impl Pending {
             r.text = None;
             let known = p.records.iter().any(|g| g.op == r.op && g.table == r.table);
             if !known && p.records.len() < MAX_PENDING_RECORDS {
+                let n = record_bytes(&r);
+                p.bytes += n;
+                self.bytes = self.bytes.saturating_add(n);
                 p.records.push(r);
             }
-            return flushed;
-        }
-        while self.map.len() >= MAX_PENDING_CONNECTIONS {
-            match self.evict_oldest(mono) {
-                Some(p) => flushed.push(p),
-                None => break,
+        } else {
+            while self.map.len() >= MAX_PENDING_CONNECTIONS {
+                match self.evict_oldest(mono) {
+                    Some(p) => flushed.push(p),
+                    None => break,
+                }
             }
+            let bytes = record_bytes(&r);
+            let seq = self.next_seq();
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.order.insert(seq, c);
+            self.map.insert(
+                c,
+                PendingStatement {
+                    records: vec![r],
+                    seq,
+                    since: mono,
+                    bytes,
+                },
+            );
         }
-        let text_bytes = r.text.as_ref().map_or(0, |t| t.len());
-        let seq = self.next_seq();
-        self.text_bytes = self.text_bytes.saturating_add(text_bytes);
-        self.map.insert(
-            c,
-            PendingStatement {
-                records: vec![r],
-                seq,
-                since: mono,
-                text_bytes,
-            },
-        );
-        while self.text_bytes > MAX_PENDING_TEXT_BYTES {
+        while self.bytes > MAX_PENDING_BYTES {
             match self.evict_oldest(mono) {
                 Some(p) => flushed.push(p),
                 None => break,
@@ -427,26 +456,43 @@ impl Pending {
     /// Statements pending for [`PENDING_TIMEOUT`] or more, oldest first;
     /// early-flushed statements older than [`REPORTED_TTL`] are forgotten.
     fn expired(&mut self, mono: Instant) -> Vec<Vec<FileRecord>> {
-        self.reported
-            .retain(|_, rep| mono.saturating_duration_since(rep.since) < REPORTED_TTL);
-        let mut old: Vec<(u64, u64)> = self
-            .map
-            .iter()
-            .filter(|(_, p)| mono.saturating_duration_since(p.since) >= PENDING_TIMEOUT)
-            .map(|(c, p)| (p.seq, *c))
-            .collect();
-        old.sort_unstable();
-        old.into_iter()
-            .filter_map(|(_, c)| self.take_early(c, mono))
-            .collect()
+        while let Some((_, c)) = self.reported_order.first_key_value().map(|(s, c)| (*s, *c)) {
+            let old = self
+                .reported
+                .get(&c)
+                .is_none_or(|rep| mono.saturating_duration_since(rep.since) >= REPORTED_TTL);
+            if !old {
+                break;
+            }
+            self.forget(c);
+        }
+        let mut out = Vec::new();
+        while let Some(c) = self.order.first_key_value().map(|(_, c)| *c) {
+            let due = self
+                .map
+                .get(&c)
+                .is_none_or(|p| mono.saturating_duration_since(p.since) >= PENDING_TIMEOUT);
+            if !due {
+                break;
+            }
+            match self.take_early(c, mono) {
+                Some(p) => out.push(p),
+                None => {
+                    // Not pending (cannot happen): drop the stale entry.
+                    self.order.pop_first();
+                }
+            }
+        }
+        out
     }
 
     /// Every pending statement, oldest first; the state is emptied.
     fn drain(&mut self) -> Vec<Vec<FileRecord>> {
-        let mut all: Vec<(u64, u64)> = self.map.iter().map(|(c, p)| (p.seq, *c)).collect();
-        all.sort_unstable();
-        let out = all.into_iter().filter_map(|(_, c)| self.take(c)).collect();
+        let conns: Vec<u64> = self.order.values().copied().collect();
+        let out = conns.into_iter().filter_map(|c| self.take(c)).collect();
         self.reported.clear();
+        self.reported_order.clear();
+        self.order.clear();
         out
     }
 
@@ -459,7 +505,7 @@ impl Pending {
                 .map(|p| p.records.len())
                 .max()
                 .unwrap_or(0),
-            self.text_bytes,
+            self.bytes,
             self.reported.len(),
         )
     }
@@ -1707,7 +1753,7 @@ mod tests {
             );
             let recs = vec![parse_json(rec.as_bytes()).unwrap()];
             b.convert_file_at(recs, EventSource::MysqlAuditLog, SystemTime::now(), t0);
-            assert!(b.pending.sizes().2 <= MAX_PENDING_TEXT_BYTES);
+            assert!(b.pending.sizes().2 <= MAX_PENDING_BYTES);
         }
     }
 

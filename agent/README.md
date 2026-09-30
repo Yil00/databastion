@@ -267,6 +267,10 @@ review remain the primary controls.
 
 ### Audit streams that panic
 A connector call that panics fails that call only (`crate::panics`).
+MySQL / MariaDB audit log statements reported before their statement record
+because the bounded grouping state was full are counted in the heartbeat
+metric `audit_pending_evicted_total` (`databastion_core::audit::count_pending_evicted`).
+
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's
 group of records) to events in isolation, as do the polled sources for each

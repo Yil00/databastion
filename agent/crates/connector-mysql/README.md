@@ -202,9 +202,13 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   record across polls and log rotations; they are reported without it at
   the connection's next statement, its disconnect, after 5 minutes, when
   the audit source changes, or when more than 1024 connections have a
-  statement waiting (the oldest first; logged). The waiting state is
-  bounded (1024 statements, 64 distinct tables each, 8 MiB of statement
-  text in all; only JSON `table_access` records carry one). A statement
+  statement waiting (the oldest first; logged and counted in the
+  heartbeat metric `audit_pending_evicted_total`). The waiting state is
+  bounded: 1024 statements, 64 distinct tables each, 16 MiB in all (names
+  of at most 1 KiB each, statement text, which only JSON `table_access`
+  records carry, and a fixed overhead per record); the memory of
+  statements reported early is at most 16384 statements of 64 table
+  hashes (8 MiB). A statement
   reported before its statement record is remembered by its query id and
   the tables already reported: a late table record of one of these tables
   is ignored, one of another table is reported (with the statement record
