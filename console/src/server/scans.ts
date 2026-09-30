@@ -4,6 +4,7 @@ import type { Database } from "@/db/client";
 import { agents, agentTargets, jobs } from "@/db/schema";
 import { registeredClassifiers } from "@/lib/protocol/classifiers";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
+import { parseCoverage, type ScanCoverage } from "@/lib/scan-coverage";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
@@ -263,6 +264,8 @@ export interface ScanJobView {
   createdAt: Date;
   finishedAt: Date | null;
   progress: Record<string, number> | null;
+  /** Coverage derived from the stored `progress` (counts only; src/lib/scan-coverage.ts). */
+  coverage: ScanCoverage;
   errorCode: string | null;
   /** The classifier set the job was issued with. */
   classifiersVersion: string | null;
@@ -312,6 +315,7 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
       createdAt: r.createdAt,
       finishedAt: r.finishedAt,
       progress: r.progress ?? null,
+      coverage: parseCoverage(r.progress),
       errorCode: r.error?.code ?? null,
       classifiersVersion: r.classifiersVersion,
     });

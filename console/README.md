@@ -262,7 +262,27 @@ events show the principal, database, hour, rows, score and signals, and their ev
 delete exceptions); `/policies/{id}` shows one policy with its exceptions (admin: edit form) and
 warns when a notify channel name matches no channel or a disabled one (the form warns as you type). A scan that failed with `unsupported` while its `classifiers_version` differs from
 the agent's current heartbeat version is shown as "classifier set mismatch" (the agent build runs
-another classifier set) instead of a bare `unsupported`. Agent-reported strings are rendered
+another classifier set) instead of a bare `unsupported`. The last scan of each target also shows its
+**coverage** (contract `JobProgress`, capability `job_progress.coverage`): the agent reports
+`objects_sampled` and one `skipped_*` counter per reason on the scan's terminal status, the console
+stores the whole `progress` map with the job (`jobs.progress`) and `src/lib/scan-coverage.ts` maps it
+on read (safe non-negative integers only; counts, never a name or a value, I2). The page lists
+`N objects sampled` and each non-zero reason with a label and, when there is one, a remedy
+(`skipped_limit` time budget or connector limit, `skipped_error` sampling failed,
+`skipped_not_readable`, `skipped_row_level_security`, `skipped_unsupported`, `skipped_remote`;
+a `skipped_*` counter unknown to this console is shown raw), plus `objects_total - objects_done`
+objects never reached when the agent reports both. A **succeeded** scan with an actionable gap
+(`skipped_limit`, `skipped_error`, `skipped_not_readable`, `skipped_row_level_security`, objects
+never reached, or a `skipped_*` reason unknown to this console, treated as a gap to be safe) gets a
+"partial coverage" badge and warning. By-design skips (`skipped_unsupported`: views, merge tables;
+`skipped_remote`: foreign tables, never read under I5) are listed without the badge, so a target
+with views is not flagged on every scan. The warning matters because, since Discovery pacing (ADR-0035), a scan that would
+run past its budget stops before the next object, reports the objects left as `skipped_limit` and
+still succeeds, so "succeeded" alone does not mean the whole target was covered. The remedy is a
+larger "Scan budget" (and the agent's `limits.max_scan_duration_s`), a higher
+`limits.discovery_duty_cycle_percent`, or narrower filters. A failed scan lists its counters without
+the badge. Partial coverage raises no incident, notification nor system alert (UI only; a new alert
+kind would need an ADR). Agents that do not report coverage show nothing. Agent-reported strings are rendered
 as React text nodes only (no `dangerouslySetInnerHTML` anywhere). UI components follow shadcn/ui
 (new-york) in `src/components/ui/`, written without Radix / `class-variance-authority` (the
 confirmation dialog uses the native `<dialog>` element).
