@@ -97,7 +97,9 @@ jobs:
       # has none). --locked: the lockfile is only read here, never changed.
       - name: Fetch the agent dependencies
         if: hashFiles('agent/Cargo.lock') != ''
-        run: cargo fetch --locked --manifest-path agent/Cargo.toml
+        run: |
+          cargo fetch --locked --manifest-path agent/Cargo.toml
+          if [ -f agent/fuzz/Cargo.lock ]; then cargo fetch --locked --manifest-path agent/fuzz/Cargo.toml; fi
 
       # The release commit carries the repository owner's noreply identity:
       # no bot account appears among the contributors.
