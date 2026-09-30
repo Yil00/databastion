@@ -84,8 +84,12 @@ pub(crate) struct Position {
     /// (`CursorStore::skip_records`); counted as dropped.
     skip: u32,
     /// Isolation mode (`CursorStore::isolate`): entries still to hand over
-    /// and save one by one.
+    /// and save one by one (the first round of the session only).
     isolate_left: u32,
+    /// Isolation mode: the entry being handed over, saved before its
+    /// conversion. A skip request drops this exact entry only (PR #83
+    /// re-review L-A).
+    handing: Option<String>,
 }
 
 impl Position {
@@ -138,6 +142,7 @@ impl Position {
             match key {
                 "cursor" => p.cursor = Some(csn.to_owned()),
                 "floor" => p.floor = Some(csn.to_owned()),
+                "handing" => p.handing = Some(csn.to_owned()),
                 "seen" if p.seen.len() < MAX_PERSISTED_SEEN => {
                     p.seen.insert(csn.to_owned());
                 }
@@ -170,7 +175,15 @@ impl Position {
         if let Some(f) = floor {
             out.push_str(&format!("floor {f}\n"));
         }
+        if let Some(h) = &self.handing {
+            out.push_str(&format!("handing {h}\n"));
+        }
         for csn in window.iter().skip(cut) {
+            // The entry being handed over is not read yet: after a crash
+            // it is read again (or skipped on the core's request).
+            if self.handing.as_ref() == Some(*csn) {
+                continue;
+            }
             out.push_str("seen ");
             out.push_str(csn);
             out.push('\n');
@@ -442,12 +455,13 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
             if !position.fresh(&r.csn) {
                 continue;
             }
-            if position.skip > 0 {
-                // The core's request: the stream panicked at this exact
-                // position, in isolation mode, so the first unread entry
-                // (in CSN order) is the one at fault. Dropped, counted,
-                // and the position saved past it.
+            if position.skip > 0 && position.handing.as_deref() == Some(r.csn.as_str()) {
+                // The core's request: the stream panicked repeatedly at
+                // this exact position, in isolation mode, while handing
+                // over this entry. Dropped, counted, and the position
+                // saved past it.
                 position.skip -= 1;
+                position.handing = None;
                 state.note_dropped(&target.id, 1);
                 tracing::warn!(
                     target_id = %target.id,
@@ -475,9 +489,12 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
                 // panic is at the exact entry at fault.
                 position.isolate_left -= 1;
                 let csn = r.csn.clone();
+                position.handing = Some(csn.clone());
+                save(position);
                 for e in convert(builder, vec![r]) {
                     sink.submit(e).await?;
                 }
+                position.handing = None;
                 position.advance(&csn);
                 save(position);
                 continue;
@@ -496,6 +513,11 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
             position.advance(max);
             save(position);
         }
+        // Isolation mode and a skip request last one round (PR #83
+        // re-review L-B): past it, the entry at fault was handed over or
+        // skipped, or the panic was elsewhere.
+        position.isolate_left = 0;
+        position.skip = 0;
         if !polled.more {
             return Ok(());
         }

@@ -655,7 +655,19 @@ async fn file_run(
             );
             st.reported = (t.oversized, t.malformed());
         }
+        let panicked_before = st.builder.panicked;
         let events = st.builder.convert(records, source, SystemTime::now());
+        {
+            let panicked = st.builder.panicked.saturating_sub(panicked_before);
+            if panicked > 0 {
+                state.note_dropped(&target.id, panicked);
+                tracing::warn!(
+                    target_id = %target.id,
+                    dropped = panicked,
+                    "audit records whose conversion failed dropped (internal error)"
+                );
+            }
+        }
         for e in events {
             sink.submit(e).await?;
         }
@@ -756,11 +768,16 @@ async fn profiler_run(
                         "profiler entries that do not parse dropped"
                     );
                 }
+                let panicked_before = st.builder.panicked;
                 let events = st.builder.convert(
                     polled.records,
                     EventSource::MongodbProfiler,
                     SystemTime::now(),
                 );
+                let panicked = st.builder.panicked.saturating_sub(panicked_before);
+                if panicked > 0 {
+                    state.note_dropped(&target.id, panicked);
+                }
                 for e in events {
                     sink.submit(e).await?;
                 }

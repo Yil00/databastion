@@ -171,6 +171,8 @@ pub(crate) struct EventBuilder {
     /// entry was not seen yet (at most [`MAX_POLL_CREDITS`]). Only that
     /// many poll-shaped reads of `system.profile` are left out uncharged.
     poll_credits: HashMap<String, u32>,
+    /// Records dropped because their conversion panicked.
+    pub(crate) panicked: u64,
 }
 
 /// Unused poll credits kept per database: polls whose own entry is never
@@ -201,6 +203,7 @@ impl EventBuilder {
             budget,
             conns: Conns::default(),
             poll_credits: HashMap::new(),
+            panicked: 0,
         }
     }
 
@@ -243,8 +246,12 @@ impl EventBuilder {
     ) -> Vec<MaskedEvent> {
         let mut out = Vec::new();
         for r in records {
-            if let Some(e) = self.one(r, source, now) {
-                out.push(e);
+            // Each record in isolation: one whose conversion panics is
+            // dropped alone, counted (PR #83 re-review M-A).
+            match databastion_core::isolate(|| self.one(r, source, now)) {
+                Some(Some(e)) => out.push(e),
+                Some(None) => {}
+                None => self.panicked = self.panicked.saturating_add(1),
             }
         }
         out

@@ -1151,9 +1151,13 @@ async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<b
     let mandatory = match session.flavor() {
         // Every supported MySQL (8.0 GA and later) has `mandatory_roles`:
         // a read error leaves the roles unknown (fail closed).
-        Flavor::Mysql => match optional(session, sql::MANDATORY_ROLES).await? {
-            Some(r) => cell(&r, 0, 0).map(str::to_owned),
-            None => return Ok(false),
+        // A NULL or a value that is not UTF-8 fails closed too.
+        Flavor::Mysql => match optional_complete(session, sql::MANDATORY_ROLES).await? {
+            Some(Some(r)) => match cell(&r, 0, 0) {
+                Some(v) => Some(v.to_owned()),
+                None => return Ok(false),
+            },
+            _ => return Ok(false),
         },
         Flavor::Mariadb => None,
     };

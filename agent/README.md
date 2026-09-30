@@ -210,24 +210,31 @@ review remain the primary controls.
 
 ### Audit streams that panic
 A connector call that panics fails that call only (`crate::panics`).
-Connectors parse every audit record in isolation (`databastion_core::isolate`):
-a record that makes a parser panic is dropped alone and counted
-(`audit.records_dropped`); a panic in a blocking parse task is resumed on the
-stream, never turned into an ordinary error that restarts it in a loop
+Connectors parse every audit record in isolation (`databastion_core::isolate`),
+and the file sources also convert each record (PostgreSQL: each statement's
+group of records) to events in isolation: a record that makes that code panic
+is dropped alone and counted (`audit.records_dropped`, and the heartbeat metric
+`audit_record_panics_total`, which tells crafted-record campaigns apart from
+malformed input). A panic in a blocking parse task is resumed on the stream,
+never turned into an ordinary error that restarts it in a loop
 (`databastion_core::resume_panic`).
 
 A panic that still ends the stream is handled by the core: a stream with a
 saved position (the cursor files it uses) is restarted in **isolation mode**
-(`CursorStore::isolate`: it hands over and saves its position after every
-record), so a panic that comes again is at the exact record at fault; after 3
-panics at that exact position, the stream is asked to skip **that one record**
-(`CursorStore::skip_records`, applied only when the saved position is still
-the one the panics happened at; counted as dropped, and in
-`audit_records_skipped_total`). The OpenLDAP accesslog stream implements both;
-the file sources rely on per-record isolation (the tailer does not skip). More
-than 8 skips or 64 panics within an hour, or 3 panics in a row on a source
-whose position is in memory (restarted afresh anyway), stop the stream until
-Audit is reconfigured or the agent restarts (`audit.stream_stopped`).
+(`CursorStore::isolate`: for its first read round it hands over and saves its
+position after every record, the OpenLDAP stream also saving the entry being
+handed over), so a panic that comes again is at the exact record at fault;
+after 3 panics at that exact position, the stream is asked to skip **that one
+record** (`CursorStore::skip_records`, applied only when the saved position is
+still the one the panics happened at; counted as dropped, and in
+`audit_records_skipped_total`). Only the OpenLDAP accesslog stream can skip;
+the file sources rely on per-record isolation. A stream is stopped until Audit
+is reconfigured or the agent restarts (`audit.stream_stopped`) after 6 panics
+at one position with no progress between them, more than 8 skips or 64
+panics within an hour, or 3 panics in a row on a source whose position is in
+memory (restarted afresh anyway). A stream that fails is restarted after its
+backoff, at least its poll interval (up to 3600 s) and at most 300 s or the
+poll interval when longer.
 
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
