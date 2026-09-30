@@ -480,6 +480,31 @@ async fn audit_from_the_profiler() {
         "{text:#?}"
     );
     assert_no_marker(&events, &logs);
+    // Phase 7: the profiler position is persisted. A read while the agent
+    // is stopped is reported after its restart (a new connector, the same
+    // state directory).
+    let saved = std::fs::read(state.0.join(format!("{}.mongodb_profiler.cursor", t.id)))
+        .expect("profiler cursor saved");
+    assert!(
+        String::from_utf8_lossy(&saved).contains("\"app\""),
+        "{}",
+        String::from_utf8_lossy(&saved)
+    );
+    reads(&a, "mongoexport").await;
+    let restarted = Arc::new(MongodbConnector::new());
+    let (task, mut rx) = start_audit(Arc::clone(&restarted), &t, &state.0);
+    let mut after = Vec::new();
+    collect_until(&mut rx, &mut after, Duration::from_secs(60), |ev| {
+        has(ev, COLLECTION, "signature.mongoexport")
+    })
+    .await;
+    task.abort();
+    let text: Vec<String> = after.iter().map(describe).collect();
+    assert!(
+        has(&after, COLLECTION, "signature.mongoexport"),
+        "a read while the agent was stopped: {text:#?}"
+    );
+    assert_no_marker(&after, &logs);
     // The real tool, from inside the container.
     let fresh = TempDir::new();
     let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &fresh.0);

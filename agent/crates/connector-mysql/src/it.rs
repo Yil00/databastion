@@ -1501,9 +1501,23 @@ async fn role_privileges_are_evaluated() {
         let (_dir, t) = target(&server, ROLE_USER, IT_PASSWORD);
 
         // SELECT on the application database through the default role:
-        // the minimal variant, nothing to report.
+        // the minimal variant, nothing to report (MariaDB 10.11+: the
+        // grants to PUBLIC were read, and hold nothing).
         let (notes, output) = privilege_check(&t).await;
         assert!(notes.is_empty(), "{name}: {notes:?}\n{output}");
+
+        // MariaDB 10.11+ (ADR-0025 residual, phase 7): a privilege granted
+        // to PUBLIC is held by every account, and is evaluated.
+        if !mysql && a.version() >= (10, 11, 0) {
+            exec(&mut a, &format!("GRANT INSERT ON `{db}`.* TO PUBLIC")).await;
+            let (notes, output) = privilege_check(&t).await;
+            exec(&mut a, &format!("REVOKE INSERT ON `{db}`.* FROM PUBLIC")).await;
+            let beyond = server_note(name, &notes, NoteCode::PrivilegeBeyondSelect);
+            assert_eq!(labels(beyond), ["insert"], "{name}: {output}");
+            assert_no_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated, &output);
+            let (notes, output) = privilege_check(&t).await;
+            assert!(notes.is_empty(), "{name}: {notes:?}\n{output}");
+        }
 
         // A role granted but not enabled, holding write privileges and,
         // through another role, SELECT on the mysql database.

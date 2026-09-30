@@ -130,14 +130,41 @@ so it is still reported, against `*`, but without signals. The
 `server_audit` TABLE records still name the tables; the Percona
 `audit_log_filter` `table_access` records too.
 
+## Audit connections
+
+A `performance_schema` stream holds one session on the agent's account. It
+re-probes its prerequisites (every 5 minutes) **on that session**, and
+closes a stale or broken session **before** opening its replacement (phase
+7), so the stream holds one connection at a time; the probe's session
+becomes the stream's session when `performance_schema` is chosen. A
+file-source stream holds no session: its re-probe opens one and closes it.
+The only other Audit connection is the `KILL QUERY` sent when a guarded
+Audit statement is cancelled (the stream stopped or reconfigured
+mid-statement), opened while the Audit session still exists. ADR-0025
+decision 11 counts that connection in the same slot as the re-probe and
+the reconnect, so the sizing is unchanged: keep `MAX_USER_CONNECTIONS 6`
+with a `performance_schema` stream (5 with an audit log file), plus one per
+additional Audit target on the account. What changed is that a re-probe or
+a reconnect no longer competes with a `KILL QUERY` for that slot.
+
 ## Known limits
 
 - **No volumes on the audit-log sources** (above).
 - **At-most-once delivery**, as for PostgreSQL: the log cursor advances once
   the events are handed to the core, which aggregates them for up to
   `aggregation_window_s`; an agent crash within that window loses them. On
-  `performance_schema` the cursor is in memory: after an agent restart,
-  reading starts at the newest statement.
+  `performance_schema` the cursor (end timers and ids of the statements
+  read, never a statement) is persisted with the server's start time
+  (`SHOW GLOBAL STATUS LIKE 'Uptime'`) after each poll (phase 7): an agent
+  restart resumes after the last statement read when the server did not
+  restart, and reads a restarted server's statements from its start;
+  what the history no longer holds (`events_statements_history_long`
+  wrapped while the agent was stopped) is lost and counted. The sessions'
+  accounts are not persisted: a statement of a session that ended while
+  the agent was stopped is reported as an unidentified account. Without a
+  saved cursor (first start, or the start time unreadable: a saved cursor
+  is then removed), reading starts at the newest statement. The cursor is removed while an audit log file
+  is the source, so a later switch back does not re-read that period.
 - **First start / rotation while stopped**: without a cursor, reading
   starts at the end of the log. A log rotated while the agent was stopped
   is read from the start of the new file.

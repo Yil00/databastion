@@ -372,7 +372,8 @@ pub(crate) async fn audit_stream(
                     None,
                     u64::from(cfg.max_sample_rows()),
                     state.own_usage(&target.id),
-                ),
+                )
+                .persisted(cfg),
                 session.identity.clone(),
                 u64::from(cfg.max_sample_rows()),
                 cfg.sensitive_objects().to_vec(),

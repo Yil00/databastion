@@ -44,7 +44,11 @@ use events::EventBuilder;
 use pfs::{PollError, PsPoller};
 
 /// How often the source choice is re-evaluated while streaming.
+#[cfg(not(test))]
 const REPROBE: Duration = Duration::from_secs(300);
+/// Tests: often enough for an integration test to see re-probes.
+#[cfg(test)]
+const REPROBE: Duration = Duration::from_secs(3);
 /// `program_name` the connector sends (`proto`).
 const PROGRAM_NAME: &str = "databastion-agent";
 /// `server_audit_query_log_limit` when it cannot be read.
@@ -97,21 +101,36 @@ pub(crate) fn own_address(user: &str) -> Option<ClientAddr> {
     }
 }
 
+/// [`probe_prerequisites`] on a session of its own (tests).
+#[cfg(test)]
 pub(crate) async fn prerequisites(
     state: &CheckState,
     target: &TargetConfig,
     timeouts: Timeouts,
 ) -> Result<Prerequisites, MyError> {
     let mut session = Session::connect(target, timeouts).await?;
-    let probe = check::audit_probe(&mut session).await?;
+    let pre = probe_prerequisites(state, target, &mut session).await;
+    session.close().await;
+    pre
+}
+
+/// The Audit prerequisites, probed on `session`: the held
+/// `performance_schema` session when there is one, so a re-probe opens no
+/// second Audit connection (phase 7, ADR-0025 decision 11).
+pub(crate) async fn probe_prerequisites(
+    state: &CheckState,
+    target: &TargetConfig,
+    session: &mut Session,
+) -> Result<Prerequisites, MyError> {
+    let probe = check::audit_probe(session).await?;
     let file = check::file_state(state, target).await;
     let (_, source) = check::choose(&probe, file);
-    let own_addr = optional_scalar(&mut session, sql::SESSION_USER)
+    let own_addr = optional_scalar(session, sql::SESSION_USER)
         .await?
         .as_deref()
         .and_then(own_address);
     let (utc_offset, query_limit) = if source == Source::File(MysqlLogFormat::ServerAudit) {
-        let offset = optional_scalar(&mut session, sql::SYSTEM_UTC_OFFSET)
+        let offset = optional_scalar(session, sql::SYSTEM_UTC_OFFSET)
             .await?
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|o| o.abs() <= 18 * 3600);
@@ -121,7 +140,7 @@ pub(crate) async fn prerequisites(
                 "server time zone offset unknown; server_audit times read as UTC"
             );
         }
-        let limit = optional_scalar(&mut session, sql::SERVER_AUDIT_QUERY_LIMIT)
+        let limit = optional_scalar(session, sql::SERVER_AUDIT_QUERY_LIMIT)
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_QUERY_LIMIT);
@@ -129,7 +148,6 @@ pub(crate) async fn prerequisites(
     } else {
         (0, DEFAULT_QUERY_LIMIT)
     };
-    session.close().await;
     Ok(Prerequisites {
         source,
         own_addr,
@@ -151,6 +169,7 @@ fn own_account(
         u64::from(cfg.max_sample_rows()),
         state.own_usage(&target.id),
     )
+    .persisted(cfg)
 }
 
 struct FileStream {
@@ -163,8 +182,41 @@ struct FileStream {
 
 struct PsStream {
     table: pfs::PsTable,
-    session: Session,
+    /// The held session (`None` only between closing a stale one and
+    /// opening its replacement).
+    session: Option<Session>,
     poller: PsPoller,
+}
+
+impl PsStream {
+    /// The held session, usable: a stale or poisoned one is **closed
+    /// before** its replacement is opened, so the stream never holds two
+    /// Audit connections (phase 7, ADR-0025 decision 11). The poller is
+    /// re-attached to the new session (its cursor is kept).
+    async fn fresh_session(
+        &mut self,
+        target: &TargetConfig,
+        timeouts: Timeouts,
+    ) -> Result<&mut Session, ConnectorError> {
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|s| s.is_stale() || s.is_poisoned())
+        {
+            if let Some(old) = self.session.take() {
+                old.close().await;
+            }
+            let mut session = Session::connect(target, timeouts)
+                .await
+                .map_err(MyError::into_connector_error)?;
+            self.poller
+                .reattach(&mut session)
+                .await
+                .map_err(MyError::into_connector_error)?;
+            self.session = Some(session);
+        }
+        self.session.as_mut().ok_or_else(internal)
+    }
 }
 
 /// `Connector::audit_stream` for MySQL / MariaDB.
@@ -179,17 +231,43 @@ pub(crate) async fn audit_stream(
     let mut file: Option<FileStream> = None;
     let mut ps: Option<PsStream> = None;
     loop {
-        let pre = prerequisites(state, target, timeouts)
-            .await
-            .map_err(MyError::into_connector_error)?;
+        // The prerequisites are probed on the held performance_schema
+        // session when there is one, else on a session opened for the
+        // probe, which becomes the performance_schema session when that
+        // is the source (phase 7): one Audit connection at a time.
+        let mut probe_session: Option<Session> = None;
+        let pre = match ps.as_mut() {
+            Some(st) => {
+                let session = st.fresh_session(target, timeouts).await?;
+                probe_prerequisites(state, target, session).await
+            }
+            None => {
+                let session = probe_session.insert(
+                    Session::connect(target, timeouts)
+                        .await
+                        .map_err(MyError::into_connector_error)?,
+                );
+                probe_prerequisites(state, target, session).await
+            }
+        }
+        .map_err(MyError::into_connector_error)?;
         match pre.source {
             Source::File(format) => {
-                ps = None;
+                if let Some(s) = probe_session.take() {
+                    s.close().await;
+                }
+                if let Some(old) = ps.take().and_then(|p| p.session) {
+                    old.close().await;
+                }
                 let st = match file.as_mut() {
                     Some(st) if st.format == format => st,
                     _ => {
                         let log = target.mysql_settings().audit_log.ok_or_else(internal)?;
                         tracing::info!(target_id = %target.id, "audit source: audit log file");
+                        // The log covers what performance_schema would: a
+                        // later switch back starts at its newest statement
+                        // rather than re-reading this period.
+                        forget_ps_cursor(cfg);
                         let framing = match format {
                             MysqlLogFormat::ServerAudit => Framing::Lines,
                             MysqlLogFormat::Json => Framing::JsonObjects,
@@ -223,13 +301,20 @@ pub(crate) async fn audit_stream(
             Source::Ps(table) => {
                 file = None;
                 if ps.as_ref().is_none_or(|p| p.table != table) {
-                    let mut session = Session::connect(target, timeouts)
-                        .await
-                        .map_err(MyError::into_connector_error)?;
+                    // The probe's session, or the held one (another
+                    // statement table): no new connection.
+                    let held = ps.take().and_then(|p| p.session);
+                    let mut session = match probe_session.take().or(held) {
+                        Some(s) => s,
+                        None => Session::connect(target, timeouts)
+                            .await
+                            .map_err(MyError::into_connector_error)?,
+                    };
                     let builder = EventBuilder::new(own_account(cfg, target, &pre, state));
-                    let poller = PsPoller::start(&mut session, table, builder)
-                        .await
-                        .map_err(MyError::into_connector_error)?;
+                    let poller =
+                        PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR))
+                            .await
+                            .map_err(MyError::into_connector_error)?;
                     tracing::info!(
                         target_id = %target.id,
                         table = table.name(),
@@ -237,20 +322,32 @@ pub(crate) async fn audit_stream(
                     );
                     ps = Some(PsStream {
                         table,
-                        session,
+                        session: Some(session),
                         poller,
                     });
                 }
                 if let Some(st) = ps.as_mut() {
                     st.poller.set_own_addr(pre.own_addr);
-                    ps_run(cfg, target, sink, st, timeouts).await?;
+                    ps_run(cfg, target, sink, state, st, timeouts).await?;
                 }
             }
             Source::None => {
+                if let Some(s) = probe_session.take() {
+                    s.close().await;
+                }
                 return Err(
                     MyError::new(FailureCode::Unsupported, Stage::Audit).into_connector_error()
                 );
             }
+        }
+    }
+}
+
+/// Removes the saved `performance_schema` cursor.
+fn forget_ps_cursor(cfg: &AuditConfig) {
+    if let Some(store) = cfg.cursor(pfs::CURSOR) {
+        if let Err(e) = store.remove() {
+            tracing::warn!(error = %e, "performance_schema cursor not removed");
         }
     }
 }
@@ -375,23 +472,28 @@ async fn ps_run(
     cfg: &AuditConfig,
     target: &TargetConfig,
     sink: &EventSink,
+    state: &CheckState,
     st: &mut PsStream,
     timeouts: Timeouts,
 ) -> Result<(), ConnectorError> {
     let started = Instant::now();
     loop {
-        if st.session.is_stale() || st.session.is_poisoned() {
-            let mut session = Session::connect(target, timeouts)
-                .await
-                .map_err(MyError::into_connector_error)?;
-            st.poller
-                .reattach(&mut session)
-                .await
-                .map_err(MyError::into_connector_error)?;
-            let old = std::mem::replace(&mut st.session, session);
-            old.close().await;
+        st.fresh_session(target, timeouts).await?;
+        let panicked_before = st.poller.panicked;
+        let Some(session) = st.session.as_mut() else {
+            return Err(internal());
+        };
+        let polled = st.poller.poll(session, sink).await;
+        let panicked = st.poller.panicked.saturating_sub(panicked_before);
+        if panicked > 0 {
+            state.note_dropped(&target.id, panicked);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = panicked,
+                "performance_schema statements whose conversion failed dropped (internal error)"
+            );
         }
-        match st.poller.poll(&mut st.session, sink).await {
+        match polled {
             Ok(()) => {}
             Err(PollError::Db(e)) => {
                 tracing::warn!(
