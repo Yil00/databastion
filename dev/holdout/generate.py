@@ -40,7 +40,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-SEED = 5_318_027  # holdout seed; MUST differ from dev/seed/generate.py (20260928). Rotate once per
+SEED = 860_592_072  # holdout seed; MUST differ from dev/seed/generate.py (20260928). Rotate once per
 # release cycle, before the release candidate (see RELEASE.md).
 VERSION = 1
 ROWS = 200
