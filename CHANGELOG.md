@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.0](https://github.com/Yil00/databastion/compare/0.1.0-rc.2...0.1.0) (2026-09-30)
+
+### 🐛 Bug Fixes
+
+* **deploy:** fetch the agent dependencies before the release version bump (P7) ([#109](https://github.com/Yil00/databastion/issues/109)) ([df40ddb](https://github.com/Yil00/databastion/commit/df40ddbfbdd13977eac11d4976f6849cdf9524f6))
+
+### 📝 Documentation
+
+* holdout rotation, pre-release 0.1.0-rc.2 and deferred stability test (P7) ([#106](https://github.com/Yil00/databastion/issues/106)) ([7040877](https://github.com/Yil00/databastion/commit/70408776f9f6d0f867b0017d03810ac5aea53a7c))
+
 All notable changes to DataBastion are recorded here.
 
 This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
