@@ -206,18 +206,52 @@ volumes:
 # NOT alongside the console. No port exposed. On a database host, the .deb
 # package (systemd service) is the documented path: deploy/README.md.
 #
-#  agent:
-#    image: ghcr.io/yil00/databastion-agent:<version>
-#    restart: unless-stopped
-#    environment:
-#      DATABASTION_CONSOLE_URL: https://databastion.example.com
-#      DATABASTION_ENROLLMENT_TOKEN_FILE: /run/secrets/enrollment_token  # single use
+# The console URL, its CA pin, the targets and their secret references come
+# from agent.yaml (console.url, console.ca_file, targets): the agent reads no
+# console URL from the environment. Pin the image like the console's: the tag
+# and the digest of the release's verified image-digests.txt, never `latest`.
+#
+# Enrollment is a one-shot `enroll`, before the first start, with the
+# single-use token from the console:
+#   docker compose --profile enroll run --rm agent-enroll
+# then delete ./secrets/enrollment_token and start the agent:
+#   docker compose up -d agent
+# The long-running agent never mounts the token, so deleting it does not
+# break the next `up`.
+#
+#  x-agent: &agent
+#    image: ghcr.io/yil00/databastion-agent:<version>@sha256:<digest from image-digests.txt>
 #    volumes:
-#      - ./agent.yaml:/etc/databastion/agent.yaml:ro     # targets + secret refs
+#      - ./agent.yaml:/etc/databastion/agent.yaml:ro     # console.url, targets + secret refs
 #      - agent-state:/var/lib/databastion                # identity, HMAC key, spool
-#      - /var/log/postgresql:/logs/postgresql:ro         # native logs (Audit)
-#    secrets: [enrollment_token, pg_password]
 #    user: "10001:10001"
 #    read_only: true
 #    cap_drop: [ALL]
 #    security_opt: ["no-new-privileges:true"]
+#
+#  services:
+#    agent-enroll:                                       # one-shot, profile `enroll`
+#      <<: *agent
+#      profiles: [enroll]
+#      restart: "no"
+#      command: ["enroll", "--config", "/etc/databastion/agent.yaml",
+#                "--token-file", "/run/secrets/enrollment_token"]
+#      secrets: [enrollment_token]                       # single use
+#
+#    agent:                                              # image default: run --config /etc/databastion/agent.yaml
+#      <<: *agent
+#      restart: unless-stopped
+#      volumes:
+#        - ./agent.yaml:/etc/databastion/agent.yaml:ro
+#        - agent-state:/var/lib/databastion
+#        - /var/log/postgresql:/logs/postgresql:ro       # native logs (Audit)
+#      secrets: [pg_password]                            # target password files named in agent.yaml
+#
+#  secrets:
+#    enrollment_token:
+#      file: ./secrets/enrollment_token                  # 0600, owned by uid 10001; delete after enroll
+#    pg_password:
+#      file: ./secrets/pg_password                       # 0600, owned by uid 10001
+#
+#  volumes:
+#    agent-state:

@@ -18,7 +18,10 @@ service), and how to verify what you download. The CI runs this exact path and t
 
 Supported: console on any Linux host with Docker Engine and Compose v2; agent `.deb` on Debian 12
 and Ubuntu 24.04 (amd64, arm64), with systemd. The agent image (`ghcr.io/yil00/databastion-agent`)
-is the alternative for container hosts ([agent README](../agent/README.md#docker-image)).
+is the alternative for container hosts ([agent README](../agent/README.md#docker-image)): the
+commented example at the end of [docker-compose.example.yml](docker-compose.example.yml) enrolls
+once with a separate `agent-enroll` service (profile `enroll`), then runs the agent without the
+token; pin it by digest like the console.
 
 ## Verify the artifacts
 Every release publishes, from [publish.yml](../.github/workflows/publish.yml) only:

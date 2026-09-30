@@ -15,7 +15,11 @@ database (also used as the job queue: no Redis). See
 > lifecycle (see "Policies and incidents"); P3-C: e-mail and HMAC-signed webhook notifications,
 > "silent agent" and agent-integrity alerts (see "Alerting"). Phase 4 (P4-C): `/events`
 > ingestion, volume x sensitivity scoring, per-principal baselines, policies over access events,
-> `audit.configure` settings with confirmation (see "Audit correlation").
+> `audit.configure` settings with confirmation (see "Audit correlation"). Phases 5 and 6: MongoDB
+> and OpenLDAP sources and labels in the policy form and the views. Phase 7: incident dedup per
+> principal key, `agent.audit_stream_stopped` alert and the shared system-alert budget (see
+> "Alerting", ADR-0031, ADR-0033); distroless runtime image, signed at release (see "Docker
+> image").
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
