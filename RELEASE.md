@@ -85,7 +85,7 @@ All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifac
 1. On `dev`, CI is green and the ROADMAP is up to date.
 2. (Optional) Create an `X.Y.Z-rc.N` tag on `dev` to test the candidate images.
 3. Open a `dev` → `main` PR titled `release: X.Y.Z`.
-4. On merge, the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)):
+4. On merge (the push of the merge commit to `main`), the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)) waits for the maintainer's approval of the `release-it` environment, then:
    - computes the version from the commits and the latest tag,
    - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, later the Helm chart),
    - generates the [CHANGELOG.md](CHANGELOG.md) section,
@@ -95,7 +95,7 @@ All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifac
 6. The maintainer reviews the draft (assets present, publish run green), adds upgrade notes if needed, and **publishes** the release. Assets are only ever attached to a draft.
 7. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
 
-To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase. **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
+To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase (GitHub copies the title into the merge or squash commit message, which `release.yml` reads: keep the default commit messages). **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
 
 ### Pre-release
 ```bash
@@ -119,7 +119,7 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 |----------|-------------|------|
 | [ci.yml](.github/workflows/ci.yml) | push and PR on `main` / `dev` | Doc links, gitleaks, console, agent, protocol (each job only runs if its component exists); aggregated `CI result` check |
 | [pr-checks.yml](.github/workflows/pr-checks.yml) | PR | Conventional Commits title, DCO sign-off on each commit |
-| [release.yml](.github/workflows/release.yml) | PR merged into `main` | release-it: version, changelog, `X.Y.Z` tag pushed with `RELEASE_TOKEN`, draft release (no signing) |
+| [release.yml](.github/workflows/release.yml) | push to `main` (a merged PR), except `[skip-release]` and release-it's own commit; runs in the `release-it` environment | release-it: version, changelog, `X.Y.Z` tag pushed with `RELEASE_TOKEN`, draft release (no signing) |
 | [publish.yml](.github/workflows/publish.yml) | push of an `X.Y.Z` or `X.Y.Z-*` tag only; jobs that push or sign in the `release` environment | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
 | [packaging.yml](.github/workflows/packaging.yml) | call from `ci.yml` (packaging files changed) and `publish.yml` | Reproducible `.deb`, install checks in Debian 12 / Ubuntu 24.04 containers, "Installation < 15 min" test ([deploy/README.md](deploy/README.md#installation-test-under-15-minutes)) |
 | [dependabot.yml](.github/dependabot.yml) | weekly | Updates to actions and tooling, PRs to `dev` |
@@ -127,12 +127,22 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 Third-party actions are pinned by commit SHA (Dependabot updates them).
 
 ### Repository configuration (one-time)
-- **`RELEASE_TOKEN` secret** (required for `release.yml`): the owner's *fine-grained* token, limited to this repository, with **Contents: read and write** permission. It lets the release commit pass `main`'s protection (bypass reserved for the admin). Create it in *Settings → Developer settings → Fine-grained tokens*, then add it in the repository's *Settings → Secrets and variables → Actions*.
+**These settings must be in place before the change that introduced them (ADR-0034, PR #86) is merged into `main`**, and before any release. `release.yml` and `publish.yml` check them at the start of every run and stop when one is missing (`.github/scripts/check-release-settings.sh`): a defence against a forgotten or undone setup only, since whoever can edit a workflow can remove the check.
+
+Why: `RELEASE_TOKEN` can push to `main` and create version tags (it bypasses the tag ruleset), and any version tag starts a signing run. The token must therefore be readable only by the `release-it` job on `main`, and tag creation must be limited to it and the maintainers.
+
+Maintainer steps, in this order:
+1. **`release-it` environment**: *Settings → Environments → New environment*, name `release-it`.
+   - *Required reviewers*: the maintainer(s) (leave *Prevent self-review* off while there is a single maintainer); leave *Allow administrators to bypass configured protection rules* unchecked.
+   - *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Branch*, name `main`. No other rule.
+   - *Environment secrets → Add environment secret*: `RELEASE_TOKEN` = the owner's *fine-grained* token (*Settings → Developer settings → Fine-grained tokens*), limited to this repository, **Contents: read and write** only. It lets the release commit pass `main`'s protection and pushes the tag (a push made with the default `GITHUB_TOKEN` would not start `publish.yml`).
+   - Preferred replacement for the admin token: a **GitHub App** installed on this repository only (Contents: read and write), its token minted in the job (`actions/create-github-app-token`), the app's private key as the environment secret, and the app, not *Repository admin*, in the bypass lists of `main` and of the tag ruleset.
+2. **`release` environment**: *New environment* `release`. *Required reviewers*: the maintainer(s), same settings as above. *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Tag*, pattern `[0-9]*.[0-9]*.[0-9]*`; no branch rule. No secret (keyless signing).
+3. **Delete the repository-level secret**: *Settings → Secrets and variables → Actions → Repository secrets* → `RELEASE_TOKEN` → *Remove*. From then on, no branch workflow can read the token.
+4. **Tag ruleset**: *Settings → Rules → Rulesets → New ruleset → New tag ruleset*. Name `release tags`, enforcement *Active*. *Target tags → Add target → Include by pattern*: `*.*.*` (covers `X.Y.Z` and `X.Y.Z-…`). Rules: *Restrict creations*, *Restrict updates*, *Restrict deletions*, *Block force pushes*. *Bypass list*: *Repository admin* only (the maintainers; release-it's tag push goes through the owner's token), or the release GitHub App of step 1. Save.
+5. Check once with a pre-release tag: the publish run passes its settings check, waits for approval, and `cosign verify` with the exact identity above succeeds.
+
 - Optional variables `RELEASE_GIT_NAME` / `RELEASE_GIT_EMAIL`: identity of the release commit (by default, the owner's noreply address).
-- **Release prerequisites** (ADR-0034; without them, anyone with write access could push a tag and get a signing run):
-  1. **Tag ruleset**: *Settings → Rules → Rulesets → New ruleset → New tag ruleset*. Name `release tags`, enforcement *Active*. *Target tags → Add target → Include by pattern*: `*.*.*` (covers `X.Y.Z` and `X.Y.Z-…`). Rules: *Restrict creations*, *Restrict updates*, *Restrict deletions* (and *Block force pushes*). *Bypass list*: *Repository admin* only (the maintainers; `RELEASE_TOKEN` is the owner's token, so release-it's tag push bypasses as admin). Save.
-  2. **`release` environment**: *Settings → Environments → New environment* `release`. *Required reviewers*: the maintainer(s) (leave *Prevent self-review* off while there is a single maintainer). *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Tag*, pattern `[0-9]*.[0-9]*.[0-9]*`; no branch rule. Leave *Allow administrators to bypass configured protection rules* unchecked. No environment secret is needed (keyless signing).
-  3. Check once with a pre-release tag: the publish run waits for approval, and `cosign verify` with the exact identity above succeeds.
 - As long as there is only one maintainer, no approval is required on PRs (you cannot approve your own PR). Switch to 1 approval as soon as a second maintainer joins.
 
 ## 7. Pre-release checklist
@@ -141,6 +151,6 @@ Third-party actions are pinned by commit SHA (Dependabot updates them).
 - [ ] Release notes reviewed: breaking changes first, upgrade steps
 - [ ] [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix up to date
 - [ ] Console N / agent N-1 compatibility tested
-- [ ] Release prerequisites in place (tag ruleset, `release` environment: section 6)
+- [ ] Release prerequisites in place (`release-it` and `release` environments, no repository-level `RELEASE_TOKEN`, tag ruleset: section 6)
 - [ ] Images signed, SBOM and `SHA256SUMS` published; `cosign verify` with the exact tag identity succeeds
 - [ ] Installation test of the publish run green (under 15 minutes with the published image and `.deb`)

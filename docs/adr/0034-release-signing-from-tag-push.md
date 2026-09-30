@@ -28,7 +28,10 @@ compromised action in either workflow (PR #86 security review, H1).
    nothing calls it. `release.yml` keeps computing the version, the changelog, the release commit
    and the draft release; release-it pushes the `X.Y.Z` tag with `RELEASE_TOKEN` (a personal token,
    so the push triggers workflows), and that push starts `publish.yml`. Pre-release tags keep being
-   pushed by a maintainer.
+   pushed by a maintainer. `release.yml` runs on the push of the merge commit to `main` (not on
+   `pull_request: closed`, whose `refs/pull/<N>/merge` ref deployment rules cannot match reliably),
+   and skips release-it's own `chore(release):` commit and merges whose message carries
+   `[skip-release]`.
 2. **Exact identity.** Every signature of a release carries
    `https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/<version>`, with the
    GitHub issuer and the workflow trigger `push`. Users verify with `--certificate-identity` (exact
@@ -39,25 +42,41 @@ compromised action in either workflow (PR #86 security review, H1).
    `*.*.*` tags to repository admins (the maintainers; release-it's push through the owner's token
    bypasses as admin). The jobs of `publish.yml` that push images or sign (`build`, `manifest`,
    `release-assets`) run in the GitHub Environment `release`, whose deployment rule only admits
-   version tags and whose required reviewers approve each release. These are repository settings,
-   made by the maintainer; RELEASE.md lists them as release prerequisites.
-4. **No shared state in release builds.** Release image builds use no build cache (`no-cache`,
+   version tags and whose required reviewers approve each release.
+4. **Protection of the release token.** `RELEASE_TOKEN` bypasses the tag ruleset (it must push the
+   tag), so whoever reads it can start a signing run at a commit of their choice. It is therefore
+   an **environment secret** of the GitHub Environment `release-it` only (required reviewers,
+   deployment limited to the `main` branch), used by the single `release-it` job of `release.yml`;
+   no repository-level secret of that name exists, so a workflow on any other branch cannot read it.
+   A GitHub App token (an app installed on this repository only, named in the bypass lists instead
+   of *Repository admin*, its key in the same environment) is the preferred replacement for the
+   owner's personal token.
+5. **Settings check.** The environments, the token's placement and the tag ruleset are repository
+   settings, made by the maintainer (RELEASE.md, section 6), and must exist before this decision is
+   merged. `release.yml` and `publish.yml` read them at the start of each run
+   (`check-release-settings.sh`: required reviewers and deployment rules of the environment, an
+   active tag ruleset restricting creation, update and deletion) and stop when one is missing. This
+   only guards against a forgotten or undone setup: it cannot see where a secret is stored, and
+   whoever can edit a workflow can remove it.
+6. **No shared state in release builds.** Release image builds use no build cache (`no-cache`,
    fresh base image pulls), so nothing another workflow wrote into the GitHub Actions cache can end
    up in a release. CI keeps its caches under scopes the release never reads. A pull-request job
    (`packaging.yml`, `publish-dry-run`) runs the release build configuration without a push.
-5. **Assets are attached to drafts only.** `publish.yml` refuses to change the assets of a published
+7. **Assets are attached to drafts only.** `publish.yml` refuses to change the assets of a published
    release, and moves the `next` / `X.Y` / `latest` tags only after the signature and the SBOM /
    provenance attestations of the new index are verified.
 
 ## Consequences
 - The identity users check is fully determined by the version they install. A signature made from a
   branch, a pull request ref or a manually dispatched run no longer verifies.
-- The security of the chain now rests on the tag ruleset, the `release` environment and the
-  protection of `RELEASE_TOKEN`. Until the maintainer has configured the ruleset and the
-  environment, anyone with write access can still push a tag and start a signing run: RELEASE.md
-  makes their configuration a release prerequisite and a pre-release checklist item.
-- A regular release now needs an approval of the `release` environment jobs, in up to three waves
-  (image builds, signature, release assets).
+- The security of the chain now rests on the tag ruleset, the two environments and the protection
+  of `RELEASE_TOKEN` (or of the GitHub App key). Until the maintainer has configured them, a release
+  run stops at the settings check; the repository-level copy of `RELEASE_TOKEN` must be deleted by
+  hand, and nothing checks that it is gone.
+- A maintainer with admin rights can still push a version tag and start a signing run: the
+  approval of the `release` environment is then the remaining control.
+- A regular release now needs an approval of the `release-it` environment, then of the `release`
+  environment jobs in up to three waves (image builds, signature, release assets).
 - Release builds take longer without a cache (the Rust and Next.js builds run in full).
 - If release-it's tag push does not trigger workflows (for example if `RELEASE_TOKEN` is replaced by
   the default `GITHUB_TOKEN`), nothing is published. The failure is visible (no publish run, draft
