@@ -92,6 +92,13 @@ jobs:
         with:
           toolchain: stable
 
+      # bump-version.mjs runs `cargo update --workspace --offline` to rewrite the workspace crate
+      # versions in agent/Cargo.lock: the registry must be in the local cache first (a fresh runner
+      # has none). --locked: the lockfile is only read here, never changed.
+      - name: Fetch the agent dependencies
+        if: hashFiles('agent/Cargo.lock') != ''
+        run: cargo fetch --locked --manifest-path agent/Cargo.toml
+
       # The release commit carries the repository owner's noreply identity:
       # no bot account appears among the contributors.
       - name: Git identity
