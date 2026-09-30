@@ -228,7 +228,15 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   their statement record (the old file cannot be re-read); the memory of
   statements reported early does not survive a restart or a new stream,
   so their late statement record is then reported on its own (with the
-  objects its text names). `performance_schema` has one row per statement
+  objects its text names). Without query ids (`audit_log_filter`), two
+  consecutive statements of one connection with the same text whose table
+  records are not separated by the first one's statement record are merged
+  into one event (the log gives no way to tell them apart): such repeats
+  are undercounted. Stored procedures: MariaDB 11.4 (checked on 11.4.13)
+  gives each statement of a procedure its own query id, with its own table
+  and statement records, and logs the `CALL` last with none; each is
+  reported on its own, the `CALL` against `*`. The late-table rule above
+  does not depend on it. `performance_schema` has one row per statement
   (deduplicated on thread and event id), so it has no grouping. Before
   phase 7 (load tests) records were merged only when adjacent, and
   interleaved sessions counted about 12 % of their statements twice.

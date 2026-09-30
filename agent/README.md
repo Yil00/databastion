@@ -112,7 +112,14 @@ binary: `cargo build --no-default-features --features postgres`.
   25 % of one core without pacing). Units that failed or timed out are
   charged too. Connectors release what a unit held (a poisoned session,
   the samples, and on MySQL / MariaDB an idle session when the debt
-  reaches its 45 s staleness bound) before the pause. Scans run one at a
+  reaches its 45 s staleness bound) before the pause. The pause is paid
+  before a session is checked for staleness, so a session idle through a
+  long pause is replaced before the next unit rather than used stale: the
+  MongoDB and OpenLDAP connectors reconnect after a pause of more than
+  60 s, the MySQL / MariaDB one after 45 s, and those reconnections are
+  not paced (a handful per scan at most with pauses that long; residual,
+  security review of #93, L6). The PostgreSQL connector keeps its idle
+  session through the pauses (no transaction open). Scans run one at a
   time per agent, so scans of several targets on one server never add up.
   Not paced: the connection setup (once per scan or database, and after a
   budget stop or an idle session). The bound is never relaxed: when the
