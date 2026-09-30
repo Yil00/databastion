@@ -194,6 +194,27 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   the server's limit, an ambiguous `sql_mode` reading) and `CALL` are
   reported against `*`. Under `ANSI_QUOTES`, a `"…"` name is not read
   (never a name), so such an object is missed or `*`.
+- **One event per statement.** The table records and the statement record
+  of one statement are grouped per connection id and query id (without
+  query ids, `audit_log_filter`: by text), not by position in the log:
+  concurrent sessions interleave their records (`READ a`, `READ b`,
+  `QUERY a`, `QUERY b`). A statement's table records wait for its statement
+  record across polls and log rotations; they are reported without it at
+  the connection's next statement, its disconnect, after 5 minutes, when
+  the audit source changes, or when more than 1024 connections have a
+  statement waiting (the oldest first; logged). The waiting state is
+  bounded (1024 statements, 64 distinct tables each, 8 MiB of statement
+  text in all; only JSON `table_access` records carry one). A statement
+  reported before its statement record is remembered by its query id: its
+  late statement record yields a second event only when its text shows a
+  signal (a whole-table read by a dump that ran longer than 5 minutes).
+  Residual: table records waiting when the agent stops are lost (the
+  cursor has moved past them; delivery is at most once); their statement
+  record, if written after the restart, is still reported, with the
+  objects its text names. `performance_schema` has one row per statement
+  (deduplicated on thread and event id), so it has no grouping. Before
+  phase 7 (load tests) records were merged only when adjacent, and
+  interleaved sessions counted about 12 % of their statements twice.
 - **The agent's own account.** Its statements are left out only when they
   come from its account, from its client address as the server sees it
   (`USER()`, read at each re-probe; a host name there, such as `localhost`

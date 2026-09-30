@@ -259,6 +259,9 @@ pub(crate) async fn audit_stream(
                 if let Some(old) = ps.take().and_then(|p| p.session) {
                     old.close().await;
                 }
+                if file.as_ref().is_some_and(|st| st.format != format) {
+                    close_file(target, sink, state, &mut file).await?;
+                }
                 let st = match file.as_mut() {
                     Some(st) if st.format == format => st,
                     _ => {
@@ -294,12 +297,12 @@ pub(crate) async fn audit_stream(
                         kind = %kind,
                         "audit log unreadable; re-evaluating the audit source"
                     );
-                    file = None;
+                    close_file(target, sink, state, &mut file).await?;
                     tokio::time::sleep(cfg.poll_interval()).await;
                 }
             }
             Source::Ps(table) => {
-                file = None;
+                close_file(target, sink, state, &mut file).await?;
                 if ps.as_ref().is_none_or(|p| p.table != table) {
                     // The probe's session, or the held one (another
                     // statement table): no new connection.
@@ -343,6 +346,42 @@ pub(crate) async fn audit_stream(
     }
 }
 
+fn file_source(format: MysqlLogFormat) -> EventSource {
+    match format {
+        MysqlLogFormat::ServerAudit => EventSource::MariadbServerAudit,
+        MysqlLogFormat::Json => EventSource::MysqlAuditLog,
+    }
+}
+
+/// Ends the audit log stream, if any: the statements still waiting for
+/// their statement record are reported (their records are behind the
+/// saved cursor already).
+async fn close_file(
+    target: &TargetConfig,
+    sink: &EventSink,
+    state: &CheckState,
+    file: &mut Option<FileStream>,
+) -> Result<(), ConnectorError> {
+    let Some(mut st) = file.take() else {
+        return Ok(());
+    };
+    let panicked_before = st.builder.panicked;
+    let events = st.builder.finish(file_source(st.format), SystemTime::now());
+    let panicked = st.builder.panicked.saturating_sub(panicked_before);
+    if panicked > 0 {
+        state.note_dropped(&target.id, panicked);
+        tracing::warn!(
+            target_id = %target.id,
+            dropped = panicked,
+            "audit records whose conversion failed dropped (internal error)"
+        );
+    }
+    for e in events {
+        sink.submit(e).await?;
+    }
+    Ok(())
+}
+
 /// Removes the saved `performance_schema` cursor.
 fn forget_ps_cursor(cfg: &AuditConfig) {
     if let Some(store) = cfg.cursor(pfs::CURSOR) {
@@ -364,10 +403,7 @@ async fn file_run(
 ) -> Result<Result<(), std::io::ErrorKind>, ConnectorError> {
     let started = Instant::now();
     let (format, utc_offset, query_limit) = (st.format, pre.utc_offset, pre.query_limit);
-    let source = match format {
-        MysqlLogFormat::ServerAudit => EventSource::MariadbServerAudit,
-        MysqlLogFormat::Json => EventSource::MysqlAuditLog,
-    };
+    let source = file_source(format);
     loop {
         let mut t = st.tailer.take().ok_or_else(internal)?;
         let (t, polled) = tokio::task::spawn_blocking(move || {
@@ -429,7 +465,17 @@ async fn file_run(
             st.reported = (t.oversized, t.malformed());
         }
         let panicked_before = st.builder.panicked;
+        let evicted_before = st.builder.pending_evicted();
         let events = st.builder.convert_file(records, source, SystemTime::now());
+        let evicted = st.builder.pending_evicted().saturating_sub(evicted_before);
+        if evicted > 0 {
+            tracing::warn!(
+                target_id = %target.id,
+                statements = evicted,
+                "too many statements waiting for their audit record: the oldest reported from \
+                 their table records alone"
+            );
+        }
         {
             let panicked = st.builder.panicked.saturating_sub(panicked_before);
             if panicked > 0 {
