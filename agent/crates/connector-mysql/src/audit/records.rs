@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 const MAX_NAME_BYTES: usize = 1024;
 
 /// What a record reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
     Connect,
     FailedConnect,
@@ -45,7 +45,7 @@ pub(crate) enum Op {
 }
 
 /// Access to a table (a table-access record).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TableOp {
     Read,
     Write,
@@ -81,6 +81,12 @@ pub(crate) struct FileRecord {
     pub(crate) status: u32,
     /// `program_name` connection attribute (connect records).
     pub(crate) program: Option<String>,
+    /// Position in the log file (set by the stream after parsing).
+    pub(crate) pos: Option<databastion_core::audit::tail::RecordPos>,
+    /// Re-read after a restart from a cursor moved back to held records
+    /// (set by the stream's replay filter): its statement has been pending
+    /// since its log time `ts`, not since it was read again.
+    pub(crate) replayed: bool,
 }
 
 impl fmt::Debug for FileRecord {
@@ -279,6 +285,8 @@ pub(crate) fn parse_server_audit(
         truncated: false,
         status: 0,
         program: None,
+        pos: None,
+        replayed: false,
     };
     let status_of =
         |b: &[u8]| -> Option<u32> { std::str::from_utf8(b).ok()?.trim_end().parse().ok() };
@@ -510,6 +518,8 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
         truncated: false,
         status,
         program: None,
+        pos: None,
+        replayed: false,
     })
 }
 
@@ -534,6 +544,8 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
         truncated: false,
         status: 0,
         program: None,
+        pos: None,
+        replayed: false,
     };
     match (r.class.as_str(), r.event.as_str()) {
         ("connection", "connect" | "change_user") => {

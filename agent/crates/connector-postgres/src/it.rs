@@ -198,11 +198,21 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(
     target: &TargetConfig,
     params: ScanParams,
 ) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
-    let job = ScanJob::new(params, target, &Limits::default(), key());
+    let job = ScanJob::new(params, target, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(10_000);
     let r = PostgresConnector::new().discover(&job, &sink).await;
     drop(sink);
@@ -470,12 +480,7 @@ async fn no_transaction_is_held_across_submit() {
     let _serial = SERIAL.lock().await;
     let (_dir, t) = target(&u, &u.user, &u.password, &u.dbname, false);
     let observer = raw_client(&u, &u.user, &u.password, &u.dbname).await;
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        &t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
     // Capacity 1 and no consumer: the scan blocks in `submit().await`.
     let (sink, mut rx) = FindingSink::channel(1);
     let connector = PostgresConnector::new();
@@ -1229,12 +1234,7 @@ async fn poisoned_session_is_closed_before_submit() {
     probe_fixtures(&adm, &u.user).await;
     let (_dir, t) = target(&u, &u.user, &u.password, PROBE_DB, false);
     let observer = admin(&adm, PROBE_DB).await;
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        &t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
     // Capacity 1, already full: the first submit blocks. `probe.a_wide`
     // is the first object: its sample stops at the byte budget, then the
     // scan blocks in submit.

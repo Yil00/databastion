@@ -19,7 +19,7 @@ use databastion_classifiers::names::{
     NormalizedName, PathPart, normalize_field_path, normalize_path,
 };
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FailureCode, FindingSink, ScanCoverage, ScanJob};
+use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 use std::future::Future;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -275,11 +275,22 @@ where
 {
     let n = job.sample_rows();
     let mut slot: Option<Session<S>> = None;
+    // Paced (ADR-0035 proposed): each listing and each collection's
+    // sampling. The pause owed is paid (`turn`) before a session is
+    // checked or opened, so a session never goes stale during it.
+    if job.turn().await? == Paced::OutOfTime {
+        job.skip_out_of_time(sink, 1);
+        return Ok(0);
+    }
     let (databases, truncated) = {
         let s = ensure(&mut slot, target, &mut connect).await?;
-        catalog::list_databases(s)
-            .await
-            .map_err(|e| fail(target, e))?
+        match job.paced(catalog::list_databases(s)).await? {
+            Paced::Done(r) => r.map_err(|e| fail(target, e))?,
+            Paced::OutOfTime => {
+                job.skip_out_of_time(sink, 1);
+                return Ok(0);
+            }
+        }
     };
     if truncated {
         tracing::warn!(
@@ -293,11 +304,28 @@ where
         });
     }
     let mut totals = Totals::default();
-    for db in databases.iter().filter(|d| job.includes_database(d)) {
+    let mut selected: Vec<&String> = databases
+        .iter()
+        .filter(|d| job.includes_database(d))
+        .collect();
+    // Another starting database and collection at each scan (security
+    // review of #93, M3).
+    job.rotate(&mut selected);
+    for (di, db) in selected.iter().copied().enumerate() {
         let db_name = normalize_database(db);
+        if job.turn().await? == Paced::OutOfTime {
+            job.skip_out_of_time(sink, selected.len() - di);
+            break;
+        }
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
-            catalog::list_collections(s, db).await
+            match job.paced(catalog::list_collections(s, db)).await? {
+                Paced::Done(l) => l,
+                Paced::OutOfTime => {
+                    job.skip_out_of_time(sink, selected.len() - di);
+                    break;
+                }
+            }
         };
         let (collections, truncated) = match listed {
             Ok(l) => l,
@@ -358,11 +386,25 @@ where
             ..ScanCoverage::default()
         });
         totals.unsupported += unsupported;
-        for unit in &units {
+        job.rotate(&mut units);
+        let mut out_of_time = false;
+        for (i, unit) in units.iter().enumerate() {
             let object = normalize_collection(&unit.name);
+            if job.turn().await? == Paced::OutOfTime {
+                job.skip_out_of_time(sink, units.len() - i);
+                out_of_time = true;
+                break;
+            }
             let sampled = {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                sample_collection(s, db, unit, n).await
+                match job.paced(sample_collection(s, db, unit, n)).await? {
+                    Paced::Done(r) => r,
+                    Paced::OutOfTime => {
+                        job.skip_out_of_time(sink, units.len() - i);
+                        out_of_time = true;
+                        break;
+                    }
+                }
             };
             let sampled = match sampled {
                 Ok(s) => s,
@@ -430,6 +472,10 @@ where
                     sink.submit(finding).await?;
                 }
             }
+        }
+        if out_of_time {
+            job.skip_out_of_time(sink, selected.len() - di - 1);
+            break;
         }
     }
     if let Some(s) = slot {

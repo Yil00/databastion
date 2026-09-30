@@ -198,7 +198,7 @@ pub(crate) async fn audit_stream(
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
                     poller.set_catalogs(pre.catalogs.clone());
-                    pss_run(cfg, target, sink, state, session, poller, timeouts).await?;
+                    pss_run(cfg, target, sink, session, poller, timeouts).await?;
                 }
             }
             Source::None => {
@@ -340,22 +340,25 @@ async fn pss_run(
     cfg: &AuditConfig,
     target: &TargetConfig,
     sink: &EventSink,
-    state: &CheckState,
     session: &crate::conn::Session,
     poller: &mut pss::PssPoller,
     timeouts: Timeouts,
 ) -> Result<(), ConnectorError> {
     let started = Instant::now();
     loop {
-        let panicked_before = poller.panicked;
+        let unanalyzed_before = poller.unanalyzed;
         let polled = poller.poll(session, timeouts, sink).await;
-        let panicked = poller.panicked.saturating_sub(panicked_before);
-        if panicked > 0 {
-            state.note_dropped(&target.id, panicked);
+        let unanalyzed = poller.unanalyzed.saturating_sub(unanalyzed_before);
+        if unanalyzed > 0 {
+            // Not dropped (#90): their deltas are reported as reads of
+            // `*`, so they are not counted in `audit.records_dropped`
+            // (security review of #93, L7); each panic is in the
+            // `audit_record_panics_total` metric.
             tracing::warn!(
                 target_id = %target.id,
-                dropped = panicked,
-                "pg_stat_statements statements whose analysis failed dropped (internal error)"
+                statements = unanalyzed,
+                "pg_stat_statements statements whose analysis or conversion failed (internal \
+                 error): reported as reads of unknown objects (*) from now on"
             );
         }
         match polled {

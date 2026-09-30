@@ -32,6 +32,16 @@ limits:
   statement_timeout_ms: 30000  # 100..=600000, never 0; cap of every query
   max_scan_duration_s: 3600    # 60..=86400; cap of a whole scan
   min_audit_poll_interval_s: 5 # 1..=3600; floor of audit polling
+  # Discovery duty cycle, in percent (1..=100; 100: no pacing). After each
+  # object's sampling, the scan pauses so that its time in queries is at
+  # most this share of the scan's time: at most 1 % of one database core per
+  # scan (scans run one at a time), under the 2 % MVP criterion even on a
+  # one-core server. A scan then lasts about 100 times its query time
+  # (400 tables: minutes). Objects left when the scan budget would run out
+  # are reported as skipped (limit): raise max_duration_s /
+  # max_scan_duration_s for large databases, or this value where the server
+  # has spare cores.
+  discovery_duty_cycle_percent: 1
 
 # Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,
 # files 0600). When full, the oldest batches are dropped first and counted

@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use databastion_classifiers::column::{ColumnClassifier, ColumnFinding};
 use databastion_classifiers::id::ClassifierId;
@@ -31,6 +31,7 @@ use databastion_classifiers::names::violates_numeric_rule;
 use databastion_protocol::{AuditConfigureParams, DiscoveryScanParams, IdentifierPattern};
 
 use crate::config::{Limits, SAMPLE_ROWS_RANGE, STATEMENT_TIMEOUT_MS_RANGE, TargetConfig};
+use crate::pacing::{Cancelled, Paced, Pacer, ScanCancel};
 
 /// Contract range of `max_duration_s` (seconds).
 pub const MAX_DURATION_S_RANGE: (u32, u32) = (10, 86_400);
@@ -246,6 +247,9 @@ pub struct ScanJob {
     max_duration: Duration,
     params: ScanParams,
     key: Option<Arc<HmacKey>>,
+    pacer: Pacer,
+    /// Where the object order starts (see [`ScanJob::rotate`]).
+    rotation: u64,
 }
 
 impl Default for ScanJob {
@@ -260,6 +264,8 @@ impl Default for ScanJob {
             max_duration: limits.clamp_scan_duration(u64::from(params.max_duration_s)),
             params,
             key: None,
+            pacer: Pacer::new(limits.discovery_duty_cycle_percent),
+            rotation: 0,
         }
     }
 }
@@ -272,6 +278,7 @@ impl std::fmt::Debug for ScanJob {
             .field("statement_timeout", &self.statement_timeout)
             .field("max_duration", &self.max_duration)
             .field("classifiers", &self.params.classifiers)
+            .field("duty_cycle_percent", &self.pacer.duty_percent())
             .finish_non_exhaustive()
     }
 }
@@ -286,15 +293,123 @@ impl ScanJob {
         limits: &Limits,
         key: Arc<HmacKey>,
     ) -> Self {
+        let max_duration = limits.clamp_scan_duration(u64::from(params.max_duration_s));
         Self {
             target: Some(target.clone()),
             sample_rows: limits.clamp_sample_rows(u64::from(params.sample_rows)),
             statement_timeout: limits
                 .clamp_statement_timeout(u64::from(params.statement_timeout_ms)),
-            max_duration: limits.clamp_scan_duration(u64::from(params.max_duration_s)),
+            max_duration,
             params,
             key: Some(key),
+            // The scan's window runs from its reception, as the core's
+            // deadline does.
+            pacer: Pacer::new(limits.discovery_duty_cycle_percent)
+                .with_deadline(Instant::now() + max_duration),
+            rotation: 0,
         }
+    }
+
+    /// The same job, its object order starting at `seed` (the core derives
+    /// it from the job id, so successive scans of a target start at
+    /// different objects; connectors' tests set it directly).
+    #[must_use]
+    pub fn with_rotation(mut self, seed: u64) -> Self {
+        self.rotation = seed;
+        self
+    }
+
+    /// Pays the pause owed by the previous units now, before the setup of
+    /// the next one (checking or opening a session that may have gone
+    /// stale during the pause); the unit then goes through
+    /// [`Self::paced`]. [`Paced::OutOfTime`] as for [`Self::paced`].
+    ///
+    /// # Errors
+    /// [`Cancelled`], as [`Self::paced`].
+    pub async fn turn(&self) -> Result<Paced<()>, Cancelled> {
+        self.pacer.turn().await
+    }
+
+    /// Whether the scan ran out of time (see [`Self::paced`]): a connector
+    /// checks it before opening a connection for more objects.
+    #[must_use]
+    pub fn out_of_time(&self) -> bool {
+        self.pacer.out_of_time()
+    }
+
+    /// Reports `objects` left unsampled because the scan ran out of time
+    /// ([`Paced::OutOfTime`]): skipped for a limit (`skipped_limit` in the
+    /// job's coverage), logged with counts only.
+    pub fn skip_out_of_time(&self, sink: &crate::FindingSink, objects: usize) {
+        let n = u64::try_from(objects).unwrap_or(u64::MAX);
+        if n == 0 {
+            return;
+        }
+        sink.add_coverage(crate::ScanCoverage {
+            limit: n,
+            ..crate::ScanCoverage::default()
+        });
+        tracing::warn!(
+            target_id = self.target.as_ref().map_or("", |t| t.id.as_str()),
+            objects = n,
+            duty_cycle_percent = self.pacer.duty_percent(),
+            "scan stopped before its deadline (Discovery pacing): objects not sampled, \
+             reported as skipped (limit); raise max_duration_s or the duty cycle"
+        );
+    }
+
+    /// Rotates a list of objects to scan so that it starts at a position
+    /// that changes from scan to scan (security review of #93, M3): an
+    /// object that uses up the scan's time (paced at the duty cycle) cannot
+    /// hide the same objects after it at every scan. `0` for jobs built
+    /// outside the core (tests): no rotation.
+    pub fn rotate<T>(&self, items: &mut [T]) {
+        if let Some(n) = self.rotation_offset(items.len()) {
+            items.rotate_left(n);
+        }
+    }
+
+    /// Where a list of `len` objects starts for this scan (see
+    /// [`Self::rotate`]); `None` without rotation or for an empty list.
+    #[must_use]
+    pub fn rotation_offset(&self, len: usize) -> Option<usize> {
+        let len = u64::try_from(len).ok().filter(|l| *l > 0)?;
+        usize::try_from(self.rotation % len).ok().filter(|n| *n > 0)
+    }
+
+    /// The same job, its pauses ended by `cancel` (the core, when the scan
+    /// stops).
+    #[must_use]
+    pub(crate) fn with_cancel(mut self, cancel: ScanCancel) -> Self {
+        self.pacer = self.pacer.with_cancel(cancel);
+        self
+    }
+
+    /// The scan's pacer (duty cycle `limits.discovery_duty_cycle_percent`).
+    #[must_use]
+    pub fn pacer(&self) -> &Pacer {
+        &self.pacer
+    }
+
+    /// Runs one unit of work against the target (an object's sampling, a
+    /// catalog read) after paying the pause the previous units owe, so that
+    /// the scan's time in queries stays within the duty cycle
+    /// (`crate::pacing`, ADR-0035 proposed). Every connector paces its
+    /// per-object sampling and catalog reads through this, releasing what a
+    /// unit held (a poisoned session, its samples) before the next call.
+    /// [`Paced::OutOfTime`]: the unit did not run because the pause would
+    /// reach the scan's deadline; the connector stops sampling and reports
+    /// the objects left as skipped for a limit (`ScanCoverage::limit`).
+    ///
+    /// # Errors
+    /// [`Cancelled`] when the scan is cancelled (before the work, or during
+    /// the pause): the connector stops (`?` turns it into
+    /// [`crate::ConnectorError::Cancelled`]).
+    pub async fn paced<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> Result<Paced<F::Output>, Cancelled> {
+        self.pacer.paced(work).await
     }
 
     /// The declared target (connection settings; never sent to the

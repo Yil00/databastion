@@ -185,14 +185,19 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(t: &TargetConfig) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
     let connector = OpenldapConnector::new();
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(4096);
     let r = connector.discover(&job, &sink).await;
     drop(sink);

@@ -130,6 +130,12 @@ pub(crate) struct Outcome {
     pub(crate) error: Option<FailureCode>,
     /// Discovery coverage reported by the connector (`discovery.scan`).
     pub(crate) coverage: Option<crate::sink::ScanCoverage>,
+    /// The scan stopped before its deadline (Discovery pacing,
+    /// `Paced::OutOfTime`): some objects were not sampled. Reported as
+    /// `succeeded` only with the coverage counters that show it; without
+    /// them (console without `job_progress.coverage`), as `failed` with
+    /// `timeout` (security review of #93, R3).
+    pub(crate) out_of_time: bool,
 }
 
 impl Outcome {
@@ -137,6 +143,15 @@ impl Outcome {
         status: JobStatusUpdateStatus::Succeeded,
         error: None,
         coverage: None,
+        out_of_time: false,
+    };
+
+    /// Not terminal: the `running` acknowledgement of a scan.
+    pub(crate) const RUNNING: Self = Self {
+        status: JobStatusUpdateStatus::Running,
+        error: None,
+        coverage: None,
+        out_of_time: false,
     };
 
     pub(crate) const fn failed(code: FailureCode) -> Self {
@@ -144,6 +159,21 @@ impl Outcome {
             status: JobStatusUpdateStatus::Failed,
             error: Some(code),
             coverage: None,
+            out_of_time: false,
+        }
+    }
+
+    /// Status and error sent for this outcome, depending on whether the
+    /// coverage counters go with it: a scan that ran out of time succeeds
+    /// only when the console sees what it did not sample.
+    pub(crate) fn reported(
+        &self,
+        with_coverage: bool,
+    ) -> (JobStatusUpdateStatus, Option<FailureCode>) {
+        if self.out_of_time && !with_coverage && self.status == JobStatusUpdateStatus::Succeeded {
+            (JobStatusUpdateStatus::Failed, Some(FailureCode::Timeout))
+        } else {
+            (self.status, self.error)
         }
     }
 }

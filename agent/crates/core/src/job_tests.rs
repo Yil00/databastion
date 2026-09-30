@@ -283,3 +283,32 @@ fn audit_params_are_gated_and_clamped() {
     let json = serde_json::json!({"enabled": false, "sensitive_objects": []});
     assert!(AuditParams::try_from(&audit(json)).is_ok());
 }
+
+#[test]
+fn object_order_rotates_per_scan() {
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &target(),
+        &Limits::default(),
+        key(),
+    );
+    // Built outside the core: no rotation.
+    let mut v: Vec<u32> = (0..5).collect();
+    job.rotate(&mut v);
+    assert_eq!(v, [0, 1, 2, 3, 4]);
+    let rotated = |seed: u64| {
+        let job = job.clone().with_rotation(seed);
+        let mut v: Vec<u32> = (0..5).collect();
+        job.rotate(&mut v);
+        v
+    };
+    assert_eq!(rotated(7), [2, 3, 4, 0, 1]);
+    assert_eq!(rotated(10), [0, 1, 2, 3, 4]);
+    // Every object leads for some seed, and nothing is lost.
+    let firsts: std::collections::BTreeSet<u32> = (0..5).map(|s| rotated(s)[0]).collect();
+    assert_eq!(firsts.len(), 5);
+    let mut empty: Vec<u32> = Vec::new();
+    job.clone().with_rotation(3).rotate(&mut empty);
+    assert!(empty.is_empty());
+    assert_eq!(job.clone().with_rotation(3).rotation_offset(0), None);
+}

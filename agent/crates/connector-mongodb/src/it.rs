@@ -225,13 +225,18 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(t: &TargetConfig) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(100_000);
     let r = MongodbConnector::new().discover(&job, &sink).await;
     drop(sink);
@@ -788,12 +793,7 @@ async fn probes() {
     // instance scans and checks).
     let (_dir, t) = target(&url, MIN_USER, IT_PASSWORD, "admin");
     let connector = MongodbConnector::new();
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        &t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(100_000);
     connector.discover(&job, &sink).await.unwrap();
     drop(sink);

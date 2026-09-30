@@ -5,6 +5,8 @@
 //! - [`job`]: job parameters handed to connectors ([`ScanJob`],
 //!   [`AuditConfig`]), only built through the contract `TryFrom` gates and
 //!   the `agent.yaml` clamp.
+//! - [`pacing`]: the Discovery duty cycle ([`pacing::Pacer`], ADR-0035
+//!   proposed), reached by connectors through [`ScanJob::paced`].
 //! - [`sink`]: channels through which connectors hand results to the core.
 //!   They only carry masked types from `databastion_classifiers::masking`.
 //! - [`audit`]: persisted audit cursors ([`audit::CursorStore`]), and
@@ -46,6 +48,7 @@ pub mod identity;
 pub mod job;
 mod jobs;
 pub mod notes;
+pub mod pacing;
 mod panics;
 pub mod runtime;
 mod sanitize;
@@ -61,6 +64,7 @@ pub use connector::{Connector, ConnectorError};
 pub use engine::{AuditLevel, Engine, FailureCode, TargetHealth};
 pub use job::{AuditConfig, AuditParams, ParamsError, ScanJob, ScanParams};
 pub use notes::{CountMerge, NoteCode, NoteLabel, Notes, TargetNote};
+pub use pacing::Paced;
 pub use panics::{install_panic_hook, isolate, resume_panic};
 pub use runtime::{AgentError, EnrollOptions, enroll, run};
 pub use sink::{EventSink, FindingSink, ScanCoverage};

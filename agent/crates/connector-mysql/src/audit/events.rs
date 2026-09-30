@@ -24,6 +24,10 @@
 //!   affected by one statement (`performance_schema` only: the audit log
 //!   files carry no row count).
 //!
+//! The table-access records of a statement and its statement record are
+//! grouped per connection (and query id, or text), not by adjacency:
+//! concurrent sessions interleave them in the log (see [`Pending`]).
+//!
 //! Objects come from the table-access records when the source has them
 //! (`server_audit` `TABLE` events, `audit_log_filter` `table_access`),
 //! otherwise from the statement text (reads and writes only: DDL and DCL
@@ -37,8 +41,8 @@
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Instant, SystemTime};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{
     EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
@@ -48,6 +52,7 @@ use databastion_classifiers::query::{
     AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze_raw,
 };
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
+use databastion_core::audit::tail::RecordPos;
 
 use super::records::{FileRecord, Op, TableOp};
 use crate::discover::normalize;
@@ -202,6 +207,342 @@ impl Sessions {
     }
 }
 
+/// Connections with a statement pending at most.
+const MAX_PENDING_CONNECTIONS: usize = 1024;
+/// Statements flushed before their statement record that are remembered.
+const MAX_EARLY_REPORTED: usize = 16 * MAX_PENDING_CONNECTIONS;
+/// Table-access records kept per pending statement (distinct tables; an
+/// event names 16 objects at most), and tables remembered per statement
+/// flushed early.
+const MAX_PENDING_RECORDS: usize = 64;
+/// Bytes held by all pending statements at most: their records' names
+/// (user, host, database, table: at most 1 KiB each, `records`) and
+/// statement text (only the JSON `table_access` records carry one, kept
+/// once per statement; one record is at most
+/// `databastion_core::audit::tail::MAX_RECORD_BYTES`, 1 MiB), plus a fixed
+/// overhead per record.
+const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+/// Fixed overhead counted per pending record.
+const RECORD_OVERHEAD: usize = 256;
+/// A pending statement whose statement record has not come after this
+/// long is reported from its table-access records alone.
+const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
+/// A statement flushed early is forgotten after this long: its late
+/// records are then handled as a new statement (security review of #93,
+/// L4: the memory of `reported` does not outlive the statements it is for,
+/// and a connection id reused after a server restart is not mistaken for
+/// the old one for long).
+const REPORTED_TTL: Duration = Duration::from_secs(2 * 300);
+
+/// Bytes a pending record holds (see [`MAX_PENDING_BYTES`]).
+fn record_bytes(r: &FileRecord) -> usize {
+    RECORD_OVERHEAD
+        + r.user.len()
+        + r.host.len()
+        + r.database.len()
+        + r.table.as_ref().map_or(0, |(d, t)| d.len() + t.len())
+        + r.text.as_ref().map_or(0, |t| t.len())
+}
+
+/// Since when a statement starting with `r` is pending, on the monotonic
+/// clock: when it was read (`mono`), or for a record re-read after a
+/// restart (`FileRecord::replayed`), when it was logged (`ts`, at most
+/// [`PENDING_TIMEOUT`] back). An agent restarting more often than the
+/// timeout still flushes a held statement early, so its cursor is not kept
+/// pinned to it and the log re-read at every restart does not grow
+/// (security review of #93, R4). Without a log time: when it was read.
+fn pending_since(r: &FileRecord, now: SystemTime, mono: Instant) -> Instant {
+    if !r.replayed {
+        return mono;
+    }
+    let age =
+        r.ts.and_then(|ts| now.duration_since(ts).ok())
+            .unwrap_or_default()
+            .min(PENDING_TIMEOUT);
+    mono.checked_sub(age).unwrap_or(mono)
+}
+
+/// Table-access records of one statement waiting for its statement
+/// record.
+struct PendingStatement {
+    records: Vec<FileRecord>,
+    seq: u64,
+    since: Instant,
+    bytes: usize,
+}
+
+/// Statements whose table-access records were read and whose statement
+/// record was not yet, **per connection**: the server writes a statement's
+/// `TABLE` records when it opens the tables and its `QUERY` record when it
+/// ends, and concurrent sessions interleave theirs (`READ a`, `READ b`,
+/// `QUERY a`, `QUERY b`). A connection runs one statement at a time, so a
+/// pending statement ends at its statement record, at a record of another
+/// statement of the same connection, at the connection's disconnect (or a
+/// new connect with its id), after [`PENDING_TIMEOUT`], when the state is
+/// full, and when the stream ends ([`EventBuilder::finish`]); it is kept
+/// across polls, so a statement split by a poll bound or a log rotation is
+/// still one event.
+///
+/// Bounded: at most [`MAX_PENDING_CONNECTIONS`] statements of
+/// [`MAX_PENDING_RECORDS`] records, [`MAX_PENDING_BYTES`] in all (the
+/// oldest statement is flushed first, in insertion order: `order`). A
+/// statement flushed before its statement record (timeout, full state) is
+/// remembered by its query id and the tables already reported for it
+/// (`reported`, at most [`MAX_EARLY_REPORTED`], each with at most
+/// [`MAX_PENDING_RECORDS`] tables kept as 8-byte keyed hashes: 8 MiB at
+/// most; forgotten after [`REPORTED_TTL`], oldest first), so its late
+/// records do not count it twice: a late table record of a table already
+/// reported is ignored, one of another table starts a continuation of the
+/// statement that is reported like any pending statement (a `CALL` that
+/// reads a harmless table, waits past the timeout, then reads another one
+/// is never hidden), and a late statement record without a continuation
+/// yields an event only when its text shows a signal (a whole-table read
+/// by a dump program that ran longer than the timeout). Without query ids
+/// (`audit_log_filter`) nothing is remembered.
+#[derive(Default)]
+struct Pending {
+    map: HashMap<u64, PendingStatement>,
+    /// Sequence → connection of the pending statements (oldest first).
+    order: BTreeMap<u64, u64>,
+    /// Connection → statement flushed early.
+    reported: HashMap<u64, Reported>,
+    /// Sequence → connection of `reported` (oldest first).
+    reported_order: BTreeMap<u64, u64>,
+    /// Keys of the table hashes (random per process: names are
+    /// client-controlled).
+    hasher: std::collections::hash_map::RandomState,
+    seq: u64,
+    bytes: usize,
+    /// Statements flushed early because the state was full.
+    evicted: u64,
+}
+
+/// A statement flushed before its statement record.
+struct Reported {
+    query_id: u64,
+    seq: u64,
+    since: Instant,
+    /// Keyed hashes of the tables (and operation) already reported for it
+    /// (at most [`MAX_PENDING_RECORDS`]).
+    tables: Vec<u64>,
+}
+
+impl Pending {
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    fn table_key(&self, r: &FileRecord) -> u64 {
+        use std::hash::BuildHasher as _;
+        self.hasher.hash_one((&r.table, r.op))
+    }
+
+    fn first(&self, connection: u64) -> Option<&FileRecord> {
+        self.map.get(&connection).and_then(|p| p.records.first())
+    }
+
+    fn take(&mut self, connection: u64) -> Option<Vec<FileRecord>> {
+        let p = self.map.remove(&connection)?;
+        self.order.remove(&p.seq);
+        self.bytes = self.bytes.saturating_sub(p.bytes);
+        Some(p.records)
+    }
+
+    /// Forgets the early-flushed statement of a connection.
+    fn forget(&mut self, connection: u64) {
+        if let Some(rep) = self.reported.remove(&connection) {
+            self.reported_order.remove(&rep.seq);
+        }
+    }
+
+    /// The early-flushed statement `r` belongs to, if any.
+    fn reported_of(&self, r: &FileRecord) -> Option<&Reported> {
+        let q = r.query_id?;
+        self.reported
+            .get(&r.connection)
+            .filter(|rep| rep.query_id == q)
+    }
+
+    /// Whether `r` belongs to a statement already flushed early.
+    fn reported(&self, r: &FileRecord) -> bool {
+        self.reported_of(r).is_some()
+    }
+
+    /// Whether `r` is a table record of an early-flushed statement whose
+    /// table was already reported.
+    fn table_reported(&self, r: &FileRecord) -> bool {
+        let key = self.table_key(r);
+        self.reported_of(r)
+            .is_some_and(|rep| rep.tables.contains(&key))
+    }
+
+    /// Takes a statement out before its statement record, remembering it
+    /// with its tables (merged with those of an earlier part of it).
+    fn take_early(&mut self, connection: u64, mono: Instant) -> Option<Vec<FileRecord>> {
+        let records = self.take(connection)?;
+        if let Some(q) = records.first().and_then(|r| r.query_id) {
+            let mut tables = match self.reported.get(&connection) {
+                Some(old) if old.query_id == q => old.tables.clone(),
+                _ => Vec::new(),
+            };
+            self.forget(connection);
+            for r in &records {
+                let key = self.table_key(r);
+                if !tables.contains(&key) && tables.len() < MAX_PENDING_RECORDS {
+                    tables.push(key);
+                }
+            }
+            while self.reported.len() >= MAX_EARLY_REPORTED {
+                match self.reported_order.first_key_value().map(|(_, c)| *c) {
+                    Some(old) => self.forget(old),
+                    None => break,
+                }
+            }
+            let seq = self.next_seq();
+            self.reported_order.insert(seq, connection);
+            self.reported.insert(
+                connection,
+                Reported {
+                    query_id: q,
+                    seq,
+                    since: mono,
+                    tables,
+                },
+            );
+        }
+        Some(records)
+    }
+
+    fn evict_oldest(&mut self, mono: Instant) -> Option<Vec<FileRecord>> {
+        let oldest = self.order.first_key_value().map(|(_, c)| *c)?;
+        self.evicted = self.evicted.saturating_add(1);
+        self.take_early(oldest, mono)
+    }
+
+    /// Adds a table-access record (of the connection's pending statement,
+    /// if any: the caller flushed another statement first). Returns the
+    /// statements flushed to make room.
+    fn add(&mut self, mut r: FileRecord, mono: Instant, now: SystemTime) -> Vec<Vec<FileRecord>> {
+        let since = pending_since(&r, now, mono);
+        let c = r.connection;
+        // Another statement than the early-flushed one: the connection
+        // moved on (a continuation of it keeps it).
+        if !self.reported(&r) {
+            self.forget(c);
+        }
+        let mut flushed = Vec::new();
+        if let Some(p) = self.map.get_mut(&c) {
+            // Records of one statement carry the same text, if any (the
+            // grouping compares it): the first one keeps it.
+            r.text = None;
+            let known = p.records.iter().any(|g| g.op == r.op && g.table == r.table);
+            if !known && p.records.len() < MAX_PENDING_RECORDS {
+                let n = record_bytes(&r);
+                p.bytes += n;
+                self.bytes = self.bytes.saturating_add(n);
+                p.records.push(r);
+            }
+        } else {
+            while self.map.len() >= MAX_PENDING_CONNECTIONS {
+                match self.evict_oldest(mono) {
+                    Some(p) => flushed.push(p),
+                    None => break,
+                }
+            }
+            let bytes = record_bytes(&r);
+            let seq = self.next_seq();
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.order.insert(seq, c);
+            self.map.insert(
+                c,
+                PendingStatement {
+                    records: vec![r],
+                    seq,
+                    since,
+                    bytes,
+                },
+            );
+        }
+        while self.bytes > MAX_PENDING_BYTES {
+            match self.evict_oldest(mono) {
+                Some(p) => flushed.push(p),
+                None => break,
+            }
+        }
+        flushed
+    }
+
+    /// Statements pending for [`PENDING_TIMEOUT`] or more, oldest first;
+    /// early-flushed statements older than [`REPORTED_TTL`] are forgotten.
+    fn expired(&mut self, mono: Instant) -> Vec<Vec<FileRecord>> {
+        while let Some((_, c)) = self.reported_order.first_key_value().map(|(s, c)| (*s, *c)) {
+            let old = self
+                .reported
+                .get(&c)
+                .is_none_or(|rep| mono.saturating_duration_since(rep.since) >= REPORTED_TTL);
+            if !old {
+                break;
+            }
+            self.forget(c);
+        }
+        let mut out = Vec::new();
+        while let Some(c) = self.order.first_key_value().map(|(_, c)| *c) {
+            let due = self
+                .map
+                .get(&c)
+                .is_none_or(|p| mono.saturating_duration_since(p.since) >= PENDING_TIMEOUT);
+            if !due {
+                break;
+            }
+            match self.take_early(c, mono) {
+                Some(p) => out.push(p),
+                None => {
+                    // Not pending (cannot happen): drop the stale entry.
+                    self.order.pop_first();
+                }
+            }
+        }
+        out
+    }
+
+    /// (connection, position of its first record) of every pending
+    /// statement whose records have positions.
+    fn held(&self) -> Vec<(u64, RecordPos)> {
+        self.order
+            .values()
+            .filter_map(|c| {
+                let pos = self.map.get(c)?.records.first()?.pos?;
+                Some((*c, pos))
+            })
+            .collect()
+    }
+
+    /// Every pending statement, oldest first; the state is emptied.
+    fn drain(&mut self) -> Vec<Vec<FileRecord>> {
+        let conns: Vec<u64> = self.order.values().copied().collect();
+        let out = conns.into_iter().filter_map(|c| self.take(c)).collect();
+        self.reported.clear();
+        self.reported_order.clear();
+        self.order.clear();
+        out
+    }
+
+    #[cfg(test)]
+    fn sizes(&self) -> (usize, usize, usize, usize) {
+        (
+            self.map.len(),
+            self.map
+                .values()
+                .map(|p| p.records.len())
+                .max()
+                .unwrap_or(0),
+            self.bytes,
+            self.reported.len(),
+        )
+    }
+}
+
 /// One statement to turn into an event.
 pub(crate) struct Access<'a> {
     /// Session key (`c<connection id>`, `t<thread id>`).
@@ -279,6 +620,8 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
 pub(crate) struct EventBuilder {
     own: OwnAccount,
     sessions: Sessions,
+    /// Table-access records waiting for their statement record.
+    pending: Pending,
     /// Failed statements skipped (no rows were read).
     pub(crate) failed: u64,
     /// Records dropped because their conversion panicked (PR #83
@@ -291,6 +634,7 @@ impl EventBuilder {
         Self {
             own,
             sessions: Sessions::default(),
+            pending: Pending::default(),
             panicked: 0,
             failed: 0,
         }
@@ -472,39 +816,147 @@ impl EventBuilder {
     }
 
     /// Converts audit log records (in file order): the table-access
-    /// records and the statement record of one statement are merged.
+    /// records and the statement record of one statement are merged, per
+    /// connection (see [`Pending`]). Table-access records whose statement
+    /// record has not been read yet stay pending across calls (a later
+    /// poll, a rotated file); [`Self::finish`] flushes them when the
+    /// stream ends.
     pub(crate) fn convert_file(
         &mut self,
         records: Vec<FileRecord>,
         source: EventSource,
         now: SystemTime,
     ) -> Vec<MaskedEvent> {
+        self.convert_file_at(records, source, now, Instant::now())
+    }
+
+    /// [`Self::convert_file`] at the monotonic time `mono` (tests).
+    fn convert_file_at(
+        &mut self,
+        records: Vec<FileRecord>,
+        source: EventSource,
+        now: SystemTime,
+        mono: Instant,
+    ) -> Vec<MaskedEvent> {
         let mut out = Vec::new();
-        let mut group: Vec<FileRecord> = Vec::new();
         for r in records {
             match r.op {
                 Op::Connect | Op::FailedConnect | Op::Disconnect => {
-                    self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
+                    // The connection's statement ends with it (a new
+                    // session reusing the id starts afresh).
+                    if let Some(p) = self.pending.take(r.connection) {
+                        self.flush_isolated(p, source, now, &mut out);
+                    }
+                    self.pending.forget(r.connection);
                     match databastion_core::isolate(|| self.connection(&r, source, now)) {
                         Some(Some(e)) => out.push(e),
                         Some(None) => {}
                         None => self.panicked = self.panicked.saturating_add(1),
                     }
                 }
-                Op::Query | Op::Table(_) => {
-                    if group.last().is_some_and(|g| !same_statement(g, &r)) {
-                        self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
-                    }
-                    let ends = r.op == Op::Query;
-                    group.push(r);
-                    if ends {
-                        self.flush_isolated(std::mem::take(&mut group), source, now, &mut out);
-                    }
-                }
+                Op::Table(_) => self.table_record(r, source, now, mono, &mut out),
+                Op::Query => self.query_record(r, source, now, &mut out),
             }
         }
-        self.flush_isolated(group, source, now, &mut out);
+        for p in self.pending.expired(mono) {
+            self.flush_isolated(p, source, now, &mut out);
+        }
         out
+    }
+
+    /// Flushes every pending statement (the stream ends: the source
+    /// changes, the log became unreadable).
+    pub(crate) fn finish(&mut self, source: EventSource, now: SystemTime) -> Vec<MaskedEvent> {
+        let mut out = Vec::new();
+        for p in self.pending.drain() {
+            self.flush_isolated(p, source, now, &mut out);
+        }
+        out
+    }
+
+    /// Where the pending statements start in the log: the stream commits
+    /// its cursor back to the oldest of them (`Tailer::commit_from`), so a
+    /// restart replays them (security review of #93, M1).
+    pub(crate) fn held(&self) -> Vec<(u64, RecordPos)> {
+        self.pending.held()
+    }
+
+    /// Statements flushed before their statement record because the
+    /// pending state was full (see [`Pending`]).
+    pub(crate) fn pending_evicted(&self) -> u64 {
+        self.pending.evicted
+    }
+
+    /// A table-access record: added to its connection's pending
+    /// statement, or starting one.
+    fn table_record(
+        &mut self,
+        r: FileRecord,
+        source: EventSource,
+        now: SystemTime,
+        mono: Instant,
+        out: &mut Vec<MaskedEvent>,
+    ) {
+        if self.pending.table_reported(&r) {
+            // Its statement and this table were already reported (timeout,
+            // eviction). Another table of it is a continuation: pending,
+            // reported like any statement (never dropped).
+            return;
+        }
+        let c = r.connection;
+        if self
+            .pending
+            .first(c)
+            .is_some_and(|g| !same_statement(g, &r))
+        {
+            // A connection runs one statement at a time: a record of
+            // another statement ends the pending one (a statement whose
+            // source logs no statement record).
+            if let Some(p) = self.pending.take(c) {
+                self.flush_isolated(p, source, now, out);
+            }
+        }
+        for p in self.pending.add(r, mono, now) {
+            self.flush_isolated(p, source, now, out);
+        }
+    }
+
+    /// A statement record: flushed with its connection's pending
+    /// table-access records.
+    fn query_record(
+        &mut self,
+        r: FileRecord,
+        source: EventSource,
+        now: SystemTime,
+        out: &mut Vec<MaskedEvent>,
+    ) {
+        let c = r.connection;
+        match self.pending.take(c) {
+            Some(mut group) if group.first().is_some_and(|g| same_statement(g, &r)) => {
+                // Its pending records (a continuation of an early-flushed
+                // statement included: its new tables are reported).
+                self.pending.forget(c);
+                group.push(r);
+                self.flush_isolated(group, source, now, out);
+                return;
+            }
+            Some(group) => self.flush_isolated(group, source, now, out),
+            None => {}
+        }
+        if self.pending.reported(&r) {
+            // Its table-access records were reported without it (the
+            // statement outlived the pending timeout, or was evicted): its
+            // own event is only kept when the text shows a signal the
+            // table records could not, so the statement is counted once
+            // unless it matters.
+            self.pending.forget(c);
+            let mut late = Vec::new();
+            self.flush_isolated(vec![r], source, now, &mut late);
+            out.extend(late.into_iter().filter(|e| !e.signals().is_empty()));
+            return;
+        }
+        self.pending.forget(c);
+        self.flush_isolated(vec![r], source, now, out);
     }
 
     /// [`Self::flush`] of one statement in isolation: a statement whose
@@ -620,8 +1072,9 @@ impl EventBuilder {
     }
 }
 
-/// Whether `r` belongs to the statement of `g` (same connection, and the
-/// same query id, or without query ids the same text).
+/// Whether `r` belongs to the statement of `g`, the first record of a
+/// pending statement (same connection, and the same query id, or without
+/// query ids the same text).
 fn same_statement(g: &FileRecord, r: &FileRecord) -> bool {
     g.connection == r.connection
         && g.op != Op::Query
@@ -1088,6 +1541,308 @@ mod tests {
         let r = parse_server_audit(&line, 0, 1024).unwrap();
         assert!(r.opaque);
         assert_eq!(file(&mut b, vec![r]), ["read [\"hr.*\"] None []"]);
+    }
+
+    fn rd(c: u64, q: u64, table: &str) -> String {
+        format!("20260929 09:41:34,h,app,10.0.0.5,{c},{q},READ,shop,{table},")
+    }
+
+    fn qy(c: u64, q: u64, text: &str) -> String {
+        format!("20260929 09:41:34,h,app,10.0.0.5,{c},{q},QUERY,shop,'{text}',0")
+    }
+
+    fn at(b: &mut EventBuilder, lines: &[String], mono: Instant) -> Vec<String> {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        b.convert_file_at(
+            sa(&refs),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+            mono,
+        )
+        .iter()
+        .map(show)
+        .collect()
+    }
+
+    #[test]
+    fn interleaved_sessions_give_one_event_per_statement() {
+        // What the load harness saw: concurrent sessions interleave the
+        // TABLE and QUERY records of their statements.
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        let out = at(
+            &mut b,
+            &[
+                rd(1, 10, "a"),
+                rd(2, 11, "b"),
+                rd(3, 12, "c"),
+                rd(1, 10, "a2"),
+                qy(2, 11, "select v from b where id = 1"),
+                qy(1, 10, "select v from a join a2 using (id) where id = 1"),
+                rd(2, 13, "b"),
+                qy(3, 12, "select v from c where id = 1"),
+                qy(2, 13, "select v from b where id = 2"),
+                // Split by a poll bound or a rotation: the rest comes in
+                // the next batch.
+                rd(1, 14, "a"),
+                rd(3, 15, "c"),
+            ],
+            t0,
+        );
+        assert_eq!(
+            out,
+            [
+                "read [\"shop.b\"] None []",
+                "read [\"shop.a\", \"shop.a2\"] None []",
+                "read [\"shop.c\"] None []",
+                "read [\"shop.b\"] None []",
+            ],
+            "{out:#?}"
+        );
+        let out = at(
+            &mut b,
+            &[
+                qy(3, 15, "select v from c where id = 3"),
+                qy(1, 14, "select v from a where id = 3"),
+            ],
+            t0,
+        );
+        assert_eq!(
+            out,
+            ["read [\"shop.c\"] None []", "read [\"shop.a\"] None []"],
+            "{out:#?}"
+        );
+        assert_eq!(b.pending.sizes().0, 0);
+    }
+
+    #[test]
+    fn pending_statements_end_with_their_connection_or_stream() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        // A statement whose source logs no QUERY record ends at the
+        // connection's next statement, or at its disconnect.
+        let out = at(
+            &mut b,
+            &[
+                "20260929 09:41:34,h,app,10.0.0.5,1,20,WRITE,shop,a,".to_owned(),
+                rd(2, 21, "b"),
+                qy(1, 22, "select v from a where id = 1"),
+                "20260929 09:41:34,h,app,10.0.0.5,2,0,DISCONNECT,shop,,0".to_owned(),
+                rd(3, 23, "c"),
+            ],
+            t0,
+        );
+        assert_eq!(
+            out,
+            [
+                "write [\"shop.a\"] None []",
+                "read [\"shop.a\"] None []",
+                "read [\"shop.b\"] None []",
+            ],
+            "{out:#?}"
+        );
+        // The stream ends: what is pending is reported.
+        let out: Vec<String> = b
+            .finish(EventSource::MariadbServerAudit, SystemTime::now())
+            .iter()
+            .map(show)
+            .collect();
+        assert_eq!(out, ["read [\"shop.c\"] None []"], "{out:#?}");
+        assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #93, R4: a statement re-read after a restart is
+    /// pending since its log time, not since it was read again, so an agent
+    /// restarting more often than the timeout still flushes it on time and
+    /// its cursor moves on.
+    #[test]
+    fn replayed_statements_are_pending_since_their_log_time() {
+        let logged = |line: &str| {
+            let mut r = parse_server_audit(line.as_bytes(), 0, 1024).unwrap();
+            r.replayed = true;
+            r
+        };
+        let ts = logged(&rd(1, 30, "a")).ts.unwrap();
+        // Past the timeout 4 minutes ago: flushed at once.
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now() + PENDING_TIMEOUT;
+        let out = b.convert_file_at(
+            vec![logged(&rd(1, 30, "a"))],
+            EventSource::MariadbServerAudit,
+            ts + PENDING_TIMEOUT + Duration::from_secs(240),
+            t0,
+        );
+        assert_eq!(
+            out.iter().map(show).collect::<Vec<_>>(),
+            ["read [\"shop.a\"] None []"]
+        );
+        assert!(b.held().is_empty());
+        // Logged 100 s ago: flushed 200 s later, not after a full timeout.
+        let run = |b: &mut EventBuilder, recs: Vec<FileRecord>, mono: Instant| {
+            b.convert_file_at(
+                recs,
+                EventSource::MariadbServerAudit,
+                ts + Duration::from_secs(100),
+                mono,
+            )
+            .len()
+        };
+        let mut b = EventBuilder::new(own());
+        assert_eq!(run(&mut b, vec![logged(&rd(1, 30, "a"))], t0), 0);
+        let due = t0 + PENDING_TIMEOUT - Duration::from_secs(100);
+        assert_eq!(run(&mut b, vec![], due - Duration::from_secs(1)), 0);
+        assert_eq!(run(&mut b, vec![], due), 1);
+        // A record read live (not replayed) keeps its reading time.
+        let mut b = EventBuilder::new(own());
+        let live = parse_server_audit(rd(1, 30, "a").as_bytes(), 0, 1024).unwrap();
+        assert_eq!(run(&mut b, vec![live], t0), 0);
+        assert_eq!(run(&mut b, vec![], due), 0);
+        assert_eq!(run(&mut b, vec![], t0 + PENDING_TIMEOUT), 1);
+    }
+
+    #[test]
+    fn timed_out_statements_are_not_counted_twice() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        assert!(at(&mut b, &[rd(1, 30, "a"), rd(2, 31, "big")], t0).is_empty());
+        // Nothing yet just before the timeout.
+        let early = t0 + PENDING_TIMEOUT - Duration::from_secs(1);
+        assert!(at(&mut b, &[], early).is_empty());
+        // At the timeout: reported from the table records.
+        let out = at(&mut b, &[], t0 + PENDING_TIMEOUT);
+        assert_eq!(
+            out,
+            ["read [\"shop.a\"] None []", "read [\"shop.big\"] None []"],
+            "{out:#?}"
+        );
+        // The late QUERY records: no second event without a signal, one
+        // with the signal the table records could not show.
+        let late = t0 + PENDING_TIMEOUT * 2;
+        let out = at(
+            &mut b,
+            &[
+                rd(1, 30, "a"),
+                qy(1, 30, "select v from a where id = 1"),
+                qy(2, 31, "SELECT /*!40001 SQL_NO_CACHE */ * FROM big"),
+            ],
+            late,
+        );
+        assert_eq!(
+            out,
+            ["read [\"shop.big\"] None [\"shape.full_table_read\", \"signature.mysqldump\"]"],
+            "{out:#?}"
+        );
+        // The connections moved on: their next statements are reported.
+        let out = at(
+            &mut b,
+            &[rd(1, 32, "a"), qy(1, 32, "select v from a where id = 2")],
+            late,
+        );
+        assert_eq!(out, ["read [\"shop.a\"] None []"], "{out:#?}");
+        assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #93 (M2): after an early flush, a table the
+    /// statement reads later is reported, never dropped.
+    #[test]
+    fn late_tables_of_an_early_flushed_statement_are_reported() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        assert!(at(&mut b, &[rd(1, 40, "harmless")], t0).is_empty());
+        let t1 = t0 + PENDING_TIMEOUT;
+        let out = at(&mut b, &[], t1);
+        assert_eq!(out, ["read [\"shop.harmless\"] None []"], "{out:#?}");
+        // The procedure goes on: the same table again (ignored), then
+        // another one, then its statement record.
+        let out = at(
+            &mut b,
+            &[
+                rd(1, 40, "harmless"),
+                rd(1, 40, "salaries"),
+                qy(1, 40, "call report()"),
+            ],
+            t1,
+        );
+        assert_eq!(out, ["read [\"shop.salaries\"] None []"], "{out:#?}");
+        // A continuation that times out too is reported, and remembered
+        // with every table so far.
+        assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
+        let t2 = t1 + PENDING_TIMEOUT;
+        assert_eq!(at(&mut b, &[], t2), ["read [\"shop.a\"] None []"]);
+        assert!(at(&mut b, &[rd(2, 41, "b")], t2).is_empty());
+        let t3 = t2 + PENDING_TIMEOUT;
+        assert_eq!(at(&mut b, &[], t3), ["read [\"shop.b\"] None []"]);
+        let out = at(
+            &mut b,
+            &[
+                rd(2, 41, "a"),
+                rd(2, 41, "b"),
+                qy(2, 41, "select v from a join b using (id) where id = 1"),
+            ],
+            t3,
+        );
+        assert!(out.is_empty(), "{out:#?}");
+        assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn early_flushed_statements_are_forgotten_after_their_ttl() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        assert!(at(&mut b, &[rd(1, 50, "a")], t0).is_empty());
+        assert_eq!(at(&mut b, &[], t0 + PENDING_TIMEOUT).len(), 1);
+        assert_eq!(b.pending.sizes().3, 1);
+        let late = t0 + PENDING_TIMEOUT + REPORTED_TTL;
+        assert!(at(&mut b, &[], late).is_empty());
+        assert_eq!(b.pending.sizes().3, 0);
+        // A record after that is a statement of its own.
+        assert_eq!(
+            at(&mut b, &[qy(1, 50, "select v from a where id = 1")], late),
+            ["read [\"shop.a\"] None []"]
+        );
+    }
+
+    #[test]
+    fn pending_state_stays_bounded_and_counts_exactly() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        let n = 3 * MAX_PENDING_CONNECTIONS as u64;
+        // Many sessions open a statement each before any ends.
+        let mut reported = 0usize;
+        for c in 0..n {
+            reported += at(&mut b, &[rd(c + 1, c + 1, "a")], t0).len();
+            let (conns, _, _, done) = b.pending.sizes();
+            assert!(conns <= MAX_PENDING_CONNECTIONS, "{conns}");
+            assert!(done <= MAX_EARLY_REPORTED, "{done}");
+        }
+        assert_eq!(b.pending_evicted(), n - MAX_PENDING_CONNECTIONS as u64);
+        // Then every statement ends: each is counted once in all.
+        for c in 0..n {
+            reported += at(
+                &mut b,
+                &[qy(c + 1, c + 1, "select v from a where id = 1")],
+                t0,
+            )
+            .len();
+        }
+        assert_eq!(reported as u64, n);
+        // One statement touching many tables keeps a bounded record list.
+        let lines: Vec<String> = (0..4 * MAX_PENDING_RECORDS)
+            .map(|i| rd(1, 999_999, &format!("t{i}")))
+            .collect();
+        assert!(at(&mut b, &lines, t0).is_empty());
+        assert_eq!(b.pending.sizes().1, MAX_PENDING_RECORDS);
+        // JSON table_access records carry the text: bounded in bytes.
+        let text = "x".repeat(900 * 1024);
+        let mut b = EventBuilder::new(own());
+        for c in 0..64u64 {
+            let rec = format!(
+                r#"{{"timestamp":"2026-09-29 10:06:12","class":"table_access","event":"read","connection_id":{c},"login":{{"user":"app","ip":"10.1.2.3"}},"table_access_data":{{"db":"hr","table":"t","query":"select {text} from t"}}}}"#
+            );
+            let recs = vec![parse_json(rec.as_bytes()).unwrap()];
+            b.convert_file_at(recs, EventSource::MysqlAuditLog, SystemTime::now(), t0);
+            assert!(b.pending.sizes().2 <= MAX_PENDING_BYTES);
+        }
     }
 
     #[test]

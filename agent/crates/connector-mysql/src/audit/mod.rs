@@ -28,11 +28,12 @@ pub(crate) mod events;
 pub(crate) mod pfs;
 pub(crate) mod records;
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{ClientAddr, EventSource};
 use databastion_core::audit::own::OwnAccount;
-use databastion_core::audit::tail::{Framing, TailError, Tailer};
+use databastion_core::audit::tail::{Framing, ReplayFrom, TailError, Tailer};
 use databastion_core::config::{MysqlLogFormat, TargetConfig};
 use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
@@ -178,6 +179,91 @@ struct FileStream {
     builder: EventBuilder,
     reported: (u64, u64),
     unparsed: u64,
+    /// Records re-read after a restart from a cursor moved back to held
+    /// records: only those held are replayed.
+    replay: Option<ReplayFilter>,
+}
+
+impl FileStream {
+    fn new(format: MysqlLogFormat, tailer: Tailer, builder: EventBuilder) -> Self {
+        Self {
+            format,
+            tailer: Some(tailer),
+            builder,
+            reported: (0, 0),
+            unparsed: 0,
+            replay: None,
+        }
+    }
+}
+
+/// The records re-read after a restart (security review of #93, M1): the
+/// cursor was saved at the start of the oldest statement the stream held
+/// (its table records waited for their statement record), so the records
+/// up to the end read before the restart were handed over already, except
+/// those of the held statements.
+struct ReplayFilter {
+    file: (u64, u64),
+    end: u64,
+    /// Connection → offset its held statement starts at.
+    keep: HashMap<u64, u64>,
+    /// Rotations of the tailer when the replay started (a truncation ends
+    /// it: the offsets no longer mean the same records).
+    rotations: u64,
+}
+
+impl ReplayFilter {
+    fn new(from: ReplayFrom, rotations: u64) -> Self {
+        Self {
+            file: from.file,
+            end: from.replay.end,
+            keep: from.replay.keep.into_iter().collect(),
+            rotations,
+        }
+    }
+
+    /// Whether `r` is still in the replayed part.
+    fn covers(&self, r: &records::FileRecord, rotations: u64) -> bool {
+        rotations == self.rotations
+            && r.pos
+                .is_some_and(|p| p.file == self.file && p.end <= self.end)
+    }
+
+    /// Whether a record of the replayed part is to be handled again.
+    fn admits(&self, r: &records::FileRecord) -> bool {
+        matches!(r.op, records::Op::Query | records::Op::Table(_))
+            && r.pos.is_some_and(|p| {
+                self.keep
+                    .get(&r.connection)
+                    .is_some_and(|start| p.start >= *start)
+            })
+    }
+}
+
+/// Keeps the records to handle: those after the replayed part, and in it
+/// only the held statements' (see [`ReplayFilter`]).
+fn apply_replay(
+    replay: &mut Option<ReplayFilter>,
+    records: Vec<records::FileRecord>,
+    rotations: u64,
+) -> Vec<records::FileRecord> {
+    let mut out = Vec::with_capacity(records.len());
+    for mut r in records {
+        match replay.as_ref() {
+            Some(f) if f.covers(&r, rotations) => {
+                if f.admits(&r) {
+                    r.replayed = true;
+                    out.push(r);
+                }
+            }
+            Some(_) => {
+                *replay = None;
+                out.push(r);
+            }
+            None => out.push(r),
+        }
+    }
+    out
 }
 
 struct PsStream {
@@ -259,6 +345,9 @@ pub(crate) async fn audit_stream(
                 if let Some(old) = ps.take().and_then(|p| p.session) {
                     old.close().await;
                 }
+                if file.as_ref().is_some_and(|st| st.format != format) {
+                    close_file(target, sink, state, &mut file).await?;
+                }
                 let st = match file.as_mut() {
                     Some(st) if st.format == format => st,
                     _ => {
@@ -272,17 +361,11 @@ pub(crate) async fn audit_stream(
                             MysqlLogFormat::ServerAudit => Framing::Lines,
                             MysqlLogFormat::Json => Framing::JsonObjects,
                         };
-                        file.insert(FileStream {
+                        file.insert(FileStream::new(
                             format,
-                            tailer: Some(Tailer::new(
-                                log.path,
-                                framing,
-                                cfg.cursor(cursor_name(format)),
-                            )),
-                            builder: EventBuilder::new(own_account(cfg, target, &pre, state)),
-                            reported: (0, 0),
-                            unparsed: 0,
-                        })
+                            Tailer::new(log.path, framing, cfg.cursor(cursor_name(format))),
+                            EventBuilder::new(own_account(cfg, target, &pre, state)),
+                        ))
                     }
                 };
                 // The agent's address may change (a new route, a DHCP
@@ -294,12 +377,12 @@ pub(crate) async fn audit_stream(
                         kind = %kind,
                         "audit log unreadable; re-evaluating the audit source"
                     );
-                    file = None;
+                    close_file(target, sink, state, &mut file).await?;
                     tokio::time::sleep(cfg.poll_interval()).await;
                 }
             }
             Source::Ps(table) => {
-                file = None;
+                close_file(target, sink, state, &mut file).await?;
                 if ps.as_ref().is_none_or(|p| p.table != table) {
                     // The probe's session, or the held one (another
                     // statement table): no new connection.
@@ -343,6 +426,47 @@ pub(crate) async fn audit_stream(
     }
 }
 
+fn file_source(format: MysqlLogFormat) -> EventSource {
+    match format {
+        MysqlLogFormat::ServerAudit => EventSource::MariadbServerAudit,
+        MysqlLogFormat::Json => EventSource::MysqlAuditLog,
+    }
+}
+
+/// Ends the audit log stream, if any: the statements still waiting for
+/// their statement record are reported (their records are behind the
+/// saved cursor already).
+async fn close_file(
+    target: &TargetConfig,
+    sink: &EventSink,
+    state: &CheckState,
+    file: &mut Option<FileStream>,
+) -> Result<(), ConnectorError> {
+    let Some(mut st) = file.take() else {
+        return Ok(());
+    };
+    let panicked_before = st.builder.panicked;
+    let events = st.builder.finish(file_source(st.format), SystemTime::now());
+    let panicked = st.builder.panicked.saturating_sub(panicked_before);
+    if panicked > 0 {
+        state.note_dropped(&target.id, panicked);
+        tracing::warn!(
+            target_id = %target.id,
+            dropped = panicked,
+            "audit records whose conversion failed dropped (internal error)"
+        );
+    }
+    for e in events {
+        sink.submit(e).await?;
+    }
+    // Everything was handed over: a plain cursor (a later stream must not
+    // replay what `finish` reported).
+    if let Some(t) = st.tailer.take() {
+        let _ = tokio::task::spawn_blocking(move || t.settle()).await;
+    }
+    Ok(())
+}
+
 /// Removes the saved `performance_schema` cursor.
 fn forget_ps_cursor(cfg: &AuditConfig) {
     if let Some(store) = cfg.cursor(pfs::CURSOR) {
@@ -364,17 +488,14 @@ async fn file_run(
 ) -> Result<Result<(), std::io::ErrorKind>, ConnectorError> {
     let started = Instant::now();
     let (format, utc_offset, query_limit) = (st.format, pre.utc_offset, pre.query_limit);
-    let source = match format {
-        MysqlLogFormat::ServerAudit => EventSource::MariadbServerAudit,
-        MysqlLogFormat::Json => EventSource::MysqlAuditLog,
-    };
+    let source = file_source(format);
     loop {
         let mut t = st.tailer.take().ok_or_else(internal)?;
         let (t, polled) = tokio::task::spawn_blocking(move || {
             let polled = t.poll().map(|p| {
                 let mut unparsed = 0u64;
                 let mut records = Vec::with_capacity(p.records.len());
-                for r in &p.records {
+                for (r, pos) in p.records.iter().zip(p.positions.iter()) {
                     // Per-record isolation: a record that makes the parser
                     // panic is dropped alone, counted (phase-7 review H1).
                     let parsed = databastion_core::isolate(|| match format {
@@ -385,7 +506,10 @@ async fn file_run(
                     })
                     .flatten();
                     match parsed {
-                        Some(rec) => records.push(rec),
+                        Some(mut rec) => {
+                            rec.pos = Some(*pos);
+                            records.push(rec);
+                        }
                         None => unparsed += 1,
                     }
                 }
@@ -402,8 +526,16 @@ async fn file_run(
         })?;
         let (records, more, unparsed) = match polled {
             Ok(p) => p,
-            Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
+            Err(TailError::Unreadable(kind)) => {
+                st.tailer = Some(t);
+                return Ok(Err(kind));
+            }
         };
+        let mut t = t;
+        if let Some(from) = t.take_replay() {
+            st.replay = Some(ReplayFilter::new(from, t.rotations));
+        }
+        let records = apply_replay(&mut st.replay, records, t.rotations);
         if !records.is_empty() {
             state.note_record(&target.id);
         }
@@ -429,7 +561,18 @@ async fn file_run(
             st.reported = (t.oversized, t.malformed());
         }
         let panicked_before = st.builder.panicked;
+        let evicted_before = st.builder.pending_evicted();
         let events = st.builder.convert_file(records, source, SystemTime::now());
+        let evicted = st.builder.pending_evicted().saturating_sub(evicted_before);
+        if evicted > 0 {
+            databastion_core::audit::count_pending_evicted(evicted);
+            tracing::warn!(
+                target_id = %target.id,
+                statements = evicted,
+                "too many statements waiting for their audit record: the oldest reported from \
+                 their table records alone"
+            );
+        }
         {
             let panicked = st.builder.panicked.saturating_sub(panicked_before);
             if panicked > 0 {
@@ -444,9 +587,12 @@ async fn file_run(
         for e in events {
             sink.submit(e).await?;
         }
-        // Everything read so far was handed over: move the cursor.
+        // Everything read so far was handed over, except the statements
+        // still waiting for their statement record: move the cursor, back
+        // to the oldest of those (security review of #93, M1).
+        let held = st.builder.held();
         let t = tokio::task::spawn_blocking(move || {
-            t.commit();
+            t.commit_from(&held);
             t
         })
         .await
@@ -520,6 +666,142 @@ async fn ps_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security review of #93, M1: table records still waiting for their
+    /// statement record when the stream stops (a crash, a restart, a
+    /// reconfiguration) are read again from the saved cursor, and only
+    /// they: exactly one event with all tables, nothing counted twice.
+    #[tokio::test]
+    async fn held_records_survive_a_restart() {
+        use databastion_classifiers::masking::{EventAction, MaskedEvent};
+        use databastion_core::audit::own::SharedOwnUsage;
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-my-held-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("server_audit.log");
+        std::fs::write(&log, "").unwrap();
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        let yaml = format!(
+            "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: my-t\n    \
+             engine: mariadb\n    host: \"127.0.0.1\"\n    account: databastion\n    \
+             secret: {{env: DATABASTION_TEST_UNUSED}}\n    mysql: {{tls: disable, audit_log: \
+             {{path: \"{}\", format: server_audit}}}}\n",
+            log.display()
+        );
+        let config = databastion_core::AgentConfig::parse(&yaml).unwrap();
+        let target = config.targets[0].clone();
+        let limits = databastion_core::config::Limits {
+            min_audit_poll_interval_s: 1,
+            ..databastion_core::config::Limits::default()
+        };
+        let cfg = AuditConfig::local(&target, 1, &limits).with_state_dir(dir.clone());
+        let state = CheckState::default();
+        let pre = Prerequisites {
+            source: Source::File(MysqlLogFormat::ServerAudit),
+            own_addr: None,
+            utc_offset: 0,
+            query_limit: DEFAULT_QUERY_LIMIT,
+        };
+        let stream = || {
+            FileStream::new(
+                MysqlLogFormat::ServerAudit,
+                Tailer::new(
+                    log.clone(),
+                    Framing::Lines,
+                    cfg.cursor(cursor_name(MysqlLogFormat::ServerAudit)),
+                ),
+                EventBuilder::new(OwnAccount::new(
+                    "databastion",
+                    Some(PROGRAM_NAME),
+                    None,
+                    1000,
+                    SharedOwnUsage::default(),
+                )),
+            )
+        };
+        let reads = |rx: &mut tokio::sync::mpsc::Receiver<MaskedEvent>| {
+            let mut out = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                if e.action() == EventAction::Read {
+                    let mut objects: Vec<String> = e
+                        .objects()
+                        .iter()
+                        .map(|o| o.object().as_str().to_owned())
+                        .collect();
+                    objects.sort();
+                    out.push(objects.join(","));
+                }
+            }
+            out
+        };
+        let line = |c: u64, q: u64, op: &str, rest: &str| {
+            format!("20260929 09:41:34,h,app,10.0.0.5,{c},{q},{op},shop,{rest}\n")
+        };
+        let (sink, mut rx) = EventSink::channel(64);
+        // First stream: the cursor starts at the end of the (empty) log.
+        let mut st = stream();
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        append(&line(1, 10, "READ", "a,"));
+        append(&line(2, 11, "READ", "x,"));
+        append(&line(2, 11, "QUERY", "'select v from x where id = 1',0"));
+        append(&line(1, 10, "READ", "b,"));
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reads(&mut rx), ["x"]);
+        // The stream stops without reporting what it held (a crash).
+        drop(st);
+        append(&line(
+            1,
+            10,
+            "QUERY",
+            "'select v from a join b using (id) where id = 1',0",
+        ));
+        append(&line(3, 12, "READ", "y,"));
+        append(&line(3, 12, "QUERY", "'select v from y where id = 1',0"));
+        let mut st = stream();
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reads(&mut rx), ["a,b", "y"]);
+        assert!(st.replay.is_none());
+        // A graceful end reports what is held and settles the cursor.
+        append(&line(4, 13, "READ", "z,"));
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reads(&mut rx).is_empty());
+        let mut file = Some(st);
+        close_file(&target, &sink, &state, &mut file).await.unwrap();
+        assert_eq!(reads(&mut rx), ["z"]);
+        append(&line(4, 13, "QUERY", "'select v from z where id = 1',0"));
+        let mut st = stream();
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        // Its late statement record, without the table records: counted
+        // from the text only (no memory across streams).
+        assert_eq!(reads(&mut rx), ["z"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn own_address_is_an_ip_literal_only() {
