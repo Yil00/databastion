@@ -14,7 +14,10 @@
 //!   unidentified account (a `db_user` fingerprint of an empty name), per
 //!   client address for at most [`MAX_OVERFLOW_GROUPS`] addresses, then
 //!   without address, whose `aggregated_count` is the number of attempts
-//!   (phase 7, the failed-login flood of ADR-0025).
+//!   (phase 7, the failed-login flood of ADR-0025). A principal attempted
+//!   more often than the least attempted named group takes its place
+//!   (that group joins the overflow, counts kept), so junk names sent
+//!   first cannot hide which account is brute-forced (#88 review M1).
 //! - `reportable` (crate-private): the `audit.configure` filter. An event
 //!   is reported when it carries a signal, touches an object listed in
 //!   `sensitive_objects`, is not a `read` / `write` (connections, DDL,
@@ -297,14 +300,24 @@ pub(crate) const MAX_AUTH_FAILURE_GROUPS: usize = 100;
 /// Overflow events with a client address per window; beyond, one without
 /// address.
 pub(crate) const MAX_OVERFLOW_GROUPS: usize = 16;
+/// Failed logins beyond the named groups are first counted per principal
+/// in a table of this many entries (space-saving: when it is full, the
+/// entry with the fewest attempts joins the overflow event), so a
+/// principal attempted more often than the least attempted named group is
+/// promoted to a named group (#88 review M1).
+pub(crate) const MAX_FOLDED_PRINCIPALS: usize = 256;
 
 /// Pre-aggregation of one target's events.
 pub(crate) struct Aggregator {
     window: Duration,
     groups: HashMap<EventGroupKey, MaskedEvent>,
     opened: Option<Instant>,
-    /// `auth_failure` groups of the window (overflow events aside).
-    auth_groups: usize,
+    /// Keys of the named `auth_failure` groups of the window (overflow
+    /// events aside).
+    named: std::collections::HashSet<EventGroupKey>,
+    /// Failed logins beyond the named groups, per original group, not yet
+    /// in an overflow event (at most [`MAX_FOLDED_PRINCIPALS`]).
+    folded: HashMap<EventGroupKey, MaskedEvent>,
     /// Overflow groups with a client address in the window.
     overflow_groups: usize,
 }
@@ -315,36 +328,89 @@ impl Aggregator {
             window,
             groups: HashMap::new(),
             opened: None,
-            auth_groups: 0,
+            named: std::collections::HashSet::new(),
+            folded: HashMap::new(),
             overflow_groups: 0,
         }
     }
 
-    /// Adds an event; `true` when it was a failed login folded into an
-    /// overflow event (counted by the caller).
+    /// Adds an event; `true` when it was a failed login beyond the named
+    /// groups (counted by the caller; its attempts are never lost: they
+    /// end in a named group once promoted, or in an overflow event).
     pub(crate) fn push(&mut self, event: MaskedEvent, now: Instant) -> bool {
         if self.opened.is_none() {
             self.opened = Some(now);
         }
-        let mut key = event.group_key();
-        let mut event = event;
-        let mut overflowed = false;
+        let key = event.group_key();
         if event.action() == EventAction::AuthFailure && !self.groups.contains_key(&key) {
-            if self.auth_groups < MAX_AUTH_FAILURE_GROUPS {
-                self.auth_groups += 1;
+            if self.named.len() < MAX_AUTH_FAILURE_GROUPS {
+                self.named.insert(key.clone());
             } else {
-                overflowed = true;
-                event = self.overflow(&event);
-                key = event.group_key();
+                self.fold(key, event);
+                return true;
             }
         }
+        self.insert(key, event);
+        false
+    }
+
+    fn insert(&mut self, key: EventGroupKey, event: MaskedEvent) {
         match self.groups.get_mut(&key) {
             Some(existing) => existing.merge(event),
             None => {
                 self.groups.insert(key, event);
             }
         }
-        overflowed
+    }
+
+    /// A failed login beyond the named groups: counted per principal, and
+    /// promoted to a named group once attempted more often than the least
+    /// attempted named group (which then joins the overflow, counts kept).
+    fn fold(&mut self, key: EventGroupKey, event: MaskedEvent) {
+        match self.folded.get_mut(&key) {
+            Some(existing) => existing.merge(event),
+            None => {
+                if self.folded.len() >= MAX_FOLDED_PRINCIPALS {
+                    let least = self
+                        .folded
+                        .iter()
+                        .min_by_key(|(_, e)| e.aggregated_count())
+                        .map(|(k, _)| k.clone());
+                    if let Some(e) = least.and_then(|k| self.folded.remove(&k)) {
+                        self.add_to_overflow(&e);
+                    }
+                }
+                self.folded.insert(key.clone(), event);
+            }
+        }
+        let count = self
+            .folded
+            .get(&key)
+            .map_or(0, MaskedEvent::aggregated_count);
+        let smallest = self
+            .named
+            .iter()
+            .filter_map(|k| self.groups.get(k).map(|e| (k, e.aggregated_count())))
+            .min_by_key(|(_, n)| *n)
+            .map(|(k, n)| (k.clone(), n));
+        if let Some((demoted, n)) = smallest {
+            if count > n {
+                self.named.remove(&demoted);
+                if let Some(e) = self.groups.remove(&demoted) {
+                    self.add_to_overflow(&e);
+                }
+                if let Some(e) = self.folded.remove(&key) {
+                    self.named.insert(key.clone());
+                    self.insert(key, e);
+                }
+            }
+        }
+    }
+
+    /// Adds the attempts of `e` to their overflow event.
+    fn add_to_overflow(&mut self, e: &MaskedEvent) {
+        let o = self.overflow(e);
+        self.insert(o.group_key(), o);
     }
 
     /// The overflow event a failed login joins: same source, time, count
@@ -376,7 +442,7 @@ impl Aggregator {
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.groups.len() >= MAX_GROUPS
+        self.groups.len() + self.folded.len() >= MAX_GROUPS
     }
 
     #[cfg(test)]
@@ -390,8 +456,13 @@ impl Aggregator {
     }
 
     pub(crate) fn drain(&mut self) -> Vec<MaskedEvent> {
+        // Folded attempts not promoted join their overflow events.
+        let folded: Vec<MaskedEvent> = self.folded.drain().map(|(_, e)| e).collect();
+        for e in &folded {
+            self.add_to_overflow(e);
+        }
         self.opened = None;
-        self.auth_groups = 0;
+        self.named.clear();
         self.overflow_groups = 0;
         let mut out: Vec<MaskedEvent> = self.groups.drain().map(|(_, e)| e).collect();
         out.sort_by_key(MaskedEvent::ts);
@@ -644,5 +715,41 @@ mod tests {
         assert!(out.iter().any(|e| e.action() == EventAction::Read));
         // A new window starts over.
         assert!(!a.push(failed("w", None, 1), now));
+    }
+
+    /// #88 review M1: 100 junk names first cannot hide the account that is
+    /// then brute-forced: it is promoted to a named (fingerprinted) group
+    /// with all its attempts; the junk group it replaces joins the
+    /// overflow, and no attempt is lost.
+    #[test]
+    fn a_brute_forced_account_is_promoted_over_junk_names() {
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        let now = Instant::now();
+        for i in 0..MAX_AUTH_FAILURE_GROUPS as u64 {
+            assert!(!a.push(failed(&format!("junk{i}"), Some("198.51.100.7"), i), now));
+        }
+        for i in 0..50u64 {
+            a.push(failed("root", Some("198.51.100.7"), 1_000 + i), now);
+        }
+        let out = a.drain();
+        let root = out
+            .iter()
+            .find(|e| e.principal().account_name() == "root")
+            .expect("root in a named group");
+        assert!(!root.principal().send_name(), "fingerprinted");
+        assert_eq!(root.aggregated_count(), 50);
+        let named = out
+            .iter()
+            .filter(|e| !e.principal().account_name().is_empty())
+            .count();
+        assert_eq!(named, MAX_AUTH_FAILURE_GROUPS);
+        let overflow: u64 = out
+            .iter()
+            .filter(|e| e.principal().account_name().is_empty())
+            .map(MaskedEvent::aggregated_count)
+            .sum();
+        assert_eq!(overflow, 1, "the demoted junk name");
+        let total: u64 = out.iter().map(MaskedEvent::aggregated_count).sum();
+        assert_eq!(total, MAX_AUTH_FAILURE_GROUPS as u64 + 50);
     }
 }

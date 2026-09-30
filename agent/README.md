@@ -267,7 +267,11 @@ beyond, a failed login joins an **overflow** event: an `auth_failure` of an
 unidentified account (a `db_user` fingerprint, as for any failed login),
 per client address for at most 16 addresses, then one without address,
 whose `aggregated_count` is the number of attempts and whose `ts` /
-`ts_last` span them. No attempt goes uncounted, and a flood gives at most
+`ts_last` span them. Attempts beyond the named groups are first counted per
+principal (at most 256, the least attempted joining the overflow first); a
+principal attempted more often than the least attempted named group takes
+its place, that group joining the overflow with its count, so junk names
+sent first cannot hide which account is brute-forced (#88 review M1). No attempt goes uncounted, and a flood gives at most
 117 `auth_failure` events per window instead of one per name. Folded
 attempts are counted in `auth_failures_overflowed_total` (heartbeat
 metrics). With the spool priorities above, a later dump's
