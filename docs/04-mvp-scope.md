@@ -38,5 +38,5 @@ Auditing depends on what the engine logs natively. DataBastion **does not promis
 - Correct detection of PII in the test dataset (`dev/`): recall ≥ 90 %, precision ≥ 85 %
 - Detection of a `pg_dump`, a `mysqldump`, a `mongodump` and a bulk LDAP search in the test environment
 - **No raw sensitive value** present in the console database (automated test)
-- Impact on the monitored database < 2 % CPU during Discovery (bounded sampling)
+- Impact on the monitored database < 2 % CPU during Discovery (bounded sampling). Measured by the load harness ([e2e/load/README.md](../e2e/load/README.md)) with Discovery pacing: 0.045 % (PostgreSQL) to 0.322 % (MariaDB) of a 2-CPU server per scan; results and the Audit-under-load figures in [08-engine-capabilities.md](08-engine-capabilities.md#load-and-database-impact-measured)
 - Agents stable for 72 h on Ubuntu 24.04 and Debian 12

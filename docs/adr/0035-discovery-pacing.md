@@ -1,7 +1,7 @@
 # ADR-0035: Discovery pacing to a bounded duty cycle per scan
 
-- **Status**: Proposed
-- **Date**: 2026-09-30
+- **Status**: Accepted
+- **Date**: 2026-09-30 (proposed and accepted)
 - **Context references**: ROADMAP phase 7 "Load / database impact tests"; the load harness of #92 ([e2e/load/README.md](../../e2e/load/README.md)); PR #93 (commits `3c2a0e9`, `3184023`, `af2553d`, `8acb570`, `9fd0472`) and its security review (M3, L1, L5, L6, R1, R2, R3); PR #94 (console lease of queued scans, default scan budget); `agent/crates/core/src/pacing.rs`, `agent/crates/core/src/job.rs` (`ScanJob::paced`, `ScanJob::turn`, `ScanJob::rotate`), `agent/crates/core/src/runtime.rs` (scan worker), `agent/crates/core/src/config.rs`, `console/src/server/jobs.ts`, `console/src/server/scans.ts`; [agent/README.md](../../agent/README.md)
 
 ## Context
@@ -28,7 +28,7 @@ A first version of the pacing paused after each unit of work. Its security revie
 
 ## Consequences
 - A scan takes about `100 / d` times its query time. Measured on MariaDB 11.4 with 200 tables (debug build): 120 s and 0.35 % of one core paced, against 6.6 s and 5.4 % unpaced. The #92 load job on #93 (`b4aa999`, pgaudit) measured a Discovery impact of 0.30 % on MariaDB, 0.28 % on MongoDB and about 0 % on PostgreSQL.
-- A database too large for its scan budget is not scanned in full: the scan succeeds, and the objects left are reported as `skipped_limit` (a database, suffix or MySQL / MariaDB target not reached counts as 1, so the counter underestimates the objects left). The console (PR #95, pending) flags succeeded scans with actionable gaps as "partial coverage"; on a console without the coverage counters, such a scan shows as `failed` / `timeout`. At 1 %, the 3600 s default covers about 36 s of query time (some 7 000 objects at 5 ms). The remedy is a larger `max_duration_s` and `limits.max_scan_duration_s`, or a higher `d` where the server has spare cores. Thanks to the rotation, successive scans skip different objects.
+- A database too large for its scan budget is not scanned in full: the scan succeeds, and the objects left are reported as `skipped_limit` (a database, suffix or MySQL / MariaDB target not reached counts as 1, so the counter underestimates the objects left). The console (#95) flags a succeeded scan with an actionable gap as "partial coverage" on the agent page; on a console without the coverage counters, such a scan shows as `failed` / `timeout`. At 1 %, the 3600 s default covers about 36 s of query time (some 7 000 objects at 5 ms). The remedy is a larger `max_duration_s` and `limits.max_scan_duration_s`, or a higher `d` where the server has spare cores. Thanks to the rotation, successive scans skip different objects.
 - The bound is conservative: latency (network, I/O and lock waits) counts as busy time, so a slow link or a busy server lengthens the pauses without adding database CPU.
 - Not paced: connection setup (once per scan or database), and the reconnections after long pauses (decision 6: at most a handful per scan with pauses that long; security review of #93, L6).
 - Residual: PostgreSQL parallel query workers are not disabled for the scan's connection. A sampling query that the planner runs in parallel can use more than one core during its `busy` time, so on PostgreSQL the bound is per connection, not strictly per core.
