@@ -25,6 +25,7 @@ jobs:
       agent: ${{ steps.detect.outputs.agent }}
       protocol: ${{ steps.detect.outputs.protocol }}
       e2e: ${{ steps.e2e.outputs.e2e }}
+      packaging: ${{ steps.e2e.outputs.packaging }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,6 +42,7 @@ jobs:
           } | tee -a "$GITHUB_OUTPUT"
       # The E2E job (a few minutes of image builds) runs when something it exercises changed. When
       # the changed files cannot be listed (new branch, force push, shallow history), it runs.
+      # Same rule for the packaging jobs (.deb, installation test), on the packaging files.
       - id: e2e
         env:
           EVENT: ${{ github.event_name }}
@@ -63,6 +65,12 @@ jobs:
             e2e=false
           fi
           echo "e2e=$e2e" | tee -a "$GITHUB_OUTPUT"
+          if [ -z "$changed" ] || grep -qE '^(deploy/|agent/Dockerfile$|agent/agent\.example\.yaml$|console/Dockerfile$|console/docker/|\.github/workflows/(ci|packaging|publish)\.yml$)' <<<"$changed"; then
+            packaging=true
+          else
+            packaging=false
+          fi
+          echo "packaging=$packaging" | tee -a "$GITHUB_OUTPUT"
 
   docs:
     name: Documentation
@@ -510,11 +518,23 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Agent .deb (reproducible build, install in Debian 12 / Ubuntu 24.04 containers, systemd unit
+  # checks) and the "Installation < 15 min" test on the runner (deploy/README.md), when packaging
+  # files change. Required through ci-result.
+  packaging:
+    name: Packaging
+    needs: detect
+    if: needs.detect.outputs.packaging == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    uses: ./.github/workflows/packaging.yml
+    permissions:
+      contents: read
+      packages: read
+
   # Single status check required by branch protection.
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, protocol, e2e]
+    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, protocol, e2e, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

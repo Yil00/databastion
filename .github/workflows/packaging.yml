@@ -1,0 +1,182 @@
+name: Packaging
+
+# Agent .deb and installation tests (deploy/README.md):
+# - deb:          builds the agent image of the checkout per architecture, copies its binary out, and
+#                 packages it twice with nfpm (deploy/deb/build.sh): both builds must be identical
+#                 (reproducible package);
+# - deb-install:  installs each .deb in Debian 12 and Ubuntu 24.04 containers and checks users,
+#                 files, owners, modes, the systemd unit (systemd-analyze verify / security),
+#                 `--version`, reinstall, remove and purge (deploy/deb/test-install.sh);
+# - install-test: "Installation < 15 min" (ROADMAP phase 7): a fresh console + agent install on the
+#                 runner following deploy/README.md, timed up to the agent's first heartbeat
+#                 (deploy/install-test.sh).
+# Called by ci.yml (pull requests and pushes that touch packaging: builds everything from the
+# checkout) and by publish.yml (releases: the published console image and the .deb files built
+# from the signed agent image, uploaded by publish.yml as the deb-amd64 / deb-arm64 artifacts).
+
+on:
+  workflow_call:
+    inputs:
+      build-deb:
+        description: Build the .deb from the checkout (false = use the deb-<arch> artifacts of the calling run)
+        type: boolean
+        default: true
+      ref:
+        description: Git ref to test (empty = the ref of the triggering event)
+        type: string
+        default: ""
+      console-image:
+        description: Console image for the install test (empty = build it from the checkout)
+        type: string
+        default: ""
+      expected-version:
+        description: Version `databastion-agent --version` must print (empty = the agent/Cargo.toml version, `any` = no check)
+        type: string
+        default: ""
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_IMAGE: debian:12@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+  UBUNTU_IMAGE: ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+
+jobs:
+  deb:
+    name: Build .deb (${{ matrix.arch }})
+    if: inputs.build-deb || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The same Dockerfile and pinned toolchain as the published image; the .deb carries its binary.
+      - name: Build the agent image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: agent
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: databastion-agent:packaging
+          cache-from: type=gha,scope=agent-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agent-${{ matrix.arch }}
+      - name: Copy the binary out of the image
+        run: |
+          id="$(docker create databastion-agent:packaging)"
+          docker cp "$id:/usr/local/bin/databastion-agent" "$RUNNER_TEMP/databastion-agent"
+          docker rm "$id" >/dev/null
+          "$RUNNER_TEMP/databastion-agent" --version
+      - name: Install nfpm (pinned, checksum database verified)
+        run: echo "NFPM=$(deploy/deb/install-nfpm.sh "$RUNNER_TEMP/bin")" >> "$GITHUB_ENV"
+      - name: Build the .deb twice (reproducible)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' agent/Cargo.toml)"
+          deb="$(deploy/deb/build.sh --binary "$RUNNER_TEMP/databastion-agent" --arch "$ARCH" \
+            --version "$version" --out "$RUNNER_TEMP/deb")"
+          again="$(deploy/deb/build.sh --binary "$RUNNER_TEMP/databastion-agent" --arch "$ARCH" \
+            --version "$version" --out "$RUNNER_TEMP/deb-again")"
+          sha256sum "$deb" "$again"
+          cmp "$deb" "$again"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: ${{ runner.temp }}/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  deb-install:
+    name: Install .deb (${{ matrix.distro }}, ${{ matrix.arch }})
+    needs: deb
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        distro: [debian-12, ubuntu-24.04]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: ${{ runner.temp }}/deb
+      - name: dpkg -i in a fresh container, checks, remove, purge
+        env:
+          DISTRO: ${{ matrix.distro }}
+          EXPECTED: ${{ inputs.expected-version }}
+        run: |
+          image="$DEBIAN_IMAGE"; [ "$DISTRO" = ubuntu-24.04 ] && image="$UBUNTU_IMAGE"
+          if [ -z "$EXPECTED" ]; then
+            EXPECTED="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' agent/Cargo.toml)"
+          elif [ "$EXPECTED" = any ]; then
+            EXPECTED=""
+          fi
+          deb="$(cd "$RUNNER_TEMP/deb" && ls -- *.deb)"
+          docker run --rm -v "$PWD/deploy/deb:/test:ro" -v "$RUNNER_TEMP/deb:/deb:ro" "$image" \
+            /test/test-install.sh "/deb/$deb" "$EXPECTED"
+
+  install-test:
+    name: Installation < 15 min (console + agent .deb)
+    needs: deb
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read   # release mode: pull the published console image even before it is public
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deb-amd64
+          path: ${{ runner.temp }}/deb
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: inputs.console-image == ''
+      # Pull requests: the console image of the checkout, built before the clock starts (a user pulls
+      # the published image instead; release runs time that pull).
+      - name: Build the console image
+        if: inputs.console-image == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: console
+          platforms: linux/amd64
+          load: true
+          tags: databastion-console:install-test
+          cache-from: type=gha,scope=console-amd64
+          cache-to: type=gha,mode=max,scope=console-amd64
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: inputs.console-image != ''
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          systemctl --version | head -n 1
+      - name: Run deploy/install-test.sh
+        env:
+          CONSOLE_IMAGE: ${{ inputs.console-image || 'databastion-console:install-test' }}
+        run: |
+          export AGENT_DEB
+          AGENT_DEB="$(ls "$RUNNER_TEMP"/deb/*.deb)"
+          deploy/install-test.sh
