@@ -1876,21 +1876,23 @@ audit_verify() {
   # Fingerprinted principals are the test clients only (OpenLDAP). Audit ran from before the
   # Discovery scan to the first client operation of this target (its dump, AUDIT_T0), so that window
   # held the agent's own reads, binds and probes only: none may have surfaced as a fingerprint.
+  # Stored event times have whole-second precision: the window ends at AUDIT_T0 floored to the
+  # second (else the dump's own events, in T0's second, would count as before it).
   if [[ "$dump_p $query_p" == *@fingerprint* ]]; then
     [[ "${AUDIT_T0[$target]:-}" =~ ^[0-9]+$ ]] || fail "Audit ($target): no dump start recorded"
     n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}'
         AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
-        AND ts < to_timestamp(${AUDIT_T0[$target]} / 1000.0)")" \
+        AND ts < to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))")" \
       || fail "cannot count the fingerprinted events of $target before its first client operation"
     if [ "$n" != 0 ]; then
       # Diagnostic without any value: action, delay before T0, and whose fingerprint it is (the
       # exporter's: the one with a bulk search; the analyst's: the other one seen after T0).
       console_sql "WITH pre AS (SELECT * FROM access_events WHERE agent_id = '${AGENT_ID}'
             AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
-            AND ts < to_timestamp(${AUDIT_T0[$target]} / 1000.0)),
+            AND ts < to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))),
           post AS (SELECT db_user_fingerprint AS fp, bool_or(signals ? 'shape.bulk_search') AS bulk
             FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
-              AND db_user_fingerprint IS NOT NULL AND ts >= to_timestamp(${AUDIT_T0[$target]} / 1000.0)
+              AND db_user_fingerprint IS NOT NULL AND ts >= to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))
             GROUP BY 1)
         SELECT string_agg(pre.action || ' ' || round(${AUDIT_T0[$target]} - extract(epoch FROM pre.ts) * 1000)
             || ' ms before T0, rows ' || coalesce(pre.rows::text, '-') || ', count '
