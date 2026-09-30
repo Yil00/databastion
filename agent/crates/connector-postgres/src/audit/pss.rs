@@ -27,7 +27,9 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events_counted};
+use super::events::{
+    Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events_counted, pss_unanalyzed_event,
+};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -294,24 +296,26 @@ impl PssPoller {
         // is carried over: the previous counters stay the baseline, so the
         // next poll reports it in full.
         carry_over(&mut snapshot, &prev, &changed, &self.analyses);
-        let deltas: Vec<StatementDelta<'_>> = changed
-            .iter()
-            .filter_map(|(k, user, database, calls, n)| {
-                let a = self.analyses.get(k)?.as_ref()?;
-                Some(StatementDelta {
-                    user,
-                    database,
-                    analysis: &a.analysis,
-                    own_text: a.own_text,
-                    calls: *calls,
-                    rows: *n,
-                })
-            })
-            .collect();
-        let (events, panicked) =
+        let (deltas, unanalyzed) = split_deltas(&changed, &self.analyses);
+        let (mut events, panicked) =
             pss_events_counted(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
         self.panicked = self.panicked.saturating_add(panicked);
         drop(deltas);
+        // A statement whose analysis panicked stays cached as such (never
+        // analyzed again, counted once), but each of its deltas is still
+        // reported against `*`: `queryid` ignores constants and comments,
+        // so dropping them would hide every later execution of that shape
+        // (phase-7 security review).
+        for (user, database, calls, n) in unanalyzed {
+            events.push(pss_unanalyzed_event(
+                user,
+                database,
+                calls,
+                n,
+                self.last_poll,
+                now,
+            ));
+        }
         self.snapshot = Some(snapshot);
         self.last_poll = now;
         for e in events {
@@ -319,6 +323,34 @@ impl PssPoller {
         }
         Ok(())
     }
+}
+
+/// Changed statements with an analysis, as deltas; and those whose
+/// analysis panicked, as (user, database, calls, rows). Statements not
+/// analyzed yet (text limit per poll, cache cleared) are in neither: they
+/// are carried over ([`carry_over`]).
+#[allow(clippy::type_complexity)]
+fn split_deltas<'a>(
+    changed: &'a [(Key, String, String, u64, u64)],
+    analyses: &'a HashMap<Key, Option<Analyzed>>,
+) -> (Vec<StatementDelta<'a>>, Vec<(&'a str, &'a str, u64, u64)>) {
+    let mut deltas = Vec::new();
+    let mut unanalyzed = Vec::new();
+    for (k, user, database, calls, n) in changed {
+        match analyses.get(k) {
+            Some(Some(a)) => deltas.push(StatementDelta {
+                user,
+                database,
+                analysis: &a.analysis,
+                own_text: a.own_text,
+                calls: *calls,
+                rows: *n,
+            }),
+            Some(None) => unanalyzed.push((user.as_str(), database.as_str(), *calls, *n)),
+            None => {}
+        }
+    }
+    (deltas, unanalyzed)
 }
 
 fn carry_over<V>(
@@ -410,8 +442,8 @@ mod tests {
         assert!(analyze_isolated(&format!("SELECT 1 /* {TEST_POISON} */"), false).is_none());
         let ok = analyze_isolated("SELECT * FROM shop.customers", false).unwrap();
         assert!(!ok.parts().is_empty());
-        // A statement whose analysis panicked has no delta: it is not
-        // reported, and its counters move on (not retried every poll).
+        // A statement whose analysis panicked stays cached as such: its
+        // counters move on (not analyzed again every poll).
         let c = |calls, rows| Counters { calls, rows };
         let k = (1, 1, 1, true);
         let prev: HashMap<Key, Counters> = [(k, c(1, 1))].into();
@@ -420,5 +452,77 @@ mod tests {
         let analyses: HashMap<Key, Option<Analyzed>> = [(k, None)].into();
         carry_over(&mut snapshot, &prev, &changed, &analyses);
         assert_eq!(snapshot[&k].calls, 5);
+    }
+
+    /// Phase-7 security review: the later deltas of a statement whose
+    /// analysis panicked are still reported, against `*`, with their
+    /// counts; the others are analyzed as usual.
+    #[test]
+    fn a_poisoned_statement_still_reports_its_later_deltas() {
+        let poisoned = (10, 1, 7, true);
+        let fine = (10, 1, 8, true);
+        let not_yet = (10, 1, 9, true);
+        let analyses: HashMap<Key, Option<Analyzed>> = [
+            (
+                poisoned,
+                analyze_isolated(&format!("SELECT 1 /* {TEST_POISON} */"), false).map(|analysis| {
+                    Analyzed {
+                        analysis,
+                        own_text: false,
+                    }
+                }),
+            ),
+            (
+                fine,
+                analyze_isolated("SELECT id FROM crm.customers WHERE id = $1", false).map(
+                    |analysis| Analyzed {
+                        analysis,
+                        own_text: false,
+                    },
+                ),
+            ),
+        ]
+        .into();
+        assert!(analyses[&poisoned].is_none());
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let own = || {
+            PgOwn::new(
+                databastion_core::audit::own::OwnAccount::new(
+                    "databastion",
+                    Some(crate::conn::APPLICATION_NAME),
+                    None,
+                    1000,
+                    databastion_core::audit::own::SharedOwnUsage::default(),
+                ),
+                super::super::events::SharedOwnStatements::default(),
+            )
+        };
+        let mut own = own();
+        // Two later polls of the poisoned statement, run by another role
+        // and by the agent's own account.
+        for (user, calls, rows) in [("mallory", 3u64, 12_000u64), ("databastion", 1, 2)] {
+            let changed = vec![
+                (poisoned, user.to_owned(), "shop".to_owned(), calls, rows),
+                (fine, "alice".to_owned(), "shop".to_owned(), 1, 1),
+                (not_yet, "bob".to_owned(), "shop".to_owned(), 1, 1),
+            ];
+            let (deltas, unanalyzed) = split_deltas(&changed, &analyses);
+            assert_eq!(deltas.len(), 1);
+            assert_eq!(unanalyzed, [(user, "shop", calls, rows)]);
+            let (mut events, panicked) =
+                pss_events_counted(&deltas, &mut own, &Catalogs::default(), t0, t0);
+            assert_eq!(panicked, 0, "never analyzed again");
+            for (u, d, c, r) in unanalyzed {
+                events.push(pss_unanalyzed_event(u, d, c, r, t0, t0));
+            }
+            assert_eq!(events.len(), 2);
+            let e = &events[1];
+            assert_eq!(e.principal().account_name(), user);
+            assert_eq!(e.objects().len(), 1);
+            assert_eq!(e.objects()[0].database().as_str(), "shop");
+            assert_eq!(e.objects()[0].object().as_str(), "*");
+            assert_eq!(e.aggregated_count(), calls);
+            assert_eq!(e.rows(), Some(rows));
+        }
     }
 }

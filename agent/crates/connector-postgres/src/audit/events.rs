@@ -882,10 +882,12 @@ pub(crate) fn pss_events(
     pss_events_counted(deltas, own, catalogs, from, to).0
 }
 
-/// [`pss_events`], with the number of statements dropped because their
-/// conversion panicked: each statement is converted in isolation
+/// [`pss_events`], with the number of statements whose conversion
+/// panicked: each statement is converted in isolation
 /// (`databastion_core::isolate`), so one that makes the analysis code
-/// panic is dropped alone (security review of #85).
+/// panic does not stop the others (security review of #85). Its delta is
+/// still reported, against `*` ([`pss_unanalyzed_event`]), so a statement
+/// shape that makes the code panic cannot hide its executions.
 pub(crate) fn pss_events_counted(
     deltas: &[StatementDelta<'_>],
     own: &mut PgOwn,
@@ -914,10 +916,45 @@ pub(crate) fn pss_events_counted(
         match databastion_core::isolate(|| pss_event(d, own, catalogs, &copied, from, to)) {
             Some(Some(e)) => out.push(e),
             Some(None) => {}
-            None => panicked += 1,
+            None => {
+                panicked += 1;
+                out.push(pss_unanalyzed_event(
+                    d.user, d.database, d.calls, d.rows, from, to,
+                ));
+            }
         }
     }
     (out, panicked)
+}
+
+/// The event of a `pg_stat_statements` delta whose statement could not be
+/// analyzed or converted (the analysis or conversion panicked; phase-7
+/// security review): a read of unknown objects (`*`) with the delta's
+/// counts, and `volume.large_result` above [`LARGE_ROWS`] rows. Built
+/// from the counters, the role and the database only: no statement text.
+/// Never left out as the agent's own activity (the connector names every
+/// relation it reads) and never budgeted.
+pub(crate) fn pss_unanalyzed_event(
+    user: &str,
+    database: &str,
+    calls: u64,
+    rows: u64,
+    from: SystemTime,
+    to: SystemTime,
+) -> MaskedEvent {
+    let mut e = MaskedEvent::new(
+        EventSource::PgStatStatements,
+        EventAction::Read,
+        EventPrincipal::account(user),
+        from,
+    )
+    .with_rows(Some(rows))
+    .with_aggregate(calls, to)
+    .with_object(unknown_object(database));
+    if rows > LARGE_ROWS {
+        e = e.with_signal(Signal::LargeResult);
+    }
+    e
 }
 
 /// Tests: a statement of this role makes its conversion panic (a bug on
@@ -2565,8 +2602,28 @@ mod tests {
         let (events, panicked) =
             pss_events_counted(&deltas, &mut own(), &Catalogs::default(), t0, t0);
         assert_eq!(panicked, 1);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].principal().account_name(), "alice");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].principal().account_name(), TEST_POISON_USER);
+        // The panicking statement is still reported, against `*`.
+        assert!(json(&events[0]).contains("shop..*"), "{}", json(&events[0]));
+        assert!(events[0].signals().is_empty());
+        assert_eq!(events[1].principal().account_name(), "alice");
+        assert!(json(&events[1]).contains("customers"));
+    }
+
+    #[test]
+    fn unanalyzed_pss_deltas_are_reads_of_unknown_objects() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let e = pss_unanalyzed_event("databastion", "shop", 3, LARGE_ROWS + 1, t0, t0);
+        let j = json(&e);
+        assert!(j.contains("shop..*"), "{j}");
+        assert_eq!(e.action(), EventAction::Read);
+        assert!(e.signals().contains(&Signal::LargeResult));
+        assert!(
+            pss_unanalyzed_event("alice", "shop", 1, 5, t0, t0)
+                .signals()
+                .is_empty()
+        );
     }
 
     /// Security review of #85: on `pg_stat_statements`, role changes are

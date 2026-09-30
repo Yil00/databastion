@@ -246,7 +246,12 @@ text's analysis and its conversion; the MongoDB profiler: each entry): a
 record that makes that code panic is dropped alone and counted (`audit.records_dropped`, per record; and the
 heartbeat metric `audit_record_panics_total`, one per isolated unit that
 failed, a record or a statement's group, which tells crafted-record campaigns
-apart from malformed input). A panic in a blocking parse task is resumed on the stream,
+apart from malformed input). On `pg_stat_statements`, a statement whose
+analysis or conversion panicked is not dropped: each of its deltas is still
+reported as a read of unknown objects (`*`) with its counts, because
+`queryid` ignores constants and comments and dropping it would hide every
+later execution of that statement shape. A failed analysis is kept in the
+text cache (never analyzed again, counted once). A panic in a blocking parse task is resumed on the stream,
 never turned into an ordinary error that restarts it in a loop
 (`databastion_core::resume_panic`).
 
