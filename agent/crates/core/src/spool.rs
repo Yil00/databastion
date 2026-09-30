@@ -10,9 +10,14 @@
 //! - File names give the FIFO order: `<seq>[.<n>]*-<f|e>.json`. A batch
 //!   replaced after a `400` / `404` / `413` gets child keys (`<seq>.0`,
 //!   `<seq>.1`) so it keeps its place at the head of the queue.
-//! - Bounded by `spool.max_bytes` and `spool.max_batches`: when full, the
-//!   oldest batches are dropped first and counted (`dropped_batches`,
-//!   `dropped_items`).
+//! - Bounded by `spool.max_bytes` and `spool.max_batches`: when full, a
+//!   batch is dropped and counted (`dropped_batches`, `dropped_items`),
+//!   by priority (phase 7, failed-login flood): findings and events each
+//!   keep up to 3/4 of the bounds against the other, so a flood of events
+//!   cannot evict the findings (nor findings the events); within the
+//!   events, the batches holding a `signature.*` signal are dropped last,
+//!   and a new batch without one is dropped rather than evict them. Within
+//!   a class, the oldest batch goes first.
 //! - A file that cannot be read or parsed is moved to `spool/quarantine/`
 //!   (at most [`MAX_QUARANTINED`] files kept) and counted; it never crashes
 //!   the agent. Its content is never logged.
@@ -46,10 +51,43 @@ pub(crate) type Key = Vec<u64>;
 struct Entry {
     key: Key,
     findings: bool,
+    /// An events batch holding a `signature.*` signal.
+    signature: bool,
     bytes: u64,
     items: u64,
     created: SystemTime,
 }
+
+/// What a batch is, for the eviction priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Findings,
+    /// Events without a `signature.*` signal: dropped first.
+    Events,
+    /// Events with a `signature.*` signal: dropped last.
+    Signature,
+}
+
+impl Class {
+    fn of(findings: bool, signature: bool) -> Self {
+        match (findings, signature) {
+            (true, _) => Self::Findings,
+            (false, false) => Self::Events,
+            (false, true) => Self::Signature,
+        }
+    }
+}
+
+impl Entry {
+    fn class(&self) -> Class {
+        Class::of(self.findings, self.signature)
+    }
+}
+
+/// Share of the bounds (bytes, batches) findings or events keep against
+/// the other when the spool is full: `SHARE_NUM / SHARE_DEN`.
+const SHARE_NUM: u64 = 3;
+const SHARE_DEN: u64 = 4;
 
 /// Why a spooled file could not be read.
 #[derive(Debug)]
@@ -161,6 +199,7 @@ impl Spool {
                     found.push(Entry {
                         key,
                         findings,
+                        signature: batch.has_signature(),
                         bytes: to_u64(batch.bytes().len()),
                         items: to_u64(batch.len()),
                         created,
@@ -181,7 +220,7 @@ impl Spool {
             .map_or(0, |m| m.saturating_add(1));
         spool.total = found.iter().map(|e| e.bytes).sum();
         spool.entries = found.into();
-        spool.make_room(0);
+        spool.make_room(0, None);
         Ok(spool)
     }
 
@@ -250,20 +289,80 @@ impl Spool {
         Some(entry)
     }
 
-    /// Drops the oldest batches until `incoming` more bytes and one more
-    /// batch fit (`incoming == 0`: only enforce the bounds).
-    fn make_room(&mut self, incoming: u64) {
-        let extra = usize::from(incoming > 0);
+    /// Drops batches until `incoming` more bytes and one more batch of
+    /// `class` fit (`None`: only enforce the bounds), by priority (see the
+    /// module documentation). `false` when the new batch must be dropped
+    /// instead (an events batch without a signature, when only batches
+    /// that rank above it could make room).
+    fn make_room(&mut self, incoming: u64, class: Option<Class>) -> bool {
+        let extra = usize::from(class.is_some());
         while !self.entries.is_empty()
             && (self.entries.len() + extra > self.max_batches
                 || self.total.saturating_add(incoming) > self.max_bytes)
         {
-            if let Some(e) = self.remove_entry(0) {
+            let Some(i) = self.victim(incoming, class) else {
+                return false;
+            };
+            if let Some(e) = self.remove_entry(i) {
                 self.counters.dropped_batches += 1;
                 self.counters.dropped_items += e.items;
-                tracing::warn!("spool full: oldest batch dropped");
+                match e.class() {
+                    Class::Findings => tracing::warn!("spool full: oldest findings batch dropped"),
+                    Class::Events => tracing::warn!("spool full: oldest events batch dropped"),
+                    Class::Signature => tracing::warn!(
+                        "spool full: oldest events batch with a signature signal dropped"
+                    ),
+                }
             }
         }
+        true
+    }
+
+    fn oldest(&self, class: Class) -> Option<usize> {
+        self.entries.iter().position(|e| e.class() == class)
+    }
+
+    /// The batch to drop to make room for `incoming` bytes of `class`.
+    fn victim(&self, incoming: u64, class: Option<Class>) -> Option<usize> {
+        let events_first = || {
+            self.oldest(Class::Events)
+                .or_else(|| self.oldest(Class::Findings))
+                .or_else(|| self.oldest(Class::Signature))
+        };
+        let Some(class) = class else {
+            // Bounds only (a smaller configuration at startup).
+            return events_first();
+        };
+        let own_events = class != Class::Findings;
+        let (bytes, count) = self
+            .entries
+            .iter()
+            .filter(|e| e.findings != own_events)
+            .fold((0u64, 0u64), |(b, n), e| (b.saturating_add(e.bytes), n + 1));
+        let share =
+            |bound: u64| bound / SHARE_DEN * SHARE_NUM + bound % SHARE_DEN * SHARE_NUM / SHARE_DEN;
+        let own_over = bytes.saturating_add(incoming) > share(self.max_bytes)
+            || count + 1 > share(to_u64(self.max_batches));
+        let own = if own_events {
+            // A batch without a signature never evicts one with.
+            self.oldest(Class::Events).or_else(|| {
+                (class == Class::Signature)
+                    .then(|| self.oldest(Class::Signature))
+                    .flatten()
+            })
+        } else {
+            self.oldest(Class::Findings)
+        };
+        if own_over {
+            return own;
+        }
+        let other = if own_events {
+            self.oldest(Class::Findings)
+        } else {
+            self.oldest(Class::Events)
+                .or_else(|| self.oldest(Class::Signature))
+        };
+        other.or(own)
     }
 
     /// Writes a batch file (after making room). `Ok(None)`: the batch can
@@ -281,12 +380,22 @@ impl Spool {
             self.counters.dropped_items += items;
             return Ok(None);
         }
-        self.make_room(len);
+        let class = Class::of(batch.is_findings(), batch.has_signature());
+        if !self.make_room(len, Some(class)) {
+            self.counters.dropped_batches += 1;
+            self.counters.dropped_items += items;
+            tracing::warn!(
+                "spool full: new events batch dropped (the spool holds findings and events \
+                 batches with a signature signal)"
+            );
+            return Ok(None);
+        }
         fsutil::write_private_atomic(&self.path(&key, batch.is_findings()), bytes)?;
         self.total += len;
         Ok(Some(Entry {
             key,
             findings: batch.is_findings(),
+            signature: batch.has_signature(),
             bytes: len,
             items,
             created: SystemTime::now(),

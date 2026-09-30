@@ -319,6 +319,9 @@ struct Counters {
     /// batches were still spooled (flush wait elapsed, or `/findings`
     /// parked).
     scan_status_before_flush: AtomicU64,
+    /// Failed logins folded into an overflow event (more distinct
+    /// `auth_failure` groups than the aggregator keeps per window).
+    auth_failures_overflowed: AtomicU64,
     /// Heartbeat target checks still running at the deadline.
     checks_timed_out: AtomicU64,
     /// Heartbeat target checks not run: another check of the same account
@@ -1161,6 +1164,10 @@ impl Runtime {
             (
                 "scan_status_before_flush_total",
                 &c.scan_status_before_flush,
+            ),
+            (
+                "auth_failures_overflowed_total",
+                &c.auth_failures_overflowed,
             ),
             ("checks_timed_out_total", &c.checks_timed_out),
             ("checks_account_busy_total", &c.checks_account_busy),
@@ -2417,7 +2424,9 @@ impl Runtime {
                 ev = rx.recv(), if can_emit && !agg.is_full() => {
                     if let Some(e) = ev {
                         bump(&self.counters.events_received, 1);
-                        agg.push(e, Instant::now());
+                        if agg.push(e, Instant::now()) {
+                            bump(&self.counters.auth_failures_overflowed, 1);
+                        }
                     }
                 }
                 () = tokio::time::sleep_until(sleep_to), if can_emit && deadline.is_some() => {
@@ -2435,7 +2444,9 @@ impl Runtime {
         drop(sink);
         while let Ok(e) = rx.try_recv() {
             bump(&self.counters.events_received, 1);
-            agg.push(e, Instant::now());
+            if agg.push(e, Instant::now()) {
+                bump(&self.counters.auth_failures_overflowed, 1);
+            }
             if agg.is_full() {
                 self.flush_events(cfg, target_id, &mut agg);
             }

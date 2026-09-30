@@ -8,7 +8,13 @@
 //!   position in an audit source. Connectors never get a path.
 //! - `Aggregator` (crate-private): merges events of the same principal,
 //!   object set, action and source within the aggregation window (docs/09),
-//!   bounded in groups.
+//!   bounded in groups. Failed logins (`auth_failure`) keep at most
+//!   [`MAX_AUTH_FAILURE_GROUPS`] groups of their own per window; beyond, a
+//!   failed login joins an **overflow** event: an `auth_failure` of an
+//!   unidentified account (a `db_user` fingerprint of an empty name), per
+//!   client address for at most [`MAX_OVERFLOW_GROUPS`] addresses, then
+//!   without address, whose `aggregated_count` is the number of attempts
+//!   (phase 7, the failed-login flood of ADR-0025).
 //! - `reportable` (crate-private): the `audit.configure` filter. An event
 //!   is reported when it carries a signal, touches an object listed in
 //!   `sensitive_objects`, is not a `read` / `write` (connections, DDL,
@@ -22,7 +28,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use databastion_classifiers::masking::{EventAction, EventGroupKey, MaskedEvent};
+use databastion_classifiers::masking::{EventAction, EventGroupKey, EventPrincipal, MaskedEvent};
 
 use crate::fsutil;
 use crate::job::AuditConfig;
@@ -285,12 +291,22 @@ impl PositionRegistry {
 
 /// Most groups held by one aggregator; a full aggregator is flushed early.
 pub(crate) const MAX_GROUPS: usize = 10_000;
+/// `auth_failure` groups (distinct attempted accounts, addresses…) kept
+/// per window; beyond, failed logins join an overflow event.
+pub(crate) const MAX_AUTH_FAILURE_GROUPS: usize = 100;
+/// Overflow events with a client address per window; beyond, one without
+/// address.
+pub(crate) const MAX_OVERFLOW_GROUPS: usize = 16;
 
 /// Pre-aggregation of one target's events.
 pub(crate) struct Aggregator {
     window: Duration,
     groups: HashMap<EventGroupKey, MaskedEvent>,
     opened: Option<Instant>,
+    /// `auth_failure` groups of the window (overflow events aside).
+    auth_groups: usize,
+    /// Overflow groups with a client address in the window.
+    overflow_groups: usize,
 }
 
 impl Aggregator {
@@ -299,20 +315,64 @@ impl Aggregator {
             window,
             groups: HashMap::new(),
             opened: None,
+            auth_groups: 0,
+            overflow_groups: 0,
         }
     }
 
-    pub(crate) fn push(&mut self, event: MaskedEvent, now: Instant) {
+    /// Adds an event; `true` when it was a failed login folded into an
+    /// overflow event (counted by the caller).
+    pub(crate) fn push(&mut self, event: MaskedEvent, now: Instant) -> bool {
         if self.opened.is_none() {
             self.opened = Some(now);
         }
-        let key = event.group_key();
+        let mut key = event.group_key();
+        let mut event = event;
+        let mut overflowed = false;
+        if event.action() == EventAction::AuthFailure && !self.groups.contains_key(&key) {
+            if self.auth_groups < MAX_AUTH_FAILURE_GROUPS {
+                self.auth_groups += 1;
+            } else {
+                overflowed = true;
+                event = self.overflow(&event);
+                key = event.group_key();
+            }
+        }
         match self.groups.get_mut(&key) {
             Some(existing) => existing.merge(event),
             None => {
                 self.groups.insert(key, event);
             }
         }
+        overflowed
+    }
+
+    /// The overflow event a failed login joins: same source, time, count
+    /// and signals; an unidentified account, no object; its client address
+    /// while fewer than [`MAX_OVERFLOW_GROUPS`] addresses have one.
+    fn overflow(&mut self, e: &MaskedEvent) -> MaskedEvent {
+        let make = |client| {
+            let mut o = MaskedEvent::new(
+                e.source(),
+                EventAction::AuthFailure,
+                EventPrincipal::unidentified().with_client(client),
+                e.ts(),
+            )
+            .with_aggregate(e.aggregated_count(), e.ts_last().unwrap_or(e.ts()));
+            for s in e.signals() {
+                o = o.with_signal(*s);
+            }
+            o
+        };
+        let with_client = make(e.principal().client());
+        if e.principal().client().is_none() || self.groups.contains_key(&with_client.group_key()) {
+            return with_client;
+        }
+        if self.overflow_groups < MAX_OVERFLOW_GROUPS {
+            self.overflow_groups += 1;
+            return with_client;
+        }
+        make(None)
     }
 
     pub(crate) fn is_full(&self) -> bool {
@@ -331,6 +391,8 @@ impl Aggregator {
 
     pub(crate) fn drain(&mut self) -> Vec<MaskedEvent> {
         self.opened = None;
+        self.auth_groups = 0;
+        self.overflow_groups = 0;
         let mut out: Vec<MaskedEvent> = self.groups.drain().map(|(_, e)| e).collect();
         out.sort_by_key(MaskedEvent::ts);
         out
@@ -511,5 +573,76 @@ mod tests {
         remove_settings(&dir, "pg");
         assert!(load_settings(&dir, "pg").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn failed(user: &str, client: Option<&str>, at: u64) -> MaskedEvent {
+        use databastion_classifiers::masking::ClientAddr;
+        MaskedEvent::new(
+            EventSource::MariadbServerAudit,
+            EventAction::AuthFailure,
+            EventPrincipal::failed_account(user).with_client(client.and_then(ClientAddr::parse)),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(at),
+        )
+    }
+
+    /// Phase 7 (failed-login flood, ADR-0025): made-up account names give
+    /// at most `MAX_AUTH_FAILURE_GROUPS` groups per window, then overflow
+    /// events that keep the count of attempts, per address for a bounded
+    /// number of addresses.
+    #[test]
+    fn a_failed_login_flood_is_capped_with_overflow_events() {
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        let now = Instant::now();
+        let mut overflowed = 0;
+        // 5 000 made-up names from one address, then from 40 addresses.
+        for i in 0..5_000u64 {
+            overflowed += u64::from(a.push(failed(&format!("u{i}"), Some("198.51.100.7"), i), now));
+        }
+        for i in 0..4_000u64 {
+            let ip = format!("203.0.113.{}", i % 40);
+            overflowed += u64::from(a.push(failed(&format!("v{i}"), Some(&ip), 10_000 + i), now));
+        }
+        // A read is never folded.
+        a.push(ev("u", "customers", Some(5)), now);
+        assert!(!a.is_full());
+        let out = a.drain();
+        let auth: Vec<&MaskedEvent> = out
+            .iter()
+            .filter(|e| e.action() == EventAction::AuthFailure)
+            .collect();
+        assert_eq!(overflowed, 9_000 - MAX_AUTH_FAILURE_GROUPS as u64);
+        // The named groups, the overflow events per address, one without.
+        let overflow: Vec<&&MaskedEvent> = auth
+            .iter()
+            .filter(|e| e.principal().account_name().is_empty())
+            .collect();
+        assert_eq!(auth.len() - overflow.len(), MAX_AUTH_FAILURE_GROUPS);
+        assert_eq!(overflow.len(), MAX_OVERFLOW_GROUPS + 1);
+        assert!(overflow.iter().all(|e| !e.principal().send_name()));
+        assert_eq!(
+            overflow
+                .iter()
+                .filter(|e| e.principal().client().is_none())
+                .count(),
+            1
+        );
+        // Every attempt is counted.
+        let total: u64 = auth.iter().map(|e| e.aggregated_count()).sum();
+        assert_eq!(total, 9_000);
+        let first = overflow
+            .iter()
+            .find(|e| {
+                e.principal().client()
+                    == databastion_classifiers::masking::ClientAddr::parse("198.51.100.7")
+            })
+            .unwrap();
+        assert_eq!(
+            first.aggregated_count(),
+            5_000 - MAX_AUTH_FAILURE_GROUPS as u64
+        );
+        assert!(first.ts_last() > Some(first.ts()));
+        assert!(out.iter().any(|e| e.action() == EventAction::Read));
+        // A new window starts over.
+        assert!(!a.push(failed("w", None, 1), now));
     }
 }

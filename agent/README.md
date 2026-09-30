@@ -102,7 +102,12 @@ binary: `cargo build --no-default-features --features postgres`.
   removed at startup, unreadable files are moved to `spool/quarantine/` (32
   kept) and counted (`quarantined`), never crash the agent and are never
   logged. Bounded by `spool.max_bytes` (default 256 MiB) and
-  `spool.max_batches` (default 10000): oldest dropped first. FIFO send:
+  `spool.max_batches` (default 10000). When full, a batch is dropped by
+  priority (phase 7): findings and events each keep up to 3/4 of the bounds
+  against the other, so an events flood cannot evict the findings; within
+  the events, batches holding a `signature.*` signal (packed apart from the
+  others) are dropped last, and a new batch without one is dropped rather
+  than evict them; within a class, the oldest goes first. FIFO send:
   `2xx` (including `duplicate: true`) removes the batch; `400` / `404` whose
   pointers all designate items → those items dropped, the rest resent under
   a new `batch_id` at the same queue position; `413` → two halves with new
@@ -253,6 +258,21 @@ panics within an hour, or 3 panics in a row on a source whose position is in
 memory (restarted afresh anyway). A stream that fails is restarted after its
 backoff, at least its poll interval (up to 3600 s) and at most 300 s or the
 poll interval when longer.
+
+### Failed-login flood
+A client that can reach the database port can try many made-up account
+names, each its own `auth_failure` group (ADR-0025, docs/08). Per target
+and aggregation window, the core keeps at most 100 `auth_failure` groups;
+beyond, a failed login joins an **overflow** event: an `auth_failure` of an
+unidentified account (a `db_user` fingerprint, as for any failed login),
+per client address for at most 16 addresses, then one without address,
+whose `aggregated_count` is the number of attempts and whose `ts` /
+`ts_last` span them. No attempt goes uncounted, and a flood gives at most
+117 `auth_failure` events per window instead of one per name. Folded
+attempts are counted in `auth_failures_overflowed_total` (heartbeat
+metrics). With the spool priorities above, a later dump's
+`signature.*` batches are kept, though they still queue behind earlier
+batches for sending.
 
 ### Audit state kept across restarts
 Under `<state_dir>/audit/` (`0700`), every file `0600`, owned by the agent
