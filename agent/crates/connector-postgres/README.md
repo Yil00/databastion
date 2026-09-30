@@ -120,10 +120,11 @@ load otherwise), so a server-wide load is the normal case.
   (a failure, a source switch, the agent's sessions terminated on purpose)
   does not reset them, and they are persisted across **agent restarts**
   (phase 7; `<state_dir>/audit/<target>.own_usage.counters`, `0600`,
-  written atomically at most every 30 s while charging and when a stream
-  ends: normalized object names and row counts per hour only), so a
-  restart no longer gives a fresh budget per object; at most the charges
-  of the last 30 s before a crash are lost. The agent's database
+  written atomically at most every 30 s while charging, by a periodic
+  flush every 30 s when a charge is not saved yet (even with no further
+  activity), and when a stream ends: normalized object names and row
+  counts per hour only), so a restart no longer gives a fresh budget per
+  object; at most the charges of the last 30 s before a crash are lost. The agent's database
   credentials never leave its host (I3).
 - **The agent's own table-less statements.** The connector sends a few
   statements that read no relation: the per-connection and
@@ -138,8 +139,23 @@ load otherwise), so a server-wide load is the normal case.
   same identity and signal rules as above, and is **not charged** to any
   row budget; it is never reported. It is recognized by its exact text with
   pgaudit (pgaudit logs the text as sent; bound parameter values are not
-  part of it) and by its normalized shape with `pg_stat_statements`
-  (constants, booleans included, are placeholders there). Anything else of
+  part of it) and, with `pg_stat_statements`, by its exact text as
+  `pg_stat_statements` stores it: constants (booleans included) replaced by
+  `$n` numbered after the bound parameters, and the connector's bound
+  parameters in place (`audit::events::pss_form`, phase 7). The same
+  statement sent with constants instead of parameters has another
+  `queryid` and another text, and is reported. The text alone is not
+  enough: an entry with an own text is the connector's only when its
+  `userid` is the agent's role (its oid, read once per connection), it is
+  a top-level entry, the connector runs that statement in that database
+  (the session and transaction statements in the declared databases, the
+  text query only in the poller's database), and its `queryid` is the one
+  first seen in that slot. Anything else with the same text is reported:
+  another role, a non-target database, a nested execution, or another
+  `queryid` (the text prepared with every constant bound as a parameter).
+  If such an entry is seen in the agent's own slot before the agent's
+  own, the agent's own executions are reported instead: loud, not hidden.
+  The slots are a closed set, so other roles cannot exhaust them. Anything else of
   the agent's account whose objects are unknown (`*`: any other function
   call, including `pg_catalog` ones that run SQL such as `query_to_xml`,
   text that does not parse, several statements) is **always reported** and
@@ -152,8 +168,9 @@ load otherwise), so a server-wide load is the normal case.
   `current_setting` reads settings the role may read; the text query
   returns statement texts, as a read of the view `pg_stat_statements`
   does, which is skipped as statistics for every role). With
-  `pg_stat_statements`, where only the shape is visible, the settings read
-  by `current_setting(…)` are not checked. The text query is recognized in
+  `pg_stat_statements`, where constants are not visible, the settings read
+  by `current_setting(…)` are not checked (a client using the same bound
+  parameters shares the agent's `queryid` and entry). The text query is recognized in
   pgaudit records written during a `pg_stat_statements` period only if the
   agent did not restart in between.
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;

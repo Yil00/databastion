@@ -1,0 +1,12 @@
+# Compose override for the SASL EXTERNAL integration test (phase 7, CI): publishes the dev slapd's
+# ldapi:// socket directory to the host, so a test process on the host can bind with SASL EXTERNAL
+# (slapd reads its Unix uid / gid from the socket's peer credentials). Not part of `make dev`.
+#
+#   mkdir -p dev/.state/ldapi
+#   docker compose -f dev/docker-compose.yml -f dev/openldap/compose.ldapi.yml up -d --wait openldap
+#
+# The socket is then dev/.state/ldapi/ldapi. Paths are relative to dev/ (the project directory).
+services:
+  openldap:
+    volumes:
+      - ./.state/ldapi:/run/slapd

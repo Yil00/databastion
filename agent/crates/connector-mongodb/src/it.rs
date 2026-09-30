@@ -12,10 +12,13 @@
 //!
 //! The dev server has no TLS: the tests connect with `tls: disable` on the
 //! loopback address (the TLS and SCRAM exchanges are covered by the
-//! scripted server of `fake.rs`).
+//! scripted server of `fake.rs`). `verify_full` against a real server is
+//! tested on the TLS-only server of `dev/mongo/tls-test-server.sh`
+//! (`DATABASTION_TEST_MONGO_TLS_URL`, `DATABASTION_TEST_MONGO_TLS_CA_FILE`:
+//! a test CA generated at run time), `tls_real_server_*`.
 //!
-//! `DATABASTION_TEST_REQUIRE` (comma-separated: `mongo`, `mongo-admin`, or
-//! `all`) turns the matching skips into failures: CI lists what each run
+//! `DATABASTION_TEST_REQUIRE` (comma-separated: `mongo`, `mongo-admin`,
+//! `mongo-tls`, or `all`) turns the matching skips into failures: CI lists what each run
 //! must exercise.
 //!
 //! The tests are serialized. The Audit tests are in `it_audit.rs`.
@@ -222,13 +225,18 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(t: &TargetConfig) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(100_000);
     let r = MongodbConnector::new().discover(&job, &sink).await;
     drop(sink);
@@ -785,12 +793,7 @@ async fn probes() {
     // instance scans and checks).
     let (_dir, t) = target(&url, MIN_USER, IT_PASSWORD, "admin");
     let connector = MongodbConnector::new();
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        &t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(100_000);
     connector.discover(&job, &sink).await.unwrap();
     drop(sink);
@@ -831,6 +834,115 @@ async fn probes() {
     let h = MongodbConnector::new().check(&t).await;
     assert!(!h.reachable);
     assert_eq!(h.failure, Some(FailureCode::AuthenticationFailed));
+}
+
+/// The TLS-only test server of `dev/mongo/tls-test-server.sh` (the agent
+/// account, host `localhost`) and its test CA file.
+fn tls_server() -> Option<(Url, PathBuf)> {
+    match (
+        std::env::var("DATABASTION_TEST_MONGO_TLS_URL"),
+        std::env::var("DATABASTION_TEST_MONGO_TLS_CA_FILE"),
+    ) {
+        (Ok(u), Ok(ca)) => Some((
+            parse_url(&u).expect("DATABASTION_TEST_MONGO_TLS_URL"),
+            PathBuf::from(ca),
+        )),
+        _ => {
+            skip(
+                "mongo-tls",
+                "DATABASTION_TEST_MONGO_TLS_URL / DATABASTION_TEST_MONGO_TLS_CA_FILE are not set",
+            );
+            None
+        }
+    }
+}
+
+/// A declared target for `url`'s account on `host` with the `mongodb`
+/// settings `settings` (YAML flow mapping body).
+fn tls_target(url: &Url, host: &str, settings: &str) -> (TempDir, TargetConfig) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = TempDir::new();
+    let file = dir.0.join("secret");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file)
+        .unwrap();
+    f.write_all(url.password.as_bytes()).unwrap();
+    let yaml = format!(
+        "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: mongo-tls-it\n    \
+         engine: mongodb\n    host: \"{host}\"\n    port: {}\n    account: \"{}\"\n    \
+         secret: {{file: \"{}\"}}\n    mongodb: {{auth_source: {}, {settings}}}\n",
+        url.port,
+        url.user,
+        file.display(),
+        url.auth_source,
+    );
+    let config = databastion_core::AgentConfig::parse(&yaml).unwrap();
+    (dir, config.targets[0].clone())
+}
+
+/// Phase 7 (#74 review): `verify_full` against a real MongoDB server
+/// (TLS-only, test CA generated at run time), not only the scripted
+/// server: `check()` and Discovery over TLS, no value in the logs.
+#[tokio::test]
+async fn tls_real_server_verify_full_with_the_test_ca() {
+    let _serial = SERIAL.lock().await;
+    let Some((url, ca)) = tls_server() else {
+        return;
+    };
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let settings = format!("tls: verify_full, ca_file: \"{}\"", ca.display());
+    let (_dir, t) = tls_target(&url, &url.host, &settings);
+    let connector = MongodbConnector::new();
+    let h = connector.check(&t).await;
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(h.failure, None, "{h:?}");
+    let (r, findings) = scan(&t).await;
+    r.unwrap();
+    let got = located(&findings);
+    assert!(
+        got.contains(&(
+            "app".to_owned(),
+            "tls_probe".to_owned(),
+            "email".to_owned(),
+            "pii.email".to_owned()
+        )),
+        "{got:?}"
+    );
+    let text = logs.text();
+    assert!(!text.contains("tls.probe"), "a value in the logs");
+    assert!(!text.contains(&url.password), "the password in the logs");
+    for f in &findings {
+        assert!(!format!("{f:?}").contains("tls.probe"), "a clear value");
+    }
+}
+
+/// Phase 7 (#74 review): `verify_full` refuses the real server when the
+/// chain or the name does not verify, and the TLS-only server refuses
+/// cleartext.
+#[tokio::test]
+async fn tls_real_server_refuses_what_does_not_verify() {
+    let _serial = SERIAL.lock().await;
+    let Some((url, ca)) = tls_server() else {
+        return;
+    };
+    let connector = MongodbConnector::new();
+    // The test CA is in no system store.
+    let (_dir, t) = tls_target(&url, &url.host, "tls: verify_full");
+    let h = connector.check(&t).await;
+    assert!(!h.reachable, "system store: {h:?}");
+    // The certificate names `localhost` only: 127.0.0.1 does not match.
+    let settings = format!("tls: verify_full, ca_file: \"{}\"", ca.display());
+    let (_dir, t) = tls_target(&url, "127.0.0.1", &settings);
+    let h = connector.check(&t).await;
+    assert!(!h.reachable, "IP address not in the certificate: {h:?}");
+    // Cleartext on the loopback address: refused by the server.
+    let (_dir, t) = tls_target(&url, "127.0.0.1", "tls: disable");
+    let h = connector.check(&t).await;
+    assert!(!h.reachable, "cleartext: {h:?}");
 }
 
 #[test]

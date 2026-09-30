@@ -336,13 +336,18 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(target: &TargetConfig) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        target,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), target, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(100_000);
     let r = MysqlConnector::new().discover(&job, &sink).await;
     drop(sink);
@@ -699,12 +704,7 @@ async fn no_transaction_is_held_across_submit() {
         probe_fixtures(&server, &admin).await;
         let (_dir, t) = target(&server, MIN_USER, IT_PASSWORD);
         let mut observer = admin_session(&server, &admin).await;
-        let job = ScanJob::new(
-            ScanParams::contract_defaults(),
-            &t,
-            &Limits::default(),
-            key(),
-        );
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         // Capacity 1 and no consumer: the scan blocks in `submit().await`.
         let (sink, mut rx) = FindingSink::channel(1);
         let connector = MysqlConnector::new();

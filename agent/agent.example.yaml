@@ -32,6 +32,16 @@ limits:
   statement_timeout_ms: 30000  # 100..=600000, never 0; cap of every query
   max_scan_duration_s: 3600    # 60..=86400; cap of a whole scan
   min_audit_poll_interval_s: 5 # 1..=3600; floor of audit polling
+  # Discovery duty cycle, in percent (1..=100; 100: no pacing). After each
+  # object's sampling, the scan pauses so that its time in queries is at
+  # most this share of the scan's time: at most 1 % of one database core per
+  # scan (scans run one at a time), under the 2 % MVP criterion even on a
+  # one-core server. A scan then lasts about 100 times its query time
+  # (400 tables: minutes). Objects left when the scan budget would run out
+  # are reported as skipped (limit): raise max_duration_s /
+  # max_scan_duration_s for large databases, or this value where the server
+  # has spare cores.
+  discovery_duty_cycle_percent: 1
 
 # Bounded disk spool of findings / events batches (<state_dir>/spool, 0700,
 # files 0600). When full, the oldest batches are dropped first and counted
@@ -63,6 +73,13 @@ targets:
       # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
       # the membership as an expected warning instead of over-privilege.
       extended_grants: false
+      # pgaudit server log file (P4-A), read by the agent on this host (never
+      # through SQL); a fixed log_filename, rotation by rename or truncation
+      # is followed. Readable by the agent user, never writable by it:
+      #   jsonlog: log_destination = jsonlog (PostgreSQL 15+)
+      #   csvlog:  log_destination = csvlog
+      # Without it, Audit uses pg_stat_statements (Limited).
+      # audit_log: {path: /var/log/postgresql/postgresql.json, format: jsonlog}
   - id: mariadb-support
     engine: mariadb            # or mysql: same connector, flavor detected at connection
     host: db2.internal         # or `socket: /run/mysqld/mysqld.sock` (with tls: disable)

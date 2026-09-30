@@ -176,6 +176,43 @@ services:
           --eval 'db.runCommand({ping: 1})'
       <<: *healthcheck
 
+  # Percona Server for MongoDB (phase 7): the auditLog source (JSON file, successful authorization
+  # checks included) against a real server. Opt-in (profile `psmdb`): name the service to start it,
+  # `docker compose -f dev/docker-compose.yml up -d psmdb`. Same seed and ADR-0026 account as `mongo`.
+  psmdb:
+    image: percona/percona-server-mongodb:8.0.32-14@sha256:5ba5f240d2dc98bc6236ab1d79c0862c4b62dba9d98cd0ffdf716c30473d2d11
+    profiles: [psmdb]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+    command:
+      - mongod
+      - --auditDestination
+      - file
+      - --auditFormat
+      - JSON
+      - --auditPath
+      - /var/log/databastion/auditLog.json
+      - --setParameter
+      - auditAuthorizationSuccess=true
+    ports:
+      - "127.0.0.1:${PSMDB_PORT:-27019}:27017"
+    volumes:
+      - psmdb-data:/data/db
+      - ./.state/logs/psmdb:/var/log/databastion
+      - ./seed/out/mongo.json:/seed/mongo.json:ro
+      - ./mongo/initdb/10-seed.js:/docker-entrypoint-initdb.d/10-seed.js:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --norc "mongodb://root:$$MONGO_INITDB_ROOT_PASSWORD@127.0.0.1:27017/admin"
+          --eval 'if (!db.adminCommand({getCmdLineOpts: 1}).argv.includes("--auth")) quit(1)'
+          && mongosh --quiet --norc "mongodb://databastion:$$DATABASTION_DB_PASSWORD@127.0.0.1:27017/app?authSource=admin"
+          --eval 'db.runCommand({ping: 1})'
+      <<: *healthcheck
+
   openldap:
     build: ./openldap
     image: databastion-dev/openldap:bookworm-20260918
@@ -274,6 +311,7 @@ volumes:
   mysql-data:
   percona-data:
   mongo-data:
+  psmdb-data:
   openldap-config:
   openldap-data:
   prometheus-data:

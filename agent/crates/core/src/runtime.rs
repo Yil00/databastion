@@ -537,6 +537,17 @@ impl PanicTracker {
     }
 }
 
+/// How the console answered a job status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// Recorded.
+    Accepted,
+    /// `404` / `409`: the job is terminal already or not the agent's.
+    Gone,
+    /// Not reported (retries exhausted, another error).
+    Failed,
+}
+
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
 struct PreparedScan {
     id: Uuid,
@@ -1209,6 +1220,12 @@ impl Runtime {
         if let Ok(key) = MetricsMapKey::try_from("audit_record_panics_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::panics::record_panics() as f64);
+        }
+        // Audit statements flushed early because a connector's bounded
+        // pending state was full (security review of #93, L2).
+        if let Ok(key) = MetricsMapKey::try_from("audit_pending_evicted_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::pending_evicted() as f64);
         }
         let spool = self.lock_spool().counters;
         for (name, value) in [
@@ -2544,7 +2561,42 @@ impl Runtime {
         // findings batches spooled between these two readings are this
         // job's (their splits and resends keep the sequence number).
         let first = self.lock_spool().next_seq();
-        let outcome = self.discovery_scan(prepared, shutdown.as_mut()).await;
+        // Acknowledge the lease with a `running` status before the scan
+        // (contract `pollJobs`: a delivered job without a status is
+        // delivered again after 120 s, and the console gives it up after 5
+        // deliveries). A paced scan (ADR-0035 proposed) lasts minutes; an
+        // unacknowledged one would be failed by the console meanwhile.
+        let acknowledged = tokio::select! {
+            r = self.report(id, Outcome::RUNNING) => Some(r),
+            () = shutdown.as_mut() => None,
+        };
+        if acknowledged == Some(Reported::Gone) {
+            // The console answered `404` / `409`: the job is terminal
+            // (cancelled, expired, timed out) or not ours. The scan does
+            // not run and nothing more is reported (security review of
+            // #93, L5); the ledger keeps a redelivery from running it.
+            tracing::warn!(
+                job_id = %id,
+                "scan not run: the console no longer accepts a status for the job"
+            );
+            self.lock_scans().in_flight.remove(&id);
+            self.ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(
+                    id,
+                    LedgerEntry {
+                        outcome: Outcome::failed(FailureCode::Cancelled),
+                        reported: true,
+                    },
+                );
+            return;
+        }
+        let outcome = if acknowledged.is_some() {
+            self.discovery_scan(prepared, shutdown.as_mut()).await
+        } else {
+            Outcome::failed(FailureCode::Cancelled)
+        };
         let seqs = first..self.lock_spool().next_seq();
         if outcome.error != Some(FailureCode::Cancelled) {
             self.await_findings_sent(id, &seqs, shutdown.as_mut()).await;
@@ -2682,6 +2734,13 @@ impl Runtime {
         let Some(version) = classifiers_version() else {
             return Outcome::failed(FailureCode::Internal);
         };
+        // Ends the scan's Discovery pauses when it stops (fired below, and
+        // by its drop on every return path).
+        let (cancel, token) = crate::pacing::ScanCancel::channel();
+        // The object order starts elsewhere at each scan (M3 of the #93
+        // security review): derived from the job id.
+        let seed = id.get().as_u64_pair().1;
+        let scan = scan.with_cancel(token).with_rotation(seed);
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
@@ -2799,6 +2858,9 @@ impl Runtime {
                         Outcome::failed(FailureCode::ResourceLimit)
                     }
                     Some(Ok(())) => Outcome::SUCCEEDED,
+                    Some(Err(crate::ConnectorError::Cancelled)) => {
+                        Outcome::failed(FailureCode::Cancelled)
+                    }
                     Some(Err(crate::ConnectorError::NotImplemented { .. })) => {
                         Outcome::failed(FailureCode::Unsupported)
                     }
@@ -2827,6 +2889,17 @@ impl Runtime {
                 () = shutdown => Outcome::failed(FailureCode::Cancelled),
             }
         };
+        // The connector future is dropped; a pause in progress ends too.
+        cancel.cancel();
+        let (busy, paused) = scan.pacer().totals();
+        tracing::info!(
+            job_id = %id,
+            duty_cycle_percent = scan.pacer().duty_percent(),
+            busy_ms = u64::try_from(busy.as_millis()).unwrap_or(u64::MAX),
+            paused_ms = u64::try_from(paused.as_millis()).unwrap_or(u64::MAX),
+            out_of_time = scan.pacer().out_of_time(),
+            "scan pacing"
+        );
         // The connector future (and its sink) is dropped: drain what it
         // handed over (within the cap), then flush the partial chunk.
         while let Ok(f) = rx.try_recv() {
@@ -2849,6 +2922,7 @@ impl Runtime {
         outcome.coverage = *coverage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        outcome.out_of_time = scan.pacer().out_of_time();
         outcome
     }
 
@@ -2935,14 +3009,15 @@ impl Runtime {
         if outcome.error.is_some() {
             bump(&self.counters.jobs_failed, 1);
         }
-        let reported = self.report(id, outcome).await;
+        let reported = self.report(id, outcome).await != Reported::Failed;
         self.ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record(id, LedgerEntry { outcome, reported });
     }
 
-    /// Reports a terminal status. The coverage counters of a scan are
+    /// Reports a terminal status, or the `running` acknowledgement of a
+    /// scan ([`Outcome::RUNNING`]). The coverage counters of a scan are
     /// gated fields (ADR-0022): sent only when the console's latest
     /// heartbeat response listed `job_progress.coverage`. A `400` reporting
     /// an unknown field (`additionalProperties`) to a body that carried
@@ -2950,7 +3025,7 @@ impl Runtime {
     /// a rolled-back build) and the status is sent again once without them,
     /// instead of being lost (decision 9). Any other `400` is not retried
     /// and keeps the capabilities.
-    async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
+    async fn report(&self, id: Uuid, outcome: Outcome) -> Reported {
         let ts = now();
         let mut progress = outcome.coverage.and_then(|c| {
             self.console_caps
@@ -2960,17 +3035,25 @@ impl Runtime {
         let path = format!("/jobs/{id}/status");
         let mut attempt = 0;
         while attempt < 3 {
+            let (status, error) = outcome.reported(progress.is_some());
+            if status != outcome.status && attempt == 0 {
+                tracing::warn!(
+                    job_id = %id,
+                    "scan stopped before its deadline and the console does not take coverage \
+                     counters: reported as failed (timeout)"
+                );
+            }
             let update = JobStatusUpdate {
-                error: outcome.error.map(|code| JobError {
+                error: error.map(|code| JobError {
                     code,
                     engine_code: None,
                 }),
                 progress: progress.clone(),
-                status: outcome.status,
+                status,
                 ts: ts.clone(),
             };
             let Ok(body) = serde_json::to_vec(&update) else {
-                return false;
+                return Reported::Failed;
             };
             match self
                 .session
@@ -2984,11 +3067,11 @@ impl Runtime {
                 )
                 .await
             {
-                Ok(()) => return true,
+                Ok(()) => return Reported::Accepted,
                 // Terminal already, or not ours: nothing more to report.
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
-                })) => return true,
+                })) => return Reported::Gone,
                 // A gated field was sent and the console does not know a
                 // field: forget the capabilities and send the status once
                 // more without it (never a loop: the stripped body carries
@@ -3013,12 +3096,12 @@ impl Runtime {
                 }
                 Err(e) => {
                     tracing::warn!(job_id = %id, error = %e, "job status not reported");
-                    return false;
+                    return Reported::Failed;
                 }
             }
             attempt += 1;
         }
-        false
+        Reported::Failed
     }
 }
 

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 
 import { AgentActions } from "@/components/console/agent-actions";
 import { findingsHref } from "@/components/console/findings-table";
+import { ScanCoverageView } from "@/components/console/scan-coverage";
 import { ScanDialog } from "@/components/console/scan-dialog";
 import { StatusBadge } from "@/components/console/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -234,11 +235,16 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                       <TargetNotes notes={t.notes} />
                     </TableCell>
                     <TableCell>{formatAge(t.lastReportedAt, now)}</TableCell>
-                    <TableCell>
+                    <TableCell className="max-w-72 whitespace-normal">
                       {(() => {
                         const scan = scans.get(t.targetId);
                         if (!scan) return "never";
-                        return `${scanStatusLabel(scan, agent.classifiersVersion)}, ${formatAge(scan.createdAt, now)}`;
+                        return (
+                          <>
+                            {`${scanStatusLabel(scan, agent.classifiersVersion)}, ${formatAge(scan.createdAt, now)}`}
+                            <ScanCoverageView status={scan.status} coverage={scan.coverage} />
+                          </>
+                        );
                       })()}
                     </TableCell>
                     <TableCell className="max-w-56 whitespace-normal">

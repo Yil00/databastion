@@ -14,3 +14,7 @@ Dockerfile
 **/*.token
 **/agent.yaml
 **/hmac*.key
+# Fuzzing output (agent/fuzz): inputs may be large, and a crash input must never reach an image.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

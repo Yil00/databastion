@@ -21,7 +21,7 @@ import {
   sha256Hex,
 } from "@/server/crypto";
 import { handleLogin, loginFailuresUnknownUser } from "@/server/user-api";
-import { enqueueJob, MAX_JOB_ATTEMPTS } from "@/server/jobs";
+import { AGENT_ONLINE_WINDOW_S, enqueueJob, MAX_JOB_ATTEMPTS, QUEUED_SCAN_MARGIN_S } from "@/server/jobs";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { pgBossOptions } from "@/worker/queues";
@@ -899,6 +899,157 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       const [row] = await getDb().select().from(jobs).where(eq(jobs.id, id));
       expect(row?.status).toBe("failed");
       expect(row?.error).toEqual({ code: "timeout" });
+    });
+
+    describe("scans queued behind a long paced scan (PR #93)", () => {
+      const MIN = 60_000;
+      /** Last heartbeat of the agent: `ageS` seconds ago. */
+      const seen = (agentId: string, ageS: number) =>
+        getDb()
+          .update(agents)
+          .set({ lastSeenAt: new Date(Date.now() - ageS * 1000) })
+          .where(eq(agents.id, agentId));
+      /**
+       * A `discovery.scan` delivered `attempts` times without a status, first delivered
+       * `firstAgoMs` ago, its lease expired.
+       */
+      async function unacknowledgedScan(agentId: string, targetId: string, firstAgoMs: number, attempts: number) {
+        const id = await enqueueJob(getDb(), {
+          agentId,
+          type: "discovery.scan",
+          targetId,
+          classifiersVersion: "2026.09.1",
+          params: SCAN_PARAMS,
+          expiresAt: new Date(Date.now() + 6 * 3600_000),
+        });
+        await getDb()
+          .update(jobs)
+          .set({
+            status: "delivered",
+            attempts,
+            firstDeliveredAt: new Date(Date.now() - firstAgoMs),
+            deliveredAt: new Date(Date.now() - 2 * MIN),
+            leaseUntil: new Date(Date.now() - 1000),
+          })
+          .where(eq(jobs.id, id));
+        return id;
+      }
+      const row = async (id: string) => (await getDb().select().from(jobs).where(eq(jobs.id, id)))[0];
+      const poll = async (auth: Awaited<ReturnType<typeof enroll>>) => {
+        const res = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+        if (res.status === 204) return [];
+        expect(res.status).toBe(200);
+        const list = (await res.json()) as { jobs: { job_id: string }[] };
+        expect(validateSchema("JobList", list).ok).toBe(true);
+        return list.jobs.map((j) => j.job_id);
+      };
+      /**
+       * 4 targets at 5 min each, one scan at a time: the 1st runs (acknowledged), the 3rd has
+       * waited 11 min unacknowledged and was delivered 5 times (the former give-up point).
+       */
+      async function queue(auth: Awaited<ReturnType<typeof enroll>>) {
+        const first = await enqueueJob(getDb(), {
+          agentId: auth.agentId,
+          type: "discovery.scan",
+          targetId: "pg-prod-1",
+          classifiersVersion: "2026.09.1",
+          params: SCAN_PARAMS,
+        });
+        await getDb()
+          .update(jobs)
+          .set({ status: "running", deliveredAt: new Date(Date.now() - 11 * MIN), leaseUntil: null })
+          .where(eq(jobs.id, first));
+        const third = await unacknowledgedScan(auth.agentId, "pg-prod-3", 11 * MIN, MAX_JOB_ATTEMPTS);
+        return { first, third };
+      }
+
+      it("keeps redelivering a queued scan of an online agent within its budget", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        const { first, third } = await queue(auth);
+        expect(await poll(auth)).toEqual([third]);
+        expect((await row(third))?.status).toBe("delivered");
+        expect((await row(third))?.attempts).toBe(MAX_JOB_ATTEMPTS + 1);
+        expect((await row(first))?.status).toBe("running");
+        // Leased again: not delivered before the lease expires; later, delivered again.
+        expect(await poll(auth)).toEqual([]);
+        await getDb().update(jobs).set({ leaseUntil: new Date(Date.now() - 1000) }).where(eq(jobs.id, third));
+        expect(await poll(auth)).toEqual([third]);
+        // The agent starts it: acknowledged like any job.
+        const status = await handleJobStatus(
+          agentRequest("POST", `/jobs/${third}/status`, { auth, body: { status: "running", ts: new Date().toISOString() } }),
+          third,
+        );
+        expect(status.status).toBeLessThan(300);
+        expect((await row(third))?.status).toBe("running");
+        expect((await row(third))?.leaseUntil).toBeNull();
+      });
+
+      it("redelivers then gives up the same scan when the agent is offline, as before", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, AGENT_ONLINE_WINDOW_S + 60);
+        const { third } = await queue(auth);
+        await getDb().update(jobs).set({ attempts: MAX_JOB_ATTEMPTS - 1 }).where(eq(jobs.id, third));
+        expect(await poll(auth)).toEqual([third]);
+        expect((await row(third))?.attempts).toBe(MAX_JOB_ATTEMPTS);
+        await getDb().update(jobs).set({ leaseUntil: new Date(Date.now() - 1000) }).where(eq(jobs.id, third));
+        expect(await poll(auth)).toEqual([]);
+        expect((await row(third))?.status).toBe("failed");
+        expect((await row(third))?.error).toEqual({ code: "timeout" });
+      });
+
+      it("gives up a scan whose agent never sent a heartbeat", async () => {
+        const auth = await enroll();
+        await getDb().update(agents).set({ lastSeenAt: null }).where(eq(agents.id, auth.agentId));
+        const { third } = await queue(auth);
+        expect(await poll(auth)).toEqual([]);
+        expect((await row(third))?.status).toBe("failed");
+      });
+
+      it("gives up a queued scan past first delivery + max_duration_s + margin, agent online", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        const budgetMs = (SCAN_PARAMS.max_duration_s + QUEUED_SCAN_MARGIN_S) * 1000;
+        const late = await unacknowledgedScan(auth.agentId, "pg-prod-2", budgetMs + MIN, MAX_JOB_ATTEMPTS);
+        const inTime = await unacknowledgedScan(auth.agentId, "pg-prod-3", budgetMs - MIN, MAX_JOB_ATTEMPTS);
+        expect(await poll(auth)).toEqual([inTime]);
+        expect((await row(late))?.status).toBe("failed");
+        expect((await row(late))?.error).toEqual({ code: "timeout" });
+        expect((await row(inTime))?.status).toBe("delivered");
+      });
+
+      it("falls back to the contract's 900 s on a malformed max_duration_s, without throwing (L1)", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        // Within 86 400 s but past 900 + margin: kept alive only with the old fail-open fallback.
+        const firstAgoMs = (900 + QUEUED_SCAN_MARGIN_S) * 1000 + MIN;
+        const ids: string[] = [];
+        for (const [i, bad] of (["900", 1.5, 1e20, -5, { x: 1 }, null] as unknown[]).entries()) {
+          const id = await unacknowledgedScan(auth.agentId, `pg-prod-${i + 1}`, firstAgoMs, MAX_JOB_ATTEMPTS);
+          await getDb()
+            .update(jobs)
+            .set({ params: { sample_rows: 200, max_duration_s: bad } })
+            .where(eq(jobs.id, id));
+          ids.push(id);
+        }
+        expect(await poll(auth)).toEqual([]);
+        for (const id of ids) {
+          expect((await row(id))?.status).toBe("failed");
+          expect((await row(id))?.error).toEqual({ code: "timeout" });
+        }
+      });
+
+      it("still gives up other job types of an online agent after MAX_JOB_ATTEMPTS deliveries", async () => {
+        const auth = await enroll();
+        await seen(auth.agentId, 10);
+        const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "agent.config.reload", params: {} });
+        await getDb()
+          .update(jobs)
+          .set({ status: "delivered", attempts: MAX_JOB_ATTEMPTS, leaseUntil: new Date(Date.now() - 1000) })
+          .where(eq(jobs.id, id));
+        expect(await poll(auth)).toEqual([]);
+        expect((await row(id))?.status).toBe("failed");
+      });
     });
 
     it("does not deliver expired jobs", async () => {

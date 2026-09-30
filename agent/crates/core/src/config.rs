@@ -167,6 +167,14 @@ pub struct Limits {
     /// `poll_interval_s` values below it are raised to it).
     #[serde(default = "default_audit_poll")]
     pub min_audit_poll_interval_s: u32,
+    /// Discovery duty cycle, in percent (1 to 100, `100`: no pacing):
+    /// after each object's sampling (and each catalog read), the scan
+    /// pauses so that the agent's time in queries is at most this share of
+    /// the scan's time (`crate::pacing`, ADR-0035 proposed). Default 1: at
+    /// most 1 % of one server core per scan (scans run one at a time), so
+    /// under the 2 % MVP criterion even on a one-core server.
+    #[serde(default = "default_duty_cycle")]
+    pub discovery_duty_cycle_percent: u8,
 }
 
 const fn default_sample_rows() -> u32 {
@@ -181,6 +189,9 @@ const fn default_scan_duration() -> u32 {
 const fn default_audit_poll() -> u32 {
     5
 }
+const fn default_duty_cycle() -> u8 {
+    crate::pacing::DEFAULT_DUTY_CYCLE_PERCENT
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -189,6 +200,7 @@ impl Default for Limits {
             statement_timeout_ms: default_statement_timeout(),
             max_scan_duration_s: default_scan_duration(),
             min_audit_poll_interval_s: default_audit_poll(),
+            discovery_duty_cycle_percent: default_duty_cycle(),
         }
     }
 }
@@ -842,6 +854,7 @@ const KNOWN_KEYS: &[&str] = &[
     "statement_timeout_ms",
     "max_scan_duration_s",
     "min_audit_poll_interval_s",
+    "discovery_duty_cycle_percent",
     "phone_region",
     "databases",
     "tls",
@@ -1046,6 +1059,13 @@ impl AgentConfig {
             return Err(invalid(
                 "limits.min_audit_poll_interval_s",
                 "must be in 1..=3600",
+            ));
+        }
+        let (lo, hi) = crate::pacing::DUTY_CYCLE_PERCENT_RANGE;
+        if !(lo..=hi).contains(&l.discovery_duty_cycle_percent) {
+            return Err(invalid(
+                "limits.discovery_duty_cycle_percent",
+                "must be in 1..=100 (100: no pacing)",
             ));
         }
         if !(2 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&self.spool.max_bytes) {
@@ -1560,9 +1580,22 @@ targets:
             ("statement_timeout_ms", "600001"),
             ("max_scan_duration_s", "10"),
             ("min_audit_poll_interval_s", "0"),
+            ("discovery_duty_cycle_percent", "0"),
+            ("discovery_duty_cycle_percent", "101"),
+            ("discovery_duty_cycle_percent", "-1"),
+            ("discovery_duty_cycle_percent", "1.5"),
         ] {
             let text = format!("{BASE}limits:\n  {key}: {value}\n");
             assert!(err(&text).contains(key), "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn discovery_duty_cycle_default_and_bounds() {
+        assert_eq!(parse(BASE).unwrap().limits.discovery_duty_cycle_percent, 1);
+        for v in [1u8, 2, 50, 100] {
+            let text = format!("{BASE}limits:\n  discovery_duty_cycle_percent: {v}\n");
+            assert_eq!(parse(&text).unwrap().limits.discovery_duty_cycle_percent, v);
         }
     }
 
@@ -1573,6 +1606,7 @@ targets:
             statement_timeout_ms: 10_000,
             max_scan_duration_s: 600,
             min_audit_poll_interval_s: 5,
+            discovery_duty_cycle_percent: 1,
         };
         assert_eq!(limits.clamp_sample_rows(0), 1);
         assert_eq!(limits.clamp_sample_rows(10_000), 500);

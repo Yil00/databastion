@@ -12,12 +12,14 @@
 //! `TABLESAMPLE SYSTEM` on large relations (by `reltuples`) and a plain
 //! `LIMIT` otherwise or when the sample comes back short; every statement
 //! under `SET LOCAL statement_timeout` from the clamped job parameter; at
-//! most [`MAX_SAMPLE_BYTES`] read per relation.
+//! most [`MAX_SAMPLE_BYTES`] read per relation. The introspection and each
+//! object's sampling are paced by the core (`ScanJob::paced`: a bounded
+//! duty cycle, `limits.discovery_duty_cycle_percent`, ADR-0035 proposed).
 
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
 use databastion_core::config::TargetConfig;
-use databastion_core::{ConnectorError, FindingSink, ScanCoverage, ScanJob};
+use databastion_core::{ConnectorError, FindingSink, Paced, ScanCoverage, ScanJob};
 use futures_util::StreamExt;
 use tokio_postgres::types::Type;
 
@@ -50,13 +52,25 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         );
     };
     let timeouts = Timeouts::new(job.statement_timeout());
-    for database in &target.postgres_settings().databases {
-        if !job.includes_database(database) {
-            continue;
-        }
+    for database in planned_databases(job, &target.postgres_settings().databases) {
         scan_database(job, target, database, timeouts, sink).await?;
     }
     Ok(())
+}
+
+/// The databases this scan covers (the job's `databases` filter), in the
+/// order they are scanned: rotated with the job's seed, as the objects of
+/// each database, so that a slow object in one database cannot run every
+/// scan out of time before the databases after it (security review of
+/// #93, R1).
+fn planned_databases<'a>(job: &ScanJob, databases: &'a [String]) -> Vec<&'a str> {
+    let mut planned: Vec<&str> = databases
+        .iter()
+        .map(String::as_str)
+        .filter(|d| job.includes_database(d))
+        .collect();
+    job.rotate(&mut planned);
+    planned
 }
 
 fn fail(target: &TargetConfig, database: &NormalizedName, e: PgError) -> ConnectorError {
@@ -79,33 +93,59 @@ async fn scan_database(
     sink: &FindingSink,
 ) -> Result<(), ConnectorError> {
     let db_name = normalize(database);
+    if job.out_of_time() {
+        // Paced out of the scan's time: this database is not covered. Its
+        // objects are not known without introspecting it (a query the scan
+        // has no time left for): it counts as one skipped object (R2 of
+        // the #93 security review; documented in the README).
+        job.skip_out_of_time(sink, 1);
+        return Ok(());
+    }
     let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
-    let relations = {
-        let tx = first
-            .begin(timeouts)
-            .await
-            .map_err(|e| fail(target, &db_name, e))?;
-        match catalog::introspect(&tx).await {
-            Ok(r) => {
-                tx.commit().await.map_err(|e| fail(target, &db_name, e))?;
-                r
+    // Paced (ADR-0035 proposed): the introspection, then each object.
+    let relations = match job
+        .paced(async {
+            let tx = first
+                .begin(timeouts)
+                .await
+                .map_err(|e| fail(target, &db_name, e))?;
+            match catalog::introspect(&tx).await {
+                Ok(r) => {
+                    tx.commit().await.map_err(|e| fail(target, &db_name, e))?;
+                    Ok(r)
+                }
+                Err(e) => {
+                    tx.rollback().await;
+                    Err(fail(target, &db_name, e))
+                }
             }
-            Err(e) => {
-                tx.rollback().await;
-                return Err(fail(target, &db_name, e));
-            }
+        })
+        .await?
+    {
+        Paced::Done(r) => r?,
+        Paced::OutOfTime => {
+            job.skip_out_of_time(sink, 1);
+            return Ok(());
         }
     };
     let mut session = Some(first);
-    let (units, coverage) = catalog::plan(&relations, |schema, name| {
+    let (mut units, coverage) = catalog::plan(&relations, |schema, name| {
         job.includes_schema(schema) && job.includes_object(name)
     });
+    // Another starting object at each scan (security review of #93, M3).
+    job.rotate(&mut units);
     log_coverage(target, &db_name, &coverage);
     sink.add_coverage(planned_coverage(&coverage));
     let mut skipped = 0usize;
-    for unit in &units {
+    for (i, unit) in units.iter().enumerate() {
+        // The pause the previous objects owe, before the session is
+        // reused or reopened (M3 of the #93 security review).
+        if job.turn().await? == Paced::OutOfTime {
+            job.skip_out_of_time(sink, units.len() - i);
+            break;
+        }
         let current = match session.take() {
             Some(s) => s,
             // Replaced after a budget stop.
@@ -115,7 +155,16 @@ async fn scan_database(
         };
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sampled = sample_unit(&current, unit, job.sample_rows(), timeouts).await;
+        let sampled = match job
+            .paced(sample_unit(&current, unit, job.sample_rows(), timeouts))
+            .await?
+        {
+            Paced::Done(s) => s,
+            Paced::OutOfTime => {
+                job.skip_out_of_time(sink, units.len() - i);
+                break;
+            }
+        };
         // A poisoned session (budget stop: cancel in flight, aborted
         // transaction still open, AccessShareLock held) is closed here,
         // before any submit (L-new-1); the next object reconnects.
@@ -481,6 +530,25 @@ mod tests {
             ..Coverage::default()
         };
         assert_eq!(planned_coverage(&cut).limit, 1);
+    }
+
+    /// Security review of #93, R1: the databases start at a position that
+    /// changes with the job's seed, after the `databases` filter, so every
+    /// database comes first in some scan.
+    #[test]
+    fn databases_are_rotated_per_scan() {
+        let all: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        let job = ScanJob::default();
+        assert_eq!(planned_databases(&job, &all), ["a", "b", "c"]);
+        let firsts: std::collections::BTreeSet<&str> = (0..3u64)
+            .map(|seed| planned_databases(&job.clone().with_rotation(seed), &all)[0])
+            .collect();
+        assert_eq!(firsts.len(), 3, "{firsts:?}");
+        assert_eq!(
+            planned_databases(&ScanJob::default().with_rotation(1), &all),
+            ["b", "c", "a"]
+        );
+        assert!(planned_databases(&job.with_rotation(7), &[]).is_empty());
     }
 
     #[test]

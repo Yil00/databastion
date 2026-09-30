@@ -194,6 +194,55 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   the server's limit, an ambiguous `sql_mode` reading) and `CALL` are
   reported against `*`. Under `ANSI_QUOTES`, a `"…"` name is not read
   (never a name), so such an object is missed or `*`.
+- **One event per statement.** The table records and the statement record
+  of one statement are grouped per connection id and query id (without
+  query ids, `audit_log_filter`: by text), not by position in the log:
+  concurrent sessions interleave their records (`READ a`, `READ b`,
+  `QUERY a`, `QUERY b`). A statement's table records wait for its statement
+  record across polls and log rotations; they are reported without it at
+  the connection's next statement, its disconnect, after 5 minutes, when
+  the audit source changes, or when more than 1024 connections have a
+  statement waiting (the oldest first; logged and counted in the
+  heartbeat metric `audit_pending_evicted_total`). The waiting state is
+  bounded: 1024 statements, 64 distinct tables each, 16 MiB in all (names
+  of at most 1 KiB each, statement text, which only JSON `table_access`
+  records carry, and a fixed overhead per record); the memory of
+  statements reported early is at most 16384 statements of 64 table
+  hashes (8 MiB). A statement
+  reported before its statement record is remembered by its query id and
+  the tables already reported: a late table record of one of these tables
+  is ignored, one of another table is reported (with the statement record
+  when it comes, or at the next flush), and a late statement record alone
+  yields a second event only when its text shows a signal (a whole-table
+  read by a dump that ran longer than 5 minutes). That memory is kept 10
+  minutes.
+  The saved cursor is moved back to the first record of the oldest
+  statement still waiting in the current file, with the end read so far
+  and the connections waiting (`Tailer::commit_from`): after a restart, a
+  crash, a stream restart or a reconfiguration, the stream re-reads from
+  there and replays only the waiting statements' records, so they are
+  neither lost nor counted twice. A replayed statement has been waiting
+  since its log time, not since the restart: an agent that restarts more
+  often than every 5 minutes still reports it after 5 minutes, and its
+  cursor moves on instead of staying pinned to it. When the stream ends gracefully (the
+  source changes, the log becomes unreadable), the waiting statements are
+  reported and the cursor saved without them. Residuals: statements
+  waiting in a rotated (earlier) file are lost if the agent stops before
+  their statement record (the old file cannot be re-read); the memory of
+  statements reported early does not survive a restart or a new stream,
+  so their late statement record is then reported on its own (with the
+  objects its text names). Without query ids (`audit_log_filter`), two
+  consecutive statements of one connection with the same text whose table
+  records are not separated by the first one's statement record are merged
+  into one event (the log gives no way to tell them apart): such repeats
+  are undercounted. Stored procedures: MariaDB 11.4 (checked on 11.4.13)
+  gives each statement of a procedure its own query id, with its own table
+  and statement records, and logs the `CALL` last with none; each is
+  reported on its own, the `CALL` against `*`. The late-table rule above
+  does not depend on it. `performance_schema` has one row per statement
+  (deduplicated on thread and event id), so it has no grouping. Before
+  phase 7 (load tests) records were merged only when adjacent, and
+  interleaved sessions counted about 12 % of their statements twice.
 - **The agent's own account.** Its statements are left out only when they
   come from its account, from its client address as the server sees it
   (`USER()`, read at each re-probe; a host name there, such as `localhost`

@@ -4,6 +4,7 @@ import type { Database } from "@/db/client";
 import { agents, agentTargets, jobs } from "@/db/schema";
 import { registeredClassifiers } from "@/lib/protocol/classifiers";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
+import { parseCoverage, type ScanCoverage } from "@/lib/scan-coverage";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
@@ -22,19 +23,48 @@ export type DiscoveryScanParams = Schemas["DiscoveryScanParams"];
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
-/** Contract defaults (`DiscoveryScanParams`), made explicit in every job. */
-export const SCAN_DEFAULTS = { sample_rows: 200, max_duration_s: 900, statement_timeout_ms: 30_000 } as const;
+/**
+ * Defaults of the three bounds, made explicit in every job. `max_duration_s` is 3600 (not the
+ * contract's 900): Discovery is paced (PR #93, ADR-0035 proposed), so a scan lasts about
+ * `100 / duty_cycle_percent` times its query time (100x at the default 1 %). 3600 s is the default
+ * local cap of the agent (`limits.max_scan_duration_s`), which clamps a larger value down.
+ */
+export const SCAN_DEFAULTS = { sample_rows: 200, max_duration_s: 3600, statement_timeout_ms: 30_000 } as const;
 /** The agent must not start a scan after this delay (contract `expires_at`). */
 export const SCAN_JOB_TTL_MS = 6 * 3600_000;
 /**
- * Slack added to a scan's `max_duration_s` after delivery: past `delivered_at + max_duration_s +
- * SCAN_GRACE_MS`, a `delivered` / `running` scan is dead (the agent's own budget is over). It gets no
- * more findings, and the next scan request of the agent marks it `failed` (`timeout`).
+ * Slack added to a scan's `max_duration_s` after its first delivery: past `first_delivered_at +
+ * max_duration_s + SCAN_GRACE_MS`, a `delivered` / `running` scan is dead (the agent's own budget is
+ * over). It gets no more findings, and the next scan request of the agent marks it `failed` (`timeout`).
  */
 export const SCAN_GRACE_MS = 3600_000;
 
+/** Contract default of `max_duration_s`: the fail-closed fallback of `scanBudgetSql`. */
+export const CONTRACT_MAX_DURATION_S = 900;
+
+/**
+ * SQL: the start of a scan's window, its first delivery. Anchored on `first_delivered_at`, never
+ * moved by a redelivery, so an agent that delays its `running` acknowledgement cannot extend how
+ * long the scan holds its target and accepts findings (the agent counts the window from its
+ * reception of the job). `delivered_at` is the fallback for rows delivered before migration 0017
+ * added `first_delivered_at` (no release carried them; no backfill).
+ */
+export const scanAnchorSql = sql`coalesce(${jobs.firstDeliveredAt}, ${jobs.deliveredAt})`;
+
+/**
+ * SQL: a scan's `max_duration_s`, in seconds. The value is validated against the contract when the
+ * job is created; a row that does not hold a plain integer (hand-edited, older code) falls back to
+ * the contract default, fail closed, and the guard keeps the cast from throwing inside `claimJobs`
+ * / `/findings` (which would wedge the agent's polls).
+ */
+export const scanBudgetSql = sql`(case
+  when jsonb_typeof(${jobs.params}->'max_duration_s') = 'number'
+    and (${jobs.params}->>'max_duration_s') ~ '^[0-9]{1,5}$'
+  then least((${jobs.params}->>'max_duration_s')::int, 86400)
+  else ${CONTRACT_MAX_DURATION_S} end)`;
+
 /** SQL: the instant after which a delivered / running scan job is dead. */
-export const scanDeadlineSql = sql`${jobs.deliveredAt} + make_interval(secs => coalesce((${jobs.params}->>'max_duration_s')::int, 86400)) + make_interval(secs => ${SCAN_GRACE_MS / 1000})`;
+export const scanDeadlineSql = sql`${scanAnchorSql} + make_interval(secs => ${scanBudgetSql}) + make_interval(secs => ${SCAN_GRACE_MS / 1000})`;
 
 /**
  * Expiry sweep of the agent's scan jobs, run before the "one open scan per target" check (L2):
@@ -55,7 +85,7 @@ export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]>
         eq(jobs.agentId, agentId),
         eq(jobs.type, "discovery.scan"),
         inArray(jobs.status, ["delivered", "running"]),
-        sql`${jobs.deliveredAt} is not null and ${scanDeadlineSql} < now()`,
+        sql`${scanAnchorSql} is not null and ${scanDeadlineSql} < now()`,
       ),
     )
     .returning({ id: jobs.id, targetId: jobs.targetId });
@@ -234,6 +264,8 @@ export interface ScanJobView {
   createdAt: Date;
   finishedAt: Date | null;
   progress: Record<string, number> | null;
+  /** Coverage derived from the stored `progress` (counts only; src/lib/scan-coverage.ts). */
+  coverage: ScanCoverage;
   errorCode: string | null;
   /** The classifier set the job was issued with. */
   classifiersVersion: string | null;
@@ -283,6 +315,7 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
       createdAt: r.createdAt,
       finishedAt: r.finishedAt,
       progress: r.progress ?? null,
+      coverage: parseCoverage(r.progress),
       errorCode: r.error?.code ?? null,
       classifiersVersion: r.classifiersVersion,
     });

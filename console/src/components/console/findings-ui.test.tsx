@@ -7,7 +7,9 @@ import type { FindingView } from "@/server/findings";
 import { proxy } from "@/proxy";
 
 import { findingsHref, FindingsSummary, FindingsTable, locationLabel } from "./findings-table";
-import { scanErrorMessage, scanRequestBody } from "./scan-dialog";
+import { SCAN_DEFAULTS } from "@/server/scans";
+
+import { ScanDialog, SCAN_FIELDS, scanErrorMessage, scanRequestBody } from "./scan-dialog";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: () => undefined }) }));
 
@@ -133,6 +135,16 @@ describe("FindingsTable", () => {
   it("shows no false-positive button to non-admins (M2)", () => {
     const html = renderToStaticMarkup(<FindingsTable findings={[finding()]} csrfToken="csrf" now={NOW} canMark={false} />);
     expect(html).not.toContain("False positive");
+  });
+});
+
+describe("scan dialog defaults", () => {
+  it("prefills the server defaults, the budget sized for paced scans (PR #93)", () => {
+    for (const f of SCAN_FIELDS) expect(f.value).toBe(SCAN_DEFAULTS[f.name]);
+    expect(SCAN_DEFAULTS.max_duration_s).toBe(3600);
+    const html = renderToStaticMarkup(<ScanDialog agentId="a" targetId="pg-prod-1" csrfToken="csrf" />);
+    expect(html).toContain('value="3600"');
+    expect(html).toContain("Scans are paced");
   });
 });
 

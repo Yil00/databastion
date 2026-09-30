@@ -423,6 +423,35 @@ jobs:
           export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
           export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
           (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+      # Phase 7 (#74 review): verify_full against a real TLS-only MongoDB server, with a test CA
+      # generated at run time in $RUNNER_TEMP (never committed) and removed afterwards.
+      - name: Connector TLS integration test (real server, verify_full, runtime test CA)
+        run: |
+          eval "$(timeout 300 dev/mongo/tls-test-server.sh start)"
+          export DATABASTION_TEST_REQUIRE=mongo-tls
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
+      - name: Stop the TLS test server
+        if: always()
+        run: dev/mongo/tls-test-server.sh stop
+      # Phase 7 (P5-B follow-up): the auditLog source against a real Percona Server for MongoDB
+      # (opt-in dev service `psmdb`: JSON auditLog file, auditAuthorizationSuccess).
+      - name: Percona Server for MongoDB auditLog integration test
+        run: |
+          set -a; . dev/.env; set +a
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 psmdb
+          sudo chmod a+r dev/.state/logs/psmdb/auditLog.json
+          export DATABASTION_TEST_PSMDB_URL="mongodb://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${PSMDB_PORT}/app?authSource=admin"
+          export DATABASTION_TEST_PSMDB_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${PSMDB_PORT}/?authSource=admin"
+          export DATABASTION_TEST_PSMDB_AUDIT_LOG="$PWD/dev/.state/logs/psmdb/auditLog.json"
+          export DATABASTION_TEST_REQUIRE=psmdb-audit
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
+      - name: PSMDB logs and stop
+        if: always()
+        run: |
+          if [ "${{ job.status }}" != success ]; then
+            timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb logs --no-color --tail=300 psmdb || true
+          fi
+          docker compose -f dev/docker-compose.yml --profile psmdb rm -fsv psmdb || true
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mongo
@@ -464,12 +493,49 @@ jobs:
           export DATABASTION_TEST_LDAP_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapsearch -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}' -b dc=example,dc=org -E pr=20/noprompt '(objectClass=*)'"
           export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls
           (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
+      # Phase 7: SASL EXTERNAL over ldapi:// against the real slapd. The socket directory is published
+      # to the runner (compose override) and olcAuthzRegexp maps the runner's uid to the service DN.
+      - name: SASL EXTERNAL over ldapi:// (runner uid mapped to the service DN)
+        run: |
+          set -a; . dev/.env; set +a
+          mkdir -p dev/.state/ldapi
+          timeout 600 docker compose -f dev/docker-compose.yml -f dev/openldap/compose.ldapi.yml up -d --wait --wait-timeout 300 openldap
+          sudo chmod 0755 dev/.state/ldapi
+          sudo chmod 0777 dev/.state/ldapi/ldapi
+          printf 'dn: cn=config\nchangetype: modify\nadd: olcAuthzRegexp\nolcAuthzRegexp: "gidNumber=%s\\+uidNumber=%s,cn=peercred,cn=external,cn=auth" "cn=databastion,ou=services,dc=example,dc=org"\n' "$(id -g)" "$(id -u)" \
+            | docker compose -f dev/docker-compose.yml exec -T openldap ldapmodify -Q -Y EXTERNAL -H ldapi:///
+          export DATABASTION_TEST_LDAPI_PATH="$PWD/dev/.state/ldapi/ldapi"
+          export DATABASTION_TEST_LDAPI_DN="cn=databastion,ou=services,dc=example,dc=org"
+          export DATABASTION_TEST_REQUIRE=ldapi
+          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 openldap
       - name: Stop
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
+
+  # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
+  # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,
+  # accesslog entries. Coverage-instrumented, no sanitizer (nightly only), 10 s per target.
+  agent-fuzz-smoke:
+    name: Agent fuzz smoke
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent/fuzz
+      - name: Fuzz targets, 10 s each
+        run: agent/fuzz/smoke.sh 10
 
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL, MariaDB, MongoDB and OpenLDAP targets (ADR-0012 / ADR-0018 / ADR-0026 / ADR-0029

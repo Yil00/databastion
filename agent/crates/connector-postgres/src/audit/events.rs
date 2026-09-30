@@ -34,8 +34,9 @@
 //! `CatalogRule`) are skipped. Events of the agent's own account
 //! are left out only when they come from its `application_name` and client
 //! address, carry no signal, and either are one of the connector's own
-//! statements that read no relation (exact text with pgaudit, normalized
-//! shape with `pg_stat_statements`; not charged) or stay within
+//! statements that read no relation (exact text: as sent with pgaudit, as
+//! `pg_stat_statements` stores it, parameters in place, with
+//! `pg_stat_statements`; not charged) or stay within
 //! Discovery's row budget per named object and window (`PgOwn`). Any
 //! other event of the agent's account on `*` is reported.
 
@@ -49,8 +50,8 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, NormalizedQuery, QueryAnalysis, RelationName, StatementInfo,
-    StatementKind, analyze,
+    AnalyzeOptions, CopyEndpoint, QueryAnalysis, RelationName, StatementInfo, StatementKind,
+    analyze,
 };
 
 use super::records::AuditRecord;
@@ -361,20 +362,131 @@ pub(crate) enum OwnKind {
     Named,
 }
 
-/// Normalized text of a statement with `true` / `false` read as
-/// placeholders (`pg_stat_statements` replaces boolean constants too).
-fn statement_shape(n: &NormalizedQuery) -> String {
-    n.as_str()
-        .split(' ')
-        .map(|t| {
-            if matches!(t, "true" | "false") {
-                "?"
-            } else {
-                t
+/// The text `pg_stat_statements` stores for one of the connector's own
+/// statements: every constant (string, integer, `true` / `false`)
+/// replaced by `$n`, numbered in order of appearance after the highest
+/// bound parameter of the statement, everything else verbatim (as
+/// PostgreSQL's `generate_normalized_query` does; checked on PostgreSQL
+/// 16). The connector's bound parameters stay `$1`, `$2`… in place: a
+/// client sending the same statement with constants instead of parameters
+/// gets another `queryid` and another text, and is reported (#76 review
+/// I2).
+///
+/// The text alone does not prove the statement is the connector's: a
+/// client can prepare this exact text with every constant bound as a
+/// parameter, which gets another `queryid` and the same stored text. The
+/// `pg_stat_statements` poller therefore also pins, per own statement, the
+/// entry's `queryid` first seen with that text, only in the slots the
+/// connector itself uses (the agent's role, top level, a database where
+/// it runs that statement), and treats anything else with the same text
+/// as not the connector's (`audit::pss`, PR #90 review Low-1).
+///
+/// Only for the connector's own texts (a closed list): `None` on anything
+/// they never hold (a comment, an escape, bit or dollar-quoted string, a
+/// non-integer number), so such a text never matches.
+fn pss_form(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // Highest bound parameter.
+    let mut highest = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let from = i + 1;
+            i = from;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            highest = highest.max(text[from..i].parse().ok()?);
+        } else {
+            i += 1;
+        }
+    }
+    let mut next = highest;
+    let mut constant = |out: &mut String| {
+        next += 1;
+        out.push('$');
+        out.push_str(&next.to_string());
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\'' => {
+                // `''` inside a string is a quote.
+                let mut j = i + 1;
+                loop {
+                    match b.get(j) {
+                        None => return None,
+                        Some(b'\'') if b.get(j + 1) == Some(&b'\'') => j += 2,
+                        Some(b'\'') => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                constant(&mut out);
+                i = j + 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                loop {
+                    match b.get(j) {
+                        None => return None,
+                        Some(b'"') if b.get(j + 1) == Some(&b'"') => j += 2,
+                        Some(b'"') => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                out.push_str(&text[i..=j]);
+                i = j + 1;
+            }
+            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                out.push_str(&text[i..j]);
+                i = j;
+            }
+            b'$' => return None,
+            b'0'..=b'9' => {
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if b.get(j).is_some_and(|&d| ident(d) || d == b'.') {
+                    return None;
+                }
+                constant(&mut out);
+                i = j;
+            }
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let mut j = i;
+                while j < b.len() && ident(b[j]) {
+                    j += 1;
+                }
+                let word = &text[i..j];
+                if b.get(j) == Some(&b'\'') {
+                    // `E'…'`, `B'…'`, `U&'…'`: never in the connector's texts.
+                    return None;
+                }
+                if word.eq_ignore_ascii_case("true") || word.eq_ignore_ascii_case("false") {
+                    constant(&mut out);
+                } else {
+                    out.push_str(word);
+                }
+                i = j;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => return None,
+            b'/' if b.get(i + 1) == Some(&b'*') => return None,
+            _ if c.is_ascii() => {
+                out.push(char::from(c));
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// The agent's own activity in the PostgreSQL sources: the core rule
@@ -386,8 +498,10 @@ fn statement_shape(n: &NormalizedQuery) -> String {
 ///   registered by its stream) are left out on the core's identity and
 ///   signal rules without being charged ([`OwnKind::Tableless`]): they read
 ///   no row, and charging them used up the `*` budget within one scan.
-///   They are recognized as sent (pgaudit logs the text verbatim) and by
-///   normalized shape (`pg_stat_statements` replaces the constants).
+///   They are recognized by their exact text: as sent with pgaudit (it
+///   logs the text verbatim), and as `pg_stat_statements` stores it
+///   ([`pss_form`]: constants as `$n`, the connector's bound parameters
+///   in place) with `pg_stat_statements`.
 /// - Any other event of the agent's account on the unknown object `*`
 ///   ([`OwnKind::Unknown`]: a function call, even in `pg_catalog`, e.g.
 ///   `query_to_xml`; a text that does not parse) is reported and never
@@ -395,7 +509,8 @@ fn statement_shape(n: &NormalizedQuery) -> String {
 pub(crate) struct PgOwn {
     core: OwnAccount,
     own_texts: Vec<String>,
-    own_shapes: Vec<String>,
+    /// (`pg_stat_statements` form, statement as sent).
+    own_pss: Vec<(String, String)>,
     registry: SharedOwnStatements,
 }
 
@@ -408,7 +523,7 @@ impl PgOwn {
         let mut own = Self {
             core,
             own_texts: Vec::new(),
-            own_shapes: Vec::new(),
+            own_pss: Vec::new(),
             registry,
         };
         for text in sql::OWN_TABLELESS {
@@ -425,8 +540,8 @@ impl PgOwn {
             return;
         }
         self.own_texts.push(text.to_owned());
-        if let Some(n) = analyze(text, analyze_opts(false)).normalized() {
-            self.own_shapes.push(statement_shape(n));
+        if let Some(f) = pss_form(text) {
+            self.own_pss.push((f, text.to_owned()));
         }
     }
 
@@ -449,11 +564,23 @@ impl PgOwn {
         self.own_texts.iter().any(|t| t == text)
     }
 
-    /// The normalized shape of `a` is one of the connector's own
-    /// table-less statements (no normalized text, e.g. a cut text: no).
-    fn own_shape(&self, a: &QueryAnalysis) -> bool {
-        a.normalized()
-            .is_some_and(|n| self.own_shapes.contains(&statement_shape(n)))
+    /// Which of the connector's own table-less statements (as sent) `text`,
+    /// read from `pg_stat_statements` (not cut), is exactly, as
+    /// `pg_stat_statements` stores it ([`pss_form`]). The text is
+    /// necessary, not sufficient: the poller also requires the agent's
+    /// role, a top-level entry, a database where the connector runs that
+    /// statement, and pins the entry's `queryid` (`audit::pss`).
+    pub(crate) fn own_pss_form(&self, text: &str) -> Option<&str> {
+        self.own_pss
+            .iter()
+            .find(|(f, _)| f == text)
+            .map(|(_, sent)| sent.as_str())
+    }
+
+    /// [`Self::own_pss_form`] as a test.
+    #[cfg(test)]
+    pub(crate) fn own_pss_text(&self, text: &str) -> bool {
+        self.own_pss_form(text).is_some()
     }
 
     /// Whether an event may be left out (see the type documentation).
@@ -753,6 +880,9 @@ pub(crate) struct StatementDelta<'a> {
     pub(crate) user: &'a str,
     pub(crate) database: &'a str,
     pub(crate) analysis: &'a QueryAnalysis,
+    /// The text is exactly one of the connector's own table-less
+    /// statements ([`PgOwn::own_pss_text`]).
+    pub(crate) own_text: bool,
     pub(crate) calls: u64,
     pub(crate) rows: u64,
 }
@@ -774,21 +904,24 @@ pub(crate) fn pss_events(
     pss_events_counted(deltas, own, catalogs, from, to).0
 }
 
-/// [`pss_events`], with the number of statements dropped because their
-/// conversion panicked: each statement is converted in isolation
+/// [`pss_events`], with the indices (in `deltas`) of the statements whose
+/// conversion panicked, so the caller marks them poisoned and does not
+/// convert them again: each statement is converted in isolation
 /// (`databastion_core::isolate`), so one that makes the analysis code
-/// panic is dropped alone (security review of #85).
+/// panic does not stop the others (security review of #85). Its delta is
+/// still reported, against `*` ([`pss_unanalyzed_event`]), so a statement
+/// shape that makes the code panic cannot hide its executions.
 pub(crate) fn pss_events_counted(
     deltas: &[StatementDelta<'_>],
     own: &mut PgOwn,
     catalogs: &Catalogs,
     from: SystemTime,
     to: SystemTime,
-) -> (Vec<MaskedEvent>, u64) {
+) -> (Vec<MaskedEvent>, Vec<usize>) {
     // The pg_dump pattern per role within the poll.
     // No object names here: unqualified `pg_*` names stay catalogs.
     let none = HashSet::new();
-    let mut panicked = 0u64;
+    let mut panicked = Vec::new();
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
         let rule = catalogs.rule(d.database, true, &none);
@@ -802,14 +935,59 @@ pub(crate) fn pss_events_counted(
         }
     }
     let mut out = Vec::new();
-    for d in deltas {
+    for (i, d) in deltas.iter().enumerate() {
         match databastion_core::isolate(|| pss_event(d, own, catalogs, &copied, from, to)) {
             Some(Some(e)) => out.push(e),
             Some(None) => {}
-            None => panicked += 1,
+            None => {
+                panicked.push(i);
+                out.push(pss_unanalyzed_event(
+                    d.user, d.database, d.calls, d.rows, from, to,
+                ));
+            }
         }
     }
     (out, panicked)
+}
+
+/// The event of a `pg_stat_statements` delta whose statement could not be
+/// analyzed or converted (the analysis or conversion panicked; phase-7
+/// security review): a read of unknown objects (`*`) with the delta's
+/// counts, and `volume.large_result` above [`LARGE_ROWS`] rows. Built
+/// from the counters, the role and the database only: no statement text.
+/// Never left out as the agent's own activity (the connector names every
+/// relation it reads) and never budgeted.
+///
+/// Always a read, on purpose: the statement's kind is unknown, and a read
+/// of `*` over-reports (a write or DDL shows up as a read of unknown
+/// objects) rather than hides; it fails safe (PR #90 review Low-2).
+pub(crate) fn pss_unanalyzed_event(
+    user: &str,
+    database: &str,
+    calls: u64,
+    rows: u64,
+    from: SystemTime,
+    to: SystemTime,
+) -> MaskedEvent {
+    let mut e = MaskedEvent::new(
+        EventSource::PgStatStatements,
+        EventAction::Read,
+        EventPrincipal::account(user),
+        from,
+    )
+    .with_rows(Some(rows))
+    .with_aggregate(calls, to)
+    .with_object(unknown_object(database));
+    if rows > LARGE_ROWS {
+        e = e.with_signal(Signal::LargeResult);
+    }
+    e
+}
+
+/// [`pss_form`] for the poller's tests.
+#[cfg(test)]
+pub(crate) fn tests_pss_form(text: &str) -> String {
+    pss_form(text).unwrap_or_default()
 }
 
 /// Tests: a statement of this role makes its conversion panic (a bug on
@@ -887,7 +1065,7 @@ fn pss_event(
     } else if d.rows > LARGE_ROWS {
         e = e.with_signal(Signal::LargeResult);
     }
-    let kind = if objects.is_empty() && !named_any && own.own_shape(a) {
+    let kind = if objects.is_empty() && !named_any && d.own_text {
         OwnKind::Tableless
     } else if rw && objects.is_empty() {
         OwnKind::Unknown
@@ -1318,6 +1496,7 @@ mod tests {
         let dump = analyze_pss("select * from crm.t", false);
         let deltas = [
             StatementDelta {
+                own_text: false,
                 user: "databastion",
                 database: "shop",
                 analysis: &routine,
@@ -1325,6 +1504,7 @@ mod tests {
                 rows: 1000,
             },
             StatementDelta {
+                own_text: false,
                 user: "databastion",
                 database: "shop",
                 analysis: &dump,
@@ -1388,6 +1568,7 @@ mod tests {
         // pg_stat_statements: rows per object within the poll.
         let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
         let deltas = [StatementDelta {
+            own_text: false,
             user: "databastion",
             database: "shop",
             analysis: &routine,
@@ -1430,6 +1611,7 @@ mod tests {
         // same object is still charged, and the next read is reported.
         let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
         let deltas = [StatementDelta {
+            own_text: false,
             user: "databastion",
             database: "shop",
             analysis: &routine,
@@ -1568,6 +1750,10 @@ mod tests {
             &format!("{} , crm.f()", sql::OWN_CLIENT_ADDR),
             "SELECT pg_catalog.set_config('statement_timeout', $1, true)",
             &sql::SET_LOCAL_TIMEOUTS.to_lowercase(),
+            // Another setting read, or the own statement with constants
+            // instead of its bound parameters: exact text only.
+            &sql::SESSION_SETUP.replace("server_version_num", "crm.secret"),
+            &sql::SET_LOCAL_TIMEOUTS.replace("$1", "'1s'"),
             // Several statements.
             &format!("{}; select crm.f()", sql::OWN_CLIENT_ADDR),
         ];
@@ -1637,6 +1823,7 @@ mod tests {
         assert!(b.convert(vec![r], SystemTime::now()).is_empty());
         let a = analyze_pss(text, false);
         let deltas = [StatementDelta {
+            own_text: false,
             user: "databastion",
             database: "shop",
             analysis: &a,
@@ -1665,12 +1852,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].signals().contains(&Signal::LargeResult));
         // pg_stat_statements: rows summed over the poll.
-        let a = analyze_pss(
-            "SELECT pg_catalog.set_config($4, $1, $5), pg_catalog.set_config($6, $2, $7), \
-             pg_catalog.set_config($8, $3, $9), pg_catalog.current_setting($10)",
-            false,
-        );
+        let a = analyze_pss(PSS_SET_LOCAL, false);
         let deltas = [StatementDelta {
+            own_text: true,
             user: "databastion",
             database: "shop",
             analysis: &a,
@@ -1683,39 +1867,67 @@ mod tests {
         assert!(ev[0].signals().contains(&Signal::LargeResult));
     }
 
+    /// `SET_LOCAL_TIMEOUTS` as `pg_stat_statements` stores it (constants,
+    /// booleans included, replaced by parameters numbered after the bound
+    /// ones; checked on PostgreSQL 16).
+    const PSS_SET_LOCAL: &str = "SELECT pg_catalog.set_config($4, $1, $5), \
+        pg_catalog.set_config($6, $2, $7), pg_catalog.set_config($8, $3, $9), \
+        pg_catalog.current_setting($10)";
+
+    #[test]
+    fn pss_form_of_the_own_statements() {
+        assert_eq!(
+            pss_form(sql::SET_LOCAL_TIMEOUTS).as_deref(),
+            Some(PSS_SET_LOCAL)
+        );
+        assert_eq!(
+            pss_form(sql::SESSION_SETUP).as_deref(),
+            Some(
+                "SELECT pg_catalog.set_config($4, $5, $6), \
+                 pg_catalog.set_config($7, $8, $9), \
+                 pg_catalog.set_config($10, $1, $11), \
+                 pg_catalog.set_config($12, $2, $13), \
+                 pg_catalog.set_config($14, $3, $15), \
+                 pg_catalog.current_setting($16)"
+            )
+        );
+        assert_eq!(
+            pss_form(sql::OWN_CLIENT_ADDR).as_deref(),
+            Some(sql::OWN_CLIENT_ADDR)
+        );
+        let texts = pss_form(&sql::pss_texts("public", true).unwrap()).unwrap();
+        // Numbered in order of appearance, as PostgreSQL does.
+        assert!(texts.contains("left(s.query, $2)"), "{texts}");
+        assert!(texts.contains(">= $3"), "{texts}");
+        assert!(texts.contains("pg_stat_statements($4)"), "{texts}");
+        assert!(texts.ends_with("LIMIT $5"), "{texts}");
+        assert!(texts.contains("ANY($1)"), "{texts}");
+        let texts = pss_form(&sql::pss_texts("public", false).unwrap()).unwrap();
+        assert!(texts.contains("s.queryid, $2, pg_catalog"), "{texts}");
+        // Quoted identifiers and doubled quotes.
+        assert_eq!(
+            pss_form("SELECT \"a\"\"b\" FROM t WHERE x = 'it''s' AND y = $1").as_deref(),
+            Some("SELECT \"a\"\"b\" FROM t WHERE x = $2 AND y = $1")
+        );
+        // What the connector never sends: no form, never matched.
+        for t in [
+            "SELECT 1 -- c",
+            "SELECT /* c */ 1",
+            "SELECT E'a'",
+            "SELECT 1.5",
+            "SELECT $$a$$",
+            "SELECT 'a",
+            "SELECT é",
+        ] {
+            assert_eq!(pss_form(t), None, "{t}");
+        }
+    }
+
     #[test]
     fn own_tableless_statements_in_pg_stat_statements() {
-        // Texts as pg_stat_statements stores them (constants, booleans
-        // included, replaced by parameters; checked on PostgreSQL 16).
-        let set_local = analyze_pss(
-            "SELECT pg_catalog.set_config($4, $1, $5), pg_catalog.set_config($6, $2, $7), \
-             pg_catalog.set_config($8, $3, $9), pg_catalog.current_setting($10)",
-            false,
-        );
-        let setup = analyze_pss(
-            &sql::SESSION_SETUP
-                .replace("'search_path'", "$4")
-                .replace("''", "$5")
-                .replace("false", "$6"),
-            false,
-        );
-        let addr = analyze_pss(sql::OWN_CLIENT_ADDR, false);
+        let setup = pss_form(sql::SESSION_SETUP).unwrap();
         let texts_sql = sql::pss_texts("public", true).unwrap();
-        let texts = analyze_pss(
-            &texts_sql
-                .replace("pg_stat_statements(true)", "pg_stat_statements($2)")
-                .replace("8192", "$3"),
-            false,
-        );
-        let cut = analyze_pss(sql::OWN_CLIENT_ADDR, true);
-        let other = analyze_pss("select crm.f($1)", false);
-        let delta = |user, analysis| StatementDelta {
-            user,
-            database: "shop",
-            analysis,
-            calls: 90,
-            rows: 90,
-        };
+        let texts = pss_form(&texts_sql).unwrap();
         let own_account = own;
         let usage = SharedOwnUsage::default();
         let mut own = own_with(
@@ -1724,6 +1936,47 @@ mod tests {
             std::sync::Arc::clone(&usage),
         );
         own.allow_statement(&texts_sql);
+        for t in [PSS_SET_LOCAL, &setup, sql::OWN_CLIENT_ADDR, &texts] {
+            assert!(own.own_pss_text(t), "{t}");
+        }
+        // Sent with constants instead of the connector's bound
+        // parameters (another queryid), another setting read, another
+        // spelling, the text as sent: not an own statement (#76 review I2).
+        let literals = "SELECT pg_catalog.set_config($1, $2, $3), \
+            pg_catalog.set_config($4, $5, $6), pg_catalog.set_config($7, $8, $9), \
+            pg_catalog.current_setting($10)";
+        let lowered = PSS_SET_LOCAL.to_lowercase();
+        let reordered = "SELECT pg_catalog.set_config($4, $1, $5), \
+            pg_catalog.set_config($6, $2, $7), pg_catalog.set_config($8, $3, $9), \
+            pg_catalog.current_setting($1)";
+        for t in [
+            literals,
+            &lowered,
+            reordered,
+            sql::SET_LOCAL_TIMEOUTS,
+            "select crm.f($1)",
+        ] {
+            assert!(!own.own_pss_text(t), "{t}");
+        }
+        let analyzed = |t: &str| (analyze_pss(t, false), own.own_pss_text(t));
+        let set_local = analyzed(PSS_SET_LOCAL);
+        let setup = analyzed(&setup);
+        let addr = analyzed(sql::OWN_CLIENT_ADDR);
+        let texts = analyzed(&texts);
+        let literals = analyzed(literals);
+        let other = analyzed("select crm.f($1)");
+        // A cut text is never an own statement (the poller checks `cut`).
+        let cut = (analyze_pss(sql::OWN_CLIENT_ADDR, true), false);
+        fn delta<'a>(user: &'a str, a: &'a (QueryAnalysis, bool)) -> StatementDelta<'a> {
+            StatementDelta {
+                user,
+                database: "shop",
+                analysis: &a.0,
+                own_text: a.1,
+                calls: 90,
+                rows: 90,
+            }
+        }
         let t0 = SystemTime::UNIX_EPOCH;
         // Two polls' worth of a scan: nothing reported, nothing charged.
         for _ in 0..2 {
@@ -1741,26 +1994,23 @@ mod tests {
             );
         }
         assert!(charged_keys(&usage).is_empty());
-        // Another role, a cut text, another function: reported on `*`.
+        // Another role, a cut text, another function, the own statement
+        // with constants instead of parameters: reported on `*`.
         let deltas = [
             delta("app", &set_local),
             delta("app", &texts),
             delta("databastion", &cut),
             delta("databastion", &other),
+            delta("databastion", &literals),
         ];
         let ev = pss_events(&deltas, &mut own, &Catalogs::default(), t0, t0);
-        assert_eq!(ev.len(), 4);
+        assert_eq!(ev.len(), 5);
         assert!(ev.iter().all(|e| json(e).contains("shop..*")));
+        assert!(charged_keys(&usage).is_empty(), "`*` is never budgeted");
         // Without the stream's registration, the text query is not one of
         // the agent's statements.
-        let ev = pss_events(
-            &[delta("databastion", &texts)],
-            &mut own_account(),
-            &Catalogs::default(),
-            t0,
-            t0,
-        );
-        assert_eq!(ev.len(), 1);
+        let fresh = own_account();
+        assert!(!fresh.own_pss_text(&pss_form(&texts_sql).unwrap()));
     }
 
     #[test]
@@ -1987,6 +2237,7 @@ mod tests {
         let bare = analyze_pss("select query from pg_stat_statements", false);
         let deltas = [
             StatementDelta {
+                own_text: false,
                 user: "app",
                 database: "shop",
                 analysis: &copy,
@@ -1994,6 +2245,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                own_text: false,
                 user: "app",
                 database: "shop",
                 analysis: &view,
@@ -2001,6 +2253,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                own_text: false,
                 user: "app",
                 database: "shop",
                 analysis: &bare,
@@ -2280,6 +2533,7 @@ mod tests {
         let ddl = analyze_pss("alter table crm.customers add column x int", false);
         let deltas = [
             StatementDelta {
+                own_text: false,
                 user: "u",
                 database: "shop",
                 analysis: &copy,
@@ -2287,6 +2541,7 @@ mod tests {
                 rows: 150,
             },
             StatementDelta {
+                own_text: false,
                 user: "u",
                 database: "shop",
                 analysis: &copy2,
@@ -2294,6 +2549,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                own_text: false,
                 user: "u",
                 database: "shop",
                 analysis: &copy3,
@@ -2301,6 +2557,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                own_text: false,
                 user: "v",
                 database: "shop",
                 analysis: &sel,
@@ -2308,6 +2565,7 @@ mod tests {
                 rows: 30,
             },
             StatementDelta {
+                own_text: false,
                 user: "v",
                 database: "shop",
                 analysis: &ddl,
@@ -2358,6 +2616,7 @@ mod tests {
         let read = analyze_pss("SELECT * FROM crm.customers", false);
         let deltas = vec![
             StatementDelta {
+                own_text: false,
                 user: TEST_POISON_USER,
                 database: "shop",
                 analysis: &read,
@@ -2365,6 +2624,7 @@ mod tests {
                 rows: 5,
             },
             StatementDelta {
+                own_text: false,
                 user: "alice",
                 database: "shop",
                 analysis: &read,
@@ -2374,9 +2634,29 @@ mod tests {
         ];
         let (events, panicked) =
             pss_events_counted(&deltas, &mut own(), &Catalogs::default(), t0, t0);
-        assert_eq!(panicked, 1);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].principal().account_name(), "alice");
+        assert_eq!(panicked, [0]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].principal().account_name(), TEST_POISON_USER);
+        // The panicking statement is still reported, against `*`.
+        assert!(json(&events[0]).contains("shop..*"), "{}", json(&events[0]));
+        assert!(events[0].signals().is_empty());
+        assert_eq!(events[1].principal().account_name(), "alice");
+        assert!(json(&events[1]).contains("customers"));
+    }
+
+    #[test]
+    fn unanalyzed_pss_deltas_are_reads_of_unknown_objects() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let e = pss_unanalyzed_event("databastion", "shop", 3, LARGE_ROWS + 1, t0, t0);
+        let j = json(&e);
+        assert!(j.contains("shop..*"), "{j}");
+        assert_eq!(e.action(), EventAction::Read);
+        assert!(e.signals().contains(&Signal::LargeResult));
+        assert!(
+            pss_unanalyzed_event("alice", "shop", 1, 5, t0, t0)
+                .signals()
+                .is_empty()
+        );
     }
 
     /// Security review of #85: on `pg_stat_statements`, role changes are
@@ -2394,6 +2674,7 @@ mod tests {
         ] {
             let analysis = analyze_pss(q, false);
             let deltas = vec![StatementDelta {
+                own_text: false,
                 user: "alice",
                 database: "shop",
                 analysis: &analysis,

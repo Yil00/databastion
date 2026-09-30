@@ -25,8 +25,10 @@
 //!
 //! - `DATABASTION_TEST_LDAPI_PATH` and `DATABASTION_TEST_LDAPI_DN`: an
 //!   `ldapi://` socket reachable from the test process and the DN slapd
-//!   maps the test's Unix uid to, for SASL `EXTERNAL` (not in CI: the dev
-//!   server's socket is inside its container).
+//!   maps the test's Unix uid to, for SASL `EXTERNAL` (CI: the dev
+//!   server's socket directory published to the runner by
+//!   `dev/openldap/compose.ldapi.yml`, the runner's uid mapped to the
+//!   service DN).
 //!
 //! `DATABASTION_TEST_REQUIRE` (comma-separated: `ldap`, `ldap-admin`,
 //! `ldap-export`, `ldap-tls`, `ldapi`, or `all`) turns the matching skips
@@ -183,14 +185,19 @@ fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
+/// Local limits of the scans here: Discovery pacing off (these tests are
+/// about sampling; pacing is covered by `databastion_core::pacing`, the
+/// core's runtime tests and the load harness of #92).
+fn unpaced() -> Limits {
+    Limits {
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    }
+}
+
 async fn scan(t: &TargetConfig) -> (Result<(), ConnectorError>, Vec<MaskedFinding>) {
     let connector = OpenldapConnector::new();
-    let job = ScanJob::new(
-        ScanParams::contract_defaults(),
-        t,
-        &Limits::default(),
-        key(),
-    );
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
     let (sink, mut rx) = FindingSink::channel(4096);
     let r = connector.discover(&job, &sink).await;
     drop(sink);
@@ -616,8 +623,11 @@ async fn tls_verify_full_and_start_tls() {
 /// SASL `EXTERNAL` over an `ldapi://` socket reachable from the test
 /// process (`DATABASTION_TEST_LDAPI_PATH`), authenticating the test's Unix
 /// uid as `DATABASTION_TEST_LDAPI_DN` (the DN slapd maps it to, e.g.
-/// `gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth`). Not run in
-/// CI (the dev server's socket is inside its container).
+/// `gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth`). In CI
+/// (phase 7), the dev server's socket directory is published to the runner
+/// (`dev/openldap/compose.ldapi.yml`) and `olcAuthzRegexp` maps the
+/// runner's uid to the service DN, as recommended in `docs/05-security.md`;
+/// a Discovery scan then reads the tree with that identity.
 #[tokio::test]
 async fn sasl_external_over_ldapi() {
     let _serial = SERIAL.lock().await;
@@ -644,10 +654,19 @@ async fn sasl_external_over_ldapi() {
         .clone();
     let h = OpenldapConnector::new().check(&t).await;
     assert!(h.reachable, "{:?}", h.detail);
+    assert_eq!(h.failure, None, "{:?}", h.detail);
+    if dn.eq_ignore_ascii_case(SERVICE_DN) {
+        // Mapped to the service DN: its read access applies.
+        let (r, findings) = scan(&t).await;
+        r.unwrap();
+        assert!(!findings.is_empty(), "no finding read over ldapi://");
+    }
     // Another expected identity: refused after the bind.
-    let t = databastion_core::AgentConfig::parse(&yaml(SERVICE_DN))
-        .unwrap()
-        .targets[0]
+    let t = databastion_core::AgentConfig::parse(&yaml(
+        "cn=not-the-agent,ou=services,dc=example,dc=org",
+    ))
+    .unwrap()
+    .targets[0]
         .clone();
     let h = OpenldapConnector::new().check(&t).await;
     assert!(!h.reachable);

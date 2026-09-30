@@ -465,7 +465,16 @@ fn job(id: &str, kind: &str, params: serde_json::Value) -> serde_json::Value {
     })
 }
 
-async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
+/// Whether a request is the `running` acknowledgement of a scan.
+fn is_running(r: &Request) -> bool {
+    r.url.path().ends_with("/status")
+        && serde_json::from_slice::<serde_json::Value>(&r.body)
+            .is_ok_and(|b| b["status"] == "running")
+}
+
+/// Every job status sent, the `running` acknowledgements of scans
+/// included.
+async fn all_statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
     server
         .received_requests()
         .await
@@ -476,6 +485,15 @@ async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
             let id = r.url.path().split('/').rev().nth(1).unwrap().to_owned();
             (id, serde_json::from_slice(&r.body).unwrap())
         })
+        .collect()
+}
+
+/// The terminal job statuses sent.
+async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
+    all_statuses(server)
+        .await
+        .into_iter()
+        .filter(|(_, b)| b["status"] != "running")
         .collect()
 }
 
@@ -1341,6 +1359,17 @@ async fn payload_too_large_splits_in_halves_with_new_ids() {
     let get = |k: &str| m[&MetricsMapKey::try_from(k).unwrap()];
     assert!((get("batches_duplicate_total") - 1.0).abs() < f64::EPSILON);
     assert!((get("batches_sent_total") - 2.0).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn pending_evictions_are_a_heartbeat_metric() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let key = MetricsMapKey::try_from("audit_pending_evicted_total").unwrap();
+    let before = rt.metrics().0[&key];
+    crate::audit::count_pending_evicted(3);
+    assert!(rt.metrics().0[&key] >= before + 3.0);
 }
 
 #[tokio::test]
@@ -2224,6 +2253,274 @@ impl Connector for Stuck {
     ) -> Result<(), crate::ConnectorError> {
         Ok(())
     }
+}
+
+/// Samples objects of 50 ms each through the job's pacer (at the default
+/// 1 %: a pause of about 5 s after each).
+struct Paced(Arc<AtomicU64>);
+
+#[async_trait::async_trait]
+impl Connector for Paced {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        loop {
+            job.paced(async {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            })
+            .await?;
+        }
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+/// Samples five objects of 100 ms through the job's pacer, reporting what
+/// it could not sample in time as a connector does.
+struct PacedObjects;
+
+#[async_trait::async_trait]
+impl Connector for PacedObjects {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        sink: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        let objects = 5;
+        for i in 0..objects {
+            let r = job
+                .paced(async { tokio::time::sleep(Duration::from_millis(100)).await })
+                .await?;
+            if r == crate::Paced::OutOfTime {
+                job.skip_out_of_time(sink, objects - i);
+                break;
+            }
+            sink.add_coverage(crate::ScanCoverage {
+                sampled: 1,
+                ..crate::ScanCoverage::default()
+            });
+        }
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+/// Security review of #93, M3: a scan whose pacing debt would pass its
+/// deadline stops sampling first and succeeds, the objects left reported
+/// as skipped for a limit, instead of ending in `timeout`.
+#[tokio::test]
+async fn a_paced_scan_out_of_time_succeeds_with_skipped_objects() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(PacedObjects)],
+    )
+    .unwrap();
+    accept_tokens(&rt, &[token::JOB_PROGRESS_COVERAGE]);
+    // 10 s window at 1 %: the first object owes about 10 s.
+    let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({"max_duration_s": 10}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let started = Instant::now();
+    run_queued_scans(&rt).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["status"], "succeeded");
+    assert_eq!(sent[0]["progress"]["objects_sampled"], 1);
+    assert_eq!(sent[0]["progress"]["skipped_limit"], 4);
+}
+
+/// Security review of #93, R3: without the coverage counters (console
+/// without `job_progress.coverage`), a scan that ran out of time cannot
+/// show what it left out, so it is reported as `failed` (`timeout`), never
+/// as a plain `succeeded`.
+#[tokio::test]
+async fn a_paced_scan_out_of_time_fails_without_coverage_counters() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(PacedObjects)],
+    )
+    .unwrap();
+    let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({"max_duration_s": 10}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["status"], "failed");
+    assert_eq!(sent[0]["error"]["code"], "timeout");
+    assert!(sent[0].get("progress").is_none(), "{sent:?}");
+}
+
+/// A scan that was not out of time still succeeds without the coverage
+/// counters, and the ledger keeps the unmodified outcome.
+#[test]
+fn only_an_out_of_time_success_is_downgraded() {
+    use crate::jobs::Outcome;
+    use databastion_protocol::{FailureCode, JobStatusUpdateStatus as S};
+    let ok = Outcome::SUCCEEDED;
+    assert_eq!(ok.reported(false), (S::Succeeded, None));
+    let late = Outcome {
+        out_of_time: true,
+        ..Outcome::SUCCEEDED
+    };
+    assert_eq!(late.reported(true), (S::Succeeded, None));
+    assert_eq!(
+        late.reported(false),
+        (S::Failed, Some(FailureCode::Timeout))
+    );
+    let failed = Outcome {
+        out_of_time: true,
+        ..Outcome::failed(FailureCode::ResourceLimit)
+    };
+    assert_eq!(
+        failed.reported(false),
+        (S::Failed, Some(FailureCode::ResourceLimit))
+    );
+}
+
+/// Security review of #93, L5: a scan whose `running` acknowledgement the
+/// console refuses (`404` / `409`: cancelled, expired, not ours) does not
+/// run, and nothing more is reported for it.
+#[tokio::test]
+async fn a_scan_the_console_refuses_to_acknowledge_does_not_run() {
+    for status in [404u16, 409] {
+        let server = MockServer::start().await;
+        let env = enrolled(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(STATUS_PATH))
+            .respond_with(error_body(status, "gone"))
+            .mount(&server)
+            .await;
+        let objects = Arc::new(AtomicU64::new(0));
+        let rt = Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(Paced(Arc::clone(&objects)))],
+        )
+        .unwrap();
+        let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+        rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run_queued_scans(&rt))
+            .await
+            .unwrap();
+        assert_eq!(objects.load(Ordering::Relaxed), 0, "{status}");
+        let all = all_statuses(&server).await;
+        assert_eq!(all.len(), 1, "{status}: {all:?}");
+        assert_eq!(all[0].1["status"], "running");
+        assert!(rt.lock_scans().in_flight.is_empty());
+        // Delivered again: not run either (the ledger has it).
+        rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+            .await
+            .unwrap();
+        assert!(rt.lock_scans().queued.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_paced_scan_is_acknowledged_and_its_pause_ends_at_shutdown() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    assert_eq!(env.config.limits.discovery_duty_cycle_percent, 1);
+    let objects = Arc::new(AtomicU64::new(0));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Paced(Arc::clone(&objects)))],
+    )
+    .unwrap();
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let prepared = rt.lock_scans().queued.pop_front().unwrap();
+    let (tx, mut rx) = watch::channel(false);
+    let started = Instant::now();
+    let scan = rt.run_prepared_scan(prepared, async move {
+        let _ = rx.wait_for(|s| *s).await;
+    });
+    let driver = async {
+        // The first object, then its pause (about 5 s).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tx.send(true).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(4), async { tokio::join!(scan, driver) })
+        .await
+        .expect("the pause must end at shutdown");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // One object only: the scan was pausing when it stopped.
+    assert_eq!(objects.load(Ordering::Relaxed), 1);
+    let all = all_statuses(&server).await;
+    let mine: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|(i, _)| i == JOB)
+        .map(|(_, b)| b)
+        .collect();
+    assert_eq!(mine.len(), 2, "{mine:?}");
+    assert_eq!(mine[0]["status"], "running");
+    assert!(mine[0].get("error").is_none_or(serde_json::Value::is_null));
+    serde_json::from_value::<JobStatusUpdate>(mine[0].clone()).unwrap();
+    assert_eq!(mine[1]["status"], "failed");
+    assert_eq!(mine[1]["error"]["code"], "cancelled");
 }
 
 #[tokio::test]
@@ -3468,7 +3765,11 @@ struct Seq(
 );
 
 impl wiremock::Respond for Seq {
-    fn respond(&self, _: &Request) -> ResponseTemplate {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        // The `running` acknowledgement of a scan takes no scripted answer.
+        if is_running(r) {
+            return ResponseTemplate::new(204);
+        }
         self.0
             .lock()
             .unwrap()
@@ -3922,7 +4223,10 @@ struct SpoolAtStatus {
 }
 
 impl wiremock::Respond for SpoolAtStatus {
-    fn respond(&self, _: &Request) -> ResponseTemplate {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        if is_running(r) {
+            return ResponseTemplate::new(204);
+        }
         let pending = std::fs::read_dir(&self.dir)
             .unwrap()
             .filter(|e| {
@@ -4019,16 +4323,27 @@ async fn scan_status_is_sent_only_after_its_findings_are_acknowledged() {
     assert_eq!(*seen.lock().unwrap(), [0]);
     assert_eq!(rt.lock_spool().status().batches.0, 0);
     assert_eq!(metric(&rt, "scan_status_before_flush_total"), 0.0);
-    // The request order on the wire: the three batches, then the status.
+    // The request order on the wire: the `running` acknowledgement, the
+    // three batches, then the terminal status.
     let order: Vec<String> = server
         .received_requests()
         .await
         .unwrap()
         .iter()
-        .map(|r| r.url.path().rsplit('/').next().unwrap().to_owned())
-        .filter(|p| p == "findings" || p == "status")
+        .map(|r| {
+            let p = r.url.path().rsplit('/').next().unwrap().to_owned();
+            if is_running(r) {
+                "running".to_owned()
+            } else {
+                p
+            }
+        })
+        .filter(|p| p == "findings" || p == "status" || p == "running")
         .collect();
-    assert_eq!(order, ["findings", "findings", "findings", "status"]);
+    assert_eq!(
+        order,
+        ["running", "findings", "findings", "findings", "status"]
+    );
 }
 
 /// Acknowledges a findings batch only after 2 s (a console slower than
