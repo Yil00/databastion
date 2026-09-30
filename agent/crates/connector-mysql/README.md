@@ -162,8 +162,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   wrapped while the agent was stopped) is lost and counted. The sessions'
   accounts are not persisted: a statement of a session that ended while
   the agent was stopped is reported as an unidentified account. Without a
-  saved cursor (first start, or the start time unreadable), reading starts
-  at the newest statement. The cursor is removed while an audit log file
+  saved cursor (first start, or the start time unreadable: a saved cursor
+  is then removed), reading starts at the newest statement. The cursor is removed while an audit log file
   is the source, so a later switch back does not re-read that period.
 - **First start / rotation while stopped**: without a cursor, reading
   starts at the end of the log. A log rotated while the agent was stopped

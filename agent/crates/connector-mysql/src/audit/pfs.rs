@@ -299,8 +299,21 @@ impl PsPoller {
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         let digest_limit = limit(scalar(session, sql::PS_DIGEST_LIMIT).await?);
         let boot = server_boot(session).await?;
-        let saved = load(store.as_ref());
+        let mut saved = load(store.as_ref());
         let (last, seen, floor) = resume(saved.clone(), boot);
+        if boot.is_none() && saved.is_some() {
+            // The saved cursor cannot be matched to a server run: it is
+            // not used, and removed rather than left to be resumed later
+            // against another run (#88 review L4).
+            tracing::warn!(
+                "performance_schema: server start time unknown; the saved cursor is dropped \
+                 and reading starts at the newest statement"
+            );
+            if let Some(Err(e)) = store.as_ref().map(CursorStore::remove) {
+                tracing::warn!(error = %e, "performance_schema cursor not removed");
+            }
+            saved = None;
+        }
         Ok(Self {
             table,
             own_thread,
