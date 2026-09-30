@@ -64,12 +64,12 @@ Rules:
 | Agent package (phase 7) | `databastion-agent_<X.Y.Z>_<arch>.deb` | amd64, arm64 |
 | Checksums (phase 7) | `SHA256SUMS` + cosign signature | — |
 
-Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists.
+Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists. The `.deb` files are built from the binary of the signed agent image; `SHA256SUMS` covers them and `image-digests.txt`, and is signed with `cosign sign-blob` (`SHA256SUMS.cosign.bundle`). [publish.yml](.github/workflows/publish.yml) verifies every signature right after signing.
 
-Verify an image:
+Verify an image (all the checks: [deploy/README.md](deploy/README.md#verify-the-artifacts)):
 ```bash
 cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
-  --certificate-identity-regexp '^https://github.com/Yil00/databastion/' \
+  --certificate-identity-regexp '^https://github\.com/Yil00/databastion/\.github/workflows/publish\.yml@refs/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -97,7 +97,7 @@ git switch dev && git pull
 git tag -s 0.1.0-alpha.1 -m "DataBastion 0.1.0-alpha.1"
 git push origin 0.1.0-alpha.1
 ```
-Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images). Then create the GitHub pre-release by hand (`gh release create 0.1.0-alpha.1 --prerelease --generate-notes`).
+Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images), which creates a **draft** GitHub pre-release with the `.deb` files and the signed `SHA256SUMS`. Review it, then publish it (`gh release edit 0.1.0-alpha.1 --draft=false`).
 
 ### Hotfix
 1. `hotfix/<slug>` from `main`, PR to `main` with a `fix:` commit.
@@ -114,7 +114,8 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 | [ci.yml](.github/workflows/ci.yml) | push and PR on `main` / `dev` | Doc links, gitleaks, console, agent, protocol (each job only runs if its component exists); aggregated `CI result` check |
 | [pr-checks.yml](.github/workflows/pr-checks.yml) | PR | Conventional Commits title, DCO sign-off on each commit |
 | [release.yml](.github/workflows/release.yml) | PR merged into `main` | release-it + call to `publish.yml` |
-| [publish.yml](.github/workflows/publish.yml) | call from `release.yml`, or `X.Y.Z-*` tag | Signed multi-arch GHCR images |
+| [publish.yml](.github/workflows/publish.yml) | call from `release.yml`, or `X.Y.Z-*` tag | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
+| [packaging.yml](.github/workflows/packaging.yml) | call from `ci.yml` (packaging files changed) and `publish.yml` | Reproducible `.deb`, install checks in Debian 12 / Ubuntu 24.04 containers, "Installation < 15 min" test ([deploy/README.md](deploy/README.md#installation-test-under-15-minutes)) |
 | [dependabot.yml](.github/dependabot.yml) | weekly | Updates to actions and tooling, PRs to `dev` |
 
 Third-party actions are pinned by commit SHA (Dependabot updates them).
@@ -131,3 +132,4 @@ Third-party actions are pinned by commit SHA (Dependabot updates them).
 - [ ] [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix up to date
 - [ ] Console N / agent N-1 compatibility tested
 - [ ] Images signed, SBOM and `SHA256SUMS` published
+- [ ] Installation test of the publish run green (under 15 minutes with the published image and `.deb`)
