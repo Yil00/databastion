@@ -208,7 +208,9 @@ review remain the primary controls.
   one engine family, account and port name different hosts: through the
   system resolver (the declared targets only, as the connectors resolve
   them anyway; no scan, I5), at most 1 s and within the deadline, cached
-  5 minutes; a name not resolved in time keeps its literal key. A check
+  5 minutes; a name not resolved in time keeps its literal key, counts as
+  unresolved for a minute, and is not looked up again while its lookup is
+  still in flight. A check
   still running at the deadline is reported unreachable with `timeout` and
   the `check.timed_out` note, and takes the last turn of its account at the
   next heartbeats (the other targets of the account rotate), so a hung

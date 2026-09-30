@@ -172,10 +172,17 @@ pub(crate) fn account_groups(
     (0..targets.len()).map(|i| find(&mut parent, i)).collect()
 }
 
-/// Resolutions kept between heartbeats.
+/// How long a resolution that did not answer in time counts as
+/// unresolved (#88 review L3).
+pub(crate) const DNS_TIMEOUT_TTL: Duration = Duration::from_secs(60);
+
+/// Resolutions kept between heartbeats, and the lookups in flight.
 #[derive(Debug, Default)]
 pub(crate) struct DnsCache {
-    entries: HashMap<String, (Instant, Vec<IpAddr>)>,
+    /// Name: (when, for how long, addresses; empty: unresolved).
+    entries: HashMap<String, (Instant, Duration, Vec<IpAddr>)>,
+    /// Names whose lookup still runs (never started twice).
+    pending: HashSet<String>,
 }
 
 impl DnsCache {
@@ -183,18 +190,42 @@ impl DnsCache {
     pub(crate) fn get(&self, name: &str, now: Instant) -> Option<Vec<IpAddr>> {
         self.entries
             .get(name)
-            .filter(|(at, _)| now.saturating_duration_since(*at) < DNS_TTL)
-            .map(|(_, a)| a.clone())
+            .filter(|(at, ttl, _)| now.saturating_duration_since(*at) < *ttl)
+            .map(|(_, _, a)| a.clone())
     }
 
-    /// Records a resolution (an empty list: it failed).
-    pub(crate) fn put(&mut self, name: String, mut addrs: Vec<IpAddr>, now: Instant) {
+    /// Records a resolution (an empty list: it failed) for [`DNS_TTL`].
+    pub(crate) fn put(&mut self, name: String, addrs: Vec<IpAddr>, now: Instant) {
+        self.put_for(name, addrs, now, DNS_TTL);
+    }
+
+    /// Records `name` as unresolved for [`DNS_TIMEOUT_TTL`] (its lookup
+    /// did not answer in time), unless a fresher result is there.
+    pub(crate) fn put_timed_out(&mut self, name: String, now: Instant) {
+        if self.get(&name, now).is_none() {
+            self.put_for(name, Vec::new(), now, DNS_TIMEOUT_TTL);
+        }
+    }
+
+    fn put_for(&mut self, name: String, mut addrs: Vec<IpAddr>, now: Instant, ttl: Duration) {
         addrs.truncate(MAX_ADDRS);
         self.entries
-            .retain(|_, (at, _)| now.saturating_duration_since(*at) < DNS_TTL);
+            .retain(|_, (at, ttl, _)| now.saturating_duration_since(*at) < *ttl);
         if self.entries.len() < 4 * MAX_NAMES {
-            self.entries.insert(name, (now, addrs));
+            self.entries.insert(name, (now, ttl, addrs));
         }
+    }
+
+    /// Marks a lookup of `name` as started; `false` when one is already in
+    /// flight (then none is started).
+    pub(crate) fn start(&mut self, name: &str) -> bool {
+        self.pending.len() < 4 * MAX_NAMES && self.pending.insert(name.to_owned())
+    }
+
+    /// A lookup ended with `addrs`.
+    pub(crate) fn finish(&mut self, name: &str, addrs: Vec<IpAddr>, now: Instant) {
+        self.pending.remove(name);
+        self.put(name.to_owned(), addrs, now);
     }
 }
 
@@ -417,6 +448,16 @@ mod tests {
         c.put("a".to_owned(), vec![IpAddr::from([10, 0, 0, 1])], t0);
         assert_eq!(c.get("a", t0).unwrap().len(), 1);
         assert!(c.get("a", t0 + DNS_TTL).is_none());
+        // A lookup that did not answer in time: unresolved for a minute, a
+        // later answer replaces it; a lookup in flight is not started again.
+        c.put_timed_out("t".to_owned(), t0);
+        assert_eq!(c.get("t", t0), Some(Vec::new()));
+        assert!(c.get("t", t0 + DNS_TIMEOUT_TTL).is_none());
+        assert!(c.start("t"));
+        assert!(!c.start("t"));
+        c.finish("t", vec![IpAddr::from([10, 0, 0, 3])], t0);
+        assert_eq!(c.get("t", t0).unwrap().len(), 1);
+        assert!(c.start("t"));
         c.put("b".to_owned(), vec![IpAddr::from([10, 0, 0, 2]); 40], t0);
         assert_eq!(c.get("b", t0).unwrap().len(), MAX_ADDRS);
     }

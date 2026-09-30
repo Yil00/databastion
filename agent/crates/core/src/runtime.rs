@@ -635,7 +635,7 @@ struct Runtime {
     /// Order of the heartbeat check turns per account (see `checks`).
     turns: Mutex<crate::checks::TurnState>,
     /// Host name resolutions of the account keys (see `checks`).
-    dns: Mutex<crate::checks::DnsCache>,
+    dns: Arc<Mutex<crate::checks::DnsCache>>,
     /// Whether the spool worker runs (it always does under `run`): without
     /// it nothing sends the spool, so a terminal status never waits.
     spool_worker: std::sync::atomic::AtomicBool,
@@ -814,7 +814,7 @@ impl Runtime {
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
             turns: Mutex::new(crate::checks::TurnState::default()),
-            dns: Mutex::new(crate::checks::DnsCache::default()),
+            dns: Arc::new(Mutex::new(crate::checks::DnsCache::default())),
             spool_worker: std::sync::atomic::AtomicBool::new(false),
             spool_changed: tokio::sync::Notify::new(),
             spool_pushed: tokio::sync::Notify::new(),
@@ -983,21 +983,46 @@ impl Runtime {
         if todo.is_empty() {
             return out;
         }
+        // Each lookup runs in a task of its own that records its answer
+        // whenever it comes; a name whose lookup is still in flight is not
+        // looked up again, and one that does not answer in time counts as
+        // unresolved for a minute (#88 review L3).
         let bound = deadline.min(tokio::time::Instant::now() + crate::checks::DNS_TIMEOUT);
-        let lookups = todo.iter().map(|n| async move {
-            let addrs = tokio::time::timeout_at(bound, crate::checks::resolve(n.clone())).await;
-            (n.clone(), addrs.ok())
-        });
+        let mut lookups = Vec::new();
+        for n in todo {
+            let started = self
+                .dns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .start(&n);
+            if !started {
+                continue;
+            }
+            let dns = Arc::clone(&self.dns);
+            let name = n.clone();
+            let task = tokio::spawn(async move {
+                let addrs = crate::checks::resolve(name.clone()).await;
+                dns.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .finish(&name, addrs.clone(), Instant::now());
+                addrs
+            });
+            lookups.push(async move {
+                let addrs = tokio::time::timeout_at(bound, task).await;
+                (n, addrs.ok().and_then(Result::ok))
+            });
+        }
         let results = futures_util::future::join_all(lookups).await;
         let mut cache = self
             .dns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (n, addrs) in results {
-            // Not answered in time: not cached, tried again next time.
-            if let Some(addrs) = addrs {
-                cache.put(n.clone(), addrs.clone(), now);
-                out.insert(n, addrs);
+            match addrs {
+                Some(addrs) => {
+                    out.insert(n, addrs);
+                }
+                None => cache.put_timed_out(n, Instant::now()),
             }
         }
         out
