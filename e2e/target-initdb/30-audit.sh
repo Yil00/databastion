@@ -13,6 +13,9 @@
 #   e2e_exporter runs pg_dump, e2e_analyst runs queries whose text holds ground-truth literals.
 #   Read-only on the seeded schemas (USAGE, SELECT on tables and sequences). Their password is read
 #   by psql itself from the Docker secret (`\set` with a backquoted `cat`), never on a command line.
+# - A third test role, e2e_admin (CREATEROLE, no table privilege), runs the password-bearing DCL of
+#   the Audit test (CREATE USER / ALTER ROLE ... PASSWORD, ROADMAP phase 7); pgaudit logs the
+#   `role` class too, so these statements reach the log the agent reads.
 set -eu
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
 -- Test-only deviation from ADR-0012 (psql's password meta-command is interactive): the role
@@ -33,8 +36,10 @@ CREATE ROLE e2e_exporter LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
   PASSWORD :'client_password';
 CREATE ROLE e2e_analyst LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   PASSWORD :'client_password';
+CREATE ROLE e2e_admin LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'client_password';
 \unset client_password
-GRANT CONNECT ON DATABASE :"DBNAME" TO e2e_exporter, e2e_analyst;
+GRANT CONNECT ON DATABASE :"DBNAME" TO e2e_exporter, e2e_analyst, e2e_admin;
 GRANT USAGE ON SCHEMA crm, billing, ops TO e2e_exporter, e2e_analyst;
 GRANT SELECT ON ALL TABLES IN SCHEMA crm, billing, ops TO e2e_exporter, e2e_analyst;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA crm, billing, ops TO e2e_exporter, e2e_analyst;
@@ -43,7 +48,7 @@ CREATE ROLE databastion_auditor NOLOGIN;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA crm, billing, ops TO databastion_auditor;
 
 \if :has_pgaudit
-ALTER DATABASE :"DBNAME" SET pgaudit.log = 'read, write';
+ALTER DATABASE :"DBNAME" SET pgaudit.log = 'read, write, role';
 ALTER DATABASE :"DBNAME" SET pgaudit.role = 'databastion_auditor';
 ALTER DATABASE :"DBNAME" SET pgaudit.log_relation = on;
 ALTER DATABASE :"DBNAME" SET pgaudit.log_catalog = off;

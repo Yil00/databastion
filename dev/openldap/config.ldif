@@ -75,8 +75,13 @@ olcDbDirectory: /var/lib/ldap/data
 olcDbMaxSize: 268435456
 olcDbIndex: objectClass eq
 olcDbIndex: uid,mail eq
-# The service account can authenticate and read the tree, but never password hashes.
-olcAccess: {0}to attrs=userPassword by self =xw by anonymous auth by * none
+# The service account can authenticate and read the tree, but never credential attributes: the
+# recommended ACL (docs/05-security.md, ADR-0029 decision 4) names every credential attribute the
+# schema defines. Here: userPassword (core) and userPKCS12 (inetorgperson). authPassword (RFC 3112)
+# is not named: no schema loaded here defines it (slapd only has it when built with
+# SLAPD_AUTHPASSWD), and slapd refuses an olcAccess clause naming an unknown attribute. Neither are
+# the Samba, Kerberos and ppolicy attributes: their schemas are not loaded.
+olcAccess: {0}to attrs=userPassword,userPKCS12 by self =xw by anonymous auth by * none
 olcAccess: {1}to * by dn.exact="@SERVICE_DN@" read by self read by * none
 
 dn: olcOverlay={0}accesslog,olcDatabase={2}mdb,cn=config

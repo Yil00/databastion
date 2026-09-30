@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end enrollment / revocation test (phase 1 exit criterion):
 #   "end-to-end enrollment in containers; revocation effective in < 60 s",
-# invariant I2 test (P2-E): a Discovery scan of each seeded target (PostgreSQL, MySQL, MariaDB)
-# leaves no ground-truth value in clear text in the console database, the container logs or the
-# findings page; and the Audit path (P4-D, phase 4 exit criterion "pg_dump in dev -> incident in
-# under 2 minutes"): a real pg_dump of the PostgreSQL target opens an incident through an
-# access_event policy in less than 120 s, the agent's own Discovery reads open none, and no
-# ground-truth value (including literals put in query text) reaches access events, incidents,
+# invariant I2 test (P2-E): a Discovery scan of each seeded target (PostgreSQL, MySQL, MariaDB,
+# MongoDB, OpenLDAP) leaves no ground-truth value in clear text in the console database, the
+# container logs or the findings page; and the Audit path (P4-D, phase 4 exit criterion "pg_dump in
+# dev -> incident in under 2 minutes", and the v0.1.0 release gates of phase 7 for MongoDB and
+# OpenLDAP): a real pg_dump / mariadb-dump / mongodump / bulk ldapsearch of each Audit target opens
+# an incident through an access_event policy in less than 120 s, the agent's own Discovery reads
+# open none, and no ground-truth value (including literals put in query text and entry DNs), and
+# no password of a password-bearing DCL statement, reaches access events, incidents,
 # notifications (the e-mail in Mailpit), the console pages or any log.
 # See e2e/README.md. Requires: docker (compose v2), openssl, curl, jq, python3.
 #
@@ -27,16 +29,25 @@ I2_CHECK="$HERE/i2_check.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
 SEED_DIR="$HERE/../dev/seed/out"
 # Declared targets: "<target id> <ground-truth engine> <committed seed>". The scans run in parallel.
-E2E_TARGETS=("pg-e2e postgresql postgres.sql" "mysql-e2e mysql mysql.sql" "mariadb-e2e mariadb mariadb.sql")
+E2E_TARGETS=("pg-e2e postgresql postgres.sql" "mysql-e2e mysql mysql.sql" "mariadb-e2e mariadb mariadb.sql"
+  "mongo-e2e mongodb mongo.json" "ldap-e2e openldap openldap.ldif")
 # Audit targets (P4-D): "<target id> <ground-truth engine> <client> <agent account> <dump signal>".
 # <client> selects the audit_client_<client> helpers below (dump, literal queries, the target's own
 # audit log). MariaDB (P4-B, ADR-0023): the server_audit log file, read by the agent. MySQL
 # Community has only performance_schema, which needs a grant the minimal e2e account must not have
-# (ADR-0023 decision 3); Percona's audit_log_filter would need a fourth target (not covered here).
+# (ADR-0023 decision 3); Percona's audit_log_filter would need another target (not covered here).
+# MongoDB Community (ADR-0027): the structured JSON server log, read by the agent (Limited); the
+# agent's account is `name@authdb`. OpenLDAP (ADR-0029): cn=accesslog, read over LDAPS by the
+# service DN; the "dump" is a bulk subtree ldapsearch (no signature: shape.bulk_search), and every
+# principal but the agent's is an entry DN, sent as a fingerprint.
 E2E_AUDIT_TARGETS=("pg-e2e postgresql pg databastion_agent signature.pg_dump"
-  "mariadb-e2e mariadb my databastion signature.mysqldump")
+  "mariadb-e2e mariadb my databastion signature.mysqldump"
+  "mongo-e2e mongodb mongo databastion@admin signature.mongodump"
+  "ldap-e2e openldap ldap cn=databastion,ou=services,dc=example,dc=org shape.bulk_search")
+LDAP_SERVICE_DN="cn=databastion,ou=services,dc=example,dc=org"
 AUDIT_POLICY_DUMP="e2e dump signature"    # access_event policy: the target's dump signal
 AUDIT_POLICY_READS="e2e reads"            # access_event policy: every read of an Audit target
+AUDIT_POLICY_DCL="e2e dcl"                # access_event policy: DCL on the targets of the DCL test
 AUDIT_CHANNEL="e2e-mail"                  # e-mail channel to Mailpit
 DUMP_INCIDENT_LIMIT_MS=120000             # phase 4 exit criterion: dump -> incident < 2 min
 AUDIT_EVENTS_TIMEOUT_S=240                # client queries -> events stored and evaluated
@@ -47,7 +58,7 @@ AUDIT_EVENTS_TIMEOUT_S=240                # client queries -> events stored and 
 # pgaudit-only checks (source, level, literal positive control in the target's log).
 E2E_PG_AUDIT="${E2E_PG_AUDIT:-pgaudit}"
 SCAN_TIMEOUT_S=360   # every scan, launched together
-TARGET_TIMEOUT_S=240 # target-mysql / target-mariadb initialization (seed, account, TLS)
+TARGET_TIMEOUT_S=240 # target-mysql / -mariadb / -mongo / -ldap initialization (seed, accounts, TLS)
 SPOOL_TIMEOUT_S=90   # three heartbeat intervals (console HEARTBEAT_INTERVAL_S = 30)
 MAX_LISTED_FINDINGS=500  # console/src/server/findings.ts: the page lists at most this many
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -166,7 +177,8 @@ compose() { timeout 120 docker compose -f "$HERE/docker-compose.yml" "$@"; }
 dump_logs() {
   local svc
   compose logs --no-color --timestamps >"$E2E_LOG_DIR/all.log" 2>&1 || true
-  for svc in db migrate web worker proxy mailpit target-pg target-mysql target-mariadb agent; do
+  for svc in db migrate web worker proxy mailpit target-pg target-mysql target-mariadb target-mongo \
+      target-ldap agent; do
     compose logs --no-color --timestamps "$svc" >"$E2E_LOG_DIR/$svc.log" 2>&1 || true
   done
 }
@@ -174,12 +186,14 @@ dump_logs() {
 cleanup() {
   local status=$?
   set +e
+  [ -z "${DUMP_POLLER_PID:-}" ] || kill "$DUMP_POLLER_PID" 2>/dev/null
   phase_done exit
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
   # Before teardown and before $E2E_WORK_DIR (the registry) goes away, whatever the exit path.
   redact_dir "$E2E_LOG_DIR" "$P"
+  redact_dir "$E2E_LOG_DIR" "${DCLP:-}"
   log "tearing down"
   timeout 120 docker compose -f "$HERE/docker-compose.yml" --profile tools down -v --remove-orphans \
     >/dev/null 2>&1
@@ -213,6 +227,10 @@ TARGET_MYSQL_PASSWORD="$(rand_hex 24)"         # MySQL root: stays in target-mys
 TARGET_MYSQL_AGENT_PASSWORD="$(rand_hex 24)"   # MySQL `databastion` (ADR-0018 minimal)
 TARGET_MARIADB_PASSWORD="$(rand_hex 24)"       # MariaDB root: stays in target-mariadb
 TARGET_MARIADB_AGENT_PASSWORD="$(rand_hex 24)" # MariaDB `databastion` (ADR-0018 minimal)
+TARGET_MONGO_PASSWORD="$(rand_hex 24)"         # MongoDB root: stays in target-mongo
+TARGET_MONGO_AGENT_PASSWORD="$(rand_hex 24)"   # MongoDB `databastion` (ADR-0026)
+TARGET_LDAP_PASSWORD="$(rand_hex 24)"          # OpenLDAP rootDN cn=admin: stays in target-ldap
+TARGET_LDAP_AGENT_PASSWORD="$(rand_hex 24)"    # OpenLDAP service DN (ADR-0029)
 register_secret db_password "$DB_PASSWORD"
 register_secret db_owner_password "$DB_OWNER_PASSWORD"
 register_secret db_app_password "$DB_APP_PASSWORD"
@@ -230,6 +248,10 @@ register_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
 register_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
 register_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
 register_secret target_mariadb_agent_password "$TARGET_MARIADB_AGENT_PASSWORD"
+register_secret target_mongo_password "$TARGET_MONGO_PASSWORD"
+register_secret target_mongo_agent_password "$TARGET_MONGO_AGENT_PASSWORD"
+register_secret target_ldap_password "$TARGET_LDAP_PASSWORD"
+register_secret target_ldap_agent_password "$TARGET_LDAP_AGENT_PASSWORD"
 put_secret db_password "$DB_PASSWORD"
 put_secret db_owner_password "$DB_OWNER_PASSWORD"
 put_secret db_app_password "$DB_APP_PASSWORD"
@@ -247,7 +269,25 @@ put_secret target_mysql_password "$TARGET_MYSQL_PASSWORD"
 put_secret target_mysql_agent_password "$TARGET_MYSQL_AGENT_PASSWORD"
 put_secret target_mariadb_password "$TARGET_MARIADB_PASSWORD"
 put_secret target_mariadb_agent_password "$TARGET_MARIADB_AGENT_PASSWORD"
+put_secret target_mongo_password "$TARGET_MONGO_PASSWORD"
+put_secret target_mongo_agent_password "$TARGET_MONGO_AGENT_PASSWORD"
+put_secret target_ldap_password "$TARGET_LDAP_PASSWORD"
+put_secret target_ldap_agent_password "$TARGET_LDAP_AGENT_PASSWORD"
 chmod 0700 "$S"
+
+# Passwords of the password-bearing DCL statements of the Audit test (CREATE USER / ALTER ... PASSWORD
+# on target-pg and target-mariadb): a registry of their own. They are statement literals, so they do
+# reach the targets' statement text (pgaudit and server_audit mask them in their logs), which
+# the secret registry above must not hold; they must be nowhere on the console side nor in the
+# console / agent logs (checked with the I2 scans). Redacted from the uploaded logs like the others.
+DCLP="$E2E_WORK_DIR/dcl-patterns"
+mkdir -p "$DCLP"
+for n in 1 2; do
+  v="$(rand_hex 24)"
+  printf '%s\n' "$v" >"$DCLP/dcl_password_$n"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$v"; fi
+done
+unset v
 
 # --------------------------------------------------------------------------- test CA
 log "generating the throwaway test CA and the proxy certificate"
@@ -330,8 +370,86 @@ targets:
       ca_file: /etc/databastion/mariadb-ca.pem
       # Audit (P4-D): the server_audit log, mounted read-only from the target-mariadb-log volume.
       audit_log: {path: /var/log/target-mariadb/server_audit.log, format: server_audit}
+  # ADR-0026 account (dev's initdb/10-seed.js). target-mongo has no TLS; it sits on the internal
+  # agent network only: explicit insecure opt-in (SCRAM-SHA-256 whatever the transport). Audit
+  # (ADR-0027): the structured JSON server log, mounted read-only from the target-mongo-log volume.
+  - id: mongo-e2e
+    engine: mongodb
+    host: target-mongo
+    port: 27017
+    account: databastion
+    secret:
+      file: /run/databastion-secrets/target_mongo_agent_password
+    mongodb:
+      tls: disable_insecure
+      auth_source: admin
+      audit_log: {path: /var/log/target-mongo/mongod.log, format: server_log}
+  # ADR-0029 service DN, simple bind over LDAPS (verify_full, the dev CA of target-ldap pinned; the
+  # host name is its network alias, named in its certificate). Audit: cn=accesslog (default base).
+  # No clear_principals: every principal but the agent's own DN is sent as a fingerprint.
+  - id: ldap-e2e
+    engine: openldap
+    host: openldap
+    port: 636
+    account: ${LDAP_SERVICE_DN}
+    secret:
+      file: /run/databastion-secrets/target_ldap_agent_password
+    openldap:
+      tls: verify_full
+      ca_file: /etc/databastion/ldap-ca.pem
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
+
+# --------------------------------------------------------------------------- OpenLDAP seed + clients
+# target-ldap loads the committed dev seed plus the two Audit test client entries (e2e exporter and
+# analyst: applicationProcess + simpleSecurityObject under ou=services, like the agent's service DN).
+# Their DNs are `cn=<ground-truth person name>,ou=services,dc=example,dc=org`: a DN (a principal)
+# that reached the console in clear would be found by the I2 scans. ASCII names of at least 8
+# letters (plain LDIF, unbounded needles). The password is the Audit clients' one, stored as a
+# salted SHA-1 ({SSHA}, what slappasswd writes) computed here from the secret file.
+mkdir -p "$E2E_WORK_DIR/ldap/client"
+mapfile -t LDAP_CLIENT_NAMES < <(jq -r '.locations | to_entries[]
+  | select(.value.engine == "openldap" and .value.container == "ou=people,dc=example,dc=org"
+           and .value.field == "cn")
+  | .key as $i | .value.values | to_entries[]
+  | select(.value | test("^[A-Z][a-z]+ [A-Z][a-z]+$")) | select((.value | length) >= 9)
+  | "L\($i).v\(.key)\t\(.value)"' "$GROUND_TRUTH" | head -n 2)
+[ "${#LDAP_CLIENT_NAMES[@]}" = 2 ] || fail "no two ASCII person names in the OpenLDAP ground truth"
+declare -A LDAP_CLIENT_DN=()    # role -> DN (holds a ground-truth value: never printed)
+LDAP_CLIENT_NEEDLES=""          # needle ids of the two names
+i=0
+for role in exporter analyst; do
+  IFS=$'\t' read -r id name <<<"${LDAP_CLIENT_NAMES[$i]}"
+  [ -n "$name" ] || fail "empty OpenLDAP client name"
+  LDAP_CLIENT_DN[$role]="cn=${name},ou=services,dc=example,dc=org"
+  LDAP_CLIENT_NEEDLES+=" $id"
+  i=$((i + 1))
+done
+unset LDAP_CLIENT_NAMES name
+# shellcheck disable=SC2016 # Python program, not shell
+ssha="$(python3 -c 'import base64, hashlib, os, sys
+pw = open(sys.argv[1], "rb").read(); salt = os.urandom(8)
+print("{SSHA}" + base64.b64encode(hashlib.sha1(pw + salt).digest() + salt).decode())' \
+  "$S/target_client_password")"
+[[ "$ssha" == "{SSHA}"* ]] || fail "cannot hash the OpenLDAP client password"
+{
+  cat "$SEED_DIR/openldap.ldif"
+  for role in exporter analyst; do
+    dn="${LDAP_CLIENT_DN[$role]}"
+    cn="${dn#cn=}"
+    printf '\ndn: %s\nobjectClass: applicationProcess\nobjectClass: simpleSecurityObject\n' "$dn"
+    printf 'cn: %s\ndescription: DataBastion e2e Audit test client (%s)\nuserPassword: %s\n' \
+      "${cn%%,*}" "$role" "$ssha"
+  done
+} >"$E2E_WORK_DIR/ldap/seed.ldif"
+unset ssha dn cn
+# ldaprc of each client (ldap-client, LDAPRC=<role>.ldaprc): bind DN, LDAPS URI, the dev CA.
+for role in exporter analyst; do
+  printf 'URI ldaps://openldap:636\nBASE dc=example,dc=org\nBINDDN %s\nTLS_CACERT /etc/e2e/ldap/ca.pem\nTLS_REQCERT demand\n' \
+    "${LDAP_CLIENT_DN[$role]}" >"$E2E_WORK_DIR/ldap/client/$role.ldaprc"
+done
+chmod 0755 "$E2E_WORK_DIR/ldap" "$E2E_WORK_DIR/ldap/client"
+chmod 0644 "$E2E_WORK_DIR/ldap/seed.ldif" "$E2E_WORK_DIR/ldap/client/"*.ldaprc
 
 # --------------------------------------------------------------------------- HTTP helpers
 CURL=(curl -sS --max-time 40 --cacert "$T/ca.crt"
@@ -358,10 +476,11 @@ body_of() { tail -n +2 <<<"$1"; }
 # images as already built, e.g. behind a TLS-intercepting proxy that the Dockerfiles cannot trust;
 # E2E_CONSOLE_IMAGE / E2E_AGENT_IMAGE / E2E_TARGET_PG_IMAGE name other tags. CI always builds.
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
-  unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_TARGET_PG_IMAGE
+  unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_TARGET_PG_IMAGE E2E_TARGET_LDAP_IMAGE
 fi
-BUILT_IMAGES=("${E2E_CONSOLE_IMAGE:-databastion-console:e2e}" "${E2E_AGENT_IMAGE:-databastion-agent:e2e}")
-BUILD_SERVICES=(web agent)
+BUILT_IMAGES=("${E2E_CONSOLE_IMAGE:-databastion-console:e2e}" "${E2E_AGENT_IMAGE:-databastion-agent:e2e}"
+  "${E2E_TARGET_LDAP_IMAGE:-databastion-dev/openldap:bookworm-20260918}")
+BUILD_SERVICES=(web agent target-ldap)
 if [ "$E2E_PG_AUDIT" = pgaudit ]; then
   BUILT_IMAGES+=("${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}")
   BUILD_SERVICES+=(target-pg)
@@ -387,19 +506,27 @@ files_agent() {
     --user 10001:10001 agent-files "$1"
 }
 
-# The target-pg and target-mariadb log volumes belong to the server user of the target (postgres /
-# mysql, uid / gid 999 in both images), 0750: the servers write their 0640 audit logs there, the
-# agent reads them through its supplementary group 999.
-log "preparing the target-pg and target-mariadb log volumes (999:999, 0750)"
+# The target-pg, target-mariadb and target-mongo log volumes belong to the server user of the target
+# (postgres / mysql / mongodb, uid / gid 999 in the three images), 0750: the servers write their
+# 0640 audit logs there, the agent reads them through its supplementary group 999. mongod creates
+# its log file 0600 when it does not exist: it is created here, 0640, and mongod appends to it
+# (--logappend).
+log "preparing the target-pg, target-mariadb and target-mongo log volumes (999:999, 0750)"
+# The file is created and checked before the directories change owner: agent-files only has
+# CAP_CHOWN, not CAP_DAC_OVERRIDE, so root can neither write into nor traverse a 999:999 0750
+# directory. Mode first, then owner: once the file belongs to 999, root (no CAP_FOWNER) can no
+# longer change its mode (`install -o -g -m` chowns before it chmods).
 # shellcheck disable=SC2016 # expanded by the container shell, on purpose
-files_root 'for d in /pglog /mylog; do chmod 0750 "$d" && chown 999:999 "$d" && stat -c "%u:%g %a" "$d"; done' \
-  | tr '\n' ' ' | grep -qx '999:999 750 999:999 750 ' || fail "cannot prepare the target log volumes"
+files_root 'install -m 0640 /dev/null /mongolog/mongod.log && chown 999:999 /mongolog/mongod.log && stat -c "%u:%g %a" /mongolog/mongod.log
+  for d in /pglog /mylog /mongolog; do chmod 0750 "$d" && chown 999:999 "$d" && stat -c "%u:%g %a" "$d"; done' \
+  | tr '\n' ' ' | grep -qx '999:999 640 999:999 750 999:999 750 999:999 750 ' \
+  || fail "cannot prepare the target log volumes"
 
-log "starting console DB, migrate, web, worker, TLS proxy, Mailpit and the target PostgreSQL, MySQL, MariaDB"
+log "starting console DB, migrate, web, worker, TLS proxy, Mailpit and the target PostgreSQL, MySQL, MariaDB, MongoDB, OpenLDAP"
 # No `--wait`: it treats the exited one-shot `migrate` as a failure on some Compose versions.
 # `up` itself blocks on the depends_on conditions (db healthy, migrate done, web healthy).
 timeout 400 docker compose -f "$HERE/docker-compose.yml" up -d db web worker proxy mailpit \
-  target-pg target-mysql target-mariadb
+  target-pg target-mysql target-mariadb target-mongo target-ldap
 
 log "waiting for console readiness through the TLS proxy"
 deadline=$(( $(date +%s) + 120 ))
@@ -410,11 +537,11 @@ done
 
 [ "$(compose ps -a --format '{{.ExitCode}}' migrate)" = "0" ] || fail "migrate did not succeed"
 
-# The MySQL / MariaDB targets initialize in parallel with the console (seed, agent account, TLS
-# material); their CA must exist before any agent container is created (bind mounts).
-log "waiting for target-mysql and target-mariadb to be healthy (at most ${TARGET_TIMEOUT_S} s)"
+# The MySQL / MariaDB / MongoDB / OpenLDAP targets initialize in parallel with the console (seed,
+# accounts, TLS material); their CA must exist before any agent container is created (bind mounts).
+log "waiting for target-mysql, target-mariadb, target-mongo and target-ldap to be healthy (at most ${TARGET_TIMEOUT_S} s)"
 deadline=$(( $(date +%s) + TARGET_TIMEOUT_S ))
-for svc in target-mysql target-mariadb; do
+for svc in target-mysql target-mariadb target-mongo target-ldap; do
   until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q "$svc")" 2>/dev/null)" = healthy ]; do
     [ "$(date +%s)" -lt "$deadline" ] || fail "$svc not healthy within ${TARGET_TIMEOUT_S} s"
     sleep 2
@@ -432,6 +559,15 @@ for ca in mysql mariadb; do
   ! grep -q 'PRIVATE KEY' "$T/$ca-ca.pem" || fail "$ca-ca.pem holds a private key"
   chmod 0644 "$T/$ca-ca.pem"
 done
+log "copying the dev CA of target-ldap (dev/openldap/entrypoint.sh) for the agent and ldap-client"
+compose exec -T target-ldap cat /var/lib/ldap/tls/ca.pem >"$T/ldap-ca.pem" \
+  || fail "cannot read the CA of target-ldap"
+openssl x509 -in "$T/ldap-ca.pem" -noout -subject 2>/dev/null | grep -q "DataBastion dev LDAP CA" \
+  || fail "ldap-ca.pem is not the dev CA of target-ldap"
+! grep -q 'PRIVATE KEY' "$T/ldap-ca.pem" || fail "ldap-ca.pem holds a private key"
+chmod 0644 "$T/ldap-ca.pem"
+cp "$T/ldap-ca.pem" "$E2E_WORK_DIR/ldap/client/ca.pem"
+chmod 0644 "$E2E_WORK_DIR/ldap/client/ca.pem"
 
 phase_done start
 
@@ -474,6 +610,10 @@ printf '%s' "$TARGET_MYSQL_AGENT_PASSWORD" \
   | files_agent 'umask 077; cat > /secrets/target_mysql_agent_password'
 printf '%s' "$TARGET_MARIADB_AGENT_PASSWORD" \
   | files_agent 'umask 077; cat > /secrets/target_mariadb_agent_password'
+printf '%s' "$TARGET_MONGO_AGENT_PASSWORD" \
+  | files_agent 'umask 077; cat > /secrets/target_mongo_agent_password'
+printf '%s' "$TARGET_LDAP_AGENT_PASSWORD" \
+  | files_agent 'umask 077; cat > /secrets/target_ldap_agent_password'
 printf '%s' "$ENROLLMENT_TOKEN" | files_agent 'umask 077; cat > /secrets/enrollment_token'
 
 # --------------------------------------------------------------------------- enroll + run
@@ -524,7 +664,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ -n "$a" ] && jq -e '.status == "online"
       and any(.targets[]; .targetId == "pg-e2e" and .engine == "postgres" and .present and .reachable == true)
       and any(.targets[]; .targetId == "mysql-e2e" and .engine == "mysql" and .present and .reachable == true)
-      and any(.targets[]; .targetId == "mariadb-e2e" and .engine == "mariadb" and .present and .reachable == true)' \
+      and any(.targets[]; .targetId == "mariadb-e2e" and .engine == "mariadb" and .present and .reachable == true)
+      and any(.targets[]; .targetId == "mongo-e2e" and .engine == "mongodb" and .present and .reachable == true)
+      and any(.targets[]; .targetId == "ldap-e2e" and .engine == "openldap" and .present and .reachable == true)' \
       <<<"$a" >/dev/null; then
     online="$a"
     break
@@ -534,9 +676,9 @@ done
 if [ -z "$online" ]; then
   # Reachability and error codes only (lastError is a code, never a server message).
   log "last agent state: $(jq -c '{status, targets: [.targets[]? | {targetId, engine, present, reachable, lastError}]}' <<<"${a:-{\}}" 2>/dev/null || true)"
-  fail "agent not online with targets pg-e2e, mysql-e2e and mariadb-e2e reachable within 90 s"
+  fail "agent not online with targets pg-e2e, mysql-e2e, mariadb-e2e, mongo-e2e and ldap-e2e reachable within 90 s"
 fi
-for t in pg-e2e mysql-e2e mariadb-e2e; do
+for t in pg-e2e mysql-e2e mariadb-e2e mongo-e2e ldap-e2e; do
   log "agent online; target $t: $(jq -c --arg t "$t" '.targets[] | select(.targetId == $t) | {reachable, auditLevel, lastError}' <<<"$online")"
 done
 
@@ -659,7 +801,93 @@ for u in e2e_exporter e2e_analyst; do
   esac
   [ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 2 ] || fail "target-mariadb: $u has extra grants"
 done
+# The DCL test account: exactly the global CREATE USER privilege (no data access).
+grants="$(my_sql target-mariadb mariadb "SHOW GRANTS FOR 'e2e_admin'@'%'" | tr '\n' '|')" \
+  || fail "target-mariadb: cannot read the grants of e2e_admin"
+grants="${grants//\`/}"
+case "$grants" in
+  "GRANT CREATE USER ON *.* TO e2e_admin@%"*"|") ;;
+  *) fail "target-mariadb: e2e_admin has unexpected grants" ;;
+esac
+[ "$(grep -o 'GRANT' <<<"$grants" | wc -l)" = 1 ] || fail "target-mariadb: e2e_admin has extra grants"
 unset grants
+# DCL on the Audit path (phase 7): server_audit also logs QUERY_DCL from now on (after the
+# initialization, whose CREATE USER statements stay out of the log as with the dev settings).
+my_sql target-mariadb mariadb "SET GLOBAL server_audit_events = 'CONNECT,QUERY_DML,QUERY_DCL,TABLE'" \
+  >/dev/null || fail "target-mariadb: cannot add QUERY_DCL to server_audit_events"
+[ "$(my_sql target-mariadb mariadb "SELECT FIND_IN_SET('QUERY_DCL', @@global.server_audit_events) > 0")" = 1 ] \
+  || fail "target-mariadb: server_audit_events does not hold QUERY_DCL"
+
+# MongoDB agent account (ADR-0026, dev's initdb/10-seed.js), inspected as root, whose password is
+# read by mongosh from the Docker secret inside the target (never on a command line): exactly the
+# role databastionDiscovery of admin, whose only privileges are find + listCollections on `app`,
+# SCRAM-SHA-256 credentials only, one account named `databastion`; the Audit test accounts have
+# the built-in `read` on `app` only. Done before Audit starts: the root session is not in the part
+# of the server log the agent reads (its stream starts at the end of the file).
+# mongo_root JS: runs JS (no secret in it) in target-mongo with `c`, a root connection.
+mongo_root() {
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T -e HOME=/tmp -e DO_NOT_TRACK=1 target-mongo \
+    mongosh --nodb --quiet --norc --eval 'const c = connect("mongodb://root:" + encodeURIComponent(require("fs").readFileSync("/run/secrets/root_password", "utf8")) + "@127.0.0.1:27017/admin?authSource=admin");'"$1"
+}
+log "checking the agent's MongoDB account (ADR-0026, read-only: I4) and the Audit test accounts"
+# shellcheck disable=SC2016 # JavaScript, not shell
+acct="$(mongo_root 'const a = c.getSiblingDB("admin");
+  const u = (n) => a.getUser(n, {showPrivileges: true});
+  const d = u("databastion");
+  print(JSON.stringify({roles: d.roles, mechanisms: d.mechanisms, privileges: d.inheritedPrivileges,
+    restrictions: d.authenticationRestrictions || [], n: a.system.users.countDocuments({user: "databastion"}),
+    clients: ["e2e_exporter", "e2e_analyst"].map((n) => ({roles: u(n).roles, mechanisms: u(n).mechanisms}))}));')" \
+  || fail "target-mongo: cannot inspect the agent account"
+jq -e '.roles == [{"role": "databastionDiscovery", "db": "admin"}]
+  and .mechanisms == ["SCRAM-SHA-256"] and .n == 1
+  and (.privileges | length) == 1
+  and .privileges[0].resource == {"db": "app", "collection": ""}
+  and (.privileges[0].actions | sort) == ["find", "listCollections"]
+  and all(.clients[]; .roles == [{"role": "read", "db": "app"}] and .mechanisms == ["SCRAM-SHA-256"])' \
+  <<<"$acct" >/dev/null || fail "target-mongo: unexpected accounts (not printed)"
+unset acct
+# mongod appends to the log file prepared above (0640, group 999: the agent's supplementary group).
+mode="$(compose exec -T target-mongo stat -c '%u:%g %a' /var/log/databastion/mongod.log)" \
+  || fail "target-mongo: cannot stat its log file"
+[ "$mode" = "999:999 640" ] || fail "target-mongo: mongod.log is '$mode', expected '999:999 640'"
+
+# OpenLDAP (ADR-0029 decision 4, dev/openldap/config.ldif): the Audit test clients get read access
+# to the data database (they bind with their own DN; the agent's DN keeps its ACL), through ldapi as
+# root (cn=config: not in cn=accesslog). Then the ACLs and the accesslog settings are checked as
+# root: the credential attributes readable by nobody but their entry, the tree readable by the
+# service DN and the two clients only, cn=accesslog by the service DN and the rootDN only; reads,
+# writes and sessions logged, failed operations included (olcAccessLogSuccess FALSE: the Full level
+# of decision 10). The DNs hold ground-truth values: fed on stdin, compared, never printed.
+ldap_root() {
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-ldap "$@"
+}
+log "OpenLDAP: read access for the Audit test clients (cn=config over ldapi), then checking the ACLs"
+{
+  printf 'dn: olcDatabase={2}mdb,cn=config\nchangetype: modify\ndelete: olcAccess\nolcAccess: {1}\n-\n'
+  printf 'add: olcAccess\nolcAccess: {1}to * by dn.exact="%s" read by dn.exact="%s" read by dn.exact="%s" read by self read by * none\n' \
+    "$LDAP_SERVICE_DN" "${LDAP_CLIENT_DN[exporter]}" "${LDAP_CLIENT_DN[analyst]}"
+} | ldap_root ldapmodify -Q -Y EXTERNAL -H ldapi:/// >/dev/null 2>"$E2E_WORK_DIR/ldap-acl.err" \
+  || fail "target-ldap: cannot set the clients' ACL ($(grep -m 1 -oE '\([0-9]+\)' "$E2E_WORK_DIR/ldap-acl.err" || true))"
+rm -f -- "$E2E_WORK_DIR/ldap-acl.err"
+for b in 'olcDatabase={1}mdb,cn=config' 'olcDatabase={2}mdb,cn=config' \
+    'olcOverlay={0}accesslog,olcDatabase={2}mdb,cn=config'; do
+  ldap_root ldapsearch -Q -Y EXTERNAL -H ldapi:/// -LLL -o ldif_wrap=no -b "$b" -s base \
+    olcAccess olcAccessLogOps olcAccessLogSuccess olcAccessLogDB
+done >"$E2E_WORK_DIR/ldap-acl.ldif" || fail "target-ldap: cannot read cn=config"
+{
+  printf 'dn: olcDatabase={1}mdb,cn=config\n'
+  printf 'olcAccess: {0}to * by dn.exact="%s" read by dn.exact="cn=admin,dc=example,dc=org" read by * none\n\n' \
+    "$LDAP_SERVICE_DN"
+  printf 'dn: olcDatabase={2}mdb,cn=config\n'
+  printf 'olcAccess: {0}to attrs=userPassword,userPKCS12 by self =xw by anonymous auth by * none\n'
+  printf 'olcAccess: {1}to * by dn.exact="%s" read by dn.exact="%s" read by dn.exact="%s" read by self read by * none\n\n' \
+    "$LDAP_SERVICE_DN" "${LDAP_CLIENT_DN[exporter]}" "${LDAP_CLIENT_DN[analyst]}"
+  printf 'dn: olcOverlay={0}accesslog,olcDatabase={2}mdb,cn=config\n'
+  printf 'olcAccessLogDB: cn=accesslog\nolcAccessLogOps: reads writes session\nolcAccessLogSuccess: FALSE\n\n'
+} >"$E2E_WORK_DIR/ldap-acl.expected"
+cmp -s "$E2E_WORK_DIR/ldap-acl.ldif" "$E2E_WORK_DIR/ldap-acl.expected" \
+  || fail "target-ldap: unexpected ACLs or accesslog settings (not printed: they name the clients' DNs)"
+rm -f -- "$E2E_WORK_DIR/ldap-acl.ldif" "$E2E_WORK_DIR/ldap-acl.expected"
 
 log "checking /metrics (scraped inside the console network, not through the proxy)"
 metrics="$(timeout 30 docker compose -f "$HERE/docker-compose.yml" exec -T web node -e '
@@ -708,15 +936,19 @@ console_sql() {
 #                                 statement text (no literal positive control possible)
 # audit_client_<c>_log_user_records FILE ACCOUNT START  audit records of ACCOUNT since START
 # audit_client_<c>_time           current time in the log's timestamp format
+# Optional: audit_client_<c>_dcl (+ _has_dcl) the password-bearing DCL test; _forbidden_notes
+# heartbeat note codes the target must not report; _i2_args extra `i2_check.py audit` options.
+# A principal `@fingerprint` stands for a principal sent as a fingerprint (OpenLDAP entry DNs).
 # Client output never reaches a log: result rows go to /dev/null in the container, and errors
 # (which may echo a statement holding a literal) to a private file; only exit codes are printed.
 
 # client_error_code: the error code of the last client failure (client.err), never its text (it
 # can echo a statement holding a literal, or rows): `ERROR 1227` (mariadb), `ERROR 42P01` (psql with
-# VERBOSITY=sqlstate), `mariadb-dump: Got error: 1045`, `pg_dump: error`; `none` otherwise.
+# VERBOSITY=sqlstate), `mariadb-dump: Got error: 1045`, `pg_dump: error`, the failing libldap call
+# (`ldap_sasl_bind`), mongodump's `Failed:` or a mongosh error class; `none` otherwise.
 client_error_code() {
   local code
-  code="$(grep -m 1 -oE '^ERROR [0-9]+|ERROR: +[0-9A-Z]{5}$|^(pg_dump|mariadb-dump|mysqldump): (Got )?error(: [0-9]+)?' \
+  code="$(grep -m 1 -oE '^ERROR [0-9]+|ERROR: +[0-9A-Z]{5}$|^(pg_dump|mariadb-dump|mysqldump): (Got )?error(: [0-9]+)?|^ldap_[a-z_]+|Failed:|Mongo[A-Za-z]*Error' \
     "$E2E_WORK_DIR/client.err" 2>/dev/null | head -n 1 | tr -s ' ')"
   printf '%s' "${code:-none}"
 }
@@ -846,6 +1078,245 @@ audit_client_my_log_user_records() {
     && substr($1, 1, 17) >= t' "$1" | wc -l
 }
 audit_client_my_time() { date -u +'%Y%m%d %H:%M:%S'; }
+
+# Password-bearing DCL on the Audit path (ROADMAP phase 7): e2e_admin creates a role and changes its
+# password with the two passwords of the DCL registry ($DCLP), fed on stdin (never on a command
+# line). The agent must report the statements as `dcl` events of e2e_admin, and neither password
+# may reach the console (checked with the I2 scans). pgaudit (`role` class) needs the dev image:
+# not in the local E2E_PG_AUDIT=pss mode.
+audit_client_pg_has_dcl() { [ "$E2E_PG_AUDIT" = pgaudit ]; }
+audit_client_pg_dcl() {
+  local sql="$E2E_WORK_DIR/client.sql"
+  {
+    printf "CREATE USER e2e_dcl_probe PASSWORD '%s';\n" "$(cat "$DCLP/dcl_password_1")"
+    printf "ALTER ROLE e2e_dcl_probe PASSWORD '%s';\n" "$(cat "$DCLP/dcl_password_2")"
+  } >"$sql"
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  pg_client 'PGPASSWORD="$(cat /run/secrets/target_client_password)" exec psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate -U e2e_admin -f -' \
+    <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
+  rm -f -- "$sql"
+}
+audit_client_my_has_dcl() { true; }
+audit_client_my_dcl() {
+  local sql="$E2E_WORK_DIR/client.sql"
+  {
+    printf "CREATE USER 'e2e_dcl_probe'@'%%' IDENTIFIED BY '%s';\n" "$(cat "$DCLP/dcl_password_1")"
+    printf "ALTER USER 'e2e_dcl_probe'@'%%' IDENTIFIED BY '%s';\n" "$(cat "$DCLP/dcl_password_2")"
+  } >"$sql"
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  my_client 'MYSQL_PWD="$(cat /run/secrets/target_client_password)" exec mariadb -h mariadb --ssl-ca=/etc/e2e/mariadb-ca.pem -u e2e_admin' \
+    <"$sql" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
+  rm -f -- "$sql"
+}
+# has_dcl CLIENT: whether the client runs the DCL test.
+has_dcl() { declare -F "audit_client_${1}_dcl" >/dev/null && "audit_client_${1}_has_dcl"; }
+DCL_PRINCIPAL=e2e_admin
+# What the target's own audit log keeps of the DCL passwords (audit_verify): both sources mask them,
+# so neither password (nor a window or an encoded form of it) may be there, and the masked statement
+# must be (not vacuous: a filter change dropping DCL would otherwise pass). pgaudit redacts all text
+# after the `password` token of CREATE/ALTER ROLE (pgaudit.c, TOKEN_REDACTED "<REDACTED>");
+# server_audit replaces the password by ***** (measured on MariaDB 11.4 for every password form,
+# agent/crates/connector-mysql/README.md). These halves prove the sources' masking only; the agent's
+# own redaction of DCL text is covered by the classifier and connector tests (a source that keeps
+# the password, e.g. pg_stat_statements, is a follow-up).
+audit_client_pg_dcl_masked() { printf '%s' 'e2e_dcl_probe.*<REDACTED>'; }
+audit_client_my_dcl_masked() { printf '%s' 'e2e_dcl_probe.*[*]{5}'; }
+# DCL statements the target's audit log records, so `dcl` events to wait for. pgaudit (`role`): both.
+# server_audit: CREATE USER only. Its QUERY_DCL class (plugin/server_audit/server_audit.c, MariaDB
+# 11.4) is CREATE/DROP/RENAME USER, CREATE/DROP ROLE, GRANT and REVOKE: ALTER USER is in no class
+# but QUERY (every statement), so a password change by ALTER USER is not in the log the agent reads
+# (engine limit, docs/08). The statement still runs: its password must not reach the console either.
+audit_client_pg_dcl_statements() { printf 2; }
+audit_client_my_dcl_statements() { printf 1; }
+# dcl_scan [i2_check.py scan options...] PATH...: the two DCL passwords searched by i2_check.py
+# (--secret-file: case-insensitive, whole, every 16-character window, base64 / base64url at the three
+# byte alignments and hex, in the raw, JSON, URL, HTML, SQL and LDIF views). Prints needle ids
+# (S.dcl_password_<n>[.<form>]) and file names only; exit 1 on any hit, 2 on an error.
+dcl_scan() {
+  timeout 300 python3 "$I2_CHECK" scan --secret-file "$DCLP/dcl_password_1" \
+    --secret-file "$DCLP/dcl_password_2" "$@"
+}
+
+# MongoDB (target-mongo, Community: the structured JSON server log, ADR-0027). The accounts
+# e2e_exporter / e2e_analyst of `admin` come from target-initdb/mongo-20-clients.js; the principal
+# is `name@authdb`. mongodump declares itself (appName), hence signature.mongodump.
+mongo_client() {
+  timeout 300 docker compose -f "$HERE/docker-compose.yml" --profile tools run --rm -T --no-deps \
+    mongo-client "$1"
+}
+audit_client_mongo_started() { printf 'audit source: log file'; }
+# The server log records slow operations only: Limited at most, never Full (ADR-0027 decision 2).
+audit_client_mongo_levels() { printf 'limited'; }
+audit_client_mongo_source() { printf 'mongodb_log'; }
+audit_client_mongo_principals() { printf 'e2e_exporter@admin e2e_analyst@admin'; }
+audit_client_mongo_object_sets() { printf 2; }  # app.users (two filtered finds), app.integrations
+audit_client_mongo_query_statements() { printf 3; }  # the three finds
+audit_client_mongo_query_signal() { printf 'shape.full_table_read'; }  # find({}) on integrations
+# Over-privilege notes check() must not report for the ADR-0026 account (no profiler grant either).
+audit_client_mongo_forbidden_notes() {
+  printf 'privilege.write_actions privilege.read_beyond_discovery privilege.cluster_actions '
+  printf 'privilege.any_database privilege.system_collections privilege.not_evaluated'
+}
+audit_client_mongo_dump() {
+  # The password goes from the secret file into a mongodump --config file (YAML) in the client's
+  # tmpfs, never on a command line (printf is a shell builtin); the archive goes to /dev/null.
+  # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+  mongo_client 'umask 077; printf "password: \"%s\"\n" "$(cat /run/secrets/target_client_password)" >/tmp/dump.yaml
+    exec mongodump --quiet --config=/tmp/dump.yaml --host=target-mongo --port=27017 --username=e2e_exporter --authenticationDatabase=admin --authenticationMechanism=SCRAM-SHA-256 --db=app --archive' \
+    </dev/null >/dev/null 2>"$E2E_WORK_DIR/client.err"
+}
+audit_client_mongo_queries() {
+  local engine="$1" email iban email_id iban_id js="$E2E_WORK_DIR/client.js"
+  IFS=$'\t' read -r email_id email < <(gt_needle "$engine" - users email)
+  IFS=$'\t' read -r iban_id iban < <(gt_needle "$engine" - users iban)
+  [ -n "$email" ] && [ -n "$iban" ] || fail "no ground-truth e-mail / IBAN for the MongoDB literal queries"
+  # Plain JavaScript string literals: the values must hold no quote or backslash.
+  [[ "$email$iban" =~ ^[A-Za-z0-9@._+\ -]+$ ]] || fail "a MongoDB literal needs quoting (not printed)"
+  # Written to the private work directory, fed on stdin into the client's tmpfs: the literals are on
+  # no command line. The password is read by mongosh from the secret file (connect()).
+  {
+    printf 'const pw = require("fs").readFileSync("/run/secrets/target_client_password", "utf8");\n'
+    printf 'const c = connect("mongodb://e2e_analyst:" + encodeURIComponent(pw) + "@target-mongo:27017/app?authSource=admin&authMechanism=SCRAM-SHA-256");\n'
+    printf 'c.users.find({email: "%s"}).toArray();\n' "$email"
+    printf 'c.users.find({iban: "%s"}).toArray();\n' "$iban"
+    printf 'c.integrations.find({}).toArray();\n'
+  } >"$js"
+  unset email iban
+  mongo_client 'umask 077; cat >/tmp/q.js; exec mongosh --nodb --quiet --norc /tmp/q.js' \
+    <"$js" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
+  rm -f -- "$js"
+  printf '%s %s' "$email_id" "$iban_id"
+}
+# The structured JSON server log (the file the agent reads).
+audit_client_mongo_target_log() {
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-mongo \
+    cat /var/log/databastion/mongod.log >"$1"
+}
+audit_client_mongo_log_user_records() {
+  # Slow-query lines (id 51803) on a namespace of `app`, at or after START (YYYY-MM-DDTHH:MM:SS, UTC
+  # as mongod writes it in the image), of the connections (ctx) that authenticated as ACCOUNT
+  # (`name@authdb`; id 5286306 "Successfully authenticated": attr.user / attr.db, or
+  # principalName / authenticationDatabase). Lines that do not parse are skipped (fromjson?).
+  local user="${2%@*}" db="${2##*@}" ctxs
+  ctxs="$(jq -Rr --arg u "$user" --arg d "$db" --arg t "$3" 'fromjson? | select(.id == 5286306
+      and (.attr.user // .attr.principalName // "") == $u
+      and (.attr.db // .attr.authenticationDatabase // "") == $d
+      and (.t["$date"] // "")[0:19] >= $t) | .ctx' "$1" 2>/dev/null \
+    | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  jq -Rc --arg t "$3" --argjson ctx "${ctxs:-[]}" 'fromjson? | select(.id == 51803
+      and ((.attr.ns // "") | startswith("app."))
+      and (.t["$date"] // "")[0:19] >= $t
+      and (.ctx as $c | any($ctx[]; . == $c)))' "$1" 2>/dev/null | wc -l
+}
+audit_client_mongo_time() { date -u +'%Y-%m-%dT%H:%M:%S'; }
+
+# OpenLDAP (target-ldap, cn=accesslog read over LDAPS, ADR-0029). The two client entries are in
+# the seed (OpenLDAP seed + clients, above): their DNs are principals, sent as fingerprints, so the
+# dump principal is `@fingerprint` (i2_check.py) and the query principal `@fingerprint!<signal>`:
+# the fingerprinted principal none of whose events carries the bulk-search shape (the exporter's
+# bulk search does), so the analyst's events and incidents cannot be satisfied by the exporter's.
+# ldapsearch declares nothing: the "dump" is a bulk subtree search (shape.bulk_search, decision 8).
+ldap_client() {
+  timeout 300 docker compose -f "$HERE/docker-compose.yml" --profile tools run --rm -T --no-deps \
+    ldap-client "$1"
+}
+audit_client_ldap_started() { printf 'audit source: cn=accesslog'; }
+# The dev overlay logs reads and failed operations: Full (decision 10).
+audit_client_ldap_levels() { printf 'full'; }
+audit_client_ldap_source() { printf 'openldap_accesslog'; }
+audit_client_ldap_principals() { printf '@fingerprint @fingerprint!shape.bulk_search'; }
+audit_client_ldap_object_sets() { printf 1; }  # the objects of ou=people (both value filters)
+audit_client_ldap_query_statements() { printf 2; }  # the two searches
+audit_client_ldap_query_signal() { printf ''; }
+audit_client_ldap_forbidden_notes() {
+  printf 'privilege.password_attributes_readable privilege.config_readable '
+  printf 'privilege.accesslog_without_audit audit.accesslog_not_readable audit.reads_not_logged '
+  printf 'audit.failed_operations_not_logged'
+}
+# Every principal a fingerprint; the exporter and the analyst are two distinct ones that read, and
+# no other fingerprint on any event or incident (any action): exactly the two test clients, so none
+# of the agent's own reads, binds or probes surfaced as a fingerprint.
+audit_client_ldap_i2_args() { printf -- '--fingerprinted-only --min-fingerprints 2 --max-fingerprints 2'; }
+audit_client_ldap_dump() {
+  # The whole tree, subtree scope, presence filter: the LDIF-export shape. The bind DN comes from
+  # the exporter's ldaprc, the password from the secret file (-y).
+  ldap_client 'cd /etc/e2e/ldap && LDAPRC=exporter.ldaprc exec ldapsearch -x -y /run/secrets/target_client_password -LLL -o ldif_wrap=no -s sub "(objectClass=*)"' \
+    </dev/null >/dev/null 2>"$E2E_WORK_DIR/client.err"
+}
+audit_client_ldap_queries() {
+  local engine="$1" email phone email_id phone_id f="$E2E_WORK_DIR/client.filters"
+  IFS=$'\t' read -r email_id email < <(gt_needle "$engine" ou=people,dc=example,dc=org inetOrgPerson mail)
+  IFS=$'\t' read -r phone_id phone < <(gt_needle "$engine" ou=people,dc=example,dc=org inetOrgPerson telephonenumber)
+  [ -n "$email" ] && [ -n "$phone" ] || fail "no ground-truth e-mail / phone for the OpenLDAP literal queries"
+  # Assertion values without filter metacharacters (RFC 4515 escaping not needed).
+  [[ "$email$phone" =~ ^[A-Za-z0-9@._+\ -]+$ ]] || fail "an OpenLDAP literal needs escaping (not printed)"
+  # One filter per line, read by ldapsearch -f from the client's tmpfs (fed on stdin): the literals
+  # are on no command line. Pattern (|%s): each line is a complete filter.
+  printf '(mail=%s)\n(telephoneNumber=%s)\n' "$email" "$phone" >"$f"
+  unset email phone
+  ldap_client 'umask 077; cat >/tmp/filters; cd /etc/e2e/ldap && LDAPRC=analyst.ldaprc exec ldapsearch -x -y /run/secrets/target_client_password -LLL -o ldif_wrap=no -b ou=people,dc=example,dc=org -s sub -f /tmp/filters "(|%s)" dn' \
+    <"$f" >/dev/null 2>"$E2E_WORK_DIR/client.err" || return 1
+  rm -f -- "$f"
+  printf '%s %s' "$email_id" "$phone_id"
+}
+# cn=accesslog, exported offline as root in the target (slapcat reads the mdb database next to the
+# running slapd; no LDAP operation, so no record of its own), unwrapped. i2_check.py decodes its
+# base64 values (`ldif` view).
+audit_client_ldap_target_log() {
+  timeout 60 docker compose -f "$HERE/docker-compose.yml" exec -T target-ldap \
+    sh -c 'slapcat -F /etc/ldap/slapd.d -b cn=accesslog -o ldif_wrap=no 2>/dev/null' >"$1" || return 1
+  grep -q '^dn: ' "$1"
+}
+audit_client_ldap_log_user_records() {
+  # auditSearch records of the DN ACCOUNT (reqAuthzID, case-insensitive) at or after START
+  # (reqStart, YYYYMMDDHHMMSS UTC) on the data tree (reqDN under dc=example,dc=org).
+  awk -v RS= -v u="$(tr '[:upper:]' '[:lower:]' <<<"$2")" -v t="$3" '
+    /\nobjectClass: auditSearch(\n|$)/ {
+      a = ""; s = ""; d = ""
+      n = split($0, l, "\n")
+      for (i = 1; i <= n; i++) {
+        if (l[i] ~ /^reqAuthzID: /) a = tolower(substr(l[i], 13))
+        else if (l[i] ~ /^reqStart: /) s = substr(l[i], 11, 14)
+        else if (l[i] ~ /^reqDN: /) d = tolower(substr(l[i], 8))
+      }
+      if (a == u && s >= t && d ~ /(^|,)dc=example,dc=org$/) c++
+    }
+    END { print c + 0 }' "$1"
+}
+audit_client_ldap_time() { date -u +'%Y%m%d%H%M%S'; }
+
+# fp_without_sql TARGET SIGNAL: SQL subquery, the fingerprints of TARGET's events none of which
+# carries SIGNAL (`@fingerprint!SIGNAL`). One line (the dump poller reads its predicates by line).
+fp_without_sql() {
+  printf "(SELECT db_user_fingerprint FROM access_events WHERE agent_id = '%s' AND target_id = '%s'" \
+    "$AGENT_ID" "$1"
+  printf " AND db_user_fingerprint IS NOT NULL GROUP BY db_user_fingerprint HAVING NOT bool_or(signals ? '%s'))" "$2"
+}
+# principal_sql PRINCIPAL TARGET: SQL predicate on the `principal` column of TARGET's incidents.
+principal_sql() {
+  case "$1" in
+    @fingerprint) printf "principal ~ '^hmac-sha256:[0-9a-f]{64}\$'" ;;
+    "@fingerprint!"*) printf "principal IN %s" "$(fp_without_sql "$2" "${1#@fingerprint!}")" ;;
+    *) printf "principal = '%s'" "$1" ;;
+  esac
+}
+# query_events_sql PRINCIPAL DUMP_SIGNAL TARGET: SQL predicate on TARGET's access_events for the
+# query principal's events (`@fingerprint`: the fingerprinted events without the dump signal).
+query_events_sql() {
+  case "$1" in
+    @fingerprint)
+      printf "db_user IS NULL AND db_user_fingerprint IS NOT NULL AND NOT (signals ? '%s')" "$2" ;;
+    "@fingerprint!"*)
+      printf "db_user IS NULL AND db_user_fingerprint IN %s" "$(fp_without_sql "$3" "${1#@fingerprint!}")" ;;
+    *) printf "db_user = '%s'" "$1" ;;
+  esac
+}
+# client_fn CLIENT NAME [ARGS...]: the optional helper audit_client_<CLIENT>_<NAME>, or nothing.
+client_fn() {
+  local f="audit_client_${1}_${2}"
+  shift 2
+  if declare -F "$f" >/dev/null; then "$f" "$@"; fi
+}
 
 # --------------------------------------------------------------------------- Audit setup (P4-D)
 # As a user would, through the user API (admin session + CSRF): an e-mail channel to Mailpit, two
@@ -1002,6 +1473,23 @@ r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_READS" --ar
 [ "$(status_of "$r")" = 201 ] \
   || fail "policy '${AUDIT_POLICY_READS}': HTTP $(status_of "$r") ($(body_of "$r" | jq -c '{error, field}' 2>/dev/null || true))"
 assert_wakeup "the creation of policy '${AUDIT_POLICY_READS}'" "$t_policy"
+# Every DCL statement on the targets of the DCL test (phase 7: password-bearing DCL on the Audit
+# path): an incident and an e-mail, so the notification path is exercised with these events too.
+DCL_TARGET_IDS="$(for at in "${E2E_AUDIT_TARGETS[@]}"; do
+    read -r t _ c _ <<<"$at"; if has_dcl "$c"; then printf '%s\n' "$t"; fi
+  done | jq -Rsc 'split("\n") | map(select(length > 0))')"
+if [ "$DCL_TARGET_IDS" != "[]" ]; then
+  log "Audit: creating the access_event policy '${AUDIT_POLICY_DCL}' (medium) on $(jq -r 'join(", ")' <<<"$DCL_TARGET_IDS")"
+  t_policy="$(db_now)"
+  r="$(api_json POST /api/policies "$(jq -nc --arg name "$AUDIT_POLICY_DCL" --arg ch "$AUDIT_CHANNEL" \
+    --argjson targets "$DCL_TARGET_IDS" '{name: $name,
+    description: "Any DCL statement on a target of the DCL test (e2e)", source: "access_event",
+    conditions: {event_actions: ["dcl"], target_ids: $targets},
+    actions: [{type: "create_incident", severity: "medium"}, {type: "notify", channel: $ch}]}')")"
+  [ "$(status_of "$r")" = 201 ] \
+    || fail "policy '${AUDIT_POLICY_DCL}': HTTP $(status_of "$r") ($(body_of "$r" | jq -c '{error, field}' 2>/dev/null || true))"
+  assert_wakeup "the creation of policy '${AUDIT_POLICY_DCL}'" "$t_policy"
+fi
 
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
   read -r target _ client _ <<<"$at"
@@ -1092,7 +1580,7 @@ stable=0
 while :; do
   n="$(console_sql "SELECT string_agg(t.id || '=' || (SELECT count(*) FROM findings f
         WHERE f.agent_id = '${AGENT_ID}' AND f.target_id = t.id), ',' ORDER BY t.id)
-      FROM (VALUES ('pg-e2e'), ('mysql-e2e'), ('mariadb-e2e')) AS t(id)")" \
+      FROM (VALUES ('pg-e2e'), ('mysql-e2e'), ('mariadb-e2e'), ('mongo-e2e'), ('ldap-e2e')) AS t(id)")" \
     || fail "cannot count the findings"
   if [[ ! "$n" =~ =0(,|$) ]] && [ "$n" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
   [ "$stable" -ge 3 ] && break
@@ -1126,6 +1614,13 @@ findings_check pg-e2e postgresql \
 # table name) is a negative control: its raw name must not be stored anywhere.
 findings_check mysql-e2e mysql --require-expected-classifiers --forbid-negative-controls
 findings_check mariadb-e2e mariadb --require-expected-classifiers --forbid-negative-controls
+# MongoDB (release gate, end-of-phase-5 review M1) and OpenLDAP (release gate, phase 6): the same.
+# MongoDB's value-bearing names are dynamic keys (e-mails, phones: `contacts.<email>.phone`, the
+# negative control `members.<phone>.points`), stored under their normalized field
+# (`contacts.*.phone`); OpenLDAP's is a container named after a person (`ou=<name>,ou=teams,…`,
+# stored as `ou=*,ou=teams,…`), and the contractors' custom attributes (NIR, IBAN) must be found.
+findings_check mongo-e2e mongodb --require-expected-classifiers --forbid-negative-controls
+findings_check ldap-e2e openldap --require-expected-classifiers --forbid-negative-controls
 
 # The findings page renders the masked samples decrypted (they are encrypted at rest, so the
 # database dump cannot show a masking failure): it is scanned too, below. It must be complete
@@ -1165,15 +1660,16 @@ fetch_page() {
   [ "$code" = 200 ] || fail "page $2: HTTP $code"
 }
 
-# critical_incidents: the "Active: N critical" count of the incidents page (console UI, session,
-# through the TLS proxy). Only the dump policy opens critical incidents.
+# critical_incidents OUT: the "Active: N critical" count of the incidents page (console UI, session,
+# through the TLS proxy; the page is written to OUT). Only the dump policy opens critical incidents.
+# The cookie jar is only read (the dump poller runs it next to the foreground).
 critical_incidents() {
-  local code
-  code="$("${CURL[@]}" -o "$E2E_WORK_DIR/incidents-poll.html" -w '%{http_code}' "${BASE_URL}/incidents")" \
-    || code=000
+  local code out="$1"
+  code="$(curl -sS --max-time 40 --cacert "$T/ca.crt" \
+    --resolve "${HOSTNAME_CONSOLE}:${E2E_HTTPS_PORT}:127.0.0.1" -b "$E2E_WORK_DIR/cookies" \
+    -o "$out" -w '%{http_code}' "${BASE_URL}/incidents")" || code=000
   [ "$code" = 200 ] || return 1
-  sed 's/<!-- -->//g' "$E2E_WORK_DIR/incidents-poll.html" | grep -oE 'Active: [0-9]+ critical' \
-    | head -n 1 | grep -oE '[0-9]+'
+  sed 's/<!-- -->//g' "$out" | grep -oE 'Active: [0-9]+ critical' | head -n 1 | grep -oE '[0-9]+'
 }
 
 # mailpit_fetch OUT: every message of Mailpit as JSON (list summary, decoded message with its text
@@ -1192,16 +1688,65 @@ mailpit_fetch() {
     })().catch(() => process.exit(3));' >"$1"
 }
 
-audit_run() {
-  local target="$1" engine="$2" client="$3" account="$4" signal="$5"
-  local dump_p query_p prev cover n_sent n_missing n0 n t0 t_dump t_inc latency ids deadline st
-  local n_sets n_pending n_inc n_notif level source rc min_sets query_signal min_stmts n_stmts
-  local inc_ms db_latency
-  read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
-  min_sets="$("audit_client_${client}_object_sets")"
-  min_stmts="$("audit_client_${client}_query_statements")"
-  query_signal="$("audit_client_${client}_query_signal")"
+# The Audit targets run side by side (the waits overlap; the job time grows little per target):
+#   1. per target: audit.configure again (sensitive objects derived from the findings), the stream
+#      restart;
+#   2. per target, one after the other: the dump (its start t0 is the target's clock), then, while a
+#      background poller watches the incidents page and the console database for every started
+#      dump, the literal queries and the DCL statements of every target;
+#   3. every dump incident within 120 s of its own dump, on the page and by created_at;
+#   4. the events of every target stored and evaluated, their incidents opened, the notifications
+#      sent; then per target the heartbeat level and source, the notes, the notifications, the
+#      i2_check.py audit rows and the positive controls in the target's own audit log.
+AUDIT_POLL_DIR="$E2E_WORK_DIR/dump-poll"
+mkdir -p "$AUDIT_POLL_DIR"
 
+# dump_poller N0: in the background. Every second, for every target whose dump started
+# ($AUDIT_POLL_DIR/<target>.t0: "<t0 ms> <signal> <principal SQL>") and whose incident was not seen
+# yet: the incident of this target, the dump policy, the principal and the dump signal, created at
+# or after t0, must be in the console database AND the page's critical count must have risen by one
+# more than the incidents already seen (the count alone could be another incident). Writes
+# <target>.done "<page time ms> <created_at ms>", or "timeout" past the limit + 120 s (to print the
+# actual time). Returns once every started target is done and `all-started` exists.
+dump_poller() {
+  trap - EXIT INT TERM
+  set +e
+  local n0="$1" n f target t0 signal psql inc_ms seen pending now
+  while :; do
+    n="$(critical_incidents "$AUDIT_POLL_DIR/incidents-poll.html")"
+    # Dump incidents already seen (a timed-out target has none).
+    seen="$(cat "$AUDIT_POLL_DIR"/*.done 2>/dev/null | grep -vc '^timeout$')"
+    pending=0
+    for f in "$AUDIT_POLL_DIR"/*.t0; do
+      [ -e "$f" ] || continue
+      target="$(basename "$f" .t0)"
+      [ -s "$AUDIT_POLL_DIR/$target.done" ] && continue
+      pending=1
+      read -r t0 signal psql <"$f"
+      now="$(now_ms)"
+      if [ "$now" -gt $((t0 + DUMP_INCIDENT_LIMIT_MS + 120000)) ]; then
+        echo timeout >"$AUDIT_POLL_DIR/$target.done"
+        continue
+      fi
+      inc_ms="$(console_sql "SELECT floor(extract(epoch FROM min(created_at)) * 1000)::bigint
+        FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+          AND ${psql} AND policy_name = '${AUDIT_POLICY_DUMP}'
+          AND event_signals ? '${signal}' AND created_at >= to_timestamp(${t0} / 1000.0)" 2>/dev/null)"
+      if [ -n "$inc_ms" ] && [ -n "$n" ] && [ "$n" -ge $((n0 + seen + 1)) ]; then
+        printf '%s %s\n' "$now" "$inc_ms" >"$AUDIT_POLL_DIR/$target.done"
+        seen=$((seen + 1))
+      fi
+    done
+    [ -e "$AUDIT_POLL_DIR/all-started" ] && [ "$pending" = 0 ] && return 0
+    sleep 1
+  done
+}
+
+# audit_prepare TARGET CLIENT: Audit configured again, the sensitive objects derived from the
+# findings must cover every object with a finding (audit_configs.sent_objects); the stream restarts
+# from its cursor.
+audit_prepare() {
+  local target="$1" client="$2" prev cover n_sent n_missing
   prev="$(agent_log_count "$("audit_client_${client}_started")" "$target")"
   log "Audit ($target): configuring Audit again, sensitive objects derived from the findings"
   audit_configure "$target"
@@ -1218,69 +1763,73 @@ audit_run() {
     || fail "Audit ($target): sensitive_objects do not cover the objects with findings (sent ${n_sent:-?}, missing ${n_missing:-?})"
   log "Audit ($target): $n_sent sensitive object(s) sent, every object with a finding covered"
   wait_audit_stream "$target" "$prev" "$client"
+}
 
-  n0="$(critical_incidents)" || fail "cannot read the critical incident count on the incidents page"
-  log "Audit ($target): dump of the seeded database as $dump_p, from the ${client}-client container"
+# audit_dump TARGET CLIENT SIGNAL: the dump, from the client container, as the dump principal; its
+# start is handed to the poller.
+audit_dump() {
+  local target="$1" client="$2" signal="$3" dump_p t0 rc=0
+  read -r dump_p _ <<<"$("audit_client_${client}_principals")"
+  log "Audit ($target): dump of the seeded data as $dump_p, from the ${client}-client container"
   t0="$(now_ms)"
-  "audit_client_${client}_dump" \
-    || fail "the dump of $target failed (exit $?, $(client_error_code); client output kept private)"
-  t_dump="$(now_ms)"
-  log "Audit ($target): dump finished in $((t_dump - t0)) ms; waiting for its incident on the incidents page"
-  # The page count must rise AND the console must hold the incident of this target, this principal
-  # and the dump policy, opened after the dump started (the count alone could be another incident).
-  t_inc=""
-  inc_ms=""
-  deadline=$(( t0 + DUMP_INCIDENT_LIMIT_MS + 120000 ))  # past the limit: to print the actual time
-  while [ "$(now_ms)" -lt "$deadline" ]; do
-    n="$(critical_incidents || true)"
-    if [ -n "$n" ] && [ "$n" -gt "$n0" ]; then
-      [ -n "$t_inc" ] || t_inc="$(now_ms)"
-      inc_ms="$(console_sql "SELECT floor(extract(epoch FROM min(created_at)) * 1000)::bigint
-        FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
-          AND principal = '${dump_p}' AND policy_name = '${AUDIT_POLICY_DUMP}'
-          AND event_signals ? '${signal}' AND created_at >= to_timestamp(${t0} / 1000.0)")" \
-        || fail "cannot read the incidents of $target"
-      [ -n "$inc_ms" ] && break
-    fi
-    sleep 1
-  done
-  [ -n "$t_inc" ] && [ -n "$inc_ms" ] \
-    || fail "Audit ($target): no '${AUDIT_POLICY_DUMP}' incident of $dump_p with $signal on the console within $(( (deadline - t0) / 1000 )) s of the dump"
-  latency=$((t_inc - t0))
-  db_latency=$((inc_ms - t0))
-  log "Audit ($target): dump start -> incident: ${latency} ms on the incidents page, ${db_latency} ms by incidents.created_at (limit ${DUMP_INCIDENT_LIMIT_MS} ms)"
-  AUDIT_LATENCIES+="$target ${latency} ms (created_at ${db_latency} ms); "
-  [ "$latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] && [ "$db_latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] \
-    || fail "Audit ($target): dump -> incident took ${latency} ms (page) / ${db_latency} ms (created_at), not under ${DUMP_INCIDENT_LIMIT_MS} ms"
+  "audit_client_${client}_dump" || rc=$?
+  [ "$rc" = 0 ] || fail "the dump of $target failed (exit $rc, $(client_error_code); client output kept private)"
+  printf '%s %s %s\n' "$t0" "$signal" "$(principal_sql "$dump_p" "$target")" >"$AUDIT_POLL_DIR/$target.t0"
+  AUDIT_T0[$target]="$t0"
+  log "Audit ($target): dump finished in $(( $(now_ms) - t0 )) ms"
+}
 
+# audit_queries TARGET ENGINE CLIENT: the literal queries as the query principal, then the DCL
+# statements (clients with a DCL test).
+audit_queries() {
+  local target="$1" engine="$2" client="$3" query_p ids rc=0
+  read -r _ query_p <<<"$("audit_client_${client}_principals")"
   log "Audit ($target): queries with ground-truth literals as $query_p (see audit_client_${client}_queries)"
-  ids="$("audit_client_${client}_queries" "$engine")" \
-    || fail "the literal queries on $target failed (step $?, $(client_error_code); client output kept private)"
+  ids="$("audit_client_${client}_queries" "$engine")" || rc=$?
+  [ "$rc" = 0 ] || fail "the literal queries on $target failed (step $rc, $(client_error_code); client output kept private)"
   [ -n "$ids" ] || fail "the literal queries on $target returned no needle id"
+  AUDIT_IDS[$target]="$ids"
   AUDIT_LITERALS[$engine]="${AUDIT_LITERALS[$engine]:-} $ids"
+  # OpenLDAP: the clients' DNs (ground-truth names) are followed like the literals.
+  [ "$engine" != openldap ] || AUDIT_LITERALS[$engine]+="$LDAP_CLIENT_NEEDLES"
+  if has_dcl "$client"; then
+    log "Audit ($target): password-bearing DCL (CREATE USER, ALTER ... PASSWORD / IDENTIFIED BY) as $DCL_PRINCIPAL"
+    rc=0
+    "audit_client_${client}_dcl" || rc=$?
+    [ "$rc" = 0 ] || fail "the DCL statements on $target failed (exit $rc, $(client_error_code); client output kept private)"
+  fi
+}
 
-  log "Audit ($target): waiting for the events of $query_p, their evaluation and the notifications (at most ${AUDIT_EVENTS_TIMEOUT_S} s)"
-  deadline=$(( $(date +%s) + AUDIT_EVENTS_TIMEOUT_S ))
-  while :; do
-    st="$(console_sql "SELECT concat_ws(',',
-        (SELECT count(DISTINCT objects::text) FROM access_events
-          WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${query_p}'),
-        (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
-          WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${query_p}'
-            AND action = 'read'),
-        (SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND evaluated_at IS NULL),
-        (SELECT count(*) FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
-          AND principal = '${query_p}' AND policy_name = '${AUDIT_POLICY_READS}'),
-        (SELECT count(*) FROM notification_deliveries WHERE status IN ('pending', 'sending')))")" \
-      || fail "cannot read the Audit state of $target"
-    IFS=, read -r n_sets n_stmts n_pending n_inc n_notif <<<"$st"
-    # Every literal-bearing statement was ingested: the positive control below then shows the
-    # literals were in the source the agent read.
-    [ "$n_sets" -ge "$min_sets" ] && [ "$n_stmts" -ge "$min_stmts" ] && [ "$n_pending" = 0 ] && [ "$n_inc" -ge 1 ] && [ "$n_notif" = 0 ] && break
-    [ "$(date +%s)" -lt "$deadline" ] || fail "Audit ($target): events of $query_p not all stored, evaluated and notified within ${AUDIT_EVENTS_TIMEOUT_S} s (object sets $n_sets/$min_sets, read statements $n_stmts/$min_stmts, not evaluated $n_pending, incidents $n_inc, notifications pending $n_notif)"
-    sleep 2
-  done
-  log "Audit ($target): $n_stmts read statement(s) on $n_sets object set(s) of $query_p stored and evaluated"
+# audit_state TARGET CLIENT SIGNAL: "<object sets>,<read statements>,<incidents>,<dcl statements>,
+# <dcl incidents>" of the query principal (and of the DCL principal) on TARGET.
+audit_state() {
+  local target="$1" client="$2" signal="$3" query_p qsql
+  read -r _ query_p <<<"$("audit_client_${client}_principals")"
+  qsql="$(query_events_sql "$query_p" "$signal" "$target")"
+  console_sql "SELECT concat_ws(',',
+      (SELECT count(DISTINCT objects::text) FROM access_events
+        WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND ${qsql}),
+      (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
+        WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND ${qsql} AND action = 'read'),
+      (SELECT count(*) FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+        AND $(principal_sql "$query_p" "$target") AND policy_name = '${AUDIT_POLICY_READS}'),
+      (SELECT coalesce(sum(aggregated_count), 0) FROM access_events
+        WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}' AND db_user = '${DCL_PRINCIPAL}'
+          AND action = 'dcl'),
+      (SELECT count(*) FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+        AND principal = '${DCL_PRINCIPAL}' AND policy_name = '${AUDIT_POLICY_DCL}'))"
+}
+
+# audit_verify TARGET ENGINE CLIENT ACCOUNT SIGNAL: once every event is in, the heartbeat level,
+# source and notes, the events and incidents against the ground truth (i2_check.py audit) and the
+# positive controls in the target's own audit log.
+audit_verify() {
+  local target="$1" engine="$2" client="$3" account="$4" signal="$5"
+  local dump_p query_p query_signal level source deadline notes code rc id ids n masked
+  local -a extra=() needles=()
+  read -r dump_p query_p <<<"$("audit_client_${client}_principals")"
+  query_signal="$("audit_client_${client}_query_signal")"
+  ids="${AUDIT_IDS[$target]}"
 
   # check() level and source, from a heartbeat (every 30 s) once the stream has read events.
   deadline=$(( $(date +%s) + 90 ))
@@ -1292,50 +1841,80 @@ audit_run() {
     [ "$(date +%s)" -lt "$deadline" ] || fail "Audit ($target): heartbeat audit level '${level:-?}' / source '${source:-?}', expected one of '$("audit_client_${client}_levels")' / '$("audit_client_${client}_source")'"
     sleep 3
   done
-  log "Audit ($target): heartbeat audit level $level, source $source"
-
-  # Notifications: every delivery sent, and the dump incident's e-mail received by Mailpit.
-  st="$(console_sql "SELECT count(*) FILTER (WHERE status = 'delivered') || ',' ||
-      count(*) FILTER (WHERE status NOT IN ('delivered')) || ',' ||
-      coalesce(string_agg(DISTINCT last_error, ' ') FILTER (WHERE status <> 'delivered'), '-')
-    FROM notification_deliveries WHERE channel_slug = '${AUDIT_CHANNEL}'")" \
-    || fail "cannot read the notification deliveries"
-  IFS=, read -r n_sent n_notif rc <<<"$st"
-  [ "$n_sent" -ge 1 ] && [ "$n_notif" = 0 ] \
-    || fail "notifications to ${AUDIT_CHANNEL}: $n_sent delivered, $n_notif not delivered (error codes: $rc)"
-  mailpit_fetch "$AUDIT_DIR/mail.json" || fail "cannot read the Mailpit messages"
-  jq -e --arg p "$AUDIT_POLICY_DUMP" 'any(.[]; (.summary.Subject // "") | contains($p))' \
-    "$AUDIT_DIR/mail.json" >/dev/null || fail "Mailpit has no e-mail for the '$AUDIT_POLICY_DUMP' incident"
-  log "Audit ($target): $n_sent notification(s) delivered; Mailpit holds $(jq length "$AUDIT_DIR/mail.json") message(s), the dump incident's included"
+  # Notes: closed codes (and counts) only. The account's over-privileges and the audit
+  # prerequisites the target must not report.
+  notes="$(agent_json | jq -r --arg t "$target" '[.targets[] | select(.targetId == $t) | .notes[]?.code] | join(" ")')"
+  log "Audit ($target): heartbeat audit level $level, source $source; notes: ${notes:-none}"
+  # shellcheck disable=SC2046 # a list of note codes, split on purpose
+  for code in $(client_fn "$client" forbidden_notes); do
+    [[ " $notes " != *" $code "* ]] || fail "Audit ($target): the heartbeat reports $code"
+  done
 
   # Events and incidents of the target against the ground truth and the agent's own account.
   console_sql "SELECT coalesce(json_agg(json_build_object('db_user', db_user,
       'db_user_fingerprint', db_user_fingerprint, 'action', action, 'objects', objects,
-      'signals', signals, 'rows', rows, 'source', source) ORDER BY ts), '[]')
+      'signals', signals, 'rows', rows, 'source', source, 'aggregated_count', aggregated_count)
+      ORDER BY ts), '[]')
     FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
     >"$E2E_WORK_DIR/audit-events.json" || fail "cannot read the access events of $target"
   console_sql "SELECT coalesce(json_agg(json_build_object('policy_name', policy_name,
       'principal', principal, 'event_signals', event_signals, 'severity', severity) ORDER BY created_at), '[]')
     FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
     >"$E2E_WORK_DIR/audit-incidents.json" || fail "cannot read the incidents of $target"
+  read -r -a extra <<<"$(client_fn "$client" i2_args)"
+  if has_dcl "$client"; then
+    extra+=(--require-action "${DCL_PRINCIPAL}:dcl" --require-incident "${AUDIT_POLICY_DCL}:${DCL_PRINCIPAL}")
+  fi
   timeout 60 python3 "$I2_CHECK" audit --ground-truth "$GROUND_TRUTH" --engine "$engine" \
     --agent-account "$account" --events "$E2E_WORK_DIR/audit-events.json" \
     --incidents "$E2E_WORK_DIR/audit-incidents.json" \
     --require-event "${dump_p}:${signal}" --require-event "${query_p}${query_signal:+:$query_signal}" \
     --require-incident "${AUDIT_POLICY_DUMP}:${dump_p}:${signal}" \
-    --require-incident "${AUDIT_POLICY_READS}:${query_p}" >&2 \
+    --require-incident "${AUDIT_POLICY_READS}:${query_p}" "${extra[@]}" >&2 \
     || fail "Audit check of $target failed (see above)"
   rm -f -- "$E2E_WORK_DIR/audit-events.json" "$E2E_WORK_DIR/audit-incidents.json"
+  # Fingerprinted principals are the test clients only (OpenLDAP). Audit ran from before the
+  # Discovery scan to the first client operation of this target (its dump, AUDIT_T0), so that window
+  # held the agent's own reads, binds and probes only: none may have surfaced as a fingerprint.
+  # Stored event times have whole-second precision: the window ends at AUDIT_T0 floored to the
+  # second (else the dump's own events, in T0's second, would count as before it).
+  if [[ "$dump_p $query_p" == *@fingerprint* ]]; then
+    [[ "${AUDIT_T0[$target]:-}" =~ ^[0-9]+$ ]] || fail "Audit ($target): no dump start recorded"
+    n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}'
+        AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
+        AND ts < to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))")" \
+      || fail "cannot count the fingerprinted events of $target before its first client operation"
+    if [ "$n" != 0 ]; then
+      # Diagnostic without any value: action, delay before T0, and whose fingerprint it is (the
+      # exporter's: the one with a bulk search; the analyst's: the other one seen after T0).
+      console_sql "WITH pre AS (SELECT * FROM access_events WHERE agent_id = '${AGENT_ID}'
+            AND target_id = '${target}' AND db_user_fingerprint IS NOT NULL
+            AND ts < to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))),
+          post AS (SELECT db_user_fingerprint AS fp, bool_or(signals ? 'shape.bulk_search') AS bulk
+            FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'
+              AND db_user_fingerprint IS NOT NULL AND ts >= to_timestamp(floor(${AUDIT_T0[$target]} / 1000.0))
+            GROUP BY 1)
+        SELECT string_agg(pre.action || ' ' || round(${AUDIT_T0[$target]} - extract(epoch FROM pre.ts) * 1000)
+            || ' ms before T0, rows ' || coalesce(pre.rows::text, '-') || ', count '
+            || pre.aggregated_count || ', principal '
+            || CASE WHEN post.fp IS NULL THEN 'unknown (not a client after T0)'
+                    WHEN post.bulk THEN 'the exporter' ELSE 'the analyst' END, '; ')
+        FROM pre LEFT JOIN post ON post.fp = pre.db_user_fingerprint" >&2 || true
+      fail "Audit ($target): $n fingerprinted event(s) before the first client operation: the agent's own activity surfaced as a fingerprint"
+    fi
+    log "Audit ($target): no fingerprinted event before the first client operation (the agent's own reads during the Discovery scan)"
+  fi
 
-  # Positive control of the literal search: the literals are in the target's own audit log (the
-  # source side, which keeps statement text), so the queries did carry them to the agent.
+  # Positive control of the literal search: the literals (for OpenLDAP, the clients' DNs too) are in
+  # the target's own audit log (the source side, which keeps statement text, filters and DNs), so
+  # the clients did carry them to the agent.
+  [ "$engine" != openldap ] || ids+="$LDAP_CLIENT_NEEDLES"
   rc=0
   "audit_client_${client}_target_log" "$E2E_WORK_DIR/target-audit.log" || rc=$?
   if [ "$rc" = 3 ]; then
     log "Audit ($target): the $E2E_PG_AUDIT source keeps no statement text: no literal positive control"
   else
     [ "$rc" = 0 ] || fail "cannot read the audit log of $target"
-    local -a needles=()
     for id in $ids; do needles+=(--needle "$id"); done
     rc=0
     timeout 120 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine "$engine" \
@@ -1347,13 +1926,133 @@ audit_run() {
       fi
     done
     log "Audit ($target): the literals ($ids) are in the target's own audit log (positive control)"
+    if has_dcl "$client"; then
+      # The DCL passwords in the target's own audit log, searched as on the console side (below).
+      # The `dcl` events above prove the statements reached the agent.
+      rc=0
+      dcl_scan --label "$target target audit log (DCL passwords)" "$E2E_WORK_DIR/target-audit.log" \
+        >"$E2E_WORK_DIR/dcl-control.out" 2>&1 || rc=$?
+      if [ "$rc" != 0 ]; then
+        cat "$E2E_WORK_DIR/dcl-control.out" >&2
+        fail "Audit ($target): a DCL password (or part of it) is in the target's own audit log, which should mask it (exit $rc)"
+      fi
+      masked="$(client_fn "$client" dcl_masked)"
+      [ -n "$masked" ] || fail "Audit ($target): audit_client_${client}_dcl_masked is missing"
+      grep -qE "$masked" "$E2E_WORK_DIR/target-audit.log" \
+        || fail "Audit ($target): no masked DCL statement of e2e_dcl_probe in the target's own audit log"
+      log "Audit ($target): the DCL statements are in the target's own audit log, their passwords masked by the source"
+    fi
   fi
-  rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out"
+  rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out" \
+    "$E2E_WORK_DIR/dcl-control.out"
 }
+
+declare -A AUDIT_T0=() AUDIT_IDS=()
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ <<<"$at"
+  audit_prepare "$target" "$client"
+done
+n0="$(critical_incidents "$E2E_WORK_DIR/incidents-poll.html")" \
+  || fail "cannot read the critical incident count on the incidents page"
+log "Audit: dumps of every Audit target; a background poller times each dump -> incident (critical count before: $n0)"
+dump_poller "$n0" &
+DUMP_POLLER_PID=$!
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ signal <<<"$at"
+  audit_dump "$target" "$client" "$signal"
+done
+touch "$AUDIT_POLL_DIR/all-started"
+T_QUERIES="$(date +%s)"
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target engine client _ <<<"$at"
+  audit_queries "$target" "$engine" "$client"
+done
+log "Audit: client queries done in $(( $(date +%s) - T_QUERIES )) s; waiting for the dump incidents"
+wait "$DUMP_POLLER_PID" || fail "the dump -> incident poller failed"
+DUMP_POLLER_PID=""
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ signal <<<"$at"
+  read -r dump_p _ <<<"$("audit_client_${client}_principals")"
+  read -r t_inc inc_ms <"$AUDIT_POLL_DIR/$target.done" \
+    || fail "Audit ($target): the dump poller left no result"
+  [ "$t_inc" != timeout ] \
+    || fail "Audit ($target): no '${AUDIT_POLICY_DUMP}' incident of $dump_p with $signal on the console within $(( (DUMP_INCIDENT_LIMIT_MS + 120000) / 1000 )) s of the dump"
+  latency=$((t_inc - AUDIT_T0[$target]))
+  db_latency=$((inc_ms - AUDIT_T0[$target]))
+  log "Audit ($target): dump start -> incident: ${latency} ms on the incidents page, ${db_latency} ms by incidents.created_at (limit ${DUMP_INCIDENT_LIMIT_MS} ms)"
+  AUDIT_LATENCIES+="$target ${latency} ms (created_at ${db_latency} ms); "
+  [ "$latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] && [ "$db_latency" -lt "$DUMP_INCIDENT_LIMIT_MS" ] \
+    || fail "Audit ($target): dump -> incident took ${latency} ms (page) / ${db_latency} ms (created_at), not under ${DUMP_INCIDENT_LIMIT_MS} ms"
+done
+rm -rf -- "$AUDIT_POLL_DIR"
+
+log "Audit: waiting for the events of every target, their evaluation and the notifications (at most ${AUDIT_EVENTS_TIMEOUT_S} s)"
+deadline=$(( $(date +%s) + AUDIT_EVENTS_TIMEOUT_S ))
+while :; do
+  waiting=""
+  for at in "${E2E_AUDIT_TARGETS[@]}"; do
+    read -r target _ client _ signal <<<"$at"
+    st="$(audit_state "$target" "$client" "$signal")" || fail "cannot read the Audit state of $target"
+    IFS=, read -r n_sets n_stmts n_inc n_dcl n_dcl_inc <<<"$st"
+    # Every literal-bearing statement was ingested: the positive control then shows the literals
+    # were in the source the agent read. DCL: both statements, and their incident.
+    ok=1
+    [ "$n_sets" -ge "$("audit_client_${client}_object_sets")" ] \
+      && [ "$n_stmts" -ge "$("audit_client_${client}_query_statements")" ] && [ "$n_inc" -ge 1 ] || ok=0
+    if has_dcl "$client"; then
+      [ "$n_dcl" -ge "$("audit_client_${client}_dcl_statements")" ] && [ "$n_dcl_inc" -ge 1 ] || ok=0
+    fi
+    [ "$ok" = 1 ] || waiting+="$target (object sets $n_sets/$("audit_client_${client}_object_sets"), read statements $n_stmts/$("audit_client_${client}_query_statements"), incidents $n_inc, DCL statements $n_dcl, DCL incidents $n_dcl_inc); "
+  done
+  pending="$(console_sql "SELECT (SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND evaluated_at IS NULL)
+      || ',' || (SELECT count(*) FROM notification_deliveries WHERE status IN ('pending', 'sending'))")" \
+    || fail "cannot read the evaluation state"
+  IFS=, read -r n_pending n_notif <<<"$pending"
+  [ -z "$waiting" ] && [ "$n_pending" = 0 ] && [ "$n_notif" = 0 ] && break
+  [ "$(date +%s)" -lt "$deadline" ] || fail "Audit: events not all stored, evaluated and notified within ${AUDIT_EVENTS_TIMEOUT_S} s (${waiting}not evaluated $n_pending, notifications pending $n_notif)"
+  sleep 2
+done
+log "Audit: every target's events stored and evaluated ($(( $(date +%s) - deadline + AUDIT_EVENTS_TIMEOUT_S )) s)"
+
+# Notifications: every delivery sent, and the dump incident's e-mail received by Mailpit.
+st="$(console_sql "SELECT count(*) FILTER (WHERE status = 'delivered') || ',' ||
+    count(*) FILTER (WHERE status NOT IN ('delivered')) || ',' ||
+    coalesce(string_agg(DISTINCT last_error, ' ') FILTER (WHERE status <> 'delivered'), '-')
+  FROM notification_deliveries WHERE channel_slug = '${AUDIT_CHANNEL}'")" \
+  || fail "cannot read the notification deliveries"
+IFS=, read -r n_sent n_notif rc <<<"$st"
+[ "$n_sent" -ge 1 ] && [ "$n_notif" = 0 ] \
+  || fail "notifications to ${AUDIT_CHANNEL}: $n_sent delivered, $n_notif not delivered (error codes: $rc)"
+mailpit_fetch "$AUDIT_DIR/mail.json" || fail "cannot read the Mailpit messages"
+jq -e --arg p "$AUDIT_POLICY_DUMP" 'any(.[]; (.summary.Subject // "") | contains($p))' \
+  "$AUDIT_DIR/mail.json" >/dev/null || fail "Mailpit has no e-mail for the '$AUDIT_POLICY_DUMP' incident"
+# require_incident_mail TARGET POLICY: an incident of POLICY on TARGET has a delivered notification
+# to the e-mail channel, and Mailpit holds its e-mail: a text part naming both the incident id and
+# TARGET. Per target, so that the e-mail I2 scan below reads the notifications of every engine.
+require_incident_mail() {
+  local target="$1" policy="$2" ids
+  ids="$(console_sql "SELECT coalesce(json_agg(DISTINCT i.id::text), '[]') FROM incidents i
+      JOIN notification_deliveries d ON d.incident_id = i.id
+    WHERE i.agent_id = '${AGENT_ID}' AND i.target_id = '${target}' AND i.policy_name = '${policy}'
+      AND d.channel_slug = '${AUDIT_CHANNEL}' AND d.status = 'delivered'")" \
+    || fail "cannot read the notifications of the '$policy' incidents of $target"
+  jq -e 'type == "array" and length > 0' <<<"$ids" >/dev/null \
+    || fail "Audit ($target): no delivered notification of a '$policy' incident to ${AUDIT_CHANNEL}"
+  jq -e --argjson ids "$ids" --arg t "$target" 'any(.[]; (.message.Text // "") as $x
+      | ($x | contains($t)) and any($ids[]; . as $i | $x | contains($i)))' \
+    "$AUDIT_DIR/mail.json" >/dev/null \
+    || fail "Audit ($target): Mailpit has no e-mail naming $target and its '$policy' incident"
+}
+for at in "${E2E_AUDIT_TARGETS[@]}"; do
+  read -r target _ client _ <<<"$at"
+  require_incident_mail "$target" "$AUDIT_POLICY_DUMP"
+  if has_dcl "$client"; then require_incident_mail "$target" "$AUDIT_POLICY_DCL"; fi
+done
+log "Audit: $n_sent notification(s) delivered; Mailpit holds $(jq length "$AUDIT_DIR/mail.json") message(s), the dump incident e-mail of every Audit target (and the DCL one of every DCL target) included"
 
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
   read -r target engine client account signal <<<"$at"
-  audit_run "$target" "$engine" "$client" "$account" "$signal"
+  audit_verify "$target" "$engine" "$client" "$account" "$signal"
 done
 log "Audit: dump -> incident latency: ${AUDIT_LATENCIES}"
 # Pages and user API answers that show the agent and its targets' Audit state (target notes, audit
@@ -1365,8 +2064,11 @@ for at in "${E2E_AUDIT_TARGETS[@]}"; do
   fetch_page "audit-settings-$target" "/agents/${AGENT_ID}/targets/${target}/audit"
 done
 # No event of this run carries a db_user_fingerprint (no failed or unknown login was made while
-# Audit ran: one would mean a principal the agent could not name).
-n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL")" \
+# Audit ran: one would mean a principal the agent could not name), except on the OpenLDAP target,
+# where every principal but the agent's is an entry DN sent as a fingerprint (checked above by
+# i2_check.py audit --fingerprinted-only).
+n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL
+    AND target_id <> 'ldap-e2e'")" \
   || fail "cannot count the fingerprinted events"
 [ "$n" = 0 ] || fail "$n access event(s) carry a db_user_fingerprint"
 # Every accepted events batch woke the policy engine (see assert_wakeup).
@@ -1500,7 +2202,8 @@ timeout 120 docker compose -f "$HERE/docker-compose.yml" exec -T db \
 grep -q '^CREATE TABLE ' "$db_dump" || fail "the console database dump holds no table"
 for name in agent_secret enrollment_token admin_password target_pg_password target_agent_password \
     target_client_password target_mysql_password target_mysql_agent_password \
-    target_mariadb_password target_mariadb_agent_password mailpit_password; do
+    target_mariadb_password target_mariadb_agent_password target_mongo_password \
+    target_mongo_agent_password target_ldap_password target_ldap_agent_password mailpit_password; do
   [ -s "$P/$name" ] || fail "secret $name was never registered"
 done
 # Every registered secret (the whole registry, not a list).
@@ -1583,10 +2286,12 @@ while IFS=, read -r target key; do
   n_pages=$((n_pages + 1))
 done < <(console_sql "SELECT target_id || ',' || principal_key FROM principal_baselines WHERE agent_id = '${AGENT_ID}'")
 [ "$n_pages" -gt 0 ] || fail "no incident or principal page to scan"
-# The events and incidents pages list what the test did (the query principal is shown).
+# The events and incidents pages list what the test did (the query principal is shown; a
+# fingerprinted one has no name to look for).
 for at in "${E2E_AUDIT_TARGETS[@]}"; do
   read -r _ _ client _ <<<"$at"
   read -r _ query_p <<<"$("audit_client_${client}_principals")"
+  [[ "$query_p" != @* ]] || continue
   for page in events incidents; do
     grep -qF "$query_p" "$AUDIT_DIR/pages/$page.html" || fail "the $page page does not list $query_p"
   done
@@ -1597,7 +2302,7 @@ mailpit_fetch "$AUDIT_DIR/mail.json" || fail "cannot read the Mailpit messages"
 # (so the scan reads real notification bodies).
 AUDIT_WORDS="$(for at in "${E2E_AUDIT_TARGETS[@]}"; do
     read -r t _ c _ <<<"$at"; printf '%s\n' "$t"; "audit_client_${c}_principals" | tr ' ' '\n'; echo
-  done | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
+  done | jq -Rsc 'split("\n") | map(select(length > 0 and (startswith("@") | not))) | unique')"
 jq -e --argjson w "$AUDIT_WORDS" 'all(.[]; (.message.Text // "") as $t
     | ($t | length) > 0 and any($w[]; . as $x | $t | contains($x)))' "$AUDIT_DIR/mail.json" >/dev/null \
   || fail "a Mailpit message has no text part naming an Audit target or principal"
@@ -1618,9 +2323,61 @@ for engine in "${!AUDIT_ENGINES[@]}"; do
     --exclude 'target-*.log' --exclude all.log \
     "$db_dump" "$E2E_LOG_DIR" "$E2E_WORK_DIR/findings-page.html" "$AUDIT_DIR" || i2_failed=1
 done
+# Password-bearing DCL on the Audit path (phase 7): neither password of the DCL statements, nor a
+# 16-character part or an encoded form of one, is in the console database, its Audit tables, the
+# pages, the e-mails, the findings page or the console, agent and proxy logs (dcl_scan: needle ids
+# and file names only). Positive controls: the `dcl` events of the DCL principal were required
+# above (i2_check.py audit --require-action), and the same scan found both passwords in target-pg's
+# own audit log (audit_verify).
+dcl_leaks=0
+if [ "$DCL_TARGET_IDS" != "[]" ]; then
+  dcl_scan --label "DCL passwords, console side and logs" --exclude 'target-*.log' --exclude all.log \
+    "$db_dump" "$AUDIT_DIR" "$E2E_WORK_DIR/findings-page.html" "$E2E_LOG_DIR" >&2 || dcl_leaks=$?
+fi
+# L1: the OpenLDAP clients' DNs are sent as keyed fingerprints (HMAC under the agent's key). Neither
+# an unkeyed SHA-256 nor an empty-key HMAC-SHA256 of a DN (as written, lowercased, no space after a
+# comma) may be in the console database, its Audit tables, pages or e-mails: such a digest would
+# let anyone link the principal to a guessed DN. Hex digests only; never printed (needle ids).
+DNH="$E2E_WORK_DIR/dn-digests"
+mkdir -p "$DNH"
+for role in exporter analyst; do
+  # The DN (a ground-truth name) goes on stdin, never on a command line.
+  # shellcheck disable=SC2016 # Python program, not shell
+  printf '%s' "${LDAP_CLIENT_DN[$role]}" | python3 -c 'import hashlib, hmac, os, sys
+dn = sys.stdin.read()
+forms = {"asis": dn, "lower": dn.lower(), "nospace": dn.replace(", ", ","),
+         "lower-nospace": dn.lower().replace(", ", ",")}
+for form, v in forms.items():
+    b = v.encode("utf-8")
+    for alg, d in (("sha256", hashlib.sha256(b)), ("hmac0", hmac.new(b"", b, hashlib.sha256))):
+        with open(os.path.join(sys.argv[1], f"dn_{sys.argv[2]}_{form}_{alg}"), "w") as f:
+            f.write(d.hexdigest() + "\n")' "$DNH" "$role" || fail "cannot hash the OpenLDAP client DNs"
+done
+dn_args=()
+for f in "$DNH"/*; do dn_args+=(--literal-file "$f"); done
+[ "${#dn_args[@]}" = 32 ] || fail "expected 16 DN digests, found $(( ${#dn_args[@]} / 2 ))"
+# Positive control: one digest planted in a canary file must be reported.
+mkdir -p "$E2E_WORK_DIR/dn-canary"
+{ printf 'principal: '; cat "$DNH/dn_analyst_asis_hmac0"; } >"$E2E_WORK_DIR/dn-canary/zz-dn-canary.txt"
+rc=0
+timeout 60 python3 "$I2_CHECK" scan --label "DN digests (canary)" "${dn_args[@]}" \
+  "$E2E_WORK_DIR/dn-canary" >"$E2E_WORK_DIR/dn-canary.out" 2>&1 || rc=$?
+if [ "$rc" != 1 ] || ! grep -q '^LEAK S\.dn_analyst_asis_hmac0 ' "$E2E_WORK_DIR/dn-canary.out"; then
+  cat "$E2E_WORK_DIR/dn-canary.out" >&2
+  fail "DN digest scan positive control: canary not detected (exit $rc)"
+fi
+rm -rf -- "$E2E_WORK_DIR/dn-canary" "$E2E_WORK_DIR/dn-canary.out"
+dn_leaks=0
+timeout 300 python3 "$I2_CHECK" scan --label "OpenLDAP client DN digests, console side" "${dn_args[@]}" \
+  "$db_dump" "$AUDIT_DIR" >&2 || dn_leaks=$?
+rm -rf -- "$DNH"
 rm -rf -- "$AUDIT_DIR"
 rm -f -- "$db_dump" "$E2E_WORK_DIR/pg_dump.err" "$E2E_WORK_DIR/findings-page.html"
 [ "$i2_failed" -eq 0 ] || fail "invariant I2: ground-truth value(s) in clear text (ids above)"
+[ "$dcl_leaks" -eq 0 ] \
+  || fail "a password of a DCL statement (or part / encoded form of one) reached the console or a log, or its scan failed (exit $dcl_leaks, ids above)"
+[ "$dn_leaks" -eq 0 ] \
+  || fail "an unkeyed digest of an OpenLDAP client DN reached the console, or its scan failed (exit $dn_leaks, ids above)"
 
 phase_done i2
 log "all checks passed (revocation latency ${latency} ms; dump -> incident: ${AUDIT_LATENCIES})"

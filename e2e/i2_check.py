@@ -21,13 +21,29 @@ Subcommands
   audit     Checks the console's access events and incidents of one target (Audit path, P4-D; JSON
             arrays, see run.sh): at least one of each; no event and no incident of the agent's own
             account (--agent-account: its Discovery reads must not surface); the required events
-            (principal, optionally with a signal) and incidents (policy and principal, optionally
-            with a signal) are present; no stored event object (database, schema or object name)
-            holds a raw value-bearing name, even partially. Values themselves are searched by
-            `scan`, on the same rows.
+            (principal, optionally with a signal, or with an action: --require-action) and
+            incidents (policy and principal, optionally with a signal) are present; no stored event
+            object (database, schema or object name) holds a raw value-bearing name, even
+            partially. The principal `@fingerprint` stands for any fingerprinted principal (an
+            event with `db_user_fingerprint` and no `db_user`, an incident whose principal is a
+            fingerprint): OpenLDAP principals are entry DNs, sent as fingerprints (ADR-0029
+            decision 7); `@fingerprint!SIGNAL` stands for a fingerprinted principal none of whose
+            events carries SIGNAL (the OpenLDAP analyst: the exporter's bulk search carries
+            shape.bulk_search). --fingerprinted-only then requires every principal to be one (a
+            principal in clear is counted, never printed: it may be a DN holding a value),
+            --min-fingerprints the number of distinct fingerprinted principals that read, and
+            --max-fingerprints the most distinct fingerprints over every event and incident, any
+            action (with both at N: exactly the N test clients, the agent's own reads never
+            surfaced as a fingerprint). Values themselves are searched by `scan`, on the same rows.
   `scan --needle ID` restricts a scan to the given needle ids (and their e-mail local part): run.sh
   uses it to follow the ground-truth literals it put in query text, on the console side (must be
   absent) and in the target's own audit log (positive control: must be present).
+  `scan --secret-file FILE` adds an ad-hoc secret (the file's content, e.g. a password of a DCL
+  statement), searched in every view like a value, case-insensitively, as a whole, as each of its
+  SECRET_WINDOW-character windows (a partial copy), and base64 / base64url-encoded at the three
+  byte alignments and hex-encoded (an encoded copy). `scan --literal-file FILE` adds a string
+  searched as a whole only (e.g. an unkeyed hash of a principal). Needle ids `S.<file name>…`;
+  --ground-truth may then be omitted (secrets only).
 
 Output: counts, needle ids (`L<location index>.v<value index>`, `.n<name value index>`,
 `.object`) and file names only. A matched value, or a value-bearing name, is never printed: the
@@ -40,7 +56,9 @@ What "in clear" means (a *needle* is one ground-truth value or value-bearing nam
   Views: each file is searched as is and, when it holds such escapes, after decoding JSON
   \\uXXXX escapes, URL %XX escapes, HTML character references and SQL doubled quotes; HTML is also
   searched as rendered text (`html-text`: comments such as React's `<!-- -->` and inline tags
-  removed, other tags replaced by a space, character references decoded).
+  removed, other tags replaced by a space, character references decoded); LDIF (a `dn:` line) also
+  with its folded lines joined and its base64 values (`attr:: …`) decoded (`ldif`: the OpenLDAP
+  seed and the `cn=accesslog` export of the target, which encode non-ASCII values that way).
   Plain form: the folded needle is a substring of a folded view. Needles with fewer than
   BOUNDED_BELOW letters / digits must also stand at word boundaries (no letter or digit right
   before or after; `_` and punctuation are boundaries), so that "Martin" matches in
@@ -72,6 +90,8 @@ bounds the clear digits of every masked sample instead.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import fnmatch
 import html
 import json
@@ -90,6 +110,9 @@ COMPACT_MIN_ALNUM = 9
 COMPACT_MIN_DIGITS = 6
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_CLEAR_DIGITS = 4
+# Ad-hoc secrets (`scan --secret-file`): windows of this many characters are needles too, and a
+# secret or literal shorter than this is refused (too short to tell a leak from an accident).
+SECRET_WINDOW = 16
 
 # Folded single words that also occur in the console independently of the target data.
 # word -> reason. Empty on purpose: add an entry only with evidence, never to hide a real leak.
@@ -177,7 +200,9 @@ class Plan:
 
 
 def location_label(index: int, loc: dict) -> str:
-    """Printable location: never a value-bearing name."""
+    """Printable location: never a value-bearing name (for an ad-hoc secret, its file name)."""
+    if "secret" in loc:
+        return f"S {loc['secret']}"
     parts = [loc.get("engine") or "?", loc.get("database") or "-"]
     if loc.get("name_contains_value"):
         parts.append("<value-bearing name>")
@@ -264,6 +289,25 @@ def html_text(text: str) -> str:
     return html.unescape(text)
 
 
+_LDIF_DN = re.compile(r"^dn::? ", re.M)
+_LDIF_B64 = re.compile(r"^([A-Za-z][A-Za-z0-9;.\-]*):: ?([A-Za-z0-9+/=]+)[ \t]*$", re.M)
+
+
+def ldif_text(text: str) -> str:
+    """LDIF with folded lines joined (a line starting with one space continues the previous one)
+    and base64 values (`attr:: …`) decoded as UTF-8 (`attr: …`); undecodable ones are kept."""
+    text = text.replace("\r\n ", "").replace("\n ", "")
+
+    def rep(m: re.Match[str]) -> str:
+        try:
+            value = base64.b64decode(m.group(2), validate=True).decode("utf-8")
+        except (binascii.Error, ValueError):
+            return m.group(0)
+        return f"{m.group(1)}: {value}"
+
+    return _LDIF_B64.sub(rep, text)
+
+
 def views(text: str) -> Iterator[tuple[str, str]]:
     """(name, folded text) of every decoded view of a file."""
     yield "raw", fold(text)
@@ -277,6 +321,8 @@ def views(text: str) -> Iterator[tuple[str, str]]:
         yield "sql-quotes", fold(text.replace("''", "'"))
     if "<" in text and ">" in text:
         yield "html-text", fold(html_text(text))
+    if _LDIF_DN.search(text):
+        yield "ldif", fold(ldif_text(text))
 
 
 def projection(folded: str) -> str:
@@ -364,15 +410,26 @@ def read_text(path: str) -> str:
 
 
 def load_plan(args: argparse.Namespace) -> Plan:
-    with open(args.ground_truth, encoding="utf-8") as f:
-        gt = json.load(f)
-    plan = build_plan(gt, args.engine)
+    secrets = getattr(args, "secret_file", None) or []
+    literals = getattr(args, "literal_file", None) or []
     wanted = getattr(args, "needle", None) or []
-    if wanted:
-        plan = restrict_plan(plan, wanted)
-    if not plan.needles:
-        raise ValueError(f"no searchable value for engine {args.engine!r} in the ground truth")
-    return plan
+    if args.ground_truth:
+        if not args.engine:
+            raise ValueError("--engine is required with --ground-truth")
+        with open(args.ground_truth, encoding="utf-8") as f:
+            gt = json.load(f)
+        plan = build_plan(gt, args.engine)
+        if wanted:
+            plan = restrict_plan(plan, wanted)
+        if not plan.needles:
+            raise ValueError(f"no searchable value for engine {args.engine!r} in the ground truth")
+    elif not secrets and not literals:
+        raise ValueError("--ground-truth is required (or --secret-file / --literal-file)")
+    elif wanted:
+        raise ValueError("--needle needs --ground-truth")
+    else:
+        plan = Plan([], {"short": 0, "common": 0}, {})
+    return add_secrets(plan, secrets, literals)
 
 
 def restrict_plan(plan: Plan, ids: list[str]) -> Plan:
@@ -383,6 +440,52 @@ def restrict_plan(plan: Plan, ids: list[str]) -> Plan:
         raise ValueError(f"unknown or excluded needle id(s): {' '.join(missing)}")
     locations = {n.location: plan.locations[n.location] for n in keep}
     return Plan(keep, {"short": 0, "common": 0}, locations)
+
+
+def secret_needles(name: str, value: str, encoded: bool) -> list[Needle]:
+    """Needles of an ad-hoc secret (never printed): the whole folded value; with `encoded`, also
+    each SECRET_WINDOW-character window, its base64 / base64url forms at the three byte alignments
+    (the stable part: whole 3-byte groups, no padding) and its hex form."""
+    if len(value) < SECRET_WINDOW:
+        raise ValueError(f"{name}: shorter than {SECRET_WINDOW} characters")
+    loc = -1
+    base = f"S.{name}"
+    out = [Needle(base, loc, "secret", fold(value), False)]
+    if not encoded:
+        return out
+    for i in range(len(value) - SECRET_WINDOW + 1):
+        out.append(Needle(f"{base}.w{i}", loc, "secret", fold(value[i:i + SECRET_WINDOW]), False))
+    raw = value.encode("utf-8")
+    for o in range(3):
+        chunk = raw[o:]
+        chunk = chunk[:len(chunk) // 3 * 3]
+        if len(chunk) * 4 // 3 < SECRET_WINDOW:
+            continue
+        out.append(Needle(f"{base}.b64.{o}", loc, "secret",
+                          fold(base64.b64encode(chunk).decode("ascii")), False))
+        out.append(Needle(f"{base}.b64url.{o}", loc, "secret",
+                          fold(base64.urlsafe_b64encode(chunk).decode("ascii")), False))
+    out.append(Needle(f"{base}.hex", loc, "secret", raw.hex(), False))
+    return out
+
+
+def add_secrets(plan: Plan, secret_files: list[str], literal_files: list[str]) -> Plan:
+    """The plan with the needles of every secret / literal file. Each gets its own location (a
+    negative index) labelled with the file name; the value is never printed."""
+    needles = list(plan.needles)
+    locations = dict(plan.locations)
+    k = 0
+    for files, encoded in ((secret_files, True), (literal_files, False)):
+        for path in files:
+            name = os.path.basename(path)
+            value = read_text(path).rstrip("\r\n")
+            k += 1
+            loc = -k
+            for n in secret_needles(name, value, encoded):
+                n.location = loc
+                needles.append(n)
+            locations[loc] = {"secret": name}
+    return Plan(needles, plan.excluded, locations)
 
 
 def summary_line(plan: Plan) -> str:
@@ -417,7 +520,8 @@ def cmd_scan(args: argparse.Namespace, out) -> int:
         print(f"i2 scan [{args.label}]: nothing to scan: the check would prove nothing", file=out)
         return 2
     if not hits:
-        print(f"i2 scan [{args.label}]: no ground-truth value in clear text", file=out)
+        what = "ground-truth value" if args.ground_truth else "secret"
+        print(f"i2 scan [{args.label}]: no {what} in clear text", file=out)
         return 0
     leaked = {h.needle.id for h in hits}
     for h in sorted(hits, key=lambda h: (h.needle.location, h.needle.id, h.file)):
@@ -472,6 +576,28 @@ def holds_raw_name(stored: Iterable[str], names: set[str], parts: list[str]) -> 
     return bool(names & folded) or any(nv in st for nv in parts for st in folded)
 
 
+def value_part(loc: dict) -> str:
+    """The part of a location's name that carries the value, or a placeholder for it (`<email>`):
+    the object for SQL tables, the container for LDAP (`ou=<person name>,…`), the field for MongoDB
+    dynamic keys (`contacts.<email>.phone`). The expected normalized name (ADR-0009) replaces it."""
+    name_values = [fold(v) for v in loc.get("name_values") or []]
+    for part in ("object", "container", "field"):
+        raw = loc.get(part)
+        if raw and (any(nv in fold(raw) for nv in name_values) or "<" in raw):
+            return part
+    return "object"
+
+
+def location_key(loc: dict, normalized: bool = False) -> tuple:
+    """(database, container, object, field) of a ground-truth location, as a finding stores it;
+    with `normalized`, its expected normalized name in place of the part that carries a value."""
+    parts = {k: loc.get(k) for k in ("database", "container", "object", "field")}
+    norm = loc.get("expected_normalized_name")
+    if normalized and norm:
+        parts[value_part(loc)] = norm
+    return (parts["database"], parts["container"], parts["object"], parts["field"])
+
+
 def check_findings(rows: list[dict], ground_truth: dict, engine: str, required: list[str],
                    require_expected: bool = False,
                    forbid_negative_controls: bool = False) -> tuple[list[str], list[str]]:
@@ -514,29 +640,28 @@ def check_findings(rows: list[dict], ground_truth: dict, engine: str, required: 
                     errors.append(f"{label}: a finding stores the raw value-bearing name")
                     break
             norm = loc.get("expected_normalized_name")
+            nkey = location_key(loc, normalized=True)
             if norm and loc.get("negative_control") and forbid_negative_controls:
-                nkey = (loc.get("database"), loc.get("container"), norm, loc.get("field"))
                 hits = sorted(c for c in by_location.get(nkey, set()) if c)
                 if hits:
                     errors.append(f"{label}: negative control has finding(s) under the normalized "
                                   f"name {norm!r}: {', '.join(hits)}")
             if norm and want:
-                # SQL engines: the object (table) name carries the value.
-                nkey = (loc.get("database"), loc.get("container"), norm, loc.get("field"))
+                # The part that carries the value (value_part) is stored normalized.
                 if not (by_location.get(nkey, set()) & want):
                     errors.append(f"{label}: no finding stored under the expected normalized name "
                                   f"{norm!r}")
                 else:
                     info.append(f"{label}: stored under the expected normalized name {norm!r}")
             continue
+        # A placeholder name (MongoDB `hourly.<hour>`) is stored under its normalized form.
+        k = location_key(loc, normalized=True)
         if loc.get("negative_control") and forbid_negative_controls:
-            k = (loc.get("database"), loc.get("container"), loc.get("object"), loc.get("field"))
             hits = sorted(c for c in by_location.get(k, set()) if c)
             if hits:
                 errors.append(f"{label}: negative control has finding(s): {', '.join(hits)}")
         if want:
             expected += 1
-            k = (loc.get("database"), loc.get("container"), loc.get("object"), loc.get("field"))
             if by_location.get(k, set()) & want:
                 found += 1
     info.append(f"ground-truth locations with an expected classifier found: {found}/{expected} "
@@ -680,11 +805,50 @@ def _principal(row: dict) -> str:
     return str(row.get("db_user") or row.get("principal") or "")
 
 
+# A principal the agent sent as its fingerprint (contract `Fingerprint`, shared/protocol/openapi.yaml:
+# "hmac-sha256:" followed by the lowercase hex HMAC-SHA256).
+FINGERPRINTED = "@fingerprint"
+_FINGERPRINT = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
+
+
+def _fingerprinted_event(e: dict) -> bool:
+    return not e.get("db_user") and bool(_FINGERPRINT.match(str(e.get("db_user_fingerprint") or "")))
+
+
+def _fingerprinted_incident(i: dict) -> bool:
+    return bool(_FINGERPRINT.match(str(i.get("principal") or "")))
+
+
+def _fingerprints_without(events: list[dict], signal: str) -> set[str]:
+    """Fingerprints of the fingerprinted events, less those with an event carrying `signal`."""
+    fps = {str(e.get("db_user_fingerprint")) for e in events if _fingerprinted_event(e)}
+    with_signal = {str(e.get("db_user_fingerprint")) for e in events
+                   if _fingerprinted_event(e) and signal in (e.get("signals") or [])}
+    return fps - with_signal
+
+
+def _matcher(events: list[dict], principal: str):
+    """(event predicate, incident predicate) of a principal given on the command line: a name,
+    `@fingerprint` (any fingerprinted principal) or `@fingerprint!SIGNAL` (a fingerprinted
+    principal none of whose events carries SIGNAL)."""
+    if principal == FINGERPRINTED:
+        return _fingerprinted_event, _fingerprinted_incident
+    if principal.startswith(FINGERPRINTED + "!"):
+        fps = _fingerprints_without(events, principal[len(FINGERPRINTED) + 1:])
+        return (lambda e: _fingerprinted_event(e) and str(e.get("db_user_fingerprint")) in fps,
+                lambda i: _fingerprinted_incident(i) and str(i.get("principal")) in fps)
+    return (lambda e: _principal(e) == principal), (lambda i: _principal(i) == principal)
+
+
 def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, engine: str,
                 agent_account: str, require_events: list[str],
-                require_incidents: list[str]) -> tuple[list[str], list[str]]:
-    """Returns (errors, info). Only principals given on the command line, policy names, signal ids
-    and counts are printed: never an object name (it may be value-bearing) or a value."""
+                require_incidents: list[str], require_actions: list[str] | None = None,
+                fingerprinted_only: bool = False,
+                min_fingerprints: int = 0,
+                max_fingerprints: int | None = None) -> tuple[list[str], list[str]]:
+    """Returns (errors, info). Only principals given on the command line, policy names, signal ids,
+    actions and counts are printed: never an object name (it may be value-bearing), a principal
+    read from the rows, or a value."""
     errors: list[str] = []
     info: list[str] = []
     if not events:
@@ -704,7 +868,8 @@ def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, e
                       f"{agent_account!r}")
     for req in require_events:
         principal, _, signal = req.partition(":")
-        mine = [e for e in events if _principal(e) == principal]
+        event_of = _matcher(events, principal)[0]
+        mine = [e for e in events if event_of(e)]
         if signal:
             mine = [e for e in mine if signal in (e.get("signals") or [])]
         what = f"principal {principal!r}" + (f" with {signal}" if signal else "")
@@ -720,7 +885,8 @@ def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, e
             continue
         policy, principal = parts[0], parts[1]
         signal = parts[2] if len(parts) == 3 else ""
-        mine = [i for i in incidents if i.get("policy_name") == policy and _principal(i) == principal]
+        incident_of = _matcher(events, principal)[1]
+        mine = [i for i in incidents if i.get("policy_name") == policy and incident_of(i)]
         if signal:
             mine = [i for i in mine if signal in (i.get("event_signals") or [])]
         what = f"policy {policy!r}, principal {principal!r}" + (f", signal {signal}" if signal else "")
@@ -728,6 +894,49 @@ def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, e
             info.append(f"{len(mine)} incident(s) of {what}")
         else:
             errors.append(f"no incident of {what}")
+    for req in require_actions or []:
+        principal, _, action = req.partition(":")
+        if not action:
+            errors.append(f"bad --require-action {req!r}: PRINCIPAL:ACTION")
+            continue
+        event_of = _matcher(events, principal)[0]
+        mine = [e for e in events if event_of(e) and e.get("action") == action]
+        what = f"principal {principal!r} with action {action}"
+        if mine:
+            n = sum(int(e.get("aggregated_count") or 1) for e in mine)
+            objs = sum(len(e.get("objects") or []) for e in mine)
+            info.append(f"{len(mine)} event(s) ({n} statement(s)) of {what}; objects named: {objs}")
+        else:
+            errors.append(f"no access event of {what}")
+    if fingerprinted_only:
+        clear_events = sum(1 for e in events if not _fingerprinted_event(e))
+        clear_incidents = sum(1 for i in incidents if _principal(i) and not _fingerprinted_incident(i))
+        if clear_events:
+            errors.append(f"{clear_events} access event(s) carry a principal that is not a "
+                          "fingerprint (not printed: it may be an entry DN)")
+        if clear_incidents:
+            errors.append(f"{clear_incidents} incident(s) name a principal that is not a "
+                          "fingerprint (not printed: it may be an entry DN)")
+        if not clear_events and not clear_incidents:
+            info.append("every principal is a fingerprint")
+    if min_fingerprints:
+        readers = {e.get("db_user_fingerprint") for e in events
+                   if _fingerprinted_event(e) and e.get("action") == "read"}
+        if len(readers) < min_fingerprints:
+            errors.append(f"{len(readers)} distinct fingerprinted principal(s) read, "
+                          f"at least {min_fingerprints} expected")
+        else:
+            info.append(f"{len(readers)} distinct fingerprinted principal(s) read")
+    if max_fingerprints is not None:
+        seen = ({str(e.get("db_user_fingerprint")) for e in events if _fingerprinted_event(e)}
+                | {str(i.get("principal")) for i in incidents if _fingerprinted_incident(i)})
+        if len(seen) > max_fingerprints:
+            errors.append(f"{len(seen)} distinct fingerprinted principal(s) over the events and "
+                          f"incidents (any action), at most {max_fingerprints} expected: a principal "
+                          "other than the test clients (the agent's own reads?) surfaced")
+        else:
+            info.append(f"{len(seen)} distinct fingerprinted principal(s) over the events and "
+                        f"incidents (at most {max_fingerprints})")
     for i, loc in enumerate(ground_truth.get("locations", [])):
         if loc.get("engine") != engine or not loc.get("name_contains_value"):
             continue
@@ -760,7 +969,9 @@ def cmd_audit(args: argparse.Namespace, out) -> int:
     events = _load_rows(args.events, "events file")
     incidents = _load_rows(args.incidents, "incidents file")
     errors, info = check_audit(events, incidents, gt, args.engine, args.agent_account,
-                               args.require_event, args.require_incident)
+                               args.require_event, args.require_incident, args.require_action,
+                               args.fingerprinted_only, args.min_fingerprints,
+                               args.max_fingerprints)
     for line in info:
         print(f"i2 audit: {line}", file=out)
     for line in errors:
@@ -774,13 +985,19 @@ def main(argv: list[str] | None = None, out=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("scan", "coverage"):
         s = sub.add_parser(name)
-        s.add_argument("--ground-truth", required=True)
-        s.add_argument("--engine", required=True)
+        # Required, except by `scan` with only --secret-file / --literal-file (load_plan).
+        s.add_argument("--ground-truth", required=name == "coverage")
+        s.add_argument("--engine", required=name == "coverage")
         s.add_argument("--exclude", action="append", default=[],
                        help="basename glob of files to skip (repeatable)")
         s.add_argument("--label", default="files")
         s.add_argument("--needle", action="append", default=[],
                        help="only this needle id and its derived needles (repeatable)")
+        if name == "scan":
+            s.add_argument("--secret-file", action="append", default=[],
+                           help="a secret (the file's content): whole, windows, encoded forms")
+            s.add_argument("--literal-file", action="append", default=[],
+                           help="a string (the file's content), searched whole only")
         s.add_argument("paths", nargs="+")
     f = sub.add_parser("findings")
     f.add_argument("--ground-truth", required=True)
@@ -799,6 +1016,14 @@ def main(argv: list[str] | None = None, out=None) -> int:
     a.add_argument("--require-event", action="append", default=[], metavar="PRINCIPAL[:SIGNAL]")
     a.add_argument("--require-incident", action="append", default=[],
                    metavar="POLICY:PRINCIPAL[:SIGNAL]")
+    a.add_argument("--require-action", action="append", default=[], metavar="PRINCIPAL:ACTION",
+                   help="an event of PRINCIPAL with ACTION (e.g. dcl)")
+    a.add_argument("--fingerprinted-only", action="store_true",
+                   help=f"every event and incident principal is a fingerprint ({FINGERPRINTED})")
+    a.add_argument("--min-fingerprints", type=int, default=0,
+                   help="at least N distinct fingerprinted principals with a read event")
+    a.add_argument("--max-fingerprints", type=int, default=None,
+                   help="at most N distinct fingerprints over every event and incident")
     a.add_argument("--events", required=True)
     a.add_argument("--incidents", required=True)
     g = sub.add_parser("page")
