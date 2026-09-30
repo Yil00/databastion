@@ -386,9 +386,11 @@ pub(crate) const OWN_CLIENT_ADDR: &str = "SELECT pg_catalog.host(pg_catalog.inet
 /// any relation: `pg_catalog.set_config`, `pg_catalog.current_setting`,
 /// `pg_catalog.inet_client_addr`, `pg_catalog.host`. The Audit stream
 /// leaves them out for the agent's own account without charging its row
-/// budget (`audit::events::PgOwn`), matched by exact text (pgaudit)
-/// or normalized shape (`pg_stat_statements`). A unit test checks that
-/// every other statement of this module names a relation.
+/// budget (`audit::events::PgOwn`), matched by exact text: as sent
+/// (pgaudit), or as `pg_stat_statements` stores it, constants replaced
+/// and these bound parameters in place (`audit::events::pss_form`). A
+/// unit test checks that every other statement of this module names a
+/// relation.
 pub(crate) const OWN_TABLELESS: [&str; 3] = [SESSION_SETUP, SET_LOCAL_TIMEOUTS, OWN_CLIENT_ADDR];
 
 /// Schema of the `pg_stat_statements(boolean)` function, if it is a member

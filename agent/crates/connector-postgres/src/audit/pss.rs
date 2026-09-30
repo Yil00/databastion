@@ -58,10 +58,18 @@ pub(crate) struct PssPoller {
     snapshot: Option<HashMap<Key, Counters>>,
     /// `None`: the analysis panicked; the statement is dropped (counted
     /// once) and not analyzed again while cached.
-    analyses: HashMap<Key, Option<QueryAnalysis>>,
+    analyses: HashMap<Key, Option<Analyzed>>,
     last_poll: SystemTime,
     /// Statements dropped because their analysis or conversion panicked.
     pub(crate) panicked: u64,
+}
+
+/// A statement text's analysis, and whether the text is exactly one of
+/// the connector's own table-less statements (`PgOwn::own_pss_text`,
+/// decided on the text, which is not kept).
+struct Analyzed {
+    analysis: QueryAnalysis,
+    own_text: bool,
 }
 
 /// Tests: a text holding this marker makes its analysis panic (a bug on
@@ -272,7 +280,9 @@ impl PssPoller {
                     .try_get::<_, Option<bool>>(5)
                     .map_err(get)?
                     .unwrap_or(true);
-                let analysis = analyze_isolated(&text, cut);
+                let own_text = !cut && self.own.own_pss_text(&text);
+                let analysis =
+                    analyze_isolated(&text, cut).map(|analysis| Analyzed { analysis, own_text });
                 if analysis.is_none() {
                     self.panicked = self.panicked.saturating_add(1);
                 }
@@ -287,10 +297,12 @@ impl PssPoller {
         let deltas: Vec<StatementDelta<'_>> = changed
             .iter()
             .filter_map(|(k, user, database, calls, n)| {
+                let a = self.analyses.get(k)?.as_ref()?;
                 Some(StatementDelta {
                     user,
                     database,
-                    analysis: self.analyses.get(k)?.as_ref()?,
+                    analysis: &a.analysis,
+                    own_text: a.own_text,
                     calls: *calls,
                     rows: *n,
                 })
@@ -405,7 +417,7 @@ mod tests {
         let prev: HashMap<Key, Counters> = [(k, c(1, 1))].into();
         let mut snapshot: HashMap<Key, Counters> = [(k, c(5, 5))].into();
         let changed = vec![(k, String::new(), String::new(), 4, 4)];
-        let analyses: HashMap<Key, Option<QueryAnalysis>> = [(k, None)].into();
+        let analyses: HashMap<Key, Option<Analyzed>> = [(k, None)].into();
         carry_over(&mut snapshot, &prev, &changed, &analyses);
         assert_eq!(snapshot[&k].calls, 5);
     }
