@@ -267,6 +267,13 @@ review remain the primary controls.
 
 ### Audit streams that panic
 A connector call that panics fails that call only (`crate::panics`).
+Audit log files (`core::audit::tail`): records come with their position; a
+source that holds records back commits its cursor with
+`Tailer::commit_from`, moved back to the oldest record it holds in the open
+file with a `replay` (the end read and the held keys), which a restart
+applies (`Tailer::take_replay`); `Tailer::settle` saves a cursor without
+it once the source has reported what it held (security review of #93, M1).
+
 MySQL / MariaDB audit log statements reported before their statement record
 because the bounded grouping state was full are counted in the heartbeat
 metric `audit_pending_evicted_total` (`databastion_core::audit::count_pending_evicted`).

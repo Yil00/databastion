@@ -81,6 +81,8 @@ pub(crate) struct FileRecord {
     pub(crate) status: u32,
     /// `program_name` connection attribute (connect records).
     pub(crate) program: Option<String>,
+    /// Position in the log file (set by the stream after parsing).
+    pub(crate) pos: Option<databastion_core::audit::tail::RecordPos>,
 }
 
 impl fmt::Debug for FileRecord {
@@ -279,6 +281,7 @@ pub(crate) fn parse_server_audit(
         truncated: false,
         status: 0,
         program: None,
+        pos: None,
     };
     let status_of =
         |b: &[u8]| -> Option<u32> { std::str::from_utf8(b).ok()?.trim_end().parse().ok() };
@@ -510,6 +513,7 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
         truncated: false,
         status,
         program: None,
+        pos: None,
     })
 }
 
@@ -534,6 +538,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
         truncated: false,
         status: 0,
         program: None,
+        pos: None,
     };
     match (r.class.as_str(), r.event.as_str()) {
         ("connection", "connect" | "change_user") => {

@@ -52,6 +52,7 @@ use databastion_classifiers::query::{
     AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze_raw,
 };
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
+use databastion_core::audit::tail::RecordPos;
 
 use super::records::{FileRecord, Op, TableOp};
 use crate::discover::normalize;
@@ -486,6 +487,18 @@ impl Pending {
         out
     }
 
+    /// (connection, position of its first record) of every pending
+    /// statement whose records have positions.
+    fn held(&self) -> Vec<(u64, RecordPos)> {
+        self.order
+            .values()
+            .filter_map(|c| {
+                let pos = self.map.get(c)?.records.first()?.pos?;
+                Some((*c, pos))
+            })
+            .collect()
+    }
+
     /// Every pending statement, oldest first; the state is emptied.
     fn drain(&mut self) -> Vec<Vec<FileRecord>> {
         let conns: Vec<u64> = self.order.values().copied().collect();
@@ -840,6 +853,13 @@ impl EventBuilder {
             self.flush_isolated(p, source, now, &mut out);
         }
         out
+    }
+
+    /// Where the pending statements start in the log: the stream commits
+    /// its cursor back to the oldest of them (`Tailer::commit_from`), so a
+    /// restart replays them (security review of #93, M1).
+    pub(crate) fn held(&self) -> Vec<(u64, RecordPos)> {
+        self.pending.held()
     }
 
     /// Statements flushed before their statement record because the

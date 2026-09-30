@@ -216,10 +216,19 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   yields a second event only when its text shows a signal (a whole-table
   read by a dump that ran longer than 5 minutes). That memory is kept 10
   minutes.
-  Residual: table records waiting when the agent stops are lost (the
-  cursor has moved past them; delivery is at most once); their statement
-  record, if written after the restart, is still reported, with the
-  objects its text names. `performance_schema` has one row per statement
+  The saved cursor is moved back to the first record of the oldest
+  statement still waiting in the current file, with the end read so far
+  and the connections waiting (`Tailer::commit_from`): after a restart, a
+  crash, a stream restart or a reconfiguration, the stream re-reads from
+  there and replays only the waiting statements' records, so they are
+  neither lost nor counted twice. When the stream ends gracefully (the
+  source changes, the log becomes unreadable), the waiting statements are
+  reported and the cursor saved without them. Residuals: statements
+  waiting in a rotated (earlier) file are lost if the agent stops before
+  their statement record (the old file cannot be re-read); the memory of
+  statements reported early does not survive a restart or a new stream,
+  so their late statement record is then reported on its own (with the
+  objects its text names). `performance_schema` has one row per statement
   (deduplicated on thread and event id), so it has no grouping. Before
   phase 7 (load tests) records were merged only when adjacent, and
   interleaved sessions counted about 12 % of their statements twice.

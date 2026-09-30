@@ -15,6 +15,13 @@
 //!   to its end first, then the new file from its start. Truncation (the
 //!   file got shorter than the offset, `copytruncate` or
 //!   `log_truncate_on_rotation`): reading restarts at 0.
+//! - Records come with their position ([`RecordPos`]). A source that
+//!   holds records back (the MySQL / MariaDB grouping of a statement's
+//!   records) commits with [`Tailer::commit_from`]: the cursor is then the
+//!   start of the oldest record held in the open file, with the end of what
+//!   was read and the keys to replay ([`Replay`]); a restart re-reads from
+//!   there and the source replays only the records of those keys
+//!   ([`Tailer::take_replay`]).
 //! - Each poll reads at most [`MAX_POLL_BYTES`]; records are bounded by the
 //!   splitter. The path must be a regular file (checked before and after
 //!   opening, so a FIFO or a device is never read).
@@ -78,6 +85,9 @@ pub struct Splitter {
     skipping: bool,
     /// Bytes consumed since the end of the last complete record.
     pending: u64,
+    /// Records completed by the last `feed`: (index after their last byte
+    /// in the data fed, bytes since the previous record boundary).
+    ends: Vec<(usize, u64)>,
     /// Records skipped for their size.
     pub oversized: u64,
     /// Records dropped as damaged ([`Framing::JsonObjects`]).
@@ -108,6 +118,7 @@ impl Splitter {
             in_quotes: false,
             skipping: false,
             pending: 0,
+            ends: Vec::new(),
             oversized: 0,
             malformed: 0,
             max,
@@ -136,13 +147,22 @@ impl Splitter {
         self.line_start = true;
     }
 
+    /// Where the records of the last [`Self::feed`] end: (index after their
+    /// last byte in the data fed, bytes since the previous record boundary,
+    /// which may lie in earlier data).
+    #[must_use]
+    pub fn last_ends(&self) -> &[(usize, u64)] {
+        &self.ends
+    }
+
     /// Feeds bytes; complete records are appended to `out`.
     pub fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
+        self.ends.clear();
         if self.framing == Framing::JsonObjects {
             self.feed_json(data, out);
             return;
         }
-        for &b in data {
+        for (i, &b) in data.iter().enumerate() {
             self.pending += 1;
             if self.csv && b == b'"' {
                 self.in_quotes = !self.in_quotes;
@@ -158,6 +178,7 @@ impl Splitter {
                         record.pop();
                     }
                     out.push(record);
+                    self.ends.push((i + 1, self.pending));
                 }
                 self.buf.clear();
                 self.pending = 0;
@@ -178,7 +199,7 @@ impl Splitter {
 
 impl Splitter {
     fn feed_json(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
-        for &b in data {
+        for (i, &b) in data.iter().enumerate() {
             self.pending += 1;
             if b == b'\n' {
                 if self.in_string {
@@ -236,6 +257,7 @@ impl Splitter {
                             let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                             record.extend_from_slice(&self.buf);
                             out.push(record);
+                            self.ends.push((i + 1, self.pending));
                         }
                         self.buf.clear();
                         self.pending = 0;
@@ -260,12 +282,51 @@ impl Splitter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Cursor {
     v: u32,
     dev: u64,
     ino: u64,
     offset: u64,
+    /// Set when `offset` was moved back to records the source held
+    /// ([`Tailer::commit_from`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay: Option<Replay>,
+}
+
+/// What to replay after a restart from a cursor moved back
+/// ([`Tailer::commit_from`]): the records up to `end` (the end of what had
+/// been read) were handed over already, except those of the `keep` keys
+/// at or after their offset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Replay {
+    /// End of what had been read (offset in the file).
+    pub end: u64,
+    /// (key, start offset): the records of `key` from that offset were
+    /// held by the source, not handed over.
+    pub keep: Vec<(u64, u64)>,
+}
+
+/// Position of a record in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordPos {
+    /// Device and inode of the file it was read from.
+    pub file: (u64, u64),
+    /// Offset of the end of the previous record (a boundary reading can
+    /// resume from).
+    pub start: u64,
+    /// Offset just after the record.
+    pub end: u64,
+}
+
+/// The records to replay after a restart, in the file the tailer opened
+/// (see [`Replay`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayFrom {
+    /// Device and inode of the file.
+    pub file: (u64, u64),
+    /// What to replay.
+    pub replay: Replay,
 }
 
 /// Why the log could not be read (kind only; never a path or content).
@@ -279,6 +340,8 @@ pub enum TailError {
 pub struct Polled {
     /// Complete records read (zeroized on drop).
     pub records: Vec<Zeroizing<Vec<u8>>>,
+    /// Position of each record (same order as `records`).
+    pub positions: Vec<RecordPos>,
     /// More data is waiting (the poll stopped at its byte bound).
     pub more: bool,
 }
@@ -296,6 +359,8 @@ pub struct Tailer {
     tail: Zeroizing<Vec<u8>>,
     splitter: Splitter,
     store: Option<CursorStore>,
+    /// Replay found in the cursor at open, until taken.
+    replay: Option<ReplayFrom>,
     /// Oversized records seen (skipped).
     pub oversized: u64,
     /// Rotations or truncations seen.
@@ -402,6 +467,7 @@ impl Tailer {
             tail: Zeroizing::new(Vec::new()),
             splitter: Splitter::new(framing),
             store,
+            replay: None,
             oversized: 0,
             rotations: 0,
         }
@@ -441,7 +507,16 @@ impl Tailer {
         }
         let (mut file, dev, ino, len) = open_regular(&self.path)?;
         let start = match self.load_cursor() {
-            Some(c) if c.dev == dev && c.ino == ino && c.offset <= len => c.offset,
+            Some(c) if c.dev == dev && c.ino == ino && c.offset <= len => {
+                self.replay =
+                    c.replay
+                        .filter(|r| r.end <= len && r.end >= c.offset)
+                        .map(|replay| ReplayFrom {
+                            file: (dev, ino),
+                            replay,
+                        });
+                c.offset
+            }
             Some(c) if c.dev == dev && c.ino == ino => {
                 self.rotations += 1;
                 tracing::warn!(
@@ -476,6 +551,7 @@ impl Tailer {
     pub fn poll(&mut self) -> Result<Polled, TailError> {
         self.ensure_open()?;
         let mut records = Vec::new();
+        let mut positions = Vec::new();
         let mut read_total: u64 = 0;
         let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
         while let Some((file, dev, ino)) = self.file.as_mut() {
@@ -510,9 +586,18 @@ impl Tailer {
                     eof = true;
                     break;
                 }
+                let base = self.offset;
                 self.offset += n as u64;
                 read_total += n as u64;
                 self.splitter.feed(&buf[..n], &mut records);
+                for &(i, len) in self.splitter.last_ends() {
+                    let end = base + i as u64;
+                    positions.push(RecordPos {
+                        file: (dev, ino),
+                        start: end.saturating_sub(len),
+                        end,
+                    });
+                }
                 let keep = TAIL_BYTES.min(n);
                 self.tail.clear();
                 self.tail.extend_from_slice(&buf[n - keep..n]);
@@ -521,6 +606,7 @@ impl Tailer {
             if !eof {
                 return Ok(Polled {
                     records,
+                    positions,
                     more: true,
                 });
             }
@@ -547,20 +633,73 @@ impl Tailer {
         }
         Ok(Polled {
             records,
+            positions,
             more: false,
         })
     }
 
+    /// The replay found in the saved cursor when the file was opened
+    /// (once).
+    pub fn take_replay(&mut self) -> Option<ReplayFrom> {
+        self.replay.take()
+    }
+
+    /// Saves a cursor that holds nothing back: [`Self::commit`] when the
+    /// file is open, otherwise the saved cursor without its replay (moved
+    /// to the end read before). For a source that reported what it held
+    /// (its stream ends) so that a later stream does not replay it.
+    pub fn settle(&self) {
+        if self.file.is_some() {
+            self.commit();
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Some(mut c) = self.load_cursor() {
+            if let Some(r) = c.replay.take() {
+                c.offset = r.end;
+                match serde_json::to_vec(&c) {
+                    Ok(bytes) => {
+                        if let Err(e) = store.save(&bytes) {
+                            tracing::warn!(error = %e, "audit cursor not saved");
+                        }
+                    }
+                    Err(_) => tracing::warn!("audit cursor not saved"),
+                }
+            }
+        }
+    }
+
     /// Saves the position of the end of the last complete record read.
     pub fn commit(&self) {
+        self.commit_from(&[]);
+    }
+
+    /// Saves the position like [`Self::commit`], moved back to the start of
+    /// the oldest record the source still holds in the open file: `held`
+    /// lists (key, position of the first held record of that key). Held
+    /// records of an earlier (rotated) file cannot be re-read after a
+    /// restart and are left out. A restart then resumes at that start and
+    /// [`Self::take_replay`] tells which records up to the end read so far
+    /// are to be replayed.
+    pub fn commit_from(&self, held: &[(u64, RecordPos)]) {
         let (Some(store), Some((_, dev, ino))) = (self.store.as_ref(), self.file.as_ref()) else {
             return;
         };
+        let end = self.offset.saturating_sub(self.splitter.pending());
+        let here: Vec<(u64, u64)> = held
+            .iter()
+            .filter(|(_, p)| p.file == (*dev, *ino) && p.start < end)
+            .map(|(k, p)| (*k, p.start))
+            .collect();
+        let from = here.iter().map(|(_, s)| *s).min();
         let cursor = Cursor {
             v: 1,
             dev: *dev,
             ino: *ino,
-            offset: self.offset.saturating_sub(self.splitter.pending()),
+            offset: from.unwrap_or(end),
+            replay: from.map(|_| Replay { end, keep: here }),
         };
         match serde_json::to_vec(&cursor) {
             Ok(bytes) => {
@@ -612,6 +751,13 @@ mod tests {
         f.write_all(s.as_bytes()).unwrap();
     }
 
+    fn lines_of(p: &Polled) -> Vec<String> {
+        p.records
+            .iter()
+            .map(|r| String::from_utf8(r.to_vec()).unwrap())
+            .collect()
+    }
+
     fn lines(p: Polled) -> Vec<String> {
         p.records
             .iter()
@@ -642,6 +788,72 @@ mod tests {
         std::fs::write(&log, "f\n").unwrap();
         assert_eq!(lines(t.poll().unwrap()), ["f"]);
         assert_eq!(t.rotations, 2);
+    }
+
+    #[test]
+    fn positions_and_a_cursor_moved_back_to_held_records() {
+        let d = Dir::new("held");
+        let log = d.0.join("server_audit.log");
+        append(&log, "");
+        let store = || CursorStore::new(&d.0, "t", "server_audit");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert!(t.poll().unwrap().records.is_empty());
+        t.commit();
+        append(&log, "a1\nb1\na2\n");
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["a1", "b1", "a2"]);
+        let pos = p.positions.clone();
+        assert_eq!(
+            pos.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
+            [(0, 3), (3, 6), (6, 9)]
+        );
+        // The source still holds `a1` (key 7); `b1` was handed over.
+        t.commit_from(&[(7, pos[0])]);
+        drop(t);
+        // Restart: reading resumes at `a1`, with the replay to apply.
+        append(&log, "a3\n");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["a1", "b1", "a2", "a3"]);
+        let r = t.take_replay().unwrap();
+        assert_eq!(
+            r.replay,
+            Replay {
+                end: 9,
+                keep: vec![(7, 0)]
+            }
+        );
+        assert_eq!(r.file, pos[0].file);
+        assert!(t.take_replay().is_none());
+        // Held again, then settled without the file open: the replay is
+        // dropped, the cursor at the end read.
+        t.commit_from(&[(7, p.positions[0])]);
+        drop(t);
+        let t = Tailer::new(log.clone(), Framing::Lines, store());
+        t.settle();
+        drop(t);
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert!(t.poll().unwrap().records.is_empty());
+        assert!(t.take_replay().is_none());
+        // Nothing held: a plain cursor.
+        t.commit_from(&[]);
+        drop(t);
+        let mut t = Tailer::new(log, Framing::Lines, store());
+        assert!(t.poll().unwrap().records.is_empty());
+        assert!(t.take_replay().is_none());
+    }
+
+    #[test]
+    fn json_positions_span_chunks() {
+        let mut s = Splitter::new(Framing::JsonObjects);
+        let mut out = Vec::new();
+        s.feed(b"[{\"a\":", &mut out);
+        assert!(s.last_ends().is_empty());
+        s.feed(b"1},\n{\"b\":2}", &mut out);
+        assert_eq!(out.len(), 2);
+        // Ends in the second feed; the first record's bytes began 6 bytes
+        // before it (a boundary: the start of the data).
+        assert_eq!(s.last_ends(), [(2, 8), (11, 9)]);
     }
 
     #[test]
