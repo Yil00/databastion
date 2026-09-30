@@ -40,6 +40,14 @@ DataBastion can only audit what the engine logs. This page states **honestly** w
 
 > **MySQL Community**: the official audit plugin is reserved for MySQL Enterprise. `performance_schema` provides recent queries and the number of rows returned, but its history is a ring buffer: the agent must read it often enough not to lose anything.
 
+## Discovery load on the monitored database (every engine)
+
+Sampling is bounded per object (rows, bytes, statement timeout), and since #93 the agent also paces every scan ([ADR-0035](adr/0035-discovery-pacing.md), proposed). After each unit of work against the target (an object's sampling, a catalog read, a listing), the scan pauses `busy × (100 − d) / d`, where `busy` is the agent's wall-clock time for that unit and `d` is `limits.discovery_duty_cycle_percent` in `agent.yaml` (default 1, range 1 to 100, `100`: no pacing). A scan uses one connection, and scans run one at a time per agent, so a scan costs the server at most about `d` % of one core. The MVP criterion is under 2 % of the server's CPU while a scan runs ([04-mvp-scope.md](04-mvp-scope.md)).
+
+- **Scans take longer.** A scan lasts about `100 / d` times its query time. Measured on MariaDB 11.4 with 200 tables (debug build): 120 s and 0.35 % of one core paced, against 6.6 s and 5.4 % unpaced. The #92 harness measured 20 to 25 % of one core per server without pacing.
+- **Scan budget.** The job's `max_duration_s` (console default 900 s, capped by `limits.max_scan_duration_s`, default 3600 s) must cover it: at 1 %, 900 s covers about 9 s of query time (some 1 800 objects at 5 ms each). A scan that reaches its budget ends `failed` with `timeout` and keeps the findings produced so far. Sizing: [10-user-guide.md](10-user-guide.md#9-discovery-scans-and-findings).
+- **Limits of the bound.** It is conservative (network, I/O and lock waits count as busy time). Connection setup is not paced. On PostgreSQL, parallel query workers are not disabled, so a query the planner runs in parallel can use more than one core during its busy time. The result of the #92 load job with pacing is pending (ROADMAP phase 7).
+
 ## Audit log files and failing streams (every engine)
 
 - **Log files the agent could write are refused.** Every file source (PostgreSQL pgaudit log, MariaDB `server_audit`, the MySQL / Percona JSON logs, the MongoDB `auditLog` and server log) must be written and owned by the database server. The agent refuses, on the opened handle and after following symlinks, a file owned by its own effective uid, world-writable, or group-writable by one of its groups (mode bits and owner only: POSIX ACL write entries, and an agent running as root or with `CAP_DAC_OVERRIDE`, are not detected): `check()` reports `audit.log_not_readable` (#83, [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md) decision 8). An agent running as root while the log belongs to root, or as the database server's user, cannot use the file: run it as a dedicated non-root user with group or ACL read access ([05-security.md](05-security.md#recommended-database-accounts-read-only)).
@@ -155,6 +163,18 @@ Because the session `sql_mode` of a logged statement is unknown, the normalizer 
 
 DDL and DCL events take no object names from the statement text; objects come from the log's table records when it has them (`server_audit` `TABLE`, `audit_log_filter` `table_access`), otherwise from the text for reads and writes. A failed statement is reported unless the server refused it before reading anything (syntax, unknown object and access errors), it sent no row, and the audit log has no table read record for it.
 
+### One event per statement (audit log files)
+
+The audit log files write a statement as several records: its table records (`server_audit` `TABLE` events, `audit_log_filter` `table_access`) and its statement record (`QUERY`). Since #93 the agent groups them per connection id and query id (without query ids, `audit_log_filter`: per connection and statement text), not by their position in the log, because concurrent sessions interleave their records (`READ a`, `READ b`, `QUERY a`, `QUERY b`). These rules refine [ADR-0023](adr/0023-mysql-mariadb-audit-sources-and-levels.md), which stays Accepted:
+
+- **When a statement is reported.** At its statement record; otherwise, without it, at the connection's next statement, at its disconnect (or a new connect with the same connection id), after 5 minutes, when it is evicted (more than 1024 connections with a statement waiting: the oldest first, logged), and when the file stream ends (source change, unreadable log). A waiting statement is kept across polls and log rotations, so a statement split by the poll bound or a rotation is one event.
+- **Bounds.** At most 1024 connections with a statement waiting, 64 distinct tables per statement and 8 MiB of statement text in all (only JSON `table_access` records carry a text, kept once per statement and zeroized).
+- **Late statement records.** A statement reported before its statement record is remembered by its query id (at most 16 384). Its late table records are ignored, and its late statement record yields a second event only when its text shows a signal (for example a whole-table read by a dump that ran longer than 5 minutes).
+
+`performance_schema` has one row per statement (deduplicated on thread and event id), so it needs no grouping.
+
+Before #93, records were merged only when adjacent: the #92 load harness measured about 12 % of the statements of interleaved MariaDB sessions counted twice, and the end of a poll batch or a connect / disconnect record also split a statement.
+
 ### Signals
 
 The signal ids are registered for `mysql` and `mariadb` in [`shared/protocol/signals.json`](../shared/protocol/signals.json).
@@ -186,6 +206,7 @@ Behind a proxy every client has the proxy's address, and another process on the 
 - **Signal stripping on the audit log files.** A client can make its own statement keep only its kind by putting a non-ASCII character right before a backslash or a backtick (`` 1 AS `é` ``, `/* é\ */`), through the fail-closed multibyte rule. The event is still reported, against `*` (with the tables named by the log's table records where it has them), but without text-derived signals (`signature.*`, `shape.*`).
 - **Dump heuristic evasions** (above).
 - **At-most-once delivery**, as for PostgreSQL: an agent crash within the aggregation window loses the events the cursor has already passed.
+- **Waiting table records at agent stop.** Table records whose statement record has not been read yet are lost when the agent stops: the cursor has moved past them. Their statement record, if written after the restart, is still reported, with the objects its text names ([One event per statement](#one-event-per-statement-audit-log-files)).
 - **Cursors and counters after a restart.** Since #88 the `performance_schema` cursor (end timers and ids of the statements read, with the server's start time) and the own-account row counters are persisted: an agent restart resumes after the last statement read when the server did not restart. What `events_statements_history_long` no longer holds (it wrapped while the agent was stopped) is lost and counted, and a statement of a session that ended while the agent was stopped is reported as an unidentified account. Without a cursor, a log file is read from its end; a log rotated while the agent was stopped is read from the start of the new file.
 - **A file source is Limited until a record is parsed**: after the log is configured, after an agent restart (the time of the last record is not persisted), and when nothing was written to the log for 24 h.
 - **`server_audit` times are local**, converted with the server's time-zone offset read at each re-probe; a DST change in between shifts times until the next re-probe.
@@ -427,3 +448,4 @@ Signatures are easy to forge (`application_name` and `program_name` are chosen b
 | MongoDB profiler level 2 | **High** | Avoid in production; level 1 with a suitable `slowms` |
 | MongoDB profiler polling by the agent | Low to medium: each poll scans `system.profile` from the start in natural order (no `ts` index), bounded by `maxTimeMS` (at most 30 s) | A failing poll (for example a `maxTimeMS` expiry) is logged by the agent; with no entry read for 24 h the target shows the level None |
 | OpenLDAP `accesslog` | Low | Purge with `olcAccessLogPurge` |
+| Discovery scan (every engine) | Paced: at most about `limits.discovery_duty_cycle_percent` % (default 1 %) of one core while a scan runs, one scan at a time per agent | Raise the duty cycle only where the server has spare cores, and size the scan's `max_duration_s` ([above](#discovery-load-on-the-monitored-database-every-engine)) |

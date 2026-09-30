@@ -2,7 +2,7 @@
 
 How to install the console and an agent, enroll the agent, declare targets, give the agent least-privilege accounts, and read findings and incidents. This page only describes what the code on `dev` does; the component READMEs linked below hold the full reference.
 
-> **Status.** v0.1.0 is being prepared (ROADMAP [phase 7](ROADMAP.md#phase-7--hardening--v010-release)). The "installation in under 15 minutes" goal, the load tests and the 72 h stability test are not done yet. Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+> **Status.** v0.1.0 is being prepared (ROADMAP [phase 7](ROADMAP.md#phase-7--hardening--v010-release)). The "installation in under 15 minutes" goal and the 72 h stability test are not done yet, and the load tests are in progress. Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
 
 ## 1. What you deploy
 | Component | Where | Network |
@@ -66,7 +66,7 @@ Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-pri
 **`agent.yaml`**: start from [agent/agent.example.yaml](../agent/agent.example.yaml). Unknown keys are rejected. The main settings:
 - `console.url`: the console's public HTTPS URL. `console.ca_file` pins a private CA (it then is the only trusted root). TLS 1.3 minimum. `HTTPS_PROXY` / `NO_PROXY` are honored.
 - `state_dir`: a directory owned by the agent user, not group- or world-writable.
-- `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval).
+- `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval), and `discovery_duty_cycle_percent`, the Discovery pacing (see [section 9](#9-discovery-scans-and-findings)).
 - `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority: findings and events can each grow to 3/4 of the bounds, so each keeps at least 1/4 (an events flood can evict findings down to that quarter); batches with a `signature.*` signal go last; otherwise the oldest first. and the console raises an `agent.batches_dropped` alert.
 - `targets`: see [section 6](#6-declare-targets).
 
@@ -132,6 +132,17 @@ What Audit can see depends on the engine, its edition and its logging settings. 
 2. The agent page shows the last scan of each target and a link to its findings.
 3. **Findings** lists, per target and classifier, the locations (database, schema or container, object, field) that hold a sensitive data type, with masked samples (at most 4 digits kept). Filter by agent, target and classifier.
 4. An administrator can mark a finding as a **false positive**; the mark is cleared automatically when a later scan matches more values or uses another classifier set.
+
+**Scans are paced, and therefore long.** To keep the monitored database under 2 % CPU while a scan runs, the agent pauses after each object's sampling and each catalog read so that its time in queries is at most `limits.discovery_duty_cycle_percent` of the scan's time (`agent.yaml`, default `1`, range 1 to 100, `100` disables pacing; [ADR-0035](adr/0035-discovery-pacing.md), proposed). A scan uses one connection and the agent runs one scan at a time, so a scan costs the server at most about that share of one core. The cost is time: a scan lasts about `100 / d` times its query time, e.g. about 2 minutes instead of 7 seconds for 200 MariaDB tables at the default of 1 %.
+
+Sizing the scan's **maximum duration** (`max_duration_s`, console default 900 s, capped by the agent's `limits.max_scan_duration_s`, default 3600 s):
+- at 1 %, each second of query time needs about 100 s of scan budget. 900 s covers about 9 s of query time (some 1 800 objects at 5 ms each); 3600 s about 36 s;
+- measure first: the agent logs each scan's busy and paused time at its end (`scan pacing`);
+- for a larger database, raise the scan's maximum duration, and `limits.max_scan_duration_s` above it (up to 86 400 s), or narrow the scan with filters;
+- raise `limits.discovery_duty_cycle_percent` only where the server has spare cores: 2 % on a 4-core server is 0.5 % of it;
+- a scan that reaches its maximum duration ends `failed` with `timeout`; the findings produced until then are kept.
+
+Scans of several targets of one agent run one after the other. The agent acknowledges a scan only when it starts it, and in 0.1 the console fails a scan left unacknowledged for 5 leases of 120 s (about 10 minutes, `timeout`). While a long scan runs, launch the next scan of the same agent after it ends (ROADMAP phase 7 follow-up). A queued scan's maximum duration also counts its time in the queue.
 
 Classifiers and their semantics: [agent/crates/classifiers/README.md](../agent/crates/classifiers/README.md).
 
