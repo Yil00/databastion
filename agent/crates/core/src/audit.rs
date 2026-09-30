@@ -302,7 +302,9 @@ pub(crate) const MAX_AUTH_FAILURE_GROUPS: usize = 100;
 pub(crate) const MAX_OVERFLOW_GROUPS: usize = 16;
 /// Failed logins beyond the named groups are first counted per principal
 /// in a table of this many entries (space-saving: when it is full, the
-/// entry with the fewest attempts joins the overflow event), so a
+/// entry with the fewest attempts joins the overflow event, the most
+/// recently inserted one among ties, so fresh junk names evict each other
+/// rather than an older entry such as `root`), so a
 /// principal attempted more often than the least attempted named group is
 /// promoted to a named group (#88 review M1).
 pub(crate) const MAX_FOLDED_PRINCIPALS: usize = 256;
@@ -316,8 +318,11 @@ pub(crate) struct Aggregator {
     /// events aside).
     named: std::collections::HashSet<EventGroupKey>,
     /// Failed logins beyond the named groups, per original group, not yet
-    /// in an overflow event (at most [`MAX_FOLDED_PRINCIPALS`]).
-    folded: HashMap<EventGroupKey, MaskedEvent>,
+    /// in an overflow event (at most [`MAX_FOLDED_PRINCIPALS`]), each with
+    /// its insertion sequence number (eviction tie-break).
+    folded: HashMap<EventGroupKey, (u64, MaskedEvent)>,
+    /// Next insertion sequence number of `folded` (monotonic).
+    folded_seq: u64,
     /// Overflow groups with a client address in the window.
     overflow_groups: usize,
 }
@@ -330,6 +335,7 @@ impl Aggregator {
             opened: None,
             named: std::collections::HashSet::new(),
             folded: HashMap::new(),
+            folded_seq: 0,
             overflow_groups: 0,
         }
     }
@@ -366,27 +372,35 @@ impl Aggregator {
     /// A failed login beyond the named groups: counted per principal, and
     /// promoted to a named group once attempted more often than the least
     /// attempted named group (which then joins the overflow, counts kept).
+    ///
+    /// When the table is full, the entry evicted to the overflow is the
+    /// least attempted one and, among ties, the most recently inserted
+    /// (sequence numbers are unique, so the choice is deterministic): fresh
+    /// junk names evict each other, and an older entry keeps its slot and
+    /// its count (#88 review, residual A).
     fn fold(&mut self, key: EventGroupKey, event: MaskedEvent) {
         match self.folded.get_mut(&key) {
-            Some(existing) => existing.merge(event),
+            Some((_, existing)) => existing.merge(event),
             None => {
                 if self.folded.len() >= MAX_FOLDED_PRINCIPALS {
                     let least = self
                         .folded
                         .iter()
-                        .min_by_key(|(_, e)| e.aggregated_count())
+                        .min_by_key(|(_, (seq, e))| (e.aggregated_count(), std::cmp::Reverse(*seq)))
                         .map(|(k, _)| k.clone());
-                    if let Some(e) = least.and_then(|k| self.folded.remove(&k)) {
+                    if let Some((_, e)) = least.and_then(|k| self.folded.remove(&k)) {
                         self.add_to_overflow(&e);
                     }
                 }
-                self.folded.insert(key.clone(), event);
+                let seq = self.folded_seq;
+                self.folded_seq += 1;
+                self.folded.insert(key.clone(), (seq, event));
             }
         }
         let count = self
             .folded
             .get(&key)
-            .map_or(0, MaskedEvent::aggregated_count);
+            .map_or(0, |(_, e)| e.aggregated_count());
         let smallest = self
             .named
             .iter()
@@ -399,7 +413,7 @@ impl Aggregator {
                 if let Some(e) = self.groups.remove(&demoted) {
                     self.add_to_overflow(&e);
                 }
-                if let Some(e) = self.folded.remove(&key) {
+                if let Some((_, e)) = self.folded.remove(&key) {
                     self.named.insert(key.clone());
                     self.insert(key, e);
                 }
@@ -457,10 +471,14 @@ impl Aggregator {
 
     pub(crate) fn drain(&mut self) -> Vec<MaskedEvent> {
         // Folded attempts not promoted join their overflow events.
-        let folded: Vec<MaskedEvent> = self.folded.drain().map(|(_, e)| e).collect();
-        for e in &folded {
+        // In insertion order, so overflow addresses are assigned
+        // deterministically.
+        let mut folded: Vec<(u64, MaskedEvent)> = self.folded.drain().map(|(_, e)| e).collect();
+        folded.sort_by_key(|(seq, _)| *seq);
+        for (_, e) in &folded {
             self.add_to_overflow(e);
         }
+        self.folded_seq = 0;
         self.opened = None;
         self.named.clear();
         self.overflow_groups = 0;
@@ -751,5 +769,63 @@ mod tests {
         assert_eq!(overflow, 1, "the demoted junk name");
         let total: u64 = out.iter().map(MaskedEvent::aggregated_count).sum();
         assert_eq!(total, MAX_AUTH_FAILURE_GROUPS as u64 + 50);
+    }
+
+    /// #88 review, residual A: more than `MAX_FOLDED_PRINCIPALS` fresh junk
+    /// names between two attempts on `root` cannot evict root from the
+    /// folded table (ties at the minimum count evict the most recent
+    /// entry), so root is promoted with all its attempts and no attempt is
+    /// lost.
+    #[test]
+    fn fresh_junk_names_cannot_evict_an_older_folded_account() {
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        let now = Instant::now();
+        let mut at = 0u64;
+        let mut pushed = 0u64;
+        let mut overflowed = 0u64;
+        let mut push = |a: &mut Aggregator, user: &str| {
+            at += 1;
+            pushed += 1;
+            overflowed += u64::from(a.push(failed(user, Some("198.51.100.7"), at), now));
+        };
+        // Fill the named groups first.
+        for i in 0..MAX_AUTH_FAILURE_GROUPS {
+            push(&mut a, &format!("named{i}"));
+        }
+        // Root every Nth failed login, more than the folded table between.
+        let gap = MAX_FOLDED_PRINCIPALS + 44;
+        let rounds = 5u64;
+        let mut junk = 0usize;
+        for _ in 0..rounds {
+            push(&mut a, "root");
+            for _ in 0..gap {
+                push(&mut a, &format!("junk{junk}"));
+                junk += 1;
+            }
+        }
+        let out = a.drain();
+        let root = out
+            .iter()
+            .find(|e| e.principal().account_name() == "root")
+            .expect("root in a named group");
+        assert!(!root.principal().send_name(), "fingerprinted");
+        assert_eq!(root.aggregated_count(), rounds);
+        let named = out
+            .iter()
+            .filter(|e| !e.principal().account_name().is_empty())
+            .count();
+        assert_eq!(named, MAX_AUTH_FAILURE_GROUPS);
+        let overflow: u64 = out
+            .iter()
+            .filter(|e| e.principal().account_name().is_empty())
+            .map(MaskedEvent::aggregated_count)
+            .sum();
+        // Every junk name and the demoted named group in the overflow.
+        assert_eq!(overflow, junk as u64 + 1);
+        let total: u64 = out.iter().map(MaskedEvent::aggregated_count).sum();
+        assert_eq!(total, pushed);
+        // Folded: every junk name, and root's first two attempts (promoted
+        // on the second, its later attempts go to its named group).
+        assert_eq!(overflowed, junk as u64 + 2);
     }
 }

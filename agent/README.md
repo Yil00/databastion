@@ -274,13 +274,19 @@ unidentified account (a `db_user` fingerprint, as for any failed login),
 per client address for at most 16 addresses, then one without address,
 whose `aggregated_count` is the number of attempts and whose `ts` /
 `ts_last` span them. Attempts beyond the named groups are first counted per
-principal (at most 256, the least attempted joining the overflow first); a
+principal (at most 256, the least attempted joining the overflow first, the
+most recently seen among ties, so fresh junk names evict each other rather
+than an older account); a
 principal attempted more often than the least attempted named group takes
 its place, that group joining the overflow with its count, so junk names
 sent first cannot hide which account is brute-forced (#88 review M1). No attempt goes uncounted, and a flood gives at most
 117 `auth_failure` events per window instead of one per name. Folded
 attempts are counted in `auth_failures_overflowed_total` (heartbeat
-metrics). With the spool priorities above, a later dump's
+metrics). Known limit: an attacker can keep 100 named junk groups above
+root's per-window count and so keep root out of the named groups, but that
+costs about 100 times root's volume, which stays visible in the overflow
+count and in `auth_failures_overflowed_total`. With the spool priorities
+above, a later dump's
 `signature.*` batches are kept, though they still queue behind earlier
 batches for sending.
 
