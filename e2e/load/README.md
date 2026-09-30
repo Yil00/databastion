@@ -25,19 +25,22 @@ and no secret, but on a runner for about 30 minutes). Before redaction, the run 
 results for every generated secret (with a canary as positive control, as `e2e/run.sh`); a hit is
 logged as `LEAK:` and fails the run. The raw pgbench / sysbench summaries go to the logs only.
 
-**Status (first runs, 2026-09-30, local, `LOAD_PG_AUDIT=pss`): two checks fail, on purpose.** They
-are findings about the agent, not harness defects, and are tracked outside this harness:
-- Discovery: while a scan runs, each server works at about 20 to 25 % of one core (about 1.5 ms of
-  database CPU per object, for 7 to 8 ms of scan time per object: the objects are sampled back to back,
-  without pacing), i.e. about 10 to 12 % of a 2-CPU server for PostgreSQL and MariaDB and about 5 % for
-  MongoDB. Over a one-minute window, the same scans are about 0.5 %.
-- MariaDB Audit: about 12 % of the statements are counted twice when concurrent sessions interleave
-  their `server_audit` records (the target's log holds exactly the statements issued; the agent reports
-  more). PostgreSQL (`pg_stat_statements` source) was exact.
+**Status (CI load job on commit `b4aa999`, 2026-09-30): every check passes.** Discovery impact
+while a scan runs: 0.30 % on MariaDB, 0.28 % on MongoDB, about 0 % on PostgreSQL. Audit:
+`events_accounted` exactly 1 (nothing lost, nothing counted twice). Agent peak RSS: 41 MiB.
 
-The Audit path otherwise kept up (nothing spooled or dropped, events stored within about 65 s), the
-workload's p95 latency did not move with Audit on, and the agent stayed at about 0.012 core and 28 to
-36 MiB RSS over 10 minutes at 600 statements per second, without growth.
+The first local runs (2026-09-30, `LOAD_PG_AUDIT=pss`) had two failing checks, both findings about
+the agent rather than harness defects, fixed since then (PR 93):
+- Discovery: objects were sampled back to back, without pacing, so each server worked at about 20 to
+  25 % of one core while a scan ran (about 10 to 12 % of a 2-CPU server for PostgreSQL and MariaDB,
+  about 5 % for MongoDB). Scans are now paced at a bounded duty cycle
+  (`limits.discovery_duty_cycle_percent`, ADR-0035).
+- MariaDB Audit: about 12 % of the statements were counted twice when concurrent sessions interleaved
+  their `server_audit` records. The agent now groups the records of a statement per connection.
+
+In those runs the Audit path otherwise kept up (nothing spooled or dropped, events stored within about
+65 s), the workload's p95 latency did not move with Audit on, and the agent stayed at about
+0.012 core and 28 to 36 MiB RSS over 10 minutes at 600 statements per second, without growth.
 
 ## Running it
 Requirements: Docker with Compose v2 on a cgroup v2 (or v1) Linux host, `openssl`, `curl`, `jq`,
