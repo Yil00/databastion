@@ -1,0 +1,21 @@
+#!/bin/sh
+# databastion-agent postrm. Purge deletes the agent state (/var/lib/databastion: identity, local
+# HMAC key, spool, audit cursors): revoke the agent in the console first. The `databastion` system
+# user and the files the administrator added under /etc/databastion/secrets are kept.
+set -e
+
+case "$1" in
+  purge)
+    rm -rf /var/lib/databastion
+    ;;
+esac
+
+case "$1" in
+  remove|purge)
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

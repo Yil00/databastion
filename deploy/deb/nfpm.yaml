@@ -1,0 +1,61 @@
+# nfpm configuration of the databastion-agent .deb (deploy/deb/build.sh sets the variables).
+# Reproducible: every mtime comes from SOURCE_DATE_EPOCH (the commit time), modes are explicit,
+# owners are root in the archive; postinst creates the `databastion` system user and hands it
+# the configuration group and the state directory.
+name: databastion-agent
+arch: ${DEB_ARCH}
+platform: linux
+version: ${DEB_VERSION}
+version_schema: semver
+section: admin
+priority: optional
+maintainer: MyDataVizion <105881992+Yil00@users.noreply.github.com>
+description: |-
+  DataBastion agent: sensitive-data discovery and exfiltration audit
+  Finds sensitive data in PostgreSQL, MySQL / MariaDB, MongoDB and OpenLDAP
+  (Discovery) and reports abnormal extractions of it (Audit) to a DataBastion
+  console. Outbound HTTPS only: the agent opens no listening port, and no raw
+  sensitive value nor database credential leaves this host.
+vendor: DataBastion
+homepage: https://github.com/Yil00/databastion
+license: Apache-2.0
+depends:
+  - ${DEB_LIBC_DEPENDS}
+  - libgcc-s1
+  - passwd
+umask: 0o022
+
+contents:
+  - src: ${AGENT_BINARY}
+    dst: /usr/bin/databastion-agent
+    expand: true
+    file_info: {mode: 0o755, owner: root, group: root}
+  - src: ${AGENT_EXAMPLE_CONFIG}
+    dst: /etc/databastion/agent.yaml
+    type: config|noreplace
+    expand: true
+    file_info: {mode: 0o640, owner: root, group: root}
+  - src: ${AGENT_EXAMPLE_CONFIG}
+    dst: /usr/share/databastion-agent/agent.example.yaml
+    expand: true
+    file_info: {mode: 0o644, owner: root, group: root}
+  - src: ./databastion-agent.service
+    dst: /usr/lib/systemd/system/databastion-agent.service
+    file_info: {mode: 0o644, owner: root, group: root}
+  - src: ./copyright
+    dst: /usr/share/doc/databastion-agent/copyright
+    file_info: {mode: 0o644, owner: root, group: root}
+  - dst: /etc/databastion
+    type: dir
+    file_info: {mode: 0o750, owner: root, group: root}
+  - dst: /etc/databastion/secrets
+    type: dir
+    file_info: {mode: 0o750, owner: root, group: root}
+  - dst: /var/lib/databastion
+    type: dir
+    file_info: {mode: 0o700, owner: root, group: root}
+
+scripts:
+  postinstall: ./postinst
+  preremove: ./prerm
+  postremove: ./postrm

@@ -1,0 +1,45 @@
+#!/bin/sh
+# databastion-agent postinst: system user, ownership of the configuration and state directories,
+# systemd reload. The service is neither enabled nor started on a first install (the agent must be
+# enrolled first, deploy/README.md); an upgrade restarts it if it was running.
+set -e
+
+# owner:group mode path, unless the administrator set a dpkg-statoverride for the path.
+set_perms() {
+  if ! dpkg-statoverride --list "$3" >/dev/null 2>&1; then
+    chown "$1" "$3"
+    chmod "$2" "$3"
+  fi
+}
+
+case "$1" in
+  configure)
+    if ! getent group databastion >/dev/null; then
+      groupadd --system databastion
+    fi
+    if ! getent passwd databastion >/dev/null; then
+      useradd --system --gid databastion --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin --comment "DataBastion agent" databastion
+    fi
+    set_perms root:databastion 0750 /etc/databastion
+    set_perms root:databastion 0750 /etc/databastion/secrets
+    set_perms root:databastion 0640 /etc/databastion/agent.yaml
+    set_perms databastion:databastion 0700 /var/lib/databastion
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null || true
+      # $2: the previously configured version (upgrade).
+      if [ -n "$2" ]; then
+        systemctl try-restart databastion-agent.service >/dev/null || true
+      fi
+    fi
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+  *)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

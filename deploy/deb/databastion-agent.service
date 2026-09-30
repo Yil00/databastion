@@ -1,0 +1,75 @@
+# DataBastion agent: systemd unit installed by the databastion-agent .deb (deploy/README.md).
+#
+# The agent is an HTTPS client only: it opens no listening port (invariant I1). Nothing here adds
+# one; SocketBindDeny=any makes the kernel refuse any bind() to an IP port by this service.
+#
+# Customize with a drop-in (`systemctl edit databastion-agent`), never by editing this file:
+# - read database audit logs: SupplementaryGroups=<group of the log files>. The agent refuses an
+#   audit log file it owns or could write (agent README, "Audit log files"): give it read access
+#   through a group (e.g. log files 0640, owner postgres or mysql, group databastion or adm), or
+#   an ACL, never ownership.
+# - a Unix socket under /tmp (e.g. MongoDB's /tmp/mongodb-27017.sock): PrivateTmp=yes hides the
+#   host's /tmp; use TCP on the loopback, or add BindReadOnlyPaths=/tmp/mongodb-27017.sock.
+# - another state_dir in agent.yaml: add it to ReadWritePaths= (owned by databastion, 0700).
+# - HTTPS_PROXY / NO_PROXY / DATABASTION_LOG: in /etc/databastion/agent.env (optional,
+#   KEY=value lines, 0600 root:root; read by systemd before the privileges are dropped).
+
+[Unit]
+Description=DataBastion agent (outbound HTTPS only, no listening port)
+Documentation=https://github.com/Yil00/databastion/blob/main/deploy/README.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=databastion
+Group=databastion
+# SupplementaryGroups=adm
+ExecStart=/usr/bin/databastion-agent run --config /etc/databastion/agent.yaml
+EnvironmentFile=-/etc/databastion/agent.env
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+
+# Filesystem: everything read-only but the state directory (identity, HMAC key, spool, cursors).
+StateDirectory=databastion
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/databastion
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Privileges: none.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# Network: outbound TCP to the console and the declared targets, Unix sockets of local targets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SocketBindDeny=any
+
+# Kernel and process isolation. /proc stays visible: local engine detection reads the process
+# names (/proc/<pid>/comm, never the command line) and /proc/net/tcp (ADR-0006).
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
