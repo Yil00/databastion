@@ -396,7 +396,12 @@ impl ColumnClassifier<'_> {
             let value: &str = if is_nfc_quick(original.chars()) == IsNormalized::Yes {
                 original
             } else {
-                composed = Zeroizing::new(original.nfc().collect());
+                // Pre-sized so that no reallocation leaves an unzeroized
+                // copy of a raw prefix behind: NFC expands UTF-8 by at
+                // most 3 times (UAX #15).
+                let mut buf = String::with_capacity(original.len().saturating_mul(3));
+                buf.extend(original.nfc());
+                composed = Zeroizing::new(buf);
                 detect::bounded(&composed)
             };
             // Typographic spaces and hyphens (no-break space, narrow
@@ -406,7 +411,10 @@ impl ColumnClassifier<'_> {
             // form. Zeroized on drop.
             let folded: Zeroizing<String>;
             let value: &str = if value.contains(typographic) {
-                folded = Zeroizing::new(value.chars().map(fold_typographic).collect());
+                // Folding only shrinks the value: no reallocation.
+                let mut buf = String::with_capacity(value.len());
+                buf.extend(value.chars().map(fold_typographic));
+                folded = Zeroizing::new(buf);
                 detect::bounded(&folded)
             } else {
                 value
