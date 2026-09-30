@@ -1013,6 +1013,258 @@ fn round2(r: &mut Rng, cases: &mut Vec<Case>) {
     });
 }
 
+/// Third round: phones as a small minority or embedded among other
+/// content, typographic separators, generator layouts with random digits,
+/// national layouts only accepted under a phone name so far.
+fn round3(r: &mut Rng, cases: &mut Vec<Case>) {
+    let mut add = |r: &mut Rng, label: &str, name: &str, want: bool, g: &Gen| {
+        let values = (0..200).map(|_| g(r)).collect();
+        cases.push(Case {
+            label: label.to_owned(),
+            name: name.to_owned(),
+            values,
+            want,
+        });
+    };
+    // Typographic separators (word processors, spreadsheets, French
+    // typography): no-break space, narrow no-break space, figure space.
+    for (i, sep) in ["\u{a0}", "\u{202f}", "\u{2007}"].iter().enumerate() {
+        let sp = (*sep).to_owned();
+        add(
+            r,
+            &format!("nbsp fr {i}"),
+            &format!("c{}", 100 + i),
+            true,
+            &move |r| {
+                let mob = *r.pick(&["6", "7"]);
+                if r.chance(50) {
+                    format!("0{mob}{sp}{}", pairs(r, 4, &sp))
+                } else {
+                    format!("+33{sp}{mob}{sp}{}", pairs(r, 4, &sp))
+                }
+            },
+        );
+    }
+    add(r, "nbsp in prose", "c103", true, &|r| {
+        if r.chance(15) {
+            format!(
+                "Rappeler Mme Martin au 01\u{a0}{} demain.",
+                pairs(r, 4, "\u{a0}")
+            )
+        } else {
+            prose_plain(r)
+        }
+    });
+    add(r, "non-breaking hyphen", "c104", true, &|r| {
+        format!(
+            "{}\u{2011}{}\u{2011}{}",
+            r.range(201, 989),
+            r.range(200, 999),
+            r.digits(4)
+        )
+    });
+    // Small minorities in text.
+    for (i, pct) in [4u32, 3].iter().enumerate() {
+        let p = *pct;
+        add(
+            r,
+            &format!("prose {p}% phones"),
+            &format!("c{}", 105 + i),
+            true,
+            &move |r| {
+                if r.chance(p) {
+                    let ph = formatted_phone(r);
+                    prose_with_phone(r, &ph)
+                } else {
+                    prose_plain(r)
+                }
+            },
+        );
+    }
+    add(r, "prose 6% compact mobiles", "c107", true, &|r| {
+        if r.chance(6) {
+            let ph = fr(r, 3);
+            let t = *r.pick(&[
+                "Le client demande à être rappelé au {}.",
+                "Contact: {} (M. Durand)",
+                "Please call back on {}",
+                "Joignable au {} après 18h",
+                "Numéro portable {}",
+                "Nouveau numéro: {}",
+                "Contacter au {}",
+            ]);
+            t.replace("{}", &ph)
+        } else {
+            prose_plain(r)
+        }
+    });
+    add(r, "key=value logs", "c108", true, &|r| {
+        if r.chance(15) {
+            let ph = any_phone(r);
+            format!("event=signup user={} phone={ph} status=ok", r.digits(6))
+        } else {
+            format!(
+                "event=login user={} status=ok ms={}",
+                r.digits(6),
+                r.range(1, 900)
+            )
+        }
+    });
+    add(r, "tel= logs compact", "c109", true, &|r| {
+        if r.chance(20) {
+            format!(
+                "sms sent to=+33{}{} len={}",
+                r.pick(&["6", "7"]),
+                r.digits(8),
+                r.range(10, 160)
+            )
+        } else {
+            format!("sms queued id={} len={}", r.digits(8), r.range(10, 160))
+        }
+    });
+    // Whole-value minorities among other contact data.
+    add(r, "phones among usernames", "c110", true, &|r| {
+        if r.chance(20) {
+            fr(r, 0)
+        } else {
+            format!(
+                "{}{}",
+                r.pick(&["jdupont", "msmith", "alice", "bob_m", "lucas.b"]),
+                r.range(1, 999)
+            )
+        }
+    });
+    add(r, "phones among names", "c111", true, &|r| {
+        if r.chance(20) {
+            let f = r.below(NANP_FORMATS);
+            nanp(r, f)
+        } else {
+            (*r.pick(&[
+                "Marie Curie",
+                "Jean Martin",
+                "Anna Rossi",
+                "Tom Smith",
+                "Lea Garcia",
+            ]))
+            .to_owned()
+        }
+    });
+    add(
+        r,
+        "email, phone or handle",
+        "c112",
+        true,
+        &|r| match r.below(4) {
+            0 => fr(r, 0),
+            1 => email(r),
+            2 => format!("@{}", r.pick(&["jdoe", "mmartin", "anna_r"])),
+            _ => format!("skype:{}", r.pick(&["jdoe", "mmartin", "anna_r"])),
+        },
+    );
+    add(r, "several numbers per value", "c113", true, &|r| {
+        format!(
+            "{}{}{}",
+            fr(r, 3),
+            r.pick(&[",", ";", " ; ", "/", " | "]),
+            fr(r, 3)
+        )
+    });
+    // Generator layouts with random digits (area codes from 0 too).
+    add(r, "us random digits", "c114", true, &|r| match r.below(6) {
+        0 => format!("{}-{}-{}", r.digits(3), r.digits(3), r.digits(4)),
+        1 => format!("({}){}-{}", r.digits(3), r.digits(3), r.digits(4)),
+        2 => format!("{}.{}.{}", r.digits(3), r.digits(3), r.digits(4)),
+        3 => format!("+1-{}-{}-{}", r.digits(3), r.digits(3), r.digits(4)),
+        4 => format!(
+            "001-{}-{}-{}x{}",
+            r.digits(3),
+            r.digits(3),
+            r.digits(4),
+            r.digits(3)
+        ),
+        _ => format!(
+            "{}-{}-{}x{}",
+            r.digits(3),
+            r.digits(3),
+            r.digits(4),
+            r.digits(4)
+        ),
+    });
+    add(
+        r,
+        "de area 4-5 + subscriber",
+        "c115",
+        true,
+        &|r| match r.below(4) {
+            0 => format!("0{} {}", r.digits(4), r.digits(5)),
+            1 => format!("0{}-{}", r.digits(4), r.digits(5)),
+            2 => format!("0{}/{}", r.digits(3), r.digits(5)),
+            _ => format!("(0{}) {}", r.digits(4), r.digits(6)),
+        },
+    );
+    add(r, "uk +44(0)", "c116", true, &|r| {
+        format!(
+            "+44(0){} {}",
+            r.pick(&["1632", "20 7946", "113 496"]),
+            r.digits(4)
+        )
+    });
+    add(r, "fr +33 (0)1 8 digits", "c117", true, &|r| {
+        format!("+33 (0){} {}", r.range(1, 9), r.digits(8))
+    });
+    // Precision for the rules above.
+    add(r, "prose with order numbers", "c118", false, &|r| {
+        let t = *r.pick(&[
+            "Commande {} livrée au point relais.",
+            "Numéro de commande {} annulé.",
+            "Order {} refunded.",
+            "Dossier n° {} transmis au service client.",
+            "Facture {} envoyée.",
+        ]);
+        t.replace("{}", &format!("0{}", r.digits(9)))
+    });
+    add(r, "logs with ids", "c119", false, &|r| {
+        format!(
+            "event=order id=0{} amount={}.{:02} user={}",
+            r.digits(9),
+            r.range(1, 999),
+            r.range(0, 99),
+            r.digits(6)
+        )
+    });
+    add(r, "csv of amounts", "c120", false, &|r| {
+        format!(
+            "{},{:02};{},{:02}",
+            r.range(1, 99_999),
+            r.range(0, 99),
+            r.range(1, 99_999),
+            r.range(0, 99)
+        )
+    });
+    add(r, "nbsp amounts", "c121", false, &|r| {
+        format!(
+            "{}\u{a0}{:03}\u{a0}{:03},{:02}\u{a0}€",
+            r.range(1, 999),
+            r.range(0, 999),
+            r.range(0, 999),
+            r.range(0, 99)
+        )
+    });
+    add(r, "nbsp postcodes", "c122", false, &|r| {
+        format!("{:05}\u{a0}Paris", r.range(75001, 75020))
+    });
+    add(r, "codes among words", "c123", false, &|r| {
+        if r.chance(20) {
+            format!("0{} {} {}", r.digits(3), r.digits(4), r.digits(2))
+        } else {
+            (*r.pick(&["pending", "shipped", "returned", "lost"])).to_owned()
+        }
+    });
+    add(r, "de-like identifiers", "c124", false, &|r| {
+        format!("{}-{}", r.digits(5), r.digits(5))
+    });
+}
+
 #[test]
 fn phone_columns_are_decided_correctly() {
     let mut r = Rng(0x5eed_0bad_f00d_0001);
@@ -1020,6 +1272,7 @@ fn phone_columns_are_decided_correctly() {
     positives(&mut r, &mut cases);
     negatives(&mut r, &mut cases);
     round2(&mut r, &mut cases);
+    round3(&mut r, &mut cases);
     let mut wrong = Vec::new();
     let (mut tp, mut fneg, mut fpos, mut tn) = (0, 0, 0, 0);
     for c in &cases {
@@ -1032,6 +1285,14 @@ fn phone_columns_are_decided_correctly() {
             (true, false) => fneg += 1,
             (false, true) => fpos += 1,
             (false, false) => tn += 1,
+        }
+        if got != c.want && std::env::var("PHONE_EVAL_DEBUG").is_ok() {
+            let h = classify_column("phone", &raws);
+            let m = h
+                .iter()
+                .find(|f| f.classifier() == C::Phone)
+                .map_or(0, |f| f.matched());
+            eprintln!("  debug {}: matched under a phone name {m}", c.label);
         }
         if got != c.want {
             wrong.push(format!(

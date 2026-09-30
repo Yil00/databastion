@@ -937,12 +937,29 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
         (3, &*PHONE_GROUPED),
         (4, &*PHONE_333),
     ] {
-        for m in r.find_iter(v) {
+        let mut pos = 0;
+        while let Some(m) = r.find_at(v, pos) {
+            pos = m.end();
             let before = prev_char(v, m.start());
-            // `Tél.06 12 34 56 78`: a dot that ends an abbreviated label.
-            let label_dot = before == Some('.')
-                && prev_char(v, m.start() - 1).is_some_and(char::is_alphabetic)
-                && phone_label_before(v, m.start());
+            // `Tél.06 12 34 56 78`: a dot that ends an abbreviated label;
+            // `phone=+33…`, `tel=06…`: a key named after a phone.
+            let label_dot = match before {
+                Some('.') => {
+                    prev_char(v, m.start() - 1).is_some_and(char::is_alphabetic)
+                        && phone_label_before(v, m.start())
+                }
+                Some('=') => phone_label_before(v, m.start()),
+                // The second number of a list (`0612345678/0698765432`).
+                Some('/' | ',') => {
+                    v[..m.start() - 1]
+                        .bytes()
+                        .rev()
+                        .take_while(u8::is_ascii_digit)
+                        .count()
+                        >= 8
+                }
+                _ => false,
+            };
             if !label_dot
                 && before.is_some_and(|c| {
                     c.is_alphanumeric()
@@ -965,6 +982,8 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
             let Some((range, mut strength)) = found else {
                 continue;
             };
+            // A cut number: search again after it (the next number).
+            pos = pos.min(range.end);
             if phone_label_before(v, range.start) {
                 strength = PhoneStrength::Strong;
             }
@@ -992,7 +1011,10 @@ fn grade(v: &str, kind: u8, range: Range<usize>, next_group: bool) -> Option<Pho
         // An extension glued to the number (`202-555-0125x12`).
         Some('x' | 'X') => !extension_after(&v[range.end + 1..]),
         Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '@' | '%') => true,
+        // `0612345678,0698765432`: a list of numbers, not a decimal.
+        Some(',') if list_next(&v[range.end + 1..]) => false,
         Some(' ' | ',') => !next_group && after.next().is_some_and(|c| c.is_ascii_digit()),
+        Some('/') if list_next(&v[range.end + 1..]) => false,
         Some('.' | '-' | '/') => after.next().is_some_and(|c| c.is_ascii_alphanumeric()),
         Some(_) => false,
     };
@@ -1054,7 +1076,8 @@ fn grade(v: &str, kind: u8, range: Range<usize>, next_group: bool) -> Option<Pho
 
 /// A trunk number followed by another group of 4 or more digits (`06 12 34
 /// 56 78 75011 Paris`): the longest leading groups that fit a national plan
-/// (normal grading), else `None`.
+/// (normal grading), or a compact number followed by another one
+/// (`0612345678/0698765432`, weak), else `None`.
 fn trunk_prefix(v: &str, range: Range<usize>) -> Option<(Range<usize>, PhoneStrength)> {
     let text = &v[range.clone()];
     // Ends of the digit groups, except the last one.
@@ -1067,17 +1090,29 @@ fn trunk_prefix(v: &str, range: Range<usize>) -> Option<(Range<usize>, PhoneStre
         .collect();
     for end in ends.into_iter().rev() {
         let rest = &text[end..];
-        let next = rest.trim_start_matches([' ', ',']);
+        let next = rest.trim_start_matches([' ', ',', '/']);
         if rest.len() - next.len() != 1 || next.chars().take_while(char::is_ascii_digit).count() < 4
         {
             continue;
         }
         let r = range.start..range.start + end;
-        if grade(v, 2, r.clone(), true) == Some(PhoneStrength::Normal) {
-            return Some((r, PhoneStrength::Normal));
+        match grade(v, 2, r.clone(), true) {
+            Some(PhoneStrength::Normal) => return Some((r, PhoneStrength::Normal)),
+            // A list of compact numbers (`0612345678/0698765432`).
+            Some(PhoneStrength::Weak) if list_next(&rest[1..]) => {
+                return Some((r, PhoneStrength::Weak));
+            }
+            _ => {}
         }
     }
     None
+}
+
+/// After a `,` or `/`: another phone-like number (`+`, or a run of 8 or
+/// more digits), so the separator lists numbers.
+fn list_next(rest: &str) -> bool {
+    let rest = rest.trim_start_matches(' ');
+    rest.starts_with('+') || rest.bytes().take_while(u8::is_ascii_digit).count() >= 8
 }
 
 /// Lengths of the digit groups of a text.
@@ -2257,6 +2292,30 @@ mod tests {
         // the whole run fits no plan (weak).
         assert_eq!(strength("06 12 34 56 78 90"), Some(PhoneStrength::Weak));
         assert_eq!(strength("Ref 06 12 34 56 78 901"), None);
+    }
+
+    #[test]
+    fn phone_keys_and_lists() {
+        assert_eq!(
+            found("event=signup phone=+33612345678 ok"),
+            [(C::Phone, "+33612345678")]
+        );
+        assert_eq!(found("tel=0612345678"), [(C::Phone, "0612345678")]);
+        // A key that is not a phone label keeps the boundary rule.
+        assert!(found("id=0612345678").is_empty());
+        assert!(found("delta=+12345678").is_empty());
+        for v in [
+            "0612345678,0698765432",
+            "0612345678/0698765432",
+            "0612345678, 0698765432",
+            "+33612345678,+33698765432",
+        ] {
+            let f = found(v);
+            assert_eq!(f.len(), 2, "{v}: {f:?}");
+            assert!(f.iter().all(|(c, _)| *c == C::Phone), "{v}");
+        }
+        // Decimals and short groups after a comma stay glued.
+        assert!(found("0612345678,50").is_empty());
     }
 
     #[test]

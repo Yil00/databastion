@@ -20,7 +20,7 @@
 //! | IBAN, card, NIR (checksums) | `matched ≥ 1` and at least half of the checksum-shaped candidates are valid; card: not under an order / tracking / IMEI / SIRET name | `0.6 + 0.35·ratio (+0.05 hint)` |
 //! | AWS key id, secret key in context, password hash | `matched ≥ 1` | idem |
 //! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
-//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07` or `00` + country code + mobile prefix), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it), or 3 values and `≥ 0.05` with a formatted number among words (free text); a column of `≥ 0.95` compact North American numbers (20 at least, 3 area codes); in a contact column, the shares `0.3`, `0.8` and `0.95` are taken over the values that are not e-mail addresses (3 values at least); `+` compact numbers among negative numbers are signed amounts | `0.4 + 0.4·ratio (+0.2 hint)` |
+//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07` or `00` + country code + mobile prefix), or 3 values and `≥ 0.01` with a strong one (`+`, parentheses, a phone label before it), or 3 values and `≥ 0.01` with a formatted number among words (free text); a column of `≥ 0.95` compact North American numbers (20 at least, 3 area codes); the shares `0.3`, `0.8` and `0.95` are taken over the values with at least 6 digits that are not e-mail addresses (contact columns mixing e-mail addresses, user names, names; 3 values at least); `+` compact numbers among negative numbers are signed amounts | `0.4 + 0.4·ratio (+0.2 hint)` |
 //! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
 //! | person name | never under a name of something else (`pet_name`, `hostname`, `product.name`, `team_name`, `company_name`…); hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
 //! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
@@ -72,11 +72,14 @@ const PHONE_MIN_RATIO: f64 = 0.3;
 /// Phone without a name hint, in text: values with a strong token (`+`,
 /// parentheses, a phone label), and their share.
 const PHONE_STRONG_MIN_MATCHED: u32 = 3;
-const PHONE_STRONG_MIN_RATIO: f64 = 0.05;
+const PHONE_STRONG_MIN_RATIO: f64 = 0.01;
+/// Share of whole negative numbers that makes `+` compact numbers signed
+/// amounts.
+const SIGNED_MIN_RATIO: f64 = 0.05;
 /// Phone without a name hint, in free text: values where a normal or strong
 /// number sits among words, and their share.
 const PHONE_TEXT_MIN_MATCHED: u32 = 3;
-const PHONE_TEXT_MIN_RATIO: f64 = 0.05;
+const PHONE_TEXT_MIN_RATIO: f64 = 0.01;
 /// Phone without a name hint: a column of compact North American numbers.
 const PHONE_NANP_MIN_MATCHED: u32 = 20;
 const PHONE_NANP_MIN_RATIO: f64 = 0.95;
@@ -198,6 +201,9 @@ struct Stats {
     /// Values with an e-mail token and no phone token: the other half of a
     /// contact column ("e-mail or phone").
     email_only: u32,
+    /// Values with at least 6 digits: the ones that could be phone numbers
+    /// (not names, user names, handles or words).
+    numeric: u32,
     /// Whole compact North American numbers, and up to 3 of their area
     /// codes.
     phone_nanp: u32,
@@ -393,6 +399,18 @@ impl ColumnClassifier<'_> {
                 composed = Zeroizing::new(original.nfc().collect());
                 detect::bounded(&composed)
             };
+            // Typographic spaces and hyphens (no-break space, narrow
+            // no-break space, non-breaking hyphen, en dash, minus sign),
+            // as word processors and spreadsheets write numbers
+            // (`06\u{a0}12\u{a0}34\u{a0}56\u{a0}78`), read as their ASCII
+            // form. Zeroized on drop.
+            let folded: Zeroizing<String>;
+            let value: &str = if value.contains(typographic) {
+                folded = Zeroizing::new(value.chars().map(fold_typographic).collect());
+                detect::bounded(&folded)
+            } else {
+                value
+            };
             if value.trim().is_empty() {
                 continue;
             }
@@ -418,6 +436,7 @@ impl ColumnClassifier<'_> {
                 st.phone_text += 1;
             }
             st.email_only += u32::from(has(ClassifierId::Email) && !has(ClassifierId::Phone));
+            st.numeric += u32::from(value.bytes().filter(u8::is_ascii_digit).count() >= 6);
             {
                 let t = value.trim();
                 let number = |x: &str| {
@@ -452,14 +471,22 @@ impl ColumnClassifier<'_> {
                 }
                 self.record(&ctx, &mut acc, &mut hit, t.classifier, token);
             }
+            // Whole compact numbers, one or a list (`0612345678`,
+            // `0612345678,0698765432`).
             if cand.phone == Some(detect::PhoneStrength::Weak)
-                && let [t] = tokens.as_slice()
-                && t.classifier == ClassifierId::Phone
-                && value[t.range.clone()] == *value.trim()
+                && !tokens.is_empty()
+                && tokens.iter().all(|t| {
+                    t.classifier == ClassifierId::Phone
+                        && value[t.range.clone()].bytes().all(|b| b.is_ascii_digit())
+                })
+                && only_list_separators(value, &tokens)
             {
                 st.phone_compact += 1;
-                let v = value.trim();
-                st.phone_compact_mobile += u32::from(compact_mobile(v));
+                st.phone_compact_mobile += u32::from(
+                    tokens
+                        .iter()
+                        .all(|t| compact_mobile(&value[t.range.clone()])),
+                );
             }
             st.aws_tokens += u32::from(aws);
             st.hash_tokens += u32::from(hash);
@@ -598,6 +625,29 @@ impl ColumnClassifier<'_> {
     }
 }
 
+/// Typographic spaces and hyphens folded by [`fold_typographic`].
+fn typographic(c: char) -> bool {
+    matches!(
+        c,
+        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{2010}'..='\u{2013}' | '\u{2212}'
+    )
+}
+
+fn fold_typographic(c: char) -> char {
+    match c {
+        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' => ' ',
+        '\u{2010}'..='\u{2013}' | '\u{2212}' => '-',
+        c => c,
+    }
+}
+
+/// Only list separators (spaces, `,`, `;`, `/`, `|`) outside the tokens.
+fn only_list_separators(value: &str, tokens: &[detect::Token]) -> bool {
+    value.char_indices().all(|(i, c)| {
+        tokens.iter().any(|t| t.range.contains(&i)) || matches!(c, ' ' | ',' | ';' | '/' | '|')
+    })
+}
+
 /// Letters of a value outside its phone tokens (a number among words).
 fn letters_outside_phones(value: &str, tokens: &[detect::Token]) -> usize {
     value
@@ -648,11 +698,17 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats, hints: &NameHints) -> bool 
         ClassifierId::Phone => {
             // In a contact column ("e-mail or phone"), the phone numbers
             // are the values that are not e-mail addresses.
-            let others = st.n.saturating_sub(st.email_only).max(1);
+            // Phone numbers among other contact data (e-mail addresses,
+            // user names, names, handles): shares over the values with
+            // digits that are not e-mail addresses.
+            let others =
+                st.n.saturating_sub(st.email_only)
+                    .min(st.numeric.saturating_sub(st.email_only))
+                    .max(1);
             let share_others = |k: u32| f64::from(k) / f64::from(others);
             // `+12345678` among `-2345678`: signed amounts.
             let signed = st.minus_numbers >= PHONE_STRONG_MIN_MATCHED
-                && share(st.minus_numbers) >= PHONE_STRONG_MIN_RATIO;
+                && share(st.minus_numbers) >= SIGNED_MIN_RATIO;
             let strong = if signed {
                 st.phone_strong.saturating_sub(st.plus_compact)
             } else {
@@ -930,6 +986,53 @@ mod tests {
             })
             .collect();
         assert!(phone_found("c1", &sparse));
+    }
+
+    #[test]
+    fn phones_as_a_minority() {
+        // Typographic separators.
+        let nbsp: Vec<String> = (0..20)
+            .map(|i| format!("06\u{a0}12\u{a0}34\u{a0}{:02}\u{a0}{:02}", i, 99 - i))
+            .collect();
+        assert!(phone_found("c1", &nbsp));
+        // 20 % phones among user names.
+        let users: Vec<String> = (0..50)
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("01 99 00 {:02} 59", i)
+                } else {
+                    format!("user_{i}")
+                }
+            })
+            .collect();
+        assert!(phone_found("login", &users));
+        // 2 % of notes with a labelled number.
+        let notes: Vec<String> = (0..200)
+            .map(|i| {
+                if i % 50 == 1 {
+                    format!("Rappeler au 06123456{:02}", i)
+                } else {
+                    format!("Commande {} expédiée.", 1000 + i)
+                }
+            })
+            .collect();
+        assert!(phone_found("notes", &notes));
+        // Lists of compact mobile numbers.
+        let lists: Vec<String> = (0..20)
+            .map(|i| format!("06123456{i:02};07987654{i:02}"))
+            .collect();
+        assert!(phone_found("c1", &lists));
+        // Codes among words do not become phones.
+        let codes: Vec<String> = (0..50)
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("0{:03} {:04} {:02}", i, i * 7, i % 100)
+                } else {
+                    "shipped".to_owned()
+                }
+            })
+            .collect();
+        assert!(!phone_found("c1", &codes));
     }
 
     #[test]
