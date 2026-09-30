@@ -172,6 +172,19 @@ export DATABASTION_TEST_MONGO_ADMIN_URL="mongodb://root:$MONGO_ROOT_PASSWORD@127
 `DATABASTION_TEST_REQUIRE` accepts `mongo` and `mongo-admin` for these tests. On volumes created
 before ADR-0026, run `make dev-reset dev` first: the init script creates the account only once.
 
+`verify_full` against a real server (phase 7) runs on a separate, throwaway TLS-only server:
+`dev/mongo/tls-test-server.sh` generates a test CA and a server certificate for `localhost` at run
+time (in `$RUNNER_TEMP` or `/tmp`, never committed, the CA key deleted once used), starts the same
+pinned image with `--tlsMode requireTLS` on `127.0.0.1:27018` and creates the ADR-0026 account:
+
+```sh
+eval "$(dev/mongo/tls-test-server.sh start)"
+(cd agent && cargo test -p databastion-connector-mongodb tls_real_server -- --nocapture)
+dev/mongo/tls-test-server.sh stop
+```
+
+`DATABASTION_TEST_REQUIRE` accepts `mongo-tls` for these tests.
+
 The Audit tests (`src/it_audit.rs`, P5-B / P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md))
 read the server log as the agent host sees it (make it readable first: `mongod` may create it
 `0600`), and create a profiler account (`databastion_it_profiler`: the ADR-0026 role on `app` plus

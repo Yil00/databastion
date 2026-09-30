@@ -415,6 +415,16 @@ jobs:
           export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
           export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
           (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+      # Phase 7 (#74 review): verify_full against a real TLS-only MongoDB server, with a test CA
+      # generated at run time in $RUNNER_TEMP (never committed) and removed afterwards.
+      - name: Connector TLS integration test (real server, verify_full, runtime test CA)
+        run: |
+          eval "$(timeout 300 dev/mongo/tls-test-server.sh start)"
+          export DATABASTION_TEST_REQUIRE=mongo-tls
+          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
+      - name: Stop the TLS test server
+        if: always()
+        run: dev/mongo/tls-test-server.sh stop
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mongo
