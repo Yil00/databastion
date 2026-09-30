@@ -2372,6 +2372,46 @@ async fn a_paced_scan_out_of_time_succeeds_with_skipped_objects() {
     assert_eq!(sent[0]["progress"]["skipped_limit"], 4);
 }
 
+/// Security review of #93, L5: a scan whose `running` acknowledgement the
+/// console refuses (`404` / `409`: cancelled, expired, not ours) does not
+/// run, and nothing more is reported for it.
+#[tokio::test]
+async fn a_scan_the_console_refuses_to_acknowledge_does_not_run() {
+    for status in [404u16, 409] {
+        let server = MockServer::start().await;
+        let env = enrolled(&server).await;
+        Mock::given(method("POST"))
+            .and(path_regex(STATUS_PATH))
+            .respond_with(error_body(status, "gone"))
+            .mount(&server)
+            .await;
+        let objects = Arc::new(AtomicU64::new(0));
+        let rt = Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(Paced(Arc::clone(&objects)))],
+        )
+        .unwrap();
+        let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+        rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run_queued_scans(&rt))
+            .await
+            .unwrap();
+        assert_eq!(objects.load(Ordering::Relaxed), 0, "{status}");
+        let all = all_statuses(&server).await;
+        assert_eq!(all.len(), 1, "{status}: {all:?}");
+        assert_eq!(all[0].1["status"], "running");
+        assert!(rt.lock_scans().in_flight.is_empty());
+        // Delivered again: not run either (the ledger has it).
+        rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+            .await
+            .unwrap();
+        assert!(rt.lock_scans().queued.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn a_paced_scan_is_acknowledged_and_its_pause_ends_at_shutdown() {
     let server = MockServer::start().await;

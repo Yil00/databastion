@@ -537,6 +537,17 @@ impl PanicTracker {
     }
 }
 
+/// How the console answered a job status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// Recorded.
+    Accepted,
+    /// `404` / `409`: the job is terminal already or not the agent's.
+    Gone,
+    /// Not reported (retries exhausted, another error).
+    Failed,
+}
+
 /// A `discovery.scan` that passed the gates, waiting for the scan worker.
 struct PreparedScan {
     id: Uuid,
@@ -2556,10 +2567,32 @@ impl Runtime {
         // deliveries). A paced scan (ADR-0035 proposed) lasts minutes; an
         // unacknowledged one would be failed by the console meanwhile.
         let acknowledged = tokio::select! {
-            _ = self.report(id, Outcome::RUNNING) => true,
-            () = shutdown.as_mut() => false,
+            r = self.report(id, Outcome::RUNNING) => Some(r),
+            () = shutdown.as_mut() => None,
         };
-        let outcome = if acknowledged {
+        if acknowledged == Some(Reported::Gone) {
+            // The console answered `404` / `409`: the job is terminal
+            // (cancelled, expired, timed out) or not ours. The scan does
+            // not run and nothing more is reported (security review of
+            // #93, L5); the ledger keeps a redelivery from running it.
+            tracing::warn!(
+                job_id = %id,
+                "scan not run: the console no longer accepts a status for the job"
+            );
+            self.lock_scans().in_flight.remove(&id);
+            self.ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(
+                    id,
+                    LedgerEntry {
+                        outcome: Outcome::failed(FailureCode::Cancelled),
+                        reported: true,
+                    },
+                );
+            return;
+        }
+        let outcome = if acknowledged.is_some() {
             self.discovery_scan(prepared, shutdown.as_mut()).await
         } else {
             Outcome::failed(FailureCode::Cancelled)
@@ -2975,7 +3008,7 @@ impl Runtime {
         if outcome.error.is_some() {
             bump(&self.counters.jobs_failed, 1);
         }
-        let reported = self.report(id, outcome).await;
+        let reported = self.report(id, outcome).await != Reported::Failed;
         self.ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2991,7 +3024,7 @@ impl Runtime {
     /// a rolled-back build) and the status is sent again once without them,
     /// instead of being lost (decision 9). Any other `400` is not retried
     /// and keeps the capabilities.
-    async fn report(&self, id: Uuid, outcome: Outcome) -> bool {
+    async fn report(&self, id: Uuid, outcome: Outcome) -> Reported {
         let ts = now();
         let mut progress = outcome.coverage.and_then(|c| {
             self.console_caps
@@ -3011,7 +3044,7 @@ impl Runtime {
                 ts: ts.clone(),
             };
             let Ok(body) = serde_json::to_vec(&update) else {
-                return false;
+                return Reported::Failed;
             };
             match self
                 .session
@@ -3025,11 +3058,11 @@ impl Runtime {
                 )
                 .await
             {
-                Ok(()) => return true,
+                Ok(()) => return Reported::Accepted,
                 // Terminal already, or not ours: nothing more to report.
                 Err(CallError::Uplink(UplinkError::Rejected {
                     status: 404 | 409, ..
-                })) => return true,
+                })) => return Reported::Gone,
                 // A gated field was sent and the console does not know a
                 // field: forget the capabilities and send the status once
                 // more without it (never a loop: the stripped body carries
@@ -3054,12 +3087,12 @@ impl Runtime {
                 }
                 Err(e) => {
                     tracing::warn!(job_id = %id, error = %e, "job status not reported");
-                    return false;
+                    return Reported::Failed;
                 }
             }
             attempt += 1;
         }
-        false
+        Reported::Failed
     }
 }
 

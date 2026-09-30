@@ -140,7 +140,10 @@ binary: `cargo build --no-default-features --features postgres`.
   (contract: a delivered job without a status is delivered again after
   120 s, and the console gives it up after 5 deliveries, so an
   unacknowledged scan longer than about 10 minutes was failed by the
-  console). The scan's end logs its busy and paused time and whether it
+  console). When the console refuses that status with `404` / `409` (the
+  job was cancelled, expired or timed out meanwhile, or is not the
+  agent's), the scan does not run and nothing more is reported for it.
+  The scan's end logs its busy and paused time and whether it
   ran out of time (`scan pacing`).
 - Spool: `<state_dir>/spool/`, one `0600` file per batch written with
   tmp + `fsync` + `rename` + directory `fsync`; stale temporary files are
