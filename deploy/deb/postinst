@@ -1,6 +1,6 @@
 #!/bin/sh
-# databastion-agent postinst: system user, ownership of the configuration and state directories,
-# systemd reload. The service is neither enabled nor started on a first install (the agent must be
+# databastion-agent postinst: ownership of the configuration and state directories, systemd
+# reload. The service is neither enabled nor started on a first install (the agent must be
 # enrolled first, deploy/README.md); an upgrade restarts it if it was running.
 set -e
 
@@ -14,16 +14,12 @@ set_perms() {
 
 case "$1" in
   configure)
-    if ! getent group databastion >/dev/null; then
-      groupadd --system databastion
-    fi
-    if ! getent passwd databastion >/dev/null; then
-      useradd --system --gid databastion --no-create-home --home-dir /nonexistent \
-        --shell /usr/sbin/nologin --comment "DataBastion agent" databastion
-    fi
+    # The user comes from preinst; the archive already carries these owners and modes. Set again
+    # here for a conffile dpkg replaced at configure time.
     set_perms root:databastion 0750 /etc/databastion
     set_perms root:databastion 0750 /etc/databastion/secrets
     set_perms root:databastion 0640 /etc/databastion/agent.yaml
+    set_perms root:root 0600 /etc/databastion/agent.env
     set_perms databastion:databastion 0700 /var/lib/databastion
 
     if [ -d /run/systemd/system ]; then

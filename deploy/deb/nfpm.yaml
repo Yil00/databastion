@@ -1,7 +1,7 @@
 # nfpm configuration of the databastion-agent .deb (deploy/deb/build.sh sets the variables).
-# Reproducible: every mtime comes from SOURCE_DATE_EPOCH (the commit time), modes are explicit,
-# owners are root in the archive; postinst creates the `databastion` system user and hands it
-# the configuration group and the state directory.
+# Reproducible: every mtime comes from SOURCE_DATE_EPOCH (the commit time), modes and owners are
+# explicit. preinst creates the `databastion` system user and group before the unpack, so the
+# directories get their final owners from the archive itself.
 name: databastion-agent
 arch: ${DEB_ARCH}
 platform: linux
@@ -34,7 +34,11 @@ contents:
     dst: /etc/databastion/agent.yaml
     type: config|noreplace
     expand: true
-    file_info: {mode: 0o640, owner: root, group: root}
+    file_info: {mode: 0o640, owner: root, group: databastion}
+  - src: ./agent.env
+    dst: /etc/databastion/agent.env
+    type: config|noreplace
+    file_info: {mode: 0o600, owner: root, group: root}
   - src: ${AGENT_EXAMPLE_CONFIG}
     dst: /usr/share/databastion-agent/agent.example.yaml
     expand: true
@@ -47,15 +51,16 @@ contents:
     file_info: {mode: 0o644, owner: root, group: root}
   - dst: /etc/databastion
     type: dir
-    file_info: {mode: 0o750, owner: root, group: root}
+    file_info: {mode: 0o750, owner: root, group: databastion}
   - dst: /etc/databastion/secrets
     type: dir
-    file_info: {mode: 0o750, owner: root, group: root}
+    file_info: {mode: 0o750, owner: root, group: databastion}
   - dst: /var/lib/databastion
     type: dir
-    file_info: {mode: 0o700, owner: root, group: root}
+    file_info: {mode: 0o700, owner: databastion, group: databastion}
 
 scripts:
+  preinstall: ./preinst
   postinstall: ./postinst
   preremove: ./prerm
   postremove: ./postrm

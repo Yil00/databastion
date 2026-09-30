@@ -52,9 +52,12 @@ expect_stat /etc/databastion "root:databastion 750"
 expect_stat /etc/databastion/secrets "root:databastion 750"
 expect_stat /etc/databastion/agent.yaml "root:databastion 640"
 expect_stat /var/lib/databastion "databastion:databastion 700"
+expect_stat /etc/databastion/agent.env "root:root 600"
 expect_stat "$unit" "root:root 644"
-dpkg-query -W -f='${Conffiles}\n' databastion-agent | grep -q '^ /etc/databastion/agent.yaml ' \
-  || fail "/etc/databastion/agent.yaml is not a conffile"
+for f in agent.yaml agent.env; do
+  dpkg-query -W -f='${Conffiles}\n' databastion-agent | grep -q "^ /etc/databastion/$f " \
+    || fail "/etc/databastion/$f is not a conffile"
+done
 cmp -s /etc/databastion/agent.yaml /usr/share/databastion-agent/agent.example.yaml \
   || fail "agent.yaml differs from agent.example.yaml"
 log "ok  /etc/databastion/agent.yaml is a conffile (agent.example.yaml)"
@@ -65,7 +68,8 @@ if grep -E '^(ListenStream|ListenDatagram|ListenSequentialPacket|Sockets)=' "$un
   fail "the unit declares a listening socket"
 fi
 grep -qx 'SocketBindDeny=any' "$unit" || fail "SocketBindDeny=any missing from the unit"
-log "ok  no socket unit, no Listen*=, SocketBindDeny=any"
+grep -qx 'SystemCallFilter=~listen accept accept4' "$unit" || fail "listen / accept not denied by the unit"
+log "ok  no socket unit, no Listen*=, SocketBindDeny=any, listen / accept / accept4 denied"
 
 log "systemd-analyze verify"
 out="$(systemd-analyze verify "$unit" 2>&1)" || { echo "$out"; fail "systemd-analyze verify failed"; }
@@ -103,8 +107,22 @@ tail -n 1 /etc/databastion/agent.yaml | grep -qx '# local change' || fail "the l
 expect_stat /etc/databastion/agent.yaml "root:databastion 640"
 expect_stat /var/lib/databastion "databastion:databastion 700"
 
-log "remove: binary and unit gone, configuration kept"
+log "upgrade to a newer version: owners, modes, local configuration and state kept"
 touch /var/lib/databastion/marker
+rm -rf /tmp/deb-upgrade
+dpkg-deb -R "$deb" /tmp/deb-upgrade
+old_version="$(sed -n 's/^Version: //p' /tmp/deb-upgrade/DEBIAN/control)"
+sed -i "s/^Version: .*/Version: ${old_version}+upgradetest/" /tmp/deb-upgrade/DEBIAN/control
+dpkg-deb -b /tmp/deb-upgrade /tmp/databastion-agent-upgrade.deb >/dev/null
+dpkg -i --force-confold /tmp/databastion-agent-upgrade.deb >/dev/null
+[ "$(dpkg-query -W -f='${Version}' databastion-agent)" = "${old_version}+upgradetest" ] || fail "upgrade not applied"
+tail -n 1 /etc/databastion/agent.yaml | grep -qx '# local change' || fail "the local agent.yaml change was lost on upgrade"
+[ -e /var/lib/databastion/marker ] || fail "the state was lost on upgrade"
+expect_stat /etc/databastion "root:databastion 750"
+expect_stat /etc/databastion/agent.yaml "root:databastion 640"
+expect_stat /var/lib/databastion "databastion:databastion 700"
+
+log "remove: binary and unit gone, configuration kept"
 dpkg -r databastion-agent
 [ ! -e /usr/bin/databastion-agent ] && [ ! -e "$unit" ] || fail "files left after remove"
 [ -f /etc/databastion/agent.yaml ] && [ -e /var/lib/databastion/marker ] || fail "configuration or state removed by remove"

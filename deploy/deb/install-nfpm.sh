@@ -11,16 +11,21 @@ set -euo pipefail
 
 NFPM_VERSION="v2.47.0"
 NFPM_MODULE_SUM="h1:0bioJAjWaMPntgDqynP4ze0Wt4zYqYSFJ5/BBy9XIGI="
+# Go toolchain used to build it (nfpm needs go >= 1.26.4); fetched and verified by the local `go`
+# (1.21 or later) through the same checksum database.
+GO_TOOLCHAIN="go1.26.8"
 
 dir="${1:-.bin}"
 mkdir -p "$dir"
 dir="$(cd "$dir" && pwd)"
 # The checksum database must not be disabled or bypassed by the environment.
-GOBIN="$dir" GOSUMDB=sum.golang.org GOPRIVATE="" GONOSUMDB="" GOINSECURE="" GOFLAGS="" \
+GOBIN="$dir" GOTOOLCHAIN="$GO_TOOLCHAIN" GOSUMDB=sum.golang.org GOPRIVATE="" GONOSUMDB="" GOINSECURE="" GOFLAGS="" \
   go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}" >&2
-got="$(go version -m "$dir/nfpm" | awk '$1 == "mod" && $2 == "github.com/goreleaser/nfpm/v2" {print $3 " " $4}')"
+got="$(GOTOOLCHAIN="$GO_TOOLCHAIN" go version -m "$dir/nfpm" \
+  | awk '$1 == "mod" && $2 == "github.com/goreleaser/nfpm/v2" {print $3 " " $4}')"
 if [ "$got" != "${NFPM_VERSION} ${NFPM_MODULE_SUM}" ]; then
-  echo "nfpm module mismatch: got '$got', expected '${NFPM_VERSION} ${NFPM_MODULE_SUM}'" >&2
+  rm -f "$dir/nfpm"
+  echo "nfpm module mismatch: got '$got', expected '${NFPM_VERSION} ${NFPM_MODULE_SUM}' (binary deleted)" >&2
   exit 1
 fi
 echo "$dir/nfpm"

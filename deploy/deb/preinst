@@ -1,0 +1,19 @@
+#!/bin/sh
+# databastion-agent preinst: creates the `databastion` system user and group before the files are
+# unpacked, so that dpkg gives the configuration and state directories their final owners at once
+# (no window with other owners during an upgrade).
+set -e
+
+case "$1" in
+  install|upgrade)
+    if ! getent group databastion >/dev/null; then
+      groupadd --system databastion
+    fi
+    if ! getent passwd databastion >/dev/null; then
+      useradd --system --gid databastion --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin --comment "DataBastion agent" databastion
+    fi
+    ;;
+esac
+
+exit 0

@@ -1,7 +1,9 @@
 # DataBastion agent: systemd unit installed by the databastion-agent .deb (deploy/README.md).
 #
 # The agent is an HTTPS client only: it opens no listening port (invariant I1). Nothing here adds
-# one; SocketBindDeny=any makes the kernel refuse any bind() to an IP port by this service.
+# one. Defence in depth, should a bug or a compromised dependency try: SocketBindDeny=any makes
+# the kernel refuse any bind() to an IP port, and the system-call filter refuses listen(),
+# accept() and accept4() (a listen() on an unbound socket would otherwise auto-bind a port).
 #
 # Customize with a drop-in (`systemctl edit databastion-agent`), never by editing this file:
 # - read database audit logs: SupplementaryGroups=<group of the log files>. The agent refuses an
@@ -11,8 +13,8 @@
 # - a Unix socket under /tmp (e.g. MongoDB's /tmp/mongodb-27017.sock): PrivateTmp=yes hides the
 #   host's /tmp; use TCP on the loopback, or add BindReadOnlyPaths=/tmp/mongodb-27017.sock.
 # - another state_dir in agent.yaml: add it to ReadWritePaths= (owned by databastion, 0700).
-# - HTTPS_PROXY / NO_PROXY / DATABASTION_LOG: in /etc/databastion/agent.env (optional,
-#   KEY=value lines, 0600 root:root; read by systemd before the privileges are dropped).
+# - HTTPS_PROXY / NO_PROXY / DATABASTION_LOG: in /etc/databastion/agent.env (shipped with comments
+#   only, KEY=value lines, 0600 root:root; read by systemd before the privileges are dropped).
 
 [Unit]
 Description=DataBastion agent (outbound HTTPS only, no listening port)
@@ -51,6 +53,7 @@ RestrictSUIDSGID=yes
 RemoveIPC=yes
 
 # Network: outbound TCP to the console and the declared targets, Unix sockets of local targets.
+# No listening socket of any family (the system-call filter below also denies listen / accept).
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SocketBindDeny=any
 
@@ -69,6 +72,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+SystemCallFilter=~listen accept accept4
 SystemCallErrorNumber=EPERM
 
 [Install]
