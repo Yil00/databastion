@@ -58,7 +58,7 @@ These are known and documented; reporting them again is not needed, but a way to
 - **Release trust**: a single maintainer approves releases ([RELEASE.md](RELEASE.md#repository-configuration-one-time)).
 
 ## Verifying release artifacts
-The console and agent images are published to GHCR by [publish.yml](.github/workflows/publish.yml): multi-arch (amd64, arm64), signed with cosign in keyless mode (GitHub OIDC), with an SBOM and a provenance attestation. Under ADR-0034 (added by the packaging PR), images and release artifacts are signed by `publish.yml` only, in the run triggered by the push of the release tag. The certificate identity is therefore exact for each version: check it exactly, never with a pattern.
+The console and agent images are published to GHCR by [publish.yml](.github/workflows/publish.yml): multi-arch (amd64, arm64), signed with cosign in keyless mode (GitHub OIDC), with an SBOM and a provenance attestation. Under [ADR-0034](docs/adr/0034-release-signing-from-tag-push.md), images and release artifacts are signed by `publish.yml` only, in the run triggered by the push of the release tag. The certificate identity is therefore exact for each version: check it exactly, never with a pattern.
 
 1. Resolve the digest of the tag (a tag can be moved in a registry; a digest cannot):
    ```bash
@@ -76,4 +76,4 @@ The console and agent images are published to GHCR by [publish.yml](.github/work
    ```
 3. Deploy exactly that digest (`$IMAGE:$VERSION@sha256:<digest>`), never the bare tag.
 
-Same steps for `ghcr.io/yil00/databastion-console`. The full verification steps, including the agent `.deb` packages and the signed `SHA256SUMS`, are in RELEASE.md section 4 and deploy/README.md, both updated by the packaging PR. Until that PR is merged, the `.deb` packages and `SHA256SUMS` are not published.
+Same steps for `ghcr.io/yil00/databastion-console`. The full verification steps, including the agent `.deb` packages and the signed `SHA256SUMS`, are in [RELEASE.md § 4](RELEASE.md#4-published-artifacts) and [deploy/README.md](deploy/README.md#verify-the-artifacts). No release has been published yet; the first pre-release is `0.1.0-rc.1`.

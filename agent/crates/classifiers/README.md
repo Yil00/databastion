@@ -19,7 +19,7 @@ renamed: a change of meaning is a new id in a new classifier set version.
 | `pii.iban` | token: `CCkk` (any case) + exactly the country's IBAN length, single space / hyphen / dot separators, ISO 7064 mod 97 | no |
 | `pii.nir` | token: French NIR, 15 characters with optional separators anywhere (space, dot, hyphen; key separated by space, `-` or `/`), sex `1`/`2`, plausible month, Corsica `2A`/`2B` (any case), key `97 - n mod 97` | no |
 | `pii.person_name` | whole value: 1–5 name words, capitalized, upper or (known names only) lower case, compound (`Jean-Pierre`, `García-López`), elided particles (`O'Connor`, `d'Angelo`), `McDonald`, lowercase particles (`de la`, `van der`), initials, leading titles (`Mr`, `Mme`, `Dr`), suffixes (`Jr.`), `LAST, First`; no digit, no word of an organization, place, product, role or status; evidence from a lexicon of given names and surnames (multi-cultural) and surname endings | optional: without a hint the lexicon must recognize the column |
-| `pii.phone` | token: international `+` / `00` with 8–15 digits (area code in parentheses, trunk `(0)` ignored), North American `(202) 555-0125` / `202-555-0125`, national with a trunk `0` (FR, UK, DE, IT, NL, BE, CH: 9–12 digits with separators, 10–11 compact), Italian mobiles `3xx xxx xxxx`, Spanish mobiles `6xx xx xx xx`; not glued to a longer number, a code (`REF-0123…`), a time, a decimal or a word; not date-shaped; North American area code and exchange not `N11`. Each number is graded: *strong* (`+`, area code in parentheses, a phone label before it), *normal* (consistent separators and a national grouping: pairs, 3-2-2, 2-2-2, one 6–8 digit group, or two groups ending with 4 digits; `0123-456-789` does not fit), *weak* (compact digits). With a phone hint, also any whole value of 7–15 digits with the usual separators and an optional extension (`x12`, `ext. 12`, `poste 12`) | lowers the threshold |
+| `pii.phone` | token: international `+` (`+33`, `+ 33`, `(+33)`) with 8–15 digits or `00` with 10–15, not in groups of 4 (area code in parentheses, trunk `(0)` ignored; a single dot as the only separator is a signed decimal, `+48.856614`), North American `(202) 555-0125` / `202-555-0125` / `555-123-4567` (area code `[2-9]XX`, any exchange), national with a trunk `0` (FR, UK, DE, IT, NL, BE, CH: 9–12 digits with separators, 10–11 compact; Belgian `0470/12.34.56`; cut before a following group of 4+ digits, `06 12 34 56 78 75011 Paris`), Italian mobiles `3xx xxx xxxx`, Spanish mobiles `6xx xx xx xx`, Spanish / Portuguese `3-3-3` (`612 345 678`, `912 345 678`: `6xx`, `7[1-4]x`, `9[1-8]x`, not Luhn-valid like SIREN / SIN); not glued to a longer number, a code (`REF-0123…`), a time, a decimal or a word, except an extension glued after `x` (`202-555-0125x12`), a dot ending a label (`Tél.06…`), a key named after a phone (`phone=+33…`, `tel=06…`) and lists of numbers (`0612345678,0698765432`, `…/…`); not date-shaped; North American area code and exchange not `N11`. Each number is graded: *strong* (`+`, area code in parentheses, a phone label before it: `tel`, `phone`, `mobile`, `call`, `appeler` / `rappeler`, `joignable`, `reach me at`, `voicemail`, `llamar`, `móvil`, `Handy`, `anrufen`…), *normal* (consistent separators and a national grouping: pairs, 3-2-2, 2-2-2, one 6–8 digit group, two groups ending with 4 digits and 10–11 digits in all, UK `07700 900 123`; `0123-456-789` and `0123 4567 8901` do not fit; `00` with separators), *weak* (compact digits, `0612345678`, `0033612345678`). With a phone hint, also any whole value of 7–15 digits with the usual separators and an optional extension (`x12`, `ext. 12`, `poste 12`) | lowers the threshold (also `phones`, `phone1`, `workPhone`, `mobilenumber`, `telnr`…); dropped under `imei`, `serial`, `model`, `version`, `build`, `price`, `pin`… |
 | `pii.postal_address` | whole value: a house number before a FR / EN street type (`10 rue …`, `10, rue …`, `221B Baker Street`, `123 main st`), a number-last street type or compound street name then a number (`Via Roma 10`, `Calle Mayor 5`, `C/ Mayor 5`, `ul. Długa 5`, `Musterstraße 12`, `Kerkstraat 12`, `Storgatan 12`), a post office box (`PO Box`, `BP`, `Postfach`, `Apartado`, `Postbus`…), or a street type with a postcode (FR / DE / ES / IT / US 5 digits, ZIP+4, UK, NL, CA, PT, PL, SE, 4-digit with a city); abbreviations (`av.`, `bd`, `St`, `Rd`, `Blvd`); comma, line or LDAP `$` separated. *Weak* evidence: a street type alone, or a house number then a word | optional: without a hint strong addresses are needed |
 | `secret.aws_key` | token: access key id `AKIA` / `ASIA` / `ABIA` / `ACCA` / `A3T…` + 16 characters (not glued to other letters or digits); a 40-character secret after its key id or after its name in text (`aws_secret_access_key = …`, `"SecretAccessKey": "…"`); whole value: 40 characters `[A-Za-z0-9/+]` mixing cases and digits | optional (secret-key names lower the threshold; token / session / digest names raise it) |
 | `secret.password_hash` | token: bcrypt (`$2a/b/x/y$`, Django `bcrypt_sha256$`), argon2 (PHC, Django), scrypt (PHC, `$7$`, Werkzeug), yescrypt `$y$`, sha-crypt `$5$` / `$6$`, md5-crypt `$1$`, `$apr1$`, NetBSD `$sha1$`, phpass `$P$` / `$H$`, Drupal `$S$`, pbkdf2 (PHC / passlib, Django, Werkzeug), Django legacy salted digests, PostgreSQL SCRAM and `md5…`, MySQL `*…` and `$A$`, LDAP `{SSHA}`-style schemes, Atlassian `{PKCS5S2}`; whole value: a raw hex / base64 digest (MD5, SHA-1, SHA-2) only under a password name (`password`, `pwd`, `mdp`, `pw_hash`… or a bare `hash`) | raw digests only |
@@ -54,7 +54,14 @@ consistency rule below (most SIRETs are Luhn-valid but not issuer-shaped).
   after 2002) are missed; other old dates spread over decades (publication dates) can be reported.
   `01/02/1980` is read day first (fingerprints included).
 - **Phones**: compact numbers (`0612345678`, `2025550125`) and national formats not listed above are
-  only found under a phone name, except a column of compact French mobile numbers.
+  only found under a phone name, except a column of compact mobile numbers (`06` / `07`, `00` or no
+  prefix + country code + mobile prefix: `0033 6…`, `33 6…`, `44 7…`), a column of at least 20
+  compact North American numbers of which 95 % fit the plan (area code and exchange `[2-9]XX`)
+  from 3 area codes, also when mixed with e-mail addresses. A column of compact
+  French landlines and mobiles together cannot be told from zero-led customer numbers and needs a
+  phone name. In free text, a number among words counts when it fits a numbering plan (normal) or
+  has a label; 3 such values and 5 % are enough, so notes quoting numbers in a national phone
+  grouping for another purpose would be reported.
 - **Person names in identifiers**: the name normalizer masks words from a small list of common
   first names (`archive_lucas_martin` -> `*`, `ou=Oliver Martin` -> `ou=*`), but a surname alone
   (`archive_martin`) or a first name missing from the list is not recognized.
@@ -124,7 +131,9 @@ distinct masked samples whose values have the smallest
 independent across columns. Without the agent key, a random key (OS CSPRNG) is drawn for the call.
 Fingerprints are the 50 smallest distinct ones, emitted sorted.
 
-**Unicode.** Each value is put in canonical composition (NFC) before detection, so a value stored
+**Unicode.** Typographic spaces and hyphens (no-break space U+00A0, U+2002–U+200A, narrow no-break
+space U+202F, U+2010–U+2013, minus sign U+2212) are read as ASCII space and `-` before detection
+(`06\u{a0}12\u{a0}34…`, as word processors and spreadsheets write numbers). Each value is put in canonical composition (NFC) before detection, so a value stored
 decomposed (`e` + U+0301, as written by macOS and some ETLs) is recognized like its composed form
 (names, addresses, textual months, e-mail local parts). Tokens, masked samples and fingerprints are
 taken from the NFC value: fingerprints of names and addresses were already computed on NFC (no
@@ -134,14 +143,15 @@ only, not to values.
 
 **Decision rules.** Values are detected first; a column name only lowers thresholds. `n` counts the
 informative values (empty values and placeholders such as `N/A`, `null`, `-`, `unknown`,
-`0000-00-00` skipped), `ratio = matched / n`:
+`0000-00-00`, export artefacts `nan`, `\N`, `#N/A`, `—`, `not provided`, and one digit repeated
+`0000000000` / `00 00 00 00 00` skipped), `ratio = matched / n`:
 
 | Classifiers | Reported when | Confidence |
 |-------------|---------------|------------|
 | IBAN, card, NIR | `matched >= 1` and at least half of the checksum-shaped candidates are valid (a column of order numbers, SIRETs, IMEIs or EAN codes where a few pass Luhn by chance is not reported); card: not under an order / tracking / IMEI / barcode name | `0.6 + 0.35·ratio (+0.05 hint)` |
 | AWS key id or secret in context, password hash token | `matched >= 1` | idem |
 | e-mail | hint, `ratio >= 0.05` or `matched >= 3`; not the same single address repeated (`matched >= 3`) | idem |
-| phone | hint and `matched >= 1`; no hint: `>= 0.3` of values with a formatted number (national plan groupings, North American, `+` / `00`), compact digits only in a column of `>= 0.8` whole compact numbers 60 % with a mobile prefix `06` / `07`, or 3 values and `>= 0.05` with a strong number (`+`, area code in parentheses, a phone label such as `tel`, `phone`, `call` just before) | `0.4 + 0.4·ratio (+0.2 hint)` |
+| phone | hint and `matched >= 1`; no hint: `>= 0.3` of values with a formatted number (national plan groupings, North American, `+` / `00`), compact digits only in a column of `>= 0.8` whole compact numbers 60 % with a mobile prefix (`06` / `07`, `0033 6`, `33 6`, `0044 7`…) or of `>= 0.95` compact North American numbers (at least 20, 3 area codes), or 3 values and `>= 0.01` with a strong number (`+`, area code in parentheses, a phone label such as `tel`, `phone`, `call` just before), or 3 values and `>= 0.01` with a formatted number among words (free text: at least 3 letters outside the numbers). Contact columns ("e-mail or phone", user names, names, handles): the `0.3`, `0.8` and `0.95` shares are taken over the values with at least 6 digits that hold no e-mail address, with 3 values at least. With 3 and 5 % whole negative numbers, `+` compact numbers are signed amounts and do not count | `0.4 + 0.4·ratio (+0.2 hint)` |
 | birth date | labelled dates in text: `ratio >= 0.05` or 3 values; hint: dates `>= 0.5`; no hint: dates `>= 0.7`, at least 3, distributed like ages (median year ≤ 2002, 10-year spread between the 10th and 90th percentiles, ≤ 15 % after 2014, none after 2026, not all on the 1st; with more than 20 % times of day, median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
 | person name | never under a name of something else (below); hint: name-shaped `>= 0.6` (bare `name`: `>= 0.7` and 25 % with a known name); no hint: name-shaped `>= 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed name, under 20 % well-known places or brands (`Austin`, `Lincoln`, `Hugo Boss`: a list of major cities, countries, US states, regions, car makers, fashion houses and large companies), 3 distinct values | idem |
 | postal address | hint: address-like `>= 0.5`; no hint: strong addresses `>= 0.5`, address-like `>= 0.8` with 25 % strong, or at least 3 strong addresses and `>= 0.1` | idem |
@@ -296,6 +306,16 @@ statements as clients write them and as the servers log them, truncation).
   hard negatives (event dates, cities, products, companies, order and tracking numbers, IMEIs,
   SIRETs, EAN codes, URLs with user info, git remotes, message ids, package specs, system
   mailboxes, checksums, session tokens…); gate 95 % recall and precision per classifier;
+- `tests/phone_eval.rs`: ~190 labeled `pii.phone` columns written independently of the dev seed
+  and of the held-out corpus (FR, DE, UK, BE, CH, ES, IT, NL, North American and E.164 formats,
+  extensions, prose, "e-mail or phone" contact columns, sparse columns; hard negatives: dial codes,
+  extensions, IMEI, EAN / GTIN, ISBN, order and tracking numbers, SIREN / SIRET, IBAN, cards,
+  timestamps, epochs, prices, signed decimals and coordinates, versions, postcodes, IP addresses,
+  UUIDs, git SHAs, serial numbers in text, signed integers, 10–12 digit identifiers, Luhn-valid `3-3-3`
+  identifiers, `phone_imei` / `mobile_serial` / `phone_price`-style names; phones as a small minority in
+  text, logs and contact columns, typographic separators, lists of numbers, generator layouts with
+  random digits); every column must be decided
+  correctly;
 - `tests/regex_features.rs`: the `regex` features resolved for the production build (without
   dev-dependencies) cover the detector patterns;
 - `tests/holdout.rs`: the phase 2 gate on the independent held-out corpus (`dev/holdout/`,

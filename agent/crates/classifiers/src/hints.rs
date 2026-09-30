@@ -70,6 +70,26 @@ const DIRECT: &[(ClassifierId, &[&str])] = &[
             "phonenum",
             "numtel",
             "numerotelephone",
+            "cellular",
+            "cellulaire",
+            "cellulare",
+            "celular",
+            "movil",
+            "móvil",
+            "mobil",
+            "mobiel",
+            "telefone",
+            "telemovel",
+            "telemóvel",
+            "telefonnummer",
+            "telefoonnummer",
+            "handynummer",
+            "mobilnummer",
+            "rufnummer",
+            "whatsapp",
+            "sms",
+            "tlf",
+            "telf",
         ],
     ),
     (ClassifierId::Iban, &["iban", "rib", "bban"]),
@@ -584,6 +604,125 @@ const NOT_CARD_WORDS: &[&str] = &[
     "waybill",
 ];
 
+/// Qualifiers glued before a phone word in flat names (`workphone`,
+/// `contactphone`, `homemobile`).
+const PHONE_PREFIXES: &[&str] = &[
+    "home",
+    "work",
+    "office",
+    "business",
+    "contact",
+    "customer",
+    "client",
+    "user",
+    "primary",
+    "secondary",
+    "main",
+    "alt",
+    "other",
+    "private",
+    "personal",
+    "emergency",
+    "billing",
+    "shipping",
+    "company",
+    "direct",
+    "fixed",
+    "day",
+    "night",
+    "evening",
+    "mobile",
+    "cell",
+    "num",
+    "numero",
+    "no",
+];
+/// Suffixes glued after a phone word (`mobilenumber`, `telnr`, `faxno`).
+const PHONE_SUFFIXES: &[&str] = &["number", "numbers", "num", "no", "nr", "nummer", "numero"];
+
+/// Name words of things about a phone rather than its number
+/// (`phone_imei`, `mobile_serial`, `phone_model`, `phone_price`): the phone
+/// hint is dropped wherever they appear in the name.
+const NOT_PHONE_WORDS: &[&str] = &[
+    "imei",
+    "imsi",
+    "iccid",
+    "meid",
+    "esn",
+    "serial",
+    "sn",
+    "model",
+    "models",
+    "version",
+    "build",
+    "firmware",
+    "os",
+    "price",
+    "prices",
+    "cost",
+    "amount",
+    "pin",
+    "puk",
+    "plan",
+    "minutes",
+    "duration",
+    "carrier",
+    "operator",
+    "mac",
+    "udid",
+    "uuid",
+    "sku",
+    "stock",
+    "quantity",
+    "qty",
+    "level",
+    "gain",
+    "volume",
+    "battery",
+    "storage",
+    "memory",
+    "screen",
+    "color",
+    "colour",
+    "charger",
+    "case",
+    "sales",
+    "revenue",
+    "tariff",
+    "contract",
+    "subscription",
+];
+
+/// A name token that designates phone numbers beyond the listed words:
+/// trailing digits and plural dropped (`phone1`, `phones`), or a listed
+/// word with a glued qualifier or number suffix (`workphone`,
+/// `mobilenumber`, `telnr`).
+fn phone_token(t: &str, words: &[&str]) -> bool {
+    let t = t.trim_end_matches(|c: char| c.is_ascii_digit());
+    let bare = |x: &str| {
+        !x.is_empty()
+            && (words.contains(&x) || x.strip_suffix('s').is_some_and(|y| words.contains(&y)))
+    };
+    if bare(t) {
+        return true;
+    }
+    let core = PHONE_SUFFIXES
+        .iter()
+        .find_map(|s| t.strip_suffix(s).filter(|c| bare(c)))
+        .unwrap_or(t);
+    if core != t {
+        return true;
+    }
+    PHONE_PREFIXES.iter().any(|p| {
+        t.strip_prefix(p).is_some_and(|rest| {
+            bare(rest)
+                || PHONE_SUFFIXES
+                    .iter()
+                    .any(|s| rest.strip_suffix(s).is_some_and(bare))
+        })
+    })
+}
+
 /// Tokens of the **last** segment that turn a hint off for the hint-gated
 /// classifiers: the column is about the data type, not the data itself
 /// (`email_opt_in`, `phone_country`, `card_brand`, `postal_code`…).
@@ -671,6 +810,15 @@ impl NameHints {
             || (has("secret") && (has("key") || has("aws")));
         if aws_secret && !hinted.contains(&ClassifierId::AwsKey) {
             hinted.push(ClassifierId::AwsKey);
+        }
+        if let Some((_, words)) = DIRECT.iter().find(|(id, _)| *id == ClassifierId::Phone)
+            && !hinted.contains(&ClassifierId::Phone)
+            && all.iter().any(|t| phone_token(t, words))
+        {
+            hinted.push(ClassifierId::Phone);
+        }
+        if all.iter().any(|t| NOT_PHONE_WORDS.contains(t)) {
+            hinted.retain(|c| *c != ClassifierId::Phone);
         }
         hinted.sort();
         let negative = last.iter().any(|t| NEGATIVE.contains(&t.as_str()));
@@ -953,6 +1101,46 @@ mod tests {
         assert!(!NameHints::of("card_number").not_card());
         assert!(NameHints::of("session_token").other_token());
         assert!(!NameHints::of("aws_secret_access_key").other_token());
+    }
+
+    #[test]
+    fn phone_names() {
+        for n in [
+            "phones",
+            "phone1",
+            "Phone2",
+            "workPhone",
+            "workphone",
+            "MobileNumber",
+            "mobilenumber",
+            "telnr",
+            "PHONE_NR",
+            "faxno",
+            "contactphone",
+            "telefonnummer",
+            "celular",
+            "cellular",
+            "whatsapp",
+            "tel_portable",
+            "customerphonenumber",
+        ] {
+            assert!(hinted(n).contains(&C::Phone), "{n}");
+        }
+        for n in [
+            "phone_imei",
+            "mobile_serial",
+            "phone_model",
+            "phone_price",
+            "mobile_app_build",
+            "mobile_imsi",
+            "microphone_level",
+            "microphone",
+            "hotel",
+            "hotelno",
+            "telemetry",
+        ] {
+            assert!(!hinted(n).contains(&C::Phone), "{n}");
+        }
     }
 
     #[test]
