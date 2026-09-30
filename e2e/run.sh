@@ -2070,7 +2070,14 @@ done
 n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL
     AND target_id <> 'ldap-e2e'")" \
   || fail "cannot count the fingerprinted events"
-[ "$n" = 0 ] || fail "$n access event(s) carry a db_user_fingerprint"
+if [ "$n" != 0 ]; then
+  # Diagnostic without any value: target, source, action, signals, count.
+  console_sql "SELECT string_agg(target_id || ' ' || coalesce(source, '-') || ' ' || action || ' '
+      || signals::text || ' objects ' || jsonb_array_length(objects) || ' app ' || (application IS NOT NULL)::text || ' count ' || aggregated_count, '; ')
+    FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL
+      AND target_id <> 'ldap-e2e'" >&2 || true
+  fail "$n access event(s) carry a db_user_fingerprint"
+fi
 # Every accepted events batch woke the policy engine (see assert_wakeup).
 wake="$(console_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE st = 'sent') || ',' ||
     count(*) FILTER (WHERE st = 'lost') FROM (SELECT ${WAKEUP_STATUS_SQL//@T@/b.received_at} AS st
