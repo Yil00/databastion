@@ -10,7 +10,8 @@
  * schema regenerated). "Accepts" means schema-valid and not rejected; the console may still
  * ignore the value. Today `access_event.bytes` is stored and shown (not scored),
  * `target_status.notes` is stored for the latest heartbeat and rendered, and the
- * `job_progress.coverage` counters are accepted but not stored.
+ * `job_progress.coverage` counters are stored with the job's progress and shown with the target's
+ * latest scan (src/lib/scan-coverage.ts).
  */
 export const CONSOLE_ACCEPTS = ["access_event.bytes", "job_progress.coverage", "target_status.notes"] as const;
 
