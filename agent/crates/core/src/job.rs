@@ -31,6 +31,7 @@ use databastion_classifiers::names::violates_numeric_rule;
 use databastion_protocol::{AuditConfigureParams, DiscoveryScanParams, IdentifierPattern};
 
 use crate::config::{Limits, SAMPLE_ROWS_RANGE, STATEMENT_TIMEOUT_MS_RANGE, TargetConfig};
+use crate::pacing::{Cancelled, Pacer, ScanCancel};
 
 /// Contract range of `max_duration_s` (seconds).
 pub const MAX_DURATION_S_RANGE: (u32, u32) = (10, 86_400);
@@ -246,6 +247,7 @@ pub struct ScanJob {
     max_duration: Duration,
     params: ScanParams,
     key: Option<Arc<HmacKey>>,
+    pacer: Pacer,
 }
 
 impl Default for ScanJob {
@@ -260,6 +262,7 @@ impl Default for ScanJob {
             max_duration: limits.clamp_scan_duration(u64::from(params.max_duration_s)),
             params,
             key: None,
+            pacer: Pacer::new(limits.discovery_duty_cycle_percent),
         }
     }
 }
@@ -272,6 +275,7 @@ impl std::fmt::Debug for ScanJob {
             .field("statement_timeout", &self.statement_timeout)
             .field("max_duration", &self.max_duration)
             .field("classifiers", &self.params.classifiers)
+            .field("duty_cycle_percent", &self.pacer.duty_percent())
             .finish_non_exhaustive()
     }
 }
@@ -294,7 +298,36 @@ impl ScanJob {
             max_duration: limits.clamp_scan_duration(u64::from(params.max_duration_s)),
             params,
             key: Some(key),
+            pacer: Pacer::new(limits.discovery_duty_cycle_percent),
         }
+    }
+
+    /// The same job, its pauses ended by `cancel` (the core, when the scan
+    /// stops).
+    #[must_use]
+    pub(crate) fn with_cancel(mut self, cancel: ScanCancel) -> Self {
+        self.pacer = self.pacer.with_cancel(cancel);
+        self
+    }
+
+    /// The scan's pacer (duty cycle `limits.discovery_duty_cycle_percent`).
+    #[must_use]
+    pub fn pacer(&self) -> &Pacer {
+        &self.pacer
+    }
+
+    /// Runs one unit of work against the target (an object's sampling, a
+    /// catalog read), then pauses so that the scan's time in queries stays
+    /// within the duty cycle (`crate::pacing`, ADR-0035 proposed). Every
+    /// connector paces its per-object sampling and catalog reads through
+    /// this.
+    ///
+    /// # Errors
+    /// [`Cancelled`] when the scan is cancelled (before the work, or during
+    /// the pause): the connector stops (`?` turns it into
+    /// [`crate::ConnectorError::Cancelled`]).
+    pub async fn paced<F: std::future::Future>(&self, work: F) -> Result<F::Output, Cancelled> {
+        self.pacer.paced(work).await
     }
 
     /// The declared target (connection settings; never sent to the

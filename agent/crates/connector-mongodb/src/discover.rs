@@ -275,10 +275,12 @@ where
 {
     let n = job.sample_rows();
     let mut slot: Option<Session<S>> = None;
+    // Paced (ADR-0035 proposed): each listing and each collection's
+    // sampling.
     let (databases, truncated) = {
         let s = ensure(&mut slot, target, &mut connect).await?;
-        catalog::list_databases(s)
-            .await
+        job.paced(catalog::list_databases(s))
+            .await?
             .map_err(|e| fail(target, e))?
     };
     if truncated {
@@ -297,7 +299,7 @@ where
         let db_name = normalize_database(db);
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
-            catalog::list_collections(s, db).await
+            job.paced(catalog::list_collections(s, db)).await?
         };
         let (collections, truncated) = match listed {
             Ok(l) => l,
@@ -362,7 +364,7 @@ where
             let object = normalize_collection(&unit.name);
             let sampled = {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                sample_collection(s, db, unit, n).await
+                job.paced(sample_collection(s, db, unit, n)).await?
             };
             let sampled = match sampled {
                 Ok(s) => s,

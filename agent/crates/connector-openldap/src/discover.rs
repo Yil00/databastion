@@ -175,17 +175,23 @@ where
         .max(1);
     let accesslog = dn::canon(&target.openldap_settings().accesslog_base).unwrap_or_default();
     let mut slot: Option<Session<S>> = None;
+    // Paced (ADR-0035 proposed): the root DSE and schema reads, each
+    // container listing and each container's sampling.
     let (dse, schema) = {
         let s = ensure(&mut slot, target, &mut connect).await?;
-        let dse = catalog::root_dse(s, Stage::Introspection)
-            .await
-            .map_err(|e| fail(target, e))?;
-        // Without a schema the connector cannot tell credential attributes
-        // apart: the scan fails rather than requesting everything.
-        let schema = catalog::schema(s, dse.subschema.as_deref())
-            .await
-            .map_err(|e| fail(target, e))?;
-        (dse, schema)
+        job.paced(async {
+            let dse = catalog::root_dse(s, Stage::Introspection)
+                .await
+                .map_err(|e| fail(target, e))?;
+            // Without a schema the connector cannot tell credential
+            // attributes apart: the scan fails rather than requesting
+            // everything.
+            let schema = catalog::schema(s, dse.subschema.as_deref())
+                .await
+                .map_err(|e| fail(target, e))?;
+            Ok::<_, ConnectorError>((dse, schema))
+        })
+        .await??
     };
     if dse.naming_contexts_cut {
         tracing::warn!(
@@ -222,7 +228,7 @@ where
         totals.contexts += 1;
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
-            catalog::containers(s, suffix).await
+            job.paced(catalog::containers(s, suffix)).await?
         };
         let (containers, cut, references) = match listed {
             Ok(l) => l,
@@ -286,7 +292,16 @@ where
             totals.containers += 1;
             let read = {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                sample_container(s, &schema, &raw, &attributes, n, job, groups).await
+                job.paced(sample_container(
+                    s,
+                    &schema,
+                    &raw,
+                    &attributes,
+                    n,
+                    job,
+                    groups,
+                ))
+                .await?
             };
             match read {
                 Ok((entries, references)) => {

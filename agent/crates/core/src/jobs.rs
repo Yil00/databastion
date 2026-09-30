@@ -139,6 +139,13 @@ impl Outcome {
         coverage: None,
     };
 
+    /// Not terminal: the `running` acknowledgement of a scan.
+    pub(crate) const RUNNING: Self = Self {
+        status: JobStatusUpdateStatus::Running,
+        error: None,
+        coverage: None,
+    };
+
     pub(crate) const fn failed(code: FailureCode) -> Self {
         Self {
             status: JobStatusUpdateStatus::Failed,

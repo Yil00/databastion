@@ -83,19 +83,22 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
     let mut first = Session::connect(target, timeouts)
         .await
         .map_err(|e| fail(target, e))?;
-    let tables = {
-        let mut tx = first.begin().await.map_err(|e| fail(target, e))?;
-        match catalog::introspect(&mut tx).await {
-            Ok(t) => {
-                tx.commit().await.map_err(|e| fail(target, e))?;
-                t
+    // Paced (ADR-0035 proposed): the introspection, then each table.
+    let tables = job
+        .paced(async {
+            let mut tx = first.begin().await.map_err(|e| fail(target, e))?;
+            match catalog::introspect(&mut tx).await {
+                Ok(t) => {
+                    tx.commit().await.map_err(|e| fail(target, e))?;
+                    Ok(t)
+                }
+                Err(e) => {
+                    tx.rollback().await;
+                    Err(fail(target, e))
+                }
             }
-            Err(e) => {
-                tx.rollback().await;
-                return Err(fail(target, e));
-            }
-        }
-    };
+        })
+        .await??;
     let (units, coverage) = catalog::plan(&tables, |schema, name| {
         // MySQL has no schema level: the job's `schemas` filter
         // (PostgreSQL) does not apply.
@@ -120,7 +123,9 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         };
         let db = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sampled = sample_table(&mut current, unit, job.sample_rows()).await;
+        let sampled = job
+            .paced(sample_table(&mut current, unit, job.sample_rows()))
+            .await?;
         // A poisoned session (budget stop: kill in flight, unread result)
         // is closed here, before any submit; the next table reconnects.
         if current.is_poisoned() {

@@ -2544,7 +2544,20 @@ impl Runtime {
         // findings batches spooled between these two readings are this
         // job's (their splits and resends keep the sequence number).
         let first = self.lock_spool().next_seq();
-        let outcome = self.discovery_scan(prepared, shutdown.as_mut()).await;
+        // Acknowledge the lease with a `running` status before the scan
+        // (contract `pollJobs`: a delivered job without a status is
+        // delivered again after 120 s, and the console gives it up after 5
+        // deliveries). A paced scan (ADR-0035 proposed) lasts minutes; an
+        // unacknowledged one would be failed by the console meanwhile.
+        let acknowledged = tokio::select! {
+            _ = self.report(id, Outcome::RUNNING) => true,
+            () = shutdown.as_mut() => false,
+        };
+        let outcome = if acknowledged {
+            self.discovery_scan(prepared, shutdown.as_mut()).await
+        } else {
+            Outcome::failed(FailureCode::Cancelled)
+        };
         let seqs = first..self.lock_spool().next_seq();
         if outcome.error != Some(FailureCode::Cancelled) {
             self.await_findings_sent(id, &seqs, shutdown.as_mut()).await;
@@ -2682,6 +2695,10 @@ impl Runtime {
         let Some(version) = classifiers_version() else {
             return Outcome::failed(FailureCode::Internal);
         };
+        // Ends the scan's Discovery pauses when it stops (fired below, and
+        // by its drop on every return path).
+        let (cancel, token) = crate::pacing::ScanCancel::channel();
+        let scan = scan.with_cancel(token);
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
@@ -2799,6 +2816,9 @@ impl Runtime {
                         Outcome::failed(FailureCode::ResourceLimit)
                     }
                     Some(Ok(())) => Outcome::SUCCEEDED,
+                    Some(Err(crate::ConnectorError::Cancelled)) => {
+                        Outcome::failed(FailureCode::Cancelled)
+                    }
                     Some(Err(crate::ConnectorError::NotImplemented { .. })) => {
                         Outcome::failed(FailureCode::Unsupported)
                     }
@@ -2827,6 +2847,16 @@ impl Runtime {
                 () = shutdown => Outcome::failed(FailureCode::Cancelled),
             }
         };
+        // The connector future is dropped; a pause in progress ends too.
+        cancel.cancel();
+        let (busy, paused) = scan.pacer().totals();
+        tracing::info!(
+            job_id = %id,
+            duty_cycle_percent = scan.pacer().duty_percent(),
+            busy_ms = u64::try_from(busy.as_millis()).unwrap_or(u64::MAX),
+            paused_ms = u64::try_from(paused.as_millis()).unwrap_or(u64::MAX),
+            "scan pacing"
+        );
         // The connector future (and its sink) is dropped: drain what it
         // handed over (within the cap), then flush the partial chunk.
         while let Ok(f) = rx.try_recv() {
@@ -2942,7 +2972,8 @@ impl Runtime {
             .record(id, LedgerEntry { outcome, reported });
     }
 
-    /// Reports a terminal status. The coverage counters of a scan are
+    /// Reports a terminal status, or the `running` acknowledgement of a
+    /// scan ([`Outcome::RUNNING`]). The coverage counters of a scan are
     /// gated fields (ADR-0022): sent only when the console's latest
     /// heartbeat response listed `job_progress.coverage`. A `400` reporting
     /// an unknown field (`additionalProperties`) to a body that carried

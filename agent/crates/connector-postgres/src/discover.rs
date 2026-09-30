@@ -12,7 +12,9 @@
 //! `TABLESAMPLE SYSTEM` on large relations (by `reltuples`) and a plain
 //! `LIMIT` otherwise or when the sample comes back short; every statement
 //! under `SET LOCAL statement_timeout` from the clamped job parameter; at
-//! most [`MAX_SAMPLE_BYTES`] read per relation.
+//! most [`MAX_SAMPLE_BYTES`] read per relation. The introspection and each
+//! object's sampling are paced by the core (`ScanJob::paced`: a bounded
+//! duty cycle, `limits.discovery_duty_cycle_percent`, ADR-0035 proposed).
 
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
@@ -82,22 +84,25 @@ async fn scan_database(
     let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
-    let relations = {
-        let tx = first
-            .begin(timeouts)
-            .await
-            .map_err(|e| fail(target, &db_name, e))?;
-        match catalog::introspect(&tx).await {
-            Ok(r) => {
-                tx.commit().await.map_err(|e| fail(target, &db_name, e))?;
-                r
+    // Paced (ADR-0035 proposed): the introspection, then each object.
+    let relations = job
+        .paced(async {
+            let tx = first
+                .begin(timeouts)
+                .await
+                .map_err(|e| fail(target, &db_name, e))?;
+            match catalog::introspect(&tx).await {
+                Ok(r) => {
+                    tx.commit().await.map_err(|e| fail(target, &db_name, e))?;
+                    Ok(r)
+                }
+                Err(e) => {
+                    tx.rollback().await;
+                    Err(fail(target, &db_name, e))
+                }
             }
-            Err(e) => {
-                tx.rollback().await;
-                return Err(fail(target, &db_name, e));
-            }
-        }
-    };
+        })
+        .await??;
     let mut session = Some(first);
     let (units, coverage) = catalog::plan(&relations, |schema, name| {
         job.includes_schema(schema) && job.includes_object(name)
@@ -115,7 +120,9 @@ async fn scan_database(
         };
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
-        let sampled = sample_unit(&current, unit, job.sample_rows(), timeouts).await;
+        let sampled = job
+            .paced(sample_unit(&current, unit, job.sample_rows(), timeouts))
+            .await?;
         // A poisoned session (budget stop: cancel in flight, aborted
         // transaction still open, AccessShareLock held) is closed here,
         // before any submit (L-new-1); the next object reconnects.

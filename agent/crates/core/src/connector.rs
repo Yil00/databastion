@@ -25,6 +25,10 @@ pub enum ConnectorError {
     /// The core stopped consuming results.
     #[error(transparent)]
     SinkClosed(#[from] SinkClosed),
+    /// The scan was cancelled during a Discovery pause
+    /// ([`crate::pacing::Pacer`]).
+    #[error("scan cancelled")]
+    Cancelled,
     /// The target failed the operation. Reported to the console as `code`
     /// only; `engine_code` is the engine's error code (e.g. a SQLSTATE),
     /// never its message, detail or context text (ADR-0012 obligation 7).
@@ -69,6 +73,9 @@ pub trait Connector: Send + Sync {
     /// column with `job.classify(raw_column_name, &values)`, normalize names
     /// with `databastion_classifiers::names` (`normalize_field_path` for
     /// document keys), and submit `ColumnFinding::into_finding(location)`.
+    /// Run each object's sampling and each catalog read through
+    /// `job.paced(…)` (Discovery duty cycle, `crate::pacing`) and stop on
+    /// its `Cancelled` error (`?`).
     /// The core stops the scan after `job.max_duration()`, or when the
     /// agent is suspended or revoked, by dropping this future.
     ///

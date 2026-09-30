@@ -465,7 +465,16 @@ fn job(id: &str, kind: &str, params: serde_json::Value) -> serde_json::Value {
     })
 }
 
-async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
+/// Whether a request is the `running` acknowledgement of a scan.
+fn is_running(r: &Request) -> bool {
+    r.url.path().ends_with("/status")
+        && serde_json::from_slice::<serde_json::Value>(&r.body)
+            .is_ok_and(|b| b["status"] == "running")
+}
+
+/// Every job status sent, the `running` acknowledgements of scans
+/// included.
+async fn all_statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
     server
         .received_requests()
         .await
@@ -476,6 +485,15 @@ async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
             let id = r.url.path().split('/').rev().nth(1).unwrap().to_owned();
             (id, serde_json::from_slice(&r.body).unwrap())
         })
+        .collect()
+}
+
+/// The terminal job statuses sent.
+async fn statuses(server: &MockServer) -> Vec<(String, serde_json::Value)> {
+    all_statuses(server)
+        .await
+        .into_iter()
+        .filter(|(_, b)| b["status"] != "running")
         .collect()
 }
 
@@ -2226,6 +2244,96 @@ impl Connector for Stuck {
     }
 }
 
+/// Samples objects of 50 ms each through the job's pacer (at the default
+/// 1 %: a pause of about 5 s after each).
+struct Paced(Arc<AtomicU64>);
+
+#[async_trait::async_trait]
+impl Connector for Paced {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        job: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        loop {
+            job.paced(async {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            })
+            .await?;
+        }
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_paced_scan_is_acknowledged_and_its_pause_ends_at_shutdown() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    assert_eq!(env.config.limits.discovery_duty_cycle_percent, 1);
+    let objects = Arc::new(AtomicU64::new(0));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Paced(Arc::clone(&objects)))],
+    )
+    .unwrap();
+    let body =
+        serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let prepared = rt.lock_scans().queued.pop_front().unwrap();
+    let (tx, mut rx) = watch::channel(false);
+    let started = Instant::now();
+    let scan = rt.run_prepared_scan(prepared, async move {
+        let _ = rx.wait_for(|s| *s).await;
+    });
+    let driver = async {
+        // The first object, then its pause (about 5 s).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tx.send(true).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(4), async { tokio::join!(scan, driver) })
+        .await
+        .expect("the pause must end at shutdown");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // One object only: the scan was pausing when it stopped.
+    assert_eq!(objects.load(Ordering::Relaxed), 1);
+    let all = all_statuses(&server).await;
+    let mine: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|(i, _)| i == JOB)
+        .map(|(_, b)| b)
+        .collect();
+    assert_eq!(mine.len(), 2, "{mine:?}");
+    assert_eq!(mine[0]["status"], "running");
+    assert!(mine[0].get("error").is_none_or(serde_json::Value::is_null));
+    serde_json::from_value::<JobStatusUpdate>(mine[0].clone()).unwrap();
+    assert_eq!(mine[1]["status"], "failed");
+    assert_eq!(mine[1]["error"]["code"], "cancelled");
+}
+
 #[tokio::test]
 async fn suspension_cancels_a_running_scan_and_flushes_its_findings() {
     let server = MockServer::start().await;
@@ -3468,7 +3576,11 @@ struct Seq(
 );
 
 impl wiremock::Respond for Seq {
-    fn respond(&self, _: &Request) -> ResponseTemplate {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        // The `running` acknowledgement of a scan takes no scripted answer.
+        if is_running(r) {
+            return ResponseTemplate::new(204);
+        }
         self.0
             .lock()
             .unwrap()
@@ -3922,7 +4034,10 @@ struct SpoolAtStatus {
 }
 
 impl wiremock::Respond for SpoolAtStatus {
-    fn respond(&self, _: &Request) -> ResponseTemplate {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        if is_running(r) {
+            return ResponseTemplate::new(204);
+        }
         let pending = std::fs::read_dir(&self.dir)
             .unwrap()
             .filter(|e| {
@@ -4019,16 +4134,27 @@ async fn scan_status_is_sent_only_after_its_findings_are_acknowledged() {
     assert_eq!(*seen.lock().unwrap(), [0]);
     assert_eq!(rt.lock_spool().status().batches.0, 0);
     assert_eq!(metric(&rt, "scan_status_before_flush_total"), 0.0);
-    // The request order on the wire: the three batches, then the status.
+    // The request order on the wire: the `running` acknowledgement, the
+    // three batches, then the terminal status.
     let order: Vec<String> = server
         .received_requests()
         .await
         .unwrap()
         .iter()
-        .map(|r| r.url.path().rsplit('/').next().unwrap().to_owned())
-        .filter(|p| p == "findings" || p == "status")
+        .map(|r| {
+            let p = r.url.path().rsplit('/').next().unwrap().to_owned();
+            if is_running(r) {
+                "running".to_owned()
+            } else {
+                p
+            }
+        })
+        .filter(|p| p == "findings" || p == "status" || p == "running")
         .collect();
-    assert_eq!(order, ["findings", "findings", "findings", "status"]);
+    assert_eq!(
+        order,
+        ["running", "findings", "findings", "findings", "status"]
+    );
 }
 
 /// Acknowledges a findings batch only after 2 s (a console slower than
