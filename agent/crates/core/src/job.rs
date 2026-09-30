@@ -642,6 +642,9 @@ pub struct AuditConfig {
     positions: Option<crate::audit::PositionRegistry>,
     isolate: bool,
     skip_records: u32,
+    /// Sub-key for the integrity tags of the cursors (see
+    /// [`crate::audit::CursorStore::with_tag_key`]).
+    tag_key: Option<std::sync::Arc<databastion_classifiers::masking::LocalTagKey>>,
 }
 
 impl std::fmt::Debug for AuditConfig {
@@ -674,6 +677,7 @@ impl Default for AuditConfig {
             positions: None,
             isolate: false,
             skip_records: 0,
+            tag_key: None,
         }
     }
 }
@@ -700,6 +704,7 @@ impl AuditConfig {
             positions: None,
             isolate: false,
             skip_records: 0,
+            tag_key: None,
         }
     }
 
@@ -754,6 +759,10 @@ impl AuditConfig {
     pub fn cursor(&self, name: &str) -> Option<crate::audit::CursorStore> {
         let store =
             crate::audit::CursorStore::new(self.state_dir.as_deref()?, &self.target_id, name)?;
+        let store = match &self.tag_key {
+            Some(key) => store.with_tag_key(std::sync::Arc::clone(key)),
+            None => store,
+        };
         Some(match &self.positions {
             Some(p) => p.register(store, self.isolate, self.skip_records),
             None => store,
@@ -785,6 +794,17 @@ impl AuditConfig {
         self.positions = Some(positions);
         self.isolate = isolate;
         self.skip_records = skip;
+        self
+    }
+
+    /// The sub-key of the agent key the cursors use for their integrity
+    /// tags (see [`crate::audit::CursorStore::with_tag_key`]).
+    #[must_use]
+    pub(crate) fn with_tag_key(
+        mut self,
+        key: Option<std::sync::Arc<databastion_classifiers::masking::LocalTagKey>>,
+    ) -> Self {
+        self.tag_key = key;
         self
     }
 
