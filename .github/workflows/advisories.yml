@@ -1,7 +1,8 @@
 name: Advisories
 
 # Dependency advisory scanning (P1-C review follow-up L3): RustSec for the agent, npm registry
-# advisories for the console production dependencies.
+# advisories for the console production dependencies and for the root release tooling
+# (release-it, which runs with RELEASE_TOKEN; end-of-phase-7 review M2).
 #
 # Deliberately NOT part of the "CI result" aggregate in ci.yml and not a required check: a new
 # upstream advisory would otherwise block every unrelated PR. Failures here are triaged by the
@@ -19,6 +20,7 @@ on:
       - agent/Cargo.lock
       - agent/fuzz/Cargo.lock
       - console/pnpm-lock.yaml
+      - package-lock.json
       - shared/protocol/package-lock.json
       - .github/workflows/advisories.yml
   pull_request:
@@ -27,6 +29,7 @@ on:
       - agent/Cargo.lock
       - agent/fuzz/Cargo.lock
       - console/pnpm-lock.yaml
+      - package-lock.json
       - shared/protocol/package-lock.json
       - .github/workflows/advisories.yml
   workflow_dispatch:
@@ -108,5 +111,34 @@ jobs:
             echo "::error title=Vulnerable dependencies::pnpm audit reported high or critical advisories in the console production dependencies."
           else
             echo "::error title=Advisory source unreachable::pnpm audit failed without a findings report (registry or network error). This is an infrastructure failure, not a vulnerability finding."
+          fi
+          exit "$rc"
+
+  release-tooling:
+    name: Release tooling advisories (npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # Root package-lock.json: release-it and its plugins, run by release.yml with RELEASE_TOKEN.
+      # All of them are devDependencies, so the whole graph is audited (no --omit=dev). `npm audit`
+      # reads the lockfile only (no install). As for the console, only an output carrying the
+      # findings summary ("N vulnerabilities (…)" or "N high severity vulnerabilities") is reported
+      # as vulnerable dependencies; any other failure is an infrastructure failure.
+      - name: npm audit (release tooling, high and critical)
+        run: |
+          set +e
+          npm audit --audit-level=high > audit.log 2>&1
+          rc=$?
+          set -e
+          cat audit.log
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if grep -qE '^[0-9]+ ([a-z]+ severity )?vulnerabilit(y|ies)' audit.log; then
+            echo "::error title=Vulnerable dependencies::npm audit reported high or critical advisories in the root release tooling (package-lock.json)."
+          else
+            echo "::error title=Advisory source unreachable::npm audit failed without a findings report (registry or network error). This is an infrastructure failure, not a vulnerability finding."
           fi
           exit "$rc"
