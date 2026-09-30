@@ -497,7 +497,7 @@ r="$(api POST /api/auth/login "$W/login.json")"
 rm -f "$W/login.json"
 [ "$(status_of "$r")" = 200 ] || fail "login: HTTP $(status_of "$r")"
 CSRF="$(body_of "$r" | jq -r '.csrf_token')"
-[ -n "$CSRF" ] && [ "$CSRF" != null ] || fail "login: no CSRF token"
+if [ -z "$CSRF" ] || [ "$CSRF" = null ]; then fail "login: no CSRF token"; fi
 register_secret csrf_token "$CSRF"
 printf 'X-CSRF-Token: %s\n' "$CSRF" >"$W/csrf.hdr"
 register_secret session_cookie "$(awk '$6 ~ /databastion_session$/ {print $7}' "$W/cookies")"
@@ -659,7 +659,7 @@ wait_spool_empty() {
       || fail "cannot read the agent spool status"
     case "$spool" in
       t,*,*,*) IFS=, read -r _ batches db di <<<"$spool"
-        [ "$db" = 0 ] && [ "$di" = 0 ] || fail "the agent dropped results ($db batch(es), $di item(s)) $label"
+        if [ "$db" != 0 ] || [ "$di" != 0 ]; then fail "the agent dropped results ($db batch(es), $di item(s)) $label"; fi
         if [ "$batches" = 0 ]; then return 0; fi ;;
     esac
     [ "$(date +%s)" -lt "$deadline" ] || return 1
