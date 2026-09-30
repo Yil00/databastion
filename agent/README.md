@@ -284,42 +284,6 @@ file the server owns (for instance `0640`, owner `mysql`, group
 `test-support` feature (enabled from the connectors' `[dev-dependencies]`),
 and only test code calls it (guarded by `crates/agent/tests/architecture.rs`).
 
-### Audit streams that panic
-A connector call that panics fails that call only (`crate::panics`). An
-Audit stream that panics is restarted from its persisted read position. When
-it panics again and again **at the same saved position** (a record that
-crashes a parser), the core asks it to skip records there: after 3 panics, 1
-record, then 2, 4… at each further panic there (at most 12 rounds); the
-connector drops them without parsing, counts them as dropped
-(`audit.records_dropped`, and `audit_records_skipped_total` in the heartbeat
-metrics), and goes on. File sources do it in the core tailer, the OpenLDAP
-accesslog on its own entries (`CursorStore::skip_records`). Panics at
-different positions (3 in a row), or on a source whose position is in memory
-(restarted afresh anyway), still stop the stream until Audit is reconfigured
-or the agent restarts (`audit.stream_stopped`).
-
-### Logs
-`DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
-capped at `warn`: drivers and HTTP clients may log parameters or payloads at
-debug/trace level.
-
-### Audit log files
-Every file source (the PostgreSQL server log, the MariaDB `server_audit` log,
-the MySQL `audit_log` / `audit_log_filter` JSON file, the MongoDB `auditLog` and
-server log) is read by the core tailer (`crates/core/src/audit/tail.rs`):
-opened without blocking, it must be a regular file, and it must **not be
-owned by the agent's own user** (effective uid), checked on the opened handle,
-so after following symlinks (end-of-phase-4 review L4). An audit log is the
-database server's evidence: a file the agent's account owns could have been
-written or rewritten by that account. Such a file is refused like an unreadable
-one (`check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
-its source, and the agent logs `audit log refused: the file is owned by the
-agent's own user`). Give the agent read access through a group or an ACL on a
-file the server owns (for instance `0640`, owner `mysql`, group
-`databastion`), never ownership. Tests enable owned files through
-`allow_agent_owned_logs_for_tests()`, which only test code calls (guarded by
-`crates/agent/tests/architecture.rs`).
-
 ### PostgreSQL connector
 tokio-postgres with the connector's own rustls adapter
 (`crates/connector-postgres/src/tls.rs`: `verify_full` against a pinned CA or the system

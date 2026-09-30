@@ -15,7 +15,7 @@ Audit. In `cn=config` (adapt the suffix and the DN):
 
 ```
 # Data database: credentials first, then the tree.
-olcAccess: {0}to attrs=userPassword,authPassword by self =xw by anonymous auth by * none
+olcAccess: {0}to attrs=userPassword,userPKCS12 by self =xw by anonymous auth by * none
 olcAccess: {1}to dn.subtree="dc=example,dc=org" by dn.exact="cn=databastion,ou=services,dc=example,dc=org" read by * break
 # Log database (Audit only).
 olcAccess: {0}to dn.subtree="cn=accesslog" by dn.exact="cn=databastion,ou=services,dc=example,dc=org" read by * none
@@ -23,6 +23,10 @@ olcAccess: {0}to dn.subtree="cn=accesslog" by dn.exact="cn=databastion,ou=servic
 olcLimits: dn.exact="cn=databastion,ou=services,dc=example,dc=org" size=1000 time=60
 ```
 
+- The first rule names `userPKCS12` (a credential attribute of the stock
+  `inetOrgPerson` schema) next to `userPassword`: stock slapd rejects an ACL
+  naming `authPassword` unless a loaded schema defines it. Add
+  `authPassword` to the list where your schema defines it.
 - The connector never requests `userPassword`, `authPassword`, their
   subtypes, nor the Samba, Kerberos and `pwdHistory` hashes, whatever the
   ACL grants. Their presence is not reported either: the hash scheme is
