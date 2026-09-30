@@ -60,17 +60,17 @@ pub(crate) struct PssPoller {
     catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
     /// `None`: the analysis or a conversion panicked (poisoned); the
-    /// statement is counted once in `panicked` and not analyzed again while
+    /// statement is counted once in `unanalyzed` and not analyzed again while
     /// cached, and each of its later deltas is still reported, as a read of
     /// `*` with its counts (#90).
     analyses: HashMap<Key, Option<Analyzed>>,
     /// The `queryid` pinned for each of the connector's own statements.
     own_keys: OwnKeys,
     last_poll: SystemTime,
-    /// Statements whose analysis or conversion panicked, counted once
-    /// each; they are not dropped: their deltas are reported as reads of
-    /// `*` (#90).
-    pub(crate) panicked: u64,
+    /// Statements whose analysis or conversion panicked (poisoned),
+    /// counted once each; they are not dropped: their deltas are reported
+    /// as reads of `*` (#90).
+    pub(crate) unanalyzed: u64,
 }
 
 /// Where the connector's own table-less statements may be recognized on
@@ -229,7 +229,7 @@ pub(crate) async fn connect(
                     pinned: HashMap::new(),
                 },
                 last_poll: SystemTime::now(),
-                panicked: 0,
+                unanalyzed: 0,
             },
         ));
     }
@@ -306,7 +306,7 @@ impl PssPoller {
                 .is_some_and(|sent| self.own_keys.admit(key, sent));
         let analysis = analyze_isolated(text, cut).map(|analysis| Analyzed { analysis, own_text });
         if analysis.is_none() {
-            self.panicked = self.panicked.saturating_add(1);
+            self.unanalyzed = self.unanalyzed.saturating_add(1);
         }
         self.analyses.insert(key, analysis);
     }
@@ -321,7 +321,7 @@ impl PssPoller {
         let (deltas, keys, unanalyzed) = split_deltas(changed, &self.analyses);
         let (mut events, panicked) =
             pss_events_counted(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
-        self.panicked = self.panicked.saturating_add(panicked.len() as u64);
+        self.unanalyzed = self.unanalyzed.saturating_add(panicked.len() as u64);
         // A statement whose conversion panicked is marked poisoned, like
         // one whose analysis panicked: its later deltas go straight to the
         // `*` fallback, without converting (and counting) it again.
@@ -584,9 +584,10 @@ mod tests {
     }
 
     /// Security review of #85: a statement whose analysis panics is
-    /// dropped alone; the others are analyzed.
+    /// poisoned alone (reported against `*` from then on, #90); the others
+    /// are analyzed.
     #[test]
-    fn a_panicking_analysis_drops_one_statement() {
+    fn a_panicking_analysis_poisons_one_statement() {
         assert!(analyze_isolated(&format!("SELECT 1 /* {TEST_POISON} */"), false).is_none());
         let ok = analyze_isolated("SELECT * FROM shop.customers", false).unwrap();
         assert!(!ok.parts().is_empty());
@@ -711,7 +712,7 @@ mod tests {
                 pinned: HashMap::new(),
             },
             last_poll: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
-            panicked: 0,
+            unanalyzed: 0,
         }
     }
 
@@ -866,7 +867,7 @@ mod tests {
             assert_eq!(events[0].objects()[0].object().as_str(), "*");
             assert_eq!(events[0].aggregated_count(), 2);
             assert!(p.analyses[&k].is_none(), "poisoned");
-            assert_eq!(p.panicked, 1, "counted once (poll {poll})");
+            assert_eq!(p.unanalyzed, 1, "counted once (poll {poll})");
         }
     }
 }
