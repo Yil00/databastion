@@ -210,9 +210,9 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
     await getDb().update(jobs).set({ status: "running" }).where(eq(jobs.id, jobId));
     expect((await scan(auth.agentId, {})).status).toBe(409);
-    // Past delivered_at + max_duration_s + grace: dead.
+    // Past first_delivered_at + max_duration_s + grace: dead.
     const past = new Date(Date.now() - SCAN_DEFAULTS.max_duration_s * 1000 - SCAN_GRACE_MS - 60_000);
-    await getDb().update(jobs).set({ deliveredAt: past }).where(eq(jobs.id, jobId));
+    await getDb().update(jobs).set({ deliveredAt: past, firstDeliveredAt: past }).where(eq(jobs.id, jobId));
     const replaced = await scan(auth.agentId, {});
     expect(replaced.status).toBe(202);
     const [dead] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
@@ -232,6 +232,25 @@ describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () =>
     expect((await scan(auth.agentId, {})).status).toBe(202);
     const [expired] = await getDb().select().from(jobs).where(eq(jobs.id, pendingId));
     expect(expired?.status).toBe("expired");
+  });
+
+  it("anchors a scan's deadline on its first delivery: a late acknowledgement does not extend it (M1)", async () => {
+    const auth = await agentWithTarget();
+    const res = await scan(auth.agentId, {});
+    const { job_id: jobId } = (await res.json()) as { job_id: string };
+    expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+    // First delivered past its budget + grace, redelivered a minute ago, acknowledged just now.
+    const first = new Date(Date.now() - SCAN_DEFAULTS.max_duration_s * 1000 - SCAN_GRACE_MS - 60_000);
+    await getDb()
+      .update(jobs)
+      .set({ status: "running", firstDeliveredAt: first, deliveredAt: new Date(Date.now() - 60_000), leaseUntil: null })
+      .where(eq(jobs.id, jobId));
+    expect((await scan(auth.agentId, {})).status).toBe(202);
+    const [dead] = await getDb().select().from(jobs).where(eq(jobs.id, jobId));
+    expect(dead?.status).toBe("failed");
+    expect(dead?.error).toEqual({ code: "timeout" });
+    const deadline = first.getTime() + SCAN_DEFAULTS.max_duration_s * 1000 + SCAN_GRACE_MS;
+    expect(Math.abs((dead?.finishedAt?.getTime() ?? 0) - deadline)).toBeLessThan(1000);
   });
 
   it("rejects out-of-range or unknown parameters with 400 and queues nothing", async () => {

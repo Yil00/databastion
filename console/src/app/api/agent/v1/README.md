@@ -65,10 +65,10 @@ agent (advisory lock):
 2. `job_id` must be a `discovery.scan` job of the agent that was delivered (`delivered`, `running`,
    `succeeded` or `failed`: batches may overtake the `running` status or arrive after the final one)
    and is still open: `succeeded` / `failed` for 24 h after
-   `least(finished_at, delivered_at + max_duration_s + 1 h)` (`LATE_BATCH_RETENTION_MS`, the
+   `least(finished_at, first_delivered_at + max_duration_s + 1 h)` (`LATE_BATCH_RETENTION_MS`, the
    spool-retention bound; the scan's own deadline caps it, so a final status sent long after the
    deadline does not reopen the window, and a null `finished_at` or `delivered_at` closes it),
-   `delivered` / `running` until `delivered_at + max_duration_s + 1 h` (a dead scan swept to
+   `delivered` / `running` until `first_delivered_at + max_duration_s + 1 h` (a dead scan swept to
    `failed` gets that deadline as its `finished_at`);
    otherwise `404` with pointer `/job_id` (keyword `notFound`);
 3. every `target_id` reported by the agent in a heartbeat: otherwise `404`, pointers
