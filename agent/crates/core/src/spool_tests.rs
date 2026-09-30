@@ -399,10 +399,11 @@ fn a_plain_events_batch_never_evicts_a_signature_one() {
     for _ in 0..4 {
         spool.push(&events_batch_signed(true)).unwrap();
     }
-    // Full: a plain batch is dropped itself.
+    // Full: a plain batch is dropped itself (counted apart as rejected).
     spool.push(&events_batch_signed(false)).unwrap();
     assert_eq!(classes(&spool), [Class::Signature; 4]);
     assert_eq!(spool.counters.dropped_batches, 1);
+    assert_eq!(spool.counters.rejected_batches, 1);
     // A signature batch evicts the oldest signature batch.
     let oldest = spool.entries[0].key.clone();
     spool.push(&events_batch_signed(true)).unwrap();
@@ -462,4 +463,23 @@ fn signature_events_are_packed_in_batches_of_their_own() {
         .map(|b| (b.has_signature(), b.len()))
         .collect();
     assert_eq!(shape, [(true, 2), (false, 2)]);
+}
+
+/// #88 review L1: with `max_batches` 1 (a share of 0), findings and
+/// signature batches still take the place of the other class; only a plain
+/// events batch is dropped itself.
+#[test]
+fn a_one_batch_spool_still_takes_findings_and_signature_batches() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 1)).unwrap();
+    spool.push(&events_batch_signed(true)).unwrap();
+    let f = batches(200);
+    spool.push(&f[0]).unwrap();
+    assert_eq!(classes(&spool), [Class::Findings]);
+    spool.push(&events_batch_signed(true)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature]);
+    spool.push(&events_batch_signed(false)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature]);
+    assert_eq!(spool.counters.rejected_batches, 1);
+    assert_eq!(spool.counters.dropped_batches, 3);
 }

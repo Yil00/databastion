@@ -1185,10 +1185,15 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::panics::record_panics() as f64);
         }
-        let quarantined = self.lock_spool().counters.quarantined;
-        if let Ok(key) = MetricsMapKey::try_from("spool_quarantined_total") {
-            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
-            map.insert(key, quarantined as f64);
+        let spool = self.lock_spool().counters;
+        for (name, value) in [
+            ("spool_quarantined_total", spool.quarantined),
+            ("spool_rejected_batches_total", spool.rejected_batches),
+        ] {
+            if let Ok(key) = MetricsMapKey::try_from(name) {
+                #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+                map.insert(key, value as f64);
+            }
         }
         MetricsMap(map)
     }

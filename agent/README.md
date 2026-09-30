@@ -107,7 +107,11 @@ binary: `cargo build --no-default-features --features postgres`.
   against the other, so an events flood cannot evict the findings; within
   the events, batches holding a `signature.*` signal (packed apart from the
   others) are dropped last, and a new batch without one is dropped rather
-  than evict them; within a class, the oldest goes first. FIFO send:
+  than evict them; within a class, the oldest goes first. A findings or
+  signature batch over its share that has no batch of its own class to
+  evict takes the place of the other class (small bounds); a new batch
+  dropped itself is counted in `dropped_batches` and apart in the heartbeat
+  metric `spool_rejected_batches_total`. FIFO send:
   `2xx` (including `duplicate: true`) removes the batch; `400` / `404` whose
   pointers all designate items → those items dropped, the rest resent under
   a new `batch_id` at the same queue position; `413` → two halves with new

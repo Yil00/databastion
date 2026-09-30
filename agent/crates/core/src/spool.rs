@@ -104,6 +104,9 @@ enum ReadError {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpoolCounters {
     pub(crate) dropped_batches: u64,
+    /// New batches dropped themselves when the spool was full (also in
+    /// `dropped_batches`), apart from the evicted ones.
+    pub(crate) rejected_batches: u64,
     pub(crate) dropped_items: u64,
     pub(crate) quarantined: u64,
 }
@@ -353,16 +356,23 @@ impl Spool {
         } else {
             self.oldest(Class::Findings)
         };
-        if own_over {
-            return own;
-        }
         let other = if own_events {
             self.oldest(Class::Findings)
         } else {
             self.oldest(Class::Events)
                 .or_else(|| self.oldest(Class::Signature))
         };
-        other.or(own)
+        match (class, own_over) {
+            // A plain events batch over the events' share evicts plain
+            // events only; else it is dropped itself (never a signature
+            // batch, never findings within their share).
+            (Class::Events, true) => own,
+            // Findings and signature batches over their share evict their
+            // own class first, then the other (small bounds: a share of 0
+            // with `max_batches` 1 must not drop every incoming batch).
+            (_, true) => own.or(other),
+            (_, false) => other.or(own),
+        }
     }
 
     /// Writes a batch file (after making room). `Ok(None)`: the batch can
@@ -383,11 +393,18 @@ impl Spool {
         let class = Class::of(batch.is_findings(), batch.has_signature());
         if !self.make_room(len, Some(class)) {
             self.counters.dropped_batches += 1;
+            self.counters.rejected_batches += 1;
             self.counters.dropped_items += items;
-            tracing::warn!(
-                "spool full: new events batch dropped (the spool holds findings and events \
-                 batches with a signature signal)"
-            );
+            match class {
+                Class::Events => tracing::warn!(
+                    "spool full: new events batch dropped (the spool holds findings and events \
+                     batches with a signature signal)"
+                ),
+                Class::Findings => tracing::warn!("spool full: new findings batch dropped"),
+                Class::Signature => {
+                    tracing::warn!("spool full: new events batch with a signature signal dropped")
+                }
+            }
             return Ok(None);
         }
         fsutil::write_private_atomic(&self.path(&key, batch.is_findings()), bytes)?;
