@@ -334,3 +334,152 @@ fn findings_pending_tracks_a_sequence_range_through_replacements() {
     assert_eq!(spool.findings_pending(&(0..first)), 1);
     assert_eq!(spool.len(), 2);
 }
+
+/// An events batch, with a `signature.*` signal or not.
+fn events_batch_signed(signed: bool) -> ResultBatch {
+    let mut event = serde_json::to_value(crate::sanitize::tests::event("read", 1)).unwrap();
+    event["signals"] = if signed {
+        serde_json::json!(["signature.pg_dump"])
+    } else {
+        serde_json::json!(["volume.large_result"])
+    };
+    let body = serde_json::json!({
+        "batch_id": databastion_protocol::new_batch_id(),
+        "events": [event],
+    });
+    ResultBatch::parse(false, serde_json::to_vec(&body).unwrap()).unwrap()
+}
+
+fn classes(spool: &Spool) -> Vec<Class> {
+    spool.entries.iter().map(Entry::class).collect()
+}
+
+/// Phase 7 (failed-login flood, ADR-0025): an events flood cannot evict
+/// the findings, nor the events batches with a `signature.*` signal.
+#[test]
+fn an_events_flood_keeps_findings_and_signature_batches() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 8)).unwrap();
+    for f in batches(2 * 200) {
+        spool.push(&f).unwrap();
+    }
+    spool.push(&events_batch_signed(true)).unwrap();
+    let flood: Vec<ResultBatch> = (0..30).map(|_| events_batch_signed(false)).collect();
+    for e in &flood {
+        spool.push(e).unwrap();
+    }
+    let c = classes(&spool);
+    assert_eq!(c.iter().filter(|c| **c == Class::Findings).count(), 2);
+    assert_eq!(c.iter().filter(|c| **c == Class::Signature).count(), 1);
+    // Events keep 3/4 of the batches: 6 of 8.
+    assert_eq!(c.len(), 8);
+    // The newest plain batches are kept (oldest dropped first).
+    assert_eq!(
+        spool.entries.back().unwrap().key,
+        spool.entries.iter().map(|e| e.key.clone()).max().unwrap()
+    );
+    assert_eq!(spool.counters.dropped_batches, 30 - 5);
+    // Signature batches survive a restart as such.
+    drop(spool);
+    let spool = Spool::open(dir.path(), &config(8 << 20, 8)).unwrap();
+    assert_eq!(
+        classes(&spool)
+            .iter()
+            .filter(|c| **c == Class::Signature)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_plain_events_batch_never_evicts_a_signature_one() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 4)).unwrap();
+    // Without findings, events may fill the spool.
+    for _ in 0..4 {
+        spool.push(&events_batch_signed(true)).unwrap();
+    }
+    // Full: a plain batch is dropped itself (counted apart as rejected).
+    spool.push(&events_batch_signed(false)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature; 4]);
+    assert_eq!(spool.counters.dropped_batches, 1);
+    assert_eq!(spool.counters.rejected_batches, 1);
+    // A signature batch evicts the oldest signature batch.
+    let oldest = spool.entries[0].key.clone();
+    spool.push(&events_batch_signed(true)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature; 4]);
+    assert_ne!(spool.entries[0].key, oldest);
+    assert_eq!(spool.counters.dropped_batches, 2);
+    // Findings take the rest of the room, then evict events beyond their
+    // share, plain ones first.
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 4)).unwrap();
+    spool.push(&events_batch_signed(true)).unwrap();
+    spool.push(&events_batch_signed(false)).unwrap();
+    spool.push(&events_batch_signed(false)).unwrap();
+    for f in batches(5 * 200) {
+        spool.push(&f).unwrap();
+    }
+    assert_eq!(
+        classes(&spool),
+        [
+            Class::Signature,
+            Class::Findings,
+            Class::Findings,
+            Class::Findings
+        ]
+    );
+}
+
+#[test]
+fn signature_events_are_packed_in_batches_of_their_own() {
+    let target = TargetId::try_from("pg-main").unwrap();
+    let key = databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap();
+    let fp = crate::sanitize::HmacFingerprints(&key);
+    let ev = |signed: bool| {
+        use databastion_classifiers::masking::{EventAction, EventPrincipal, EventSource, Signal};
+        let e = databastion_classifiers::masking::MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Connect,
+            EventPrincipal::account("app"),
+            std::time::SystemTime::now(),
+        );
+        if signed {
+            e.with_signal(Signal::PgDump)
+        } else {
+            e
+        }
+    };
+    let events = [ev(false), ev(true), ev(false), ev(true)];
+    let built = to_batches(MaskedResults::Events {
+        target_id: &target,
+        events: &events,
+        fingerprints: &fp,
+        accept_bytes: true,
+    });
+    let shape: Vec<(bool, usize)> = built
+        .batches
+        .iter()
+        .map(|b| (b.has_signature(), b.len()))
+        .collect();
+    assert_eq!(shape, [(true, 2), (false, 2)]);
+}
+
+/// #88 review L1: with `max_batches` 1 (a share of 0), findings and
+/// signature batches still take the place of the other class; only a plain
+/// events batch is dropped itself.
+#[test]
+fn a_one_batch_spool_still_takes_findings_and_signature_batches() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 1)).unwrap();
+    spool.push(&events_batch_signed(true)).unwrap();
+    let f = batches(200);
+    spool.push(&f[0]).unwrap();
+    assert_eq!(classes(&spool), [Class::Findings]);
+    spool.push(&events_batch_signed(true)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature]);
+    spool.push(&events_batch_signed(false)).unwrap();
+    assert_eq!(classes(&spool), [Class::Signature]);
+    assert_eq!(spool.counters.rejected_batches, 1);
+    assert_eq!(spool.counters.dropped_batches, 3);
+}

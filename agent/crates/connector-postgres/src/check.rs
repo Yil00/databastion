@@ -712,9 +712,21 @@ pub(crate) struct Prerequisites {
     pub(crate) catalogs: crate::audit::events::Catalogs,
 }
 
+#[cfg(test)]
 pub(crate) async fn prerequisites(
     target: &TargetConfig,
     timeouts: Timeouts,
+) -> Result<Prerequisites, PgError> {
+    prerequisites_with(target, timeouts, None).await
+}
+
+/// [`prerequisites`], probing the database of `held` (the held
+/// `pg_stat_statements` session and its database) on that session rather
+/// than on a new connection (phase 7, ADR-0025 decision 11).
+pub(crate) async fn prerequisites_with(
+    target: &TargetConfig,
+    timeouts: Timeouts,
+    held: Option<(&str, &Session)>,
 ) -> Result<Prerequisites, PgError> {
     let log_readable = crate::audit::log_readable(target).await;
     let mut level = AuditLevel::None;
@@ -722,9 +734,16 @@ pub(crate) async fn prerequisites(
     let mut own_addr = None;
     let mut catalogs = crate::audit::events::Catalogs::default();
     for database in &target.postgres_settings().databases {
-        let session = Session::connect(target, database, timeouts).await?;
+        let opened: Session;
+        let session = match held {
+            Some((db, s)) if db == database.as_str() => s,
+            _ => {
+                opened = Session::connect(target, database, timeouts).await?;
+                &opened
+            }
+        };
         if own_addr.is_none() {
-            own_addr = match probe(&session, timeouts, sql::OWN_CLIENT_ADDR).await {
+            own_addr = match probe(session, timeouts, sql::OWN_CLIENT_ADDR).await {
                 Ok(rows) => {
                     let addr: Option<String> = rows
                         .first()
@@ -740,7 +759,7 @@ pub(crate) async fn prerequisites(
                 Err(_) => None,
             };
         }
-        let probe = audit_probe(&session, timeouts).await?;
+        let probe = audit_probe(session, timeouts).await?;
         level = level.max(probe.level(log_readable));
         catalogs.insert(
             database,

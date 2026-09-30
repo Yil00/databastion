@@ -147,11 +147,42 @@ Maintainer steps, in this order:
 - As long as there is only one maintainer, no approval is required on PRs (you cannot approve your own PR). Switch to 1 approval as soon as a second maintainer joins.
 
 ## 7. Pre-release checklist
-- [ ] CI green on all components
-- [ ] Invariant I2 test green (no raw data in the console database)
-- [ ] Release notes reviewed: breaking changes first, upgrade steps
-- [ ] [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix up to date
-- [ ] Console N / agent N-1 compatibility tested
-- [ ] Release prerequisites in place (`release-it` and `release` environments, no repository-level `RELEASE_TOKEN`, tag ruleset: section 6)
-- [ ] Images signed, SBOM and `SHA256SUMS` published; `cosign verify` with the exact tag identity succeeds
-- [ ] Installation test of the publish run green (under 15 minutes with the published image and `.deb`)
+Every item is checked on the `dev` commit that becomes the release (and on the `-rc.N` tag when there is one). It extends the [Definition of Done](AGENTS.md#definition-of-done) of each task to the whole release.
+
+### Every release
+- [ ] **CI green on `dev`**: the `CI result` check of the release commit (lint, tests and builds of every component, protocol checks, the blocking holdout classifier gate, doc links, gitleaks; [ci.yml](.github/workflows/ci.yml))
+- [ ] **End-to-end and invariant I2 test green**: the `e2e` job of that CI run ([e2e/README.md](e2e/README.md)): enrollment and revocation, no value of `dev/ground-truth.json` in clear in the console, and the Audit path (an export raises an incident) on the PostgreSQL, MariaDB, MongoDB and OpenLDAP targets
+- [ ] **Security reviews**: every PR of the release that touches `shared/protocol/`, the uplink, masking or authentication was merged with an approved `security-reviewer` review ([CLAUDE.md](CLAUDE.md)); no open **Gate** item and no open **v0.1.0 release gate** in the [ROADMAP](docs/ROADMAP.md)
+- [ ] **Holdout seed rotated** for this release, and the holdout gate green on the new seed ([§ 8](#8-holdout-seed-rotation))
+- [ ] **[CHANGELOG.md](CHANGELOG.md) "Unreleased" section reviewed**: accurate, no promise the code does not keep; the generated release notes put breaking changes first, with upgrade steps
+- [ ] **Documentation**: [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix, [user guide](docs/10-user-guide.md), [SECURITY.md](SECURITY.md) supported versions, [ROADMAP](docs/ROADMAP.md) and [CONTEXT.md](CONTEXT.md) up to date
+- [ ] **Compatibility**: console N with agent N-1 tested (from the second release on; [§ 2](#compatibility))
+- [ ] **GitHub settings** ([§ 6](#repository-configuration-one-time)): release prerequisites in place (`release-it` and `release` environments with required reviewers and administrator bypass off, `RELEASE_TOKEN` only as a `release-it` environment secret and not expired, no repository-level `RELEASE_TOKEN`, release tag ruleset, merge and squash merges only); `main` and `dev` rulesets as in [§ 1](#1-branches), with "Require review from Code Owners" enabled (the protocol registry checks rely on [.github/CODEOWNERS](.github/CODEOWNERS)); private vulnerability reporting enabled (*Settings → Code security*), since [SECURITY.md](SECURITY.md) relies on it
+- [ ] **After publishing**: images signed, with SBOM and provenance, and `SHA256SUMS` with its cosign bundle published ([publish.yml](.github/workflows/publish.yml)); `cosign verify` with the exact tag identity passes on both images and on `SHA256SUMS` ([§ 4](#4-published-artifacts), [deploy/README.md](deploy/README.md#verify-the-artifacts)); the installation test of the publish run is green (under 15 minutes with the published image and `.deb`); the GHCR packages are public
+
+### Additional items for v0.1.0
+- [ ] **72 h stability test**, run by the maintainer on the release candidate, result recorded in the [ROADMAP](docs/ROADMAP.md) (phase 7)
+- [ ] The other phase 7 release items of the ROADMAP (packaging, "installation < 15 min" test, load and database impact tests) done, or explicitly deferred in the ROADMAP and the release notes
+- [ ] **Console and agents upgraded together**: the release notes say so; agent builds from before #60 cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md), consequences)
+
+## 8. Holdout seed rotation
+The classifier gate of the CI scores the classifiers on a held-out corpus generated from a fixed seed ([dev/holdout/README.md](dev/holdout/README.md)). Whoever has seen its failing columns while working on the classifiers has partly seen the test set, so the seed is rotated **once per release**. This only concerns the holdout seed: the dev seed (`dev/seed/generate.py`, which produces [dev/ground-truth.json](dev/ground-truth.json) for the containers, the integration tests and the end-to-end I2 test) is not a held-out set and is not rotated.
+
+**When.** On `dev`, after the last classifier change of the release is merged and before the release candidate (the `-rc.N` tag, or the `dev` → `main` release PR when there is no candidate). The release is then measured on values nobody tuned against, and the new seed stays in place for the next development cycle. First rotation: v0.1.0.
+
+**Who.** Preferably someone who did not change the classifiers during the cycle. In any case the rotation PR touches `dev/holdout/` only: whoever changes the classifiers does not change the corpus in the same PR (independence rule). The CI output of the rotation PR (aggregates plus the ids and tags of the failing columns, never a value) is public, like every CI log.
+
+**How.**
+1. Branch from `dev` (for example `test/p7-holdout-seed-0.1.0`).
+2. Pick a new seed, e.g. `python3 -c 'import secrets; print(secrets.randbelow(10**9))'`. It must differ from the dev seed `20260928` (a unit test enforces it) and from the previous holdout seeds: `git log -p -- dev/holdout/generate.py | grep '^[-+]SEED ='`.
+3. Set `SEED` in [dev/holdout/generate.py](dev/holdout/generate.py), then regenerate and check:
+   ```sh
+   python3 dev/holdout/generate.py            # rewrites labels.json (new corpus_sha256) and the git-ignored corpus.json
+   python3 dev/holdout/generate.py --check
+   python3 -m unittest discover -s dev/holdout -v
+   ```
+4. Update the seed and the counts that `generate.py` prints in [dev/holdout/README.md](dev/holdout/README.md) ("Files" table and "Counts" section).
+5. Run the gate as the CI does, from `agent/`: `cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture`.
+6. Commit `generate.py`, `labels.json` and `README.md` only (`corpus.json` stays git-ignored), open the PR to `dev` and let the CI run the blocking holdout gate.
+
+**If the gate fails on the new seed**, the release waits: do not change the corpus back, and do not tune the classifiers against the failing columns. Fix the classifiers in a separate PR, against the dev seed or examples of your own ([dev/holdout/README.md](dev/holdout/README.md#independence-rule)), then check the gate again. The person who rotated the seed, and has seen the failing columns, does not write that fix. If a fix is nevertheless made while looking at the new seed's failures, record in the release notes or the ROADMAP that this release's holdout result is no longer independent, and rotate the seed again at the start of the next cycle.

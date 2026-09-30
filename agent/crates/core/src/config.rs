@@ -685,6 +685,27 @@ impl TargetConfig {
     pub fn openldap_settings(&self) -> OpenldapTargetConfig {
         self.openldap.clone().unwrap_or_default()
     }
+
+    /// The TCP port the connector connects to: `port`, else the engine's
+    /// default (PostgreSQL 5432, MySQL / MariaDB 3306, MongoDB 27017,
+    /// OpenLDAP 636 with `verify_full`, else 389), as the connectors apply
+    /// it. `None` for a Unix socket target.
+    #[must_use]
+    pub fn effective_port(&self) -> Option<u16> {
+        self.host.as_ref()?;
+        Some(self.port.unwrap_or(match self.engine {
+            TargetEngine::Postgres => 5432,
+            TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
+            TargetEngine::Mongodb => 27017,
+            TargetEngine::Openldap => {
+                if self.openldap_settings().tls == OpenldapTlsMode::VerifyFull {
+                    636
+                } else {
+                    389
+                }
+            }
+        }))
+    }
 }
 
 /// Phone region of a target (`agent.yaml`).

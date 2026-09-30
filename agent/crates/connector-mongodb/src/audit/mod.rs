@@ -405,7 +405,8 @@ fn builder(
             pre.own_addr,
             u64::from(cfg.max_sample_rows()),
             state.own_usage(&target.id),
-        ),
+        )
+        .persisted(cfg),
         user,
         u64::from(cfg.max_sample_rows()),
     )
@@ -422,6 +423,58 @@ struct ProfilerStream {
     session: Option<Session>,
     cursors: HashMap<String, DbCursor>,
     builder: EventBuilder,
+    /// Where the cursors are persisted (`None`: in memory only).
+    store: Option<databastion_core::audit::CursorStore>,
+    /// The cursors last saved.
+    saved: Option<Vec<u8>>,
+}
+
+impl ProfilerStream {
+    /// Saves the cursors when they moved (after the poll's events were
+    /// handed over: delivery stays at most once).
+    fn save(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let Some(bytes) = profiler::encode_cursors(&self.cursors) else {
+            return;
+        };
+        if self.saved.as_ref() == Some(&bytes) {
+            return;
+        }
+        match store.save(&bytes) {
+            Ok(()) => self.saved = Some(bytes),
+            Err(e) => tracing::warn!(error = %e, "profiler cursor not saved"),
+        }
+    }
+}
+
+/// The saved profiler cursors (see `profiler`), empty when none.
+fn load_profiler_cursors(
+    store: Option<&databastion_core::audit::CursorStore>,
+) -> HashMap<String, DbCursor> {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    match store.map(databastion_core::audit::CursorStore::load) {
+        Some(Ok(Some(bytes))) => profiler::decode_cursors(&bytes, now_ms),
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "profiler cursor not readable");
+            HashMap::new()
+        }
+        _ => HashMap::new(),
+    }
+}
+
+/// Removes the saved profiler cursor: a log file covers what the profiler
+/// would, and a later switch back starts at the newest entries rather than
+/// re-reading that period.
+fn forget_profiler_cursor(cfg: &AuditConfig) {
+    if let Some(store) = cfg.cursor(profiler::CURSOR) {
+        if let Err(e) = store.remove() {
+            tracing::warn!(error = %e, "profiler cursor not removed");
+        }
+    }
 }
 
 fn cursor_name(format: MongodbLogFormat) -> &'static str {
@@ -468,6 +521,7 @@ pub(crate) async fn audit_stream(
                             source = pre.source.describe(),
                             "audit source: log file"
                         );
+                        forget_profiler_cursor(cfg);
                         let framing = match format {
                             MongodbLogFormat::AuditLog => Framing::JsonObjects,
                             MongodbLogFormat::ServerLog => Framing::Lines,
@@ -501,10 +555,13 @@ pub(crate) async fn audit_stream(
                     Some(st) => st,
                     None => {
                         tracing::info!(target_id = %target.id, "audit source: profiler");
+                        let store = cfg.cursor(profiler::CURSOR);
                         prof.insert(ProfilerStream {
                             session: None,
-                            cursors: HashMap::new(),
+                            cursors: load_profiler_cursors(store.as_ref()),
                             builder: builder(cfg, target, &pre, state),
+                            store,
+                            saved: None,
                         })
                     }
                 };
@@ -791,6 +848,7 @@ async fn profiler_run(
                 }
             }
         }
+        st.save();
         tokio::time::sleep(cfg.poll_interval()).await;
         if started.elapsed() >= REPROBE {
             return Ok(());
