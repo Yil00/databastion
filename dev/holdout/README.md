@@ -7,7 +7,7 @@ It is separate from the dev seed ([../seed/generate.py](../seed/generate.py), [.
 ## Independence rule
 - The corpus was written **without looking at the classifier implementation** (`agent/crates/classifiers`). The only inputs were the classifier id list, the label format of `dev/ground-truth.json` and general knowledge of the data types.
 - **Do not tune classifiers against this corpus.** Do not add a rule or a test because a holdout column fails, and do not copy holdout values into classifier tests. Fix the classifiers against the dev seed or against your own examples. The holdout only measures the result.
-- **Rotate the seed after each release** (`SEED` in [generate.py](generate.py); it must stay different from the dev seed `20260928`). Anyone who has seen failing holdout columns while working on the classifiers has partly "seen" the test set. A new seed produces new values. The value shapes and naming families stay the same, so this rotation limits leakage but does not remove it. Adding new naming or format families from time to time helps as well.
+- **Rotate the seed once per release cycle, before the release candidate** (`SEED` in [generate.py](generate.py); it must stay different from the dev seed `20260928`; see RELEASE.md for the release procedure). Anyone who has seen failing holdout columns while working on the classifiers has partly "seen" the test set. A new seed produces new values. The value shapes and naming families stay the same, so this rotation limits leakage but does not remove it. Adding new naming or format families from time to time helps as well.
 - Whoever changes the classifiers should not also change this corpus in the same PR.
 
 ## Files

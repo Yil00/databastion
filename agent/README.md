@@ -3,11 +3,13 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: P1-B part 1.** `agent.yaml` configuration, enrollment, `0600`
-> identity storage, HTTPS uplink, heartbeat and jobs loops, secret rotation
-> (ADR-0008). No spool, local engine detection, Discovery or Audit yet:
-> `discovery.scan` / `audit.configure` jobs are reported `failed`
-> (`unsupported`).
+> **Status: phase 7, hardening before v0.1.0.** `agent.yaml`
+> configuration, enrollment, `0600` identity storage, HTTPS uplink,
+> heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
+> detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
+> MariaDB, MongoDB and OpenLDAP. `check()` reports the audit level each
+> target actually reaches
+> ([08-engine-capabilities.md](../docs/08-engine-capabilities.md)).
 
 ## Layout
 

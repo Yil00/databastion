@@ -8,7 +8,8 @@ Python standard library only. Everything derives from ``SEED``, which differs fr
 - ``dev/holdout/labels.json``  one label per column, in the ``dev/ground-truth.json`` location format
 
 This corpus was written WITHOUT looking at the classifier implementation (independence rule, see
-README.md). Do not tune classifiers against it; rotate ``SEED`` after each release.
+README.md). Do not tune classifiers against it; rotate ``SEED`` once per release cycle, before the
+release candidate (see RELEASE.md).
 
 All data is FAKE:
 - e-mail domains are reserved (RFC 2606 / RFC 6761): example.{com,org,net}, *.example, *.test, *.invalid;
@@ -39,7 +40,8 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-SEED = 5_318_027  # holdout seed; MUST differ from dev/seed/generate.py (20260928). Rotate after a release.
+SEED = 5_318_027  # holdout seed; MUST differ from dev/seed/generate.py (20260928). Rotate once per
+# release cycle, before the release candidate (see RELEASE.md).
 VERSION = 1
 ROWS = 200
 MIN_NEG_PER_TYPE = 16  # hard-negative columns per negative type
