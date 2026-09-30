@@ -706,10 +706,14 @@ pub enum StatementKind {
     Table,
     /// `COPY`.
     Copy,
-    /// Schema change: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COMMENT`.
+    /// Schema change: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COMMENT`
+    /// (role and account statements aside).
     Ddl,
-    /// Privilege change: `GRANT`, `REVOKE` (MySQL: also account and
-    /// role statements, `SET PASSWORD`).
+    /// Privilege change: `GRANT`, `REVOKE`, and the role and account
+    /// statements: `CREATE` / `ALTER` / `DROP` `ROLE` / `USER` / `GROUP`
+    /// (not PostgreSQL `USER MAPPING`, a foreign-server setting); MySQL
+    /// also `RENAME USER`, `SET PASSWORD` / `ROLE` / `DEFAULT ROLE`. The
+    /// same class as pgaudit's `ROLE`.
     Dcl,
     /// MySQL `HANDLER t …`: reads rows without a `SELECT`.
     Handler,
@@ -1508,6 +1512,15 @@ fn first_kind(s: &[Tok]) -> StatementKind {
     match word(s.get(i)) {
         // `WITH` without a recognized main statement.
         Some("with") => StatementKind::Other,
+        // Role and account statements are privilege changes (pgaudit's
+        // `ROLE` class), `CREATE USER MAPPING` is not.
+        Some("create" | "alter" | "drop")
+            if matches!(word(s.get(i + 1)), Some("role" | "user" | "group"))
+                && !(word(s.get(i + 1)) == Some("user")
+                    && word(s.get(i + 2)) == Some("mapping")) =>
+        {
+            StatementKind::Dcl
+        }
         Some(w) => StatementKind::from_word(w),
         None => StatementKind::Other,
     }
@@ -2682,6 +2695,40 @@ mod tests {
             ("HANDLER t READ NEXT", StatementKind::Handler),
         ] {
             assert_eq!(my(q).kind(), k, "{q}");
+        }
+    }
+
+    /// Security review of #85: PostgreSQL role statements are privilege
+    /// changes on every source (pgaudit's `ROLE` class), including a text
+    /// that does not lex (cut at its first quote).
+    #[test]
+    fn postgres_role_statements_are_dcl() {
+        let kind = |q: &str| analyze(q, AnalyzeOptions::new()).kind();
+        for q in [
+            "CREATE ROLE r LOGIN PASSWORD $1",
+            "create user u with password $1",
+            "ALTER ROLE r WITH PASSWORD $1",
+            "ALTER USER u VALID UNTIL $1",
+            "ALTER ROLE r SET search_path = public",
+            "DROP ROLE IF EXISTS r",
+            "DROP USER u",
+            "CREATE GROUP g",
+            "ALTER GROUP g ADD USER u",
+            "DROP GROUP g",
+            "GRANT SELECT ON t TO r",
+            "REVOKE r FROM u",
+            "ALTER ROLE r PASSWORD 'unterminated",
+        ] {
+            assert_eq!(kind(q), StatementKind::Dcl, "{q}");
+        }
+        for q in [
+            "CREATE USER MAPPING FOR u SERVER s OPTIONS (password $1)",
+            "ALTER USER MAPPING FOR u SERVER s OPTIONS (SET password $1)",
+            "DROP USER MAPPING FOR u SERVER s",
+            "CREATE TABLE roles (a int)",
+            "ALTER TABLE users ADD COLUMN g int",
+        ] {
+            assert_eq!(kind(q), StatementKind::Ddl, "{q}");
         }
     }
 

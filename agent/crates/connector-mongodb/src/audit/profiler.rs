@@ -22,14 +22,17 @@
 //!   an entry that does not parse is skipped and counted, never failing
 //!   the whole poll.
 //! - The read position (last `ts` per database, and the entries already
-//!   read at that millisecond) is in memory; the first poll starts at the
-//!   newest entry (no history replay). The profiler is a capped
-//!   collection: entries overwritten between two polls are lost, and an
-//!   entry written after a later one with an older `ts` (a long operation)
-//!   can be missed.
+//!   read at that millisecond, by a SHA-256 of their projected bytes) is
+//!   persisted through the core (`mongodb_profiler` cursor: database
+//!   names, times and hashes only), after the events of each poll are
+//!   handed over, so an agent restart resumes where it stopped (what the
+//!   capped collection still holds). A database without a saved position
+//!   starts at its newest entry (no history replay). The profiler is a
+//!   capped collection: entries overwritten between two polls (or while
+//!   the agent is stopped) are lost, and an entry written after a later
+//!   one with an older `ts` (a long operation) can be missed.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
 use databastion_classifiers::masking::ClientAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -316,7 +319,7 @@ pub(crate) fn projection() -> DocBuf {
 }
 
 /// Where the next poll of one database starts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DbCursor {
     /// Last `ts` read (milliseconds).
     ts: i64,
@@ -364,10 +367,86 @@ pub(crate) fn newest_command() -> DocBuf {
         .bool("singleBatch", true)
 }
 
+/// A stable hash of an entry's projected bytes (the same across agent
+/// versions, since it is persisted; a collision cannot be chosen).
 fn hash_of(bytes: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&d[..8]);
+    u64::from_be_bytes(first)
+}
+
+/// Name of the persisted cursor.
+pub(crate) const CURSOR: &str = "mongodb_profiler";
+/// Version of the saved cursor.
+const CURSOR_VERSION: u32 = 1;
+/// Hashes saved per database at most; beyond, the database resumes
+/// strictly after its last millisecond (an entry of that millisecond not
+/// read yet is then missed, rather than entries read again).
+const MAX_SAVED_SEEN: usize = 32;
+/// A saved time this far ahead of the agent's clock is not trusted
+/// (another server, a clock set back): the database starts at its newest
+/// entry.
+const MAX_AHEAD_MS: i64 = 24 * 3600 * 1000;
+
+/// The saved cursor: per database, (name, last `ts`, strict, hashes).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Saved {
+    v: u32,
+    dbs: Vec<(String, i64, bool, Vec<u64>)>,
+}
+
+/// The saved form of `cursors` (sorted by database, bounded).
+pub(crate) fn encode_cursors(cursors: &HashMap<String, DbCursor>) -> Option<Vec<u8>> {
+    let mut dbs: Vec<(String, i64, bool, Vec<u64>)> = cursors
+        .iter()
+        .take(MAX_DATABASES)
+        .map(|(db, c)| {
+            let mut seen: Vec<u64> = c.seen.iter().copied().collect();
+            seen.sort_unstable();
+            if seen.len() > MAX_SAVED_SEEN {
+                (db.clone(), c.ts, true, Vec::new())
+            } else {
+                (db.clone(), c.ts, c.strict, seen)
+            }
+        })
+        .collect();
+    dbs.sort();
+    serde_json::to_vec(&Saved {
+        v: CURSOR_VERSION,
+        dbs,
+    })
+    .ok()
+}
+
+/// The cursors of a saved form; unknown or untrusted content is dropped.
+pub(crate) fn decode_cursors(bytes: &[u8], now_ms: i64) -> HashMap<String, DbCursor> {
+    let Ok(saved) = serde_json::from_slice::<Saved>(bytes) else {
+        tracing::warn!("profiler cursor not understood: starting at the newest entries");
+        return HashMap::new();
+    };
+    if saved.v != CURSOR_VERSION {
+        return HashMap::new();
+    }
+    saved
+        .dbs
+        .into_iter()
+        .take(MAX_DATABASES)
+        .filter(|(_, ts, _, seen)| {
+            *ts <= now_ms.saturating_add(MAX_AHEAD_MS) && seen.len() <= MAX_SAVED_SEEN
+        })
+        .map(|(db, ts, strict, seen)| {
+            (
+                db,
+                DbCursor {
+                    ts,
+                    seen: seen.into_iter().collect(),
+                    strict,
+                },
+            )
+        })
+        .collect()
 }
 
 fn count(doc: &Doc<'_>, key: &str) -> Result<Option<u64>, Malformed> {
@@ -774,5 +853,62 @@ mod tests {
         // No time: skipped.
         let bytes = DocBuf::new().str("op", "query").finish();
         assert!(record_of(&Doc::new(&bytes).unwrap()).unwrap().is_none());
+    }
+
+    /// Phase 7: the profiler position is persisted (database names, times
+    /// and stable hashes only) and restored across agent restarts.
+    #[test]
+    fn profiler_cursors_round_trip_bounded() {
+        // The hash is stable across agent versions (SHA-256).
+        assert_eq!(hash_of(b""), 0xe3b0_c442_98fc_1c14);
+        let mut cursors = HashMap::new();
+        cursors.insert(
+            "app".to_owned(),
+            DbCursor {
+                ts: 1_700_000_000_000,
+                seen: [1u64, 2, 3].into(),
+                strict: false,
+            },
+        );
+        cursors.insert(
+            "busy".to_owned(),
+            DbCursor {
+                ts: 1_700_000_000_500,
+                seen: (0..100u64).collect(),
+                strict: false,
+            },
+        );
+        cursors.insert("new".to_owned(), DbCursor::after(1_700_000_000_000));
+        let bytes = encode_cursors(&cursors).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.len() < 64 * 1024, "{}", text.len());
+        let back = decode_cursors(&bytes, 1_700_000_001_000);
+        assert_eq!(back["app"], cursors["app"]);
+        assert_eq!(back["new"], cursors["new"]);
+        // Too many entries at the last millisecond: strictly after it.
+        assert_eq!(back["busy"], DbCursor::after(1_700_000_000_500));
+        // A position far ahead of the agent's clock is not trusted.
+        let back = decode_cursors(&bytes, 1_600_000_000_000);
+        assert!(back.is_empty());
+        // Unknown content: nothing restored.
+        assert!(decode_cursors(b"{\"v\":2,\"dbs\":[]}", 0).is_empty());
+        assert!(decode_cursors(b"garbage", 0).is_empty());
+    }
+
+    #[test]
+    fn the_worst_case_profiler_cursor_fits_the_cursor_bound() {
+        let cursors: HashMap<String, DbCursor> = (0..MAX_DATABASES)
+            .map(|i| {
+                (
+                    format!("{i:0>64}"),
+                    DbCursor {
+                        ts: i64::MIN,
+                        seen: (0..MAX_SAVED_SEEN as u64).map(|n| u64::MAX - n).collect(),
+                        strict: false,
+                    },
+                )
+            })
+            .collect();
+        assert!(encode_cursors(&cursors).unwrap().len() <= 64 * 1024);
     }
 }

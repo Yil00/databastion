@@ -1733,6 +1733,24 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
         has(ev, "customers", "signature.pg_dump")
     })
     .await;
+    // Phase 7 (ADR-0025 decision 11): the stream re-probes its
+    // prerequisites on its held session (every 3 s in tests), so it never
+    // holds a second connection of the account.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut most = 0i64;
+    for _ in 0..40 {
+        let n: i64 = a
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+                &[&u.user],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        most = most.max(n);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(most <= 1, "Audit connections held at once: {most}");
     task.abort();
     let all: Vec<String> = events.iter().map(describe).collect();
     assert!(

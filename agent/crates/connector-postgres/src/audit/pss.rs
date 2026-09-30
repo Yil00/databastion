@@ -27,7 +27,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
-use super::events::{Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events};
+use super::events::{Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events_counted};
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
 use crate::error::{PgError, Stage};
@@ -49,13 +49,37 @@ struct Counters {
 
 /// Poller state kept across polls of one session.
 pub(crate) struct PssPoller {
+    /// Database of the session the poller reads through.
+    database: String,
     schema: String,
     toplevel: bool,
     own: PgOwn,
     catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
-    analyses: HashMap<Key, QueryAnalysis>,
+    /// `None`: the analysis panicked; the statement is dropped (counted
+    /// once) and not analyzed again while cached.
+    analyses: HashMap<Key, Option<QueryAnalysis>>,
     last_poll: SystemTime,
+    /// Statements dropped because their analysis or conversion panicked.
+    pub(crate) panicked: u64,
+}
+
+/// Tests: a text holding this marker makes its analysis panic (a bug on
+/// one statement).
+#[cfg(test)]
+const TEST_POISON: &str = "TEST-ANALYZER-PANIC";
+
+/// One text's analysis in isolation (`databastion_core::isolate`, as the
+/// file sources do; security review of #85): `None` when it panicked.
+fn analyze_isolated(text: &str, cut: bool) -> Option<QueryAnalysis> {
+    databastion_core::isolate(|| {
+        #[cfg(test)]
+        #[allow(clippy::panic)]
+        if text.contains(TEST_POISON) {
+            panic!("analysis bug on a statement");
+        }
+        analyze_pss(text, cut)
+    })
 }
 
 /// Finds a database of the target where `pg_stat_statements` is usable
@@ -113,6 +137,7 @@ pub(crate) async fn connect(
         return Ok((
             session,
             PssPoller {
+                database: database.clone(),
                 schema,
                 toplevel,
                 own,
@@ -120,6 +145,7 @@ pub(crate) async fn connect(
                 snapshot: None,
                 analyses: HashMap::new(),
                 last_poll: SystemTime::now(),
+                panicked: 0,
             },
         ));
     }
@@ -140,7 +166,22 @@ fn delta(now: Counters, prev: Option<Counters>, first: bool) -> Option<(u64, u64
     Some((calls, u64::try_from(rows).unwrap_or(0)))
 }
 
+/// A new session on the poller's database (the held one was closed for a
+/// re-probe of the other databases, phase 7).
+pub(crate) async fn reopen(
+    target: &TargetConfig,
+    timeouts: Timeouts,
+    poller: &PssPoller,
+) -> Result<Session, PgError> {
+    Session::connect(target, &poller.database, timeouts).await
+}
+
 impl PssPoller {
+    /// Database of the session the poller reads through.
+    pub(crate) fn database(&self) -> &str {
+        &self.database
+    }
+
     /// Sets the per-database catalog facts (re-probed with the source).
     pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
         self.catalogs = catalogs;
@@ -231,7 +272,11 @@ impl PssPoller {
                     .try_get::<_, Option<bool>>(5)
                     .map_err(get)?
                     .unwrap_or(true);
-                self.analyses.insert(key, analyze_pss(&text, cut));
+                let analysis = analyze_isolated(&text, cut);
+                if analysis.is_none() {
+                    self.panicked = self.panicked.saturating_add(1);
+                }
+                self.analyses.insert(key, analysis);
             }
         }
         tx.commit().await?;
@@ -245,13 +290,15 @@ impl PssPoller {
                 Some(StatementDelta {
                     user,
                     database,
-                    analysis: self.analyses.get(k)?,
+                    analysis: self.analyses.get(k)?.as_ref()?,
                     calls: *calls,
                     rows: *n,
                 })
             })
             .collect();
-        let events = pss_events(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
+        let (events, panicked) =
+            pss_events_counted(&deltas, &mut self.own, &self.catalogs, self.last_poll, now);
+        self.panicked = self.panicked.saturating_add(panicked);
         drop(deltas);
         self.snapshot = Some(snapshot);
         self.last_poll = now;
@@ -342,5 +389,24 @@ mod tests {
         assert_eq!(delta(c(7, 70), Some(c(5, 50)), false), Some((2, 20)));
         assert_eq!(delta(c(5, 50), Some(c(5, 50)), false), None, "unchanged");
         assert_eq!(delta(c(2, 3), Some(c(5, 50)), false), Some((2, 3)), "reset");
+    }
+
+    /// Security review of #85: a statement whose analysis panics is
+    /// dropped alone; the others are analyzed.
+    #[test]
+    fn a_panicking_analysis_drops_one_statement() {
+        assert!(analyze_isolated(&format!("SELECT 1 /* {TEST_POISON} */"), false).is_none());
+        let ok = analyze_isolated("SELECT * FROM shop.customers", false).unwrap();
+        assert!(!ok.parts().is_empty());
+        // A statement whose analysis panicked has no delta: it is not
+        // reported, and its counters move on (not retried every poll).
+        let c = |calls, rows| Counters { calls, rows };
+        let k = (1, 1, 1, true);
+        let prev: HashMap<Key, Counters> = [(k, c(1, 1))].into();
+        let mut snapshot: HashMap<Key, Counters> = [(k, c(5, 5))].into();
+        let changed = vec![(k, String::new(), String::new(), 4, 4)];
+        let analyses: HashMap<Key, Option<QueryAnalysis>> = [(k, None)].into();
+        carry_over(&mut snapshot, &prev, &changed, &analyses);
+        assert_eq!(snapshot[&k].calls, 5);
     }
 }

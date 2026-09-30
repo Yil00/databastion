@@ -413,6 +413,11 @@ pub(crate) const MANDATORY_ROLES: &str = "SELECT @@GLOBAL.mandatory_roles";
 /// privileges included, on the agent's session).
 pub(crate) const SHOW_GRANTS_CURRENT_ROLE: &str = "SHOW GRANTS FOR CURRENT_ROLE";
 
+/// MariaDB 10.11 and later: the privileges granted to `PUBLIC`, which every
+/// account holds and `APPLICABLE_ROLES` does not list. MariaDB shows them
+/// without `SELECT` on the `mysql` database.
+pub(crate) const SHOW_GRANTS_PUBLIC: &str = "SHOW GRANTS FOR PUBLIC";
+
 /// Whether `init_connect` is set (SQL run at every login of an account
 /// without `SUPER` / `CONNECTION_ADMIN`: user code at connection). The text
 /// itself is not read.
@@ -471,6 +476,12 @@ pub(crate) const PS_CURRENT: &str =
 /// Thread id of this session in `performance_schema` (Audit).
 pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
      WHERE t.PROCESSLIST_ID = CONNECTION_ID()";
+
+/// Seconds since the server started (`SHOW GLOBAL STATUS` needs no
+/// privilege). With the agent's clock it gives the server's start time,
+/// which tells a persisted `performance_schema` cursor (timers count from
+/// the server start) from one of an earlier server run.
+pub(crate) const SERVER_UPTIME: &str = "SHOW GLOBAL STATUS LIKE 'Uptime'";
 
 /// Text limits of `performance_schema` (statement text, digest text).
 pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
@@ -639,6 +650,7 @@ mod tests {
             show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
             CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_CURRENT_ROLE.to_owned(),
+            SHOW_GRANTS_PUBLIC.to_owned(),
             SHOW_GRANTS_OWN.to_owned(),
             MANDATORY_ROLES.to_owned(),
             INIT_CONNECT.to_owned(),
@@ -656,6 +668,7 @@ mod tests {
             SESSION_USER.to_owned(),
             PS_TEXT_LIMIT.to_owned(),
             PS_DIGEST_LIMIT.to_owned(),
+            SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
         ];
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {

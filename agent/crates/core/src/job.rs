@@ -645,6 +645,17 @@ impl AuditConfig {
         })
     }
 
+    /// The persisted counters `name` (`[a-z0-9_.-]`, e.g. `own_usage`) of
+    /// this target: a `0600` file under `<state_dir>/audit/` (see
+    /// [`crate::audit::CursorStore::counters`]), kept across agent restarts
+    /// but never part of the stream's read position (a panic does not pin
+    /// it). `None` without a state directory (tests) or for an invalid
+    /// name.
+    #[must_use]
+    pub fn counters(&self, name: &str) -> Option<crate::audit::CursorStore> {
+        crate::audit::CursorStore::counters(self.state_dir.as_deref()?, &self.target_id, name)
+    }
+
     /// The core's registry of the cursors this stream uses, and its
     /// request after panics (isolation mode, one record to skip at the
     /// exact position it panicked at; see

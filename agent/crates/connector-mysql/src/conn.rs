@@ -504,6 +504,12 @@ impl Session {
         self.flavor
     }
 
+    /// Server version from the handshake (MariaDB: without the `5.5.5-`
+    /// prefix).
+    pub(crate) fn version(&self) -> (u32, u32, u32) {
+        self.version
+    }
+
     /// See [`Session::poisoned`](Session).
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned

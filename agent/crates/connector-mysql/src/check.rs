@@ -1137,7 +1137,20 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// `SHOW GRANTS` (and MySQL's `mandatory_roles`), all of them as not
 /// evaluated. `Ok(false)` when that cannot be read either: the privileges
 /// are then reported as not evaluated (`privilege.not_evaluated`).
+///
+/// MariaDB 10.11 and later: the privileges granted to `PUBLIC` too (see
+/// [`public_privileges`]).
 async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<bool, MyError> {
+    let evaluated = granted_role_privileges(session, grants).await?;
+    public_privileges(session, grants).await?;
+    Ok(evaluated)
+}
+
+/// The roles of [`role_privileges`], `PUBLIC` aside.
+async fn granted_role_privileges(
+    session: &mut Session,
+    grants: &mut Grants,
+) -> Result<bool, MyError> {
     let listed = match session.flavor() {
         Flavor::Mysql => mysql_role_privileges(session, grants).await?,
         Flavor::Mariadb => mariadb_role_privileges(session, grants).await?,
@@ -1162,6 +1175,56 @@ async fn role_privileges(session: &mut Session, grants: &mut Grants) -> Result<b
         Flavor::Mariadb => None,
     };
     Ok(roles_from_grant_lines(&rows, mandatory.as_deref(), grants))
+}
+
+/// `ER_NONEXISTING_GRANT`: `SHOW GRANTS FOR PUBLIC` when nothing was ever
+/// granted to `PUBLIC`.
+const ER_NONEXISTING_GRANT: u16 = 1141;
+/// First MariaDB version with grants to `PUBLIC`.
+const MARIADB_PUBLIC: (u32, u32, u32) = (10, 11, 0);
+
+/// MariaDB 10.11 and later (ADR-0025 residual, phase 7): the privileges
+/// granted to `PUBLIC` apply to every account, and `APPLICABLE_ROLES` does
+/// not list `PUBLIC`. They are read with `SHOW GRANTS FOR PUBLIC` (no
+/// privilege needed) and evaluated like a role's. Fail closed: when that
+/// statement fails (other than "no such grant", i.e. nothing granted to
+/// `PUBLIC`), skips a row or has a line the parser does not understand,
+/// `PUBLIC` is counted as a role not evaluated
+/// (`privilege.roles_not_evaluated`).
+async fn public_privileges(session: &mut Session, grants: &mut Grants) -> Result<(), MyError> {
+    if session.flavor() != Flavor::Mariadb || session.version() < MARIADB_PUBLIC {
+        return Ok(());
+    }
+    let evaluated = match session
+        .query_counted(Stage::Check, sql::SHOW_GRANTS_PUBLIC)
+        .await
+    {
+        Ok((rows, 0)) => merge_public_lines(&rows, grants),
+        Ok(_) => false,
+        Err(e) if e.errno == Some(ER_NONEXISTING_GRANT) => true,
+        Err(e) if !e.fatal => false,
+        Err(e) => return Err(e),
+    };
+    if !evaluated {
+        grants.roles = grants.roles.saturating_add(1);
+        grants.roles_unevaluated = grants.roles_unevaluated.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Adds the privileges of the `SHOW GRANTS FOR PUBLIC` rows to `grants`;
+/// `false` when a line is not understood or grants a role to `PUBLIC`
+/// (that role's privileges are unknown).
+fn merge_public_lines(rows: &Rows, grants: &mut Grants) -> bool {
+    let grants_role = rows.iter().any(|row| {
+        matches!(
+            row.first()
+                .and_then(|v| v.as_deref())
+                .and_then(grant_lines::parse_line),
+            Some(Line::Roles { .. })
+        )
+    });
+    merge_grant_lines(rows, grants) && !grants_role
 }
 
 /// Counts the roles of the account's own `SHOW GRANTS` role lines, and of
@@ -1602,6 +1665,51 @@ mod tests {
             None,
             &mut grants
         ));
+    }
+
+    /// MariaDB 10.11+ (ADR-0025 residual, phase 7): the privileges granted
+    /// to `PUBLIC` are evaluated like a role's; a role granted to `PUBLIC`
+    /// or a line not understood leaves them not evaluated.
+    #[test]
+    fn public_privileges_are_evaluated_like_a_role() {
+        let mut grants = Grants {
+            global: vec![g("USAGE")],
+            scoped: vec![s("hr", "SELECT")],
+            ..Grants::default()
+        };
+        assert!(merge_public_lines(
+            &rows(&[
+                "GRANT USAGE ON *.* TO PUBLIC",
+                "GRANT SELECT ON `hr`.* TO PUBLIC",
+                "GRANT INSERT ON `hr`.* TO PUBLIC",
+                "GRANT SELECT ON `m%`.* TO PUBLIC",
+            ]),
+            &mut grants
+        ));
+        let (_, _, notes) = evaluate_privileges(&grants, false, false, false);
+        assert_eq!(
+            notes_json(&notes),
+            serde_json::json!([
+                {"code": "privilege.system_database_select"},
+                {"code": "privilege.beyond_select", "count": 1, "labels": ["insert"]}
+            ])
+        );
+        // Only SELECT on an application database: nothing to report.
+        let mut grants = Grants::default();
+        assert!(merge_public_lines(
+            &rows(&["GRANT SELECT ON `hr`.* TO PUBLIC"]),
+            &mut grants
+        ));
+        assert!(
+            evaluate_privileges(&grants, false, false, false)
+                .2
+                .is_empty()
+        );
+        // Fail closed.
+        for line in ["GRANT `app_write` TO PUBLIC", "GRANT SOMETHING ODD"] {
+            let mut grants = Grants::default();
+            assert!(!merge_public_lines(&rows(&[line]), &mut grants), "{line}");
+        }
     }
 
     #[test]

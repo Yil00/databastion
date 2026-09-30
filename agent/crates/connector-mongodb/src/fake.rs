@@ -1284,6 +1284,15 @@ async fn profiler_polls_are_bounded_and_resume_after_what_was_read() {
     // again.
     let polled = profiler::poll(&mut s, "app", &mut cursor).await.unwrap();
     assert!(polled.records.is_empty(), "{:?}", polled.records);
+    // Phase 7: nor after an agent restart (the position saved and
+    // restored: time and hashes of the entries read at that millisecond).
+    let saved = profiler::encode_cursors(&[("app".to_owned(), cursor.clone())].into()).unwrap();
+    let mut restored = profiler::decode_cursors(&saved, 10_000)
+        .remove("app")
+        .unwrap();
+    assert_eq!(restored, cursor);
+    let polled = profiler::poll(&mut s, "app", &mut restored).await.unwrap();
+    assert!(polled.records.is_empty(), "{:?}", polled.records);
     // Events: the tool's whole read with its volume; the filtered reads
     // without signatures.
     let mut b = crate::audit::events::EventBuilder::new(

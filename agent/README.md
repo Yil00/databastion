@@ -102,7 +102,16 @@ binary: `cargo build --no-default-features --features postgres`.
   removed at startup, unreadable files are moved to `spool/quarantine/` (32
   kept) and counted (`quarantined`), never crash the agent and are never
   logged. Bounded by `spool.max_bytes` (default 256 MiB) and
-  `spool.max_batches` (default 10000): oldest dropped first. FIFO send:
+  `spool.max_batches` (default 10000). When full, a batch is dropped by
+  priority (phase 7): findings and events each keep up to 3/4 of the bounds
+  against the other, so an events flood cannot evict the findings; within
+  the events, batches holding a `signature.*` signal (packed apart from the
+  others) are dropped last, and a new batch without one is dropped rather
+  than evict them; within a class, the oldest goes first. A findings or
+  signature batch over its share that has no batch of its own class to
+  evict takes the place of the other class (small bounds); a new batch
+  dropped itself is counted in `dropped_batches` and apart in the heartbeat
+  metric `spool_rejected_batches_total`. FIFO send:
   `2xx` (including `duplicate: true`) removes the batch; `400` / `404` whose
   pointers all designate items → those items dropped, the rest resent under
   a new `batch_id` at the same queue position; `413` → two halves with new
@@ -187,12 +196,29 @@ review remain the primary controls.
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
   `<= 0` are ignored. The heartbeat runs the targets' `check()`
   concurrently under one 10 s deadline, so it waits at most 10 s for all of
-  them (P2-G); targets reaching the same account (engine, host or socket,
-  port, account) are checked one at a time, so an account holds at most one
-  check next to one scan; Audit streams hold their own connections outside
-  these turns (sizing in ADR-0025 decision 11). A check still running or waiting for its
-  turn at the deadline is reported unreachable with `timeout` and the
-  `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
+  them (P2-G); targets reaching the same account (engine family, host or
+  socket, port, account) are checked one at a time, so an account holds at
+  most one check next to one scan; Audit streams hold their own connections
+  outside these turns (sizing in ADR-0025 decision 11). The account key
+  recognizes aliases (phase 7, `crates/core/src/checks.rs`): an omitted port
+  and the engine's default one, host names in any case or with a trailing
+  dot, IP literal forms (`[::1]`, `::ffff:127.0.0.1`), `localhost` and the
+  loopback addresses, a socket path through symlinks, and host names that
+  resolve to a shared address. Names are resolved only when two targets of
+  one engine family, account and port name different hosts: through the
+  system resolver (the declared targets only, as the connectors resolve
+  them anyway; no scan, I5), at most 1 s and within the deadline, cached
+  5 minutes; a name not resolved in time keeps its literal key, counts as
+  unresolved for a minute, and is not looked up again while its lookup is
+  still in flight. A check
+  still running at the deadline is reported unreachable with `timeout` and
+  the `check.timed_out` note, and takes the last turn of its account at the
+  next heartbeats (the other targets of the account rotate), so a hung
+  check no longer uses up the deadline of the others every time. A target
+  whose turn did not come before the deadline (account busy) is reported
+  the same way (the contract has no other status) but logged apart and
+  counted in `checks_account_busy_total`, next to `checks_timed_out_total`
+  (heartbeat metrics). At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
 - Access event timestamps (`ts`, `ts_last`) come from the target's audit
@@ -212,8 +238,10 @@ review remain the primary controls.
 A connector call that panics fails that call only (`crate::panics`).
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's
-group of records) to events in isolation: a record that makes that code panic
-is dropped alone and counted (`audit.records_dropped`, per record; and the
+group of records) to events in isolation, as do the polled sources for each
+statement (`performance_schema`: its conversion; `pg_stat_statements`: its
+text's analysis and its conversion; the MongoDB profiler: each entry): a
+record that makes that code panic is dropped alone and counted (`audit.records_dropped`, per record; and the
 heartbeat metric `audit_record_panics_total`, one per isolated unit that
 failed, a record or a statement's group, which tells crafted-record campaigns
 apart from malformed input). A panic in a blocking parse task is resumed on the stream,
@@ -236,6 +264,51 @@ panics within an hour, or 3 panics in a row on a source whose position is in
 memory (restarted afresh anyway). A stream that fails is restarted after its
 backoff, at least its poll interval (up to 3600 s) and at most 300 s or the
 poll interval when longer.
+
+### Failed-login flood
+A client that can reach the database port can try many made-up account
+names, each its own `auth_failure` group (ADR-0025, docs/08). Per target
+and aggregation window, the core keeps at most 100 `auth_failure` groups;
+beyond, a failed login joins an **overflow** event: an `auth_failure` of an
+unidentified account (a `db_user` fingerprint, as for any failed login),
+per client address for at most 16 addresses, then one without address,
+whose `aggregated_count` is the number of attempts and whose `ts` /
+`ts_last` span them. Attempts beyond the named groups are first counted per
+principal (at most 256, the least attempted joining the overflow first, the
+most recently seen among ties, so fresh junk names evict each other rather
+than an older account); a
+principal attempted more often than the least attempted named group takes
+its place, that group joining the overflow with its count, so junk names
+sent first cannot hide which account is brute-forced (#88 review M1). No attempt goes uncounted, and a flood gives at most
+117 `auth_failure` events per window instead of one per name. Folded
+attempts are counted in `auth_failures_overflowed_total` (heartbeat
+metrics). Known limit: an attacker can keep 100 named junk groups above
+root's per-window count and so keep root out of the named groups, but that
+costs about 100 times root's volume, which stays visible in the overflow
+count and in `auth_failures_overflowed_total`. With the spool priorities
+above, a later dump's
+`signature.*` batches are kept, though they still queue behind earlier
+batches for sending.
+
+### Audit state kept across restarts
+Under `<state_dir>/audit/` (`0700`), every file `0600`, owned by the agent
+user, written atomically (temporary file, `fsync`, `rename`, directory
+`fsync`), read with `O_NOFOLLOW` and a size bound, and never holding a value,
+a statement or a query text:
+- read positions (`<target>.<name>.cursor`, at most 64 KiB): the file sources'
+  offsets, the OpenLDAP accesslog CSNs, and (phase 7) the MySQL / MariaDB
+  `performance_schema` cursor (end timers, statement ids, the server's start
+  time) and the MongoDB profiler positions (per database, a time and SHA-256
+  hashes of the entries read at it). They are saved once the events read
+  before them are handed to the core (at-most-once delivery);
+- (phase 7) the agent's own-account row counters
+  (`<target>.own_usage.counters`, at most 2 MiB: normalized object names and
+  rows per hour over the last 24 h), saved at most every 30 s while charging
+  and when a stream ends, so an agent restart does not give a fresh
+  Discovery budget per object. A file that is not understood is ignored
+  (counted from zero), as before persistence; hours ahead of the agent's
+  clock count as the current hour; when the file would exceed its bound, the
+  objects read longest ago are left out (logged).
 
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
@@ -263,42 +336,6 @@ file the server owns (for instance `0640`, owner `mysql`, group
 `allow_agent_owned_logs_for_tests()`, compiled only for tests and the core's
 `test-support` feature (enabled from the connectors' `[dev-dependencies]`),
 and only test code calls it (guarded by `crates/agent/tests/architecture.rs`).
-
-### Audit streams that panic
-A connector call that panics fails that call only (`crate::panics`). An
-Audit stream that panics is restarted from its persisted read position. When
-it panics again and again **at the same saved position** (a record that
-crashes a parser), the core asks it to skip records there: after 3 panics, 1
-record, then 2, 4… at each further panic there (at most 12 rounds); the
-connector drops them without parsing, counts them as dropped
-(`audit.records_dropped`, and `audit_records_skipped_total` in the heartbeat
-metrics), and goes on. File sources do it in the core tailer, the OpenLDAP
-accesslog on its own entries (`CursorStore::skip_records`). Panics at
-different positions (3 in a row), or on a source whose position is in memory
-(restarted afresh anyway), still stop the stream until Audit is reconfigured
-or the agent restarts (`audit.stream_stopped`).
-
-### Logs
-`DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
-capped at `warn`: drivers and HTTP clients may log parameters or payloads at
-debug/trace level.
-
-### Audit log files
-Every file source (the PostgreSQL server log, the MariaDB `server_audit` log,
-the MySQL `audit_log` / `audit_log_filter` JSON file, the MongoDB `auditLog` and
-server log) is read by the core tailer (`crates/core/src/audit/tail.rs`):
-opened without blocking, it must be a regular file, and it must **not be
-owned by the agent's own user** (effective uid), checked on the opened handle,
-so after following symlinks (end-of-phase-4 review L4). An audit log is the
-database server's evidence: a file the agent's account owns could have been
-written or rewritten by that account. Such a file is refused like an unreadable
-one (`check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
-its source, and the agent logs `audit log refused: the file is owned by the
-agent's own user`). Give the agent read access through a group or an ACL on a
-file the server owns (for instance `0640`, owner `mysql`, group
-`databastion`), never ownership. Tests enable owned files through
-`allow_agent_owned_logs_for_tests()`, which only test code calls (guarded by
-`crates/agent/tests/architecture.rs`).
 
 ### PostgreSQL connector
 tokio-postgres with the connector's own rustls adapter
@@ -409,7 +446,11 @@ Behavior:
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as
-  `privilege.roles_not_evaluated`. When `APPLICABLE_ROLES` cannot be read (MySQL before
+  `privilege.roles_not_evaluated`. On MariaDB 10.11 and later, the privileges granted to
+  `PUBLIC` (held by every account, not listed in `APPLICABLE_ROLES`) are read with
+  `SHOW GRANTS FOR PUBLIC` (no privilege needed; "no such grant" means none) and evaluated the
+  same way (phase 7); when they cannot be read or parsed, or `PUBLIC` is granted a role, `PUBLIC`
+  counts as a role not evaluated. When `APPLICABLE_ROLES` cannot be read (MySQL before
   8.0.19, or any error), the roles are counted from the role lines of the account's own
   `SHOW GRANTS FOR CURRENT_USER()` (and MySQL's `mandatory_roles`), all as not evaluated; when
   that cannot be read or has a line the parser does not understand, the privileges are reported
@@ -506,7 +547,10 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
   **Full is never reported**;
 - files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
-  position in memory, starting at the newest entry;
+  position persisted after each poll (phase 7: per database, the last `ts` and SHA-256 hashes of
+  the entries read at it; an agent restart resumes there, within what the capped collection
+  still holds), a database without a saved position starting at its newest entry; the saved
+  position is removed while a log file is the source;
 - closed-shape facts only: command name (closed list), namespace (normalized), `name@authdb`,
   client IP, application name, document counts, a failure flag, and whether the filter has keys,
   a numeric limit and pass-through pipeline stages. Command documents are skipped by a `serde`

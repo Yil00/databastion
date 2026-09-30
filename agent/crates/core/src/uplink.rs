@@ -475,6 +475,16 @@ pub(crate) struct ResultBatch {
     batch_id: UuidV7,
     len: usize,
     bytes: Vec<u8>,
+    /// An events batch holding a `signature.*` signal (kept first by the
+    /// spool when it is full).
+    signature: bool,
+}
+
+/// Whether an event carries a `signature.*` signal.
+fn has_signature(e: &AccessEvent) -> bool {
+    e.signals
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|x| x.starts_with("signature.")))
 }
 
 enum Parsed {
@@ -517,7 +527,15 @@ impl Parsed {
             batch_id,
             len,
             bytes: bytes?,
+            signature: self.signature(),
         })
+    }
+
+    fn signature(&self) -> bool {
+        match self {
+            Self::Findings(_) => false,
+            Self::Events(b) => b.events.iter().any(has_signature),
+        }
     }
 }
 
@@ -526,7 +544,9 @@ impl ResultBatch {
     /// are (sent verbatim, so a resend is byte-identical for `batch_id`
     /// deduplication). `None` if invalid or empty.
     pub(crate) fn parse(findings: bool, bytes: Vec<u8>) -> Option<Self> {
-        let (batch_id, len) = match Self::decode(findings, &bytes)? {
+        let parsed = Self::decode(findings, &bytes)?;
+        let signature = parsed.signature();
+        let (batch_id, len) = match parsed {
             Parsed::Findings(b) => (b.batch_id, b.findings.len()),
             Parsed::Events(b) => (b.batch_id, b.events.len()),
         };
@@ -535,7 +555,13 @@ impl ResultBatch {
             batch_id,
             len,
             bytes,
+            signature,
         })
+    }
+
+    /// An events batch holding a `signature.*` signal.
+    pub(crate) fn has_signature(&self) -> bool {
+        self.signature
     }
 
     fn decode(findings: bool, bytes: &[u8]) -> Option<Parsed> {
@@ -968,6 +994,20 @@ fn pack_findings(job_id: Uuid, version: &ClassifiersVersion, items: Vec<Finding>
 /// the console accepts the gated `AccessEvent.bytes`; otherwise it is
 /// stripped from every event.
 fn pack_events(items: Vec<AccessEvent>, accept_bytes: bool) -> Built {
+    // Events with a `signature.*` signal go in batches of their own, first:
+    // the spool keeps those batches when it is full (phase 7), and they are
+    // sent ahead of the others of the same flush.
+    let (signed, plain): (Vec<AccessEvent>, Vec<AccessEvent>) =
+        items.into_iter().partition(has_signature);
+    let mut built = pack_event_items(signed, accept_bytes);
+    let rest = pack_event_items(plain, accept_bytes);
+    built.batches.extend(rest.batches);
+    built.dropped_items += rest.dropped_items;
+    built.unserializable_batches += rest.unserializable_batches;
+    built
+}
+
+fn pack_event_items(items: Vec<AccessEvent>, accept_bytes: bool) -> Built {
     let make = |events: Vec<AccessEvent>| EventsBatch {
         batch_id: new_batch_id(),
         events,
@@ -1130,6 +1170,7 @@ mod tests {
             batch_id: new_batch_id(),
             len: 4,
             bytes: b"not a batch".to_vec(),
+            signature: false,
         };
         assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
         assert_eq!(batch.halves().unwrap_err(), Unserializable);
