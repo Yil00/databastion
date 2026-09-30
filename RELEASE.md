@@ -62,16 +62,22 @@ Rules:
 | Console image (web + worker) | `ghcr.io/yil00/databastion-console:<tag>` | amd64, arm64 |
 | Agent image | `ghcr.io/yil00/databastion-agent:<tag>` | amd64, arm64 |
 | Agent package (phase 7) | `databastion-agent_<X.Y.Z>_<arch>.deb` | amd64, arm64 |
-| Checksums (phase 7) | `SHA256SUMS` + cosign signature | — |
+| Deployment bundle (phase 7) | `databastion-deploy-<X.Y.Z>.tar.gz` (`deploy/` at the tag) | — |
+| Image references (phase 7) | `image-digests.txt` (`<image>:<tag>@sha256:<digest>`) | — |
+| Checksums (phase 7) | `SHA256SUMS` + cosign bundle `SHA256SUMS.cosign.bundle` | — |
 
-Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists. The `.deb` files are built from the binary of the signed agent image; `SHA256SUMS` covers them and `image-digests.txt`, and is signed with `cosign sign-blob` (`SHA256SUMS.cosign.bundle`). [publish.yml](.github/workflows/publish.yml) verifies every signature right after signing.
+Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists. The `.deb` files are built from the binary of the signed agent image; `SHA256SUMS` covers them, the deployment bundle and `image-digests.txt`, and is signed with `cosign sign-blob` (`SHA256SUMS.cosign.bundle`). [publish.yml](.github/workflows/publish.yml) verifies every signature right after signing, and moves `next` / `X.Y` / `latest` only after that.
 
-Verify an image (all the checks: [deploy/README.md](deploy/README.md#verify-the-artifacts)):
+**Signing identity** ([ADR-0034](docs/adr/0034-release-signing-from-tag-push.md)): everything is signed by `publish.yml` in the run triggered by the **push of the release tag**, and only there. The identity is therefore exact for each version:
 ```bash
-cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
-  --certificate-identity-regexp '^https://github\.com/Yil00/databastion/\.github/workflows/publish\.yml@refs/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+VERSION=0.1.0
+cosign verify ghcr.io/yil00/databastion-console:$VERSION \
+  --certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-trigger push
+# Same three options for `cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle`.
 ```
+All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifacts).
 
 ## 5. Release walkthrough
 
@@ -83,11 +89,11 @@ cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
    - computes the version from the commits and the latest tag,
    - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, later the Helm chart),
    - generates the [CHANGELOG.md](CHANGELOG.md) section,
-   - commits `chore(release): X.Y.Z` under the owner's noreply identity, creates the `X.Y.Z` tag,
-   - creates a **draft GitHub release**,
-   - builds and publishes the images ([publish.yml](.github/workflows/publish.yml)).
-5. The maintainer reviews the draft, adds upgrade notes if needed, and **publishes** the release.
-6. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
+   - commits `chore(release): X.Y.Z` under the owner's noreply identity, creates the `X.Y.Z` tag and pushes it with `RELEASE_TOKEN`,
+   - creates a **draft GitHub release**.
+5. The tag push starts [publish.yml](.github/workflows/publish.yml): its jobs that push images or sign wait in the `release` environment for the maintainer's approval (*Review deployments*: the image builds, then the signature, then the release assets). It builds and signs the images, the `.deb` files and `SHA256SUMS`, attaches them to the draft, and runs the installation test with them.
+6. The maintainer reviews the draft (assets present, publish run green), adds upgrade notes if needed, and **publishes** the release. Assets are only ever attached to a draft.
+7. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
 
 To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase. **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
 
@@ -97,7 +103,7 @@ git switch dev && git pull
 git tag -s 0.1.0-alpha.1 -m "DataBastion 0.1.0-alpha.1"
 git push origin 0.1.0-alpha.1
 ```
-Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images), which creates a **draft** GitHub pre-release with the `.deb` files and the signed `SHA256SUMS`. Review it, then publish it (`gh release edit 0.1.0-alpha.1 --draft=false`).
+Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images; approve its `release` environment jobs), which creates a **draft** GitHub pre-release with the `.deb` files and the signed `SHA256SUMS`. Review it, then publish it (`gh release edit 0.1.0-alpha.1 --draft=false`). Only a maintainer allowed by the tag ruleset (below) can push the tag.
 
 ### Hotfix
 1. `hotfix/<slug>` from `main`, PR to `main` with a `fix:` commit.
@@ -113,8 +119,8 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 |----------|-------------|------|
 | [ci.yml](.github/workflows/ci.yml) | push and PR on `main` / `dev` | Doc links, gitleaks, console, agent, protocol (each job only runs if its component exists); aggregated `CI result` check |
 | [pr-checks.yml](.github/workflows/pr-checks.yml) | PR | Conventional Commits title, DCO sign-off on each commit |
-| [release.yml](.github/workflows/release.yml) | PR merged into `main` | release-it + call to `publish.yml` |
-| [publish.yml](.github/workflows/publish.yml) | call from `release.yml`, or `X.Y.Z-*` tag | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
+| [release.yml](.github/workflows/release.yml) | PR merged into `main` | release-it: version, changelog, `X.Y.Z` tag pushed with `RELEASE_TOKEN`, draft release (no signing) |
+| [publish.yml](.github/workflows/publish.yml) | push of an `X.Y.Z` or `X.Y.Z-*` tag only; jobs that push or sign in the `release` environment | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
 | [packaging.yml](.github/workflows/packaging.yml) | call from `ci.yml` (packaging files changed) and `publish.yml` | Reproducible `.deb`, install checks in Debian 12 / Ubuntu 24.04 containers, "Installation < 15 min" test ([deploy/README.md](deploy/README.md#installation-test-under-15-minutes)) |
 | [dependabot.yml](.github/dependabot.yml) | weekly | Updates to actions and tooling, PRs to `dev` |
 
@@ -123,6 +129,10 @@ Third-party actions are pinned by commit SHA (Dependabot updates them).
 ### Repository configuration (one-time)
 - **`RELEASE_TOKEN` secret** (required for `release.yml`): the owner's *fine-grained* token, limited to this repository, with **Contents: read and write** permission. It lets the release commit pass `main`'s protection (bypass reserved for the admin). Create it in *Settings → Developer settings → Fine-grained tokens*, then add it in the repository's *Settings → Secrets and variables → Actions*.
 - Optional variables `RELEASE_GIT_NAME` / `RELEASE_GIT_EMAIL`: identity of the release commit (by default, the owner's noreply address).
+- **Release prerequisites** (ADR-0034; without them, anyone with write access could push a tag and get a signing run):
+  1. **Tag ruleset**: *Settings → Rules → Rulesets → New ruleset → New tag ruleset*. Name `release tags`, enforcement *Active*. *Target tags → Add target → Include by pattern*: `*.*.*` (covers `X.Y.Z` and `X.Y.Z-…`). Rules: *Restrict creations*, *Restrict updates*, *Restrict deletions* (and *Block force pushes*). *Bypass list*: *Repository admin* only (the maintainers; `RELEASE_TOKEN` is the owner's token, so release-it's tag push bypasses as admin). Save.
+  2. **`release` environment**: *Settings → Environments → New environment* `release`. *Required reviewers*: the maintainer(s) (leave *Prevent self-review* off while there is a single maintainer). *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Tag*, pattern `[0-9]*.[0-9]*.[0-9]*`; no branch rule. Leave *Allow administrators to bypass configured protection rules* unchecked. No environment secret is needed (keyless signing).
+  3. Check once with a pre-release tag: the publish run waits for approval, and `cosign verify` with the exact identity above succeeds.
 - As long as there is only one maintainer, no approval is required on PRs (you cannot approve your own PR). Switch to 1 approval as soon as a second maintainer joins.
 
 ## 7. Pre-release checklist
@@ -131,5 +141,6 @@ Third-party actions are pinned by commit SHA (Dependabot updates them).
 - [ ] Release notes reviewed: breaking changes first, upgrade steps
 - [ ] [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix up to date
 - [ ] Console N / agent N-1 compatibility tested
-- [ ] Images signed, SBOM and `SHA256SUMS` published
+- [ ] Release prerequisites in place (tag ruleset, `release` environment: section 6)
+- [ ] Images signed, SBOM and `SHA256SUMS` published; `cosign verify` with the exact tag identity succeeds
 - [ ] Installation test of the publish run green (under 15 minutes with the published image and `.deb`)
