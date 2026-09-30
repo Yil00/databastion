@@ -310,8 +310,9 @@ a statement or a query text:
   before them are handed to the core (at-most-once delivery);
 - (phase 7) the agent's own-account row counters
   (`<target>.own_usage.counters`, at most 2 MiB: normalized object names and
-  rows per hour over the last 24 h), saved at most every 30 s while charging
-  and when a stream ends, so an agent restart does not give a fresh
+  rows per hour over the last 24 h), saved at most every 30 s while charging,
+  by a periodic flush every 30 s when a charge is not saved yet, and when a
+  stream ends, so an agent restart does not give a fresh
   Discovery budget per object. A file that is not understood is ignored
   (counted from zero), as before persistence; hours ahead of the agent's
   clock count as the current hour; when the file would exceed its bound, the

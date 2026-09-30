@@ -120,10 +120,11 @@ load otherwise), so a server-wide load is the normal case.
   (a failure, a source switch, the agent's sessions terminated on purpose)
   does not reset them, and they are persisted across **agent restarts**
   (phase 7; `<state_dir>/audit/<target>.own_usage.counters`, `0600`,
-  written atomically at most every 30 s while charging and when a stream
-  ends: normalized object names and row counts per hour only), so a
-  restart no longer gives a fresh budget per object; at most the charges
-  of the last 30 s before a crash are lost. The agent's database
+  written atomically at most every 30 s while charging, by a periodic
+  flush every 30 s when a charge is not saved yet (even with no further
+  activity), and when a stream ends: normalized object names and row
+  counts per hour only), so a restart no longer gives a fresh budget per
+  object; at most the charges of the last 30 s before a crash are lost. The agent's database
   credentials never leave its host (I3).
 - **The agent's own table-less statements.** The connector sends a few
   statements that read no relation: the per-connection and
