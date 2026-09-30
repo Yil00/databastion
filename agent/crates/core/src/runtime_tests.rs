@@ -2372,6 +2372,64 @@ async fn a_paced_scan_out_of_time_succeeds_with_skipped_objects() {
     assert_eq!(sent[0]["progress"]["skipped_limit"], 4);
 }
 
+/// Security review of #93, R3: without the coverage counters (console
+/// without `job_progress.coverage`), a scan that ran out of time cannot
+/// show what it left out, so it is reported as `failed` (`timeout`), never
+/// as a plain `succeeded`.
+#[tokio::test]
+async fn a_paced_scan_out_of_time_fails_without_coverage_counters() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(PacedObjects)],
+    )
+    .unwrap();
+    let body = serde_json::json!({ "jobs": [scan_job(JOB, CLASSIFIERS_VERSION, serde_json::json!({"max_duration_s": 10}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    run_queued_scans(&rt).await;
+    let sent = scan_statuses(&statuses(&server).await);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["status"], "failed");
+    assert_eq!(sent[0]["error"]["code"], "timeout");
+    assert!(sent[0].get("progress").is_none(), "{sent:?}");
+}
+
+/// A scan that was not out of time still succeeds without the coverage
+/// counters, and the ledger keeps the unmodified outcome.
+#[test]
+fn only_an_out_of_time_success_is_downgraded() {
+    use crate::jobs::Outcome;
+    use databastion_protocol::{FailureCode, JobStatusUpdateStatus as S};
+    let ok = Outcome::SUCCEEDED;
+    assert_eq!(ok.reported(false), (S::Succeeded, None));
+    let late = Outcome {
+        out_of_time: true,
+        ..Outcome::SUCCEEDED
+    };
+    assert_eq!(late.reported(true), (S::Succeeded, None));
+    assert_eq!(
+        late.reported(false),
+        (S::Failed, Some(FailureCode::Timeout))
+    );
+    let failed = Outcome {
+        out_of_time: true,
+        ..Outcome::failed(FailureCode::ResourceLimit)
+    };
+    assert_eq!(
+        failed.reported(false),
+        (S::Failed, Some(FailureCode::ResourceLimit))
+    );
+}
+
 /// Security review of #93, L5: a scan whose `running` acknowledgement the
 /// console refuses (`404` / `409`: cancelled, expired, not ours) does not
 /// run, and nothing more is reported for it.

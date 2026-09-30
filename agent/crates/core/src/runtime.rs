@@ -2922,6 +2922,7 @@ impl Runtime {
         outcome.coverage = *coverage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        outcome.out_of_time = scan.pacer().out_of_time();
         outcome
     }
 
@@ -3034,13 +3035,21 @@ impl Runtime {
         let path = format!("/jobs/{id}/status");
         let mut attempt = 0;
         while attempt < 3 {
+            let (status, error) = outcome.reported(progress.is_some());
+            if status != outcome.status && attempt == 0 {
+                tracing::warn!(
+                    job_id = %id,
+                    "scan stopped before its deadline and the console does not take coverage \
+                     counters: reported as failed (timeout)"
+                );
+            }
             let update = JobStatusUpdate {
-                error: outcome.error.map(|code| JobError {
+                error: error.map(|code| JobError {
                     code,
                     engine_code: None,
                 }),
                 progress: progress.clone(),
-                status: outcome.status,
+                status,
                 ts: ts.clone(),
             };
             let Ok(body) = serde_json::to_vec(&update) else {
