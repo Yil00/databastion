@@ -19,8 +19,8 @@ fail() { echo "::error::$*"; echo "See RELEASE.md, section 6, Release prerequisi
 
 # ruleset_ok ID < ruleset JSON: prints what it finds; true when the ruleset
 # - is an active tag ruleset;
-# - includes the version tags (`~ALL`, or a pattern matching both X.Y.Z and X.Y.Z-pre) and excludes
-#   none of them;
+# - includes the version tags: `~ALL` or one of refs/tags/*, refs/tags/*.*.*,
+#   refs/tags/[0-9]*.[0-9]*.[0-9]*; has an empty exclude list;
 # - restricts tag creation, update and deletion;
 # - lets only admins bypass it (repository admin role, organization admins), or the release GitHub
 #   App when RELEASE_APP_ID is set (repository variable of the same name). GITHUB_TOKEN may not see
@@ -32,32 +32,30 @@ ruleset_ok() {
   if ! jq -e '.target == "tag" and .enforcement == "active"' <<<"$json" >/dev/null; then
     echo "ruleset $id: not an active tag ruleset"; return 1
   fi
+  # Include: `~ALL` or one of the patterns the documented setup uses (as the API returns them).
   while IFS= read -r pattern; do
-    [ -n "$pattern" ] || continue
-    if [ "$pattern" = "~ALL" ]; then ok_include=true; continue; fi
-    pattern="${pattern#refs/tags/}"
-    # shellcheck disable=SC2053  # the pattern is a glob on purpose (fnmatch-like, as GitHub's)
-    if [[ 0.1.0 == $pattern && 10.20.30-rc.1 == $pattern ]]; then ok_include=true; fi
+    case "$pattern" in
+      "~ALL" | "refs/tags/*" | "refs/tags/*.*.*" | "refs/tags/[0-9]*.[0-9]*.[0-9]*") ok_include=true ;;
+    esac
   done < <(jq -r '.conditions.ref_name.include[]?' <<<"$json")
   if [ "$ok_include" != true ]; then
-    echo "ruleset $id: its include ($(jq -c '.conditions.ref_name.include' <<<"$json")) does not cover X.Y.Z and X.Y.Z-pre tags"
+    echo "ruleset $id: its include ($(jq -c '.conditions.ref_name.include' <<<"$json")) has none of ~ALL, refs/tags/*, refs/tags/*.*.*, refs/tags/[0-9]*.[0-9]*.[0-9]*"
     return 1
   fi
-  while IFS= read -r pattern; do
-    [ -n "$pattern" ] || continue
-    pattern="${pattern#refs/tags/}"
-    # shellcheck disable=SC2053
-    if [[ $pattern == "~ALL" || 0.1.0 == $pattern || 10.20.30-rc.1 == $pattern ]]; then
-      echo "ruleset $id: its exclude ($pattern) removes version tags"; return 1
-    fi
-  done < <(jq -r '.conditions.ref_name.exclude[]?' <<<"$json")
+  # Exclude: none (the documented setup needs none; any pattern could remove some version tags).
+  if jq -e '(.conditions.ref_name.exclude // []) | length > 0' <<<"$json" >/dev/null; then
+    echo "ruleset $id: its exclude is not empty ($(jq -c '.conditions.ref_name.exclude' <<<"$json"))"
+    return 1
+  fi
   if ! jq -e '[.rules[]?.type] | (index("creation") != null) and (index("update") != null) and (index("deletion") != null)' \
       <<<"$json" >/dev/null; then
     echo "ruleset $id: does not restrict creation, update and deletion (rules: $(jq -c '[.rules[]?.type]' <<<"$json"))"
     return 1
   fi
+  local bypass
   if jq -e 'has("bypass_actors") | not' <<<"$json" >/dev/null; then
     echo "::warning::ruleset $id: bypass list not visible to this token; check by hand that it holds only admins (RELEASE.md, section 6)"
+    bypass="not visible (check by hand)"
   else
     local others
     others="$(jq -c --arg app "${RELEASE_APP_ID:-}" '[.bypass_actors[]
@@ -66,8 +64,9 @@ ruleset_ok() {
     if [ "$others" != "[]" ]; then
       echo "ruleset $id: bypass list holds more than admins / the release app: $others"; return 1
     fi
+    bypass="$(jq -c '[.bypass_actors[] | "\(.actor_type):\(.actor_id)"]' <<<"$json")"
   fi
-  echo "tag ruleset $id: active, covers the version tags, restricts creation, update and deletion, bypass: $(jq -c '[.bypass_actors[]? | "\(.actor_type):\(.actor_id)"]' <<<"$json")"
+  echo "tag ruleset $id: active, covers the version tags, restricts creation, update and deletion, bypass: $bypass"
 }
 
 case "${1:-}" in

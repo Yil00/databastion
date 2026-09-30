@@ -23,15 +23,28 @@ expect() {
 expect ok ok-admin
 expect ok ok-all
 expect ok ok-bypass-hidden
+expect ok ok-include-star
+expect ok ok-include-digits
 expect ok app-4242 4242
 expect fail app-4242
 expect fail app-4242 99
 expect fail bad-team
 expect fail bad-include
 expect fail bad-exclude
+expect fail bad-exclude-minor
+expect fail bad-exclude-patch
+expect fail bad-include-odd
 expect fail bad-rules
 expect fail bad-evaluate
 expect fail bad-branch
+
+# A hidden bypass list is reported as such, never as an empty list.
+out="$("$here/check-release-settings.sh" tag-ruleset-json hidden <"$here/fixtures/ruleset-ok-bypass-hidden.json")"
+if grep -q 'bypass: not visible (check by hand)$' <<<"$out" && ! grep -q 'bypass: \[\]' <<<"$out"; then
+  echo "ok    ok-bypass-hidden: reported as not visible"
+else
+  echo "FAIL  ok-bypass-hidden: output was: $out"; failures=$((failures + 1))
+fi
 
 [ "$failures" = 0 ] || { echo "$failures failure(s)"; exit 1; }
 echo "all tests passed"
