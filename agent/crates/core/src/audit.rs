@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use databastion_classifiers::masking::{EventAction, EventGroupKey, EventPrincipal, MaskedEvent};
+use databastion_classifiers::masking::{
+    EventAction, EventGroupKey, EventPrincipal, LocalTagKey, MaskedEvent,
+};
 
 use crate::fsutil;
 use crate::job::AuditConfig;
@@ -58,6 +60,22 @@ pub(crate) fn pending_evicted() -> u64 {
     PENDING_EVICTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Saved audit log cursors discarded at open because the file at their
+/// inode no longer holds what had been read (truncated, or rewritten in
+/// place while the agent was stopped): heartbeat metric
+/// `audit_cursor_reset_total`.
+static CURSOR_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts one discarded audit log cursor (see [`CURSOR_RESETS`]).
+pub(crate) fn count_cursor_reset() {
+    CURSOR_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_cursor_reset`].
+pub(crate) fn cursor_resets() -> u64 {
+    CURSOR_RESETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Subdirectory of `state_dir` holding audit cursors and settings.
 pub(crate) const AUDIT_DIR: &str = "audit";
 
@@ -76,6 +94,9 @@ pub struct CursorStore {
     /// Set when the connector reads [`Self::skip_records`]: its source can
     /// skip a record (the core's registry, `None` outside the core).
     skip_reader: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Sub-key of the agent key for the integrity tags a source keeps in
+    /// its cursor (see [`Self::with_tag_key`]); `None` outside the core.
+    tag_key: Option<std::sync::Arc<LocalTagKey>>,
 }
 
 /// Why a cursor could not be read or written (logged by kind only).
@@ -105,6 +126,7 @@ impl CursorStore {
             skip: 0,
             isolate: false,
             skip_reader: None,
+            tag_key: None,
         })
     }
 
@@ -128,6 +150,22 @@ impl CursorStore {
     pub fn with_skip(mut self, n: u32) -> Self {
         self.skip = n;
         self
+    }
+
+    /// With the sub-key a source uses to tag what its cursor points at
+    /// (the audit log tailer: keyed fingerprints of the file bytes before
+    /// its positions, so a file rewritten while the agent was stopped is
+    /// detected without storing any of its bytes). Set by the core through
+    /// the `AuditConfig`; public for the connectors' tests.
+    #[must_use]
+    pub fn with_tag_key(mut self, key: std::sync::Arc<LocalTagKey>) -> Self {
+        self.tag_key = Some(key);
+        self
+    }
+
+    /// The sub-key set by [`Self::with_tag_key`].
+    pub(crate) fn tag_key(&self) -> Option<&LocalTagKey> {
+        self.tag_key.as_deref()
     }
 
     /// In isolation mode (see [`Self::isolate`]). Set by the core; public

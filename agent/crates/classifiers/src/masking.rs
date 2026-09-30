@@ -621,6 +621,54 @@ impl fmt::Debug for HmacKey {
     }
 }
 
+/// Derivation prefix of [`LocalTagKey`] sub-keys.
+const LOCAL_TAG_DOMAIN: &[u8] = b"databastion/local-tag/v1\0";
+
+impl HmacKey {
+    /// A sub-key for integrity tags the agent keeps on its own host (e.g.
+    /// the audit tail cursor, which must detect a log file rewritten while
+    /// the agent was stopped without storing any of its bytes):
+    /// `HMAC-SHA256(agent_key, "databastion/local-tag/v1" 0x00 purpose)`.
+    /// Its tags are made with another key than fingerprints, so they never
+    /// equal one, and they are never sent. `None` only if HMAC-SHA256
+    /// refused a 32-byte key (it does not).
+    #[must_use]
+    pub fn local_tag_key(&self, purpose: &str) -> Option<LocalTagKey> {
+        let sub = Zeroizing::new(self.raw_mac(&[LOCAL_TAG_DOMAIN, purpose.as_bytes()]));
+        <Hmac<Sha256> as KeyInit>::new_from_slice(sub.as_slice())
+            .ok()
+            .map(LocalTagKey)
+    }
+}
+
+/// A sub-key of the agent key for local integrity tags (see
+/// [`HmacKey::local_tag_key`]). Zeroized on drop, redacted `Debug`, no
+/// `Clone`, never serialized. Its tags are raw bytes, not [`Fingerprint`]s:
+/// they cannot enter a finding or an event.
+pub struct LocalTagKey(Hmac<Sha256>);
+
+impl LocalTagKey {
+    /// HMAC-SHA256 over the concatenation of `parts`.
+    #[must_use]
+    pub fn tag(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut mac = self.0.clone();
+        for p in parts {
+            mac.update(p);
+        }
+        let mut tag = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(tag.as_slice());
+        tag.as_mut_slice().zeroize();
+        out
+    }
+}
+
+impl fmt::Debug for LocalTagKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LocalTagKey(<redacted>)")
+    }
+}
+
 /// An `hmac-sha256:` fingerprint (contract `Fingerprint`). Only an
 /// [`HmacKey`] can produce one.
 ///
@@ -1586,6 +1634,25 @@ mod tests {
             k.fingerprint_db_user(&RawSample::new("app_rw")).as_str(),
             "hmac-sha256:908c960374bebb25445345911cbad22785e24f7a31e86a50f90bb7393732f6c5"
         );
+    }
+
+    #[test]
+    fn local_tag_keys_are_derived_sub_keys() {
+        // sub = HMAC(key, "databastion/local-tag/v1" 0x00 purpose); tag =
+        // HMAC(sub, data), computed with Python's `hmac` module.
+        let k = HmacKey::new(&[0x0b; 32]).unwrap_or_else(|_| unreachable!());
+        let sub = k
+            .local_tag_key("audit-tail-cursor")
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            hex(&sub.tag(&[b"a", b"bc"])),
+            "d8d84d9a3631a654dccb071b8bfec3074fb0a9fbcefcaf3ed71b2c856bf95fe5"
+        );
+        // Never the agent key itself, and another purpose is another key.
+        assert_ne!(sub.tag(&[b"abc"]), k.raw_mac(&[b"abc"]));
+        let other = k.local_tag_key("other").unwrap_or_else(|| unreachable!());
+        assert_ne!(sub.tag(&[b"abc"]), other.tag(&[b"abc"]));
+        assert_eq!(format!("{sub:?}"), "LocalTagKey(<redacted>)");
     }
 
     #[test]

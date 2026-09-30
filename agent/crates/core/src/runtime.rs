@@ -1227,6 +1227,12 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::pending_evicted() as f64);
         }
+        // Audit log cursors discarded at open: the file was truncated or
+        // rewritten while the agent was stopped (end-of-phase-7 review L1).
+        if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::cursor_resets() as f64);
+        }
         let spool = self.lock_spool().counters;
         for (name, value) in [
             ("spool_quarantined_total", spool.quarantined),
@@ -2282,6 +2288,12 @@ impl Runtime {
         // The cursors this stream uses, and the exact positions a skip is
         // bound to.
         let positions = audit::PositionRegistry::default();
+        // Sub-key of the agent key for the audit log cursors' integrity
+        // tags (end-of-phase-7 review L1).
+        let tag_key = self
+            .hmac
+            .local_tag_key(audit::tail::TAG_KEY_PURPOSE)
+            .map(Arc::new);
         // New settings (or an agent restart) give a stopped stream another
         // chance.
         self.lock_audit_parked().remove(&target_id);
@@ -2306,11 +2318,9 @@ impl Runtime {
             };
             let dir = Self::audit_dir(&config);
             let (isolate, skip) = panics.request();
-            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits).with_positions(
-                positions.clone(),
-                isolate,
-                skip,
-            );
+            let mut cfg = AuditConfig::new(params.clone(), target, &config.limits)
+                .with_positions(positions.clone(), isolate, skip)
+                .with_tag_key(tag_key.clone());
             match crate::fsutil::ensure_private_dir(&dir) {
                 Ok(()) => cfg = cfg.with_state_dir(dir.clone()),
                 Err(e) => tracing::warn!(

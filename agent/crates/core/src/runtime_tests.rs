@@ -1373,6 +1373,17 @@ async fn pending_evictions_are_a_heartbeat_metric() {
 }
 
 #[tokio::test]
+async fn audit_cursor_resets_are_a_heartbeat_metric() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let key = MetricsMapKey::try_from("audit_cursor_reset_total").unwrap();
+    let before = rt.metrics().0[&key];
+    crate::audit::count_cursor_reset();
+    assert!(rt.metrics().0[&key] >= before + 1.0);
+}
+
+#[tokio::test]
 async fn batch_conflict_is_dropped_never_resent() {
     let server = MockServer::start().await;
     let (_env, rt) = spooled_runtime(&server, vec![Step::Conflict], 3).await;
@@ -3560,7 +3571,8 @@ impl Connector for FakeAudit {
         self.seen.lock().unwrap().push((
             cfg.target_id().to_owned(),
             cfg.poll_interval(),
-            cfg.cursor("fake").is_some(),
+            // A cursor, with the sub-key for its integrity tags.
+            cfg.cursor("fake").is_some_and(|c| c.tag_key().is_some()),
         ));
         for i in 0..self.events {
             sink.submit(fake_event(10 + i as u64)).await?;
@@ -3647,7 +3659,10 @@ async fn audit_configure_streams_aggregated_events_and_persists_settings() {
             Duration::from_secs(5),
             "min_audit_poll_interval_s floor"
         );
-        assert!(seen[0].2, "a cursor store is provided");
+        assert!(
+            seen[0].2,
+            "a cursor store is provided, with its tag sub-key"
+        );
     }
     assert_eq!(rt.counters.events_received.load(Ordering::Relaxed), 3);
     let (_, batch) = rt.lock_spool().front_where(|_| true).unwrap();

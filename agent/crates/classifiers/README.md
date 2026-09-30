@@ -195,6 +195,12 @@ no run of more than 4 letters or digits, at least 50 % `*` among letters, digits
 or as an account name, from correlating. The key is the 32-byte `<state_dir>/hmac.key` generated at
 enrollment and loaded by the core; `HmacKey` keys the HMAC state once and clones it per value.
 
+Local integrity tags (never sent, never a `Fingerprint`): `HmacKey::local_tag_key(purpose)` derives a
+sub-key `HMAC-SHA256(agent_local_key, "databastion/local-tag/v1" 0x00 purpose)`, a `LocalTagKey`
+(redacted `Debug`, no `Clone`, zeroized on drop) whose `tag` is a raw HMAC-SHA256. The core uses it
+with the purpose `audit-tail-cursor` to fingerprint the audit log bytes before a saved cursor position
+without storing them (see the agent README).
+
 Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separators, uppercase; phone
 `+<digits>` when written with `+` (a trunk `(0)` dropped), national numbers as their digits (`0X…` →
 `+33X…` and `00…` → `+…` only with `PhoneRegion::Fr`, from the column or the agent configuration);
