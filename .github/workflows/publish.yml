@@ -1,10 +1,14 @@
 name: Publish
 
 # Builds and publishes multi-architecture images to GHCR, signed with cosign (keyless), then the
-# agent .deb files, SHA256SUMS and its cosign bundle as GitHub release assets.
-# - Called by release.yml for an X.Y.Z release     → tags X.Y.Z, X.Y, latest
-# - Triggered by an X.Y.Z-… pre-release tag        → tags X.Y.Z-…, next (never latest)
-# An image is only built if its Dockerfile exists (console/Dockerfile, agent/Dockerfile).
+# agent .deb files, the deployment bundle, SHA256SUMS and its cosign bundle as GitHub release
+# assets. Triggered ONLY by the push of a release tag (ADR-0034), so that every signature carries
+# the identity `…/.github/workflows/publish.yml@refs/tags/<version>` with the `push` trigger:
+# - X.Y.Z (pushed by release-it from release.yml)   → tags X.Y.Z, X.Y, latest
+# - X.Y.Z-… (pre-release, pushed by a maintainer)   → tags X.Y.Z-…, next (never latest)
+# The jobs that push or sign run in the `release` GitHub Environment (reviewers and tag rules:
+# RELEASE.md, "Repository configuration"). Builds use no cache: nothing another workflow wrote
+# can end up in a release. An image is only built if its Dockerfile exists.
 #
 # Chain of trust (deploy/README.md, "Verify the artifacts"):
 # - images: built natively per architecture with SBOM + SLSA provenance attestations (BuildKit),
@@ -13,16 +17,12 @@ name: Publish
 # - .deb: the binary is copied out of the signed agent image (verified first), packaged with nfpm
 #   (reproducible, deploy/deb/build.sh);
 # - SHA256SUMS (the .deb files and image-digests.txt) signed with `cosign sign-blob` (bundle).
-# The signing identity is this workflow file: ^https://github.com/<owner>/<repo>/.github/workflows/publish.yml@refs/…
+# - the deployment bundle databastion-deploy-<version>.tar.gz: reproducible `git archive` of deploy/.
 
 on:
-  workflow_call:
-    inputs:
-      version:
-        required: true
-        type: string
   push:
     tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
       - "[0-9]+.[0-9]+.[0-9]+-*"
 
 permissions:
@@ -37,21 +37,22 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       images: ${{ steps.images.outputs.images }}
-      registry: ${{ steps.meta.outputs.registry }}
     steps:
       - id: meta
         env:
-          VERSION: ${{ inputs.version || github.ref_name }}
+          VERSION: ${{ github.ref_name }}
         run: |
+          if [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_EVENT_NAME" != push ]; then
+            echo "::error::publish.yml only runs on a tag push"; exit 1
+          fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::Invalid version: $VERSION"; exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
           [[ "$VERSION" == *-* ]] && echo "prerelease=true" >> "$GITHUB_OUTPUT" || echo "prerelease=false" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.meta.outputs.version }}
+          persist-credentials: false
       - name: Images to build
         id: images
         run: |
@@ -72,13 +73,14 @@ jobs:
         arch: [amd64, arm64]
     runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 60
+    environment: release
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.version }}
+          persist-credentials: false
       - id: name
         run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/databastion-${{ matrix.image }}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -87,10 +89,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Same configuration as packaging.yml's publish-dry-run job, which runs it without a push on
+      # pull requests. Context = the component directory (its .dockerignore applies).
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
+          context: ${{ matrix.image }}
           file: ${{ matrix.image }}/Dockerfile
           platforms: linux/${{ matrix.arch }}
           labels: |
@@ -101,8 +105,8 @@ jobs:
           outputs: type=image,name=${{ steps.name.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+          no-cache: true
+          pull: true
       - name: Save digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -125,6 +129,7 @@ jobs:
         image: ${{ fromJSON(needs.prepare.outputs.images) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
     permissions:
       contents: read
       packages: write
@@ -150,15 +155,10 @@ jobs:
           IMAGE_KIND: ${{ matrix.image }}
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/databastion-${IMAGE_KIND}"
-          tags=(-t "$IMAGE:$VERSION")
-          if [ "$PRERELEASE" = "true" ]; then
-            tags+=(-t "$IMAGE:next")
-          else
-            tags+=(-t "$IMAGE:${VERSION%.*}" -t "$IMAGE:latest")
-          fi
           sources=()
           for d in /tmp/digests/*; do sources+=("$IMAGE@sha256:$(basename "$d")"); done
-          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          # Only the version tag here; `next` / `X.Y` / `latest` move after the verification below.
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "${sources[@]}"
           DIGEST=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
           cosign sign --yes "$IMAGE@$DIGEST"
           echo "ref=$IMAGE@$DIGEST" >> "$GITHUB_OUTPUT"
@@ -169,10 +169,12 @@ jobs:
       - name: Verify the signature and the attestations
         env:
           REF: ${{ steps.sign.outputs.ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           cosign verify "$REF" \
-            --certificate-identity-regexp "^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/\.github/workflows/publish\.yml@refs/" \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/publish.yml@refs/tags/${VERSION}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-trigger push \
             --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
             --certificate-github-workflow-sha "$GITHUB_SHA" >/dev/null
           echo "cosign verify: OK"
@@ -185,6 +187,19 @@ jobs:
               || { echo "::error::no SBOM attestation for $platform"; exit 1; }
             echo "$platform: SBOM and provenance attached"
           done
+      - name: Move the floating tags to the verified index
+        env:
+          REF: ${{ steps.sign.outputs.ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          IMAGE="${REF%@*}"
+          if [ "$PRERELEASE" = "true" ]; then
+            tags=(-t "$IMAGE:next")
+          else
+            tags=(-t "$IMAGE:${VERSION%.*}" -t "$IMAGE:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "$REF"
       # image-digests.txt (release asset): the tag and digest form that deploy/README.md pins.
       - name: Save the image reference
         env:
@@ -213,7 +228,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.version }}
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -226,7 +240,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Install nfpm (pinned, checksum database verified)
-        run: echo "NFPM=$(deploy/deb/install-nfpm.sh "$RUNNER_TEMP/bin")" >> "$GITHUB_ENV"
+        run: |
+          nfpm="$(deploy/deb/install-nfpm.sh "$RUNNER_TEMP/bin")"
+          echo "NFPM=$nfpm" >> "$GITHUB_ENV"
       - name: Build the .deb files from the signed image
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -235,8 +251,9 @@ jobs:
           repo="${pin%@*}"
           REF="${repo%:*}@${pin##*@}"
           cosign verify "$REF" \
-            --certificate-identity-regexp "^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/\.github/workflows/publish\.yml@refs/" \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/publish.yml@refs/tags/${VERSION}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-trigger push \
             --certificate-github-workflow-sha "$GITHUB_SHA" >/dev/null
           for arch in amd64 arm64; do
             docker pull -q --platform "linux/$arch" "$REF" >/dev/null
@@ -273,10 +290,14 @@ jobs:
     if: ${{ !failure() && !cancelled() && needs.manifest.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
     permissions:
       contents: write   # upload the release assets
       id-token: write   # keyless cosign signing (OIDC)
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: image-*
@@ -295,23 +316,30 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
+          # Deployment bundle (deploy/README.md): reproducible, same bytes for the same tag.
+          git archive --format=tar --prefix="databastion-deploy-${VERSION}/" HEAD deploy \
+            | gzip -n -9 > "$RUNNER_TEMP/assets/databastion-deploy-${VERSION}.tar.gz"
           cd "$RUNNER_TEMP/assets"
           cat image-*.txt > image-digests.txt
           rm -f image-*.txt
-          files=(image-digests.txt)
+          files=(image-digests.txt "databastion-deploy-${VERSION}.tar.gz")
           for f in *.deb; do [ -e "$f" ] && files+=("$f"); done
           sha256sum "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
           cosign sign-blob --yes --bundle SHA256SUMS.cosign.bundle SHA256SUMS
           cosign verify-blob --bundle SHA256SUMS.cosign.bundle \
-            --certificate-identity-regexp "^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/\.github/workflows/publish\.yml@refs/" \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/publish.yml@refs/tags/${VERSION}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-trigger push \
             --certificate-github-workflow-sha "$GITHUB_SHA" SHA256SUMS
           if ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             flags=(--draft --verify-tag --generate-notes --title "$VERSION")
             [ "$PRERELEASE" = true ] && flags+=(--prerelease)
             gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
           fi
+          # A published release is never modified: assets are only attached to a draft.
+          draft="$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          [ "$draft" = true ] || { echo "::error::release $VERSION is not a draft: refusing to change its assets"; exit 1; }
           gh release upload "$VERSION" --repo "$GITHUB_REPOSITORY" --clobber \
             "${files[@]}" SHA256SUMS SHA256SUMS.cosign.bundle
           {
@@ -330,8 +358,7 @@ jobs:
     uses: ./.github/workflows/packaging.yml
     with:
       build-deb: false
-      ref: ${{ needs.prepare.outputs.version }}
-      console-image: ${{ needs.prepare.outputs.registry }}/databastion-console:${{ needs.prepare.outputs.version }}
+      published-images: true
       # Pre-release tags do not bump agent/Cargo.toml (RELEASE.md): no version check for them.
       expected-version: ${{ needs.prepare.outputs.prerelease == 'true' && 'any' || needs.prepare.outputs.version }}
     permissions:

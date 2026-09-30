@@ -1,9 +1,11 @@
 name: Release
 
 # When a PR is merged into main (dev → main or hotfix/* → main):
-# computes the version, generates the CHANGELOG, creates the tag, creates a draft GitHub release,
-# then publishes the images and attaches the agent .deb files and the signed SHA256SUMS to the
-# draft. Add [skip-release] to the PR title to publish nothing.
+# computes the version, generates the CHANGELOG, creates and pushes the X.Y.Z tag (with
+# RELEASE_TOKEN, so that the push triggers workflows) and creates a draft GitHub release.
+# The tag push triggers publish.yml, which builds, signs and attaches the artifacts to the draft:
+# signing happens only in a tag-push run, never here (ADR-0034). Add [skip-release] to the PR
+# title to publish nothing.
 
 on:
   pull_request:
@@ -75,14 +77,3 @@ jobs:
           echo "Computed version: $VERSION"
           npx release-it --ci
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-  publish:
-    name: Publish images and packages
-    needs: release
-    uses: ./.github/workflows/publish.yml
-    with:
-      version: ${{ needs.release.outputs.version }}
-    permissions:
-      contents: write   # release assets (.deb, SHA256SUMS)
-      packages: write
-      id-token: write
