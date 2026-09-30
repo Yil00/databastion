@@ -232,8 +232,15 @@ pub type SharedOwnUsage = std::sync::Arc<std::sync::Mutex<OwnUsage>>;
 /// `every` when a charge is not saved yet (phase-7 security review: a
 /// charge shortly after a save, followed by no activity, stayed unsaved
 /// until a later charge or the end of the stream, and was lost on a crash
-/// or a kill). The task holds a weak handle and ends with the counters.
-/// Without a Tokio runtime (synchronous callers), no task is started.
+/// or a kill). Without a Tokio runtime (synchronous callers), no task is
+/// started.
+///
+/// Lifetime: the task holds a weak handle and ends once the counters are
+/// dropped. The connectors keep one [`SharedOwnUsage`] per target id for
+/// the life of the process (it outlives streams, by design), so in
+/// practice there is one task per target id with a counters file, ending
+/// with the runtime; a reconfigured target keeps its task. Each save runs
+/// on the blocking pool (`spawn_blocking`), not on a runtime worker.
 fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration) {
     let first = {
         let mut guard = usage
@@ -260,10 +267,16 @@ fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration)
             let Some(usage) = weak.upgrade() else {
                 break;
             };
-            usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .persist(Instant::now(), true);
+            let saved = tokio::task::spawn_blocking(move || {
+                usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .persist(Instant::now(), true);
+            })
+            .await;
+            if saved.is_err() {
+                tracing::warn!("own-account counters not saved (flush task failed)");
+            }
         }
     });
 }

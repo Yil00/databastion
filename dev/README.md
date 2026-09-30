@@ -175,7 +175,7 @@ before ADR-0026, run `make dev-reset dev` first: the init script creates the acc
 
 `verify_full` against a real server (phase 7) runs on a separate, throwaway TLS-only server:
 `dev/mongo/tls-test-server.sh` generates a test CA and a server certificate for `localhost` at run
-time (in `$RUNNER_TEMP` or `/tmp`, never committed, the CA key deleted once used), starts the same
+time (in `$RUNNER_TEMP` or a fresh `mktemp -d` directory, never committed, the CA key deleted once used), starts the same
 pinned image with `--tlsMode requireTLS` on `127.0.0.1:27018` and creates the ADR-0026 account:
 
 ```sh

@@ -9,9 +9,11 @@
 # Same pinned image as the dev `mongo` service (dev/docker-compose.yml), started with
 # `--tlsMode requireTLS` and `--auth`, published on 127.0.0.1 only (DATABASTION_MONGO_TLS_PORT,
 # default 27018). The CA and the server key are generated at run time in a private temporary
-# directory (DATABASTION_MONGO_TLS_DIR, default $RUNNER_TEMP or /tmp, then
-# databastion-mongo-tls) and deleted by `stop`; the CA private key is deleted as soon as the server
-# certificate is signed. Nothing generated here is ever committed.
+# directory: DATABASTION_MONGO_TLS_DIR when set (as `start` prints it), else
+# $RUNNER_TEMP/databastion-mongo-tls in CI, else a fresh `mktemp -d` directory. `stop` deletes it
+# only when it holds this script's marker file. The CA private key lives in its own `mktemp -d`
+# directory, removed on exit, as soon as the server certificate is signed. Nothing generated here is
+# ever committed.
 #
 # The server certificate names `localhost` only (no IP address SAN), so the test also checks that
 # `verify_full` refuses the same server reached as 127.0.0.1. Dev-only passwords from
@@ -20,7 +22,14 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEV="$(dirname "$HERE")"
-BASE="${DATABASTION_MONGO_TLS_DIR:-${RUNNER_TEMP:-/tmp}/databastion-mongo-tls}"
+if [ -n "${DATABASTION_MONGO_TLS_DIR:-}" ]; then
+  BASE="$DATABASTION_MONGO_TLS_DIR"
+elif [ -n "${RUNNER_TEMP:-}" ]; then
+  BASE="$RUNNER_TEMP/databastion-mongo-tls"
+else
+  BASE=""
+fi
+MARKER=.databastion-mongo-tls-test-server
 PORT="${DATABASTION_MONGO_TLS_PORT:-27018}"
 NAME=databastion-mongo-tls
 # Dev-only credentials (dev/.env.example).
@@ -42,11 +51,18 @@ start() {
   local img
   img="$(image)"
   [ -n "$img" ] || { echo "no pinned mongo image in dev/docker-compose.yml" >&2; exit 1; }
-  stop >/dev/null 2>&1 || true
-  mkdir -p "$BASE"
+  stop >/dev/null
+  if [ -z "$BASE" ]; then
+    BASE="$(mktemp -d)"
+  else
+    mkdir "$BASE"
+  fi
+  touch "$BASE/$MARKER"
   chmod 0755 "$BASE"
   local tmp
   tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064 # expand now: $tmp is local to this function
+  trap "rm -rf '$tmp'" EXIT
   # Test CA and a server certificate for `localhost` only.
   openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=DataBastion test MongoDB CA" \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
@@ -87,6 +103,7 @@ start() {
     for (let i = 0; i < 50; i++) { docs.push({n: i, email: 'tls.probe' + i + '@example.com'}); }
     app.tls_probe.insertMany(docs);" >/dev/null
   cat <<EOF
+export DATABASTION_MONGO_TLS_DIR='${BASE}'
 export DATABASTION_TEST_MONGO_TLS_URL='mongodb://databastion:${DATABASTION_DB_PASSWORD}@localhost:${PORT}/app?authSource=admin'
 export DATABASTION_TEST_MONGO_TLS_CA_FILE='${BASE}/ca.pem'
 EOF
@@ -94,6 +111,11 @@ EOF
 
 stop() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
+  [ -n "$BASE" ] && [ -e "$BASE" ] || return 0
+  if [ ! -f "$BASE/$MARKER" ]; then
+    echo "refusing to delete $BASE: not created by this script (no $MARKER)" >&2
+    return 1
+  fi
   rm -rf "$BASE"
 }
 
