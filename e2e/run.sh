@@ -2066,7 +2066,9 @@ done
 # No event of this run carries a db_user_fingerprint (no failed or unknown login was made while
 # Audit ran: one would mean a principal the agent could not name), except on the OpenLDAP target,
 # where every principal but the agent's is an entry DN sent as a fingerprint (checked above by
-# i2_check.py audit --fingerprinted-only).
+# i2_check.py audit --fingerprinted-only). A handshake a client abandons (mongodump's driver closes
+# pooled connections still authenticating: mongod logs "Failed to authenticate",
+# AuthenticationAbandoned) is not a failed login: the agent reports none for it.
 n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND db_user_fingerprint IS NOT NULL
     AND target_id <> 'ldap-e2e'")" \
   || fail "cannot count the fingerprinted events"
