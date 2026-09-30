@@ -29,6 +29,8 @@ use crate::job::AuditConfig;
 
 /// Largest cursor file read, in bytes.
 const MAX_CURSOR_BYTES: usize = 64 * 1024;
+/// Largest counters file (see [`CursorStore::counters`]), in bytes.
+pub(crate) const MAX_COUNTERS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Subdirectory of `state_dir` holding audit cursors and settings.
 pub(crate) const AUDIT_DIR: &str = "audit";
@@ -38,6 +40,8 @@ pub(crate) const AUDIT_DIR: &str = "audit";
 #[derive(Debug, Clone)]
 pub struct CursorStore {
     path: PathBuf,
+    /// Largest content read or written.
+    max_bytes: usize,
     /// Records to skip from the saved position (see
     /// [`Self::skip_records`]).
     skip: u32,
@@ -71,10 +75,24 @@ impl CursorStore {
         };
         (ok(target_id) && ok(name)).then(|| Self {
             path: dir.join(format!("{target_id}.{name}.cursor")),
+            max_bytes: MAX_CURSOR_BYTES,
             skip: 0,
             isolate: false,
             skip_reader: None,
         })
+    }
+
+    /// The counters file `name` of `target_id` in `dir` (normally obtained
+    /// through `AuditConfig::counters`): like [`Self::new`], but a
+    /// `<target_id>.<name>.counters` file of at most 2 MiB, for state kept
+    /// across agent restarts that is not a read position (the agent's own
+    /// row counters). It is never part of a stream's position.
+    #[must_use]
+    pub fn counters(dir: &Path, target_id: &str, name: &str) -> Option<Self> {
+        let mut store = Self::new(dir, target_id, name)?;
+        store.path = store.path.with_extension("counters");
+        store.max_bytes = MAX_COUNTERS_BYTES;
+        Some(store)
     }
 
     /// With a request to skip `n` records (see [`Self::skip_records`]).
@@ -123,10 +141,18 @@ impl CursorStore {
     ///
     /// # Errors
     /// [`CursorError`] when the file exists but is not a private regular
-    /// file of the agent user, is larger than 64 KiB, or cannot be read.
+    /// file of the agent user, is larger than its bound (64 KiB for a
+    /// cursor, 2 MiB for counters), or cannot be read.
     pub fn load(&self) -> Result<Option<Vec<u8>>, CursorError> {
-        match fsutil::read_private(&self.path) {
-            Ok(bytes) if bytes.len() <= MAX_CURSOR_BYTES => Ok(Some(bytes)),
+        use std::io::Read as _;
+        let read = fsutil::open_private(&self.path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(u64::try_from(self.max_bytes).unwrap_or(u64::MAX) + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match read {
+            Ok(bytes) if bytes.len() <= self.max_bytes => Ok(Some(bytes)),
             Ok(_) => Err(CursorError {
                 op: "read",
                 kind: std::io::ErrorKind::InvalidData,
@@ -139,12 +165,28 @@ impl CursorStore {
         }
     }
 
+    /// Removes the saved cursor (a source that will not resume from it).
+    ///
+    /// # Errors
+    /// [`CursorError`] when the file exists and cannot be removed.
+    pub fn remove(&self) -> Result<(), CursorError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CursorError {
+                op: "remove",
+                kind: e.kind(),
+            }),
+        }
+    }
+
     /// Saves the cursor atomically (`0600`, fsync).
     ///
     /// # Errors
-    /// [`CursorError`] on a write failure or a cursor above 64 KiB.
+    /// [`CursorError`] on a write failure or content above the bound
+    /// (64 KiB for a cursor, 2 MiB for counters).
     pub fn save(&self, bytes: &[u8]) -> Result<(), CursorError> {
-        if bytes.len() > MAX_CURSOR_BYTES {
+        if bytes.len() > self.max_bytes {
             return Err(CursorError {
                 op: "write",
                 kind: std::io::ErrorKind::InvalidInput,

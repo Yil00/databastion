@@ -20,18 +20,35 @@
 //! only, in zeroizing buffers.
 //!
 //! Cursor: the end timer (`TIMER_END`, picoseconds since the server
-//! started) of the newest statement read, kept in memory. The first poll
-//! starts at the newest statement (no history is replayed); a restarted
-//! server (timers back at zero) is read from its start. Statements
-//! finishing out of order are caught by re-reading the last
-//! [`OVERLAP_PS`] picoseconds, deduplicated on (thread, event id).
+//! started) of the newest statement read, and the statements already read
+//! within the overlap. Statements finishing out of order are caught by
+//! re-reading the last [`OVERLAP_PS`] picoseconds, deduplicated on
+//! (thread, event id). A restarted server (timers back at zero) is read
+//! from its start.
+//!
+//! The cursor is persisted through the core (`performance_schema` cursor
+//! file: timers and ids only, never a statement) with the server's start
+//! time (`Uptime` against the agent's clock), after the events of each
+//! poll are handed over, so an agent restart resumes where it stopped:
+//! - same server run (start times within [`BOOT_TOLERANCE_S`]): the
+//!   statements since the saved cursor are read (what the history still
+//!   holds; the ring buffer may have wrapped meanwhile, which is counted);
+//! - another server run: its statements are read from its start;
+//! - no saved cursor, or the start time unknown: the first poll starts at
+//!   the newest statement (no history is replayed).
+//!
+//! The sessions' accounts are not persisted: a statement of a session that
+//! ended while the agent was stopped is reported as an unidentified
+//! account.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use databastion_classifiers::masking::{ClientAddr, EventPrincipal, EventSource};
+use databastion_core::audit::CursorStore;
 use databastion_core::audit::own::ClientSeen;
 use databastion_core::{EventSink, FailureCode};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::events::{Access, EventBuilder};
@@ -52,6 +69,32 @@ const MAX_THREADS: usize = 4096;
 const DEFAULT_TEXT_LIMIT: usize = 1024;
 /// Largest text read per statement, whatever the server limits say.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// Name of the persisted cursor.
+pub(crate) const CURSOR: &str = "performance_schema";
+/// Two server start times (Unix seconds, from `Uptime` and the agent's
+/// clock) this close are the same server run.
+const BOOT_TOLERANCE_S: u64 = 120;
+/// Statements of the overlap kept in the saved cursor at most (the newest;
+/// the saved `floor` then keeps the older ones from being read again).
+const MAX_SAVED_SEEN: usize = 800;
+/// Version of the saved cursor.
+const CURSOR_VERSION: u32 = 1;
+
+/// The saved cursor: timers and ids only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Saved {
+    v: u32,
+    /// Server start time (Unix seconds).
+    boot: u64,
+    /// End timer of the newest statement read.
+    last: u64,
+    /// Statements before this timer are not read again (the saved `seen`
+    /// was cut).
+    floor: Option<u64>,
+    /// (thread, event id, end timer) of the statements read within the
+    /// overlap.
+    seen: Vec<(u64, u64, u64)>,
+}
 
 /// Statement table polled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +164,93 @@ pub(crate) struct PsPoller {
     builder: EventBuilder,
     /// Polls where the ring buffer had wrapped past the cursor.
     pub(crate) wrapped: u64,
+    /// Statements whose conversion failed (dropped, counted).
+    pub(crate) panicked: u64,
+    /// Where the cursor is persisted (`None`: in memory only).
+    store: Option<CursorStore>,
+    /// Server start time (Unix seconds), `None` when unknown (the cursor
+    /// is then not saved).
+    boot: Option<u64>,
+    /// First poll after a restore from a cut `seen`: no statement before.
+    floor: Option<u64>,
+    /// The cursor last saved.
+    saved: Option<Saved>,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The server's start time: now minus `Uptime`.
+async fn server_boot(session: &mut Session) -> Result<Option<u64>, MyError> {
+    let rows = match session.query(Stage::Audit, sql::SERVER_UPTIME).await {
+        Ok(rows) => rows,
+        Err(e) if !e.fatal => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(rows
+        .first()
+        .and_then(|r| r.get(1).cloned().flatten())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|uptime| unix_now().saturating_sub(uptime)))
+}
+
+/// Where polling resumes after a restart: `(last, seen, floor)`.
+type Resume = (Option<u64>, HashMap<(u64, u64), u64>, Option<u64>);
+
+/// The resume point from a saved cursor (see the module documentation).
+fn resume(saved: Option<Saved>, boot: Option<u64>) -> Resume {
+    match (saved, boot) {
+        (Some(s), Some(b)) if s.v == CURSOR_VERSION && s.boot.abs_diff(b) <= BOOT_TOLERANCE_S => {
+            let seen = s.seen.iter().map(|(t, e, te)| ((*t, *e), *te)).collect();
+            (Some(s.last), seen, s.floor)
+        }
+        (Some(s), Some(_)) if s.v == CURSOR_VERSION => {
+            tracing::info!(
+                "performance_schema: the server restarted while the agent was stopped; \
+                 reading its statements from its start"
+            );
+            (Some(0), HashMap::new(), None)
+        }
+        _ => (None, HashMap::new(), None),
+    }
+}
+
+/// The cursor to save: the newest [`MAX_SAVED_SEEN`] statements of the
+/// overlap, and a floor when some were left out. `None` while the server's
+/// start time or the position is unknown.
+fn to_save(boot: Option<u64>, last: Option<u64>, seen: &HashMap<(u64, u64), u64>) -> Option<Saved> {
+    let (boot, last) = (boot?, last?);
+    let mut seen: Vec<(u64, u64, u64)> = seen.iter().map(|((t, e), te)| (*t, *e, *te)).collect();
+    seen.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    let floor = (seen.len() > MAX_SAVED_SEEN).then(|| seen[MAX_SAVED_SEEN - 1].2);
+    seen.truncate(MAX_SAVED_SEEN);
+    Some(Saved {
+        v: CURSOR_VERSION,
+        boot,
+        last,
+        floor,
+        seen,
+    })
+}
+
+fn load(store: Option<&CursorStore>) -> Option<Saved> {
+    match store?.load() {
+        Ok(Some(bytes)) => match serde_json::from_slice::<Saved>(&bytes) {
+            Ok(s) => Some(s),
+            Err(_) => {
+                tracing::warn!("performance_schema cursor not understood: starting at the newest");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "performance_schema cursor not readable");
+            None
+        }
+    }
 }
 
 fn num(v: Option<&[u8]>) -> Option<u64> {
@@ -148,11 +278,14 @@ async fn scalar(session: &mut Session, statement: &str) -> Result<Option<String>
 }
 
 impl PsPoller {
-    /// Starts polling `table` on `session` (its own thread is left out).
+    /// Starts polling `table` on `session` (its own thread is left out),
+    /// from the cursor saved in `store` when it is of the same server run
+    /// (see the module documentation).
     pub(crate) async fn start(
         session: &mut Session,
         table: PsTable,
         builder: EventBuilder,
+        store: Option<CursorStore>,
     ) -> Result<Self, MyError> {
         let own_thread = scalar(session, sql::PS_OWN_THREAD)
             .await?
@@ -165,19 +298,48 @@ impl PsPoller {
         };
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         let digest_limit = limit(scalar(session, sql::PS_DIGEST_LIMIT).await?);
+        let boot = server_boot(session).await?;
+        let saved = load(store.as_ref());
+        let (last, seen, floor) = resume(saved.clone(), boot);
         Ok(Self {
             table,
             own_thread,
             text_limit,
             digest_limit,
             with_program: true,
-            last: None,
-            seen: HashMap::new(),
+            last,
+            seen,
             threads: HashMap::new(),
             thread_order: VecDeque::new(),
             builder,
             wrapped: 0,
+            panicked: 0,
+            store,
+            boot,
+            floor,
+            saved,
         })
+    }
+
+    /// Saves the cursor when it moved (after the poll's events were handed
+    /// over: delivery stays at most once).
+    fn save(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let Some(cursor) = to_save(self.boot, self.last, &self.seen) else {
+            return;
+        };
+        if self.saved.as_ref() == Some(&cursor) {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec(&cursor) else {
+            return;
+        };
+        match store.save(&bytes) {
+            Ok(()) => self.saved = Some(cursor),
+            Err(e) => tracing::warn!(error = %e, "performance_schema cursor not saved"),
+        }
     }
 
     /// The agent's address as the server sees it (refreshed at each
@@ -294,6 +456,7 @@ impl PsPoller {
         let Some(mut last) = self.last else {
             // First poll: start at the newest statement.
             self.last = Some(max.unwrap_or(0));
+            self.save();
             return Ok(());
         };
         if max.is_some_and(|m| m < last) || current.is_some_and(|c| c < last) {
@@ -302,6 +465,9 @@ impl PsPoller {
             );
             last = 0;
             self.seen.clear();
+            self.floor = None;
+            // A new server run: its start time goes with the cursor.
+            self.boot = server_boot(session).await?;
         }
         if self.table == PsTable::HistoryLong && last > 0 && min.is_some_and(|m| m > last) {
             self.wrapped += 1;
@@ -320,6 +486,9 @@ impl PsPoller {
             }
         };
         let mut from = last.saturating_sub(OVERLAP_PS);
+        if let Some(floor) = self.floor.take() {
+            from = from.max(floor);
+        }
         let mut events = Vec::new();
         for _ in 0..MAX_BATCHES {
             let rows = self.read_rows(session, from).await?;
@@ -368,8 +537,14 @@ impl PsPoller {
                     ts: ts_of(r.timer_end),
                     source: EventSource::PerformanceSchema,
                 };
-                if let Some(e) = self.builder.statement(access, now) {
-                    events.push(e);
+                // Per-statement isolation: a statement that makes the
+                // conversion panic is dropped alone and counted (the
+                // cursor is persisted, so a panic that ended the stream
+                // would come back at every restart).
+                match databastion_core::isolate(|| self.builder.statement(access, now)) {
+                    Some(Some(e)) => events.push(e),
+                    Some(None) => {}
+                    None => self.panicked = self.panicked.saturating_add(1),
                 }
             }
             if !full {
@@ -383,10 +558,81 @@ impl PsPoller {
         for e in events {
             sink.submit(e).await.map_err(|_| PollError::SinkClosed)?;
         }
+        self.save();
         Ok(())
     }
 }
 
 fn text_of(v: Option<&[u8]>) -> Option<String> {
     text(v, 1024).filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn saved(boot: u64, last: u64) -> Saved {
+        Saved {
+            v: CURSOR_VERSION,
+            boot,
+            last,
+            floor: None,
+            seen: vec![(7, 1, last)],
+        }
+    }
+
+    /// Phase 7: an agent restart resumes at the saved cursor of the same
+    /// server run, reads a new server run from its start, and starts at
+    /// the newest statement without a usable cursor.
+    #[test]
+    fn a_saved_cursor_resumes_the_same_server_run_only() {
+        let (last, seen, floor) = resume(Some(saved(1_000_000, 42)), Some(1_000_060));
+        assert_eq!(last, Some(42));
+        assert_eq!(seen.get(&(7, 1)), Some(&42));
+        assert_eq!(floor, None);
+        // Another server run (restarted while the agent was stopped).
+        let (last, seen, _) = resume(Some(saved(1_000_000, 42)), Some(1_090_000));
+        assert_eq!(last, Some(0));
+        assert!(seen.is_empty());
+        // Start time unknown, nothing saved, or another format version.
+        assert_eq!(resume(Some(saved(1_000_000, 42)), None).0, None);
+        assert_eq!(resume(None, Some(1_000_000)).0, None);
+        let mut other = saved(1_000_000, 42);
+        other.v = 2;
+        assert_eq!(resume(Some(other), Some(1_000_000)).0, None);
+    }
+
+    #[test]
+    fn the_saved_cursor_is_bounded_and_keeps_a_floor() {
+        assert!(to_save(None, Some(1), &HashMap::new()).is_none());
+        assert!(to_save(Some(1), None, &HashMap::new()).is_none());
+        let seen: HashMap<(u64, u64), u64> =
+            (0..2000u64).map(|i| ((i % 7, i), 1_000 + i)).collect();
+        let s = to_save(Some(5), Some(2_999), &seen).unwrap();
+        assert_eq!(s.seen.len(), MAX_SAVED_SEEN);
+        // The newest are kept; the floor is the oldest kept.
+        assert_eq!(s.seen[0].2, 2_999);
+        assert_eq!(s.floor, Some(s.seen.last().unwrap().2));
+        let bytes = serde_json::to_vec(&s).unwrap();
+        assert!(bytes.len() < 64 * 1024, "{}", bytes.len());
+        let back: Saved = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, s);
+        let (_, restored, floor) = resume(Some(back), Some(5));
+        assert_eq!(restored.len(), MAX_SAVED_SEEN);
+        assert_eq!(floor, s.floor);
+        // Small overlaps are kept whole.
+        let few: HashMap<(u64, u64), u64> = [((1, 2), 10), ((1, 3), 11)].into();
+        let s = to_save(Some(5), Some(11), &few).unwrap();
+        assert_eq!((s.seen.len(), s.floor), (2, None));
+    }
+
+    #[test]
+    fn the_worst_case_cursor_fits_the_cursor_bound() {
+        let seen: HashMap<(u64, u64), u64> = (0..MAX_SAVED_SEEN as u64)
+            .map(|i| ((u64::MAX - i, u64::MAX - i), u64::MAX - i))
+            .collect();
+        let s = to_save(Some(u64::MAX), Some(u64::MAX), &seen).unwrap();
+        assert!(serde_json::to_vec(&s).unwrap().len() <= 64 * 1024);
+    }
 }

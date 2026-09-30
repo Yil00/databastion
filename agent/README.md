@@ -237,6 +237,26 @@ memory (restarted afresh anyway). A stream that fails is restarted after its
 backoff, at least its poll interval (up to 3600 s) and at most 300 s or the
 poll interval when longer.
 
+### Audit state kept across restarts
+Under `<state_dir>/audit/` (`0700`), every file `0600`, owned by the agent
+user, written atomically (temporary file, `fsync`, `rename`, directory
+`fsync`), read with `O_NOFOLLOW` and a size bound, and never holding a value,
+a statement or a query text:
+- read positions (`<target>.<name>.cursor`, at most 64 KiB): the file sources'
+  offsets, the OpenLDAP accesslog CSNs, and (phase 7) the MySQL / MariaDB
+  `performance_schema` cursor (end timers, statement ids, the server's start
+  time) and the MongoDB profiler positions (per database, a time and SHA-256
+  hashes of the entries read at it). They are saved once the events read
+  before them are handed to the core (at-most-once delivery);
+- (phase 7) the agent's own-account row counters
+  (`<target>.own_usage.counters`, at most 2 MiB: normalized object names and
+  rows per hour over the last 24 h), saved at most every 30 s while charging
+  and when a stream ends, so an agent restart does not give a fresh
+  Discovery budget per object. A file that is not understood is ignored
+  (counted from zero), as before persistence; hours ahead of the agent's
+  clock count as the current hour; when the file would exceed its bound, the
+  objects read longest ago are left out (logged).
+
 ### Logs
 `DATABASTION_LOG` sets the filter, but targets outside `databastion_*` are
 capped at `warn`: drivers and HTTP clients may log parameters or payloads at
@@ -506,7 +526,10 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
   **Full is never reported**;
 - files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
-  position in memory, starting at the newest entry;
+  position persisted after each poll (phase 7: per database, the last `ts` and SHA-256 hashes of
+  the entries read at it; an agent restart resumes there, within what the capped collection
+  still holds), a database without a saved position starting at its newest entry; the saved
+  position is removed while a log file is the source;
 - closed-shape facts only: command name (closed list), namespace (normalized), `name@authdb`,
   client IP, application name, document counts, a failure flag, and whether the filter has keys,
   a numeric limit and pass-through pipeline stages. Command documents are skipped by a `serde`

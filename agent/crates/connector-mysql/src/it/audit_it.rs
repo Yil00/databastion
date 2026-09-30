@@ -590,6 +590,45 @@ async fn performance_schema_gives_events_with_rows() {
         let now = std::time::SystemTime::now();
         assert!(events.iter().all(|e| e.ts() <= now));
         assert_no_marker(&events, &logs);
+        // Phase 7: the cursor is persisted. After a quiet poll (the cursor
+        // saved past everything handed over), the agent stops.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        task.abort();
+        let _ = task.await;
+        let saved = std::fs::read(state.0.join(format!("{}.performance_schema.cursor", t.id)))
+            .expect("performance_schema cursor saved");
+        let saved = String::from_utf8_lossy(&saved);
+        assert!(saved.contains("\"boot\""), "{}: {saved}", server.name);
+        assert!(!saved.contains(AUDIT_MARKER), "{}", server.name);
+        // What runs while the agent is stopped is reported after its
+        // restart (a new connector: nothing kept in memory), and what was
+        // reported before is not reported again.
+        exec(&mut a, &format!("CREATE TABLE {AUDIT_DB}.stopped (i INT)")).await;
+        a.query(
+            Stage::Check,
+            &format!("SELECT /*!40001 SQL_NO_CACHE */ * FROM `{AUDIT_DB}`.`stopped`"),
+        )
+        .await
+        .unwrap();
+        let restarted = Arc::new(MysqlConnector::new());
+        let (task, mut rx) = start_audit(Arc::clone(&restarted), &t, &state.0);
+        let mut after: Events = Vec::new();
+        collect_until(&mut rx, &mut after, Duration::from_secs(30), |ev| {
+            has(ev, "stopped", "signature.mysqldump")
+        })
+        .await;
+        let all: Vec<String> = after.iter().map(describe).collect();
+        assert!(
+            has(&after, "stopped", "signature.mysqldump"),
+            "{}: a statement run while the agent was stopped: {all:#?}",
+            server.name
+        );
+        assert!(
+            !has(&after, "big", "volume.large_result"),
+            "{}: reported again after the restart: {all:#?}",
+            server.name
+        );
+        assert_no_marker(&after, &logs);
         task.abort();
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {AUDIT_DB}")).await;
         exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;

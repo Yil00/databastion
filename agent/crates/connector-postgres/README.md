@@ -118,9 +118,13 @@ load otherwise), so a server-wide load is the normal case.
   object and day with filtered queries stays unreported. The counters are
   kept per target for the life of the agent process: restarting a stream
   (a failure, a source switch, the agent's sessions terminated on purpose)
-  does not reset them, but an **agent restart** does (they are not
-  persisted), which gives a fresh budget per object. The agent's
-  database credentials never leave its host (I3).
+  does not reset them, and they are persisted across **agent restarts**
+  (phase 7; `<state_dir>/audit/<target>.own_usage.counters`, `0600`,
+  written atomically at most every 30 s while charging and when a stream
+  ends: normalized object names and row counts per hour only), so a
+  restart no longer gives a fresh budget per object; at most the charges
+  of the last 30 s before a crash are lost. The agent's database
+  credentials never leave its host (I3).
 - **The agent's own table-less statements.** The connector sends a few
   statements that read no relation: the per-connection and
   per-transaction `pg_catalog.set_config(…)` / `current_setting(…)`

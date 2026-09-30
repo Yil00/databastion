@@ -151,6 +151,7 @@ fn own_account(
         u64::from(cfg.max_sample_rows()),
         state.own_usage(&target.id),
     )
+    .persisted(cfg)
 }
 
 struct FileStream {
@@ -190,6 +191,10 @@ pub(crate) async fn audit_stream(
                     _ => {
                         let log = target.mysql_settings().audit_log.ok_or_else(internal)?;
                         tracing::info!(target_id = %target.id, "audit source: audit log file");
+                        // The log covers what performance_schema would: a
+                        // later switch back starts at its newest statement
+                        // rather than re-reading this period.
+                        forget_ps_cursor(cfg);
                         let framing = match format {
                             MysqlLogFormat::ServerAudit => Framing::Lines,
                             MysqlLogFormat::Json => Framing::JsonObjects,
@@ -227,9 +232,10 @@ pub(crate) async fn audit_stream(
                         .await
                         .map_err(MyError::into_connector_error)?;
                     let builder = EventBuilder::new(own_account(cfg, target, &pre, state));
-                    let poller = PsPoller::start(&mut session, table, builder)
-                        .await
-                        .map_err(MyError::into_connector_error)?;
+                    let poller =
+                        PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR))
+                            .await
+                            .map_err(MyError::into_connector_error)?;
                     tracing::info!(
                         target_id = %target.id,
                         table = table.name(),
@@ -243,7 +249,7 @@ pub(crate) async fn audit_stream(
                 }
                 if let Some(st) = ps.as_mut() {
                     st.poller.set_own_addr(pre.own_addr);
-                    ps_run(cfg, target, sink, st, timeouts).await?;
+                    ps_run(cfg, target, sink, state, st, timeouts).await?;
                 }
             }
             Source::None => {
@@ -251,6 +257,15 @@ pub(crate) async fn audit_stream(
                     MyError::new(FailureCode::Unsupported, Stage::Audit).into_connector_error()
                 );
             }
+        }
+    }
+}
+
+/// Removes the saved `performance_schema` cursor.
+fn forget_ps_cursor(cfg: &AuditConfig) {
+    if let Some(store) = cfg.cursor(pfs::CURSOR) {
+        if let Err(e) = store.remove() {
+            tracing::warn!(error = %e, "performance_schema cursor not removed");
         }
     }
 }
@@ -375,6 +390,7 @@ async fn ps_run(
     cfg: &AuditConfig,
     target: &TargetConfig,
     sink: &EventSink,
+    state: &CheckState,
     st: &mut PsStream,
     timeouts: Timeouts,
 ) -> Result<(), ConnectorError> {
@@ -391,7 +407,18 @@ async fn ps_run(
             let old = std::mem::replace(&mut st.session, session);
             old.close().await;
         }
-        match st.poller.poll(&mut st.session, sink).await {
+        let panicked_before = st.poller.panicked;
+        let polled = st.poller.poll(&mut st.session, sink).await;
+        let panicked = st.poller.panicked.saturating_sub(panicked_before);
+        if panicked > 0 {
+            state.note_dropped(&target.id, panicked);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = panicked,
+                "performance_schema statements whose conversion failed dropped (internal error)"
+            );
+        }
+        match polled {
             Ok(()) => {}
             Err(PollError::Db(e)) => {
                 tracing::warn!(

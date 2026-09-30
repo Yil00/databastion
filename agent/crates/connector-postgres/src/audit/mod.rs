@@ -95,7 +95,8 @@ fn own_account(
         pre.own_addr,
         u64::from(cfg.max_sample_rows()),
         state.own_usage(&target.id),
-    );
+    )
+    .persisted(cfg);
     PgOwn::new(core, state.own_statements(&target.id))
 }
 

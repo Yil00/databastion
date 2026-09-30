@@ -136,8 +136,18 @@ so it is still reported, against `*`, but without signals. The
 - **At-most-once delivery**, as for PostgreSQL: the log cursor advances once
   the events are handed to the core, which aggregates them for up to
   `aggregation_window_s`; an agent crash within that window loses them. On
-  `performance_schema` the cursor is in memory: after an agent restart,
-  reading starts at the newest statement.
+  `performance_schema` the cursor (end timers and ids of the statements
+  read, never a statement) is persisted with the server's start time
+  (`SHOW GLOBAL STATUS LIKE 'Uptime'`) after each poll (phase 7): an agent
+  restart resumes after the last statement read when the server did not
+  restart, and reads a restarted server's statements from its start;
+  what the history no longer holds (`events_statements_history_long`
+  wrapped while the agent was stopped) is lost and counted. The sessions'
+  accounts are not persisted: a statement of a session that ended while
+  the agent was stopped is reported as an unidentified account. Without a
+  saved cursor (first start, or the start time unreadable), reading starts
+  at the newest statement. The cursor is removed while an audit log file
+  is the source, so a later switch back does not re-read that period.
 - **First start / rotation while stopped**: without a cursor, reading
   starts at the end of the log. A log rotated while the agent was stopped
   is read from the start of the new file.
