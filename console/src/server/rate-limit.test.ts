@@ -246,7 +246,7 @@ describe.skipIf(!hasDb)("RateLimiter.shared (PostgreSQL)", () => {
       // Duck-typed: modules reloaded by `vi.resetModules` have their own copy of the class.
       const isLimiter = (v: unknown): v is RateLimiter => typeof v === "object" && v !== null && "reserveShared" in v;
       const limiters = modules.flatMap((m) => Object.values(m).filter(isLimiter));
-      expect(limiters).toHaveLength(20);
+      expect(limiters).toHaveLength(21);
       const names = limiters.map((l) => l.name);
       expect(names.every((n) => n !== null)).toBe(true);
       expect(new Set(names).size).toBe(names.length);

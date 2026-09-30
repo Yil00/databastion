@@ -13,6 +13,7 @@ import { purgeSecretCache } from "./agent-api/auth";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
+import { lockAgentJobs } from "./job-lock";
 
 /**
  * Consumes an enrollment token and creates the agent.
@@ -227,6 +228,8 @@ export async function revokeAgent(
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
     if (rows.length === 0) return false;
+    // After the agent row, before its jobs: same order as every job writer (job-lock.ts, L1).
+    await lockAgentJobs(tx, agentId);
     await tx
       .update(jobs)
       .set({ status: "cancelled", finishedAt: sql`now()` })

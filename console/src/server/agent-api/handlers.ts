@@ -120,6 +120,16 @@ export function parseWait(url: URL): number | null {
   return url.searchParams.getAll("wait").length > 1 ? null : wait;
 }
 
+/**
+ * `GET /jobs` requests per agent (L4 of #98): 20 per 20 s window, shared by the console processes
+ * (per-process fallback when the store fails), i.e. 1 request/s sustained with a burst of 20. A
+ * conforming agent holds one long-poll of up to 25 s and polls again at once only after a
+ * response carrying jobs, far below; a flood of `wait=0` polls (each one a claim transaction
+ * under the agent's job lock) gets `429` with `Retry-After`. Counted before the held-poll slot,
+ * so held polls are not affected once admitted.
+ */
+export const jobsPollsPerAgent = RateLimiter.shared("jobs.requests_per_agent", 20, 20_000, "local");
+
 /** Test hook: shortens the long-poll unit (seconds) so tests do not wait 25 s. */
 export const pollClock = { msPerSecond: 1000 };
 
@@ -130,7 +140,9 @@ export function handlePollJobs(req: Request): Promise<Response> {
     const wait = parseWait(new URL(req.url));
     if (wait === null) return invalidRequest();
     const agentId = auth.agent.id;
-    // Reserved synchronously (also for wait=0: L-a), before any await, released in `finally` (M2).
+    const polls = await jobsPollsPerAgent.reserveShared(agentId);
+    if (!polls.ok) return rateLimited(polls.retryAfterS);
+    // Reserved synchronously (also for wait=0: L-a), before any further await, released in `finally` (M2).
     const slot = jobHub.reserveSlot(agentId);
     if (slot === "agent") return rateLimited(1);
     if (slot === "process") return unavailable();

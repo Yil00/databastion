@@ -10,6 +10,7 @@ import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
 import { canonicalJson, type Tx } from "./findings";
+import { lockAgentJobs } from "./job-lock";
 
 /**
  * Audit settings per target (P4-C, and the `audit.configure` confirmation left open by P3-A).
@@ -312,6 +313,7 @@ export async function configureAudit(
       .for("update")
       .limit(1);
     if (!agent || agent.revokedAt || agent.lockedAt) return { outcome: "not_found" };
+    await lockAgentJobs(tx, agentId);
     const [target] = await tx
       .select({ present: agentTargets.present })
       .from(agentTargets)
