@@ -71,6 +71,7 @@ class PlanTest(unittest.TestCase):
 class ValuesTest(unittest.TestCase):
     def test_iban(self) -> None:
         self.assertTrue(iban_valid("FR7630006000011234567890189"))  # classifier test vector
+        self.assertTrue(seed.bban(1, 1).startswith("99"))  # no real bank code
         for t in (1, 7, 40, 99):
             for g in (1, 2, 96, 97, 12345, 199_999, 99_999_999_999):
                 b = seed.bban(t, g)
@@ -82,8 +83,9 @@ class ValuesTest(unittest.TestCase):
     def test_email_and_phone_shapes(self) -> None:
         for g in (1, 19, 20, 399, 400, 25_000):
             e = seed.email(3, g)
-            self.assertRegex(e, r"^[a-z]+\.[a-z]+[0-9]+@[a-z]+\.example\.(org|net|com|fr)$")
-            self.assertRegex(seed.phone(3, g), r"^\+33 6( [0-9]{2}){4}$")
+            self.assertRegex(e, r"^[a-z]+\.[a-z]+[0-9]+@[a-z]+\.example(\.(org|net|com))?$")
+            # ARCEP fiction range only.
+            self.assertRegex(seed.phone(3, g), r"^\+33 6 39 98 03 [0-9]{2}$")
 
     def test_row_values(self) -> None:
         t = seed.Table(4, 100, "mixed")
@@ -115,6 +117,8 @@ class SqlTest(unittest.TestCase):
         for t in self.p:
             self.assertIn(f"FROM seq_1_to_{t.rows})", sql)
         self.assertIn("ANALYZE TABLE load_t001, ", sql)
+        self.assertEqual(sql.count("GRANT SELECT ON support.load_t"), 8)
+        self.assertNotIn("support.*", sql)
         for stmt in sql.split(";\n"):
             self.assertEqual(stmt.count("("), stmt.count(")"), stmt[:80])
 

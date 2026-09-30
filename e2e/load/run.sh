@@ -75,6 +75,10 @@ for v in LOAD_TABLES LOAD_ROWS LOAD_MONGO_TABLES LOAD_MONGO_ROWS LOAD_SAMPLE_ROW
   [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || { echo "$v must be a positive integer" >&2; exit 2; }
 done
 [[ "$LOAD_DB_CPUS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "LOAD_DB_CPUS must be a number" >&2; exit 2; }
+# The Audit run is bounded (the job's time budget, the targets' log volumes): 30 minutes at most.
+LOAD_SOAK_MAX_S=1800
+[ "$LOAD_SOAK_S" -le "$LOAD_SOAK_MAX_S" ] \
+  || { echo "LOAD_SOAK_S must be at most $LOAD_SOAK_MAX_S seconds (got $LOAD_SOAK_S)" >&2; exit 2; }
 
 log() { printf '[load %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
@@ -128,11 +132,27 @@ BEGIN { if ((getline s < ENVIRON["SECRET_FILE"]) <= 0 || s == "") exit 2; rep = 
   while ((i = index(line, s)) > 0) { out = out substr(line, 1, i - 1) rep; line = substr(line, i + length(s)) }
   print out line
 }'
+# leak_scan DIR PATTERN_DIR: prints "<name>: <files>" for every secret of PATTERN_DIR found in DIR
+# (fixed strings; only the secret's name is printed). Returns 1 if any is found (as e2e/run.sh).
+leak_scan() {
+  local dir="$1" pdir="$2" f files found=0
+  [ -d "$dir" ] || return 0
+  for f in "$pdir"/*; do
+    [ -f "$f" ] || continue
+    files="$(LC_ALL=C grep -rlFf "$f" -- "$dir" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ' || true)"
+    if [ -n "$files" ]; then
+      printf '%s: %s\n' "$(basename "$f")" "$files"
+      found=1
+    fi
+  done
+  return "$found"
+}
+# redact_dir DIR [PATTERN_DIR]: replaces every secret (default: the registry) in the files of DIR.
 redact_dir() {
-  local dir="$1" f name file tmp="$W/redact.tmp"
+  local dir="$1" pdir="${2:-$P}" f name file tmp="$W/redact.tmp"
   local -a hits
   [ -d "$dir" ] || return 0
-  for f in "$P"/*; do
+  for f in "$pdir"/*; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     mapfile -t hits < <(LC_ALL=C grep -rlFf "$f" -- "$dir" 2>/dev/null)
@@ -159,7 +179,7 @@ stop_background() {
 }
 
 cleanup() {
-  local status=$? svc
+  local status=$? svc d
   set +e
   stop_background
   phase_done exit
@@ -169,9 +189,31 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
-  # Measurement inputs (no value, no secret: counters, timestamps, workload summaries), for a
-  # failed run's investigation.
+  # Measurement inputs (counters, timestamps, the raw pgbench / sysbench summaries), for a failed
+  # run's investigation: logs only, never in the results artifact.
   cp -f "$W"/out/*.jsonl "$W"/out/*.summary "$LOAD_LOG_DIR/" 2>/dev/null
+  # Leak scan before redaction (as e2e/run.sh): positive control first, a random canary written to
+  # the log directory must be found and redacted; then no registered secret may be in the logs or
+  # the results. A leak fails the run (the files are still redacted below before being kept).
+  local canary_dir="$W/canary-pattern" canary_hits leaked line
+  mkdir -p "$canary_dir"
+  printf 'load-canary-%s\n' "$(openssl rand -hex 16)" >"$canary_dir/canary"
+  { printf 'before '; cat "$canary_dir/canary"; printf 'after\n'; } >"$LOAD_LOG_DIR/zz-canary.log"
+  canary_hits="$(leak_scan "$LOAD_LOG_DIR" "$canary_dir")"
+  redact_dir "$LOAD_LOG_DIR" "$canary_dir" 2>/dev/null
+  if [ "$canary_hits" != "canary: zz-canary.log " ] || ! grep -qF '<REDACTED:canary>' "$LOAD_LOG_DIR/zz-canary.log" \
+      || grep -qFf "$canary_dir/canary" -- "$LOAD_LOG_DIR/zz-canary.log"; then
+    log "FAIL: leak scan positive control: canary not detected or not redacted"
+    status=1
+  fi
+  rm -rf -- "$LOAD_LOG_DIR/zz-canary.log" "$canary_dir"
+  for d in "$LOAD_LOG_DIR" "$LOAD_RESULTS_DIR"; do
+    if ! leaked="$(leak_scan "$d" "$P")"; then
+      while IFS= read -r line; do log "LEAK: $line"; done <<<"$leaked"
+      log "FAIL: secret(s) found in $d (redacted before being kept)"
+      status=1
+    fi
+  done
   redact_dir "$LOAD_LOG_DIR"
   redact_dir "$LOAD_RESULTS_DIR"
   log "tearing down"
@@ -837,8 +879,6 @@ python3 "$LOADLIB" report --facts "$FACTS" --samples "$SAMPLES_DB" "$SAMPLES_AGE
   --heartbeats "$HEARTBEATS" --out "$LOAD_RESULTS_DIR"
 rc=$?
 set -e
-cp -f "$W/out/pg-off.summary" "$W/out/pg-on.summary" "$W/out/mariadb-off.summary" "$W/out/mariadb-on.summary" \
-  "$LOAD_RESULTS_DIR/" 2>/dev/null || true
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$LOAD_RESULTS_DIR/results.md" ]; then
   cat "$LOAD_RESULTS_DIR/results.md" >>"$GITHUB_STEP_SUMMARY"
 fi

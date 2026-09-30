@@ -18,6 +18,12 @@ on demand (`workflow_dispatch`, with the Audit run length as input) and on pull 
 `load-test`. It is **not** part of the required `CI result` check (about 30 minutes). It uploads
 `results.json` and `results.md` (also written to the job summary) as the `load-results` artifact,
 and the redacted logs when it fails. The unit tests of the harness run on every pull request.
+On pull requests the job runs when the `load-test` label is added, and again on every new commit
+while the label stays. **For a pull request from a fork, remove the label when new commits arrive and
+re-apply it only after reviewing them**: the job runs the pull request's code (with `contents: read`
+and no secret, but on a runner for about 30 minutes). Before redaction, the run scans its logs and
+results for every generated secret (with a canary as positive control, as `e2e/run.sh`); a hit is
+logged as `LEAK:` and fails the run. The raw pgbench / sysbench summaries go to the logs only.
 
 **Status (first runs, 2026-09-30, local, `LOAD_PG_AUDIT=pss`): two checks fail, on purpose.** They
 are findings about the agent, not harness defects, and are tracked outside this harness:
@@ -72,7 +78,7 @@ local `e2e/run.sh`).
 | `LOAD_CLIENTS` | 4 | Workload connections per engine |
 | `LOAD_WORKLOAD_TABLES` | 40 | Tables the workload reads: the first ones of the plan (pgbench takes at most 128 scripts) |
 | `LOAD_BASELINE_S` | 120 | Workload without Audit |
-| `LOAD_SOAK_S` | 600 | Workload with Audit: the Audit measurements and the agent resource run |
+| `LOAD_SOAK_S` | 600 | Workload with Audit: the Audit measurements and the agent resource run (at most 1800) |
 | `LOAD_DRAIN_TIMEOUT_S` | 300 | Longest wait for the Audit run's events after the workload |
 | `LOAD_PG_AUDIT` | `pgaudit` | `pss`: local runs without the pgaudit image (above) |
 | `LOAD_HTTPS_PORT` | 8543 | Port of the TLS proxy on 127.0.0.1 |
@@ -84,7 +90,7 @@ local `e2e/run.sh`).
    the `server_audit` log, ADR-0026 account), workload scripts ([`seed.py`](seed.py)).
 2. Build and start the console and the targets. The targets are the e2e ones (same images, the e2e
    and dev init scripts, the committed dev seed) plus the workload account `load_app`
-   ([`initdb/`](initdb/)), read-only on the load tables; a CPU limit of `LOAD_DB_CPUS` each. Their
+   ([`initdb/`](initdb/)), granted `SELECT` table by table on the load tables; a CPU limit of `LOAD_DB_CPUS` each. Their
    Docker healthchecks run every 2 s while starting, then every 60 s: each check is a process inside
    the target's cgroup (30 to 70 ms of CPU), noise the idle baselines would otherwise absorb.
 3. Start the sampler ([`loadlib.py sample`](loadlib.py)): every 0.5 s, each target's cgroup CPU
@@ -94,8 +100,8 @@ local `e2e/run.sh`).
    disk, nothing committed): 400 tables in 4 schemas (PostgreSQL) or in `support` (MariaDB), every
    tenth table 20 times larger than the others (about 17 000 rows against 860), kinds `contact`
    (e-mail, phone), `billing` (IBAN with valid check digits, amount), `plain` (no sensitive column) and
-   `mixed`; 200 collections in `app` (MongoDB). Synthetic, deterministic values under `example.*`
-   domains. Sampling is bounded per object, so a scan's length depends on the number of objects, not
+   `mixed`; 200 collections in `app` (MongoDB). Synthetic, deterministic values: e-mails under example domains, phones in the ARCEP
+   fiction range `+33 6 39 98`, IBANs with an unassigned bank code (`99xxx`). Sampling is bounded per object, so a scan's length depends on the number of objects, not
    rows: with 40 tables the scans lasted 0.2 to 0.5 s, dominated by fixed costs (connection,
    authentication, a new backend's catalog cache) and too short for the sampling interval; hundreds of
    objects give scans of a few seconds whose steady state is measured. PostgreSQL gets `VACUUM (ANALYZE)` and a `CHECKPOINT`, MariaDB `ANALYZE TABLE`; then the
