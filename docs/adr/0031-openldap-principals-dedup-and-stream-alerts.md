@@ -1,6 +1,6 @@
 # ADR-0031: Incident dedup of fingerprinted principals, alert on stopped Audit streams, OpenLDAP residuals
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-29
 - **Refines**: [ADR-0021](0021-access-event-correlation.md) decisions 6 and 7 (dedup scope of fingerprinted principals, events after a false positive) and [ADR-0029](0029-openldap-connector.md) (principal grouping and panic isolation consequences, decision 7 object order); both stay Accepted. Adds a system alert to the set of [ADR-0017](0017-alerting.md) decision 5.
 - **Context references**: end-of-phase-6 security review on `0475510` (findings M1, M2, L3, L4, I3); `console/src/lib/event-model.ts` (`coarsePrincipal`, `eventDedupKey`), `console/src/server/event-engine.ts` (dedup key and false-positive linking), `console/src/server/dropped-batches.ts` (the `agent.batches_dropped` pattern), `agent/crates/core/src/runtime.rs` (panic guard, `connector_panics_total`, `run_audit` resuming from the persisted cursor), `agent/crates/core/src/audit.rs` (cursor and settings files), `agent/crates/connector-openldap/src/audit/mod.rs` (`Position`), `agent/crates/connector-openldap/src/audit/events.rs` (event objects)
