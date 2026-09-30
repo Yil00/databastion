@@ -42,3 +42,9 @@ regexes = ['''hunter2-SECRET''', '''db[se]_(TOKEN){8}[0-9]{3}''']
 [[allowlists]]
 description = "DataBastion console test fixtures and UUIDs"
 regexes = ['''whsec_test-[a-z0-9-]+''', '''\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b''']
+
+# E2E leak-scanner unit test fixture (e2e/test_i2_check.py SecretScanTest.SECRET): a fixed fake
+# 48-hex value standing in for a generated DCL password. Fake by construction.
+[[allowlists]]
+description = "DataBastion E2E leak-scanner test fixture"
+regexes = ['''4f9c2e7a1b3d5f60a8c4e2b9d7f1a3c5e6b8d0f2a4c6e8b1''']

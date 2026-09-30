@@ -34,6 +34,7 @@ import {
   newToken,
 } from "@/test/helpers";
 
+import * as cryptoModule from "@/server/crypto";
 import { ipBucket } from "@/server/request";
 import { CONSOLE_ACCEPTS } from "@/server/agent-api/capabilities";
 
@@ -626,15 +627,40 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     it("allows one unrecognized verification in flight per agent id (L1)", async () => {
       const auth = await enroll();
       const wrong = (await enroll("l1-other")).secret;
-      const results = await Promise.all(
-        Array.from({ length: 6 }, () =>
-          handleHeartbeat(
-            agentRequest("POST", "/heartbeat", { auth: { agentId: auth.agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
-          ),
-        ),
-      );
-      expect(results.filter((r) => r.status === 401)).toHaveLength(1);
-      expect(results.filter((r) => r.status === 503)).toHaveLength(5);
+      const neighbour = await enroll("l1-neighbour");
+      const heartbeat = (agentId: string) =>
+        handleHeartbeat(
+          agentRequest("POST", "/heartbeat", { auth: { agentId, secret: wrong }, body: MINIMAL_HEARTBEAT }),
+        );
+      // Deterministic: the first wrong-secret verification is held inside argon2id (real path: the
+      // gate marks the agent id in flight), so no timing can free its slot early.
+      let finish = (): void => undefined;
+      const held = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const verify = vi.spyOn(cryptoModule, "argon2Verify").mockImplementation(async () => {
+        await held;
+        return false;
+      });
+      try {
+        const first = heartbeat(auth.agentId);
+        await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+        // Every other unrecognized secret for the same agent id is turned away before argon2id.
+        const others = await Promise.all(Array.from({ length: 5 }, () => heartbeat(auth.agentId)));
+        expect(others.map((r) => r.status)).toEqual([503, 503, 503, 503, 503]);
+        expect(verify).toHaveBeenCalledTimes(1);
+        // The limit is per agent id, not a saturated pool: another agent id is still verified.
+        const neighbourDone = heartbeat(neighbour.agentId);
+        await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(2));
+        finish();
+        expect((await first).status).toBe(401);
+        expect((await neighbourDone).status).toBe(401);
+      } finally {
+        finish();
+        verify.mockRestore();
+      }
+      // Once the slot is free, the next one is verified again (and fails: 401).
+      expect((await heartbeat(auth.agentId)).status).toBe(401);
     });
 
     it("saturated login and wrong-secret pools never block a known-good agent", async () => {
