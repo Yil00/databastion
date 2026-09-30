@@ -20,7 +20,7 @@
 //! | IBAN, card, NIR (checksums) | `matched ≥ 1` and at least half of the checksum-shaped candidates are valid; card: not under an order / tracking / IMEI / SIRET name | `0.6 + 0.35·ratio (+0.05 hint)` |
 //! | AWS key id, secret key in context, password hash | `matched ≥ 1` | idem |
 //! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
-//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07`), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it) | `0.4 + 0.4·ratio (+0.2 hint)` |
+//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07` or `00` + country code + mobile prefix), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it), or 3 values and `≥ 0.05` with a formatted number among words (free text); in a contact column, the shares `0.3` and `0.8` are taken over the values that are not e-mail addresses (3 values at least) | `0.4 + 0.4·ratio (+0.2 hint)` |
 //! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
 //! | person name | never under a name of something else (`pet_name`, `hostname`, `product.name`, `team_name`, `company_name`…); hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
 //! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
@@ -73,6 +73,12 @@ const PHONE_MIN_RATIO: f64 = 0.3;
 /// parentheses, a phone label), and their share.
 const PHONE_STRONG_MIN_MATCHED: u32 = 3;
 const PHONE_STRONG_MIN_RATIO: f64 = 0.05;
+/// Phone without a name hint, in free text: values where a normal or strong
+/// number sits among words, and their share.
+const PHONE_TEXT_MIN_MATCHED: u32 = 3;
+const PHONE_TEXT_MIN_RATIO: f64 = 0.05;
+/// Letters outside the phone tokens that make a value text.
+const PHONE_TEXT_MIN_LETTERS: usize = 3;
 /// E-mail and labelled dates in text: share of values without a hint.
 const EMBEDDED_MIN_RATIO: f64 = 0.05;
 /// Tokens found in text: values whatever the share.
@@ -138,6 +144,11 @@ struct Stats {
     /// Values with a strong phone token, and with a normal one at best.
     phone_strong: u32,
     phone_normal: u32,
+    /// Values with a normal or strong phone token among words.
+    phone_text: u32,
+    /// Values with an e-mail token and no phone token: the other half of a
+    /// contact column ("e-mail or phone").
+    email_only: u32,
     /// Values that are a whole compact national number, and among them
     /// those with a mobile prefix (`06`, `07`).
     phone_compact: u32,
@@ -341,6 +352,14 @@ impl ColumnClassifier<'_> {
                 Some(detect::PhoneStrength::Normal) => st.phone_normal += 1,
                 _ => {}
             }
+            let has = |c| tokens.iter().any(|t| t.classifier == c);
+            if cand.phone >= Some(detect::PhoneStrength::Normal)
+                && has(ClassifierId::Phone)
+                && letters_outside_phones(value, &tokens) >= PHONE_TEXT_MIN_LETTERS
+            {
+                st.phone_text += 1;
+            }
+            st.email_only += u32::from(has(ClassifierId::Email) && !has(ClassifierId::Phone));
             let mut hit = [false; ClassifierId::ALL.len()];
             let (mut aws, mut hash, mut labelled) = (false, false, false);
             for t in &tokens {
@@ -367,7 +386,7 @@ impl ColumnClassifier<'_> {
             {
                 st.phone_compact += 1;
                 let v = value.trim();
-                st.phone_compact_mobile += u32::from(v.starts_with("06") || v.starts_with("07"));
+                st.phone_compact_mobile += u32::from(compact_mobile(v));
             }
             st.aws_tokens += u32::from(aws);
             st.hash_tokens += u32::from(hash);
@@ -489,6 +508,37 @@ impl ColumnClassifier<'_> {
     }
 }
 
+/// Letters of a value outside its phone tokens (a number among words).
+fn letters_outside_phones(value: &str, tokens: &[detect::Token]) -> usize {
+    value
+        .char_indices()
+        .filter(|(i, c)| {
+            c.is_alphabetic()
+                && !tokens
+                    .iter()
+                    .any(|t| t.classifier == ClassifierId::Phone && t.range.contains(i))
+        })
+        .count()
+}
+
+/// A whole compact number with a mobile prefix: French `06` / `07`, or
+/// `00` + a country code + its mobile prefix (`0033 6…`, `0044 7…`,
+/// `0049 15…`–`17…`, `0032 4…`, `0041 7…`, `0034 6…` / `7…`, `0039 3…`,
+/// `0031 6…`).
+fn compact_mobile(v: &str) -> bool {
+    if v.starts_with("06") || v.starts_with("07") {
+        return true;
+    }
+    let Some(rest) = v.strip_prefix("00") else {
+        return false;
+    };
+    [
+        "336", "337", "447", "4915", "4916", "4917", "324", "417", "346", "347", "393", "316",
+    ]
+    .iter()
+    .any(|p| rest.starts_with(p))
+}
+
 /// Whether classifier `c`, matched in `matched` values, is reported for the
 /// column (module table).
 fn decide(c: ClassifierId, matched: u32, st: &Stats, hints: &NameHints) -> bool {
@@ -506,13 +556,23 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats, hints: &NameHints) -> bool 
             !constant && (hint || ratio >= EMBEDDED_MIN_RATIO || matched >= EMBEDDED_MIN_MATCHED)
         }
         ClassifierId::Phone => {
+            // In a contact column ("e-mail or phone"), the phone numbers
+            // are the values that are not e-mail addresses.
+            let others = st.n.saturating_sub(st.email_only).max(1);
+            let share_others = |k: u32| f64::from(k) / f64::from(others);
+            let formatted = st.phone_strong + st.phone_normal;
             (hint && hints.gates(c))
-                || share(st.phone_strong + st.phone_normal) >= PHONE_MIN_RATIO
+                || share(formatted) >= PHONE_MIN_RATIO
+                || (formatted >= PHONE_STRONG_MIN_MATCHED
+                    && share_others(formatted) >= PHONE_MIN_RATIO)
                 || (st.phone_strong >= PHONE_STRONG_MIN_MATCHED
                     && share(st.phone_strong) >= PHONE_STRONG_MIN_RATIO)
+                // Free text: numbers that fit a numbering plan, among words.
+                || (st.phone_text >= PHONE_TEXT_MIN_MATCHED
+                    && share(st.phone_text) >= PHONE_TEXT_MIN_RATIO)
                 // A column of compact mobile numbers (zero-padded
-                // identifiers do not cluster on `06` / `07`).
-                || (share(st.phone_compact) >= 0.8
+                // identifiers do not cluster on mobile prefixes).
+                || (share_others(st.phone_compact) >= 0.8
                     && st.phone_compact >= 3
                     && st.phone_compact_mobile * 10 >= st.phone_compact * 6)
         }
@@ -663,6 +723,91 @@ mod tests {
             run("iban", &["FR7630006000011234567890189"]),
             [(C::Iban, 1, 1)]
         );
+    }
+
+    fn phone_found(name: &str, values: &[String]) -> bool {
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        run(name, &refs).iter().any(|(c, _, _)| *c == C::Phone)
+    }
+
+    #[test]
+    fn phones_in_contact_columns() {
+        // "E-mail or phone": the numbers are the values that are not
+        // addresses, compact mobile numbers included.
+        let compact: Vec<String> = (0..40)
+            .map(|i| {
+                if i % 5 < 2 {
+                    format!("06{:08}", 12_345_678 + i * 7919)
+                } else {
+                    format!("user{i}@example.com")
+                }
+            })
+            .collect();
+        assert!(phone_found("login", &compact));
+        let formatted: Vec<String> = (0..40)
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("01 99 00 {:02} {:02}", i, 99 - i)
+                } else {
+                    format!("user{i}@example.com")
+                }
+            })
+            .collect();
+        assert!(phone_found("contact", &formatted));
+        // E-mail addresses and user ids: no phone.
+        let ids: Vec<String> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("0{:09}", 123_456_789 + i * 104_729)
+                } else {
+                    format!("user{i}@example.com")
+                }
+            })
+            .collect();
+        assert!(!phone_found("login", &ids));
+    }
+
+    #[test]
+    fn phones_in_free_text() {
+        // 8 % of the notes hold a number in a national format, no label.
+        let notes: Vec<String> = (0..100)
+            .map(|i| {
+                if i % 12 == 0 {
+                    format!("Nouveau numéro 01 99 00 {i:02} 59 (ancien supprimé).")
+                } else {
+                    format!("Commande {} expédiée le 03/05/2024.", 1000 + i)
+                }
+            })
+            .collect();
+        assert!(phone_found("notes", &notes));
+        // Two numbers in 100 notes are not enough.
+        let rare: Vec<String> = (0..100)
+            .map(|i| {
+                if i % 50 == 0 {
+                    format!("Nouveau numéro 01 99 00 {i:02} 59.")
+                } else {
+                    format!("Commande {} expédiée.", 1000 + i)
+                }
+            })
+            .collect();
+        assert!(!phone_found("notes", &rare));
+        // Numbers among words that fit no numbering plan.
+        let serials: Vec<String> = (0..100)
+            .map(|i| format!("S/N 00{:02} 4567 {:02} returned, lot 0{:09}", i, i, i * 7))
+            .collect();
+        assert!(!phone_found("c1", &serials));
+    }
+
+    #[test]
+    fn signed_decimals_are_not_phones() {
+        let coords: Vec<String> = (0..50)
+            .map(|i| format!("+48.{:06}, +2.{:06}", 850_000 + i * 17, 350_000 + i * 13))
+            .collect();
+        assert!(!phone_found("c1", &coords));
+        let amounts: Vec<String> = (0..50)
+            .map(|i| format!("+{}.{:02}", 1_234_567 + i * 1_013, i))
+            .collect();
+        assert!(!phone_found("delta", &amounts));
     }
 
     #[test]

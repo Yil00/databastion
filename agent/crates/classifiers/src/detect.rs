@@ -88,11 +88,13 @@ static PHONE_INTL: LazyLock<Regex> = LazyLock::new(|| {
         r"(?:\+|\b00)[1-9](?:[ .\-/]{0,2}(?:\(0\)|\([0-9]{1,4}\)|[0-9])){6,17}",
     )
 });
-/// North American: `(202) 555-0125`, `202-555-0125`, `1 202.555.0125`.
+/// North American: `(202) 555-0125`, `202-555-0125`, `1 202.555.0125`. The
+/// exchange may start with any digit (`555-123-4567`: test data and
+/// directories often ignore the `[2-9]` rule); the area code may not.
 static PHONE_NANP: LazyLock<Regex> = LazyLock::new(|| {
     re(
         "PHONE_NANP",
-        r"(?:\b1[ .\-]?)?(?:\([2-9][0-9]{2}\)[ .\-]?|\b[2-9][0-9]{2}[ .\-])[2-9][0-9]{2}[ .\-][0-9]{4}\b",
+        r"(?:\b1[ .\-]?)?(?:\([2-9][0-9]{2}\)[ .\-]?|\b[2-9][0-9]{2}[ .\-])[0-9]{3}[ .\-][0-9]{4}",
     )
 });
 /// Mobile numbers without a trunk prefix, in their national grouping:
@@ -115,7 +117,11 @@ static PHONE_TRUNK: LazyLock<Regex> = LazyLock::new(|| {
 static PHONE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
     re(
         "PHONE_LABEL",
-        r"(?i)(?:\bt[ée]l\b|\bt[ée]l[ée]phone|phone|\bfax\b|mobile|portable|\bgsm\b|\bcell|\bcall|\bappel|joindre|whatsapp|\bsms\b|\bmob\b|telefon|\bn[°o]\s*(?:de\s+)?t[ée]l)[^0-9]{0,24}$",
+        concat!(
+            r"(?i)(?:\bt[ée]l\b|\bt[ée]l[ée]phone|phone|\bfax\b|mobile|portable|\bgsm\b|\bcell|\bcall|\br?appel(?:er|ez|le|lez|é|ée|ons)?\b|joindre|joignable",
+            r"|whatsapp|\bsms\b|\bmob\b|telefon|\bn[°o]\s*(?:de\s+)?t[ée]l|voicemail|\breach(?:ed)?\s+(?:me\s+|us\s+)?(?:at|on)\b",
+            r"|\bm[óo]vil|\bhandy|anruf|zur[üu]ckruf|\bllam|\bchiam)[^0-9]{0,24}$"
+        ),
     )
 });
 static PHONE_EXTENSION: LazyLock<Regex> = LazyLock::new(|| {
@@ -922,9 +928,16 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
         for m in r.find_iter(v) {
             let text = m.as_str();
             let before = prev_char(v, m.start());
-            if before.is_some_and(|c| {
-                c.is_alphanumeric() || matches!(c, '+' | '_' | '/' | '=' | '$' | '#' | '-' | '.')
-            }) {
+            // `Tél.06 12 34 56 78`: a dot that ends an abbreviated label.
+            let label_dot = before == Some('.')
+                && prev_char(v, m.start() - 1).is_some_and(char::is_alphabetic)
+                && phone_label_before(v, m.start());
+            if !label_dot
+                && before.is_some_and(|c| {
+                    c.is_alphanumeric()
+                        || matches!(c, '+' | '_' | '/' | '=' | '$' | '#' | '-' | '.')
+                })
+            {
                 continue;
             }
             // Not the end of a longer number either (`… 3704 0044 0532`).
@@ -939,6 +952,8 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
             let mut after = v[m.end()..].chars();
             let glued = match after.next() {
                 None => false,
+                // An extension glued to the number (`202-555-0125x12`).
+                Some('x' | 'X') => !extension_after(&v[m.end() + 1..]),
                 Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '@' | '%') => true,
                 Some(' ' | ',') => after.next().is_some_and(|c| c.is_ascii_digit()),
                 Some('.' | '-' | '/') => after.next().is_some_and(|c| c.is_ascii_alphanumeric()),
@@ -952,8 +967,12 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
                 text.chars().filter(char::is_ascii_digit).count() - text.matches("(0)").count();
             let separated = text.chars().any(|c| !c.is_ascii_digit() && c != '+');
             let strength = match kind {
-                // `+` / `00` prefix: 8 to 15 digits after it; `00` needs
-                // separators (zero-padded identifiers are not phones).
+                // `+` prefix: 8 to 15 digits after it. `00` prefix: 10 to
+                // 15 (`00` then 8 digits is a zero-led serial or
+                // identifier); compact, it is weak (`0033612345678`, like
+                // zero-padded identifiers). A single dot as the only
+                // separator is a signed decimal (`+48.856614`,
+                // `+1234567.89`), not a phone.
                 0 => {
                     let plus = text.starts_with('+');
                     let n = if plus {
@@ -961,11 +980,18 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
                     } else {
                         digits.saturating_sub(2)
                     };
-                    ((8..=15).contains(&n) && (plus || separated)).then_some(if plus {
-                        PhoneStrength::Strong
+                    let decimal = text
+                        .matches(|c: char| !c.is_ascii_digit() && c != '+')
+                        .eq(["."]);
+                    if !(8..=15).contains(&n) || decimal || (!plus && n < 10) {
+                        None
+                    } else if plus {
+                        Some(PhoneStrength::Strong)
+                    } else if separated {
+                        Some(PhoneStrength::Normal)
                     } else {
-                        PhoneStrength::Normal
-                    })
+                        (n <= 13).then_some(PhoneStrength::Weak)
+                    }
                 }
                 1 => nanp_valid(text).then_some(if text.contains('(') {
                     PhoneStrength::Strong
@@ -996,6 +1022,17 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
         }
     }
     best
+}
+
+/// 1 to 6 digits, then the end or a non-alphanumeric character: the digits
+/// of an extension glued to a number after its `x`.
+fn extension_after(rest: &str) -> bool {
+    let n = rest.chars().take_while(char::is_ascii_digit).count();
+    (1..=6).contains(&n)
+        && rest[n..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '.' | '-' | '/' | '_' | '@'))
 }
 
 /// A phone label in the few characters before a token.
@@ -1966,6 +2003,61 @@ mod tests {
         assert_eq!(phone_loose(" 2025550125 x12 "), Some(1..11));
         assert!(phone_loose("01/12/1950").is_none());
         assert!(phone_loose("1234").is_none());
+    }
+
+    #[test]
+    fn phone_formats_and_boundaries() {
+        let strength = |v: &str| scan(v, &|_| true).1.phone;
+        // Exchanges outside `[2-9]` (directories, test data), glued
+        // extensions, a compact `00` number (weak), an abbreviated label.
+        for (v, tok) in [
+            ("(555) 123-4567", "(555) 123-4567"),
+            ("555-123-4567", "555-123-4567"),
+            ("+1 555 123 4567", "+1 555 123 4567"),
+            ("202-555-0125x12", "202-555-0125"),
+            ("(202) 555-0125 X4", "(202) 555-0125"),
+            ("0033612345678", "0033612345678"),
+            ("Tél.06 12 34 56 78", "06 12 34 56 78"),
+            ("Rappeler au 0612345678 svp", "0612345678"),
+            ("Llamar al 612 34 56 78", "612 34 56 78"),
+            ("Please reach me at 020 7946 0958.", "020 7946 0958"),
+        ] {
+            assert_eq!(found(v), [(C::Phone, tok)], "{v}");
+        }
+        assert_eq!(strength("0033612345678"), Some(PhoneStrength::Weak));
+        assert_eq!(strength("0612345678"), Some(PhoneStrength::Weak));
+        assert_eq!(
+            strength("Rappeler au 0612345678"),
+            Some(PhoneStrength::Strong)
+        );
+        assert_eq!(strength("Tél.06 12 34 56 78"), Some(PhoneStrength::Strong));
+        // A word that merely starts like a label does not upgrade a number.
+        assert_eq!(
+            strength("Appellation contrôlée, lot 0612345678"),
+            Some(PhoneStrength::Weak)
+        );
+        for neg in [
+            // Signed decimals and coordinates.
+            "+48.856614",
+            "+48.8566140, +2.3522219",
+            "+1234567.89",
+            // `00` then fewer than 10 digits: a zero-led serial.
+            "0012 3456 78",
+            "S/N 0045 6789 12 returned",
+            "0012345678901234",
+            // An `x` glued to letters or a long run is not an extension.
+            "202-555-0125xyz",
+            "202-555-0125x1234567",
+            "0x1234abcd",
+            "(123) 456-7890",
+            "211-555-0125",
+        ] {
+            assert!(
+                found(neg).iter().all(|(c, _)| *c != C::Phone),
+                "{neg}: {:?}",
+                found(neg)
+            );
+        }
     }
 
     #[test]
