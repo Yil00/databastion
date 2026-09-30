@@ -135,7 +135,7 @@ Every item is checked on the `dev` commit that becomes the release (and on the `
 - [ ] **[CHANGELOG.md](CHANGELOG.md) "Unreleased" section reviewed**: accurate, no promise the code does not keep; the generated release notes put breaking changes first, with upgrade steps
 - [ ] **Documentation**: [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix, [user guide](docs/10-user-guide.md), [SECURITY.md](SECURITY.md) supported versions, [ROADMAP](docs/ROADMAP.md) and [CONTEXT.md](CONTEXT.md) up to date
 - [ ] **Compatibility**: console N with agent N-1 tested (from the second release on; [§ 2](#compatibility))
-- [ ] **GitHub settings** ([§ 6](#repository-configuration-one-time)): `RELEASE_TOKEN` secret present and not expired; `main` and `dev` rulesets as in [§ 1](#1-branches), with "Require review from Code Owners" enabled (the protocol registry checks rely on [.github/CODEOWNERS](.github/CODEOWNERS)); private vulnerability reporting enabled (*Settings → Code security*), since [SECURITY.md](SECURITY.md) relies on it
+- [ ] **GitHub settings** ([§ 6](#repository-configuration-one-time)): `RELEASE_TOKEN` secret present and not expired; `main` and `dev` rulesets as in [§ 1](#1-branches), with "Require review from Code Owners" enabled (the protocol registry checks rely on [.github/CODEOWNERS](.github/CODEOWNERS)); private vulnerability reporting enabled (*Settings → Code security*), since [SECURITY.md](SECURITY.md) relies on it; the release tag ruleset and the deployment environments as described in RELEASE.md section 6 (added by the packaging PR)
 - [ ] **After publishing**: images signed, with SBOM and provenance ([publish.yml](.github/workflows/publish.yml)); `cosign verify` passes on both images ([§ 4](#4-published-artifacts)); the GHCR packages are public
 
 ### Additional items for v0.1.0
@@ -149,7 +149,7 @@ The classifier gate of the CI scores the classifiers on a held-out corpus genera
 
 **When.** On `dev`, after the last classifier change of the release is merged and before the release candidate (the `-rc.N` tag, or the `dev` → `main` release PR when there is no candidate). The release is then measured on values nobody tuned against, and the new seed stays in place for the next development cycle. First rotation: v0.1.0.
 
-**Who.** Preferably someone who did not change the classifiers during the cycle. In any case the rotation PR touches `dev/holdout/` only: whoever changes the classifiers does not change the corpus in the same PR (independence rule).
+**Who.** Preferably someone who did not change the classifiers during the cycle. In any case the rotation PR touches `dev/holdout/` only: whoever changes the classifiers does not change the corpus in the same PR (independence rule). The CI output of the rotation PR (aggregates plus the ids and tags of the failing columns, never a value) is public, like every CI log.
 
 **How.**
 1. Branch from `dev` (for example `test/p7-holdout-seed-0.1.0`).
@@ -164,4 +164,4 @@ The classifier gate of the CI scores the classifiers on a held-out corpus genera
 5. Run the gate as the CI does, from `agent/`: `cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture`.
 6. Commit `generate.py`, `labels.json` and `README.md` only (`corpus.json` stays git-ignored), open the PR to `dev` and let the CI run the blocking holdout gate.
 
-**If the gate fails on the new seed**, the release waits: do not change the corpus back, and do not tune the classifiers against the failing columns. Fix the classifiers in a separate PR, against the dev seed or examples of your own ([dev/holdout/README.md](dev/holdout/README.md#independence-rule)), then check the gate again.
+**If the gate fails on the new seed**, the release waits: do not change the corpus back, and do not tune the classifiers against the failing columns. Fix the classifiers in a separate PR, against the dev seed or examples of your own ([dev/holdout/README.md](dev/holdout/README.md#independence-rule)), then check the gate again. The person who rotated the seed, and has seen the failing columns, does not write that fix. If a fix is nevertheless made while looking at the new seed's failures, record in the release notes or the ROADMAP that this release's holdout result is no longer independent, and rotate the seed again at the start of the next cycle.

@@ -46,7 +46,7 @@ The reference is [deploy/docker-compose.example.yml](../deploy/docker-compose.ex
 Notes:
 - 0.1 has one user role in practice: the bootstrap administrator. There is no user-management page or API yet; the `analyst` role exists in the schema but no account can be created with it from the console.
 - Without a usable `DATABASTION_ENCRYPTION_KEY`, the web and worker processes refuse to start in production. Changing it later makes the stored masked samples and notification channel secrets unusable ([console/README.md](../console/README.md#configuration)).
-- Prometheus metrics: `/metrics` on the dedicated port `9464`, with the `metrics_token` as bearer token ([console/README.md](../console/README.md#metrics)).
+- Prometheus metrics: `/metrics` on the dedicated port `9464`, with the `metrics_token` as bearer token ([console/README.md](../console/README.md#metrics)). Never publish that port: it must be reachable only by Prometheus, on the internal network.
 - Plan the internal database's `max_connections` from the sizing in [console/README.md](../console/README.md#docker-image).
 
 ## 4. Install an agent
@@ -58,6 +58,8 @@ Deploy the agent on the host or network of the databases it monitors, not next t
 | `/var/lib/databastion` (volume, `0700`, owned by uid 10001) | Identity, local HMAC key, spool |
 | Secret files referenced by `agent.yaml` (read-only, `0600`, owned by uid 10001) | Database passwords |
 | Log directories of the targets (read-only), for file-based Audit sources | e.g. the pgaudit or `server_audit` log |
+
+The commented agent block at the end of the deployment example currently uses the `:latest` tag and keeps the enrollment token in its `secrets`. This is a known issue, to be fixed in `deploy/`. Until then, pin the image by a verified digest ([SECURITY.md](../SECURITY.md#verifying-release-artifacts)) and remove the token secret once the agent is enrolled.
 
 Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-privileges` ([agent/README.md](../agent/README.md#docker-image)). The image has no health check because the agent has no listener: its health is shown by the console (agent status, `databastion_agent_up`).
 
@@ -72,7 +74,11 @@ Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the 
 
 ## 5. Enroll the agent
 1. In the console, **Enrollment tokens** (administrator): create a token. The `dbe_…` token is shown **once**; it is single-use and valid 24 h.
-2. On the agent host, write it to a file readable by the agent user only (`0600`); the agent refuses a token file readable by others.
+2. On the agent host, write it to a file readable by the agent user only (`0600`); the agent refuses a token file readable by others. Create the file empty with the right mode first, then paste the token with an editor or `read -rs`; never `echo <token> > file`, which leaves the token in the shell history:
+   ```sh
+   install -m 0600 -o <agent user> /dev/null /path/to/token
+   read -rs TOKEN && printf '%s' "$TOKEN" > /path/to/token && unset TOKEN
+   ```
 3. Enroll, once:
    ```sh
    databastion-agent enroll --config /etc/databastion/agent.yaml --token-file /path/to/token
@@ -110,8 +116,8 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 |--------|-----------|-------|-----------|
 | PostgreSQL | `CONNECT` + per-schema `USAGE` / `SELECT` | `pg_read_all_stats`; the pgaudit log file readable by the agent | [ADR-0012](adr/0012-postgresql-agent-grants.md), [connector README](../agent/crates/connector-postgres/README.md) |
 | MySQL / MariaDB | per-database `SELECT`, `REQUIRE SSL`, host restricted to the agent | no grant with a log file source; `SELECT ON performance_schema.*` only when it is the source | [ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md), [ADR-0025](adr/0025-mysql-mariadb-role-privileges-and-heartbeat-checks.md), [connector README](../agent/crates/connector-mysql/README.md) |
-| MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256 | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
-| OpenLDAP | service DN with `read` on the tree, **no** access to credential attributes | `read` on `cn=accesslog` | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
+| MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256, `authenticationRestrictions` with `clientSource` = the agent's address(es) | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
+| OpenLDAP | service DN with `read` on the tree; rule `{0}` names **every** credential attribute of the loaded schemas (`userPassword`, `userPKCS12`, and the Samba, Kerberos, ppolicy… ones where loaded), never readable; a `peername.ip` restriction to the agent's address, since the accesslog records no client address | `read` on `cn=accesslog` only while Audit runs for the target (otherwise `privilege.accesslog_without_audit`) | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.

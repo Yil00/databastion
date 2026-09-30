@@ -29,7 +29,7 @@ In scope, in this repository:
 Out of scope: the dev environment and the test harnesses (`dev/`, `e2e/`, whose dev-only deviations are documented), vulnerabilities of the monitored engines themselves, and deployments that turn off a documented safeguard (for example `DATABASTION_ALERTING_INSECURE_DEV`, `insecure_dev_http`, `tls: disable_insecure`).
 
 ## Invariants
-A way to break one of these is a vulnerability. Details: [docs/05-security.md](docs/05-security.md).
+Breaking one of the security invariants I1 to I5 is a vulnerability: report it privately as above. I6 and I7 are project rules, not security properties: report a breach of them as a regular issue. Details: [docs/05-security.md](docs/05-security.md).
 
 | # | Invariant |
 |---|-----------|
@@ -44,14 +44,22 @@ A way to break one of these is a vulnerability. Details: [docs/05-security.md](d
 Also particularly sensitive: bypassing agent or console authentication, tampering with the console audit log or the agent-integrity alerts, and agent privilege escalation on the monitored databases.
 
 ## Verifying release artifacts
-The console and agent images are published to GHCR by [publish.yml](.github/workflows/publish.yml) when a release or pre-release tag is created: multi-arch (amd64, arm64), signed with cosign in keyless mode (GitHub OIDC), with an SBOM and a provenance attestation. Verify the signature before deploying ([RELEASE.md](RELEASE.md#4-published-artifacts)):
+The console and agent images are published to GHCR by [publish.yml](.github/workflows/publish.yml): multi-arch (amd64, arm64), signed with cosign in keyless mode (GitHub OIDC), with an SBOM and a provenance attestation. Under ADR-0034 (added by the packaging PR), images and release artifacts are signed by `publish.yml` only, in the run triggered by the push of the release tag. The certificate identity is therefore exact for each version: check it exactly, never with a pattern.
 
-```bash
-cosign verify ghcr.io/yil00/databastion-agent:<tag> \
-  --certificate-identity-regexp '^https://github.com/Yil00/databastion/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
+1. Resolve the digest of the tag (a tag can be moved in a registry; a digest cannot):
+   ```bash
+   VERSION=0.1.0
+   IMAGE=ghcr.io/yil00/databastion-agent
+   docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest
+   # or: crane digest "$IMAGE:$VERSION"
+   ```
+2. Verify the signature of that digest:
+   ```bash
+   cosign verify "$IMAGE@sha256:<digest>" \
+     --certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     --certificate-github-workflow-trigger push
+   ```
+3. Deploy exactly that digest (`$IMAGE:$VERSION@sha256:<digest>`), never the bare tag.
 
-Same command for `ghcr.io/yil00/databastion-console:<tag>`. Then pin the verified digest (`image:<tag>@sha256:<digest>`), as the [deployment example](deploy/docker-compose.example.yml) explains.
-
-Not available yet: the agent `.deb` package and the `SHA256SUMS` file with its signature are planned for v0.1.0 ([ROADMAP](docs/ROADMAP.md) phase 7); their verification will be documented with the packaging.
+Same steps for `ghcr.io/yil00/databastion-console`. The full verification steps, including the agent `.deb` packages and the signed `SHA256SUMS`, are in RELEASE.md section 4 and deploy/README.md, both updated by the packaging PR. Until that PR is merged, the `.deb` packages and `SHA256SUMS` are not published.
