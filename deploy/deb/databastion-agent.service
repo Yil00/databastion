@@ -1,9 +1,11 @@
 # DataBastion agent: systemd unit installed by the databastion-agent .deb (deploy/README.md).
 #
 # The agent is an HTTPS client only: it opens no listening port (invariant I1). Nothing here adds
-# one. Defence in depth, should a bug or a compromised dependency try: SocketBindDeny=any makes
-# the kernel refuse any bind() to an IP port, and the system-call filter refuses listen(),
-# accept() and accept4() (a listen() on an unbound socket would otherwise auto-bind a port).
+# one. Defence in depth, should a bug or a compromised dependency try: the system-call filter
+# refuses bind(), listen(), accept() and accept4() for every socket family (the agent only
+# connects out; strace of an enrollment and of the run loop: none of these calls). SocketBindDeny=any
+# is kept as a second layer, but does not refuse every bind: a bind to port 0 (an ephemeral port)
+# went through it in CI (systemd 255).
 #
 # Customize with a drop-in (`systemctl edit databastion-agent`), never by editing this file:
 # - read database audit logs: SupplementaryGroups=<group of the log files>. The agent refuses an
@@ -53,7 +55,7 @@ RestrictSUIDSGID=yes
 RemoveIPC=yes
 
 # Network: outbound TCP to the console and the declared targets, Unix sockets of local targets.
-# No listening socket of any family (the system-call filter below also denies listen / accept).
+# No listening socket of any family: the system-call filter below denies bind / listen / accept.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SocketBindDeny=any
 
@@ -72,7 +74,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
-SystemCallFilter=~listen accept accept4
+SystemCallFilter=~bind listen accept accept4
 # io_uring could perform socket operations outside the filter above (the agent's runtime uses epoll).
 SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register
 SystemCallErrorNumber=EPERM

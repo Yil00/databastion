@@ -210,9 +210,10 @@ created before the files are unpacked, so the archive gives every path its final
 **Service hardening.** The unit runs the agent as `databastion` with no capability and
 `NoNewPrivileges`, a read-only system (`ProtectSystem=strict`, only `/var/lib/databastion`
 writable), no access to `/home`, a private `/tmp` and `/dev`, IPv4 / IPv6 / Unix sockets only,
-and, as defence in depth for invariant I1 (the agent itself opens no listener), `SocketBindDeny=any`
-(the kernel refuses a bind to an IP port) and `listen()`, `accept()`, `accept4()` refused by the
-system-call filter (a `listen()` on an unbound socket would otherwise pick a port by itself); the
+and, as defence in depth for invariant I1 (the agent itself opens no listener), `bind()`,
+`listen()`, `accept()`, `accept4()` and io_uring refused by the system-call filter, for every socket
+family (the agent only connects out); `SocketBindDeny=any` is kept as a second layer, but does not
+refuse every bind on its own (a bind to port 0 went through it in CI); the
 `@system-service` system-call set without `@privileged`, `MemoryDenyWriteExecute`,
 `RestrictNamespaces`, `LockPersonality`, and the kernel protections (`ProtectKernel*`,
 `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`). `systemd-analyze security
@@ -272,7 +273,8 @@ runs the [Install](#install) steps above on a fresh runner, `DATABASTION_TLS=int
 them from the download of the deployment files to the agent shown online. It fails beyond 15
 minutes, and checks afterwards that the service is active without restart, holds no listening
 socket and logged no error; then it runs a probe under the installed unit's own `[Service]`
-settings, which must be refused `listen()` and `bind()` and allowed an outbound connection. Its
+settings, which must be refused io_uring, `listen()` and `bind()` (port 0, a fixed port, a Unix
+socket) and allowed an outbound connection. Its
 stand-ins are listed at the top of the script: the deployment bundle made from the checkout as
 publish.yml makes it (checksum checked, no cosign on unsigned pull-request artifacts), an
 `/etc/hosts` entry for DNS, the user API calls the UI makes. On pull

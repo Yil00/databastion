@@ -229,7 +229,8 @@ if sudo ss -H -ltnup | grep -F "pid=${pid},"; then fail "the agent listens on a 
 log "ok  no listening socket held by the agent (pid $pid)"
 # The unit's socket restrictions, enforced: a probe run under the installed unit's own [Service]
 # settings (ExecStart replaced) must be refused io_uring_setup(), listen() on an unbound socket and
-# bind() to a port, and still be allowed an outbound connect().
+# bind() (IPv4 / IPv6 on port 0 and on a fixed port, and an abstract Unix socket), and still be allowed
+# an outbound connect().
 probe=databastion-listen-probe
 cat >"$WORK/probe.py" <<'PY'
 import ctypes
@@ -242,19 +243,38 @@ libc = ctypes.CDLL(None, use_errno=True)
 params = ctypes.create_string_buffer(120)
 if libc.syscall(425, 1, params) != -1 or ctypes.get_errno() != errno.EPERM:
     sys.exit(f"io_uring_setup not refused (errno {ctypes.get_errno()})")
+def new_socket(family):
+    try:
+        return socket.socket(family)
+    except OSError as e:
+        if family == socket.AF_INET6 and e.errno == errno.EAFNOSUPPORT:
+            return None  # no IPv6 on this host
+        raise
+
 for family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
-    s = socket.socket(family)
+    s = new_socket(family)
+    if s is None:
+        continue
     try:
         s.listen(1)
         sys.exit(f"listen() allowed ({family.name})")
     except PermissionError:
         pass
-s = socket.socket()
-try:
-    s.bind(("127.0.0.1", 0))
-    sys.exit("bind() allowed")
-except PermissionError:
-    pass
+for family, address in (
+    (socket.AF_INET, ("127.0.0.1", 0)),
+    (socket.AF_INET, ("127.0.0.1", 18765)),
+    (socket.AF_INET6, ("::1", 0)),
+    (socket.AF_INET6, ("::1", 18765)),
+    (socket.AF_UNIX, "\0databastion-listen-probe"),
+):
+    s = new_socket(family)
+    if s is None:
+        continue
+    try:
+        s.bind(address)
+        sys.exit(f"bind() allowed ({family.name} {address!r})")
+    except PermissionError:
+        pass
 socket.create_connection(("127.0.0.1", 443), 5).close()
 print("probe ok")
 PY
