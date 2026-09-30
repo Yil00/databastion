@@ -145,11 +145,17 @@ load otherwise), so a server-wide load is the normal case.
   parameters in place (`audit::events::pss_form`, phase 7). The same
   statement sent with constants instead of parameters has another
   `queryid` and another text, and is reported. The text alone is not
-  enough: per role, database and level, the first `queryid` seen with an
-  own text is pinned, and another `queryid` with the same text (the text
-  prepared with every constant bound as a parameter) is reported. If such
-  an entry is seen before the agent's own, the agent's own executions are
-  reported instead: loud, not hidden. Anything else of
+  enough: an entry with an own text is the connector's only when its
+  `userid` is the agent's role (its oid, read once per connection), it is
+  a top-level entry, the connector runs that statement in that database
+  (the session and transaction statements in the declared databases, the
+  text query only in the poller's database), and its `queryid` is the one
+  first seen in that slot. Anything else with the same text is reported:
+  another role, a non-target database, a nested execution, or another
+  `queryid` (the text prepared with every constant bound as a parameter).
+  If such an entry is seen in the agent's own slot before the agent's
+  own, the agent's own executions are reported instead: loud, not hidden.
+  The slots are a closed set, so other roles cannot exhaust them. Anything else of
   the agent's account whose objects are unknown (`*`: any other function
   call, including `pg_catalog` ones that run SQL such as `query_to_xml`,
   text that does not parse, several statements) is **always reported** and

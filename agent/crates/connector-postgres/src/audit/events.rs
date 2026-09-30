@@ -376,9 +376,10 @@ pub(crate) enum OwnKind {
 /// client can prepare this exact text with every constant bound as a
 /// parameter, which gets another `queryid` and the same stored text. The
 /// `pg_stat_statements` poller therefore also pins, per own statement, the
-/// `(userid, dbid, toplevel)` entry's `queryid` first seen with that text
-/// and treats any other `queryid` with the same text as not the
-/// connector's (`audit::pss`, PR #90 review Low-1).
+/// entry's `queryid` first seen with that text, only in the slots the
+/// connector itself uses (the agent's role, top level, a database where
+/// it runs that statement), and treats anything else with the same text
+/// as not the connector's (`audit::pss`, PR #90 review Low-1).
 ///
 /// Only for the connector's own texts (a closed list): `None` on anything
 /// they never hold (a comment, an escape, bit or dollar-quoted string, a
@@ -508,7 +509,8 @@ fn pss_form(text: &str) -> Option<String> {
 pub(crate) struct PgOwn {
     core: OwnAccount,
     own_texts: Vec<String>,
-    own_pss: Vec<String>,
+    /// (`pg_stat_statements` form, statement as sent).
+    own_pss: Vec<(String, String)>,
     registry: SharedOwnStatements,
 }
 
@@ -539,7 +541,7 @@ impl PgOwn {
         }
         self.own_texts.push(text.to_owned());
         if let Some(f) = pss_form(text) {
-            self.own_pss.push(f);
+            self.own_pss.push((f, text.to_owned()));
         }
     }
 
@@ -562,13 +564,17 @@ impl PgOwn {
         self.own_texts.iter().any(|t| t == text)
     }
 
-    /// Which of the connector's own table-less statements `text`, read
-    /// from `pg_stat_statements` (not cut), is exactly, as
+    /// Which of the connector's own table-less statements (as sent) `text`,
+    /// read from `pg_stat_statements` (not cut), is exactly, as
     /// `pg_stat_statements` stores it ([`pss_form`]). The text is
-    /// necessary, not sufficient: the poller pins the entry's `queryid`
-    /// too.
-    pub(crate) fn own_pss_form(&self, text: &str) -> Option<usize> {
-        self.own_pss.iter().position(|t| t == text)
+    /// necessary, not sufficient: the poller also requires the agent's
+    /// role, a top-level entry, a database where the connector runs that
+    /// statement, and pins the entry's `queryid` (`audit::pss`).
+    pub(crate) fn own_pss_form(&self, text: &str) -> Option<&str> {
+        self.own_pss
+            .iter()
+            .find(|(f, _)| f == text)
+            .map(|(_, sent)| sent.as_str())
     }
 
     /// [`Self::own_pss_form`] as a test.

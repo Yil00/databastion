@@ -406,6 +406,16 @@ pub(crate) const PSS_FUNCTION_SCHEMA: &str = "SELECT n.nspname FROM pg_catalog.p
          AND p.pronamespace = e.extnamespace AND p.pronargs = 1 \
        LIMIT 1";
 
+/// The agent role's oid, the oids of the declared databases (`$1`,
+/// `text[]`) and of this session's database: the `pg_stat_statements`
+/// slots where the connector's own table-less statements may be
+/// recognized (PR #90 review Low-1). Catalog reads only.
+pub(crate) const OWN_OIDS: &str = "SELECT r.oid, \
+       ARRAY(SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = ANY($1)), \
+       (SELECT d.oid FROM pg_catalog.pg_database d \
+         WHERE d.datname = pg_catalog.current_database()) \
+       FROM pg_catalog.pg_roles r WHERE r.rolname = CURRENT_USER";
+
 /// Most `pg_stat_statements` entries read per poll (`pg_stat_statements.max`
 /// defaults to 5000).
 pub(crate) const PSS_MAX_ENTRIES: u32 = 20_000;
@@ -469,6 +479,7 @@ pub(crate) fn all_statements() -> Vec<String> {
         PGAUDIT_SETTINGS.to_owned(),
         OWN_CLIENT_ADDR.to_owned(),
         PSS_FUNCTION_SCHEMA.to_owned(),
+        OWN_OIDS.to_owned(),
         pss_counters("public", true).unwrap(),
         pss_counters("public", false).unwrap(),
         pss_texts("public", true).unwrap(),

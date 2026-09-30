@@ -69,39 +69,60 @@ pub(crate) struct PssPoller {
     pub(crate) panicked: u64,
 }
 
-/// Most (userid, dbid, toplevel, own statement) slots pinned; beyond,
-/// nothing more is recognized as the connector's own (reported).
-const MAX_OWN_KEYS: usize = 4096;
-
-/// The `queryid` of each of the connector's own table-less statements,
-/// per `(userid, dbid, toplevel)`: the first entry seen with the exact
-/// text (`PgOwn::own_pss_form`) is pinned, and another `queryid` with the
-/// same text is not the connector's (PR #90 review Low-1). A client can
-/// prepare the exact stored text with every constant bound as a
-/// parameter: that is another `queryid` with the same text. The
-/// connector's own statements have one `queryid` per database and role
-/// (the same parse tree), so a legitimate second key does not occur. If
-/// such a client's entry was seen first, the connector's own executions
-/// are the ones reported from then on: loud, not hidden. Not persisted:
-/// pinned again after an agent restart.
+/// Where the connector's own table-less statements may be recognized on
+/// `pg_stat_statements`, and the `queryid` pinned for each (PR #90 review
+/// Low-1). An entry whose text is exactly an own statement
+/// (`PgOwn::own_pss_form`) is the connector's only when all hold:
+/// - its `userid` is the agent's role (its oid, read once per connection);
+/// - it is a top-level entry (the connector never runs them nested);
+/// - the connector runs that statement in that database: the session and
+///   transaction statements (`sql::OWN_TABLELESS`) in the declared
+///   databases, the text query only in the poller's database;
+/// - its `queryid` is the one first seen in that slot. A client can
+///   prepare the exact stored text with every constant bound as a
+///   parameter: another `queryid`, same text. The connector's statements
+///   have one `queryid` per database and role, so a legitimate second key
+///   does not occur; if such a client's entry was seen first, the
+///   connector's own executions are the ones reported: loud, not hidden.
+///
+/// Anything else with an own text is reported. The slots are closed (at
+/// most 16 databases x 3 statements, plus one), so other roles cannot
+/// exhaust them. Not persisted: pinned again after an agent restart.
 #[derive(Default)]
 struct OwnKeys {
-    pinned: HashMap<(u32, u32, bool, usize), i64>,
+    /// The agent role's oid (`None`: unknown, nothing is own).
+    role: Option<u32>,
+    /// The declared databases' oids.
+    databases: Vec<u32>,
+    /// The poller's database oid.
+    poller_database: Option<u32>,
+    /// The text query the poller sends (as sent).
+    texts_sql: String,
+    pinned: HashMap<(u32, String), i64>,
 }
 
 impl OwnKeys {
-    /// Whether the entry `key`, whose text is own statement `form`, is the
-    /// connector's (pinning it when it is the first seen).
-    fn admit(&mut self, key: Key, form: usize) -> bool {
-        let slot = (key.0, key.1, key.3, form);
-        match self.pinned.get(&slot) {
-            Some(queryid) => *queryid == key.2,
-            None if self.pinned.len() < MAX_OWN_KEYS => {
-                self.pinned.insert(slot, key.2);
-                true
-            }
-            None => false,
+    /// Whether the entry `key`, whose text is the own statement `sent` (as
+    /// sent), is the connector's (pinning it when it is the first seen in
+    /// its slot).
+    fn admit(&mut self, key: Key, sent: &str) -> bool {
+        let (userid, dbid, queryid, toplevel) = key;
+        if self.role != Some(userid) || !toplevel {
+            return false;
         }
+        let runs_here = if sql::OWN_TABLELESS.contains(&sent) {
+            self.databases.contains(&dbid)
+        } else {
+            sent == self.texts_sql && self.poller_database == Some(dbid)
+        };
+        if !runs_here {
+            return false;
+        }
+        *self
+            .pinned
+            .entry((dbid, sent.to_owned()))
+            .or_insert(queryid)
+            == queryid
     }
 }
 
@@ -184,6 +205,8 @@ pub(crate) async fn connect(
         let texts_sql = sql::pss_texts(&schema, toplevel)
             .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
         own.allow_statement(&texts_sql);
+        let (role, databases, poller_database) =
+            own_oids(&session, timeouts, &settings.databases).await?;
         return Ok((
             session,
             PssPoller {
@@ -194,13 +217,52 @@ pub(crate) async fn connect(
                 catalogs: Catalogs::default(),
                 snapshot: None,
                 analyses: HashMap::new(),
-                own_keys: OwnKeys::default(),
+                own_keys: OwnKeys {
+                    role,
+                    databases,
+                    poller_database,
+                    texts_sql,
+                    pinned: HashMap::new(),
+                },
                 last_poll: SystemTime::now(),
                 panicked: 0,
             },
         ));
     }
     Err(last)
+}
+
+/// The agent role's oid, the declared databases' oids and this session's
+/// database oid ([`sql::OWN_OIDS`], in a transaction with the timeouts).
+async fn own_oids(
+    session: &Session,
+    timeouts: Timeouts,
+    databases: &[String],
+) -> Result<(Option<u32>, Vec<u32>, Option<u32>), PgError> {
+    let names: Vec<String> = databases.to_vec();
+    let tx = session.begin(timeouts).await?;
+    let rows = match tx
+        .query(Stage::Audit, sql::OWN_OIDS, &[(&names, Type::TEXT_ARRAY)])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tx.rollback().await;
+            return Err(e);
+        }
+    };
+    tx.commit().await?;
+    let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Audit);
+    let Some(r) = rows.first() else {
+        return Ok((None, Vec::new(), None));
+    };
+    Ok((
+        r.try_get::<_, Option<u32>>(0).map_err(get)?,
+        r.try_get::<_, Option<Vec<u32>>>(1)
+            .map_err(get)?
+            .unwrap_or_default(),
+        r.try_get::<_, Option<u32>>(2).map_err(get)?,
+    ))
 }
 
 fn delta(now: Counters, prev: Option<Counters>, first: bool) -> Option<(u64, u64)> {
@@ -237,7 +299,7 @@ impl PssPoller {
             && self
                 .own
                 .own_pss_form(text)
-                .is_some_and(|form| self.own_keys.admit(key, form));
+                .is_some_and(|sent| self.own_keys.admit(key, sent));
         let analysis = analyze_isolated(text, cut).map(|analysis| Analyzed { analysis, own_text });
         if analysis.is_none() {
             self.panicked = self.panicked.saturating_add(1);
@@ -609,25 +671,41 @@ mod tests {
         }
     }
 
+    /// The agent's role oid in the tests.
+    const AGENT_ROLE: u32 = 10;
+    /// Declared databases (`1`: the poller's, `2`), and a non-target one.
+    const POLLER_DB: u32 = 1;
+    const OTHER_TARGET_DB: u32 = 2;
+    const NON_TARGET_DB: u32 = 3;
+
     fn poller() -> PssPoller {
+        let texts_sql = sql::pss_texts("public", true).unwrap();
+        let mut own = PgOwn::new(
+            databastion_core::audit::own::OwnAccount::new(
+                "databastion",
+                Some(crate::conn::APPLICATION_NAME),
+                databastion_classifiers::masking::ClientAddr::parse("192.0.2.14"),
+                1000,
+                databastion_core::audit::own::SharedOwnUsage::default(),
+            ),
+            super::super::events::SharedOwnStatements::default(),
+        );
+        own.allow_statement(&texts_sql);
         PssPoller {
             database: "shop".to_owned(),
             schema: "public".to_owned(),
             toplevel: true,
-            own: PgOwn::new(
-                databastion_core::audit::own::OwnAccount::new(
-                    "databastion",
-                    Some(crate::conn::APPLICATION_NAME),
-                    databastion_classifiers::masking::ClientAddr::parse("192.0.2.14"),
-                    1000,
-                    databastion_core::audit::own::SharedOwnUsage::default(),
-                ),
-                super::super::events::SharedOwnStatements::default(),
-            ),
+            own,
             catalogs: Catalogs::default(),
             snapshot: None,
             analyses: HashMap::new(),
-            own_keys: OwnKeys::default(),
+            own_keys: OwnKeys {
+                role: Some(AGENT_ROLE),
+                databases: vec![POLLER_DB, OTHER_TARGET_DB],
+                poller_database: Some(POLLER_DB),
+                texts_sql,
+                pinned: HashMap::new(),
+            },
             last_poll: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
             panicked: 0,
         }
@@ -637,57 +715,129 @@ mod tests {
         super::super::events::tests_pss_form(sql_text)
     }
 
-    /// PR #90 review Low-1: an own statement's exact stored text under
-    /// another `queryid` (the text prepared with every constant bound) is
-    /// not the connector's: only the first `queryid` seen per (userid,
-    /// dbid, toplevel) is.
+    /// PR #90 review Low-1: an own statement's exact stored text is the
+    /// connector's only for the agent's role, at top level, in a database
+    /// where the connector runs it, and under the first `queryid` seen
+    /// there; anything else with the same text is reported.
     #[test]
-    fn own_texts_are_pinned_to_their_first_queryid() {
+    fn own_texts_count_only_in_the_connectors_own_slots() {
         let mut p = poller();
         let set_local = own_pss_text(sql::SET_LOCAL_TIMEOUTS);
         let setup = own_pss_text(sql::SESSION_SETUP);
-        let agent = (10, 1, 100, true);
-        let forged = (10, 1, 999, true);
-        p.record_text(agent, &set_local, false);
-        p.record_text(forged, &set_local, false);
+        let texts = own_pss_text(&sql::pss_texts("public", true).unwrap());
         let own = |p: &PssPoller, k: &Key| p.analyses[k].as_ref().unwrap().own_text;
-        assert!(own(&p, &agent));
-        assert!(!own(&p, &forged), "another queryid, same text");
-        // Pinned per own statement, database, role and level.
+        // The agent's own entries in their own slots: excluded.
+        let agent = (AGENT_ROLE, POLLER_DB, 100, true);
+        let agent_other_db = (AGENT_ROLE, OTHER_TARGET_DB, 100, true);
+        let agent_texts = (AGENT_ROLE, POLLER_DB, 200, true);
+        p.record_text(agent, &set_local, false);
+        p.record_text(agent_other_db, &set_local, false);
+        p.record_text(agent_texts, &texts, false);
+        p.record_text((AGENT_ROLE, POLLER_DB, 101, true), &setup, false);
         for k in [
-            (10, 1, 101, true),
-            (10, 2, 555, true),
-            (11, 1, 556, true),
-            (10, 1, 557, false),
+            agent,
+            agent_other_db,
+            agent_texts,
+            (AGENT_ROLE, POLLER_DB, 101, true),
         ] {
-            let text = if k.2 == 101 { &setup } else { &set_local };
-            p.record_text(k, text, false);
             assert!(own(&p, &k), "{k:?}");
         }
+        // Slots the connector never uses: reported, never pinned.
+        let cases = [
+            (
+                "non-target database",
+                (AGENT_ROLE, NON_TARGET_DB, 300, true),
+                &set_local,
+            ),
+            (
+                "texts query outside the poller's database",
+                (AGENT_ROLE, OTHER_TARGET_DB, 301, true),
+                &texts,
+            ),
+            (
+                "nested entry",
+                (AGENT_ROLE, POLLER_DB, 302, false),
+                &set_local,
+            ),
+            ("another role", (11, POLLER_DB, 303, true), &set_local),
+            // Same slot, another queryid (every constant bound).
+            (
+                "another queryid",
+                (AGENT_ROLE, POLLER_DB, 999, true),
+                &set_local,
+            ),
+        ];
+        for (what, k, text) in cases {
+            p.record_text(k, text, false);
+            assert!(!own(&p, &k), "{what}");
+        }
+        assert_eq!(p.own_keys.pinned.len(), 4, "only the connector's slots");
         // The pin survives the cache being cleared (texts read again).
         p.analyses.clear();
-        p.record_text(forged, &set_local, false);
+        p.record_text((AGENT_ROLE, POLLER_DB, 999, true), &set_local, false);
         p.record_text(agent, &set_local, false);
-        assert!(!own(&p, &forged));
+        assert!(!own(&p, &(AGENT_ROLE, POLLER_DB, 999, true)));
         assert!(own(&p, &agent));
         // A cut text is never own, and does not pin.
-        let cut = (12, 1, 7, true);
-        p.record_text(cut, &set_local, true);
+        let cut = (AGENT_ROLE, OTHER_TARGET_DB, 7, true);
+        p.record_text(cut, &setup, true);
         assert!(!own(&p, &cut));
-        p.record_text((12, 1, 8, true), &set_local, false);
-        assert!(own(&p, &(12, 1, 8, true)));
-        // The forged entry of the agent's role is reported against `*`.
+        p.record_text((AGENT_ROLE, OTHER_TARGET_DB, 8, true), &setup, false);
+        assert!(own(&p, &(AGENT_ROLE, OTHER_TARGET_DB, 8, true)));
+        // Unknown agent role: nothing is own.
+        let mut q = poller();
+        q.own_keys.role = None;
+        q.record_text(agent, &set_local, false);
+        assert!(!own(&q, &agent));
+        for (_, k, text) in &cases {
+            p.record_text(*k, text, false);
+        }
+        // Events: the agent's own entry is left out; the same text in a
+        // non-target database, nested, or under another queryid, run by the
+        // agent's account, is reported against `*`.
         let changed = vec![
             (agent, "databastion".to_owned(), "shop".to_owned(), 90, 90),
-            (forged, "databastion".to_owned(), "shop".to_owned(), 3, 3),
+            (
+                (AGENT_ROLE, NON_TARGET_DB, 300, true),
+                "databastion".to_owned(),
+                "other".to_owned(),
+                3,
+                3,
+            ),
+            (
+                (AGENT_ROLE, POLLER_DB, 302, false),
+                "databastion".to_owned(),
+                "shop".to_owned(),
+                4,
+                4,
+            ),
+            (
+                (AGENT_ROLE, OTHER_TARGET_DB, 301, true),
+                "databastion".to_owned(),
+                "crm".to_owned(),
+                5,
+                5,
+            ),
+            (
+                (AGENT_ROLE, POLLER_DB, 999, true),
+                "databastion".to_owned(),
+                "shop".to_owned(),
+                6,
+                6,
+            ),
         ];
         let events = p.events_of(
             &changed,
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000),
         );
-        assert_eq!(events.len(), 1, "{events:?}");
-        assert_eq!(events[0].aggregated_count(), 3);
-        assert_eq!(events[0].objects()[0].object().as_str(), "*");
+        let mut counts: Vec<u64> = events.iter().map(MaskedEvent::aggregated_count).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, [3, 4, 5, 6], "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|e| e.objects()[0].object().as_str() == "*")
+        );
     }
 
     /// PR #90 review Low-2: a statement whose conversion panics is marked
