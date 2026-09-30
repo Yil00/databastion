@@ -15,7 +15,7 @@ import { failuresPerAgent } from "@/server/agent-api/auth";
 import { argon2Hash } from "@/server/crypto";
 import { enqueueJob } from "@/server/jobs";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
-import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
+import { adminUser, agentRequest, endInFlightScans, enroll, uuidv7 } from "@/test/helpers";
 import { logger } from "@/lib/logger";
 import { pgBossOptions, registerNotificationQueue, registerPolicyQueue } from "@/worker/queues";
 
@@ -114,6 +114,7 @@ async function scan(auth: Auth): Promise<void> {
     classifiersVersion: "2026.09.1",
     params: { sample_rows: 200, max_duration_s: 900 },
   });
+  await endInFlightScans(auth.agentId);
   expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
   const body = { batch_id: uuidv7(), job_id: jobId, classifiers_version: "2026.09.1", findings: [FINDING] };
   expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
@@ -555,6 +556,7 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
         classifiersVersion: "2026.09.1",
         params: { sample_rows: 200, max_duration_s: 900 },
       });
+      await endInFlightScans(auth.agentId);
       expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
       const items = ["email", "email2", "email3"].map((field) => ({ ...FINDING, location: { ...FINDING.location, field } }));
       const body = { batch_id: uuidv7(), job_id: jobId, classifiers_version: "2026.09.1", findings: items };

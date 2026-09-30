@@ -7,7 +7,9 @@ import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/val
 import { parseCoverage, type ScanCoverage } from "@/lib/scan-coverage";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
+import { HEARTBEAT_INTERVAL_S } from "./agent-api/pipeline";
 import { writeAudit } from "./audit";
+import { lockAgentJobs } from "./job-lock";
 
 /**
  * Launching Discovery scans (P2-D): a `discovery.scan` job for one target of one agent, with
@@ -67,15 +69,57 @@ export const scanBudgetSql = sql`(case
 export const scanDeadlineSql = sql`${scanAnchorSql} + make_interval(secs => ${scanBudgetSql}) + make_interval(secs => ${SCAN_GRACE_MS / 1000})`;
 
 /**
- * Expiry sweep of the agent's scan jobs, run before the "one open scan per target" check (L2):
- * pending scans past `expires_at` become `expired`; delivered / running scans past their deadline
- * become `failed` (`timeout`, `finished_at` = that deadline), each audited as a system action. Returns the timed-out job ids.
+ * Agent online window: an agent whose last heartbeat is more recent than this is online (3 missed
+ * heartbeats: offline). Re-exported by `jobs.ts`.
+ */
+export const AGENT_ONLINE_WINDOW_S = 3 * HEARTBEAT_INTERVAL_S;
+
+/**
+ * Held scans (security review M1, end of phase 7). The console delivers at most one
+ * `discovery.scan` per agent at a time (`claimJobs`): a pending scan of an agent that has a scan
+ * `delivered` or `running` is held back until that scan ends. While it is held and the agent is
+ * online, its `expires_at` is kept at least `HELD_SCAN_EXPIRY_MS / 2` ahead (refreshed to
+ * `now() + HELD_SCAN_EXPIRY_MS`), so waiting behind long scans never expires it; once the
+ * previous scan ends it is delivered at the agent's next poll, well within that margin. A held scan
+ * of an offline agent, or a pending scan that is not held, expires at its `expires_at` as before
+ * (6 h after the request, or at most `HELD_SCAN_EXPIRY_MS` after the agent was last seen while it
+ * was held). The refresh never goes past `created_at + HELD_SCAN_MAX_AGE_MS` (L2 of #98): a scan
+ * still held then expires as before, and the user requests it again. When a pending scan is
+ * delivered, its `expires_at` is raised to the same `least(now() + HELD_SCAN_EXPIRY_MS, created_at
+ * + HELD_SCAN_MAX_AGE_MS)` if lower (L3 of #98), so a scan that waited does not reach the agent
+ * with only minutes left, which would cut short the queued-scan tolerance of `claimJobs`.
+ */
+export const HELD_SCAN_EXPIRY_MS = 3600_000;
+/**
+ * Absolute bound of a scan's `expires_at`, from its request. 24 h: 4 times the default TTL, room
+ * for about 20 scans of the default 3600 s budget (agent cap) queued behind each other on one
+ * agent; an order older than a day is stale (the targets and their load may have changed) and
+ * the bound keeps a held scan from living forever on an agent whose scans never end.
+ */
+export const HELD_SCAN_MAX_AGE_MS = 24 * 3600_000;
+
+/** SQL: the `expires_at` a held or just-delivered scan of the table `jobs` is raised to. */
+export const heldScanExpirySql = sql`least(now() + make_interval(secs => ${HELD_SCAN_EXPIRY_MS / 1000}),
+  ${jobs.createdAt} + make_interval(secs => ${HELD_SCAN_MAX_AGE_MS / 1000}))`;
+
+/**
+ * SQL: the pending job of the table `jobs` is held behind another `discovery.scan` of its agent
+ * that is `delivered` or `running` (a pending scan is delivered only when this is false).
+ */
+export const scanInFlightSql = sql`exists (select 1 from jobs k
+  where k.agent_id = ${jobs.agentId} and k.type = 'discovery.scan' and k.id <> ${jobs.id}
+    and k.status in ('delivered', 'running'))`;
+
+/**
+ * Sweep of the agent's scan jobs, run before the "one open scan per target" check (L2) and before
+ * each job claim: delivered / running scans past their deadline become `failed` (`timeout`,
+ * `finished_at` = that deadline), each audited as a system action; then the pending scans held
+ * behind a scan in flight of an online agent get their `expires_at` refreshed (see
+ * `HELD_SCAN_EXPIRY_MS`); then pending scans past `expires_at` become `expired`. Dead scans are
+ * swept first so that a scan that died silently neither holds the next scan back nor keeps it
+ * alive. Returns the timed-out job ids.
  */
 export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]> {
-  await tx.execute(sql`
-    update jobs set status = 'expired', finished_at = now()
-    where agent_id = ${agentId} and type = 'discovery.scan' and status = 'pending'
-      and expires_at is not null and expires_at <= now()`);
   const dead = await tx
     .update(jobs)
     // finished_at = the deadline, not now(): the late-batch window of findings.ts starts there.
@@ -99,6 +143,20 @@ export async function sweepDeadScans(tx: Tx, agentId: string): Promise<string[]>
       details: { agent_id: agentId, target_id: job.targetId, type: "discovery.scan" },
     });
   }
+  await tx.execute(sql`
+    update jobs set expires_at = ${heldScanExpirySql}
+    where agent_id = ${agentId} and type = 'discovery.scan' and status = 'pending'
+      and expires_at is not null and expires_at > now()
+      and expires_at < now() + make_interval(secs => ${HELD_SCAN_EXPIRY_MS / 2000})
+      and expires_at < ${jobs.createdAt} + make_interval(secs => ${HELD_SCAN_MAX_AGE_MS / 1000})
+      and exists (select 1 from agents a where a.id = ${agentId}
+        and a.revoked_at is null and a.locked_at is null
+        and a.last_seen_at > now() - make_interval(secs => ${AGENT_ONLINE_WINDOW_S}))
+      and ${scanInFlightSql}`);
+  await tx.execute(sql`
+    update jobs set status = 'expired', finished_at = now()
+    where agent_id = ${agentId} and type = 'discovery.scan' and status = 'pending'
+      and expires_at is not null and expires_at <= now()`);
   return dead.map((j) => j.id);
 }
 
@@ -168,6 +226,8 @@ export async function requestScan(
       .for("update")
       .limit(1);
     if (!agent || agent.revokedAt || agent.lockedAt) return { outcome: "not_found" };
+    // After the agent row, before its jobs (job-lock.ts): no scan claim runs meanwhile.
+    await lockAgentJobs(tx, agentId);
     const [target] = await tx
       .select({ present: agentTargets.present })
       .from(agentTargets)
@@ -269,15 +329,25 @@ export interface ScanJobView {
   errorCode: string | null;
   /** The classifier set the job was issued with. */
   classifiersVersion: string | null;
+  /**
+   * Pending, held back while another scan of the agent is delivered or running (one scan per
+   * agent at a time, M1): waiting for the previous scan, not stalled.
+   */
+  waiting: boolean;
 }
 
 /**
  * Short status of a scan job for display. A scan that failed with `unsupported` while its
  * `classifiers_version` differs from the agent's current heartbeat version was refused by the
  * agent because its build runs another classifier set (contract `DiscoveryScanJob`): shown as a
- * "classifier set mismatch" rather than a bare `unsupported`.
+ * "classifier set mismatch" rather than a bare `unsupported`. A pending scan held behind another
+ * scan of the agent says so.
  */
-export function scanStatusLabel(scan: Pick<ScanJobView, "status" | "errorCode" | "classifiersVersion">, agentClassifiersVersion: string | null): string {
+export function scanStatusLabel(
+  scan: Pick<ScanJobView, "status" | "errorCode" | "classifiersVersion"> & { waiting?: boolean },
+  agentClassifiersVersion: string | null,
+): string {
+  if (scan.status === "pending" && scan.waiting) return "pending (waiting for the previous scan of this agent)";
   if (!scan.errorCode) return scan.status;
   if (
     scan.status === "failed" &&
@@ -306,6 +376,13 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
     .from(jobs)
     .where(and(eq(jobs.agentId, agentId), eq(jobs.type, "discovery.scan")))
     .orderBy(jobs.targetId, desc(jobs.createdAt));
+  const inFlight = await db
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(
+      and(eq(jobs.agentId, agentId), eq(jobs.type, "discovery.scan"), inArray(jobs.status, ["delivered", "running"])),
+    )
+    .limit(1);
   const out = new Map<string, ScanJobView>();
   for (const r of rows) {
     if (r.targetId === null) continue;
@@ -318,6 +395,7 @@ export async function latestScans(db: Database, agentId: string): Promise<Map<st
       coverage: parseCoverage(r.progress),
       errorCode: r.error?.code ?? null,
       classifiersVersion: r.classifiersVersion,
+      waiting: r.status === "pending" && inFlight.length > 0,
     });
   }
   return out;

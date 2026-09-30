@@ -131,8 +131,10 @@ export function ScanDialog({
         </p>
         <p className="mt-1 text-sm text-muted-foreground">
           Scans are paced to spare the database: a scan takes about 100 times its query time (at the agent&apos;s
-          default 1 % duty cycle), and the agent runs its scans one at a time, queued scans included in their budget.
-          The agent caps the budget at its local limit (<code>limits.max_scan_duration_s</code>, 3600 s by default).
+          default 1 % duty cycle). The console sends an agent one scan at a time: a scan requested while another scan
+          of the agent is in flight waits (&quot;waiting for the previous scan&quot;) and its budget starts only when
+          the agent receives it, so queue time does not count. The agent caps the budget at its local limit
+          (<code>limits.max_scan_duration_s</code>, 3600 s by default).
         </p>
         <form onSubmit={submit} className="mt-4 flex flex-col gap-3">
           {SCAN_FIELDS.map((f) => (

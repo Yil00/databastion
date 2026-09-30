@@ -594,6 +594,48 @@ mod tests {
         assert!(!ev[0].principal().send_name());
     }
 
+    /// A driver closing a pooled connection in its handshake (the e2e
+    /// `mongodump` does, intermittently): mongod logs "Failed to
+    /// authenticate" with `AuthenticationAbandoned` (337). Not a failed
+    /// login: no `auth_failure` event, whereas a refused proof on the next
+    /// connection still is one.
+    #[test]
+    fn abandoned_authentications_are_not_auth_failures() {
+        let abandoned = |conn: u64| {
+            line(
+                5_286_307,
+                &format!("conn{conn}"),
+                r#"{"client":"10.0.0.9:5000","isSpeculative":true,"mechanism":"SCRAM-SHA-256","user":"e2e_exporter","db":"admin","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected","result":337}"#,
+            )
+        };
+        let refused = line(
+            5_286_307,
+            "conn5",
+            r#"{"client":"10.0.0.9:5000","isSpeculative":false,"mechanism":"SCRAM-SHA-256","user":"e2e_exporter","db":"admin","error":"AuthenticationFailed: SCRAM authentication failed, storedKey mismatch","result":18}"#,
+        );
+        let mut b = builder();
+        let ev = b.convert(
+            log(&[
+                accepted(3, "10.0.0.9"),
+                meta(3, "mongodump"),
+                abandoned(3),
+                accepted(4, "10.0.0.9"),
+                abandoned(4),
+            ]),
+            EventSource::MongodbLog,
+            SystemTime::now(),
+        );
+        assert!(ev.is_empty(), "{ev:?}");
+        let ev = b.convert(
+            log(&[accepted(5, "10.0.0.9"), refused]),
+            EventSource::MongodbLog,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].action(), EventAction::AuthFailure);
+        assert!(!ev[0].principal().send_name());
+    }
+
     #[test]
     fn get_more_carries_the_shape_of_its_cursor() {
         let mut b = builder();

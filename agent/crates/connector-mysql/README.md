@@ -167,7 +167,13 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   is the source, so a later switch back does not re-read that period.
 - **First start / rotation while stopped**: without a cursor, reading
   starts at the end of the log. A log rotated while the agent was stopped
-  is read from the start of the new file.
+  is read from the start of the new file. A log truncated in place
+  (`copytruncate`) while the agent was stopped is detected by the keyed
+  fingerprints of the saved cursor, even when it has grown back past the
+  saved offset: the cursor and its replay are discarded and the file is
+  read from its start (logged, `audit_cursor_reset_total`), so no new
+  record is skipped as already reported (end-of-phase-7 review L1; see
+  the agent README).
 - **`server_audit` times are local**: converted with the server's system
   time-zone offset read at stream start and every 5 minutes (a DST change
   in between shifts times by the difference until the next re-probe).
@@ -221,7 +227,11 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   and the connections waiting (`Tailer::commit_from`): after a restart, a
   crash, a stream restart or a reconfiguration, the stream re-reads from
   there and replays only the waiting statements' records, so they are
-  neither lost nor counted twice. A replayed statement has been waiting
+  neither lost nor counted twice. The replay applies only when the bytes
+  before the saved offset and end still match the cursor's keyed
+  fingerprints; otherwise (the log was truncated or rewritten while the
+  agent was stopped) it is dropped and the file is read from its start. A
+  replayed statement has been waiting
   since its log time, not since the restart: an agent that restarts more
   often than every 5 minutes still reports it after 5 minutes, and its
   cursor moves on instead of staying pinned to it. When the stream ends gracefully (the

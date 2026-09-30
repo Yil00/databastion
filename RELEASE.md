@@ -122,6 +122,7 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 | [release.yml](.github/workflows/release.yml) | push to `main` (a merged PR), except `[skip-release]` and release-it's own commit; runs in the `release-it` environment | release-it: version, changelog, `X.Y.Z` tag pushed with `RELEASE_TOKEN`, draft release (no signing) |
 | [publish.yml](.github/workflows/publish.yml) | push of an `X.Y.Z` or `X.Y.Z-*` tag only; jobs that push or sign in the `release` environment | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
 | [packaging.yml](.github/workflows/packaging.yml) | call from `ci.yml` (packaging files changed) and `publish.yml` | Reproducible `.deb`, install checks in Debian 12 / Ubuntu 24.04 containers, "Installation < 15 min" test ([deploy/README.md](deploy/README.md#installation-test-under-15-minutes)) |
+| [advisories.yml](.github/workflows/advisories.yml) | daily, and push / PR on `main` / `dev` touching a lockfile | Dependency advisories: `cargo-deny` (agent), `pnpm audit` (console), `npm audit` (root release tooling); not a required check |
 | [dependabot.yml](.github/dependabot.yml) | weekly | Updates to actions and tooling, PRs to `dev` |
 
 Third-party actions are pinned by commit SHA (Dependabot updates them).
@@ -152,7 +153,7 @@ Maintainer steps, in this order:
 Every item is checked on the `dev` commit that becomes the release (and on the `-rc.N` tag when there is one). It extends the [Definition of Done](AGENTS.md#definition-of-done) of each task to the whole release.
 
 ### Every release
-- [ ] **CI green on `dev`**: the `CI result` check of the release commit (lint, tests and builds of every component, protocol checks, the blocking holdout classifier gate, doc links, gitleaks; [ci.yml](.github/workflows/ci.yml))
+- [ ] **CI green on `dev`**: the `CI result` check of the release commit (lint, tests and builds of every component, protocol checks, the blocking holdout classifier gate, doc links, gitleaks; [ci.yml](.github/workflows/ci.yml)). Advisories workflow green on the release commit (it is not a required check; [advisories.yml](.github/workflows/advisories.yml): agent, console and root release tooling)
 - [ ] **End-to-end and invariant I2 test green**: the `e2e` job of that CI run ([e2e/README.md](e2e/README.md)): enrollment and revocation, no value of `dev/ground-truth.json` in clear in the console, and the Audit path (an export raises an incident) on the PostgreSQL, MariaDB, MongoDB and OpenLDAP targets
 - [ ] **Security reviews**: every PR of the release that touches `shared/protocol/`, the uplink, masking or authentication was merged with an approved `security-reviewer` review ([CLAUDE.md](CLAUDE.md)); no open **Gate** item and no open **v0.1.0 release gate** in the [ROADMAP](docs/ROADMAP.md)
 - [ ] **Holdout seed rotated** for this release, and the holdout gate green on the new seed ([§ 8](#8-holdout-seed-rotation))

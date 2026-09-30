@@ -45,7 +45,12 @@ load otherwise), so a server-wide load is the normal case.
   window loses those events; they stay in the database's own log.
 - **First start / rotation while stopped.** Without a cursor, reading starts
   at the end of the log (no history). If the log was rotated while the
-  agent was stopped, the rest of the previous file is not read.
+  agent was stopped, the rest of the previous file is not read. A log
+  truncated in place while the agent was stopped (`copytruncate`,
+  `log_truncate_on_rotation`) is read from its start, even when it has
+  grown back past the saved offset: the cursor keeps a keyed fingerprint
+  of the bytes before its offset, checked at open (mismatch: logged and
+  counted in `audit_cursor_reset_total`; see the agent README).
 - **Forged records.** Any role can write `AUDIT: …` lines into the server
   log (`RAISE LOG` in PL/pgSQL). The connector drops records whose severity
   is not `pgaudit.log_level` or that carry an error context (pgaudit hides

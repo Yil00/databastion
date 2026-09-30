@@ -122,6 +122,13 @@ describe("scanStatusLabel", () => {
     expect(scanStatusLabel(job("failed", "timeout"), "2099.01.1")).toBe("failed (timeout)");
     expect(scanStatusLabel(job("running", null), "2099.01.1")).toBe("running");
   });
+  it("says a pending scan held behind another scan of the agent is waiting (M1)", () => {
+    expect(scanStatusLabel({ ...job("pending", null), waiting: true }, "2026.09.1")).toBe(
+      "pending (waiting for the previous scan of this agent)",
+    );
+    expect(scanStatusLabel({ ...job("pending", null), waiting: false }, "2026.09.1")).toBe("pending");
+    expect(scanStatusLabel(job("pending", null), "2026.09.1")).toBe("pending");
+  });
 });
 
 describe.skipIf(!hasDb)("scan launching and false positives (PostgreSQL)", () => {

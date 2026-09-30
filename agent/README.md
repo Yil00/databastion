@@ -308,6 +308,40 @@ file with a `replay` (the end read and the held keys), which a restart
 applies (`Tailer::take_replay`); `Tailer::settle` saves a cursor without
 it once the source has reported what it held (security review of #93, M1).
 
+The cursor also holds a keyed fingerprint of the 256 bytes of the file just
+before its offset, and before the end of what was read when it holds a
+replay (end-of-phase-7 review L1): HMAC-SHA256 over the position and those
+bytes, with a sub-key derived from the agent HMAC key
+(`HmacKey::local_tag_key`, purpose `audit-tail-cursor`); the bytes
+themselves are never stored (I2). At a restart on the same inode, a
+fingerprint that no longer matches, or a file shorter than a saved position,
+means the log was truncated (`copytruncate`) or rewritten while the agent
+was stopped, even if it has grown back past the offset since: the cursor is
+discarded, the file is read from its start, the replay is dropped, a
+warning is logged (no path, no content) and the reset is counted in the
+heartbeat metric `audit_cursor_reset_total`. Without this, reading would
+resume in the middle of new content, and with a replay the new records up
+to the saved end would be taken for records already reported. While the
+agent runs, the last 32 bytes read are compared at every poll (in memory;
+loaded from the file at open). A cursor saved by an older agent (no
+fingerprint) is checked on its positions only, as before; a saved offset
+within the file with an end read past it (a replay) is a truncation and
+resets it. The cursor names the sub-key of its fingerprints (`kid`, the
+sub-key's tag of a fixed label, revealing nothing about the key): after a
+new HMAC key (`enroll --new-hmac-key`), a cursor of another or no `kid` gets
+the positions-only check and is fingerprinted again at its next save,
+instead of the whole logs being read again (duplicate events, false volume
+incidents); only a mismatch under the same `kid` resets it. So a truncation
+that happens while the agent is stopped for a key change is not detected,
+as with an older agent's cursor. Fingerprints are computed when the cursor
+is saved, which can be long after the read (the events are handed over
+first, under backpressure): the last bytes read, kept in memory, are
+compared with the file first, and when they differ the fingerprints are
+saved empty, which never match, so the next start reads the file from its
+start (security review of #97, L-a). Residual: a truncation between the
+read and the save that regrows to the same last 32 bytes before the offset
+is not seen.
+
 MySQL / MariaDB audit log statements reported before their statement record
 because the bounded grouping state was full are counted in the heartbeat
 metric `audit_pending_evicted_total` (`databastion_core::audit::count_pending_evicted`).
@@ -384,8 +418,11 @@ a statement or a query text:
   offsets, the OpenLDAP accesslog CSNs, and (phase 7) the MySQL / MariaDB
   `performance_schema` cursor (end timers, statement ids, the server's start
   time) and the MongoDB profiler positions (per database, a time and SHA-256
-  hashes of the entries read at it). They are saved once the events read
-  before them are handed to the core (at-most-once delivery);
+  hashes of the entries read at it). The file sources' cursors also hold
+  keyed fingerprints of the log bytes before their positions (HMAC-SHA256
+  with a sub-key of the agent key, never the bytes; see above). They are
+  saved once the events read before them are handed to the core
+  (at-most-once delivery);
 - (phase 7) the agent's own-account row counters
   (`<target>.own_usage.counters`, at most 2 MiB: normalized object names and
   rows per hour over the last 24 h), saved at most every 30 s while charging,
@@ -631,7 +668,7 @@ Audit ([ADR-0027](../docs/adr/0027-mongodb-audit.md); `src/audit/`):
   three sources report None (`audit.limited_pending_first_record`) until the stream read a record
   of them in the last 24 h.
   **Full is never reported**;
-- files are read by the core tailer (cursor persisted, rotation followed); the profiler by one
+- files are read by the core tailer (cursor persisted with its keyed fingerprints, rotation followed, a truncation while stopped detected); the profiler by one
   bounded `find` per database and poll (`ts` filter, `limit` 1000, `singleBatch`, `maxTimeMS`),
   position persisted after each poll (phase 7: per database, the last `ts` and SHA-256 hashes of
   the entries read at it; an agent restart resumes there, within what the capped collection

@@ -14,7 +14,7 @@ import { failuresPerAgent } from "@/server/agent-api/auth";
 import { argon2Hash } from "@/server/crypto";
 import { enqueueJob } from "@/server/jobs";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
-import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
+import { adminUser, agentRequest, endInFlightScans, enroll, uuidv7 } from "@/test/helpers";
 import { pgBossOptions, registerPolicyQueue } from "@/worker/queues";
 
 import { dedupKey, drainPolicyWork, getIncident, listIncidents, reopensResolved, transitionIncident } from "./incidents";
@@ -110,6 +110,7 @@ async function claimedScan(auth: Auth, targetId = "pg-prod-1"): Promise<string> 
     classifiersVersion: "2026.09.1",
     params: { sample_rows: 200, max_duration_s: 900 },
   });
+  await endInFlightScans(auth.agentId);
   expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
   return jobId;
 }

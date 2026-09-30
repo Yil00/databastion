@@ -11,6 +11,7 @@ import { argon2Hash, argon2Verify, isLowEntropySecret, rotateArgon2Gate } from "
 import { RateLimiter } from "./rate-limit";
 import { requestNotificationDelivery } from "./notification-queue";
 import { notifyIntegrityEvent } from "./system-alerts";
+import { lockAgentJobs } from "./job-lock";
 
 /**
  * Agent secret rotation, console side (ADR-0008, refined by ADR-0010).
@@ -69,6 +70,8 @@ export async function lockAgentForConflict(
       .where(and(eq(agents.id, agentId), isNull(agents.lockedAt), isNull(agents.revokedAt)))
       .returning({ id: agents.id });
     if (rows.length === 0) return false;
+    // After the agent row, before its jobs: same order as every job writer (job-lock.ts, L1).
+    await lockAgentJobs(tx, agentId);
     await tx
       .update(jobs)
       .set({ status: "cancelled", finishedAt: sql`now()` })

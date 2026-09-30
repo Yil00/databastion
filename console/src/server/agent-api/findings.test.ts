@@ -20,7 +20,7 @@ import { integrityStats, integrityWriteBudget } from "@/server/integrity";
 import { enqueueJob } from "@/server/jobs";
 import { decryptMaskedSamples, encryptMaskedSamples, maskedSamplesKey } from "@/server/samples";
 import { hasDb, setupTestDatabase } from "@/test/db";
-import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
+import { adminUser, agentRequest, endInFlightScans, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
@@ -330,8 +330,9 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
     });
 
     it("accepts findings of a running or finished scan (spooled batches may arrive late)", async () => {
-      const auth = await agentWithTargets();
       for (const status of ["running", "succeeded", "failed"] as const) {
+        // One agent per scan: a running scan holds the agent's next one back (M1).
+        const auth = await agentWithTargets();
         const jobId = await deliveredScan(auth);
         // Terminal statuses always carry finished_at (recordJobStatus).
         const finishedAt = status === "running" ? null : new Date();
@@ -637,6 +638,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
           'o', 'f', 'custom.c' || g, '2026.09.1', 0.5, 10, 5, gen_random_uuid(), now()
         from generate_series(1, ${MAX_SUMMARY_GROUPS + 20}) g`);
       expect((await post(quiet, batch(await deliveredScan(quiet)))).status).toBe(202);
+      await endInFlightScans(quiet.agentId);
       const other = { ...PG_FINDING, target_id: "pg-other" };
       expect((await post(quiet, batch(await deliveredScan(quiet, "pg-other"), [other]))).status).toBe(202);
       await getDb().execute(sql`update findings set last_seen_at = now() - interval '1 day' where agent_id = ${quiet.agentId}`);
