@@ -227,6 +227,60 @@ impl OwnUsage {
 /// Shared handle on a target's [`OwnUsage`].
 pub type SharedOwnUsage = std::sync::Arc<std::sync::Mutex<OwnUsage>>;
 
+/// Attaches `store` to the shared counters ([`OwnUsage::attach`]) and, on
+/// the first attachment, starts a task that saves the counters every
+/// `every` when a charge is not saved yet (phase-7 security review: a
+/// charge shortly after a save, followed by no activity, stayed unsaved
+/// until a later charge or the end of the stream, and was lost on a crash
+/// or a kill). Without a Tokio runtime (synchronous callers), no task is
+/// started.
+///
+/// Lifetime: the task holds a weak handle and ends once the counters are
+/// dropped. The connectors keep one [`SharedOwnUsage`] per target id for
+/// the life of the process (it outlives streams, by design), so in
+/// practice there is one task per target id with a counters file, ending
+/// with the runtime; a reconfigured target keeps its task. Each save runs
+/// on the blocking pool (`spawn_blocking`), not on a runtime worker.
+fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration) {
+    let first = {
+        let mut guard = usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = guard.store.is_none();
+        guard.attach(store, Instant::now());
+        first
+    };
+    if !first {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = std::sync::Arc::downgrade(usage);
+    handle.spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(usage) = weak.upgrade() else {
+                break;
+            };
+            let saved = tokio::task::spawn_blocking(move || {
+                usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .persist(Instant::now(), true);
+            })
+            .await;
+            if saved.is_err() {
+                tracing::warn!("own-account counters not saved (flush task failed)");
+            }
+        }
+    });
+}
+
 /// The agent's own activity, which may be left out of the events.
 #[derive(Debug)]
 pub struct OwnAccount {
@@ -270,10 +324,16 @@ impl OwnAccount {
     /// (under `<state_dir>/audit/`), so an agent restart keeps the
     /// budget spent in the last 24 hours. The first stream of the target
     /// loads them; without a state directory they stay in memory.
+    ///
+    /// The first attachment also starts a periodic flush
+    /// ([`attach_and_flush`]): charges made within [`OWN_SAVE_EVERY`] of
+    /// the last save and followed by no activity are saved at the next
+    /// tick, not only when a later charge or the end of a stream saves
+    /// them.
     #[must_use]
     pub fn persisted(self, cfg: &AuditConfig) -> Self {
         if let Some(store) = cfg.counters(OWN_COUNTERS) {
-            self.lock_usage().attach(store, Instant::now());
+            attach_and_flush(&self.usage, store, OWN_SAVE_EVERY);
         }
         self
     }
@@ -747,6 +807,62 @@ mod tests {
             usage.attach(store, Instant::now());
             assert!(usage.budgeted_objects().is_empty());
         }
+    }
+
+    /// Phase-7 security review (Low): a charge made within the save
+    /// period after a save, followed by no activity, is saved by the
+    /// periodic flush without waiting for another charge or the end of
+    /// the stream.
+    #[tokio::test]
+    async fn a_lone_charge_after_a_save_is_flushed_periodically() {
+        let dir = crate::fsutil::test_dir::TempDir::new();
+        let path = dir.path().join("pg.own_usage.counters");
+        let usage = SharedOwnUsage::default();
+        let every = Duration::from_millis(50);
+        attach_and_flush(&usage, counters_store(dir.path()), every);
+        // A second attachment starts no second task.
+        attach_and_flush(&usage, counters_store(dir.path()), every);
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let mut o = own_on(&usage, 1_000_000);
+        let t0 = Instant::now();
+        o.routine("databastion", None, logged, &ev(Some(1)), t0);
+        let first = std::fs::read(&path).unwrap();
+        // Within the save period: not saved by the charge itself.
+        let other = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("databastion"),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_rows(Some(7))
+        .with_object(EventObject::new(
+            normalize_path("shop"),
+            Some(normalize_path("crm")),
+            normalize_path("lonely"),
+        ));
+        o.routine(
+            "databastion",
+            None,
+            logged,
+            &other,
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), first, "not due yet");
+        // No further activity, the stream still running (`o` alive).
+        let mut saved = false;
+        for _ in 0..100 {
+            tokio::time::sleep(every).await;
+            let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+            if text.contains("lonely") {
+                saved = true;
+                break;
+            }
+        }
+        assert!(saved, "the lone charge was flushed");
+        assert!(!usage.lock().unwrap().dirty);
+        drop(o);
+        // The task ends with the counters.
+        drop(usage);
     }
 
     #[test]

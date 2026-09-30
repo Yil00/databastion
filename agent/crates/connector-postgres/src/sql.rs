@@ -386,9 +386,11 @@ pub(crate) const OWN_CLIENT_ADDR: &str = "SELECT pg_catalog.host(pg_catalog.inet
 /// any relation: `pg_catalog.set_config`, `pg_catalog.current_setting`,
 /// `pg_catalog.inet_client_addr`, `pg_catalog.host`. The Audit stream
 /// leaves them out for the agent's own account without charging its row
-/// budget (`audit::events::PgOwn`), matched by exact text (pgaudit)
-/// or normalized shape (`pg_stat_statements`). A unit test checks that
-/// every other statement of this module names a relation.
+/// budget (`audit::events::PgOwn`), matched by exact text: as sent
+/// (pgaudit), or as `pg_stat_statements` stores it, constants replaced
+/// and these bound parameters in place (`audit::events::pss_form`). A
+/// unit test checks that every other statement of this module names a
+/// relation.
 pub(crate) const OWN_TABLELESS: [&str; 3] = [SESSION_SETUP, SET_LOCAL_TIMEOUTS, OWN_CLIENT_ADDR];
 
 /// Schema of the `pg_stat_statements(boolean)` function, if it is a member
@@ -403,6 +405,16 @@ pub(crate) const PSS_FUNCTION_SCHEMA: &str = "SELECT n.nspname FROM pg_catalog.p
        WHERE e.extname = 'pg_stat_statements' AND p.proname = 'pg_stat_statements' \
          AND p.pronamespace = e.extnamespace AND p.pronargs = 1 \
        LIMIT 1";
+
+/// The agent role's oid, the oids of the declared databases (`$1`,
+/// `text[]`) and of this session's database: the `pg_stat_statements`
+/// slots where the connector's own table-less statements may be
+/// recognized (PR #90 review Low-1). Catalog reads only.
+pub(crate) const OWN_OIDS: &str = "SELECT r.oid, \
+       ARRAY(SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = ANY($1)), \
+       (SELECT d.oid FROM pg_catalog.pg_database d \
+         WHERE d.datname = pg_catalog.current_database()) \
+       FROM pg_catalog.pg_roles r WHERE r.rolname = CURRENT_USER";
 
 /// Most `pg_stat_statements` entries read per poll (`pg_stat_statements.max`
 /// defaults to 5000).
@@ -467,6 +479,7 @@ pub(crate) fn all_statements() -> Vec<String> {
         PGAUDIT_SETTINGS.to_owned(),
         OWN_CLIENT_ADDR.to_owned(),
         PSS_FUNCTION_SCHEMA.to_owned(),
+        OWN_OIDS.to_owned(),
         pss_counters("public", true).unwrap(),
         pss_counters("public", false).unwrap(),
         pss_texts("public", true).unwrap(),

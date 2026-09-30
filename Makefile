@@ -6,7 +6,7 @@ COMPOSE := docker compose -f dev/docker-compose.yml
 UP_TIMEOUT ?= 900
 WAIT_TIMEOUT ?= 600
 TAIL ?= 200
-LOG_DIRS := postgres mariadb mongodb percona
+LOG_DIRS := postgres mariadb mongodb percona psmdb
 
 .PHONY: help dev-dirs dev-metrics-token dev dev-smoke dev-down dev-reset dev-logs dev-ps seed seed-check test-dev
 

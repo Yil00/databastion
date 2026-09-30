@@ -23,10 +23,19 @@ olcAccess: {0}to dn.subtree="cn=accesslog" by dn.exact="cn=databastion,ou=servic
 olcLimits: dn.exact="cn=databastion,ou=services,dc=example,dc=org" size=1000 time=60
 ```
 
-- The first rule names `userPKCS12` (a credential attribute of the stock
-  `inetOrgPerson` schema) next to `userPassword`: stock slapd rejects an ACL
-  naming `authPassword` unless a loaded schema defines it. Add
-  `authPassword` to the list where your schema defines it.
+- **Name every credential attribute your schemas define in rule {0}**
+  (ADR-0032 decision 9, `docs/05-security.md`). The rule above is for a
+  stock slapd with the `core`, `cosine` and `inetorgperson` schemas
+  (`userPassword`, `userPKCS12`). Add `authPassword` only where the server
+  defines it (built with `SLAPD_AUTHPASSWD`), `sambaNTPassword`,
+  `sambaLMPassword`, `sambaPasswordHistory` and `sambaClearTextPassword`
+  where the Samba schema is loaded, `krbPrincipalKey` and `krbExtraData`
+  where the Kerberos schema is loaded, and `pwdHistory` where the ppolicy
+  overlay module is loaded: slapd refuses an `olcAccess` clause that names
+  an attribute it does not know, so a rule naming `authPassword` does not
+  load on a stock server.
+- Never grant access to the credential attributes, not even `search` or
+  `compare`: that would make the account an oracle on the hashes.
 - The connector never requests `userPassword`, `authPassword`, their
   subtypes, nor the Samba, Kerberos and `pwdHistory` hashes, whatever the
   ACL grants. Their presence is not reported either: the hash scheme is

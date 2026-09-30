@@ -17,6 +17,7 @@ on:
     branches: [main, dev]
     paths:
       - agent/Cargo.lock
+      - agent/fuzz/Cargo.lock
       - console/pnpm-lock.yaml
       - shared/protocol/package-lock.json
       - .github/workflows/advisories.yml
@@ -24,6 +25,7 @@ on:
     branches: [main, dev]
     paths:
       - agent/Cargo.lock
+      - agent/fuzz/Cargo.lock
       - console/pnpm-lock.yaml
       - shared/protocol/package-lock.json
       - .github/workflows/advisories.yml
@@ -58,7 +60,8 @@ jobs:
       - name: Fetch crate metadata and the RustSec advisory database
         run: |
           for attempt in 1 2 3; do
-            if cargo fetch --locked && cargo deny --locked fetch db; then exit 0; fi
+            if cargo fetch --locked && cargo fetch --locked --manifest-path fuzz/Cargo.toml \
+              && cargo deny --locked fetch db; then exit 0; fi
             echo "fetch attempt $attempt failed, retrying" >&2
             sleep $((attempt * 15))
           done
@@ -70,6 +73,9 @@ jobs:
       # agent/deny-dev.toml: the full graph, dev-dependencies included (test tooling).
       - name: cargo-deny advisories (dev-dependencies included)
         run: cargo deny --config deny-dev.toml --locked --offline check advisories
+      # agent/fuzz: the fuzz harness, its own workspace and lockfile (libfuzzer-sys); never shipped.
+      - name: cargo-deny advisories (fuzz harness)
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny-dev.toml --locked --offline check advisories
 
   console:
     name: Console advisories (pnpm audit)

@@ -3,11 +3,13 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: P1-B part 1.** `agent.yaml` configuration, enrollment, `0600`
-> identity storage, HTTPS uplink, heartbeat and jobs loops, secret rotation
-> (ADR-0008). No spool, local engine detection, Discovery or Audit yet:
-> `discovery.scan` / `audit.configure` jobs are reported `failed`
-> (`unsupported`).
+> **Status: phase 7, hardening before v0.1.0.** `agent.yaml`
+> configuration, enrollment, `0600` identity storage, HTTPS uplink,
+> heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
+> detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
+> MariaDB, MongoDB and OpenLDAP. `check()` reports the audit level each
+> target actually reaches
+> ([08-engine-capabilities.md](../docs/08-engine-capabilities.md)).
 
 ## Layout
 
@@ -103,8 +105,9 @@ binary: `cargo build --no-default-features --features postgres`.
   kept) and counted (`quarantined`), never crash the agent and are never
   logged. Bounded by `spool.max_bytes` (default 256 MiB) and
   `spool.max_batches` (default 10000). When full, a batch is dropped by
-  priority (phase 7): findings and events each keep up to 3/4 of the bounds
-  against the other, so an events flood cannot evict the findings; within
+  priority (phase 7): each class (findings, events) can grow to 3/4 of the
+  bounds, so the other always keeps at least 1/4 and an events flood cannot
+  evict the findings; within
   the events, batches holding a `signature.*` signal (packed apart from the
   others) are dropped last, and a new batch without one is dropped rather
   than evict them; within a class, the oldest goes first. A findings or
@@ -244,7 +247,14 @@ text's analysis and its conversion; the MongoDB profiler: each entry): a
 record that makes that code panic is dropped alone and counted (`audit.records_dropped`, per record; and the
 heartbeat metric `audit_record_panics_total`, one per isolated unit that
 failed, a record or a statement's group, which tells crafted-record campaigns
-apart from malformed input). A panic in a blocking parse task is resumed on the stream,
+apart from malformed input). On `pg_stat_statements`, a statement whose
+analysis or conversion panicked is not dropped: each of its deltas is still
+reported as a read of unknown objects (`*`) with its counts, because
+`queryid` ignores constants and comments and dropping it would hide every
+later execution of that statement shape. A failed analysis or conversion is kept in the
+text cache as poisoned (never analyzed or converted again, counted once).
+The fallback is always a read, on purpose: it over-reports a write rather
+than hide it. A panic in a blocking parse task is resumed on the stream,
 never turned into an ordinary error that restarts it in a loop
 (`databastion_core::resume_panic`).
 
@@ -274,9 +284,9 @@ unidentified account (a `db_user` fingerprint, as for any failed login),
 per client address for at most 16 addresses, then one without address,
 whose `aggregated_count` is the number of attempts and whose `ts` /
 `ts_last` span them. Attempts beyond the named groups are first counted per
-principal (at most 256, the least attempted joining the overflow first, the
-most recently seen among ties, so fresh junk names evict each other rather
-than an older account); a
+principal (at most 256, the least attempted joining the overflow first and, among
+ties, the most recently added one is evicted, so fresh junk names evict each
+other rather than an older account); a
 principal attempted more often than the least attempted named group takes
 its place, that group joining the overflow with its count, so junk names
 sent first cannot hide which account is brute-forced (#88 review M1). No attempt goes uncounted, and a flood gives at most
@@ -303,8 +313,9 @@ a statement or a query text:
   before them are handed to the core (at-most-once delivery);
 - (phase 7) the agent's own-account row counters
   (`<target>.own_usage.counters`, at most 2 MiB: normalized object names and
-  rows per hour over the last 24 h), saved at most every 30 s while charging
-  and when a stream ends, so an agent restart does not give a fresh
+  rows per hour over the last 24 h), saved at most every 30 s while charging,
+  by a periodic flush every 30 s when a charge is not saved yet, and when a
+  stream ends, so an agent restart does not give a fresh
   Discovery budget per object. A file that is not understood is ignored
   (counted from zero), as before persistence; hours ahead of the agent's
   clock count as the current hour; when the file would exceed its bound, the
@@ -713,6 +724,7 @@ cargo deny --config deny-dev.toml --locked check licenses sources   # dev-deps t
 cargo run -p databastion-protocol-codegen      # after changing shared/protocol/openapi.yaml
 cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
 cargo run -- run --config /etc/databastion/agent.yaml
+fuzz/smoke.sh 10                               # parser fuzz targets, 10 s each (stable; fuzz/README.md)
 ```
 
 `agent.example.yaml` documents every configuration key. Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`
