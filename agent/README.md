@@ -722,6 +722,7 @@ cargo deny --config deny-dev.toml --locked check licenses sources   # dev-deps t
 cargo run -p databastion-protocol-codegen      # after changing shared/protocol/openapi.yaml
 cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
 cargo run -- run --config /etc/databastion/agent.yaml
+fuzz/smoke.sh 10                               # parser fuzz targets, 10 s each (stable; fuzz/README.md)
 ```
 
 `agent.example.yaml` documents every configuration key. Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`

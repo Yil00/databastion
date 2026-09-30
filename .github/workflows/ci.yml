@@ -488,6 +488,26 @@ jobs:
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
 
+  # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
+  # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,
+  # accesslog entries. Coverage-instrumented, no sanitizer (nightly only), 10 s per target.
+  agent-fuzz-smoke:
+    name: Agent fuzz smoke
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent/fuzz
+      - name: Fuzz targets, 10 s each
+        run: agent/fuzz/smoke.sh 10
+
   # End-to-end harness in containers (e2e/README.md): enrollment, reachability of the PostgreSQL,
   # MySQL, MariaDB, MongoDB and OpenLDAP targets (ADR-0012 / ADR-0018 / ADR-0026 / ADR-0029
   # accounts), a Discovery scan of each (in parallel), the Audit path on the PostgreSQL target

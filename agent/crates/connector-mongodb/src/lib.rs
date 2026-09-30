@@ -43,6 +43,11 @@ mod scram;
 mod tls;
 mod wire;
 
+/// Fuzz target entry points (`agent/fuzz`); `fuzzing` feature only.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
+
 #[cfg(test)]
 mod fake;
 #[cfg(test)]

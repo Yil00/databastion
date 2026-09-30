@@ -28,6 +28,11 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
 
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+
 [dev-dependencies]
 # Test helpers of the core (owned log files, the contract conversion for
 # the interim I2 checks): tests only.
