@@ -205,9 +205,12 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   statement waiting (the oldest first; logged). The waiting state is
   bounded (1024 statements, 64 distinct tables each, 8 MiB of statement
   text in all; only JSON `table_access` records carry one). A statement
-  reported before its statement record is remembered by its query id: its
-  late statement record yields a second event only when its text shows a
-  signal (a whole-table read by a dump that ran longer than 5 minutes).
+  reported before its statement record is remembered by its query id and
+  the tables already reported: a late table record of one of these tables
+  is ignored, one of another table is reported (with the statement record
+  when it comes, or at the next flush), and a late statement record alone
+  yields a second event only when its text shows a signal (a whole-table
+  read by a dump that ran longer than 5 minutes).
   Residual: table records waiting when the agent stops are lost (the
   cursor has moved past them; delivery is at most once); their statement
   record, if written after the restart, is still reported, with the

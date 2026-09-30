@@ -247,20 +247,33 @@ struct PendingStatement {
 /// [`MAX_PENDING_RECORDS`] records, [`MAX_PENDING_TEXT_BYTES`] of text in
 /// all (the oldest statement is flushed first). A statement flushed before
 /// its statement record (timeout, full state) is remembered by its query
-/// id (`reported`, at most [`MAX_EARLY_REPORTED`]), so its late records do not count it
-/// twice: late table records are ignored, and the late statement record
-/// yields an event only when its text shows a signal (a whole-table read
-/// by a dump program that ran longer than the timeout). Without query ids
-/// (`audit_log_filter`) nothing is remembered.
+/// id and the tables already reported for it (`reported`, at most
+/// [`MAX_EARLY_REPORTED`]), so its late records do not count it twice: a
+/// late table record of a table already reported is ignored, one of
+/// another table starts a continuation of the statement that is reported
+/// like any pending statement (a `CALL` that reads a harmless table, waits
+/// past the timeout, then reads another one is never hidden), and a late
+/// statement record without a continuation yields an event only when its
+/// text shows a signal (a whole-table read by a dump program that ran
+/// longer than the timeout). Without query ids (`audit_log_filter`)
+/// nothing is remembered.
 #[derive(Default)]
 struct Pending {
     map: HashMap<u64, PendingStatement>,
-    /// Connection → (query id, sequence) of a statement flushed early.
-    reported: HashMap<u64, (u64, u64)>,
+    /// Connection → statement flushed early.
+    reported: HashMap<u64, Reported>,
     seq: u64,
     text_bytes: usize,
     /// Statements flushed early because the state was full.
     evicted: u64,
+}
+
+/// A statement flushed before its statement record.
+struct Reported {
+    query_id: u64,
+    seq: u64,
+    /// Tables already reported for it (at most [`MAX_PENDING_RECORDS`]).
+    tables: Vec<(Option<(String, String)>, Op)>,
 }
 
 impl Pending {
@@ -284,32 +297,63 @@ impl Pending {
         self.reported.remove(&connection);
     }
 
+    /// The early-flushed statement `r` belongs to, if any.
+    fn reported_of(&self, r: &FileRecord) -> Option<&Reported> {
+        let q = r.query_id?;
+        self.reported
+            .get(&r.connection)
+            .filter(|rep| rep.query_id == q)
+    }
+
     /// Whether `r` belongs to a statement already flushed early.
     fn reported(&self, r: &FileRecord) -> bool {
-        r.query_id.is_some_and(|q| {
-            self.reported
-                .get(&r.connection)
-                .is_some_and(|(id, _)| *id == q)
+        self.reported_of(r).is_some()
+    }
+
+    /// Whether `r` is a table record of an early-flushed statement whose
+    /// table was already reported.
+    fn table_reported(&self, r: &FileRecord) -> bool {
+        self.reported_of(r).is_some_and(|rep| {
+            rep.tables
+                .iter()
+                .any(|(t, op)| *t == r.table && *op == r.op)
         })
     }
 
-    /// Takes a statement out before its statement record, remembering it.
+    /// Takes a statement out before its statement record, remembering it
+    /// with its tables (merged with those of an earlier part of it).
     fn take_early(&mut self, connection: u64) -> Option<Vec<FileRecord>> {
         let records = self.take(connection)?;
         if let Some(q) = records.first().and_then(|r| r.query_id) {
-            if self.reported.len() >= MAX_EARLY_REPORTED && !self.reported.contains_key(&connection)
-            {
+            let mut tables = match self.reported.remove(&connection) {
+                Some(old) if old.query_id == q => old.tables,
+                _ => Vec::new(),
+            };
+            for r in &records {
+                let t = (r.table.clone(), r.op);
+                if !tables.contains(&t) && tables.len() < MAX_PENDING_RECORDS {
+                    tables.push(t);
+                }
+            }
+            if self.reported.len() >= MAX_EARLY_REPORTED {
                 if let Some(old) = self
                     .reported
                     .iter()
-                    .min_by_key(|(_, (_, s))| *s)
+                    .min_by_key(|(_, rep)| rep.seq)
                     .map(|(c, _)| *c)
                 {
                     self.reported.remove(&old);
                 }
             }
             let seq = self.next_seq();
-            self.reported.insert(connection, (q, seq));
+            self.reported.insert(
+                connection,
+                Reported {
+                    query_id: q,
+                    seq,
+                    tables,
+                },
+            );
         }
         Some(records)
     }
@@ -329,9 +373,11 @@ impl Pending {
     /// statements flushed to make room.
     fn add(&mut self, mut r: FileRecord, mono: Instant) -> Vec<Vec<FileRecord>> {
         let c = r.connection;
-        // Not the early-flushed statement (checked by the caller): the
-        // connection moved on.
-        self.reported.remove(&c);
+        // Another statement than the early-flushed one: the connection
+        // moved on (a continuation of it keeps it).
+        if !self.reported(&r) {
+            self.reported.remove(&c);
+        }
         let mut flushed = Vec::new();
         if let Some(p) = self.map.get_mut(&c) {
             // Records of one statement carry the same text, if any (the
@@ -755,8 +801,10 @@ impl EventBuilder {
         mono: Instant,
         out: &mut Vec<MaskedEvent>,
     ) {
-        if self.pending.reported(&r) {
-            // Its statement was already reported (timeout, eviction).
+        if self.pending.table_reported(&r) {
+            // Its statement and this table were already reported (timeout,
+            // eviction). Another table of it is a continuation: pending,
+            // reported like any statement (never dropped).
             return;
         }
         let c = r.connection;
@@ -787,6 +835,18 @@ impl EventBuilder {
         out: &mut Vec<MaskedEvent>,
     ) {
         let c = r.connection;
+        match self.pending.take(c) {
+            Some(mut group) if group.first().is_some_and(|g| same_statement(g, &r)) => {
+                // Its pending records (a continuation of an early-flushed
+                // statement included: its new tables are reported).
+                self.pending.forget(c);
+                group.push(r);
+                self.flush_isolated(group, source, now, out);
+                return;
+            }
+            Some(group) => self.flush_isolated(group, source, now, out),
+            None => {}
+        }
         if self.pending.reported(&r) {
             // Its table-access records were reported without it (the
             // statement outlived the pending timeout, or was evicted): its
@@ -800,17 +860,7 @@ impl EventBuilder {
             return;
         }
         self.pending.forget(c);
-        match self.pending.take(c) {
-            Some(mut group) if group.first().is_some_and(|g| same_statement(g, &r)) => {
-                group.push(r);
-                self.flush_isolated(group, source, now, out);
-            }
-            Some(group) => {
-                self.flush_isolated(group, source, now, out);
-                self.flush_isolated(vec![r], source, now, out);
-            }
-            None => self.flush_isolated(vec![r], source, now, out),
-        }
+        self.flush_isolated(vec![r], source, now, out);
     }
 
     /// [`Self::flush`] of one statement in isolation: a statement whose
@@ -1544,6 +1594,49 @@ mod tests {
             late,
         );
         assert_eq!(out, ["read [\"shop.a\"] None []"], "{out:#?}");
+        assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #93 (M2): after an early flush, a table the
+    /// statement reads later is reported, never dropped.
+    #[test]
+    fn late_tables_of_an_early_flushed_statement_are_reported() {
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now();
+        assert!(at(&mut b, &[rd(1, 40, "harmless")], t0).is_empty());
+        let t1 = t0 + PENDING_TIMEOUT;
+        let out = at(&mut b, &[], t1);
+        assert_eq!(out, ["read [\"shop.harmless\"] None []"], "{out:#?}");
+        // The procedure goes on: the same table again (ignored), then
+        // another one, then its statement record.
+        let out = at(
+            &mut b,
+            &[
+                rd(1, 40, "harmless"),
+                rd(1, 40, "salaries"),
+                qy(1, 40, "call report()"),
+            ],
+            t1,
+        );
+        assert_eq!(out, ["read [\"shop.salaries\"] None []"], "{out:#?}");
+        // A continuation that times out too is reported, and remembered
+        // with every table so far.
+        assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
+        let t2 = t1 + PENDING_TIMEOUT;
+        assert_eq!(at(&mut b, &[], t2), ["read [\"shop.a\"] None []"]);
+        assert!(at(&mut b, &[rd(2, 41, "b")], t2).is_empty());
+        let t3 = t2 + PENDING_TIMEOUT;
+        assert_eq!(at(&mut b, &[], t3), ["read [\"shop.b\"] None []"]);
+        let out = at(
+            &mut b,
+            &[
+                rd(2, 41, "a"),
+                rd(2, 41, "b"),
+                qy(2, 41, "select v from a join b using (id) where id = 1"),
+            ],
+            t3,
+        );
+        assert!(out.is_empty(), "{out:#?}");
         assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
     }
 
