@@ -187,12 +187,27 @@ review remain the primary controls.
 - Console-provided `heartbeat_interval_s` is clamped to [10, 300], values
   `<= 0` are ignored. The heartbeat runs the targets' `check()`
   concurrently under one 10 s deadline, so it waits at most 10 s for all of
-  them (P2-G); targets reaching the same account (engine, host or socket,
-  port, account) are checked one at a time, so an account holds at most one
-  check next to one scan; Audit streams hold their own connections outside
-  these turns (sizing in ADR-0025 decision 11). A check still running or waiting for its
-  turn at the deadline is reported unreachable with `timeout` and the
-  `check.timed_out` note. At most 16 jobs are handled per poll, each parsed on
+  them (P2-G); targets reaching the same account (engine family, host or
+  socket, port, account) are checked one at a time, so an account holds at
+  most one check next to one scan; Audit streams hold their own connections
+  outside these turns (sizing in ADR-0025 decision 11). The account key
+  recognizes aliases (phase 7, `crates/core/src/checks.rs`): an omitted port
+  and the engine's default one, host names in any case or with a trailing
+  dot, IP literal forms (`[::1]`, `::ffff:127.0.0.1`), `localhost` and the
+  loopback addresses, a socket path through symlinks, and host names that
+  resolve to a shared address. Names are resolved only when two targets of
+  one engine family, account and port name different hosts: through the
+  system resolver (the declared targets only, as the connectors resolve
+  them anyway; no scan, I5), at most 1 s and within the deadline, cached
+  5 minutes; a name not resolved in time keeps its literal key. A check
+  still running at the deadline is reported unreachable with `timeout` and
+  the `check.timed_out` note, and takes the last turn of its account at the
+  next heartbeats (the other targets of the account rotate), so a hung
+  check no longer uses up the deadline of the others every time. A target
+  whose turn did not come before the deadline (account busy) is reported
+  the same way (the contract has no other status) but logged apart and
+  counted in `checks_account_busy_total`, next to `checks_timed_out_total`
+  (heartbeat metrics). At most 16 jobs are handled per poll, each parsed on
   its own; an unparseable job is reported `failed` (`unsupported` /
   `invalid_params`) when its `job_id` is readable.
 - Access event timestamps (`ts`, `ts_last`) come from the target's audit

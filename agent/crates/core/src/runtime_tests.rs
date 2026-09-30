@@ -4266,6 +4266,120 @@ async fn targets_sharing_an_account_are_checked_one_at_a_time() {
     );
 }
 
+/// Phase 7 (ADR-0025 consequence): targets naming the same account
+/// differently (an omitted port and the default one, `localhost` and a
+/// loopback literal) take turns too.
+#[tokio::test]
+async fn aliases_of_one_account_take_turns() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let mut config = with_targets(&env, &["shared-a", "shared-b", "shared-c"]);
+    // `127.0.0.1:5432`, `localhost` without a port, `[::1]:5432`.
+    config.targets[1].host = Some("LOCALHOST".to_owned());
+    config.targets[1].port = None;
+    config.targets[2].host = Some("[::1]".to_owned());
+    let turns = Arc::new(Turns::default());
+    let mut rt = Runtime::new(
+        &env.config_path,
+        config.clone(),
+        vec![Box::new(SharedTurns(Arc::clone(&turns)))],
+    )
+    .unwrap();
+    rt.check_timeout = Duration::from_secs(2);
+    let statuses = rt.target_statuses(&config).await;
+    assert!(statuses.iter().all(|s| s.reachable), "{statuses:?}");
+    assert_eq!(turns.most.load(Ordering::SeqCst), 1);
+}
+
+/// `check()`: targets named `*-hung` never answer; the others take 50 ms.
+struct HungOne;
+
+#[async_trait::async_trait]
+impl Connector for HungOne {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, target: &crate::config::TargetConfig) -> TargetHealth {
+        if target.id.ends_with("-hung") {
+            return std::future::pending().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Limited,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+}
+
+/// Phase 7 (ADR-0025 consequence): a hung check uses up its account's
+/// deadline once; from the next heartbeat on, it takes the last turn and
+/// the other targets of the account are checked. A target whose turn did
+/// not come is counted apart from a timeout (account busy).
+#[tokio::test]
+async fn a_hung_check_takes_the_last_turn_at_the_next_heartbeat() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let ids = ["shared-hung", "shared-b", "shared-c", "own-d"];
+    let config = with_targets(&env, &ids);
+    let mut rt = Runtime::new(&env.config_path, config.clone(), vec![Box::new(HungOne)]).unwrap();
+    rt.check_timeout = Duration::from_millis(300);
+    let reachable = |statuses: &[TargetStatus]| -> Vec<(String, bool)> {
+        statuses
+            .iter()
+            .map(|s| (s.target_id.as_str().to_owned(), s.reachable))
+            .collect()
+    };
+    let expect = |b: bool, c: bool| -> Vec<(String, bool)> {
+        [
+            ("shared-hung", false),
+            ("shared-b", b),
+            ("shared-c", c),
+            ("own-d", true),
+        ]
+        .iter()
+        .map(|(id, r)| ((*id).to_owned(), *r))
+        .collect()
+    };
+    // First heartbeat: the hung check goes first and uses up the deadline.
+    let statuses = rt.target_statuses(&config).await;
+    assert_eq!(reachable(&statuses), expect(false, false));
+    assert!(
+        statuses
+            .iter()
+            .filter(|s| !s.reachable)
+            .all(|s| s.last_error == Some(FailureCode::Timeout))
+    );
+    assert_eq!(metric(&rt, "checks_timed_out_total"), 1.0);
+    assert_eq!(metric(&rt, "checks_account_busy_total"), 2.0);
+    // Next heartbeats: it goes last; the others are checked.
+    for n in 2..4 {
+        let statuses = rt.target_statuses(&config).await;
+        assert_eq!(reachable(&statuses), expect(true, true), "heartbeat {n}");
+    }
+    assert_eq!(metric(&rt, "checks_timed_out_total"), 3.0);
+    assert_eq!(metric(&rt, "checks_account_busy_total"), 2.0);
+}
+
 #[tokio::test]
 async fn heartbeat_target_checks_run_concurrently_within_one_bound() {
     let server = MockServer::start().await;

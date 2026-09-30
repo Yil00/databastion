@@ -319,6 +319,11 @@ struct Counters {
     /// batches were still spooled (flush wait elapsed, or `/findings`
     /// parked).
     scan_status_before_flush: AtomicU64,
+    /// Heartbeat target checks still running at the deadline.
+    checks_timed_out: AtomicU64,
+    /// Heartbeat target checks not run: another check of the same account
+    /// was still running at the deadline (account busy).
+    checks_account_busy: AtomicU64,
 }
 
 /// The delay before restarting a failed audit stream: the backoff
@@ -554,6 +559,17 @@ struct ScanQueue {
 /// Bound of one target's `check()` in a heartbeat.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How a heartbeat target check ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    /// Answered (or failed) in time.
+    Done,
+    /// Still running at the deadline.
+    TimedOut,
+    /// Not run: its account's turn did not come before the deadline.
+    Busy,
+}
+
 /// Scans queued at most; more are left unacknowledged and redelivered.
 const MAX_QUEUED_SCANS: usize = 16;
 
@@ -613,6 +629,10 @@ struct Runtime {
     /// Longest wait for a scan's findings to be acknowledged before its
     /// terminal status ([`STATUS_FLUSH_WAIT`]; lowered in tests).
     status_flush_wait: Duration,
+    /// Order of the heartbeat check turns per account (see `checks`).
+    turns: Mutex<crate::checks::TurnState>,
+    /// Host name resolutions of the account keys (see `checks`).
+    dns: Mutex<crate::checks::DnsCache>,
     /// Whether the spool worker runs (it always does under `run`): without
     /// it nothing sends the spool, so a terminal status never waits.
     spool_worker: std::sync::atomic::AtomicBool,
@@ -790,6 +810,8 @@ impl Runtime {
             audit_parked: Mutex::new(std::collections::HashMap::new()),
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
+            turns: Mutex::new(crate::checks::TurnState::default()),
+            dns: Mutex::new(crate::checks::DnsCache::default()),
             spool_worker: std::sync::atomic::AtomicBool::new(false),
             spool_changed: tokio::sync::Notify::new(),
             spool_pushed: tokio::sync::Notify::new(),
@@ -836,59 +858,171 @@ impl Runtime {
     /// the heartbeat waits at most one `check_timeout` for all targets,
     /// whatever their number (at most `MAX_TARGETS`) and however many are
     /// slow or hung (P2-G: sequential checks delayed it by up to N x 10 s
-    /// and could raise a false `agent.silent`). A check still running, or
-    /// still waiting for its turn, at the deadline is dropped and reported
-    /// unreachable with `timeout` and `check.timed_out`; the connectors
-    /// cancel their statements server-side when dropped.
+    /// and could raise a false `agent.silent`). A check still running at
+    /// the deadline is dropped and reported unreachable with `timeout` and
+    /// `check.timed_out`; the connectors cancel their statements
+    /// server-side when dropped.
     ///
-    /// Targets reaching the same account (engine family, host or socket,
-    /// port, account) are checked **one at a time**: a check may hold two
-    /// connections (its session and a `KILL QUERY` one), and ADR-0018 sizes
-    /// the MySQL / MariaDB `MAX_USER_CONNECTIONS` for one check next to a
-    /// scan. Targets naming the same server differently (an alias, an IP
-    /// and a name) are not recognized as the same.
+    /// Targets reaching the same account are checked **one at a time**
+    /// (ADR-0025 decision 9): a check may hold two connections (its session
+    /// and a `KILL QUERY` one), and ADR-0018 sizes the MySQL / MariaDB
+    /// `MAX_USER_CONNECTIONS` for one check next to a scan. The account key
+    /// recognizes aliases (phase 7, see `crate::checks`): an omitted port
+    /// and the engine's default one, IP literal forms, `localhost`, and
+    /// host names resolving to a shared address. Within an account, the
+    /// targets whose check timed out at the previous heartbeat take the last
+    /// turns and the others rotate, so a hung check no longer uses up the
+    /// deadline of the same targets at every heartbeat. A target whose turn
+    /// did not come before the deadline (**account busy**) is reported like
+    /// a timeout (`timeout`, `check.timed_out`: the contract has no other
+    /// status), but logged and counted apart
+    /// (`checks_account_busy_total`, next to `checks_timed_out_total`).
     ///
     /// Chosen over a cache refreshed in the background: every heartbeat
     /// still reports what was checked for it (no stale reachability or
     /// audit level), no extra task or lifecycle is needed, and the bound is
     /// the same.
     async fn target_statuses(&self, config: &AgentConfig) -> Vec<TargetStatus> {
-        type Account = (Engine, Option<String>, Option<u16>, Option<PathBuf>, String);
         let deadline = tokio::time::Instant::now() + self.check_timeout;
-        let mut turns: std::collections::HashMap<Account, Arc<tokio::sync::Mutex<()>>> =
-            std::collections::HashMap::new();
-        let checks = config
-            .targets
-            .iter()
-            .filter_map(|target| {
-                // Validated by config; unreachable in practice.
-                let target_id = TargetId::try_from(target.id.as_str()).ok()?;
-                let account = (
-                    target.engine.connector(),
-                    target.host.as_ref().map(|h| h.to_ascii_lowercase()),
-                    target.port,
-                    target.socket.clone(),
-                    target.account.clone(),
-                );
-                let turn = Arc::clone(turns.entry(account).or_default());
-                Some(self.target_status(target, target_id, turn, deadline))
+        let targets = &config.targets;
+        let resolved = self.resolve_aliases(targets, deadline).await;
+        let groups = crate::checks::account_groups(targets, &resolved);
+        let (seq, slow) = {
+            let mut turns = self.lock_turns();
+            let seq = turns.seq;
+            turns.seq = turns.seq.wrapping_add(1);
+            (seq, turns.slow.clone())
+        };
+        let mut members: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, g) in groups.iter().enumerate() {
+            members.entry(*g).or_default().push(i);
+        }
+        let runs = members
+            .into_values()
+            .map(|group| {
+                let order = crate::checks::turn_order(&group, targets, seq, &slow);
+                async move {
+                    let mut out = Vec::with_capacity(order.len());
+                    for i in order {
+                        let target = &targets[i];
+                        // Validated by config; unreachable in practice.
+                        let Ok(target_id) = TargetId::try_from(target.id.as_str()) else {
+                            continue;
+                        };
+                        let busy = tokio::time::Instant::now() >= deadline;
+                        let (status, outcome) =
+                            self.target_status(target, target_id, deadline, busy).await;
+                        out.push((i, status, outcome));
+                    }
+                    out
+                }
             })
             .collect::<Vec<_>>();
-        futures_util::future::join_all(checks).await
+        let mut done: Vec<(usize, TargetStatus, CheckOutcome)> =
+            futures_util::future::join_all(runs)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+        done.sort_by_key(|(i, ..)| *i);
+        let mut turns = self.lock_turns();
+        for (i, _, outcome) in &done {
+            let id = &targets[*i].id;
+            match outcome {
+                CheckOutcome::TimedOut => {
+                    turns.slow.insert(id.clone());
+                }
+                CheckOutcome::Done => {
+                    turns.slow.remove(id);
+                }
+                CheckOutcome::Busy => {}
+            }
+        }
+        turns.slow.retain(|id| targets.iter().any(|t| &t.id == id));
+        drop(turns);
+        done.into_iter().map(|(_, s, _)| s).collect()
+    }
+
+    fn lock_turns(&self) -> std::sync::MutexGuard<'_, crate::checks::TurnState> {
+        self.turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Addresses of the host names that could be aliases of one account
+    /// (see `crate::checks`), from the cache or resolved now, within
+    /// [`crate::checks::DNS_TIMEOUT`] and `deadline`; a name not resolved
+    /// in time has none (its literal key is used).
+    async fn resolve_aliases(
+        &self,
+        targets: &[crate::config::TargetConfig],
+        deadline: tokio::time::Instant,
+    ) -> std::collections::HashMap<String, Vec<std::net::IpAddr>> {
+        let names = crate::checks::names_to_resolve(targets);
+        let now = Instant::now();
+        let mut out = std::collections::HashMap::new();
+        let mut todo = Vec::new();
+        {
+            let cache = self
+                .dns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for n in names {
+                match cache.get(&n, now) {
+                    Some(addrs) => {
+                        out.insert(n, addrs);
+                    }
+                    None => todo.push(n),
+                }
+            }
+        }
+        if todo.is_empty() {
+            return out;
+        }
+        let bound = deadline.min(tokio::time::Instant::now() + crate::checks::DNS_TIMEOUT);
+        let lookups = todo.iter().map(|n| async move {
+            let addrs = tokio::time::timeout_at(bound, crate::checks::resolve(n.clone())).await;
+            (n.clone(), addrs.ok())
+        });
+        let results = futures_util::future::join_all(lookups).await;
+        let mut cache = self
+            .dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (n, addrs) in results {
+            // Not answered in time: not cached, tried again next time.
+            if let Some(addrs) = addrs {
+                cache.put(n.clone(), addrs.clone(), now);
+                out.insert(n, addrs);
+            }
+        }
+        out
     }
 
     /// One target's status (see [`target_statuses`](Self::target_statuses)).
+    /// `busy`: its turn did not come before the deadline; it is not
+    /// checked.
     async fn target_status(
         &self,
         target: &crate::config::TargetConfig,
         target_id: TargetId,
-        turn: Arc<tokio::sync::Mutex<()>>,
         deadline: tokio::time::Instant,
-    ) -> TargetStatus {
+        busy: bool,
+    ) -> (TargetStatus, CheckOutcome) {
         let connector = self
             .connectors
             .iter()
             .find(|c| c.engine() == target.engine.connector());
+        let timed_out = || {
+            (
+                false,
+                AuditLevel::None,
+                Some(FailureCode::Timeout),
+                vec![TargetNote::new(NoteCode::CheckTimedOut)],
+            )
+        };
+        let mut outcome = CheckOutcome::Done;
         let (reachable, level, last_error, notes) = match connector {
             None => (
                 false,
@@ -896,37 +1030,50 @@ impl Runtime {
                 Some(FailureCode::Unsupported),
                 Vec::new(),
             ),
-            Some(c) => match tokio::time::timeout_at(deadline, async {
-                let _turn = turn.lock().await;
-                crate::panics::guard(c.check(target)).await
-            })
-            .await
-            {
-                Ok(Ok(h)) => (h.reachable, h.audit_level, h.failure, h.notes),
-                Ok(Err(p)) => {
-                    bump(&self.counters.connector_panics, 1);
-                    tracing::error!(
-                        target_id = %target.id,
-                        panic_id = p.id,
-                        "target check failed: internal error"
-                    );
-                    (
-                        false,
-                        AuditLevel::None,
-                        Some(FailureCode::Internal),
-                        vec![
-                            TargetNote::new(NoteCode::CheckStageFailed)
-                                .with_labels([crate::notes::NoteLabel::stage("check")]),
-                        ],
-                    )
+            Some(_) if busy => {
+                outcome = CheckOutcome::Busy;
+                bump(&self.counters.checks_account_busy, 1);
+                tracing::warn!(
+                    target_id = %target.id,
+                    "target check not run: another check of the same database account was \
+                     still running at the heartbeat deadline (account busy); reported as a \
+                     timeout"
+                );
+                timed_out()
+            }
+            Some(c) => {
+                match tokio::time::timeout_at(deadline, crate::panics::guard(c.check(target))).await
+                {
+                    Ok(Ok(h)) => (h.reachable, h.audit_level, h.failure, h.notes),
+                    Ok(Err(p)) => {
+                        bump(&self.counters.connector_panics, 1);
+                        tracing::error!(
+                            target_id = %target.id,
+                            panic_id = p.id,
+                            "target check failed: internal error"
+                        );
+                        (
+                            false,
+                            AuditLevel::None,
+                            Some(FailureCode::Internal),
+                            vec![
+                                TargetNote::new(NoteCode::CheckStageFailed)
+                                    .with_labels([crate::notes::NoteLabel::stage("check")]),
+                            ],
+                        )
+                    }
+                    Err(_) => {
+                        outcome = CheckOutcome::TimedOut;
+                        bump(&self.counters.checks_timed_out, 1);
+                        tracing::warn!(
+                            target_id = %target.id,
+                            "target check still running at the heartbeat deadline: dropped \
+                             (its next turns come after the other targets of its account)"
+                        );
+                        timed_out()
+                    }
                 }
-                Err(_) => (
-                    false,
-                    AuditLevel::None,
-                    Some(FailureCode::Timeout),
-                    vec![TargetNote::new(NoteCode::CheckTimedOut)],
-                ),
-            },
+            }
         };
         // A stream stopped after repeated panics: no audit, whatever the
         // source could give.
@@ -958,7 +1105,7 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        TargetStatus {
+        let status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
             edition: None,
@@ -969,7 +1116,8 @@ impl Runtime {
             reachable,
             server_version: None,
             target_id,
-        }
+        };
+        (status, outcome)
     }
 
     fn metrics(&self) -> MetricsMap {
@@ -1014,6 +1162,8 @@ impl Runtime {
                 "scan_status_before_flush_total",
                 &c.scan_status_before_flush,
             ),
+            ("checks_timed_out_total", &c.checks_timed_out),
+            ("checks_account_busy_total", &c.checks_account_busy),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
