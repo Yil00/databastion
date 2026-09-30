@@ -103,6 +103,41 @@ async fn collect_until(
     }
 }
 
+/// What a driver does when it closes a pooled connection still in its
+/// handshake: `hello` carrying a speculative `saslStart` for `user`, then
+/// the connection closes before the proof. mongod logs "Failed to
+/// authenticate" (`AuthenticationAbandoned`, 337): not a failed login.
+async fn abandon_handshake(url: &Url, user: &str) {
+    let endpoint = crate::net::Endpoint::Tcp {
+        host: url.host.clone(),
+        port: url.port,
+    };
+    let mut wire = crate::wire::Wire::new(endpoint.open(None).await.unwrap());
+    let (_exchange, first) = crate::scram::Scram::start(user).unwrap();
+    let hello = DocBuf::new()
+        .i32("hello", 1)
+        .doc(
+            "speculativeAuthenticate",
+            DocBuf::new()
+                .i32("saslStart", 1)
+                .str("mechanism", crate::scram::MECHANISM)
+                .binary("payload", &first)
+                .str("db", "admin"),
+        )
+        .str("$db", "admin")
+        .finish();
+    let reply = wire.round_trip(&hello).await.unwrap();
+    assert!(
+        reply
+            .doc()
+            .doc("speculativeAuthenticate")
+            .unwrap()
+            .is_some(),
+        "the server did not start the speculative conversation"
+    );
+    wire.shutdown().await;
+}
+
 /// Runs `audit_stream` in a task (poll interval 1 s, cursors in `state`).
 fn start_audit(
     connector: Arc<MongodbConnector>,
@@ -215,6 +250,10 @@ async fn audit_from_the_server_log() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     reads(&a, "mongodump").await;
     reads(&a, "mongosh 2.3.0").await;
+    // Handshakes abandoned by a client (an existing account, the agent's
+    // own included): no auth_failure (e2e flake of #98: mongodump).
+    abandon_handshake(&url, &a.user).await;
+    abandon_handshake(&url, &url.user).await;
     // A failed authentication.
     let (_d, wrong) = target(&url, "databastion_it_nobody", "wrong-password", "admin");
     assert!(
@@ -292,11 +331,13 @@ async fn audit_from_the_server_log() {
                 .iter()
                 .all(|s| !s.as_str().starts_with("signature.")))
     );
-    let failure = events
+    let failures: Vec<_> = events
         .iter()
-        .find(|e| e.action() == EventAction::AuthFailure)
-        .unwrap();
-    assert!(!failure.principal().send_name());
+        .filter(|e| e.action() == EventAction::AuthFailure)
+        .collect();
+    // The wrong password only: the abandoned handshakes are not failures.
+    assert_eq!(failures.len(), 1, "{text:#?}");
+    assert!(!failures[0].principal().send_name());
     assert_no_own_reads(&events, &format!("{}@{}", url.user, url.auth_source));
     assert_no_marker(&events, &logs);
     // The real tool, from inside the container (its own application name).
