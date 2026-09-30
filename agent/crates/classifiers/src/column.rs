@@ -20,7 +20,7 @@
 //! | IBAN, card, NIR (checksums) | `matched ≥ 1` and at least half of the checksum-shaped candidates are valid; card: not under an order / tracking / IMEI / SIRET name | `0.6 + 0.35·ratio (+0.05 hint)` |
 //! | AWS key id, secret key in context, password hash | `matched ≥ 1` | idem |
 //! | e-mail (personal mailboxes only) | hint, `ratio ≥ 0.05` or `matched ≥ 3`; not a single address repeated (`matched ≥ 3`) | idem |
-//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07` or `00` + country code + mobile prefix), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it), or 3 values and `≥ 0.05` with a formatted number among words (free text); in a contact column, the shares `0.3` and `0.8` are taken over the values that are not e-mail addresses (3 values at least) | `0.4 + 0.4·ratio (+0.2 hint)` |
+//! | phone | hint and `matched ≥ 1`; no hint: `≥ 0.3` of values with a formatted number (compact digits do not count, except a column of `≥ 0.8` whole compact numbers, 60 % with a mobile prefix `06` / `07` or `00` + country code + mobile prefix), or 3 values and `≥ 0.05` with a strong one (`+`, parentheses, a phone label before it), or 3 values and `≥ 0.05` with a formatted number among words (free text); a column of `≥ 0.95` compact North American numbers (20 at least, 3 area codes); in a contact column, the shares `0.3`, `0.8` and `0.95` are taken over the values that are not e-mail addresses (3 values at least); `+` compact numbers among negative numbers are signed amounts | `0.4 + 0.4·ratio (+0.2 hint)` |
 //! | birth date | labelled dates in text (`born …`): `ratio ≥ 0.05` or 3 values; hint: dates `≥ 0.5`; no hint: dates `≥ 0.7`, ≥ 3, an age distribution (median year ≤ 2002, 10-year spread, ≤ 15 % after 2014, not all on the 1st; with more than 20 % times of day: median ≤ 1995 and ≤ 5 % after 2014) | `0.3 + 0.5·ratio (+0.15 hint)` |
 //! | person name | never under a name of something else (`pet_name`, `hostname`, `product.name`, `team_name`, `company_name`…); hint: name-shaped `≥ 0.6` (bare `name`: `≥ 0.7` and 25 % known names); no hint: name-shaped `≥ 0.7`, 40 % with a known given name, surname or surname ending, 25 % with a listed one, under 20 % well-known places or brands (`Austin`, `Hugo Boss`), 3 distinct | idem |
 //! | postal address | hint: address-like `≥ 0.5`; no hint: strong addresses `≥ 0.5`, or address-like `≥ 0.8` with 25 % strong, or 3 strong addresses and `≥ 0.1` (free text) | idem |
@@ -77,6 +77,9 @@ const PHONE_STRONG_MIN_RATIO: f64 = 0.05;
 /// number sits among words, and their share.
 const PHONE_TEXT_MIN_MATCHED: u32 = 3;
 const PHONE_TEXT_MIN_RATIO: f64 = 0.05;
+/// Phone without a name hint: a column of compact North American numbers.
+const PHONE_NANP_MIN_MATCHED: u32 = 20;
+const PHONE_NANP_MIN_RATIO: f64 = 0.95;
 /// Letters outside the phone tokens that make a value text.
 const PHONE_TEXT_MIN_LETTERS: usize = 3;
 /// E-mail and labelled dates in text: share of values without a hint.
@@ -127,11 +130,57 @@ const PLACEHOLDERS: &[&str] = &[
     "[redacted]",
     "***",
     "0",
+    // Export artefacts: pandas, MySQL dumps, spreadsheets.
+    "nan",
+    "\\n",
+    "#n/a",
+    "#na",
+    "#null!",
+    "#value!",
+    "(empty)",
+    "<empty>",
+    "(none)",
+    "<none>",
+    "—",
+    "–",
+    "_",
+    "...",
+    "…",
+    "n.c.",
+    "n.c",
+    "nc",
+    "n/c",
+    "néant",
+    "neant",
+    "aucun",
+    "aucune",
+    "not provided",
+    "none provided",
+    "not set",
+    "not specified",
+    "missing",
+    "no data",
+    "sin datos",
+    "keine",
+    "k.a.",
+    "withheld",
 ];
 
 fn placeholder(value: &str) -> bool {
     let v = value.trim();
-    v.len() <= 20 && PLACEHOLDERS.iter().any(|p| v.eq_ignore_ascii_case(p))
+    if v.len() <= 20 && PLACEHOLDERS.iter().any(|p| v.eq_ignore_ascii_case(p)) {
+        return true;
+    }
+    // Fillers: one digit repeated, with or without separators
+    // (`0000000000`, `00 00 00 00 00`, `000-000-0000`).
+    let mut digits = v.bytes().filter(u8::is_ascii_digit);
+    let first = digits.next();
+    v.len() <= 24
+        && first.is_some()
+        && v.bytes().filter(u8::is_ascii_digit).count() >= 5
+        && digits.all(|d| Some(d) == first)
+        && v.bytes()
+            .all(|b| b.is_ascii_digit() || b" .-/()+".contains(&b))
 }
 
 /// Per-column evidence beyond the matched counts.
@@ -149,6 +198,15 @@ struct Stats {
     /// Values with an e-mail token and no phone token: the other half of a
     /// contact column ("e-mail or phone").
     email_only: u32,
+    /// Whole compact North American numbers, and up to 3 of their area
+    /// codes.
+    phone_nanp: u32,
+    nanp_areas: Vec<u16>,
+    /// Whole signed numbers: negative ones (`-12345`), and `+` compact
+    /// numbers graded as strong phones (`+12345678`). With negative
+    /// numbers around, the `+` ones are signed amounts.
+    minus_numbers: u32,
+    plus_compact: u32,
     /// Values that are a whole compact national number, and among them
     /// those with a mobile prefix (`06`, `07`).
     phone_compact: u32,
@@ -360,6 +418,21 @@ impl ColumnClassifier<'_> {
                 st.phone_text += 1;
             }
             st.email_only += u32::from(has(ClassifierId::Email) && !has(ClassifierId::Phone));
+            {
+                let t = value.trim();
+                let number = |x: &str| {
+                    !x.is_empty()
+                        && x.bytes()
+                            .all(|b| b.is_ascii_digit() || b == b'.' || b == b',')
+                };
+                st.minus_numbers += u32::from(t.strip_prefix('-').is_some_and(number));
+                st.plus_compact += u32::from(
+                    cand.phone == Some(detect::PhoneStrength::Strong)
+                        && t.strip_prefix('+').is_some_and(|x| {
+                            !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit())
+                        }),
+                );
+            }
             let mut hit = [false; ClassifierId::ALL.len()];
             let (mut aws, mut hash, mut labelled) = (false, false, false);
             for t in &tokens {
@@ -429,6 +502,23 @@ impl ColumnClassifier<'_> {
                 st.aws_whole += 1;
                 st.aws_slash += u32::from(value.contains(['/', '+']));
                 self.record(&ctx, &mut acc, &mut hit, ClassifierId::AwsKey, value);
+            }
+            if on(ClassifierId::Phone)
+                && let Some(kind) = detect::compact_phone(value)
+            {
+                match kind {
+                    detect::CompactPhone::IntlMobile => {
+                        st.phone_compact += 1;
+                        st.phone_compact_mobile += 1;
+                    }
+                    detect::CompactPhone::Nanp { area } => {
+                        st.phone_nanp += 1;
+                        if st.nanp_areas.len() < 3 && !st.nanp_areas.contains(&area) {
+                            st.nanp_areas.push(area);
+                        }
+                    }
+                }
+                self.record(&ctx, &mut acc, &mut hit, ClassifierId::Phone, value.trim());
             }
             if on(ClassifierId::Phone)
                 && hints.gates(ClassifierId::Phone)
@@ -560,13 +650,27 @@ fn decide(c: ClassifierId, matched: u32, st: &Stats, hints: &NameHints) -> bool 
             // are the values that are not e-mail addresses.
             let others = st.n.saturating_sub(st.email_only).max(1);
             let share_others = |k: u32| f64::from(k) / f64::from(others);
-            let formatted = st.phone_strong + st.phone_normal;
+            // `+12345678` among `-2345678`: signed amounts.
+            let signed = st.minus_numbers >= PHONE_STRONG_MIN_MATCHED
+                && share(st.minus_numbers) >= PHONE_STRONG_MIN_RATIO;
+            let strong = if signed {
+                st.phone_strong.saturating_sub(st.plus_compact)
+            } else {
+                st.phone_strong
+            };
+            let formatted = strong + st.phone_normal;
             (hint && hints.gates(c))
                 || share(formatted) >= PHONE_MIN_RATIO
                 || (formatted >= PHONE_STRONG_MIN_MATCHED
                     && share_others(formatted) >= PHONE_MIN_RATIO)
-                || (st.phone_strong >= PHONE_STRONG_MIN_MATCHED
-                    && share(st.phone_strong) >= PHONE_STRONG_MIN_RATIO)
+                || (strong >= PHONE_STRONG_MIN_MATCHED
+                    && share(strong) >= PHONE_STRONG_MIN_RATIO)
+                // A column of compact North American numbers: all of them
+                // fit the plan (a random 10-digit identifier does 3 times
+                // in 4), from several area codes.
+                || (st.phone_nanp >= PHONE_NANP_MIN_MATCHED
+                    && share_others(st.phone_nanp) >= PHONE_NANP_MIN_RATIO
+                    && st.nanp_areas.len() >= 3)
                 // Free text: numbers that fit a numbering plan, among words.
                 || (st.phone_text >= PHONE_TEXT_MIN_MATCHED
                     && share(st.phone_text) >= PHONE_TEXT_MIN_RATIO)
@@ -796,6 +900,55 @@ mod tests {
             .map(|i| format!("S/N 00{:02} 4567 {:02} returned, lot 0{:09}", i, i, i * 7))
             .collect();
         assert!(!phone_found("c1", &serials));
+    }
+
+    #[test]
+    fn compact_phone_columns() {
+        // North American numbers: every value fits the plan.
+        let nanp: Vec<String> = (0..40)
+            .map(|i| format!("{}{}{:04}", 202 + (i % 7) * 101, 555, i * 37))
+            .collect();
+        assert!(phone_found("c1", &nanp));
+        // 10-digit identifiers: some do not fit (exchange `0XX` / `1XX`).
+        let ids: Vec<String> = (0..40)
+            .map(|i| format!("{}", 2_000_000_000u64 + i * 12_345_679))
+            .collect();
+        assert!(!phone_found("c1", &ids));
+        // E.164 without `+`.
+        let intl: Vec<String> = (0..20)
+            .map(|i| format!("33{}{:08}", 6 + i % 2, i * 4_567_891))
+            .collect();
+        assert!(phone_found("c1", &intl));
+        // Sparse, with export artefacts for "no value".
+        let sparse: Vec<String> = (0..50)
+            .map(|i| match i % 5 {
+                0 => format!("01 99 00 {:02} 59", i),
+                1 => "nan".to_owned(),
+                2 => "\\N".to_owned(),
+                3 => "00 00 00 00 00".to_owned(),
+                _ => "#N/A".to_owned(),
+            })
+            .collect();
+        assert!(phone_found("c1", &sparse));
+    }
+
+    #[test]
+    fn signed_integers_are_not_phones() {
+        let signed: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    "{}{}",
+                    if i % 2 == 0 { "+" } else { "-" },
+                    12_345_678 + i * 991
+                )
+            })
+            .collect();
+        assert!(!phone_found("c1", &signed));
+        // E.164 numbers alone stay phones.
+        let e164: Vec<String> = (0..60)
+            .map(|i| format!("+336{:08}", 12_345_678 + i * 991))
+            .collect();
+        assert!(phone_found("c1", &e164));
     }
 
     #[test]

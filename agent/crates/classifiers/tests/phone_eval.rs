@@ -514,7 +514,8 @@ fn negatives(r: &mut Rng, cases: &mut Vec<Case>) {
     });
     add(r, "tracking digits", "c11", &|r| r.digits(22));
     add(r, "siren", "c12", &|r| {
-        format!("{} {} {}", r.digits(3), r.digits(3), r.digits(3))
+        let d = luhn_complete(&format!("{}{}", r.range(1, 9), r.digits(7)));
+        format!("{} {} {}", &d[..3], &d[3..6], &d[6..])
     });
     add(r, "siren compact", "c13", &|r| {
         format!("{}{}", r.range(1, 9), r.digits(8))
@@ -795,12 +796,230 @@ fn negatives(r: &mut Rng, cases: &mut Vec<Case>) {
     });
 }
 
+fn luhn_complete(partial: &str) -> String {
+    (0..10)
+        .map(|d| format!("{partial}{d}"))
+        .find(|n| {
+            let mut sum = 0;
+            for (i, b) in n.bytes().rev().enumerate() {
+                let mut d = u32::from(b - b'0');
+                if i % 2 == 1 {
+                    d *= 2;
+                    if d > 9 {
+                        d -= 9;
+                    }
+                }
+                sum += d;
+            }
+            sum % 10 == 0
+        })
+        .unwrap()
+}
+
+/// NANP number with area code and exchange in `[2-9]XX`, not `N11`.
+fn nanp_digits(r: &mut Rng) -> String {
+    let part = |r: &mut Rng| loop {
+        let x = r.range(200, 999);
+        if x % 100 != 11 {
+            return x;
+        }
+    };
+    let (a, e) = (part(r), part(r));
+    format!("{a}{e}{}", r.digits(4))
+}
+
+/// Second round: sparse columns with other "no value" markers, formats
+/// only accepted as weak evidence, other national groupings, names that
+/// hint at phones in other ways; long digit identifiers on the precision
+/// side.
+fn round2(r: &mut Rng, cases: &mut Vec<Case>) {
+    let mut add = |r: &mut Rng, label: &str, name: &str, want: bool, g: &Gen| {
+        let values = (0..200).map(|_| g(r)).collect();
+        cases.push(Case {
+            label: label.to_owned(),
+            name: name.to_owned(),
+            values,
+            want,
+        });
+    };
+    // Sparse columns: most values are export artefacts for "no value".
+    for (i, junk) in [
+        "nan",
+        "NaN",
+        "\\N",
+        "#N/A",
+        "—",
+        "not provided",
+        "0000000000",
+        "00 00 00 00 00",
+        "000-000-0000",
+        "N.C.",
+        "none provided",
+        "(empty)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let j = (*junk).to_owned();
+        add(
+            r,
+            &format!("sparse 80% {junk}"),
+            &format!("c{}", 60 + i),
+            true,
+            &move |r| {
+                if r.chance(80) {
+                    j.clone()
+                } else {
+                    formatted_phone(r)
+                }
+            },
+        );
+    }
+    add(r, "(+cc) prefix", "c80", true, &|r| match r.below(3) {
+        0 => format!("(+33) 6 {}", pairs(r, 4, " ")),
+        1 => format!("(+44) 20 7946 {}", r.digits(4)),
+        _ => format!("(+49) 30 {}", r.digits(8)),
+    });
+    add(r, "+ space cc", "c81", true, &|r| {
+        format!("+ 33 6 {}", pairs(r, 4, " "))
+    });
+    add(r, "es / pt 3-3-3", "c82", true, &|r| {
+        let lead = *r.pick(&["6", "7", "91", "93", "95", "96"]);
+        let d = format!("{lead}{}", r.digits(9 - lead.len()));
+        format!("{} {} {}", &d[..3], &d[3..6], &d[6..])
+    });
+    add(r, "be slash", "c83", true, &|r| {
+        if r.chance(50) {
+            format!("0470/{}", pairs(r, 3, "."))
+        } else {
+            format!("02/{}.{}.{}", r.digits(3), r.digits(2), r.digits(2))
+        }
+    });
+    add(r, "uk 5-3-3", "c84", true, &|r| {
+        format!(
+            "{} {} {}",
+            r.pick(&["07700", "01632", "07911"]),
+            r.digits(3),
+            r.digits(3)
+        )
+    });
+    add(
+        r,
+        "compact e164 without plus",
+        "c85",
+        true,
+        &|r| match r.below(4) {
+            0 => format!("33{}{}", r.pick(&["6", "7"]), r.digits(8)),
+            1 => format!("447{}", r.digits(9)),
+            2 => format!("4915{}", r.digits(8)),
+            _ => format!("346{}", r.digits(8)),
+        },
+    );
+    add(r, "compact nanp", "c86", true, &nanp_digits);
+    add(r, "compact nanp with 1", "c87", true, &|r| {
+        format!("1{}", nanp_digits(r))
+    });
+    add(r, "email or compact nanp", "c88", true, &|r| {
+        if r.chance(40) {
+            nanp_digits(r)
+        } else {
+            email(r)
+        }
+    });
+    add(r, "rows with postcode after", "c89", true, &|r| {
+        let p = fr(r, 0);
+        format!("Jean Dupont {p} {} Paris", r.range(75001, 75020))
+    });
+    for name in [
+        "phones",
+        "phone1",
+        "workPhone",
+        "MobileNumber",
+        "telefonnummer",
+        "celular",
+        "whatsapp",
+        "tel_portable",
+        "numero_mobile",
+        "PHONE_NR",
+        "contactPhone",
+        "cellular",
+    ] {
+        add(r, &format!("compact under {name}"), name, true, &|r| {
+            if r.chance(50) {
+                fr(r, 11)
+            } else {
+                nanp_digits(r)
+            }
+        });
+    }
+    // Precision.
+    add(r, "00 grouped by 4", "c90", false, &|r| {
+        format!("00{} {} {}", r.range(10, 99), r.digits(4), r.digits(4))
+    });
+    add(r, "0 grouped 4-4-4", "c91", false, &|r| {
+        format!("0{} {} {}", r.digits(3), r.digits(4), r.digits(4))
+    });
+    add(r, "signed integers", "c92", false, &|r| {
+        format!(
+            "{}{}",
+            r.pick(&["+", "-"]),
+            r.range(10_000_000, 999_999_999)
+        )
+    });
+    add(r, "3-3-3 luhn ids", "c93", false, &|r| {
+        let d = luhn_complete(&format!("{}{}", r.pick(&["6", "7", "9"]), r.digits(7)));
+        format!("{} {} {}", &d[..3], &d[3..6], &d[6..])
+    });
+    add(r, "10 digit ids", "c94", false, &|r| {
+        format!("{}{}", r.range(1, 9), r.digits(9))
+    });
+    add(r, "10 digit ids from 2", "c95", false, &|r| {
+        r.range(2_000_000_000, 2_099_999_999).to_string()
+    });
+    add(r, "11 digit ids", "c96", false, &|r| {
+        format!("{}{}", r.range(1, 9), r.digits(10))
+    });
+    add(r, "12 digit ids", "c97", false, &|r| {
+        format!("{}{}", r.range(1, 9), r.digits(11))
+    });
+    add(r, "isbn10 compact", "c98", false, &|r| {
+        format!("2{}", r.digits(9))
+    });
+    add(r, "phone imei", "phone_imei", false, &|r| {
+        luhn_complete(&format!("35{}", r.digits(12)))
+    });
+    add(r, "mobile serial", "mobile_serial", false, &|r| {
+        r.digits(10)
+    });
+    add(r, "mobile app build", "mobile_app_build", false, &|r| {
+        format!(
+            "{}.{:02}.{}",
+            r.range(2020, 2026),
+            r.range(1, 12),
+            r.digits(4)
+        )
+    });
+    add(r, "phone price", "phone_price", false, &|r| {
+        format!("{}.{:02}", r.range(100_000, 9_999_999), r.range(0, 99))
+    });
+    add(r, "mobile imsi", "mobile_imsi", false, &|r| {
+        format!("20801{}", r.digits(10))
+    });
+    add(r, "phone model", "phone_model", false, &|r| {
+        format!("{} {}", r.pick(&["SM-G", "XT", "CPH"]), r.digits(4))
+    });
+    add(r, "microphone gain", "microphone_level", false, &|r| {
+        r.range(1_000_000, 9_999_999).to_string()
+    });
+}
+
 #[test]
 fn phone_columns_are_decided_correctly() {
     let mut r = Rng(0x5eed_0bad_f00d_0001);
     let mut cases = Vec::new();
     positives(&mut r, &mut cases);
     negatives(&mut r, &mut cases);
+    round2(&mut r, &mut cases);
     let mut wrong = Vec::new();
     let (mut tp, mut fneg, mut fpos, mut tn) = (0, 0, 0, 0);
     for c in &cases {

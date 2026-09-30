@@ -80,12 +80,13 @@ static NIR: LazyLock<Regex> = LazyLock::new(|| {
         ),
     )
 });
-/// International: `+` or `00`, country code, 8 to 15 digits in total; an
-/// area code may be in parentheses, a trunk `(0)` is ignored.
+/// International: `+` (`+ 33`, `(+33)`) or `00`, country code, 8 to 15
+/// digits in total; an area code may be in parentheses, a trunk `(0)` is
+/// ignored.
 static PHONE_INTL: LazyLock<Regex> = LazyLock::new(|| {
     re(
         "PHONE_INTL",
-        r"(?:\+|\b00)[1-9](?:[ .\-/]{0,2}(?:\(0\)|\([0-9]{1,4}\)|[0-9])){6,17}",
+        r"(?:\(\+\s?[1-9][0-9]{0,3}\)|\+\s?[1-9]|\b00[1-9])(?:[ .\-/]{0,2}(?:\(0\)|\([0-9]{1,4}\)|[0-9])){6,17}",
     )
 });
 /// North American: `(202) 555-0125`, `202-555-0125`, `1 202.555.0125`. The
@@ -103,6 +104,14 @@ static PHONE_GROUPED: LazyLock<Regex> = LazyLock::new(|| {
     re(
         "PHONE_GROUPED",
         r"\b3[0-9]{2}[ .\-][0-9]{3}[ .\-][0-9]{4}\b|\b[6-9][0-9]{2}(?: [0-9]{2}){3}\b",
+    )
+});
+/// Spanish and Portuguese numbers in `3-3-3` (`612 345 678`, `912 345 678`):
+/// mobile `6xx` / `7[1-4]x`, landline or Portuguese mobile `9[1-8]x`.
+static PHONE_333: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        "PHONE_333",
+        r"\b(?:6[0-9]{2}|7[1-4][0-9]|9[1-8][0-9])[ .][0-9]{3}[ .][0-9]{3}\b",
     )
 });
 /// National numbers with a trunk `0` (FR, UK, DE, IT, NL, BE, CH…):
@@ -255,6 +264,7 @@ pub fn check_patterns() {
         &PHONE_NANP,
         &PHONE_TRUNK,
         &PHONE_GROUPED,
+        &PHONE_333,
         &PHONE_LABEL,
         &PHONE_EXTENSION,
         &AWS_ID,
@@ -916,7 +926,8 @@ pub(crate) enum PhoneStrength {
 }
 
 /// Phone tokens: international, North American, national with a trunk `0`,
-/// Italian / Spanish mobile groupings. Returns the strongest strength seen.
+/// Italian / Spanish mobile groupings, Spanish / Portuguese `3-3-3`.
+/// Returns the strongest strength seen.
 fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
     let mut best: Option<PhoneStrength> = None;
     for (kind, r) in [
@@ -924,9 +935,9 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
         (1, &*PHONE_NANP),
         (2, &*PHONE_TRUNK),
         (3, &*PHONE_GROUPED),
+        (4, &*PHONE_333),
     ] {
         for m in r.find_iter(v) {
-            let text = m.as_str();
             let before = prev_char(v, m.start());
             // `Tél.06 12 34 56 78`: a dot that ends an abbreviated label.
             let label_dot = before == Some('.')
@@ -947,81 +958,153 @@ fn phone_tokens(v: &str, out: &mut Vec<Token>) -> Option<PhoneStrength> {
             {
                 continue;
             }
-            // Not the start of a longer number or code, a time, a decimal
-            // or a word.
-            let mut after = v[m.end()..].chars();
-            let glued = match after.next() {
-                None => false,
-                // An extension glued to the number (`202-555-0125x12`).
-                Some('x' | 'X') => !extension_after(&v[m.end() + 1..]),
-                Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '@' | '%') => true,
-                Some(' ' | ',') => after.next().is_some_and(|c| c.is_ascii_digit()),
-                Some('.' | '-' | '/') => after.next().is_some_and(|c| c.is_ascii_alphanumeric()),
-                Some(_) => false,
-            };
-            if glued {
-                continue;
+            let mut found = grade(v, kind, m.range(), false).map(|s| (m.range(), s));
+            if found.is_none() && kind == 2 {
+                found = trunk_prefix(v, m.range());
             }
-            // Digits, without the `0` of a trunk `(0)` (no copy).
-            let digits: usize =
-                text.chars().filter(char::is_ascii_digit).count() - text.matches("(0)").count();
-            let separated = text.chars().any(|c| !c.is_ascii_digit() && c != '+');
-            let strength = match kind {
-                // `+` prefix: 8 to 15 digits after it. `00` prefix: 10 to
-                // 15 (`00` then 8 digits is a zero-led serial or
-                // identifier); compact, it is weak (`0033612345678`, like
-                // zero-padded identifiers). A single dot as the only
-                // separator is a signed decimal (`+48.856614`,
-                // `+1234567.89`), not a phone.
-                0 => {
-                    let plus = text.starts_with('+');
-                    let n = if plus {
-                        digits
-                    } else {
-                        digits.saturating_sub(2)
-                    };
-                    let decimal = text
-                        .matches(|c: char| !c.is_ascii_digit() && c != '+')
-                        .eq(["."]);
-                    if !(8..=15).contains(&n) || decimal || (!plus && n < 10) {
-                        None
-                    } else if plus {
-                        Some(PhoneStrength::Strong)
-                    } else if separated {
-                        Some(PhoneStrength::Normal)
-                    } else {
-                        (n <= 13).then_some(PhoneStrength::Weak)
-                    }
-                }
-                1 => nanp_valid(text).then_some(if text.contains('(') {
-                    PhoneStrength::Strong
-                } else {
-                    PhoneStrength::Normal
-                }),
-                2 => {
-                    let ok_len = if separated {
-                        (9..=12).contains(&digits)
-                    } else {
-                        (10..=11).contains(&digits)
-                    };
-                    (ok_len && !date_shaped(text)).then(|| trunk_strength(text))
-                }
-                _ => consistent_separators(text).then_some(PhoneStrength::Normal),
-            };
-            let Some(mut strength) = strength else {
+            let Some((range, mut strength)) = found else {
                 continue;
             };
-            if phone_label_before(v, m.start()) {
+            if phone_label_before(v, range.start) {
                 strength = PhoneStrength::Strong;
             }
             let before_len = out.len();
-            push(out, ClassifierId::Phone, m.range());
+            push(out, ClassifierId::Phone, range);
             if out.len() > before_len {
                 best = best.max(Some(strength));
             }
         }
     }
     best
+}
+
+/// Grades a phone candidate `v[range]` of a given pattern kind; `None` when
+/// it is glued to what follows or fits no numbering plan. `next_group`
+/// accepts a following group of digits (a trunk number cut before a
+/// postcode or a year, [`trunk_prefix`]).
+fn grade(v: &str, kind: u8, range: Range<usize>, next_group: bool) -> Option<PhoneStrength> {
+    let text = &v[range.clone()];
+    // Not the start of a longer number or code, a time, a decimal or a
+    // word.
+    let mut after = v[range.end..].chars();
+    let glued = match after.next() {
+        None => false,
+        // An extension glued to the number (`202-555-0125x12`).
+        Some('x' | 'X') => !extension_after(&v[range.end + 1..]),
+        Some(c) if c.is_alphanumeric() || matches!(c, ':' | '_' | '@' | '%') => true,
+        Some(' ' | ',') => !next_group && after.next().is_some_and(|c| c.is_ascii_digit()),
+        Some('.' | '-' | '/') => after.next().is_some_and(|c| c.is_ascii_alphanumeric()),
+        Some(_) => false,
+    };
+    if glued {
+        return None;
+    }
+    // Digits, without the `0` of a trunk `(0)` (no copy).
+    let digits: usize =
+        text.chars().filter(char::is_ascii_digit).count() - text.matches("(0)").count();
+    let separated = text.chars().any(|c| !c.is_ascii_digit() && c != '+');
+    match kind {
+        // `+` prefix (`+33`, `+ 33`, `(+33)`): 8 to 15 digits after it.
+        // `00` prefix: 10 to 15 (`00` then 8 digits is a zero-led serial
+        // or identifier), not in groups of 4 (`0012 3456 7890`: account
+        // or card layout); compact, it is weak (`0033612345678`, like
+        // zero-padded identifiers). A single dot as the only separator is
+        // a signed decimal (`+48.856614`, `+1234567.89`), not a phone.
+        0 => {
+            let plus = text.starts_with('+') || text.starts_with("(+");
+            let n = if plus {
+                digits
+            } else {
+                digits.saturating_sub(2)
+            };
+            let decimal = text
+                .matches(|c: char| !c.is_ascii_digit() && c != '+')
+                .eq(["."]);
+            let groups = digit_groups(text);
+            let by_four = groups.len() >= 3 && groups[..groups.len() - 1].iter().all(|g| *g == 4);
+            if !(8..=15).contains(&n) || decimal || (!plus && (n < 10 || by_four)) {
+                None
+            } else if plus {
+                Some(PhoneStrength::Strong)
+            } else if separated {
+                Some(PhoneStrength::Normal)
+            } else {
+                (n <= 13).then_some(PhoneStrength::Weak)
+            }
+        }
+        1 => nanp_valid(text).then_some(if text.contains('(') {
+            PhoneStrength::Strong
+        } else {
+            PhoneStrength::Normal
+        }),
+        2 => {
+            let ok_len = if separated {
+                (9..=12).contains(&digits)
+            } else {
+                (10..=11).contains(&digits)
+            };
+            (ok_len && !date_shaped(text)).then(|| trunk_strength(text))
+        }
+        3 => consistent_separators(text).then_some(PhoneStrength::Normal),
+        // `612 345 678`, `912 345 678`: also the layout of SIREN and
+        // Canadian SIN, which pass Luhn; a phone number does 1 time in 10.
+        _ => (consistent_separators(text) && !luhn_digits(text)).then_some(PhoneStrength::Normal),
+    }
+}
+
+/// A trunk number followed by another group of 4 or more digits (`06 12 34
+/// 56 78 75011 Paris`): the longest leading groups that fit a national plan
+/// (normal grading), else `None`.
+fn trunk_prefix(v: &str, range: Range<usize>) -> Option<(Range<usize>, PhoneStrength)> {
+    let text = &v[range.clone()];
+    // Ends of the digit groups, except the last one.
+    let ends: Vec<usize> = text
+        .char_indices()
+        .filter(|(i, c)| {
+            c.is_ascii_digit() && text[i + 1..].starts_with(|n: char| !n.is_ascii_digit())
+        })
+        .map(|(i, _)| i + 1)
+        .collect();
+    for end in ends.into_iter().rev() {
+        let rest = &text[end..];
+        let next = rest.trim_start_matches([' ', ',']);
+        if rest.len() - next.len() != 1 || next.chars().take_while(char::is_ascii_digit).count() < 4
+        {
+            continue;
+        }
+        let r = range.start..range.start + end;
+        if grade(v, 2, r.clone(), true) == Some(PhoneStrength::Normal) {
+            return Some((r, PhoneStrength::Normal));
+        }
+    }
+    None
+}
+
+/// Lengths of the digit groups of a text.
+fn digit_groups(text: &str) -> Vec<usize> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|g| !g.is_empty())
+        .map(str::len)
+        .collect()
+}
+
+/// Luhn checksum over the digits of a text.
+fn luhn_digits(text: &str) -> bool {
+    let mut sum = 0;
+    for (i, d) in text
+        .bytes()
+        .rev()
+        .filter(u8::is_ascii_digit)
+        .map(|b| u32::from(b - b'0'))
+        .enumerate()
+    {
+        sum += if i % 2 == 1 {
+            if d * 2 > 9 { d * 2 - 9 } else { d * 2 }
+        } else {
+            d
+        };
+    }
+    sum % 10 == 0
 }
 
 /// 1 to 6 digits, then the end or a non-alphanumeric character: the digits
@@ -1086,17 +1169,26 @@ fn trunk_strength(text: &str) -> PhoneStrength {
     if text.starts_with('(') {
         return PhoneStrength::Strong;
     }
+    // Belgian `0470/12.34.56`, `02/123.45.67`: a slash after the area code,
+    // then one separator.
+    let rest = match text.split_once('/') {
+        Some((area, rest)) if area.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => text,
+    };
     // Groupings of national plans after the trunk + area code: pairs
     // (FR `01 99 00 27 59`), 3-2-2 (CH, BE), 2-2-2 (BE mobiles), one
     // subscriber group of 6 to 8 digits (DE, NL, IT, UK `07700 900123`),
-    // or two groups ending with 4 digits (UK `020 7946 0958`, IT
-    // `06 1234 5678`). Identifier layouts (`0123-456-789`) do not fit.
+    // or two groups ending with 4 digits, 10 or 11 digits in all (UK
+    // `020 7946 0958`, IT `06 1234 5678`), UK `07700 900 123`. Identifier
+    // layouts (`0123-456-789`, `0123 4567 8901`) do not fit.
     let tail = &groups[1..];
+    let total: usize = groups.iter().sum();
     let plan = (2..=5).contains(&groups[0])
         && (matches!(tail, [2, 2, 2, 2] | [2, 2, 2] | [3, 2, 2])
             || (matches!(tail, [6..=8]) && (groups[0] <= 4 || !text.contains('-')))
-            || matches!(tail, [3 | 4, 4]));
-    if plan && consistent_separators(text) {
+            || (matches!(tail, [3 | 4, 4]) && (10..=11).contains(&total))
+            || (groups[0] == 5 && matches!(tail, [3, 3])));
+    if plan && consistent_separators(rest) {
         PhoneStrength::Normal
     } else {
         PhoneStrength::Weak
@@ -1110,10 +1202,14 @@ fn date_shaped(text: &str) -> bool {
         .filter(|g| !g.is_empty())
         .map(str::len)
         .collect();
-    matches!(
-        groups.as_slice(),
-        [1 | 2, 1 | 2, 4, ..] | [4, 1 | 2, 1 | 2, ..]
-    )
+    // A leading group of 4 is a year only from `1` / `2` (`0470/12.34.56`
+    // is a Belgian mobile).
+    let year_first = text.trim_start().starts_with(['1', '2']);
+    match groups.as_slice() {
+        [1 | 2, 1 | 2, 4, ..] => true,
+        [4, 1 | 2, 1 | 2, ..] => year_first,
+        _ => false,
+    }
 }
 
 /// A whole value that is a phone number in a loose national format
@@ -1136,11 +1232,75 @@ pub(crate) fn phone_loose(value: &str) -> Option<Range<usize>> {
     {
         return None;
     }
-    if v[1..].contains('+') || date_shaped(v) {
+    // A decimal (`12345.67`, a price or a measure) is not a phone.
+    let decimal = v.matches(|c: char| !c.is_ascii_digit()).eq(["."]);
+    if v[1..].contains('+') || date_shaped(v) || decimal {
         return None;
     }
     let digits = v.chars().filter(char::is_ascii_digit).count();
     (7..=15).contains(&digits).then_some(start..start + v.len())
+}
+
+/// Whole compact numbers that the token detectors leave alone, evidence
+/// for a column only (never a token in text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactPhone {
+    /// E.164 without `+` and with a mobile prefix: `33612345678`,
+    /// `447700900123`, `4915123456789`.
+    IntlMobile,
+    /// North American, 10 digits or `1` + 10: area code and exchange
+    /// `[2-9]XX`, not `N11` (`2025550125`).
+    Nanp {
+        /// Area code, for the diversity of a column.
+        area: u16,
+    },
+}
+
+/// Country code + mobile prefix, and the total length, of E.164 mobile
+/// numbers written without `+`.
+const INTL_MOBILE: &[(&str, usize)] = &[
+    ("336", 11),
+    ("337", 11),
+    ("447", 12),
+    ("4915", 12),
+    ("4915", 13),
+    ("4916", 12),
+    ("4916", 13),
+    ("4917", 12),
+    ("4917", 13),
+    ("324", 11),
+    ("417", 11),
+    ("346", 11),
+    ("347", 11),
+    ("393", 12),
+    ("316", 11),
+    ("3519", 12),
+];
+
+/// A whole value that is a compact number of [`CompactPhone`].
+pub(crate) fn compact_phone(value: &str) -> Option<CompactPhone> {
+    let v = value.trim();
+    if !(10..=13).contains(&v.len()) || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if INTL_MOBILE
+        .iter()
+        .any(|(p, len)| v.len() == *len && v.starts_with(p))
+    {
+        return Some(CompactPhone::IntlMobile);
+    }
+    let d = match v.len() {
+        10 => v,
+        11 => v.strip_prefix('1')?,
+        _ => return None,
+    };
+    let part_ok = |x: &str| x.as_bytes()[0] >= b'2' && &x[1..] != "11";
+    if !part_ok(&d[..3]) || !part_ok(&d[3..6]) {
+        return None;
+    }
+    Some(CompactPhone::Nanp {
+        area: d[..3].parse().ok()?,
+    })
 }
 
 /// Time of day attached to a date.
@@ -2058,6 +2218,68 @@ mod tests {
                 found(neg)
             );
         }
+    }
+
+    #[test]
+    fn phone_formats_round_two() {
+        for (v, tok) in [
+            ("(+33) 6 12 34 56 78", "(+33) 6 12 34 56 78"),
+            ("(+44) 20 7946 0958", "(+44) 20 7946 0958"),
+            ("+ 33 6 12 34 56 78", "+ 33 6 12 34 56 78"),
+            ("612 345 671", "612 345 671"),
+            ("912 345 671", "912 345 671"),
+            ("0470/12.34.56", "0470/12.34.56"),
+            ("02/123.45.67", "02/123.45.67"),
+            ("07700 900 123", "07700 900 123"),
+            ("Jean Dupont 06 12 34 56 78 75011 Paris", "06 12 34 56 78"),
+        ] {
+            assert_eq!(found(v), [(C::Phone, tok)], "{v}");
+        }
+        let strength = |v: &str| scan(v, &|_| true).1.phone;
+        assert_eq!(strength("(+33) 6 12 34 56 78"), Some(PhoneStrength::Strong));
+        assert_eq!(strength("0470/12.34.56"), Some(PhoneStrength::Normal));
+        assert_eq!(strength("07700 900 123"), Some(PhoneStrength::Normal));
+        // Account and card layouts, SIREN (Luhn-valid) in `3-3-3`.
+        assert_eq!(strength("0123 4567 8901"), Some(PhoneStrength::Weak));
+        for neg in [
+            "0012 3456 7890",
+            "0045 1234 5678 9012",
+            "732 829 320",
+            "552 100 554",
+        ] {
+            assert!(
+                found(neg).iter().all(|(c, _)| *c != C::Phone),
+                "{neg}: {:?}",
+                found(neg)
+            );
+        }
+        // A trunk number followed by more pairs is not cut into a phone:
+        // the whole run fits no plan (weak).
+        assert_eq!(strength("06 12 34 56 78 90"), Some(PhoneStrength::Weak));
+        assert_eq!(strength("Ref 06 12 34 56 78 901"), None);
+    }
+
+    #[test]
+    fn compact_phones() {
+        use CompactPhone as P;
+        assert_eq!(compact_phone("33612345678"), Some(P::IntlMobile));
+        assert_eq!(compact_phone("447700900123"), Some(P::IntlMobile));
+        assert_eq!(compact_phone(" 4915123456789 "), Some(P::IntlMobile));
+        assert_eq!(compact_phone("2025550125"), Some(P::Nanp { area: 202 }));
+        assert_eq!(compact_phone("12025550125"), Some(P::Nanp { area: 202 }));
+        for neg in [
+            "1025550125",
+            "2021550125",
+            "2115550125",
+            "2025110125",
+            "33112345678",
+            "123456789",
+            "20255501251234",
+            "202-555-0125",
+        ] {
+            assert_eq!(compact_phone(neg), None, "{neg}");
+        }
+        assert!(phone_loose("12345.67").is_none());
     }
 
     #[test]
