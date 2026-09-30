@@ -33,6 +33,9 @@ jobs:
     name: Preparation
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # read the `release` environment's protection rules (settings guard)
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
@@ -53,6 +56,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # ADR-0034 relies on repository settings the maintainer makes (RELEASE.md, section 6): refuse
+      # to publish without them. A defence against a forgotten setup only.
+      - name: Release settings in place
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/check-release-settings.sh environment release tag
+          .github/scripts/check-release-settings.sh tag-ruleset
       - name: Images to build
         id: images
         run: |
