@@ -52,6 +52,7 @@ The project follows [semantic versioning](https://semver.org/).
 - Translate the whole repository to English
 - Console alerting: webhook and e-mail receivers must escape the principal (a database account name any client can choose) and the other names of a payload wherever they render them (#75)
 - ADR-0030 and ADR-0031 accepted; ADR-0032 (Audit stream panic isolation, OpenLDAP probe refresh and cursor, recommended OpenLDAP ACL with `userPKCS12`) and ADR-0033 (system-alert budget); security and engine-capability pages updated for #81 to #83
+- Release documentation for v0.1.0: security policy (supported versions, private reporting through GitHub Security Advisories, scope, invariants, image verification), user guide (`docs/10-user-guide.md`), v0.1.0 pre-release checklist and holdout seed rotation procedure in `RELEASE.md`
 
 ### 👷 CI
 - CI (documentation, gitleaks, console, agent, protocol), PR title and DCO checks
