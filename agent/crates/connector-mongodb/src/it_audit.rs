@@ -11,8 +11,13 @@
 //!   simulated runs (a session declaring the tool's application name) are
 //!   checked (prerequisite `mongodump`).
 //!
-//! The `auditLog` (Enterprise / Percona) has no dev service: its parser is
-//! covered by the fixtures of `audit::records`.
+//! - `DATABASTION_TEST_PSMDB_URL`, `DATABASTION_TEST_PSMDB_ADMIN_URL` and
+//!   `DATABASTION_TEST_PSMDB_AUDIT_LOG` (phase 7): the opt-in dev `psmdb`
+//!   service (Percona Server for MongoDB, `auditLog` JSON file with
+//!   `auditAuthorizationSuccess`), its administrator and its `auditLog` as
+//!   the agent host sees it. Without them, the `auditLog` test is skipped
+//!   (prerequisite `psmdb-audit`); the parser is also covered by the
+//!   fixtures of `audit::records`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -542,4 +547,126 @@ async fn audit_from_the_profiler() {
     )
     .await;
     s.close().await;
+}
+
+/// A `mongodb://` URL from `var` (prerequisite `key`).
+fn env_url(var: &str, key: &str) -> Option<Url> {
+    match std::env::var(var) {
+        Ok(u) if !u.is_empty() => Some(super::parse_url(&u).expect(var)),
+        _ => {
+            skip(key, &format!("{var} is not set"));
+            None
+        }
+    }
+}
+
+/// Phase 7 (P5-B follow-up): the `auditLog` source against a real Percona
+/// Server for MongoDB (dev `psmdb` service: JSON file,
+/// `auditAuthorizationSuccess`), not only recorded samples.
+#[tokio::test]
+async fn audit_from_the_percona_audit_log() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = env_url("DATABASTION_TEST_PSMDB_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(a) = env_url("DATABASTION_TEST_PSMDB_ADMIN_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(log) = env_path("DATABASTION_TEST_PSMDB_AUDIT_LOG", "psmdb-audit") else {
+        return;
+    };
+    let extra = format!(
+        ", audit_log: {{path: \"{}\", format: audit_log}}",
+        log.display()
+    );
+    let (_dir, t) = target_with(&url, &url.user, &url.password, &url.auth_source, &extra);
+    let connector = Arc::new(MongodbConnector::new());
+    let h = connector.check(&t).await;
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MongodbAuditLog),
+        "{:?}",
+        h.detail
+    );
+    let got = codes(&h.notes);
+    assert!(got.iter().all(|c| !c.starts_with("privilege.")), "{got:?}");
+
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+    // The stream opens the log at its end: let it start first.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    reads(&a, "mongodump").await;
+    reads(&a, "mongosh 2.3.0").await;
+    // A failed authentication.
+    let (_d, wrong) = target(&url, "databastion_it_nobody", "wrong-password", "admin");
+    assert!(
+        Session::connect(&wrong, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .is_err()
+    );
+    // The agent's own Discovery.
+    let (r, _findings) = scan(&t).await;
+    r.unwrap();
+    let admin_name = format!("{}@admin", a.user);
+    let mut events = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(60), |ev| {
+        ev.iter().any(|e| e.action() == EventAction::AuthFailure)
+            && ev.iter().any(|e| {
+                e.action() == EventAction::Read
+                    && e.principal().account_name() == admin_name
+                    && e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == COLLECTION)
+            })
+    })
+    .await;
+    // A little longer for the agent's own reads (they must not come).
+    collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+    // A successful authCheck was read: Partial (never Full, ADR-0027).
+    let h = connector.check(&t).await;
+    assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", h.detail);
+    task.abort();
+    let text: Vec<String> = events.iter().map(describe).collect();
+    assert!(
+        events
+            .iter()
+            .all(|e| e.source() == EventSource::MongodbAuditLog),
+        "{text:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e.action() == EventAction::Read
+            && e.principal().account_name() == admin_name
+            && e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == COLLECTION)),
+        "{text:#?}"
+    );
+    let failure = events
+        .iter()
+        .find(|e| e.action() == EventAction::AuthFailure)
+        .unwrap_or_else(|| panic!("no failed authentication: {text:#?}"));
+    assert!(!failure.principal().send_name());
+    // Whether the server records the client metadata (the tool's
+    // application name) in its auditLog: reported, not required.
+    if !has(&events, COLLECTION, "signature.mongodump") {
+        eprintln!(
+            "note: no signature.mongodump from this server's auditLog (client metadata not audited?)"
+        );
+    }
+    // I2: no ground-truth value in the events as the core would send them,
+    // nor in the logs.
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    crate::i2::assert_clean(
+        "serialized events",
+        &gt,
+        "app",
+        &crate::i2::serialize_events(&events),
+    );
+    crate::i2::assert_clean("logs", &gt, "app", &logs.text());
+    assert_no_own_reads(&events, &format!("{}@{}", url.user, url.auth_source));
+    assert_no_marker(&events, &logs);
 }

@@ -24,6 +24,7 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | MySQL 8.4 LTS Community (`mysql`) | 3306 | `hr` | `performance_schema` history consumers (`events_statements_history_long`) | Partial |
 | Percona Server 8.4 (`percona`) | 3308 | `hr` (the MySQL seed) | `audit_log_filter` component, JSON (`log_all` for every account but `root@localhost`) | Partial (no row counts in the log) |
 | MongoDB 8.0 Community (`mongo`) | 27017 | `app` | profiler level 1 (`slowms` from `MONGO_SLOWMS`, default 0) + JSON log | Limited ([ADR-0027](../docs/adr/0027-mongodb-audit.md): server log or profiler) |
+| Percona Server for MongoDB 8.0 (`psmdb`, opt-in: profile `psmdb`) | 27019 | `app` (the MongoDB seed) | `auditLog` JSON file (`auditAuthorizationSuccess`) in `dev/.state/logs/psmdb/auditLog.json` | Partial ([ADR-0027](../docs/adr/0027-mongodb-audit.md): once a successful `authCheck` was read) |
 | OpenLDAP (Debian slapd) (`openldap`) | 1389 (LDAPS 1636) | `dc=example,dc=org` | `slapo-accesslog` in `cn=accesslog` (`reads writes session`) | Full ([ADR-0029](../docs/adr/0029-openldap-connector.md): once each naming context shows a search record) |
 | Mailpit (`mailpit`) | SMTP 1025, UI 8025 | | | |
 | Prometheus (`prometheus`) | 9090 | | | |
@@ -188,8 +189,11 @@ dev/mongo/tls-test-server.sh stop
 The Audit tests (`src/it_audit.rs`, P5-B / P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md))
 read the server log as the agent host sees it (make it readable first: `mongod` may create it
 `0600`), and create a profiler account (`databastion_it_profiler`: the ADR-0026 role on `app` plus
-`find` on `app.system.profile`). The dev server is Community: the `auditLog` parser is tested with
-fixtures only. The optional commands run the real tools inside the container (their application
+`find` on `app.system.profile`). The `mongo` server is Community: its `auditLog` test runs against
+the opt-in `psmdb` service (Percona Server for MongoDB, phase 7), started by naming it:
+`docker compose -f dev/docker-compose.yml up -d psmdb` (then `DATABASTION_TEST_PSMDB_URL`,
+`DATABASTION_TEST_PSMDB_ADMIN_URL` with port `PSMDB_PORT`, and `DATABASTION_TEST_PSMDB_AUDIT_LOG`
+pointing at `dev/.state/logs/psmdb/auditLog.json`; prerequisite `psmdb-audit`). The optional commands run the real tools inside the container (their application
 name is what the agent flags):
 
 ```sh
@@ -199,7 +203,7 @@ export DATABASTION_TEST_MONGO_DUMP_CMD="docker compose -f $PWD/dev/docker-compos
 export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:$MONGO_ROOT_PASSWORD@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
 ```
 
-Audit keys of `DATABASTION_TEST_REQUIRE` for MongoDB: `mongo-log`, `mongodump`.
+Audit keys of `DATABASTION_TEST_REQUIRE` for MongoDB: `mongo-log`, `mongodump`, `psmdb-audit`.
 
 ## Seed data and ground truth
 [seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
