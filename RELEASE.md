@@ -62,16 +62,22 @@ Rules:
 | Console image (web + worker) | `ghcr.io/yil00/databastion-console:<tag>` | amd64, arm64 |
 | Agent image | `ghcr.io/yil00/databastion-agent:<tag>` | amd64, arm64 |
 | Agent package (phase 7) | `databastion-agent_<X.Y.Z>_<arch>.deb` | amd64, arm64 |
-| Checksums (phase 7) | `SHA256SUMS` + cosign signature | — |
+| Deployment bundle (phase 7) | `databastion-deploy-<X.Y.Z>.tar.gz` (`deploy/` at the tag) | — |
+| Image references (phase 7) | `image-digests.txt` (`<image>:<tag>@sha256:<digest>`) | — |
+| Checksums (phase 7) | `SHA256SUMS` + cosign bundle `SHA256SUMS.cosign.bundle` | — |
 
-Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists.
+Images are published to GHCR, built natively on amd64 and arm64 runners, signed with cosign in *keyless* mode (GitHub OIDC), with SBOM and provenance attestation. An image is only built if its `Dockerfile` exists. The `.deb` files are built from the binary of the signed agent image; `SHA256SUMS` covers them, the deployment bundle and `image-digests.txt`, and is signed with `cosign sign-blob` (`SHA256SUMS.cosign.bundle`). [publish.yml](.github/workflows/publish.yml) verifies every signature right after signing, and moves `next` / `X.Y` / `latest` only after that.
 
-Verify an image:
+**Signing identity** ([ADR-0034](docs/adr/0034-release-signing-from-tag-push.md)): everything is signed by `publish.yml` in the run triggered by the **push of the release tag**, and only there. The identity is therefore exact for each version:
 ```bash
-cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
-  --certificate-identity-regexp '^https://github.com/Yil00/databastion/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+VERSION=0.1.0
+cosign verify ghcr.io/yil00/databastion-console:$VERSION \
+  --certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-trigger push
+# Same three options for `cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle`.
 ```
+All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifacts).
 
 ## 5. Release walkthrough
 
@@ -79,17 +85,17 @@ cosign verify ghcr.io/yil00/databastion-console:0.1.0 \
 1. On `dev`, CI is green and the ROADMAP is up to date.
 2. (Optional) Create an `X.Y.Z-rc.N` tag on `dev` to test the candidate images.
 3. Open a `dev` → `main` PR titled `release: X.Y.Z`.
-4. On merge, the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)):
+4. On merge (the push of the merge commit to `main`), the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)) waits for the maintainer's approval of the `release-it` environment, then:
    - computes the version from the commits and the latest tag,
    - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, later the Helm chart),
    - generates the [CHANGELOG.md](CHANGELOG.md) section,
-   - commits `chore(release): X.Y.Z` under the owner's noreply identity, creates the `X.Y.Z` tag,
-   - creates a **draft GitHub release**,
-   - builds and publishes the images ([publish.yml](.github/workflows/publish.yml)).
-5. The maintainer reviews the draft, adds upgrade notes if needed, and **publishes** the release.
-6. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
+   - commits `chore(release): X.Y.Z` under the owner's noreply identity, creates the `X.Y.Z` tag and pushes it with `RELEASE_TOKEN`,
+   - creates a **draft GitHub release**.
+5. The tag push starts [publish.yml](.github/workflows/publish.yml): its jobs that push images or sign wait in the `release` environment for the maintainer's approval (*Review deployments*: the image builds, then the signature, then the release assets). It builds and signs the images, the `.deb` files and `SHA256SUMS`, attaches them to the draft, and runs the installation test with them.
+6. The maintainer reviews the draft (assets present, publish run green), adds upgrade notes if needed, and **publishes** the release. Assets are only ever attached to a draft.
+7. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
 
-To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase. **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
+To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase (GitHub copies the title into the merge or squash commit message, which `release.yml` reads: keep the default commit messages). **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.
 
 ### Pre-release
 ```bash
@@ -97,7 +103,7 @@ git switch dev && git pull
 git tag -s 0.1.0-alpha.1 -m "DataBastion 0.1.0-alpha.1"
 git push origin 0.1.0-alpha.1
 ```
-Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images). Then create the GitHub pre-release by hand (`gh release create 0.1.0-alpha.1 --prerelease --generate-notes`).
+Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-alpha.1` and `next` images; approve its `release` environment jobs), which creates a **draft** GitHub pre-release with the `.deb` files and the signed `SHA256SUMS`. Review it, then publish it (`gh release edit 0.1.0-alpha.1 --draft=false`). Only a maintainer allowed by the tag ruleset (below) can push the tag.
 
 ### Hotfix
 1. `hotfix/<slug>` from `main`, PR to `main` with a `fix:` commit.
@@ -113,16 +119,35 @@ Follow [SECURITY.md](SECURITY.md): fix prepared privately (GitHub Security Advis
 |----------|-------------|------|
 | [ci.yml](.github/workflows/ci.yml) | push and PR on `main` / `dev` | Doc links, gitleaks, console, agent, protocol (each job only runs if its component exists); aggregated `CI result` check |
 | [pr-checks.yml](.github/workflows/pr-checks.yml) | PR | Conventional Commits title, DCO sign-off on each commit |
-| [release.yml](.github/workflows/release.yml) | PR merged into `main` | release-it + call to `publish.yml` |
-| [publish.yml](.github/workflows/publish.yml) | call from `release.yml`, or `X.Y.Z-*` tag | Signed multi-arch GHCR images |
+| [release.yml](.github/workflows/release.yml) | push to `main` (a merged PR), except `[skip-release]` and release-it's own commit; runs in the `release-it` environment | release-it: version, changelog, `X.Y.Z` tag pushed with `RELEASE_TOKEN`, draft release (no signing) |
+| [publish.yml](.github/workflows/publish.yml) | push of an `X.Y.Z` or `X.Y.Z-*` tag only; jobs that push or sign in the `release` environment | Signed multi-arch GHCR images (signature and attestations verified), agent `.deb` files, signed `SHA256SUMS` on the draft release, installation test with the published artifacts |
+| [packaging.yml](.github/workflows/packaging.yml) | call from `ci.yml` (packaging files changed) and `publish.yml` | Reproducible `.deb`, install checks in Debian 12 / Ubuntu 24.04 containers, "Installation < 15 min" test ([deploy/README.md](deploy/README.md#installation-test-under-15-minutes)) |
 | [advisories.yml](.github/workflows/advisories.yml) | daily, and push / PR on `main` / `dev` touching a lockfile | Dependency advisories: `cargo-deny` (agent), `pnpm audit` (console), `npm audit` (root release tooling); not a required check |
 | [dependabot.yml](.github/dependabot.yml) | weekly | Updates to actions and tooling, PRs to `dev` |
 
 Third-party actions are pinned by commit SHA (Dependabot updates them).
 
 ### Repository configuration (one-time)
-- **`RELEASE_TOKEN` secret** (required for `release.yml`): the owner's *fine-grained* token, limited to this repository, with **Contents: read and write** permission. It lets the release commit pass `main`'s protection (bypass reserved for the admin). Create it in *Settings → Developer settings → Fine-grained tokens*, then add it in the repository's *Settings → Secrets and variables → Actions*.
-- Optional variables `RELEASE_GIT_NAME` / `RELEASE_GIT_EMAIL`: identity of the release commit (by default, the owner's noreply address).
+**These settings must be in place before the change that introduced them (ADR-0034, PR #86) is merged into `main`**, and before any release. `release.yml` and `publish.yml` check them at the start of every run and stop when one is missing (`.github/scripts/check-release-settings.sh`): a defence against a forgotten or undone setup only, since whoever can edit a workflow can remove the check.
+
+Why: `RELEASE_TOKEN` can push to `main` and create version tags (it bypasses the tag ruleset), and any version tag starts a signing run. The token must therefore be readable only by the `release-it` job on `main`, and tag creation must be limited to it and the maintainers.
+
+Maintainer steps, in this order:
+1. **`release-it` environment**: *Settings → Environments → New environment*, name `release-it`.
+   - *Required reviewers*: the maintainer(s) (leave *Prevent self-review* off while there is a single maintainer). **Uncheck** *Allow administrators to bypass configured protection rules* (checked by default; the settings check refuses it unless the repository variable `RELEASE_ALLOW_ADMIN_BYPASS` is `true`, see the residual risk below).
+   - *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Branch*, name `main`. No other rule.
+   - *Environment secrets → Add environment secret*: `RELEASE_TOKEN` = the owner's *fine-grained* token (*Settings → Developer settings → Fine-grained tokens*), limited to this repository, **Contents: read and write** only. It lets the release commit pass `main`'s protection and pushes the tag (a push made with the default `GITHUB_TOKEN` would not start `publish.yml`).
+   - Preferred replacement for the admin token: a **GitHub App** installed on this repository only (Contents: read and write), its token minted in the job (`actions/create-github-app-token`), the app's private key as the environment secret, and the app, not *Repository admin*, in the bypass lists of `main` and of the tag ruleset.
+2. **`release` environment**: *New environment* `release`. *Required reviewers*: the maintainer(s), same settings as above, *Allow administrators to bypass configured protection rules* **unchecked** (same exception). *Deployment branches and tags*: *Selected branches and tags* → *Add deployment branch or tag rule* → *Ref type: Tag*, pattern `[0-9]*.[0-9]*.[0-9]*`; no branch rule. No secret (keyless signing).
+3. **Delete the repository-level secret**: *Settings → Secrets and variables → Actions → Repository secrets* → `RELEASE_TOKEN` → *Remove*. From then on, no branch workflow can read the token.
+4. **Tag ruleset**: *Settings → Rules → Rulesets → New ruleset → New tag ruleset*. Name `release tags`, enforcement *Active*. *Target tags → Add target → Include by pattern*: `*.*.*` (covers `X.Y.Z` and `X.Y.Z-…`). Rules: *Restrict creations*, *Restrict updates*, *Restrict deletions*, *Block force pushes*. *Bypass list*: *Repository admin* only (the maintainers; release-it's tag push goes through the owner's token), or the release GitHub App of step 1, whose app id then goes into the repository variable `RELEASE_APP_ID`. No other team, app or deploy key: the settings check refuses them (when the bypass list is visible to the workflow token; otherwise it warns and this is to be checked by hand). No *Exclude* pattern at all, and no other include pattern than `*.*.*`, `*` or `[0-9]*.[0-9]*.[0-9]*` (or *All tags*): the settings check accepts only these. Save.
+5. **Merge methods**: *Settings → General → Pull Requests*: allow **merge commits** and **squash merging**, disable **rebase merging** (a rebase merge keeps the original commit messages, so `[skip-release]` in the PR title would not reach `main`), and keep the default commit messages (they carry the PR title).
+6. Check once with a pre-release tag: the publish run passes its settings check, waits for approval, and `cosign verify` with the exact identity above succeeds.
+
+- Optional variables `RELEASE_GIT_NAME` / `RELEASE_GIT_EMAIL`: identity of the release commit (by default, the owner's noreply address). `RELEASE_APP_ID`: see step 4. `RELEASE_ALLOW_ADMIN_BYPASS`: see the residual risk below.
+
+**Residual risk, while there is a single maintainer.** The maintainer is on the tag ruleset's bypass list and is also the reviewer of the `release` environment. They can therefore push a pre-release tag (`X.Y.Z-…`) on **any** commit, including a branch on which `publish.yml` was edited, approve its jobs themselves, and obtain artifacts signed with the exact documented identity `publish.yml@refs/tags/<version>`. The signature proves that the artifact came from this repository's publish workflow at that tag, not that the tag points at reviewed code on `main` or `dev`. Nothing in the repository prevents this; it rests on the maintainer's account (two-factor authentication, no shared tokens) and on the public record: the tag, its commit and the publish run are visible, and a tag is never moved. A second maintainer as required reviewer, with *Prevent self-review*, removes the self-approval part.
+- **Administrator bypass on the environments (maintainer's choice).** With the repository variable `RELEASE_ALLOW_ADMIN_BYPASS` set to `true`, the settings check accepts `release-it` and `release` environments that let administrators bypass their protection rules, and prints a warning on every run. While the single maintainer is both the only administrator and the only required reviewer, this changes little: an administrator can already approve their own runs, and the bypass is still a deliberate action of an administrator's session, never of a workflow token. It removes the approval step as a forced pause, though, so it must be switched off (variable removed, box unchecked) as soon as a second maintainer joins. Set it as a **repository** variable only: an environment variable of the same name would override it in the `release-it` job, so when switching it off, also check that no environment (or organization) variable of that name remains. Whether the administrator bypass also lets an administrator deploy to an environment from a ref its deployment rule does not admit (for `release-it`, a branch other than `main`, which would expose `RELEASE_TOKEN` to that branch's code) is not documented clearly by GitHub: treat it as possible, and never bypass a run whose ref is not `main` (for `release-it`) or a version tag (for `release`).
 - As long as there is only one maintainer, no approval is required on PRs (you cannot approve your own PR). Switch to 1 approval as soon as a second maintainer joins.
 
 ## 7. Pre-release checklist
@@ -136,14 +161,13 @@ Every item is checked on the `dev` commit that becomes the release (and on the `
 - [ ] **[CHANGELOG.md](CHANGELOG.md) "Unreleased" section reviewed**: accurate, no promise the code does not keep; the generated release notes put breaking changes first, with upgrade steps
 - [ ] **Documentation**: [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) matrix, [user guide](docs/10-user-guide.md), [SECURITY.md](SECURITY.md) supported versions, [ROADMAP](docs/ROADMAP.md) and [CONTEXT.md](CONTEXT.md) up to date
 - [ ] **Compatibility**: console N with agent N-1 tested (from the second release on; [§ 2](#compatibility))
-- [ ] **GitHub settings** ([§ 6](#repository-configuration-one-time)): `RELEASE_TOKEN` secret present and not expired; `main` and `dev` rulesets as in [§ 1](#1-branches), with "Require review from Code Owners" enabled (the protocol registry checks rely on [.github/CODEOWNERS](.github/CODEOWNERS)); private vulnerability reporting enabled (*Settings → Code security*), since [SECURITY.md](SECURITY.md) relies on it; the release tag ruleset and the deployment environments as described in RELEASE.md section 6 (added by the packaging PR)
-- [ ] **After publishing**: images signed, with SBOM and provenance ([publish.yml](.github/workflows/publish.yml)); `cosign verify` passes on both images ([§ 4](#4-published-artifacts)); the GHCR packages are public
+- [ ] **GitHub settings** ([§ 6](#repository-configuration-one-time)): release prerequisites in place (`release-it` and `release` environments with required reviewers and administrator bypass off (or accepted through `RELEASE_ALLOW_ADMIN_BYPASS`), `RELEASE_TOKEN` only as a `release-it` environment secret and not expired, no repository-level `RELEASE_TOKEN`, release tag ruleset, merge and squash merges only); `main` and `dev` rulesets as in [§ 1](#1-branches), with "Require review from Code Owners" enabled (the protocol registry checks rely on [.github/CODEOWNERS](.github/CODEOWNERS)); private vulnerability reporting enabled (*Settings → Code security*), since [SECURITY.md](SECURITY.md) relies on it
+- [ ] **After publishing**: images signed, with SBOM and provenance, and `SHA256SUMS` with its cosign bundle published ([publish.yml](.github/workflows/publish.yml)); `cosign verify` with the exact tag identity passes on both images and on `SHA256SUMS` ([§ 4](#4-published-artifacts), [deploy/README.md](deploy/README.md#verify-the-artifacts)); the installation test of the publish run is green (under 15 minutes with the published image and `.deb`); the GHCR packages are public
 
 ### Additional items for v0.1.0
 - [ ] **72 h stability test**, run by the maintainer on the release candidate, result recorded in the [ROADMAP](docs/ROADMAP.md) (phase 7)
 - [ ] The other phase 7 release items of the ROADMAP (packaging, "installation < 15 min" test, load and database impact tests) done, or explicitly deferred in the ROADMAP and the release notes
 - [ ] **Console and agents upgraded together**: the release notes say so; agent builds from before #60 cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md), consequences)
-- [ ] Once the packaging is merged: the `.deb` packages and `SHA256SUMS` with its signature published, and their verification documented
 
 ## 8. Holdout seed rotation
 The classifier gate of the CI scores the classifiers on a held-out corpus generated from a fixed seed ([dev/holdout/README.md](dev/holdout/README.md)). Whoever has seen its failing columns while working on the classifiers has partly seen the test set, so the seed is rotated **once per release**. This only concerns the holdout seed: the dev seed (`dev/seed/generate.py`, which produces [dev/ground-truth.json](dev/ground-truth.json) for the containers, the integration tests and the end-to-end I2 test) is not a held-out set and is not rotated.

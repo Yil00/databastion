@@ -15,7 +15,11 @@ database (also used as the job queue: no Redis). See
 > lifecycle (see "Policies and incidents"); P3-C: e-mail and HMAC-signed webhook notifications,
 > "silent agent" and agent-integrity alerts (see "Alerting"). Phase 4 (P4-C): `/events`
 > ingestion, volume x sensitivity scoring, per-principal baselines, policies over access events,
-> `audit.configure` settings with confirmation (see "Audit correlation").
+> `audit.configure` settings with confirmation (see "Audit correlation"). Phases 5 and 6: MongoDB
+> and OpenLDAP sources and labels in the policy form and the views. Phase 7: incident dedup per
+> principal key, `agent.audit_stream_stopped` alert and the shared system-alert budget (see
+> "Alerting", ADR-0031, ADR-0033); distroless runtime image, signed at release (see "Docker
+> image").
 
 ## Requirements
 - Node.js 24 (22.22+ also works for development)
@@ -35,7 +39,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` | Worker: new incidents an `access_event` policy may open per clock hour, 1 to 10000, default 50; beyond, the matches go to one overflow incident of the policy. See "Audit correlation" |
 | `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
-| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
+| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches, stopped Audit streams) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -483,18 +487,24 @@ a code this console does not know is shown raw with its count and labels. Everyt
 text (escaped). The console never derives a decision from notes.
 
 ## Docker image
-[`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,
-base image and Dockerfile syntax frontend pinned by tag and digest, `next build` with
+[`Dockerfile`](Dockerfile) (build context `console/`): build stages on `node:24-bookworm-slim`,
+runtime on distroless Node.js 24 (`gcr.io/distroless/nodejs24-debian13`: glibc, Node.js, CA
+certificates and tzdata; **no shell, no package manager**), every base image and the Dockerfile
+syntax frontend pinned by tag and digest, `next build` with
 `NEXT_OUTPUT_STANDALONE=1`, runtime as uid/gid 10001 with root-owned, read-only
-files: compatible with `read_only: true` (only `/tmp` as tmpfs). Entrypoint commands
-([docker/entrypoint.sh](docker/entrypoint.sh)): `web` (default, standalone `server.js` on port
+files: compatible with `read_only: true` (only `/tmp` as tmpfs). `node` is on the `PATH`
+(`/nodejs/bin`), so `docker compose exec web node -e …` works; there is no shell to `exec` into.
+Entrypoint commands ([docker/entrypoint.mjs](docker/entrypoint.mjs), a Node.js dispatcher that
+replaces itself with the selected process through `process.execve`, as `exec` did in the former
+shell script): `web` (default, standalone `server.js` on port
 3000, plus the metrics listener when `DATABASTION_METRICS_PORT` is set), `worker`, `migrate`, `bootstrap-admin`. The worker, the migrator and the bootstrap command run
 from the TypeScript sources with `tsx` (`node --import tsx`, cache disabled): `tsx` is already the
 production runner of `pnpm worker` / `pnpm db:migrate`, so the image runs exactly the code the tests
 run, with no second bundler configuration to keep in sync; the cost is a larger image (production
 `node_modules` next to the standalone web bundle) and a short transpilation at startup.
-`HEALTHCHECK` ([docker/healthcheck.sh](docker/healthcheck.sh)) probes `/api/health` for `web` and
-reports healthy for the other commands. The image is not built by the CI yet.
+`HEALTHCHECK` ([docker/healthcheck.mjs](docker/healthcheck.mjs), run by the image's Node.js)
+probes `/api/health` for `web` and reports healthy for the other commands. The CI builds the image
+in the end-to-end and install tests; releases publish it signed ([deploy/README.md](../deploy/README.md)).
 
 Database connections (plan PostgreSQL `max_connections` from them). Per **web** process: the main
 pool (10), the dedicated rate-limit pool (3, P4-D, see "Shared rate limits"), the send-only pg-boss
@@ -989,9 +999,14 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   numbers, timestamps and ids: no agent-provided text (not even the host name). Revoked and locked
   agents are not alerted. The agent page shows the spool counters of the latest heartbeat, the
   last five alerts and the drops held back for the next one.
-- **Audit stream stopped** (P7, ADR-0031 decision 3, end-of-phase-6 review M2): an Audit stream
-  that panics 3 times in a row is stopped by the agent until Audit is reconfigured or the agent
-  restarts; its target reports level None with the note `audit.stream_stopped`. Each heartbeat
+- **Audit stream stopped** (P7, ADR-0031 decision 3, end-of-phase-6 review M2): the agent isolates
+  panics per record (a record that makes a parser panic is dropped and counted, and after repeated
+  panics at one saved position it is asked to skip that record; #83, ADR-0031 decision 6). It
+  parks a stream only when that does not get it through: 7 panics at one position without progress,
+  more than 8 skipped records or more than 64 panics within an hour, or, for a source whose read
+  position is in memory only, 3 panics in a row. A parked stream stays stopped until Audit is
+  reconfigured or the agent restarts; its target reports level None with the note
+  `audit.stream_stopped`. Each heartbeat
   records, in its transaction, how many targets carry that note
   (`agents.audit_stream_stops_unalerted`, the highest count since the last alert). At most once per
   agent and hour (conditional update on `agents.audit_stream_stops_alerted_at`), this becomes a

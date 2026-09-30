@@ -1,12 +1,24 @@
 name: Release
 
-# When a PR is merged into main (dev → main or hotfix/* → main):
-# computes the version, generates the CHANGELOG, creates the tag, creates a draft GitHub release,
-# then publishes the images. Add [skip-release] to the PR title to publish nothing.
+# When a PR is merged into main (dev → main or hotfix/* → main), i.e. on the push of its merge
+# commit (main only accepts pull requests): computes the version, generates the CHANGELOG,
+# creates and pushes the X.Y.Z tag (with RELEASE_TOKEN, so that the push triggers workflows) and
+# creates a draft GitHub release. The tag push triggers publish.yml, which builds, signs and
+# attaches the artifacts to the draft: signing happens only in a tag-push run, never here
+# (ADR-0034).
+#
+# Skipped for:
+# - a merge whose commit message contains [skip-release] (GitHub puts the PR title in the merge
+#   or squash commit message: add [skip-release] to the PR title);
+# - release-it's own `chore(release): X.Y.Z` commit (its push to main would start this again).
+#
+# RELEASE_TOKEN (it can push to main and create version tags, bypassing the tag ruleset) lives in
+# the `release-it` GitHub Environment only: required reviewers, deployment limited to `main`
+# (RELEASE.md, section 6). No other workflow or branch can read it. A GitHub App token, the app
+# named in the tag ruleset's bypass list, is the preferred replacement for the admin PAT.
 
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [main]
 
 permissions:
@@ -19,20 +31,39 @@ concurrency:
 jobs:
   release:
     name: release-it
-    if: github.event.pull_request.merged == true && !contains(github.event.pull_request.title, '[skip-release]')
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(release):')
+      && !contains(github.event.head_commit.message, '[skip-release]')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: release-it
     permissions:
-      contents: write
+      contents: read  # every write goes through RELEASE_TOKEN
+      actions: read   # read the environment's protection rules (settings guard)
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          path: settings-guard
+      # A defence against a forgotten setup only (RELEASE.md, section 6).
+      - name: Release settings in place
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_ALLOW_ADMIN_BYPASS: ${{ vars.RELEASE_ALLOW_ADMIN_BYPASS }}
+        run: |
+          settings-guard/.github/scripts/check-release-settings.sh environment release-it branch main
+          settings-guard/.github/scripts/check-release-settings.sh tag-ruleset
+          rm -rf settings-guard
       - name: Check release token
         env:
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           if [ -z "$RELEASE_TOKEN" ]; then
-            echo "::error::RELEASE_TOKEN secret missing: see RELEASE.md, 'Repository configuration' section."
+            echo "::error::RELEASE_TOKEN missing from the release-it environment: see RELEASE.md, section 6."
             exit 1
           fi
 
@@ -41,6 +72,12 @@ jobs:
           ref: main
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
+
+      # Release exactly the approved push: commits that reached main while the approval was pending
+      # get their own run.
+      - name: main has not moved since the approved push
+        run: |
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || { echo "::error::main moved since the approved push ($GITHUB_SHA)"; exit 1; }
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -74,14 +111,3 @@ jobs:
           echo "Computed version: $VERSION"
           npx release-it --ci
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-  publish:
-    name: Publish images
-    needs: release
-    uses: ./.github/workflows/publish.yml
-    with:
-      version: ${{ needs.release.outputs.version }}
-    permissions:
-      contents: read
-      packages: write
-      id-token: write

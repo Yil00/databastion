@@ -1,0 +1,22 @@
+# HTTPS reverse proxy of the console (docker-compose.example.yml, profile `proxy`; deploy/README.md).
+# DATABASTION_DOMAIN: the console's DNS name. DATABASTION_TLS: an e-mail address (Let's Encrypt,
+# the name must reach this host on ports 80 and 443) or `internal` (Caddy's own CA, whose root
+# certificate the agents pin with console.ca_file).
+{
+	admin off
+	skip_install_trust
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$DATABASTION_DOMAIN} {
+	tls {$DATABASTION_TLS}
+	header Strict-Transport-Security "max-age=31536000"
+	# /metrics stays on the internal network (console README, ADR-0004).
+	@metrics path /metrics /metrics/*
+	respond @metrics 404
+	# Caddy sets X-Forwarded-For to the client address (the console trusts one proxy hop:
+	# DATABASTION_TRUST_PROXY=1).
+	reverse_proxy console:3000
+}

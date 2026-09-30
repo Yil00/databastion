@@ -83,7 +83,7 @@ services:
       DATABASTION_METRICS_TOKEN_FILE: /run/secrets/metrics_token
     secrets: [db_url, encryption_key, metrics_token]
     healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      test: ["CMD", "/nodejs/bin/node", "/usr/local/lib/databastion/healthcheck.mjs"]
       interval: 3s
       timeout: 5s
       start_period: 20s

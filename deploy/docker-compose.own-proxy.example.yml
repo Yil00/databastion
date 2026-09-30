@@ -1,0 +1,10 @@
+# Add this file when YOUR OWN HTTPS reverse proxy fronts the console (not the bundled `proxy`
+# profile): it publishes the console on the loopback only. In .env:
+#   COMPOSE_FILE=compose.yaml:compose.own-proxy.yaml
+# after `cp docker-compose.own-proxy.example.yml compose.own-proxy.yaml` (deploy/README.md).
+# Your proxy must be the only way in: it overwrites X-Forwarded-For (DATABASTION_TRUST_PROXY=1),
+# serves TLS 1.3, and does not forward /metrics.
+services:
+  console:
+    ports:
+      - "127.0.0.1:8080:3000"
