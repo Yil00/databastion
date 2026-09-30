@@ -40,7 +40,11 @@ use records::{AuditRecord, Format, Skip, parse_record_checked};
 /// Name of the pgaudit cursor in the core's cursor store.
 const CURSOR: &str = "pgaudit";
 /// How often the source choice is re-evaluated while streaming.
+#[cfg(not(test))]
 const REPROBE: Duration = Duration::from_secs(300);
+/// Tests: often enough for an integration test to see re-probes.
+#[cfg(test)]
+const REPROBE: Duration = Duration::from_secs(3);
 
 fn internal() -> ConnectorError {
     PgError::new(FailureCode::Internal, Stage::Audit).into_connector_error()
@@ -123,13 +127,28 @@ pub(crate) async fn audit_stream(
     let timeouts = Timeouts::new(cfg.statement_timeout().min(Duration::from_secs(30)));
     let mut pgaudit: Option<PgauditState> = None;
     let mut pss_session: Option<(crate::conn::Session, pss::PssPoller)> = None;
+    // A poller whose session was closed for a re-probe.
+    let mut pss_idle: Option<pss::PssPoller> = None;
+    let several = target.postgres_settings().databases.len() > 1;
     loop {
-        let pre = check::prerequisites(target, timeouts)
+        // One Audit connection at a time (phase 7, ADR-0025 decision 11):
+        // the held pg_stat_statements session probes its own database;
+        // with other databases to probe, it is closed first and reopened
+        // after.
+        if several {
+            if let Some((session, poller)) = pss_session.take() {
+                drop(session);
+                pss_idle = Some(poller);
+            }
+        }
+        let held = pss_session.as_ref().map(|(s, p)| (p.database(), s));
+        let pre = check::prerequisites_with(target, timeouts, held)
             .await
             .map_err(PgError::into_connector_error)?;
         match source_for(pre.level) {
             Source::Pgaudit => {
                 pss_session = None;
+                pss_idle = None;
                 let st = match pgaudit.as_mut() {
                     Some(st) => st,
                     None => {
@@ -163,6 +182,12 @@ pub(crate) async fn audit_stream(
             }
             Source::PgStatStatements => {
                 pgaudit = None;
+                if let Some(poller) = pss_idle.take() {
+                    let session = pss::reopen(target, timeouts, &poller)
+                        .await
+                        .map_err(PgError::into_connector_error)?;
+                    pss_session = Some((session, poller));
+                }
                 if pss_session.is_none() {
                     let conn =
                         pss::connect(target, timeouts, own_account(cfg, target, &pre, state))

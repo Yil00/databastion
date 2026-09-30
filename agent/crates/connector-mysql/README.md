@@ -130,6 +130,21 @@ so it is still reported, against `*`, but without signals. The
 `server_audit` TABLE records still name the tables; the Percona
 `audit_log_filter` `table_access` records too.
 
+## Audit connections
+
+A `performance_schema` stream holds one session on the agent's account. It
+re-probes its prerequisites (every 5 minutes) **on that session**, and
+closes a stale or broken session **before** opening its replacement (phase
+7), so the stream holds one connection at a time; the probe's session
+becomes the stream's session when `performance_schema` is chosen. A
+file-source stream holds no session: its re-probe opens one and closes it.
+The only other Audit connection is the `KILL QUERY` sent when a guarded
+Audit statement is cancelled (the stream stopped or reconfigured
+mid-statement). ADR-0025 decision 11 sized `MAX_USER_CONNECTIONS` with one
+more connection for the re-probe and the reconnect; that connection is no
+longer opened (the recommended limits in docs/05 are unchanged until the
+documentation follows).
+
 ## Known limits
 
 - **No volumes on the audit-log sources** (above).

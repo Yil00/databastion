@@ -49,6 +49,8 @@ struct Counters {
 
 /// Poller state kept across polls of one session.
 pub(crate) struct PssPoller {
+    /// Database of the session the poller reads through.
+    database: String,
     schema: String,
     toplevel: bool,
     own: PgOwn,
@@ -135,6 +137,7 @@ pub(crate) async fn connect(
         return Ok((
             session,
             PssPoller {
+                database: database.clone(),
                 schema,
                 toplevel,
                 own,
@@ -163,7 +166,22 @@ fn delta(now: Counters, prev: Option<Counters>, first: bool) -> Option<(u64, u64
     Some((calls, u64::try_from(rows).unwrap_or(0)))
 }
 
+/// A new session on the poller's database (the held one was closed for a
+/// re-probe of the other databases, phase 7).
+pub(crate) async fn reopen(
+    target: &TargetConfig,
+    timeouts: Timeouts,
+    poller: &PssPoller,
+) -> Result<Session, PgError> {
+    Session::connect(target, &poller.database, timeouts).await
+}
+
 impl PssPoller {
+    /// Database of the session the poller reads through.
+    pub(crate) fn database(&self) -> &str {
+        &self.database
+    }
+
     /// Sets the per-database catalog facts (re-probed with the source).
     pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
         self.catalogs = catalogs;

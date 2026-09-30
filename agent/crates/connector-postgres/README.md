@@ -158,5 +158,15 @@ load otherwise), so a server-wide load is the normal case.
   agent did not restart in between.
 - **Heuristic signals** (`shape.*`, `signature.*`) are evadable by design;
   see `../classifiers/README.md`.
+- **Audit connections.** The `pg_stat_statements` stream holds one session
+  on the agent's role. Its re-probe (every 5 minutes) runs on that session
+  when the target declares one database; with several, the session is
+  closed first, the databases are probed one at a time, and the session is
+  reopened on the same database (phase 7). A pgaudit stream holds no
+  session: its re-probe opens one per database, one at a time. Either way
+  Audit holds one connection at a time, one less than the ADR-0025
+  decision 11 sizing counted for `pg_stat_statements` (the recommended
+  `CONNECTION LIMIT` in docs/05 is unchanged until the documentation
+  follows).
 - **`pg_stat_statements` mode** sees no client address, application name,
   per-execution time or rows, nor statements evicted between polls.

@@ -590,6 +590,24 @@ async fn performance_schema_gives_events_with_rows() {
         let now = std::time::SystemTime::now();
         assert!(events.iter().all(|e| e.ts() <= now));
         assert_no_marker(&events, &logs);
+        // Phase 7 (ADR-0025 decision 11): the stream re-probes its
+        // prerequisites on its held session (every 3 s in tests), so it
+        // never holds a second connection of the account.
+        let mut most = 0u64;
+        for _ in 0..40 {
+            let n = scalar(
+                &mut a,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = '{PFS_USER}'"
+                ),
+            )
+            .await
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+            most = most.max(n);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(most, 1, "{}: Audit connections held at once", server.name);
         // Phase 7: the cursor is persisted. After a quiet poll (the cursor
         // saved past everything handed over), the agent stops.
         tokio::time::sleep(Duration::from_millis(2500)).await;
