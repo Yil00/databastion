@@ -463,18 +463,24 @@ a code this console does not know is shown raw with its count and labels. Everyt
 text (escaped). The console never derives a decision from notes.
 
 ## Docker image
-[`Dockerfile`](Dockerfile) (build context `console/`): multi-stage on `node:24-bookworm-slim`,
-base image and Dockerfile syntax frontend pinned by tag and digest, `next build` with
+[`Dockerfile`](Dockerfile) (build context `console/`): build stages on `node:24-bookworm-slim`,
+runtime on distroless Node.js 24 (`gcr.io/distroless/nodejs24-debian13`: glibc, Node.js, CA
+certificates and tzdata; **no shell, no package manager**), every base image and the Dockerfile
+syntax frontend pinned by tag and digest, `next build` with
 `NEXT_OUTPUT_STANDALONE=1`, runtime as uid/gid 10001 with root-owned, read-only
-files: compatible with `read_only: true` (only `/tmp` as tmpfs). Entrypoint commands
-([docker/entrypoint.sh](docker/entrypoint.sh)): `web` (default, standalone `server.js` on port
+files: compatible with `read_only: true` (only `/tmp` as tmpfs). `node` is on the `PATH`
+(`/nodejs/bin`), so `docker compose exec web node -e …` works; there is no shell to `exec` into.
+Entrypoint commands ([docker/entrypoint.mjs](docker/entrypoint.mjs), a Node.js dispatcher that
+replaces itself with the selected process through `process.execve`, as `exec` did in the former
+shell script): `web` (default, standalone `server.js` on port
 3000, plus the metrics listener when `DATABASTION_METRICS_PORT` is set), `worker`, `migrate`, `bootstrap-admin`. The worker, the migrator and the bootstrap command run
 from the TypeScript sources with `tsx` (`node --import tsx`, cache disabled): `tsx` is already the
 production runner of `pnpm worker` / `pnpm db:migrate`, so the image runs exactly the code the tests
 run, with no second bundler configuration to keep in sync; the cost is a larger image (production
 `node_modules` next to the standalone web bundle) and a short transpilation at startup.
-`HEALTHCHECK` ([docker/healthcheck.sh](docker/healthcheck.sh)) probes `/api/health` for `web` and
-reports healthy for the other commands. The image is not built by the CI yet.
+`HEALTHCHECK` ([docker/healthcheck.mjs](docker/healthcheck.mjs), run by the image's Node.js)
+probes `/api/health` for `web` and reports healthy for the other commands. The CI builds the image
+in the end-to-end and install tests; releases publish it signed ([deploy/README.md](../deploy/README.md)).
 
 Database connections (plan PostgreSQL `max_connections` from them). Per **web** process: the main
 pool (10), the dedicated rate-limit pool (3, P4-D, see "Shared rate limits"), the send-only pg-boss
