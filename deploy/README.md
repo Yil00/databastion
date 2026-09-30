@@ -7,6 +7,7 @@ service), and how to verify what you download. The CI runs this exact path and t
 | File | Role |
 |------|------|
 | [docker-compose.example.yml](docker-compose.example.yml) | Console: web, worker, migrations, internal PostgreSQL, optional Caddy HTTPS proxy |
+| [agent-compose.example.yml](agent-compose.example.yml) | Agent with Docker Compose, for container hosts (copy to the agent host) |
 | [docker-compose.own-proxy.example.yml](docker-compose.own-proxy.example.yml) | Publishes the console on `127.0.0.1:8080` for your own reverse proxy (instead of Caddy) |
 | [.env.example](.env.example) | Settings read by Compose (image, DNS name, TLS mode) |
 | [init-secrets.sh](init-secrets.sh) | Generates the console secrets into `./secrets` |
@@ -18,10 +19,12 @@ service), and how to verify what you download. The CI runs this exact path and t
 
 Supported: console on any Linux host with Docker Engine and Compose v2; agent `.deb` on Debian 12
 and Ubuntu 24.04 (amd64, arm64), with systemd. The agent image (`ghcr.io/yil00/databastion-agent`)
-is the alternative for container hosts ([agent README](../agent/README.md#docker-image)): the
-commented example at the end of [docker-compose.example.yml](docker-compose.example.yml) enrolls
-once with a separate `agent-enroll` service (profile `enroll`), then runs the agent without the
-token; pin it by digest like the console.
+is the alternative for container hosts ([agent README](../agent/README.md#docker-image)):
+[agent-compose.example.yml](agent-compose.example.yml), copied to the agent host, enrolls once with
+a separate `agent-enroll` service (profile `enroll`), then runs the agent without the token; image
+pinned by digest like the console, secret files `0600` owned by uid 10001 in a root-owned `0700`
+directory (uid 10001 unused on the host or dedicated), both commands run from the same directory
+and project name (see the file's header).
 
 ## Verify the artifacts
 Every release publishes, from [publish.yml](../.github/workflows/publish.yml) only:
