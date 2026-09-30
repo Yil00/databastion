@@ -1,25 +1,19 @@
-# Example docker-compose for DataBastion (MVP)
-# Adapt to the actual implementation. Images are published on GHCR (see RELEASE.md).
+# Docker Compose deployment of the DataBastion console (MVP). Step by step: deploy/README.md.
+# Images are published on GHCR, signed with cosign (RELEASE.md, deploy/README.md).
 #
-# Only the console exposes a port, and it must be placed behind an
-# HTTPS reverse proxy. Agents expose NO port (outbound-only).
+# Settings come from `.env` next to this file (copy .env.example); secrets from ./secrets
+# (./init-secrets.sh). Only the console is reachable, through an HTTPS reverse proxy: the bundled
+# Caddy (`--profile proxy`) or your own in front of 127.0.0.1:8080. Agents expose NO port
+# (outbound-only).
 
 name: databastion
 
-# Console image, pinned by version tag (never `latest`): one place to change on upgrade. Use a
-# published tag (RELEASE.md: `X.Y.Z` or `X.Y.Z-alpha.N`, no `v` prefix); `0.1.0-alpha.1` is the first
-# planned pre-release: it is published with that first pre-release (end of phase 2), and does not
-# exist on GHCR before then. For a fully immutable pin, append the digest: `...:<tag>@sha256:<digest>`
-# (verify it first: `cosign verify`, see RELEASE.md).
-x-console-image: &console-image ghcr.io/yil00/databastion-console:0.1.0-alpha.1
+# Console image, pinned by version tag (never `latest`), ideally with its verified digest
+# (`...:<tag>@sha256:<digest>`, see deploy/README.md): one place to change on upgrade.
+x-console-image: &console-image ${DATABASTION_CONSOLE_IMAGE:?set DATABASTION_CONSOLE_IMAGE in .env}
 
 services:
   # One image (console/Dockerfile), four commands: web (default), worker, migrate, bootstrap-admin.
-  # First administrator, once, after `migrate`:
-  #   docker compose run --rm -e DATABASTION_BOOTSTRAP_ADMIN_USERNAME=admin \
-  #     -e DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/admin_password \
-  #     console bootstrap-admin
-  #   (add `admin_password` to the console secrets for that run; remove the file afterwards)
 
   # One-shot: applies the console migrations as the database OWNER role, then exits.
   migrate:
@@ -47,7 +41,7 @@ services:
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
-      DATABASTION_PUBLIC_URL: https://databastion.example.com
+      DATABASTION_PUBLIC_URL: https://${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
       # The console runs behind ONE HTTPS reverse proxy that sets / overwrites X-Forwarded-For.
       # Remove this line if nothing in front of the console does (clients could spoof their IP).
       # Several chained proxies: DATABASTION_TRUSTED_PROXY_HOPS: "<N>" instead.
@@ -92,7 +86,7 @@ services:
       # Also decrypts the channel secrets (SMTP password, webhook URL and signing secret).
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       # Links to incidents / agents in the notifications.
-      DATABASTION_PUBLIC_URL: https://databastion.example.com
+      DATABASTION_PUBLIC_URL: https://${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
       # "Silent agent" alert after N heartbeat intervals of 30 s (default 10 = 5 min).
       # DATABASTION_SILENT_AGENT_INTERVALS: "10"
       # Audit access events are deleted after N days (default 90, 7 to 3650).
@@ -110,6 +104,56 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  # One-shot, once after the first `up`: creates the first administrator (refused once a user
+  # exists). `docker compose run --rm bootstrap-admin`, then delete secrets/admin_password.
+  bootstrap-admin:
+    image: *console-image
+    profiles: [tools]
+    command: ["bootstrap-admin"]
+    restart: "no"
+    environment:
+      DATABASE_URL_FILE: /run/secrets/db_url
+      DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      DATABASTION_BOOTSTRAP_ADMIN_USERNAME: ${DATABASTION_ADMIN_USERNAME:-admin}
+      DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+    secrets: [db_url, encryption_key, admin_password]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Optional HTTPS reverse proxy (`docker compose --profile proxy up -d`), configured by ./Caddyfile:
+  # certificate from Let's Encrypt (DATABASTION_TLS = your e-mail; the DNS name must reach this host
+  # on ports 80 and 443) or from Caddy's own CA (DATABASTION_TLS=internal; agents then pin that CA,
+  # deploy/README.md). TLS 1.2+ (agents require 1.3), HSTS, /metrics not served. Skip this service
+  # if another reverse proxy fronts 127.0.0.1:8080.
+  proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    profiles: [proxy]
+    restart: unless-stopped
+    ports:
+      - "80:80"                  # ACME HTTP challenge and redirect to HTTPS
+      - "443:443"
+    environment:
+      DATABASTION_DOMAIN: ${DATABASTION_DOMAIN:?set DATABASTION_DOMAIN in .env}
+      DATABASTION_TLS: ${DATABASTION_TLS:-internal}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data         # certificates and keys (Caddy's CA with DATABASTION_TLS=internal)
+      - caddy-config:/config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      console:
+        condition: service_healthy
 
   db:
     # Pinned by tag AND digest (multi-arch index of postgres:17-alpine = 17.11 on Alpine 3.24,
@@ -149,16 +193,21 @@ secrets:
   metrics_token:
     file: ./secrets/metrics_token     # openssl rand -base64 32 (>= 32 chars); also given to Prometheus
                                       # (scrape_configs: authorization.credentials_file)
+  admin_password:
+    file: ./secrets/admin_password    # first administrator (bootstrap-admin only); delete it afterwards
 
 volumes:
   postgres-data:
+  caddy-data:
+  caddy-config:
 
 # ---------------------------------------------------------------------------
 # Agent example: deploy on the host / network of the monitored databases,
-# NOT alongside the console. No port exposed.
+# NOT alongside the console. No port exposed. On a database host, the .deb
+# package (systemd service) is the documented path: deploy/README.md.
 #
 #  agent:
-#    image: ghcr.io/yil00/databastion-agent:latest
+#    image: ghcr.io/yil00/databastion-agent:<version>
 #    restart: unless-stopped
 #    environment:
 #      DATABASTION_CONSOLE_URL: https://databastion.example.com
