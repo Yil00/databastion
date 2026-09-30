@@ -24,9 +24,22 @@
 //!   counted (heartbeat metric `audit_cursor_reset_total`), rather than
 //!   resuming in the middle of new content and treating new records as
 //!   already reported (end-of-phase-7 review L1). A cursor saved without
-//!   fingerprints (an older agent) is used as before; a new agent key
-//!   (`enroll --new-hmac-key`) makes every saved fingerprint mismatch, so
-//!   the current files are read again from their start once.
+//!   fingerprints (an older agent) is used as before (positions checked
+//!   only).
+//! - The cursor names the sub-key its fingerprints were made with (`kid`:
+//!   a tag of a fixed label, which reveals nothing about the key). After a
+//!   new agent key (`enroll --new-hmac-key`), a cursor of another (or no)
+//!   `kid` cannot be checked: it gets the positions-only check of an older
+//!   agent's cursor, and is fingerprinted again at the next save, instead
+//!   of re-reading every log from its start (duplicate events, false volume
+//!   incidents). Only a mismatch under the same `kid` resets it.
+//! - Fingerprints are computed when the cursor is saved, possibly long
+//!   after the read (the events are handed over first, under
+//!   backpressure). The last bytes read (in memory) are compared with the
+//!   file first; when they differ (the file was truncated or rewritten
+//!   since the read), the fingerprints are saved empty, which never match:
+//!   the next start reads the file from its start rather than trusting a
+//!   fingerprint of new content (security review of #97, L-a).
 //! - Rotation while running (rename + new file): the open handle is read
 //!   to its end first, then the new file from its start. Truncation (the
 //!   file got shorter than the offset, `copytruncate` or
@@ -323,6 +336,28 @@ struct Cursor {
     /// Keyed fingerprint (hex) of the bytes before `replay.end`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     end_fp: Option<String>,
+    /// Identifier (hex) of the sub-key the fingerprints were made with
+    /// ([`key_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kid: Option<String>,
+}
+
+/// Label of the key identifier (see [`key_id`]).
+const KID_LABEL: &[u8] = b"databastion/tail-cursor/kid/v1";
+
+/// Identifier of the fingerprint sub-key: its tag of a fixed label (hex).
+/// Tells two keys apart without revealing anything about them.
+fn key_id(key: &LocalTagKey) -> String {
+    hex32(&key.tag(&[KID_LABEL]))
+}
+
+/// Lowercase hex of a tag.
+fn hex32(tag: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    tag.iter()
+        .flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 0x0f)]])
+        .map(char::from)
+        .collect()
 }
 
 /// Keyed fingerprint of the (at most [`FP_BYTES`]) bytes of `file` before
@@ -339,13 +374,7 @@ fn fingerprint_at(file: &File, key: &LocalTagKey, pos: u64) -> Option<[u8; 32]> 
 /// [`fingerprint_at`] in hex, as saved in the cursor; empty (never
 /// matching) when the bytes cannot be read.
 fn fingerprint_hex(file: &File, key: &LocalTagKey, pos: u64) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    fingerprint_at(file, key, pos).map_or_else(String::new, |tag| {
-        tag.iter()
-            .flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 0x0f)]])
-            .map(char::from)
-            .collect()
-    })
+    fingerprint_at(file, key, pos).map_or_else(String::new, |tag| hex32(&tag))
 }
 
 /// Parses a saved fingerprint; `None` unless exactly 64 hex digits.
@@ -632,8 +661,9 @@ impl Tailer {
     /// `len`) still points at what was read: its positions are within the
     /// file and, when the cursor has fingerprints and the agent key is
     /// available, the bytes before them match. A cursor without
-    /// fingerprints (older agent) or without a key (tests) is checked on
-    /// its positions only. Reads at most `2 * FP_BYTES`.
+    /// fingerprints (older agent), made with another key (`kid`: after a
+    /// new agent key) or without a key (tests) is checked on its positions
+    /// only. Reads at most `2 * FP_BYTES`.
     fn cursor_intact(&self, file: &File, len: u64, c: &Cursor) -> bool {
         let end = c.replay.as_ref().map(|r| r.end);
         if c.offset > len || end.is_some_and(|e| e > len) {
@@ -643,6 +673,13 @@ impl Tailer {
             return true;
         };
         if c.fp.is_none() && c.end_fp.is_none() {
+            return true;
+        }
+        if c.kid.as_deref() != Some(key_id(key).as_str()) {
+            tracing::info!(
+                "audit cursor fingerprinted with another agent key: checked on its positions \
+                 only, fingerprinted again at the next save"
+            );
             return true;
         }
         let matches = |pos: u64, saved: Option<&String>| {
@@ -789,6 +826,21 @@ impl Tailer {
         }
     }
 
+    /// Whether the last bytes read before `offset` (kept in memory) are
+    /// still those of the file. Reads at most [`TAIL_BYTES`].
+    fn read_bytes_unchanged(&self, file: &File) -> bool {
+        use std::os::unix::fs::FileExt as _;
+        if self.offset == 0 {
+            return true;
+        }
+        let n = self.tail.len() as u64;
+        if n == 0 || n > self.offset {
+            return false;
+        }
+        let mut now = Zeroizing::new(vec![0u8; self.tail.len()]);
+        file.read_exact_at(&mut now, self.offset - n).is_ok() && *now == *self.tail
+    }
+
     /// Saves the position of the end of the last complete record read.
     pub fn commit(&self) {
         self.commit_from(&[]);
@@ -815,16 +867,32 @@ impl Tailer {
         let from = here.iter().map(|(_, s)| *s).min();
         let offset = from.unwrap_or(end);
         let key = store.tag_key();
+        // The file may have changed since it was read (the events were
+        // handed over first): fingerprints of new content would let a
+        // restart resume in its middle. Empty ones never match.
+        let unchanged = key.is_none() || self.read_bytes_unchanged(file);
+        if !unchanged {
+            tracing::warn!(
+                "audit log changed since it was read; the saved position will not be trusted \
+                 at the next start"
+            );
+        }
+        let fingerprint = |k: &LocalTagKey, pos: u64| {
+            if unchanged {
+                fingerprint_hex(file, k, pos)
+            } else {
+                String::new()
+            }
+        };
         let cursor = Cursor {
             v: 1,
             dev: *dev,
             ino: *ino,
             offset,
             replay: from.map(|_| Replay { end, keep: here }),
-            fp: key.map(|k| fingerprint_hex(file, k, offset)),
-            end_fp: key
-                .filter(|_| from.is_some())
-                .map(|k| fingerprint_hex(file, k, end)),
+            fp: key.map(|k| fingerprint(k, offset)),
+            end_fp: key.filter(|_| from.is_some()).map(|k| fingerprint(k, end)),
+            kid: key.map(key_id),
         };
         match serde_json::to_vec(&cursor) {
             Ok(bytes) => {
@@ -1176,24 +1244,13 @@ mod tests {
             assert_eq!(lines(t.poll().unwrap()), ["a1", "b1"]);
             assert_eq!(t.rotations, 1);
         }
-        // Another agent key: every fingerprint mismatches.
-        let mut c = good.clone();
-        c.fp = good.fp.clone();
-        store()
-            .unwrap()
-            .save(&serde_json::to_vec(&c).unwrap())
-            .unwrap();
-        let other = tag_key(5);
-        let mut t = Tailer::new(
-            log.clone(),
-            Framing::Lines,
-            CursorStore::new(&d.0, "t", "server_audit").map(|s| s.with_tag_key(other)),
-        );
-        assert_eq!(lines(t.poll().unwrap()), ["a1", "b1"]);
+        // The same key identifier is required for the check to apply.
+        let kid = good.kid.clone().unwrap();
+        assert_eq!(kid.len(), 64);
         // A replay without its end fingerprint, and crafted positions.
         let crafted = [
             format!(
-                "{{\"v\":1,\"dev\":{},\"ino\":{},\"offset\":6,\"fp\":\"{fp}\",\"replay\":{{\"end\":6,\"keep\":[]}}}}",
+                "{{\"v\":1,\"dev\":{},\"ino\":{},\"offset\":6,\"fp\":\"{fp}\",\"kid\":\"{kid}\",\"replay\":{{\"end\":6,\"keep\":[]}}}}",
                 meta.dev(),
                 meta.ino()
             ),
@@ -1219,6 +1276,130 @@ mod tests {
             assert!(t.take_replay().is_none());
             assert_eq!(t.rotations, 1);
         }
+    }
+
+    #[test]
+    fn a_new_agent_key_keeps_the_position_and_refingerprints_it() {
+        let d = Dir::new("fp-kid");
+        let log = d.0.join("server_audit.log");
+        append(&log, "");
+        let (old_key, new_key) = (tag_key(8), tag_key(9));
+        let store = |k: &std::sync::Arc<LocalTagKey>| {
+            CursorStore::new(&d.0, "t", "server_audit").map(|s| s.with_tag_key(k.clone()))
+        };
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store(&old_key));
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, "a1\nb1\n");
+        let p = t.poll().unwrap();
+        t.commit_from(&[(7, p.positions[0])]);
+        drop(t);
+        let before = saved(&store(&old_key).unwrap());
+        append(&log, "c1\n");
+        // `enroll --new-hmac-key`: the fingerprints cannot be checked; the
+        // position and the replay are kept (positions checked only), not
+        // reset to the start of the log.
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store(&new_key));
+        assert_eq!(lines(t.poll().unwrap()), ["a1", "b1", "c1"]);
+        assert_eq!(t.take_replay().unwrap().replay.end, 6);
+        assert_eq!(t.rotations, 0);
+        // Fingerprinted again, under the new key, at the next save.
+        t.commit();
+        drop(t);
+        let after = saved(&store(&new_key).unwrap());
+        assert!(after.kid.is_some() && after.kid != before.kid);
+        assert!(after.fp.is_some() && after.fp != before.fp);
+        // A cursor with fingerprints but no key identifier is treated the
+        // same way.
+        let mut c = after.clone();
+        c.kid = None;
+        c.fp = Some("0".repeat(64));
+        store(&new_key)
+            .unwrap()
+            .save(&serde_json::to_vec(&c).unwrap())
+            .unwrap();
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store(&new_key));
+        assert!(t.poll().unwrap().records.is_empty());
+        assert_eq!(t.rotations, 0);
+        t.commit();
+        drop(t);
+        // Under the same key, a truncation while stopped still resets.
+        copytruncate(&log, "n1 xxxxxxxx\nn2\n");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store(&new_key));
+        assert_eq!(lines(t.poll().unwrap()), ["n1 xxxxxxxx", "n2"]);
+        assert_eq!(t.rotations, 1);
+        // And a mismatch under the same key identifier (tampered
+        // fingerprint) resets too.
+        t.commit();
+        drop(t);
+        let mut c = saved(&store(&new_key).unwrap());
+        c.fp = Some("0".repeat(64));
+        store(&new_key)
+            .unwrap()
+            .save(&serde_json::to_vec(&c).unwrap())
+            .unwrap();
+        let mut t = Tailer::new(log, Framing::Lines, store(&new_key));
+        assert_eq!(lines(t.poll().unwrap()), ["n1 xxxxxxxx", "n2"]);
+        assert_eq!(t.rotations, 1);
+    }
+
+    #[test]
+    fn a_truncation_between_the_read_and_the_save_is_not_trusted() {
+        let d = Dir::new("fp-late");
+        let log = d.0.join("server_audit.log");
+        append(&log, "");
+        let key = tag_key(10);
+        let store =
+            || CursorStore::new(&d.0, "t", "server_audit").map(|s| s.with_tag_key(key.clone()));
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, "a1\nb1\nc1\n");
+        let p = t.poll().unwrap();
+        // While the events are handed over (backpressure), the log is
+        // copytruncated and grows back past the offset and the end read.
+        copytruncate(&log, "n1 xxxxxxxx\nn2 xxxxxxxx\nn3\n");
+        t.commit_from(&[(7, p.positions[0])]);
+        let c = saved(&store().unwrap());
+        assert_eq!(c.fp.as_deref(), Some(""));
+        assert_eq!(c.end_fp.as_deref(), Some(""));
+        drop(t);
+        // The next start does not resume in the middle of the new content.
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert_eq!(
+            lines(t.poll().unwrap()),
+            ["n1 xxxxxxxx", "n2 xxxxxxxx", "n3"]
+        );
+        assert!(t.take_replay().is_none());
+        assert_eq!(t.rotations, 1);
+        // Unchanged file: the fingerprints are saved.
+        t.commit();
+        assert_eq!(saved(&store().unwrap()).fp.map(|f| f.len()), Some(64));
+    }
+
+    #[test]
+    fn an_old_cursor_whose_replay_ends_past_the_file_resets() {
+        let d = Dir::new("fp-old-end");
+        let log = d.0.join("server_audit.log");
+        append(&log, "a1\nb1\n");
+        let meta = std::fs::metadata(&log).unwrap();
+        let key = tag_key(11);
+        let store =
+            || CursorStore::new(&d.0, "t", "server_audit").map(|s| s.with_tag_key(key.clone()));
+        // An older agent's cursor (no fingerprint): the offset is within
+        // the file but the end read is past it, so the file was truncated.
+        // Previously the offset was kept and the replay dropped; now the
+        // file is read from its start.
+        let old = format!(
+            "{{\"v\":1,\"dev\":{},\"ino\":{},\"offset\":3,\"replay\":{{\"end\":60,\"keep\":[[7,3]]}}}}",
+            meta.dev(),
+            meta.ino()
+        );
+        store().unwrap().save(old.as_bytes()).unwrap();
+        let resets = crate::audit::cursor_resets();
+        let mut t = Tailer::new(log, Framing::Lines, store());
+        assert_eq!(lines(t.poll().unwrap()), ["a1", "b1"]);
+        assert!(t.take_replay().is_none());
+        assert_eq!(t.rotations, 1);
+        assert!(crate::audit::cursor_resets() > resets);
     }
 
     #[test]

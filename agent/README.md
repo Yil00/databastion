@@ -324,12 +324,23 @@ resume in the middle of new content, and with a replay the new records up
 to the saved end would be taken for records already reported. While the
 agent runs, the last 32 bytes read are compared at every poll (in memory;
 loaded from the file at open). A cursor saved by an older agent (no
-fingerprint) is used as before; a new HMAC key (`enroll --new-hmac-key`)
-makes every saved fingerprint mismatch, so the current log files are read
-again from their start once (duplicate events for that content). Residual:
-the fingerprints are computed when the cursor is saved, from the file as it
-is then; a truncation between the last read and that save that regrows to
-the same bytes before the offset is not seen.
+fingerprint) is checked on its positions only, as before; a saved offset
+within the file with an end read past it (a replay) is a truncation and
+resets it. The cursor names the sub-key of its fingerprints (`kid`, the
+sub-key's tag of a fixed label, revealing nothing about the key): after a
+new HMAC key (`enroll --new-hmac-key`), a cursor of another or no `kid` gets
+the positions-only check and is fingerprinted again at its next save,
+instead of the whole logs being read again (duplicate events, false volume
+incidents); only a mismatch under the same `kid` resets it. So a truncation
+that happens while the agent is stopped for a key change is not detected,
+as with an older agent's cursor. Fingerprints are computed when the cursor
+is saved, which can be long after the read (the events are handed over
+first, under backpressure): the last bytes read, kept in memory, are
+compared with the file first, and when they differ the fingerprints are
+saved empty, which never match, so the next start reads the file from its
+start (security review of #97, L-a). Residual: a truncation between the
+read and the save that regrows to the same last 32 bytes before the offset
+is not seen.
 
 MySQL / MariaDB audit log statements reported before their statement record
 because the bounded grouping state was full are counted in the heartbeat
