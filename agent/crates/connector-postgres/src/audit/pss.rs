@@ -59,13 +59,17 @@ pub(crate) struct PssPoller {
     own: PgOwn,
     catalogs: Catalogs,
     snapshot: Option<HashMap<Key, Counters>>,
-    /// `None`: the analysis panicked; the statement is dropped (counted
-    /// once) and not analyzed again while cached.
+    /// `None`: the analysis or a conversion panicked (poisoned); the
+    /// statement is counted once in `panicked` and not analyzed again while
+    /// cached, and each of its later deltas is still reported, as a read of
+    /// `*` with its counts (#90).
     analyses: HashMap<Key, Option<Analyzed>>,
     /// The `queryid` pinned for each of the connector's own statements.
     own_keys: OwnKeys,
     last_poll: SystemTime,
-    /// Statements dropped because their analysis or conversion panicked.
+    /// Statements whose analysis or conversion panicked, counted once
+    /// each; they are not dropped: their deltas are reported as reads of
+    /// `*` (#90).
     pub(crate) panicked: u64,
 }
 
