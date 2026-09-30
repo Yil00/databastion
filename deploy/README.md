@@ -7,12 +7,14 @@ service), and how to verify what you download. The CI runs this exact path and t
 | File | Role |
 |------|------|
 | [docker-compose.example.yml](docker-compose.example.yml) | Console: web, worker, migrations, internal PostgreSQL, optional Caddy HTTPS proxy |
+| [docker-compose.own-proxy.example.yml](docker-compose.own-proxy.example.yml) | Publishes the console on `127.0.0.1:8080` for your own reverse proxy (instead of Caddy) |
 | [.env.example](.env.example) | Settings read by Compose (image, DNS name, TLS mode) |
 | [init-secrets.sh](init-secrets.sh) | Generates the console secrets into `./secrets` |
 | [Caddyfile](Caddyfile) | HTTPS reverse proxy of the `proxy` profile |
 | [initdb/](initdb/) | Console database roles (first start of PostgreSQL) |
 | [deb/](deb/) | Agent `.deb`: nfpm configuration, systemd unit, maintainer scripts, build and test scripts |
 | [install-test.sh](install-test.sh) | The timed installation test (CI) |
+| [console-image-smoke.sh](console-image-smoke.sh) | Seconds-long check of a built console image (CI) |
 
 Supported: console on any Linux host with Docker Engine and Compose v2; agent `.deb` on Debian 12
 and Ubuntu 24.04 (amd64, arm64), with systemd. The agent image (`ghcr.io/yil00/databastion-agent`)
@@ -26,41 +28,44 @@ Every release publishes, from [publish.yml](../.github/workflows/publish.yml) on
   images pinned by digest, signed with cosign *keyless* (GitHub OIDC, Sigstore public-good
   instance), with an SBOM (SPDX) and a SLSA provenance attestation per platform;
 - on the GitHub release: `databastion-agent_<version>_<arch>.deb` (amd64, arm64), built from the
-  binary of the signed agent image; `image-digests.txt` (the two image references with their
-  digest); `SHA256SUMS` of those files, and its cosign bundle `SHA256SUMS.cosign.bundle`.
+  binary of the signed agent image; `databastion-deploy-<version>.tar.gz`, the deployment files of
+  this directory (a reproducible `git archive` of `deploy/` at the tag); `image-digests.txt` (the
+  two image references with their digest); `SHA256SUMS` of those files, and its cosign bundle
+  `SHA256SUMS.cosign.bundle`.
 
-The signing identity is the publish workflow of this repository. Install
+Signatures are made only by the publish workflow of this repository, **in the run triggered by the
+push of the release tag** ([ADR-0034](../docs/adr/0034-release-signing-from-tag-push.md)), so the
+exact certificate identity is known for each version: check it exactly, not with a pattern. Install
 [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or later (the release
 bundles use the Sigstore bundle format), then:
 
 ```bash
 VERSION=0.1.0
-IDENTITY='^https://github\.com/Yil00/databastion/\.github/workflows/publish\.yml@refs/'
-ISSUER=https://token.actions.githubusercontent.com
+ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION"
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    --certificate-github-workflow-trigger push)
 
-# Images: verify, and note the digest it prints (pin it, see below).
-cosign verify "ghcr.io/yil00/databastion-console:$VERSION" \
-  --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER"
-cosign verify "ghcr.io/yil00/databastion-agent:$VERSION" \
-  --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER"
-# Or by digest, e.g. from image-digests.txt:
-#   cosign verify ghcr.io/yil00/databastion-console@sha256:<digest> --certificate-identity-regexp ...
+# Release files first: the checksum list, then every file against it.
+base="https://github.com/Yil00/databastion/releases/download/$VERSION"
+curl -fsSL -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.cosign.bundle" -O "$base/image-digests.txt"
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle "${ID[@]}"
+sha256sum --check --ignore-missing SHA256SUMS
+
+# Images, by the digests of the verified image-digests.txt.
+while read -r ref; do
+  if cosign verify "$ref" "${ID[@]}" >/dev/null; then echo "verified: $ref"; else echo "FAILED: $ref"; fi
+done < image-digests.txt
 
 # SBOM and provenance of each platform (attached to the signed index, so covered by the signature).
-docker buildx imagetools inspect "ghcr.io/yil00/databastion-agent:$VERSION" --format '{{json .SBOM}}'
-docker buildx imagetools inspect "ghcr.io/yil00/databastion-agent:$VERSION" --format '{{json .Provenance}}'
-
-# Release files: verify the checksum list, then the files against it.
-base="https://github.com/Yil00/databastion/releases/download/$VERSION"
-curl -fsSLO "$base/SHA256SUMS" -O "$base/SHA256SUMS.cosign.bundle"
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle \
-  --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER"
-sha256sum --check --ignore-missing SHA256SUMS
+agent_ref="$(grep '/databastion-agent:' image-digests.txt)"
+docker buildx imagetools inspect "$agent_ref" --format '{{json .SBOM}}'
+docker buildx imagetools inspect "$agent_ref" --format '{{json .Provenance}}'
 ```
 
-A tag can be moved in a registry; a digest cannot. Pin the verified digest in `.env`
-(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.1.0@sha256:<digest>`); Compose then
-pulls exactly that image.
+A tag can be moved in a registry; a digest cannot. **Pinning the digest is required**: `.env` takes
+the console line of the verified `image-digests.txt`
+(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.1.0@sha256:<digest>`), and Compose
+then pulls exactly that image.
 
 ## Install
 About 10 minutes on a prepared host, most of it the image download. You need:
@@ -72,18 +77,20 @@ About 10 minutes on a prepared host, most of it the image download. You need:
   The agent accepts no inbound connection (invariant I1): no firewall opening is needed on that host.
 
 ### 1. Console
-On the console host, in an empty directory (as a user allowed to run `docker`):
+On the console host, in an empty directory (as a user allowed to run `docker`), with the
+`SHA256SUMS` verified [above](#verify-the-artifacts):
 
 ```bash
 VERSION=0.1.0
-curl -fsSL "https://github.com/Yil00/databastion/archive/refs/tags/$VERSION.tar.gz" \
-  | tar -xz --strip-components=2 "databastion-$VERSION/deploy"
+curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-deploy-$VERSION.tar.gz"
+sha256sum --check --ignore-missing SHA256SUMS            # must print "databastion-deploy-...: OK"
+tar -xzf "databastion-deploy-$VERSION.tar.gz" --strip-components=2 "databastion-deploy-$VERSION/deploy"
 cp docker-compose.example.yml compose.yaml
 cp .env.example .env
 ```
 
-Edit `.env`: `DATABASTION_CONSOLE_IMAGE` (the release, ideally with its verified digest),
-`DATABASTION_DOMAIN` (the console's DNS name) and `DATABASTION_TLS`:
+Edit `.env`: `DATABASTION_CONSOLE_IMAGE` (the console line of `image-digests.txt`, digest
+included), `DATABASTION_DOMAIN` (the console's DNS name) and `DATABASTION_TLS`:
 
 - your e-mail address: the bundled Caddy proxy gets a Let's Encrypt certificate (the DNS name must
   reach this host on ports 80 and 443);
@@ -99,9 +106,15 @@ docker compose --profile proxy up -d     # pulls the images, runs the migrations
 ```
 
 `secrets/encryption_key` protects the secrets the console stores (notification channels, masked
-samples): keep a copy offline. Without the bundled proxy (`docker compose up -d`), put your own HTTPS
-reverse proxy (TLS 1.3 available, one hop that overwrites `X-Forwarded-For`, `/metrics` not
-forwarded) in front of `127.0.0.1:8080`, and adapt the steps that mention Caddy.
+samples): keep a copy offline.
+
+**Your own reverse proxy instead of Caddy**: `cp docker-compose.own-proxy.example.yml
+compose.own-proxy.yaml`, add `COMPOSE_FILE=compose.yaml:compose.own-proxy.yaml` to `.env`, start
+with `docker compose up -d` (no `proxy` profile), and put your HTTPS reverse proxy (TLS 1.3
+available, one hop that overwrites `X-Forwarded-For`, `/metrics` not forwarded) in front of
+`127.0.0.1:8080`; adapt the steps that mention Caddy. The console trusts one proxy hop
+(`DATABASTION_TRUST_PROXY=1`): a local process connecting to `127.0.0.1:8080` directly could choose
+the client address the rate limits see, which is why the bundled-proxy setup publishes no port.
 
 Create the first administrator, then log in at `https://<DATABASTION_DOMAIN>` with
 `DATABASTION_ADMIN_USERNAME` (default `admin`) and the password in `secrets/admin_password`
@@ -180,19 +193,23 @@ targets. On the database host: `systemctl status databastion-agent`, logs with
 | `/usr/bin/databastion-agent` | `root:root 0755` | The binary of the agent image |
 | `/etc/databastion/` | `root:databastion 0750` | Configuration directory |
 | `/etc/databastion/agent.yaml` | `root:databastion 0640` | Configuration (dpkg conffile: kept, or offered for merge, on upgrade) |
+| `/etc/databastion/agent.env` | `root:root 0600` | Optional service environment (proxy, log level; conffile) |
 | `/etc/databastion/secrets/` | `root:databastion 0750` | Your target password files (`databastion 0600`) |
 | `/var/lib/databastion/` | `databastion:databastion 0700` | State: identity, local HMAC key, spool, audit cursors |
 | `/usr/lib/systemd/system/databastion-agent.service` | `root:root 0644` | The service ([unit](deb/databastion-agent.service)) |
 | `/usr/share/databastion-agent/agent.example.yaml` | `root:root 0644` | The documented example, to compare after an upgrade |
 
-The `databastion` user is a system account without login shell, home directory or password.
-`dpkg-statoverride` entries on these paths are respected.
+The `databastion` user is a system account without login shell, home directory or password,
+created before the files are unpacked, so the archive gives every path its final owner and mode
+(no window with other owners during an upgrade). `dpkg-statoverride` entries are respected.
 
 **Service hardening.** The unit runs the agent as `databastion` with no capability and
 `NoNewPrivileges`, a read-only system (`ProtectSystem=strict`, only `/var/lib/databastion`
 writable), no access to `/home`, a private `/tmp` and `/dev`, IPv4 / IPv6 / Unix sockets only,
-`SocketBindDeny=any` (the kernel refuses any bind to an IP port: invariant I1 enforced by the host),
-the `@system-service` system-call set without `@privileged`, `MemoryDenyWriteExecute`,
+and, as defence in depth for invariant I1 (the agent itself opens no listener), `SocketBindDeny=any`
+(the kernel refuses a bind to an IP port) and `listen()`, `accept()`, `accept4()` refused by the
+system-call filter (a `listen()` on an unbound socket would otherwise pick a port by itself); the
+`@system-service` system-call set without `@privileged`, `MemoryDenyWriteExecute`,
 `RestrictNamespaces`, `LockPersonality`, and the kernel protections (`ProtectKernel*`,
 `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`). `systemd-analyze security
 databastion-agent` rates it about 1.5 ("OK"). `/proc` stays visible: local engine detection reads
@@ -217,7 +234,8 @@ process names (never command lines) and `/proc/net/tcp` ([ADR-0006](../docs/adr/
   Sockets under `/run` (PostgreSQL, MySQL, `ldapi`) need nothing.
 - **Another `state_dir`**: add it to `ReadWritePaths=`.
 - **Proxy and log level**: `HTTPS_PROXY`, `NO_PROXY`, `DATABASTION_LOG` in
-  `/etc/databastion/agent.env` (`KEY=value` lines, `root:root 0600`).
+  `/etc/databastion/agent.env` (shipped with comments only, a conffile, `KEY=value` lines,
+  `root:root 0600`: keep it so, systemd reads it as root).
 
 **Upgrade.** Console first, then the agents ([RELEASE.md](../RELEASE.md#compatibility)). Console:
 set the new `DATABASTION_CONSOLE_IMAGE` in `.env`, then `docker compose --profile proxy up -d`
@@ -226,8 +244,10 @@ running service is restarted, the identity and a modified `agent.yaml` are kept.
 
 **Removal.** Revoke the agent in the console, then `sudo apt-get remove databastion-agent` (stops
 and disables the service, keeps configuration and state) or `sudo apt-get purge databastion-agent`
-(also deletes `agent.yaml` and `/var/lib/databastion`: identity, HMAC key, spool). The
-`databastion` user and your files under `/etc/databastion/secrets` are kept.
+(also deletes `agent.yaml`, `agent.env` and `/var/lib/databastion`: identity, HMAC key, spool).
+The `databastion` user and your files under `/etc/databastion/secrets` are kept: after a purge,
+delete the target passwords yourself (`sudo rm -rf /etc/databastion/secrets /etc/databastion`) and
+rotate them on the databases if the host is being decommissioned.
 
 ## Building the `.deb`
 ```bash
@@ -247,8 +267,11 @@ is a build tool only: nothing of it ships in the package.
 runs the [Install](#install) steps above on a fresh runner, `DATABASTION_TLS=internal`, and times
 them from the download of the deployment files to the agent shown online. It fails beyond 15
 minutes, and checks afterwards that the service is active without restart, holds no listening
-socket and logged no error. Its stand-ins are listed at the top of the script: `git archive` for
-the release tarball, an `/etc/hosts` entry for DNS, the user API calls the UI makes. On pull
+socket and logged no error; then it runs a probe under the installed unit's own `[Service]`
+settings, which must be refused `listen()` and `bind()` and allowed an outbound connection. Its
+stand-ins are listed at the top of the script: the deployment bundle made from the checkout as
+publish.yml makes it (checksum checked, no cosign on unsigned pull-request artifacts), an
+`/etc/hosts` entry for DNS, the user API calls the UI makes. On pull
 requests the console image is built from the checkout before the clock starts; on releases
 ([publish.yml](../.github/workflows/publish.yml)) the published image is pulled inside the timed
 window, with the released `.deb`.
@@ -256,4 +279,4 @@ window, with the released `.deb`.
 The `.deb` itself is tested by [deb/test-install.sh](deb/test-install.sh) in Debian 12 and Ubuntu
 24.04 containers, amd64 and arm64: user, files, owners and modes, conffile, `systemd-analyze
 verify` and `security`, no socket unit or listener, `--version`, the refusal to run before
-enrollment, reinstall with a modified configuration, remove, purge.
+enrollment, reinstall with a modified configuration, an upgrade to a newer version, remove, purge.

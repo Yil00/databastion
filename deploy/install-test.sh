@@ -10,8 +10,10 @@
 # and starts the service. Ports 80 and 443 must be free.
 #
 # Where the test cannot do literally what a person does, it does the closest scripted equivalent:
-# - "Download the deployment files": `git archive` of this checkout's deploy/ (the release tarball is
-#   the same `git archive`, which only exists once a release is tagged);
+# - "Download the deployment files": databastion-deploy-<version>.tar.gz is made here from this
+#   checkout exactly as publish.yml makes the release asset (`git archive` of deploy/, gzip -n), and
+#   checked against a SHA256SUMS computed here (the release's is signed; its cosign check is not
+#   run: pull-request artifacts are unsigned);
 # - DNS: an /etc/hosts entry for the console name (done before the clock starts);
 # - the console UI steps (log in, create an enrollment token, see the agent online): the same user
 #   API calls the UI makes (session cookie + X-CSRF-Token);
@@ -87,11 +89,15 @@ T_START="$(date +%s)"
 T_PHASE="$T_START"
 
 # --------------------------------------------------------------------------- 1. console files
-# README "1. Console": download and unpack deploy/ of the release.
+# README "1. Console": download the deployment bundle, check it, unpack it.
+VERSION="test"
 mkdir -p "$DIR"
-git -C "$ROOT" archive --format=tar --prefix=databastion-release/ HEAD deploy \
-  | tar -x -C "$DIR" --strip-components=2 databastion-release/deploy
 cd "$DIR"
+git -C "$ROOT" archive --format=tar --prefix="databastion-deploy-${VERSION}/" HEAD deploy \
+  | gzip -n -9 >"databastion-deploy-${VERSION}.tar.gz"
+sha256sum "databastion-deploy-${VERSION}.tar.gz" >SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS >/dev/null
+tar -xzf "databastion-deploy-${VERSION}.tar.gz" --strip-components=2 "databastion-deploy-${VERSION}/deploy"
 cp docker-compose.example.yml compose.yaml
 cp .env.example .env
 sed -i \
@@ -221,6 +227,44 @@ pid="$(systemctl show -p MainPID --value databastion-agent)"
 [ "$pid" -gt 0 ] || fail "no main PID"
 if sudo ss -H -ltnup | grep -F "pid=${pid},"; then fail "the agent listens on a port (I1)"; fi
 log "ok  no listening socket held by the agent (pid $pid)"
+# The unit's socket restrictions, enforced: a probe run under the installed unit's own [Service]
+# settings (ExecStart replaced) must be refused listen() on an unbound socket and bind() to a port,
+# and still be allowed an outbound connect().
+probe=databastion-listen-probe
+cat >"$WORK/probe.py" <<'PY'
+import socket
+import sys
+
+for family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
+    s = socket.socket(family)
+    try:
+        s.listen(1)
+        sys.exit(f"listen() allowed ({family.name})")
+    except PermissionError:
+        pass
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", 0))
+    sys.exit("bind() allowed")
+except PermissionError:
+    pass
+socket.create_connection(("127.0.0.1", 443), 5).close()
+print("probe ok")
+PY
+# /run is visible (read-only) under the unit's sandbox; /tmp is private.
+sudo install -m 0644 "$WORK/probe.py" "/run/${probe}.py"
+sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 /run/${probe}.py|" -e 's|^Type=exec|Type=oneshot|' \
+  -e '/^Restart=/d' -e '/^RestartSec=/d' -e '/^\[Install\]/,$d' \
+  /usr/lib/systemd/system/databastion-agent.service | sudo tee "/run/systemd/system/${probe}.service" >/dev/null
+sudo systemctl daemon-reload
+if ! sudo systemctl start "${probe}.service"; then
+  sudo journalctl -u "${probe}.service" --no-pager -o cat >&2
+  fail "the socket probe under the unit's settings failed (see above)"
+fi
+sudo journalctl -u "${probe}.service" --no-pager -o cat | grep -qx 'probe ok' || fail "the socket probe printed no result"
+sudo rm -f "/run/systemd/system/${probe}.service" "/run/${probe}.py"
+sudo systemctl daemon-reload
+log "ok  under the unit's settings: listen() and bind() refused, outbound connect() allowed"
 if sudo journalctl -u databastion-agent --no-pager -o cat | grep -F '"level":"ERROR"'; then
   fail "the agent logged errors"
 fi

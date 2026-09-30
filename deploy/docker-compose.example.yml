@@ -3,13 +3,13 @@
 #
 # Settings come from `.env` next to this file (copy .env.example); secrets from ./secrets
 # (./init-secrets.sh). Only the console is reachable, through an HTTPS reverse proxy: the bundled
-# Caddy (`--profile proxy`) or your own in front of 127.0.0.1:8080. Agents expose NO port
-# (outbound-only).
+# Caddy (`--profile proxy`), or your own in front of 127.0.0.1:8080 published by
+# docker-compose.own-proxy.example.yml. Agents expose NO port (outbound-only).
 
 name: databastion
 
-# Console image, pinned by version tag (never `latest`), ideally with its verified digest
-# (`...:<tag>@sha256:<digest>`, see deploy/README.md): one place to change on upgrade.
+# Console image, pinned by version tag AND the verified digest (`...:<tag>@sha256:<digest>`, from
+# the release's signed image-digests.txt, see deploy/README.md): one place to change on upgrade.
 x-console-image: &console-image ${DATABASTION_CONSOLE_IMAGE:?set DATABASTION_CONSOLE_IMAGE in .env}
 
 services:
@@ -36,8 +36,9 @@ services:
     image: *console-image
     command: ["web"]
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:3000"   # to be published through the HTTPS reverse proxy
+    # No published port: the bundled proxy reaches console:3000 on the Compose network. With your own
+    # reverse proxy, add docker-compose.own-proxy.example.yml (127.0.0.1:8080). Never both: with
+    # DATABASTION_TRUST_PROXY=1, a local client of a published port could choose its X-Forwarded-For.
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
       DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
@@ -114,10 +115,9 @@ services:
     restart: "no"
     environment:
       DATABASE_URL_FILE: /run/secrets/db_url
-      DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       DATABASTION_BOOTSTRAP_ADMIN_USERNAME: ${DATABASTION_ADMIN_USERNAME:-admin}
       DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
-    secrets: [db_url, encryption_key, admin_password]
+    secrets: [db_url, admin_password]
     user: "10001:10001"
     read_only: true
     tmpfs: [/tmp]
