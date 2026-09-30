@@ -244,6 +244,24 @@ fn record_bytes(r: &FileRecord) -> usize {
         + r.text.as_ref().map_or(0, |t| t.len())
 }
 
+/// Since when a statement starting with `r` is pending, on the monotonic
+/// clock: when it was read (`mono`), or for a record re-read after a
+/// restart (`FileRecord::replayed`), when it was logged (`ts`, at most
+/// [`PENDING_TIMEOUT`] back). An agent restarting more often than the
+/// timeout still flushes a held statement early, so its cursor is not kept
+/// pinned to it and the log re-read at every restart does not grow
+/// (security review of #93, R4). Without a log time: when it was read.
+fn pending_since(r: &FileRecord, now: SystemTime, mono: Instant) -> Instant {
+    if !r.replayed {
+        return mono;
+    }
+    let age =
+        r.ts.and_then(|ts| now.duration_since(ts).ok())
+            .unwrap_or_default()
+            .min(PENDING_TIMEOUT);
+    mono.checked_sub(age).unwrap_or(mono)
+}
+
 /// Table-access records of one statement waiting for its statement
 /// record.
 struct PendingStatement {
@@ -405,7 +423,8 @@ impl Pending {
     /// Adds a table-access record (of the connection's pending statement,
     /// if any: the caller flushed another statement first). Returns the
     /// statements flushed to make room.
-    fn add(&mut self, mut r: FileRecord, mono: Instant) -> Vec<Vec<FileRecord>> {
+    fn add(&mut self, mut r: FileRecord, mono: Instant, now: SystemTime) -> Vec<Vec<FileRecord>> {
+        let since = pending_since(&r, now, mono);
         let c = r.connection;
         // Another statement than the early-flushed one: the connection
         // moved on (a continuation of it keeps it).
@@ -440,7 +459,7 @@ impl Pending {
                 PendingStatement {
                     records: vec![r],
                     seq,
-                    since: mono,
+                    since,
                     bytes,
                 },
             );
@@ -897,7 +916,7 @@ impl EventBuilder {
                 self.flush_isolated(p, source, now, out);
             }
         }
-        for p in self.pending.add(r, mono) {
+        for p in self.pending.add(r, mono, now) {
             self.flush_isolated(p, source, now, out);
         }
     }
@@ -1630,6 +1649,55 @@ mod tests {
             .collect();
         assert_eq!(out, ["read [\"shop.c\"] None []"], "{out:#?}");
         assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #93, R4: a statement re-read after a restart is
+    /// pending since its log time, not since it was read again, so an agent
+    /// restarting more often than the timeout still flushes it on time and
+    /// its cursor moves on.
+    #[test]
+    fn replayed_statements_are_pending_since_their_log_time() {
+        let logged = |line: &str| {
+            let mut r = parse_server_audit(line.as_bytes(), 0, 1024).unwrap();
+            r.replayed = true;
+            r
+        };
+        let ts = logged(&rd(1, 30, "a")).ts.unwrap();
+        // Past the timeout 4 minutes ago: flushed at once.
+        let mut b = EventBuilder::new(own());
+        let t0 = Instant::now() + PENDING_TIMEOUT;
+        let out = b.convert_file_at(
+            vec![logged(&rd(1, 30, "a"))],
+            EventSource::MariadbServerAudit,
+            ts + PENDING_TIMEOUT + Duration::from_secs(240),
+            t0,
+        );
+        assert_eq!(
+            out.iter().map(show).collect::<Vec<_>>(),
+            ["read [\"shop.a\"] None []"]
+        );
+        assert!(b.held().is_empty());
+        // Logged 100 s ago: flushed 200 s later, not after a full timeout.
+        let run = |b: &mut EventBuilder, recs: Vec<FileRecord>, mono: Instant| {
+            b.convert_file_at(
+                recs,
+                EventSource::MariadbServerAudit,
+                ts + Duration::from_secs(100),
+                mono,
+            )
+            .len()
+        };
+        let mut b = EventBuilder::new(own());
+        assert_eq!(run(&mut b, vec![logged(&rd(1, 30, "a"))], t0), 0);
+        let due = t0 + PENDING_TIMEOUT - Duration::from_secs(100);
+        assert_eq!(run(&mut b, vec![], due - Duration::from_secs(1)), 0);
+        assert_eq!(run(&mut b, vec![], due), 1);
+        // A record read live (not replayed) keeps its reading time.
+        let mut b = EventBuilder::new(own());
+        let live = parse_server_audit(rd(1, 30, "a").as_bytes(), 0, 1024).unwrap();
+        assert_eq!(run(&mut b, vec![live], t0), 0);
+        assert_eq!(run(&mut b, vec![], due), 0);
+        assert_eq!(run(&mut b, vec![], t0 + PENDING_TIMEOUT), 1);
     }
 
     #[test]

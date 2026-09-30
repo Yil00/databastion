@@ -221,7 +221,10 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   and the connections waiting (`Tailer::commit_from`): after a restart, a
   crash, a stream restart or a reconfiguration, the stream re-reads from
   there and replays only the waiting statements' records, so they are
-  neither lost nor counted twice. When the stream ends gracefully (the
+  neither lost nor counted twice. A replayed statement has been waiting
+  since its log time, not since the restart: an agent that restarts more
+  often than every 5 minutes still reports it after 5 minutes, and its
+  cursor moves on instead of staying pinned to it. When the stream ends gracefully (the
   source changes, the log becomes unreadable), the waiting statements are
   reported and the cursor saved without them. Residuals: statements
   waiting in a rotated (earlier) file are lost if the agent stops before

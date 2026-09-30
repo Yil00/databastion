@@ -83,6 +83,10 @@ pub(crate) struct FileRecord {
     pub(crate) program: Option<String>,
     /// Position in the log file (set by the stream after parsing).
     pub(crate) pos: Option<databastion_core::audit::tail::RecordPos>,
+    /// Re-read after a restart from a cursor moved back to held records
+    /// (set by the stream's replay filter): its statement has been pending
+    /// since its log time `ts`, not since it was read again.
+    pub(crate) replayed: bool,
 }
 
 impl fmt::Debug for FileRecord {
@@ -282,6 +286,7 @@ pub(crate) fn parse_server_audit(
         status: 0,
         program: None,
         pos: None,
+        replayed: false,
     };
     let status_of =
         |b: &[u8]| -> Option<u32> { std::str::from_utf8(b).ok()?.trim_end().parse().ok() };
@@ -514,6 +519,7 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
         status,
         program: None,
         pos: None,
+        replayed: false,
     })
 }
 
@@ -539,6 +545,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
         status: 0,
         program: None,
         pos: None,
+        replayed: false,
     };
     match (r.class.as_str(), r.event.as_str()) {
         ("connection", "connect" | "change_user") => {

@@ -248,10 +248,11 @@ fn apply_replay(
     rotations: u64,
 ) -> Vec<records::FileRecord> {
     let mut out = Vec::with_capacity(records.len());
-    for r in records {
+    for mut r in records {
         match replay.as_ref() {
             Some(f) if f.covers(&r, rotations) => {
                 if f.admits(&r) {
+                    r.replayed = true;
                     out.push(r);
                 }
             }
