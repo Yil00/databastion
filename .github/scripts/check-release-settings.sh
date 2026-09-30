@@ -11,6 +11,9 @@
 #                                                             # creation / update / deletion
 #                                                             # restricted, admins-only bypass
 # RELEASE_APP_ID (optional): id of the release GitHub App allowed in the bypass list.
+# RELEASE_ALLOW_ADMIN_BYPASS (optional, repository variable): `true` accepts an environment that lets
+#   administrators bypass its protection rules, with a warning (the maintainer's choice while there
+#   is a single maintainer, RELEASE.md section 6); any other value refuses it.
 # Requires gh and jq; GH_TOKEN and GITHUB_REPOSITORY set (the job needs `actions: read`).
 set -euo pipefail
 
@@ -69,6 +72,23 @@ ruleset_ok() {
   echo "tag ruleset $id: active, covers the version tags, restricts creation, update and deletion, bypass: $bypass"
 }
 
+# env_admin_bypass NAME < environment JSON: sets admin_bypass to "no admin bypass" when
+# administrators cannot bypass the environment's protection rules. When they can, it fails, unless
+# RELEASE_ALLOW_ADMIN_BYPASS is `true`: it then warns and sets "admin bypass accepted". A missing
+# can_admins_bypass field counts as a bypass.
+env_admin_bypass() {
+  local name="$1" json
+  json="$(cat)"
+  if jq -e '.can_admins_bypass == false' <<<"$json" >/dev/null; then
+    admin_bypass="no admin bypass"; return 0
+  fi
+  if [ "${RELEASE_ALLOW_ADMIN_BYPASS:-}" = "true" ]; then
+    echo "::warning::environment '$name' lets administrators bypass its protection rules; accepted because RELEASE_ALLOW_ADMIN_BYPASS is true (RELEASE.md, section 6)"
+    admin_bypass="admin bypass accepted"; return 0
+  fi
+  fail "environment '$name' lets administrators bypass its protection rules (accepted only when the repository variable RELEASE_ALLOW_ADMIN_BYPASS is true)"
+}
+
 case "${1:-}" in
   environment)
     name="${2:?environment name}" kind="${3:?tag or branch}" branch="${4:-}"
@@ -76,8 +96,7 @@ case "${1:-}" in
       || fail "environment '$name' not found (or not readable)"
     jq -e '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length > 0' \
       <<<"$env_json" >/dev/null || fail "environment '$name' has no required reviewers"
-    jq -e '.can_admins_bypass == false' <<<"$env_json" >/dev/null \
-      || fail "environment '$name' lets administrators bypass its protection rules"
+    env_admin_bypass "$name" <<<"$env_json"
     jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env_json" >/dev/null \
       || fail "environment '$name' is not limited to selected branches and tags"
     policies="$(gh api --paginate "repos/$repo/environments/$name/deployment-branch-policies" \
@@ -91,7 +110,7 @@ case "${1:-}" in
           || fail "environment '$name' must admit only branch '$branch', has: $policies" ;;
       *) fail "unknown kind '$kind'" ;;
     esac
-    echo "environment '$name': required reviewers, no admin bypass, deployment rules: $(tr '\n' ',' <<<"$policies")"
+    echo "environment '$name': required reviewers, $admin_bypass, deployment rules: $(tr '\n' ',' <<<"$policies")"
     ;;
   tag-ruleset)
     ids="$(gh api --paginate "repos/$repo/rulesets" \
@@ -102,6 +121,12 @@ case "${1:-}" in
       fi
     done
     fail "no active tag ruleset covering the version tags, restricting their creation, update and deletion, with admins (or the release app) only in its bypass list"
+    ;;
+  environment-json)
+    # Tests (test_check_release_settings.sh): the admin bypass check on one environment, as
+    # returned by GET /environments/{name}, on stdin.
+    env_admin_bypass "${2:-fixture}"
+    echo "environment ${2:-fixture}: $admin_bypass"
     ;;
   tag-ruleset-json)
     # Tests (test_check_release_settings.sh): one ruleset as returned by GET /rulesets/{id}, on stdin.

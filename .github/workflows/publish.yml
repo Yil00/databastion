@@ -67,6 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_ALLOW_ADMIN_BYPASS: ${{ vars.RELEASE_ALLOW_ADMIN_BYPASS }}
         run: |
           .github/scripts/check-release-settings.sh environment release tag
           .github/scripts/check-release-settings.sh tag-ruleset

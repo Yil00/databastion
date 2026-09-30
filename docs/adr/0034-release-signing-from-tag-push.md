@@ -55,7 +55,10 @@ compromised action in either workflow (PR #86 security review, H1).
    settings, made by the maintainer (RELEASE.md, section 6), and must exist before this decision is
    merged. `release.yml` and `publish.yml` read them at the start of each run
    (`check-release-settings.sh`: required reviewers and deployment rules of the environment, an
-   active tag ruleset restricting creation, update and deletion) and stop when one is missing. This
+   active tag ruleset restricting creation, update and deletion) and stop when one is missing. An
+   environment that lets administrators bypass its protection rules is refused, unless the
+   repository variable `RELEASE_ALLOW_ADMIN_BYPASS` is `true`: the check then warns on every run
+   (single-maintainer choice, RELEASE.md section 6, to be undone when a second maintainer joins). This
    only guards against a forgotten or undone setup: it cannot see where a secret is stored, and
    whoever can edit a workflow can remove it.
 6. **No shared state in release builds.** Release image builds use no build cache (`no-cache`,

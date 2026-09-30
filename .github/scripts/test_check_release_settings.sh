@@ -38,6 +38,28 @@ expect fail bad-rules
 expect fail bad-evaluate
 expect fail bad-branch
 
+# Environment admin bypass: refused unless RELEASE_ALLOW_ADMIN_BYPASS is exactly `true`.
+# expect_env ok|fail JSON [RELEASE_ALLOW_ADMIN_BYPASS]
+expect_env() {
+  local want="$1" json="$2" allow="${3:-}" got=ok out
+  out="$(RELEASE_ALLOW_ADMIN_BYPASS="$allow" "$here/check-release-settings.sh" environment-json env \
+    <<<"$json" 2>&1)" || got=fail
+  if [ "$got" = "$want" ]; then
+    echo "ok    environment $json${allow:+ (allow=$allow)}: $got"
+  else
+    echo "FAIL  environment $json${allow:+ (allow=$allow)}: expected $want, got $got"; printf '      %s\n' "$out"
+    failures=$((failures + 1))
+  fi
+}
+expect_env ok '{"can_admins_bypass":false}'
+expect_env ok '{"can_admins_bypass":false}' true
+expect_env fail '{"can_admins_bypass":true}'
+expect_env fail '{"can_admins_bypass":true}' yes
+expect_env fail '{"can_admins_bypass":true}' TRUE
+expect_env ok '{"can_admins_bypass":true}' true
+expect_env fail '{}'
+expect_env ok '{}' true
+
 # A hidden bypass list is reported as such, never as an empty list.
 out="$("$here/check-release-settings.sh" tag-ruleset-json hidden <"$here/fixtures/ruleset-ok-bypass-hidden.json")"
 if grep -q 'bypass: not visible (check by hand)$' <<<"$out" && ! grep -q 'bypass: \[\]' <<<"$out"; then
