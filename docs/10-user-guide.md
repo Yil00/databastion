@@ -67,7 +67,7 @@ Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-pri
 - `console.url`: the console's public HTTPS URL. `console.ca_file` pins a private CA (it then is the only trusted root). TLS 1.3 minimum. `HTTPS_PROXY` / `NO_PROXY` are honored.
 - `state_dir`: a directory owned by the agent user, not group- or world-writable.
 - `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval).
-- `spool`: bounded disk buffer for results while the console is unreachable; when full, the oldest batches are dropped and the console raises an `agent.batches_dropped` alert.
+- `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority (findings and events each keep part of the space, batches with a `signature.*` signal go last, then the oldest first) and the console raises an `agent.batches_dropped` alert.
 - `targets`: see [section 6](#6-declare-targets).
 
 Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the console's. Logs are JSON on stdout; `DATABASTION_LOG` sets the level.
@@ -138,6 +138,8 @@ Classifiers and their semantics: [agent/crates/classifiers/README.md](../agent/c
 ## 10. Audit: enabling it and reading events
 1. On the agent page, open a target's **Audit** settings (administrator): enable Audit, set the aggregation window, poll interval and minimum rows, and choose the sensitive objects (derived from the findings by default, plus manual objects). A change that disables Audit or removes objects asks for a confirmation.
 2. **Events** lists the access events, newest first, with their principal, score, signals (`signature.*` for known export tools such as `pg_dump` or `mongodump`, `shape.*`, `volume.*`), baseline anomaly flag and the incidents they matched. A principal's page shows its baseline, incidents and latest events. Principals are designated by a key, never by the account name in a URL; OpenLDAP users are sent as keyed fingerprints, except `anonymous`, the agent's own DN and the DNs listed in `openldap.clear_principals`.
+
+Audit read positions (log offsets, cursors, profiler positions) and the agent's own-account row counters are kept in `state_dir` across agent restarts, so a restart resumes where the agent stopped, within what the source still holds; `pg_stat_statements` counters are the exception. Keep `state_dir` on a persistent volume.
 
 The export signatures recognized per engine are listed in [08-engine-capabilities.md](08-engine-capabilities.md#known-export-signatures).
 
