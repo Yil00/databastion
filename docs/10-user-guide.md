@@ -67,7 +67,7 @@ Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-pri
 - `console.url`: the console's public HTTPS URL. `console.ca_file` pins a private CA (it then is the only trusted root). TLS 1.3 minimum. `HTTPS_PROXY` / `NO_PROXY` are honored.
 - `state_dir`: a directory owned by the agent user, not group- or world-writable.
 - `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval).
-- `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority (findings and events each keep part of the space, batches with a `signature.*` signal go last, then the oldest first) and the console raises an `agent.batches_dropped` alert.
+- `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority: findings and events can each grow to 3/4 of the bounds, so each keeps at least 1/4 (an events flood can evict findings down to that quarter); batches with a `signature.*` signal go last; otherwise the oldest first. and the console raises an `agent.batches_dropped` alert.
 - `targets`: see [section 6](#6-declare-targets).
 
 Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the console's. Logs are JSON on stdout; `DATABASTION_LOG` sets the level.
