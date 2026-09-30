@@ -67,7 +67,7 @@ ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
     TSX_DISABLE_CACHE=1 \
     PATH=/nodejs/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-COPY --from=users --chown=root:root --chmod=0644 /out/passwd /out/group /etc/
+COPY --from=users --chown=root:root /out/passwd /out/group /etc/
 WORKDIR /app
 # web: Next.js standalone server (traced node_modules only) + static assets.
 COPY --from=build --chown=root:root /src/.next/standalone /app/web
@@ -77,7 +77,9 @@ COPY --from=prod-deps --chown=root:root /src/node_modules /app/console/node_modu
 COPY --chown=root:root package.json tsconfig.json /app/console/
 COPY --chown=root:root drizzle /app/console/drizzle
 COPY --chown=root:root src /app/console/src
-COPY --chown=root:root --chmod=0644 docker/entrypoint.mjs docker/healthcheck.mjs /usr/local/lib/databastion/
+# No --chmod here: BuildKit would apply it to the directory it creates too (0644, not traversable by
+# the runtime user). The files keep their checkout mode (0644), owned by root.
+COPY --chown=root:root docker/entrypoint.mjs docker/healthcheck.mjs /usr/local/lib/databastion/
 # Files are owned by root and not writable by the runtime user.
 USER 10001:10001
 # 9464: suggested DATABASTION_METRICS_PORT (internal network only, never published).
