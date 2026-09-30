@@ -22,7 +22,10 @@ license: Apache-2.0
 depends:
   - ${DEB_LIBC_DEPENDS}
   - libgcc-s1
-  - passwd
+deb:
+  # preinst creates the system user with groupadd / useradd, before the unpack.
+  predepends:
+    - passwd
 umask: 0o022
 
 contents:

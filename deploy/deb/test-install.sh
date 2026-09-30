@@ -69,7 +69,9 @@ if grep -E '^(ListenStream|ListenDatagram|ListenSequentialPacket|Sockets)=' "$un
 fi
 grep -qx 'SocketBindDeny=any' "$unit" || fail "SocketBindDeny=any missing from the unit"
 grep -qx 'SystemCallFilter=~listen accept accept4' "$unit" || fail "listen / accept not denied by the unit"
-log "ok  no socket unit, no Listen*=, SocketBindDeny=any, listen / accept / accept4 denied"
+grep -qx 'SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register' "$unit" \
+  || fail "io_uring not denied by the unit"
+log "ok  no socket unit, no Listen*=, SocketBindDeny=any, listen / accept / accept4 / io_uring denied"
 
 log "systemd-analyze verify"
 out="$(systemd-analyze verify "$unit" 2>&1)" || { echo "$out"; fail "systemd-analyze verify failed"; }

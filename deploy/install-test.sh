@@ -228,13 +228,20 @@ pid="$(systemctl show -p MainPID --value databastion-agent)"
 if sudo ss -H -ltnup | grep -F "pid=${pid},"; then fail "the agent listens on a port (I1)"; fi
 log "ok  no listening socket held by the agent (pid $pid)"
 # The unit's socket restrictions, enforced: a probe run under the installed unit's own [Service]
-# settings (ExecStart replaced) must be refused listen() on an unbound socket and bind() to a port,
-# and still be allowed an outbound connect().
+# settings (ExecStart replaced) must be refused io_uring_setup(), listen() on an unbound socket and
+# bind() to a port, and still be allowed an outbound connect().
 probe=databastion-listen-probe
 cat >"$WORK/probe.py" <<'PY'
+import ctypes
+import errno
 import socket
 import sys
 
+# io_uring_setup (same number, 425, on x86_64 and aarch64) must be refused (EPERM).
+libc = ctypes.CDLL(None, use_errno=True)
+params = ctypes.create_string_buffer(120)
+if libc.syscall(425, 1, params) != -1 or ctypes.get_errno() != errno.EPERM:
+    sys.exit(f"io_uring_setup not refused (errno {ctypes.get_errno()})")
 for family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):
     s = socket.socket(family)
     try:
@@ -264,7 +271,7 @@ fi
 sudo journalctl -u "${probe}.service" --no-pager -o cat | grep -qx 'probe ok' || fail "the socket probe printed no result"
 sudo rm -f "/run/systemd/system/${probe}.service" "/run/${probe}.py"
 sudo systemctl daemon-reload
-log "ok  under the unit's settings: listen() and bind() refused, outbound connect() allowed"
+log "ok  under the unit's settings: io_uring, listen() and bind() refused, outbound connect() allowed"
 if sudo journalctl -u databastion-agent --no-pager -o cat | grep -F '"level":"ERROR"'; then
   fail "the agent logged errors"
 fi

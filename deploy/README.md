@@ -51,10 +51,14 @@ curl -fsSL -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.cosign.bundle" -O "$base/i
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle "${ID[@]}"
 sha256sum --check --ignore-missing SHA256SUMS
 
-# Images, by the digests of the verified image-digests.txt.
-while read -r ref; do
-  if cosign verify "$ref" "${ID[@]}" >/dev/null; then echo "verified: $ref"; else echo "FAILED: $ref"; fi
-done < image-digests.txt
+# Images, by the digests of the verified image-digests.txt. Stops at the first failure (the
+# subshell keeps `exit` from closing your terminal): do not install anything if it prints FAILED.
+(
+  while read -r ref; do
+    cosign verify "$ref" "${ID[@]}" >/dev/null || { echo "FAILED: $ref"; exit 1; }
+    echo "verified: $ref"
+  done < image-digests.txt
+) && echo "all images verified"
 
 # SBOM and provenance of each platform (attached to the signed index, so covered by the signature).
 agent_ref="$(grep '/databastion-agent:' image-digests.txt)"

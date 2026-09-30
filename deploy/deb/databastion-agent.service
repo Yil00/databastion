@@ -73,6 +73,8 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=~listen accept accept4
+# io_uring could perform socket operations outside the filter above (the agent's runtime uses epoll).
+SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register
 SystemCallErrorNumber=EPERM
 
 [Install]
