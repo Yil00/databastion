@@ -6,12 +6,43 @@ import { logger } from "@/lib/logger";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
+import { HEARTBEAT_INTERVAL_S } from "./agent-api/pipeline";
 
 /** A delivered job with no status is delivered again after this lease (contract: 120 s). */
 export const JOB_LEASE_S = 120;
 export const MAX_JOBS_PER_POLL = 16;
-/** Deliveries without any status before a job is given up (`failed`, `timeout`). */
+/**
+ * Deliveries without any status before a job is given up (`failed`, `timeout`), except a queued
+ * `discovery.scan` of an online agent within its budget (see `QUEUED_SCAN_MARGIN_S`).
+ */
 export const MAX_JOB_ATTEMPTS = 5;
+/** An agent whose last heartbeat is more recent than this is online (3 missed heartbeats: offline). */
+export const AGENT_ONLINE_WINDOW_S = 3 * HEARTBEAT_INTERVAL_S;
+/**
+ * Queued scans (Discovery pacing, PR #93). The agent runs scans one at a time and acknowledges a
+ * scan (`running`) only when it starts it, so a scan queued behind a long paced scan stays
+ * delivered without a status for minutes. Its `max_duration_s` window counts from the agent's
+ * reception of the job, queue time included (docs/09, "Scan worker"): past it, the agent itself
+ * ends the scan `failed` / `timeout` without touching the target. So while the agent is online
+ * (heartbeat within `AGENT_ONLINE_WINDOW_S`), such a scan is not given up after `MAX_JOB_ATTEMPTS`
+ * deliveries before `first_delivered_at + max_duration_s + QUEUED_SCAN_MARGIN_S`. It is still
+ * delivered again every lease (the agent ignores a job it has queued, and queues it again after a
+ * restart that lost its queue). The margin is the tolerance of any unacknowledged job (5 leases):
+ * lost deliveries, and the agent's own `timeout` status.
+ */
+export const QUEUED_SCAN_MARGIN_S = MAX_JOB_ATTEMPTS * JOB_LEASE_S;
+
+/**
+ * SQL: a delivered, unacknowledged job of the table `jobs` that is a queued `discovery.scan` of an
+ * online agent, still within its budget (not given up after `MAX_JOB_ATTEMPTS` deliveries).
+ */
+const queuedScanSql = sql`(${jobs.type} = 'discovery.scan'
+  and exists (select 1 from agents a where a.id = ${jobs.agentId}
+    and a.last_seen_at > now() - make_interval(secs => ${AGENT_ONLINE_WINDOW_S}))
+  and coalesce(${jobs.firstDeliveredAt}, ${jobs.deliveredAt})
+    + make_interval(secs => case when ${jobs.type} = 'discovery.scan'
+        then coalesce((${jobs.params}->>'max_duration_s')::int, 86400) else 0 end)
+    + make_interval(secs => ${QUEUED_SCAN_MARGIN_S}) > now())`;
 
 export type JobType = Schemas["Job"]["type"];
 
@@ -84,12 +115,17 @@ export async function claimJobs(db: Database, agentId: string): Promise<Schemas[
     update jobs set status = 'expired', finished_at = now()
     where agent_id = ${agentId} and status in ('pending', 'delivered')
       and expires_at is not null and expires_at <= now()`);
-  // L7: a job delivered MAX_JOB_ATTEMPTS times without any status is not redelivered forever.
-  await db.execute(sql`
+  // L7: a job delivered MAX_JOB_ATTEMPTS times without any status is not redelivered forever,
+  // unless it is a scan queued behind others on an online agent, within its budget.
+  const givenUp = await db.execute<{ id: string; type: string; target_id: string | null }>(sql`
     update jobs set status = 'failed', error = '{"code":"timeout"}'::jsonb, finished_at = now(),
       lease_until = null
     where agent_id = ${agentId} and status = 'delivered' and lease_until < now()
-      and attempts >= ${MAX_JOB_ATTEMPTS}`);
+      and attempts >= ${MAX_JOB_ATTEMPTS} and not ${queuedScanSql}
+    returning id, type, target_id`);
+  for (const job of givenUp.rows) {
+    logger.warn({ jobId: job.id, type: job.type, targetId: job.target_id }, "job given up: no status after its deliveries");
+  }
   const result = await db.execute<ClaimedRow>(sql`
     update jobs set
       status = 'delivered',

@@ -22,8 +22,13 @@ export type DiscoveryScanParams = Schemas["DiscoveryScanParams"];
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
-/** Contract defaults (`DiscoveryScanParams`), made explicit in every job. */
-export const SCAN_DEFAULTS = { sample_rows: 200, max_duration_s: 900, statement_timeout_ms: 30_000 } as const;
+/**
+ * Defaults of the three bounds, made explicit in every job. `max_duration_s` is 3600 (not the
+ * contract's 900): Discovery is paced (PR #93, ADR-0035 proposed), so a scan lasts about
+ * `100 / duty_cycle_percent` times its query time (100x at the default 1 %). 3600 s is the default
+ * local cap of the agent (`limits.max_scan_duration_s`), which clamps a larger value down.
+ */
+export const SCAN_DEFAULTS = { sample_rows: 200, max_duration_s: 3600, statement_timeout_ms: 30_000 } as const;
 /** The agent must not start a scan after this delay (contract `expires_at`). */
 export const SCAN_JOB_TTL_MS = 6 * 3600_000;
 /**
