@@ -2378,4 +2378,31 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].principal().account_name(), "alice");
     }
+
+    /// Security review of #85: on `pg_stat_statements`, role changes are
+    /// `dcl` events, as on pgaudit (its `ROLE` class), so `dcl` policies
+    /// see them.
+    #[test]
+    fn pss_role_changes_are_dcl() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        for q in [
+            "CREATE ROLE r LOGIN PASSWORD $1",
+            "ALTER ROLE r WITH PASSWORD $1",
+            "ALTER USER u PASSWORD $1",
+            "DROP ROLE r",
+            "GRANT SELECT ON crm.customers TO r",
+        ] {
+            let analysis = analyze_pss(q, false);
+            let deltas = vec![StatementDelta {
+                user: "alice",
+                database: "shop",
+                analysis: &analysis,
+                calls: 1,
+                rows: 0,
+            }];
+            let ev = pss_events(&deltas, &mut own(), &Catalogs::default(), t0, t0);
+            assert_eq!(ev.len(), 1, "{q}");
+            assert_eq!(ev[0].action(), EventAction::Dcl, "{q}");
+        }
+    }
 }
