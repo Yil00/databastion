@@ -2,7 +2,7 @@
 
 How to install the console and an agent, enroll the agent, declare targets, give the agent least-privilege accounts, and read findings and incidents. This page only describes what the code on `dev` does; the component READMEs linked below hold the full reference.
 
-> **Status.** v0.1.0 is being prepared (ROADMAP [phase 7](ROADMAP.md#phase-7--hardening--v010-release)). The "installation in under 15 minutes" goal and the 72 h stability test are not done yet, and the load tests are in progress. Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+> **Status.** v0.1.0 is being prepared (ROADMAP [phase 7](ROADMAP.md#phase-7--hardening--v010-release)). No release has been published yet: the first pre-release is `0.1.0-rc.1`. The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is not done yet. Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
 
 ## 1. What you deploy
 | Component | Where | Network |
@@ -13,35 +13,34 @@ How to install the console and an agent, enroll the agent, declare targets, give
 The agent is the only client of the console's agent API. Database credentials stay in the agent's configuration on its host (I3); the console only receives locations, masked samples and keyed fingerprints (I2). Architecture: [02-architecture.md](02-architecture.md). Security model: [05-security.md](05-security.md).
 
 ## 2. Get the images
-The console and agent images are built from [console/Dockerfile](../console/Dockerfile) and [agent/Dockerfile](../agent/Dockerfile). Published tags (`X.Y.Z`, `X.Y.Z-rc.N`…, no `v` prefix) are on GHCR as `ghcr.io/yil00/databastion-console` and `ghcr.io/yil00/databastion-agent`, signed with cosign: verify them as described in [SECURITY.md](../SECURITY.md#verifying-release-artifacts) and pin the digest. Use the same version for the console and the agents ([RELEASE.md](../RELEASE.md#2-versions)).
+The step-by-step installation, with the commands, is in [deploy/README.md](../deploy/README.md); this guide does not repeat it. Each release publishes, from [publish.yml](../.github/workflows/publish.yml) only:
+- the console and agent images, `ghcr.io/yil00/databastion-console` and `ghcr.io/yil00/databastion-agent` (amd64, arm64, distroless, non-root), with an SBOM and a provenance attestation;
+- on the GitHub release: the agent package `databastion-agent_<version>_<arch>.deb` (amd64, arm64), the deployment files `databastion-deploy-<version>.tar.gz`, `image-digests.txt`, and a `SHA256SUMS` list with its cosign bundle.
 
-Until a tag is published, build the images from a checkout:
+Tags are `X.Y.Z` or `X.Y.Z-rc.N`, without a `v` prefix. Use the same version for the console and the agents ([RELEASE.md](../RELEASE.md#2-versions)).
+
+**Verify before installing.** Everything is signed with cosign in keyless mode, only in the run of `publish.yml` triggered by the push of the release tag ([ADR-0034](adr/0034-release-signing-from-tag-push.md)). Check the certificate identity exactly, never with a pattern:
+
+```
+--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/<version>"
+--certificate-oidc-issuer https://token.actions.githubusercontent.com
+--certificate-github-workflow-trigger push
+```
+
+Verify `SHA256SUMS` with `cosign verify-blob`, every downloaded file against it, and each image of `image-digests.txt` with `cosign verify`, as in [deploy/README.md, "Verify the artifacts"](../deploy/README.md#verify-the-artifacts) (also [SECURITY.md](../SECURITY.md#verifying-release-artifacts)). Then deploy the images **by digest**, never by a bare tag.
+
+Until a release is published, build the images from a checkout (and the `.deb` as in [deploy/README.md](../deploy/README.md#building-the-deb)):
 ```sh
 docker build -t databastion-console:local console/
 docker build -t databastion-agent:local agent/
 ```
 
-<!-- TODO(packaging): the agent .deb package + systemd unit and the release console image are in the
-     packaging PR (feat/p7-packaging). When it merges, replace this comment with "See deploy/README.md"
-     and link it here and in section 4. -->
-The `.deb` package of the agent (with a systemd unit) is not available yet.
-
 ## 3. Install the console
-The reference is [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml), with [deploy/initdb/](../deploy/initdb/10-databastion-roles.sh). Every console setting is described in [console/README.md](../console/README.md#configuration).
+Follow [deploy/README.md, "Console"](../deploy/README.md#1-console). In short: extract the verified deployment bundle, copy [docker-compose.example.yml](../deploy/docker-compose.example.yml) to `compose.yaml` and [.env.example](../deploy/.env.example) to `.env`, set in `.env` the console image **with its digest** (the console line of `image-digests.txt`), the console's DNS name (`DATABASTION_DOMAIN`) and the TLS mode (`DATABASTION_TLS`: an e-mail address for a Let's Encrypt certificate, or `internal` for Caddy's own CA, which the agents then pin), generate the secrets with `./init-secrets.sh`, start with `docker compose --profile proxy up -d`, and create the first administrator once with `docker compose run --rm bootstrap-admin` (there is no default account; the command refuses to run once a user exists; delete `secrets/admin_password` afterwards). Every console setting is described in [console/README.md](../console/README.md#configuration); the three database roles in [console/README.md](../console/README.md#database-roles).
 
-1. **Copy** `docker-compose.example.yml` and the `initdb/` directory to the console host. Set the console image tag (`x-console-image`) to the version you verified.
-2. **Create the secret files** in `./secrets/` (mode `0600`), as listed at the end of the compose file: `db_password` (bootstrap superuser, used only by the initdb script), `db_owner_password` and `db_owner_url` (owner role, used only by `migrate`), `db_app_password` and `db_url` (runtime role of `web` and `worker`), `encryption_key` and `metrics_token` (`openssl rand -base64 32` each). The three database roles are explained in [console/README.md](../console/README.md#database-roles).
-3. **Set `DATABASTION_PUBLIC_URL`** to the public HTTPS origin of the console, in both the `console` and `worker` services.
-4. **Put an HTTPS reverse proxy** in front of `127.0.0.1:8080`. Keep `DATABASTION_TRUST_PROXY: "1"` only if that proxy sets or overwrites `X-Forwarded-For`. The proxy must not log the `Authorization`, `Cookie` or `X-CSRF-Token` headers ([05-security.md](05-security.md#deployment-recommendations)). Session cookies are `Secure`: the UI is not usable over plain HTTP.
-5. **Start**: `docker compose up -d`. `migrate` applies the database migrations and exits; `console` and `worker` start after it.
-6. **Create the first administrator** (there is no default account), once:
-   ```sh
-   docker compose run --rm -e DATABASTION_BOOTSTRAP_ADMIN_USERNAME=admin \
-     -e DATABASTION_BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/admin_password \
-     console bootstrap-admin
-   ```
-   with an `admin_password` secret (12 to 1024 characters) added for that run and removed afterwards ([console/README.md](../console/README.md#first-administrator)). The command refuses to run once a user exists.
-7. **Check**: `GET /api/health/ready` answers `200`, and you can sign in.
+The bundled Caddy proxy (`proxy` profile) is the only published port. To use your own HTTPS reverse proxy instead, add [docker-compose.own-proxy.example.yml](../deploy/docker-compose.own-proxy.example.yml), which publishes the console on `127.0.0.1:8080`, as described in deploy/README.md. Keep `DATABASTION_TRUST_PROXY: "1"` only if that proxy is the single hop and sets or overwrites `X-Forwarded-For`. The proxy must not log the `Authorization`, `Cookie` or `X-CSRF-Token` headers ([05-security.md](05-security.md#deployment-recommendations)). Session cookies are `Secure`: the UI is not usable over plain HTTP.
+
+Check: `GET /api/health/ready` answers `200`, and you can sign in. `secrets/encryption_key` protects the secrets the console stores: keep a copy offline.
 
 Notes:
 - 0.1 has one user role in practice: the bootstrap administrator. There is no user-management page or API yet; the `analyst` role exists in the schema but no account can be created with it from the console.
@@ -50,27 +49,26 @@ Notes:
 - Plan the internal database's `max_connections` from the sizing in [console/README.md](../console/README.md#docker-image).
 
 ## 4. Install an agent
-Deploy the agent on the host or network of the databases it monitors, not next to the console. With the image:
+Deploy the agent on the host or network of the databases it monitors, not next to the console. Two ways:
 
-| Mount | Content |
-|-------|---------|
-| `/etc/databastion/agent.yaml` (read-only) | Configuration: console URL, limits, targets |
-| `/var/lib/databastion` (volume, `0700`, owned by uid 10001) | Identity, local HMAC key, spool |
-| Secret files referenced by `agent.yaml` (read-only, `0600`, owned by uid 10001) | Database passwords |
-| Log directories of the targets (read-only), for file-based Audit sources | e.g. the pgaudit or `server_audit` log |
+- **`.deb` package** (Debian 12, Ubuntu 24.04, amd64 or arm64, with systemd), the documented path on a database host: [deploy/README.md, "Agent (`.deb`)"](../deploy/README.md#2-agent-deb). The package creates the `databastion` system user, installs `/etc/databastion/agent.yaml` and a hardened `databastion-agent` service (no capability, read-only system, `bind()` / `listen()` / `accept()` refused by the system-call filter), neither enabled nor started before enrollment. Paths, modes and service customization (group access to audit log files, sockets under `/tmp`, proxy): [deploy/README.md, "Agent package reference"](../deploy/README.md#agent-package-reference).
+- **Image**, for container hosts: [agent-compose.example.yml](../deploy/agent-compose.example.yml), copied to the agent host, image pinned by version and digest. Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-privileges` ([agent/README.md](../agent/README.md#docker-image)). The image has no health check because the agent has no listener: its health is shown by the console (agent status, `databastion_agent_up`).
 
-The commented agent block at the end of the deployment example currently uses the `:latest` tag and keeps the enrollment token in its `secrets`. This is a known issue, to be fixed in `deploy/`. Until then, pin the image by a verified digest ([SECURITY.md](../SECURITY.md#verifying-release-artifacts)) and remove the token secret once the agent is enrolled.
-
-Run it as uid/gid 10001, with `read_only: true`, `cap_drop: ALL` and `no-new-privileges` ([agent/README.md](../agent/README.md#docker-image)). The image has no health check because the agent has no listener: its health is shown by the console (agent status, `databastion_agent_up`).
+| Path | Content |
+|------|---------|
+| `/etc/databastion/agent.yaml` (read-only for the agent) | Configuration: console URL, limits, targets |
+| `/var/lib/databastion` (`0700`, owned by the agent user) | Identity, local HMAC key, spool, audit cursors |
+| Secret files referenced by `agent.yaml` (`0600`, owned by the agent user) | Database passwords |
+| Log files of the targets (read access through a group, never ownership), for file-based Audit sources | e.g. the pgaudit or `server_audit` log |
 
 **`agent.yaml`**: start from [agent/agent.example.yaml](../agent/agent.example.yaml). Unknown keys are rejected. The main settings:
 - `console.url`: the console's public HTTPS URL. `console.ca_file` pins a private CA (it then is the only trusted root). TLS 1.3 minimum. `HTTPS_PROXY` / `NO_PROXY` are honored.
 - `state_dir`: a directory owned by the agent user, not group- or world-writable.
 - `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval), and `discovery_duty_cycle_percent`, the Discovery pacing (see [section 9](#9-discovery-scans-and-findings)).
-- `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority: findings and events can each grow to 3/4 of the bounds, so each keeps at least 1/4 (an events flood can evict findings down to that quarter); batches with a `signature.*` signal go last; otherwise the oldest first. and the console raises an `agent.batches_dropped` alert.
+- `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority: findings and events can each grow to 3/4 of the bounds, so each keeps at least 1/4 (an events flood can evict findings down to that quarter); batches with a `signature.*` signal go last; otherwise the oldest first; the console raises an `agent.batches_dropped` alert.
 - `targets`: see [section 6](#6-declare-targets).
 
-Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the console's. Logs are JSON on stdout; `DATABASTION_LOG` sets the level.
+Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the console's. Logs are JSON on stdout (with the `.deb`, `journalctl -u databastion-agent`); `DATABASTION_LOG` sets the level.
 
 ## 5. Enroll the agent
 1. In the console, **Enrollment tokens** (administrator): create a token. The `dbe_…` token is shown **once**; it is single-use and valid 24 h.
@@ -83,8 +81,8 @@ Keep the agent host's clock in sync (NTP): it must stay within 5 minutes of the 
    ```sh
    databastion-agent enroll --config /etc/databastion/agent.yaml --token-file /path/to/token
    ```
-   With the image, run the same subcommand in a one-shot container with the mounts of section 4 plus the token file, e.g. `docker compose run --rm agent enroll --config /etc/databastion/agent.yaml --token-file /run/secrets/enrollment_token`. `DATABASTION_ENROLLMENT_TOKEN_FILE` can replace `--token-file`.
-4. Delete the token file, then start the agent: `databastion-agent run --config /etc/databastion/agent.yaml` (the image's default command).
+   With the `.deb`, run it as the service's user, so that the identity it writes is owned by that account: `sudo runuser -u databastion -- databastion-agent enroll …` ([deploy/README.md](../deploy/README.md#2-agent-deb)). With the image, use the one-shot `agent-enroll` service of [agent-compose.example.yml](../deploy/agent-compose.example.yml): `docker compose --profile enroll run --rm agent-enroll`. `DATABASTION_ENROLLMENT_TOKEN_FILE` can replace `--token-file`.
+4. Delete the token file, then start the agent: `sudo systemctl enable --now databastion-agent` with the `.deb`, `docker compose up -d agent` with the image, or `databastion-agent run --config /etc/databastion/agent.yaml` by hand.
 5. The agent appears under **Agents** as `online`, with its targets, their reachability and their audit level.
 
 Enrollment stores the agent identity (`identity.json`) and generates the local HMAC key (`hmac.key`) in `state_dir`, both `0600`; the HMAC key never leaves the host. Protocol details: [09-agent-protocol.md](09-agent-protocol.md#enrollment).
@@ -160,7 +158,7 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 - **Notifications** (administrator): e-mail (SMTP with STARTTLS or TLS) and HMAC-signed webhook (`https://` only) channels, with a test button. Webhook receivers must escape the names they render, because a database account name is chosen by the client ([console/README.md](../console/README.md#alerting)). Channels flagged for system alerts also receive the console's own alerts: silent agent, agent integrity, dropped batches, stopped Audit stream, within an hourly budget per channel.
 
 ## 12. Upgrading
-Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment).
+Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
 
 ## 13. Reporting a problem
 Bugs: GitHub issues. Vulnerabilities: never in a public issue, see [SECURITY.md](../SECURITY.md).

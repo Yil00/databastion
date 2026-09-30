@@ -1,6 +1,6 @@
 # ADR-0034: Release artifacts are signed only in the tag-push run of publish.yml
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-09-30
 
 ## Context
