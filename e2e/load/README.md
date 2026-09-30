@@ -25,9 +25,9 @@ and no secret, but on a runner for about 30 minutes). Before redaction, the run 
 results for every generated secret (with a canary as positive control, as `e2e/run.sh`); a hit is
 logged as `LEAK:` and fails the run. The raw pgbench / sysbench summaries go to the logs only.
 
-**Status (CI load job on commit `b4aa999`, 2026-09-30): every check passes.** Discovery impact
-while a scan runs: 0.30 % on MariaDB, 0.28 % on MongoDB, about 0 % on PostgreSQL. Audit:
-`events_accounted` exactly 1 (nothing lost, nothing counted twice). Agent peak RSS: 41 MiB.
+**Status (CI load job on commit `d04bbf6`, the final head of PR #93, 2026-09-30): every check passes.** Discovery impact
+while a scan runs: 0.32 % on MariaDB, 0.27 % on MongoDB, 0.05 % on PostgreSQL. Audit:
+`events_accounted` exactly 1 (nothing lost, nothing counted twice). Agent peak RSS: 40.7 MiB.
 
 The first local runs (2026-09-30, `LOAD_PG_AUDIT=pss`) had two failing checks, both findings about
 the agent rather than harness defects, fixed since then (PR 93):
