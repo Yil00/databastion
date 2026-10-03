@@ -118,6 +118,8 @@ jobs:
 
       # The only step that holds RELEASE_TOKEN: as GITHUB_TOKEN for release-it's GitHub release, and
       # as a git credential set for this step's pushes and removed when it ends, even on failure.
+      # Keep it the job's last step: a step added after it must not run while the credential may
+      # still be in .git/config (or must unset it explicitly first).
       - name: release-it
         id: release
         env:
