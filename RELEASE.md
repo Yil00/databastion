@@ -85,7 +85,7 @@ All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifac
 1. On `dev`, CI is green and the ROADMAP is up to date.
 2. (Optional) Create an `X.Y.Z-rc.N` tag on `dev` to test the candidate images.
 3. Open a `dev` → `main` PR titled `release: X.Y.Z`.
-   Before merging, check the version release-it will compute: a `feat` commit since the last tag gives a minor version (`0.1.0` → `0.2.0`), only `fix` commits a patch version. Title the PR with that version (0.2.0 was planned as 0.1.1; automating the check is ROADMAP item (k)).
+   release-it computes the version from the commits since the last tag: a `feat` commit gives a minor version (`0.1.0` → `0.2.0`), only `fix` commits a patch version. The "Release version" PR check (`pr-checks.yml`, PRs to `main` only) runs release-it on the PR merge commit, shows the version in the run summary and fails until the title is exactly `release: X.Y.Z` with that version, or carries `[skip-release]` (0.2.0 was planned as 0.1.1 before this check).
 4. On merge (the push of the merge commit to `main`), the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)) waits for the maintainer's approval of the `release-it` environment, then:
    - computes the version from the commits and the latest tag,
    - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json` + `package-lock.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, `agent/fuzz/Cargo.lock` since #112, later the Helm chart),

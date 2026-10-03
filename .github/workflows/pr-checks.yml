@@ -56,3 +56,53 @@ jobs:
             fi
           done
           exit $fail
+
+  # PRs to main only: shows the version release.yml will compute when the PR is merged, and fails
+  # when the title does not name it. release-it derives the version from the commits since the
+  # latest tag (a `feat` commit gives a minor version, only `fix` commits a patch version), so a
+  # title written by hand can be wrong: 0.2.0 was planned as 0.1.1 (ROADMAP v0.1.x item (k)).
+  # No token: the GitHub release step is turned off and nothing is pushed.
+  # Advisory only: the PR's own code runs here (.release-it.json hooks, npm ci), so keep the
+  # `pull_request` trigger and no secrets, and never feed this result to a privileged workflow.
+  release-version:
+    name: Release version
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The PR merge commit (refs/pull/N/merge): what main will look like after the merge.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Version release-it will compute
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          git fetch --force --tags --quiet origin
+          # release-it requires the branch main (.release-it.json); a local branch at the merge commit.
+          git checkout --quiet -B main
+          version="$(npx release-it --ci --release-version --no-github.release --no-git.requireUpstream)"
+          # The whole output must be one version: nothing else reaches the summary or a workflow command.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release-it did not print a single version (raw output in the log above)."
+            printf '%q\n' "$version"
+            exit 1
+          fi
+          echo "### Release version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+          case "$TITLE" in
+            *"[skip-release]"*)
+              echo "::notice::[skip-release] in the title: no release (it would be $version)."
+              exit 0 ;;
+          esac
+          expected="release: $version"
+          if [ "$TITLE" != "$expected" ]; then
+            echo "::error::Merging this PR releases $version: title it \"$expected\", or add [skip-release] to the title to merge without a release (RELEASE.md, section 5)."
+            exit 1
+          fi
+          echo "::notice::Merging this PR releases $version."

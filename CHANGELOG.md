@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 👷 CI
+- "Release version" PR check on PRs to `main`: shows the version release-it will compute and fails until the title is `release: X.Y.Z` with that version (or carries `[skip-release]`)
+
 ### 🔒 Security
 - Release tooling: `basic-ftp` forced to 6.2.1 under `release-it` (GHSA-c475-qrg2-pj4r, a denial of service in its directory-listing parser; release-it never uses FTP), which turns the "Release tooling advisories" check green
 
