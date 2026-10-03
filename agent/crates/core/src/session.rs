@@ -275,13 +275,13 @@ impl Session {
     fn pending_or_create(&self, job_id: Option<Uuid>) -> Result<Pending, CallError> {
         let mut creds = self.lock();
         if let Some(s1) = creds.identity.pending.clone() {
-            if let Some(id) = job_id {
-                if !creds.identity.rotation_jobs.contains(&id) {
-                    let mut next = creds.identity.clone();
-                    push_bounded(&mut next.rotation_jobs, id);
-                    self.state.save_identity(&next)?;
-                    creds.identity = next;
-                }
+            if let Some(id) = job_id
+                && !creds.identity.rotation_jobs.contains(&id)
+            {
+                let mut next = creds.identity.clone();
+                push_bounded(&mut next.rotation_jobs, id);
+                self.state.save_identity(&next)?;
+                creds.identity = next;
             }
             return Ok(Pending::Use(s1));
         }
@@ -343,10 +343,10 @@ impl Session {
             Pending::AlreadyDone => return Ok(RotateOutcome::AlreadyDone),
             Pending::Deferred => return Ok(RotateOutcome::Deferred),
         };
-        if let (true, Some(body)) = (pending_before, probe) {
-            if self.probe_pending(&s1, body).await? {
-                return Ok(RotateOutcome::AlreadyDone);
-            }
+        if let (true, Some(body)) = (pending_before, probe)
+            && self.probe_pending(&s1, body).await?
+        {
+            return Ok(RotateOutcome::AlreadyDone);
         }
         let (agent_id, s0) = {
             let mut creds = self.lock();

@@ -478,10 +478,10 @@ where
             break;
         }
     }
-    if let Some(s) = slot {
-        if !s.is_broken() {
-            s.close().await;
-        }
+    if let Some(s) = slot
+        && !s.is_broken()
+    {
+        s.close().await;
     }
     tracing::info!(
         target_id = %target.id,

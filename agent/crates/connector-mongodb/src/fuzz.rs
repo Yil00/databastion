@@ -54,10 +54,10 @@ pub fn op_msg(data: &[u8]) {
     let response_to = i32::from_le_bytes([head[8], head[9], head[10], head[11]]);
     // The payload is parsed whatever the header check says.
     let _ = wire::check_header(head, response_to);
-    if let Ok((from, to)) = wire::parse(payload) {
-        if let Some(body) = payload.get(from..to) {
-            bson(body);
-        }
+    if let Ok((from, to)) = wire::parse(payload)
+        && let Some(body) = payload.get(from..to)
+    {
+        bson(body);
     }
 }
 

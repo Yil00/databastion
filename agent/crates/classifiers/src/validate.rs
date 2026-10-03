@@ -20,7 +20,7 @@ pub fn luhn_valid(digits: &str) -> bool {
         }
         sum += d;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Whether a card number (ASCII digits) has a plausible length and a known
@@ -243,7 +243,7 @@ pub fn birth_date_valid(year: u32, month: u32, day: u32) -> bool {
     if !(1900..=2030).contains(&year) || !(1..=12).contains(&month) || day == 0 {
         return false;
     }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let max = match month {
         2 if leap => 29,
         2 => 28,

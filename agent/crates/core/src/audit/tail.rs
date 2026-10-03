@@ -715,16 +715,16 @@ impl Tailer {
                     && (file.read_exact_at(&mut now, self.offset - n).is_err()
                         || *now != *self.tail)
             };
-            if let Ok(meta) = file.metadata() {
-                if meta.len() < self.offset || rewritten {
-                    self.rotations += 1;
-                    tracing::warn!("audit log truncated; reading from its start");
-                    file.seek(SeekFrom::Start(0))
-                        .map_err(|e| TailError::Unreadable(e.kind()))?;
-                    self.offset = 0;
-                    self.tail.clear();
-                    self.splitter.reset();
-                }
+            if let Ok(meta) = file.metadata()
+                && (meta.len() < self.offset || rewritten)
+            {
+                self.rotations += 1;
+                tracing::warn!("audit log truncated; reading from its start");
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|e| TailError::Unreadable(e.kind()))?;
+                self.offset = 0;
+                self.tail.clear();
+                self.splitter.reset();
             }
             let mut eof = false;
             while read_total < MAX_POLL_BYTES {
@@ -805,23 +805,23 @@ impl Tailer {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        if let Some(mut c) = self.load_cursor() {
-            if let Some(r) = c.replay.take() {
-                c.offset = r.end;
-                // The fingerprint of the end becomes that of the offset
-                // (an empty one, never matching, if it was missing).
-                let end_fp = c.end_fp.take();
-                if c.fp.is_some() || end_fp.is_some() {
-                    c.fp = Some(end_fp.unwrap_or_default());
-                }
-                match serde_json::to_vec(&c) {
-                    Ok(bytes) => {
-                        if let Err(e) = store.save(&bytes) {
-                            tracing::warn!(error = %e, "audit cursor not saved");
-                        }
+        if let Some(mut c) = self.load_cursor()
+            && let Some(r) = c.replay.take()
+        {
+            c.offset = r.end;
+            // The fingerprint of the end becomes that of the offset
+            // (an empty one, never matching, if it was missing).
+            let end_fp = c.end_fp.take();
+            if c.fp.is_some() || end_fp.is_some() {
+                c.fp = Some(end_fp.unwrap_or_default());
+            }
+            match serde_json::to_vec(&c) {
+                Ok(bytes) => {
+                    if let Err(e) = store.save(&bytes) {
+                        tracing::warn!(error = %e, "audit cursor not saved");
                     }
-                    Err(_) => tracing::warn!("audit cursor not saved"),
                 }
+                Err(_) => tracing::warn!("audit cursor not saved"),
             }
         }
     }

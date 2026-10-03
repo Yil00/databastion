@@ -369,10 +369,10 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
             continue;
         }
         // Inside a `mod tests` (compiled under `#[cfg(test)]`).
-        if let Some(tests_at) = code_lines(&text).position(|l| l.trim() == "mod tests {") {
-            if calls.iter().all(|i| *i > tests_at) {
-                continue;
-            }
+        if let Some(tests_at) = code_lines(&text).position(|l| l.trim() == "mod tests {")
+            && calls.iter().all(|i| *i > tests_at)
+        {
+            continue;
         }
         assert!(
             TEST_ONLY.iter().any(|t| shown.contains(t)),

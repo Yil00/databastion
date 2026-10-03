@@ -285,14 +285,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             tracing::warn!("the server reports an anonymous identity after the bind");
             return Err(refused);
         };
-        if let Auth::External { expect } = auth {
-            if dn::canon(&identity) != dn::canon(expect) {
-                tracing::warn!(
-                    "the SASL EXTERNAL identity is not the configured account: check the \
+        if let Auth::External { expect } = auth
+            && dn::canon(&identity) != dn::canon(expect)
+        {
+            tracing::warn!(
+                "the SASL EXTERNAL identity is not the configured account: check the \
                      olcAuthzRegexp mapping of the agent's uid"
-                );
-                return Err(refused);
-            }
+            );
+            return Err(refused);
         }
         s.identity = identity;
         Ok(s)
