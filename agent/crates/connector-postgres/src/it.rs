@@ -1576,7 +1576,16 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         .await
         .unwrap()
         .get(0);
-    let log_rows = log_rows && rows_on.is_some_and(|v| v.eq_ignore_ascii_case("on"));
+    // The dev, e2e and load images set it on: where pgaudit defines it, it must be on, so that a
+    // lost setting fails here instead of switching this test to its Partial branch unnoticed.
+    if log_rows {
+        assert!(
+            rows_on
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("on")),
+            "pgaudit.log_rows must be on in the dev image (got {rows_on:?})"
+        );
+    }
     let expected_level = if log_rows {
         AuditLevel::Full
     } else {
@@ -1584,7 +1593,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
     };
     if !log_rows {
         eprintln!(
-            "pgaudit.log_rows: off or not defined by this server's pgaudit (before 1.6, \
+            "pgaudit.log_rows: not defined by this server's pgaudit (before 1.6, \
              PostgreSQL 13): row counts and volume.large_result checked absent, and \
              the level checked Partial instead of Full (ADR-0037)"
         );

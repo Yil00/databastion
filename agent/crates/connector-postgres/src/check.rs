@@ -118,6 +118,11 @@ pub(crate) fn pgaudit_rows_on(library: bool, defined: bool, value: Option<&str>)
 }
 
 impl AuditProbe {
+    /// pgaudit is loaded and logs reads in this database, but its records carry no row count.
+    pub(crate) fn reads_without_row_counts(&self) -> bool {
+        self.pgaudit_loaded == Some(true) && self.pgaudit_reads && !self.pgaudit_rows
+    }
+
     /// Level proven in this database; `log_readable`: the configured audit
     /// log can be read by the agent.
     ///
@@ -516,6 +521,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         notes.push("the configured audit log is not readable by the agent".to_owned());
         codes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
     }
+    // ADR-0037 decision 4: a monitored database whose pgaudit logs reads without row counts caps
+    // the target at Partial, whatever the other databases reach.
+    let mut rows_gap = false;
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
             Ok(s) => s,
@@ -536,6 +544,14 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             Err(e) => return unreachable(&e),
         };
         level = level.max(probe.level(log_readable));
+        if probe.reads_without_row_counts() {
+            rows_gap = true;
+            notes.push(format!(
+                "database {}: pgaudit logs reads without row counts, the target is capped at \
+                 Partial",
+                normalize(database).as_str()
+            ));
+        }
         let (text, probe_codes) = probe_notes(&probe, settings.audit_log.is_some());
         notes.extend(text);
         codes.extend(probe_codes);
@@ -561,6 +577,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             report_notes(&r, &mut codes);
         }
     }
+    level = capped_without_row_counts(level, rows_gap);
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
         // ADR-0015 decision 4: Full once the log is actually read.
         level = AuditLevel::Partial;
@@ -624,7 +641,7 @@ fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<Ta
         text.push("pgaudit.log does not include the read class".to_owned());
         codes.push(TargetNote::new(NoteCode::AuditPgauditReadClassMissing));
     }
-    if probe.pgaudit_loaded == Some(true) && probe.pgaudit_reads && !probe.pgaudit_rows {
+    if probe.reads_without_row_counts() {
         // Local detail only: the registered `audit.log_without_row_counts`
         // note does not list PostgreSQL (ADR-0037).
         text.push(
@@ -634,6 +651,16 @@ fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<Ta
         );
     }
     (text, codes)
+}
+
+/// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
+/// also logs their row counts.
+fn capped_without_row_counts(level: AuditLevel, rows_gap: bool) -> AuditLevel {
+    if level == AuditLevel::Full && rows_gap {
+        AuditLevel::Partial
+    } else {
+        level
+    }
 }
 
 fn summary(r: &Report) -> Vec<String> {
@@ -1437,6 +1464,18 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn one_database_without_row_counts_caps_the_target() {
+        use AuditLevel::*;
+        for level in [None, Limited, Partial, Full] {
+            assert_eq!(capped_without_row_counts(level, false), level);
+        }
+        assert_eq!(capped_without_row_counts(Full, true), Partial);
+        for level in [None, Limited, Partial] {
+            assert_eq!(capped_without_row_counts(level, true), level);
         }
     }
 
