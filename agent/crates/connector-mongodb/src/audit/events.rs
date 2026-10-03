@@ -378,22 +378,22 @@ impl EventBuilder {
         }
         let mut e = MaskedEvent::new(source, action, principal, ts);
         let collection = r.ns.as_ref().and_then(|(_, c)| c.as_deref());
-        if action != EventAction::Dcl {
-            if let Some((db, coll)) = &r.ns {
-                let object = coll
-                    .as_deref()
-                    .map_or_else(NormalizedName::wildcard, normalize_collection);
-                e = e.with_object(EventObject::new(normalize_database(db), None, object));
-            }
+        if action != EventAction::Dcl
+            && let Some((db, coll)) = &r.ns
+        {
+            let object = coll
+                .as_deref()
+                .map_or_else(NormalizedName::wildcard, normalize_collection);
+            e = e.with_object(EventObject::new(normalize_database(db), None, object));
         }
         if matches!(action, EventAction::Read | EventAction::Write) {
             e = e.with_rows(r.rows);
         }
         if action == EventAction::Read && collection.is_some() {
-            if cmd.returns_documents() {
-                if let Some(tool) = r.app.as_deref().and_then(dump_tool) {
-                    e = e.with_signal(tool);
-                }
+            if cmd.returns_documents()
+                && let Some(tool) = r.app.as_deref().and_then(dump_tool)
+            {
+                e = e.with_signal(tool);
             }
             if whole_read(cmd, &r.shape, r.origin.as_ref()) {
                 e = e.with_signal(Signal::FullTableRead);

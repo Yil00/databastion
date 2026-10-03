@@ -469,10 +469,10 @@ async fn close_file(
 
 /// Removes the saved `performance_schema` cursor.
 fn forget_ps_cursor(cfg: &AuditConfig) {
-    if let Some(store) = cfg.cursor(pfs::CURSOR) {
-        if let Err(e) = store.remove() {
-            tracing::warn!(error = %e, "performance_schema cursor not removed");
-        }
+    if let Some(store) = cfg.cursor(pfs::CURSOR)
+        && let Err(e) = store.remove()
+    {
+        tracing::warn!(error = %e, "performance_schema cursor not removed");
     }
 }
 

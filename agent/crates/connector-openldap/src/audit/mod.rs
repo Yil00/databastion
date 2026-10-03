@@ -171,10 +171,10 @@ impl Position {
         let window: Vec<&String> = self.seen.range(bound.clone()..).collect();
         let cut = window.len().saturating_sub(MAX_PERSISTED_SEEN);
         let mut floor = self.floor.clone().filter(|f| *f >= bound);
-        if let Some(newest_left_out) = cut.checked_sub(1).and_then(|i| window.get(i)) {
-            if floor.as_ref().is_none_or(|f| *newest_left_out > f) {
-                floor = Some((*newest_left_out).clone());
-            }
+        if let Some(newest_left_out) = cut.checked_sub(1).and_then(|i| window.get(i))
+            && floor.as_ref().is_none_or(|f| *newest_left_out > f)
+        {
+            floor = Some((*newest_left_out).clone());
         }
         let mut out = format!("{FORMAT_V2}\ncursor {cursor}\n");
         if let Some(f) = floor {
@@ -451,10 +451,10 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         let mut fresh = Vec::with_capacity(polled.records.len());
         let mut proven: HashSet<String> = HashSet::new();
         let save = |position: &Position| {
-            if let (Some(store), Some(c)) = (store, position.encode()) {
-                if let Err(e) = store.save(c.as_bytes()) {
-                    tracing::warn!(target_id = %target.id, error = %e, "audit cursor not saved");
-                }
+            if let (Some(store), Some(c)) = (store, position.encode())
+                && let Err(e) = store.save(c.as_bytes())
+            {
+                tracing::warn!(target_id = %target.id, error = %e, "audit cursor not saved");
             }
         };
         for r in polled.records {
@@ -477,17 +477,17 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
                 save(position);
                 continue;
             }
-            if r.op == Op::Search {
-                if let Some(c) = builder_context(builder, &r) {
-                    // Proof of logged reads: a search that succeeded (or
-                    // returned entries); a failed one that returned
-                    // entries proves failures are logged too.
-                    if r.result == 0 || r.entries.is_some_and(|n| n > 0) {
-                        proven.insert(c.clone());
-                    }
-                    if r.result != 0 && r.entries.is_some_and(|n| n > 0) {
-                        state.note_failures_logged(&target.id, &c, true);
-                    }
+            if r.op == Op::Search
+                && let Some(c) = builder_context(builder, &r)
+            {
+                // Proof of logged reads: a search that succeeded (or
+                // returned entries); a failed one that returned
+                // entries proves failures are logged too.
+                if r.result == 0 || r.entries.is_some_and(|n| n > 0) {
+                    proven.insert(c.clone());
+                }
+                if r.result != 0 && r.entries.is_some_and(|n| n > 0) {
+                    state.note_failures_logged(&target.id, &c, true);
                 }
             }
             if position.isolate_left > 0 {

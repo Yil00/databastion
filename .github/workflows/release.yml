@@ -89,13 +89,13 @@ jobs:
 
       - run: npm ci --ignore-scripts
 
-      # Pinned (the workspace's rust-version): the release commit's Cargo.lock does not depend on
-      # whichever stable release the runner gets.
+      # Pinned (the workspace's rust-version, built by the "Agent MSRV" job of ci.yml): the release
+      # commit's Cargo.lock does not depend on whichever stable release the runner gets.
       - name: Rust (to update agent/Cargo.lock)
         if: hashFiles('agent/Cargo.lock') != ''
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.85.0
+          toolchain: 1.88.0
 
       # bump-version.mjs runs `cargo update --workspace --offline` to rewrite the workspace crate
       # versions in agent/Cargo.lock: the registry must be in the local cache first (a fresh runner

@@ -17,7 +17,9 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+# The real minimum (let-chains in the classifiers, and `regress` 0.12 through the protocol crate,
+# need 1.88), checked by the "Agent MSRV" CI job; release.yml pins the same toolchain.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/Yil00/databastion"
 publish = false

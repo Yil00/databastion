@@ -126,10 +126,10 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         // An idle session is closed before a long pause rather than kept
         // open through it (L6 of the #93 security review; it would be
         // stale after it anyway).
-        if job.pacer().debt() >= crate::conn::STALE_AFTER {
-            if let Some(s) = session.take() {
-                s.close().await;
-            }
+        if job.pacer().debt() >= crate::conn::STALE_AFTER
+            && let Some(s) = session.take()
+        {
+            s.close().await;
         }
         // The pause the previous tables owe, before the session is
         // checked for staleness and reused or reopened.

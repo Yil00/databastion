@@ -462,16 +462,16 @@ impl Aggregator {
             .filter_map(|k| self.groups.get(k).map(|e| (k, e.aggregated_count())))
             .min_by_key(|(_, n)| *n)
             .map(|(k, n)| (k.clone(), n));
-        if let Some((demoted, n)) = smallest {
-            if count > n {
-                self.named.remove(&demoted);
-                if let Some(e) = self.groups.remove(&demoted) {
-                    self.add_to_overflow(&e);
-                }
-                if let Some((_, e)) = self.folded.remove(&key) {
-                    self.named.insert(key.clone());
-                    self.insert(key, e);
-                }
+        if let Some((demoted, n)) = smallest
+            && count > n
+        {
+            self.named.remove(&demoted);
+            if let Some(e) = self.groups.remove(&demoted) {
+                self.add_to_overflow(&e);
+            }
+            if let Some((_, e)) = self.folded.remove(&key) {
+                self.named.insert(key.clone());
+                self.insert(key, e);
             }
         }
     }

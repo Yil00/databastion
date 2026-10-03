@@ -402,11 +402,11 @@ fn walk_schema(
                 }
                 sub => walk_schema(sub, &child_pointer, visit),
             }
-        } else if SCHEMA_ARRAY_KEYWORDS.contains(&key) {
-            if let Value::Array(items) = child {
-                for (i, sub) in items.iter_mut().enumerate() {
-                    walk_schema(sub, &format!("{child_pointer}/{i}"), visit);
-                }
+        } else if SCHEMA_ARRAY_KEYWORDS.contains(&key)
+            && let Value::Array(items) = child
+        {
+            for (i, sub) in items.iter_mut().enumerate() {
+                walk_schema(sub, &format!("{child_pointer}/{i}"), visit);
             }
         }
     }
@@ -459,11 +459,11 @@ fn wrap_pattern(map: &mut Map<String, Value>, pointer: &str, rewritten: &mut Vec
 /// any value, e.g. `shell.exec`. A one-value `enum` becomes a one-variant
 /// Rust enum, which serde enforces.
 fn const_to_enum(map: &mut Map<String, Value>, pointer: &str, rewritten: &mut Vec<String>) {
-    if !map.contains_key("enum") {
-        if let Some(constant) = map.remove("const") {
-            map.insert("enum".to_owned(), Value::Array(vec![constant]));
-            rewritten.push(format!("{pointer}/const"));
-        }
+    if !map.contains_key("enum")
+        && let Some(constant) = map.remove("const")
+    {
+        map.insert("enum".to_owned(), Value::Array(vec![constant]));
+        rewritten.push(format!("{pointer}/const"));
     }
 }
 
@@ -477,10 +477,10 @@ fn collect_not(map: &mut Map<String, Value>, pointer: &str, found: &mut Vec<Stri
 
 /// Rewrites `$ref: "#/components/schemas/X"` to `#/$defs/X`.
 fn rewrite_ref(map: &mut Map<String, Value>, _pointer: &str) {
-    if let Some(Value::String(target)) = map.get_mut("$ref") {
-        if let Some(name) = target.strip_prefix(OPENAPI_REF_PREFIX) {
-            *target = format!("{DEFS_REF_PREFIX}{name}");
-        }
+    if let Some(Value::String(target)) = map.get_mut("$ref")
+        && let Some(name) = target.strip_prefix(OPENAPI_REF_PREFIX)
+    {
+        *target = format!("{DEFS_REF_PREFIX}{name}");
     }
 }
 

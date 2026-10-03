@@ -135,11 +135,9 @@ pub(crate) async fn audit_stream(
         // the held pg_stat_statements session probes its own database;
         // with other databases to probe, it is closed first and reopened
         // after.
-        if several {
-            if let Some((session, poller)) = pss_session.take() {
-                drop(session);
-                pss_idle = Some(poller);
-            }
+        if several && let Some((session, poller)) = pss_session.take() {
+            drop(session);
+            pss_idle = Some(poller);
         }
         let held = pss_session.as_ref().map(|(s, p)| (p.database(), s));
         let pre = check::prerequisites_with(target, timeouts, held)

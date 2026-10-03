@@ -1254,10 +1254,10 @@ impl Runtime {
                 .detection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((at, found)) = cache.as_ref() {
-                if at.elapsed() < DETECTION_TTL {
-                    return found.clone();
-                }
+            if let Some((at, found)) = cache.as_ref()
+                && at.elapsed() < DETECTION_TTL
+            {
+                return found.clone();
             }
         }
         let root = self.host_root.clone();

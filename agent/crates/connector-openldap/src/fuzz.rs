@@ -40,10 +40,10 @@ pub fn ber(data: &[u8]) {
 /// One `LDAPMessage` as the server sends it; a search result entry is
 /// reduced as an accesslog entry too.
 pub fn message(data: &[u8]) {
-    if let Ok(m) = proto::parse(data) {
-        if let Response::Entry(e) = &m.op {
-            reduce(e);
-        }
+    if let Ok(m) = proto::parse(data)
+        && let Response::Entry(e) = &m.op
+    {
+        reduce(e);
     }
 }
 

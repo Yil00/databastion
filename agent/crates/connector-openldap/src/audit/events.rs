@@ -202,15 +202,14 @@ impl EventBuilder {
         if !self.totals.contains_key(&key) && self.totals.len() >= MAX_SESSIONS {
             self.totals
                 .retain(|_, (_, t)| now.saturating_duration_since(*t) < SESSION_IDLE);
-            if self.totals.len() >= MAX_SESSIONS {
-                if let Some(oldest) = self
+            if self.totals.len() >= MAX_SESSIONS
+                && let Some(oldest) = self
                     .totals
                     .iter()
                     .min_by_key(|(_, (_, t))| *t)
                     .map(|(k, _)| *k)
-                {
-                    self.totals.remove(&oldest);
-                }
+            {
+                self.totals.remove(&oldest);
             }
         }
         let e = self.totals.entry(key).or_insert((0, now));

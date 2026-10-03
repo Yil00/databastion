@@ -8,6 +8,8 @@ The project follows [semantic versioning](https://semver.org/).
 ## Unreleased
 
 ### 👷 CI
+- "Agent MSRV (Rust 1.88.0)" job, required through "CI result": type-checks the agent workspace (every target, all features, and the minimal build) on exactly the workspace `rust-version`. The declared MSRV is raised from 1.85 to 1.88, the true minimum: the classifiers use let-chains and the protocol crate's `regress` 0.12 needs them too, so the workspace never built on 1.85. The `release.yml` toolchain pin follows (1.88.0). Released binaries are unaffected (built with Rust 1.94.1 in the agent `Dockerfile`)
+- Agent: clippy's lints gated on the MSRV now apply (nested `if`s collapsed into let-chains, `is_multiple_of`), no behavior change
 - Release: the curated "Unreleased" notes are moved under the new version section of `CHANGELOG.md` (compared with the previous final tag, pre-release tags ignored) and become the draft GitHub release notes, with absolute links, by `scripts/changelog-release.mjs` from release-it; the generated commit list is no longer written. A release with an empty "Unreleased" section fails before any commit, tag or push, and the "Release version" PR check fails first (ROADMAP v0.1.x item (a))
 
 ### 🐛 Bug Fixes

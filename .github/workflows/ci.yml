@@ -230,6 +230,44 @@ jobs:
       - name: cargo-deny dev-dependencies (licenses, sources)
         run: cargo deny --config deny-dev.toml --locked check licenses sources
 
+  # The workspace `rust-version` (MSRV) is a promise: the workspace must build on exactly that
+  # toolchain, not only on the latest stable used by the other agent jobs. Type-checks every target
+  # (lib, bins, tests, benches) with all features, plus the minimal build (no connector). Tests run
+  # in the "Agent" job; agent/fuzz (own workspace, no rust-version, stable or nightly only) is
+  # left out. Bump `toolchain` together with `rust-version` in agent/Cargo.toml and the pin in
+  # release.yml. Required through ci-result.
+  agent-msrv:
+    name: Agent MSRV (Rust 1.88.0)
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+          key: msrv
+      # The declared rust-version and this job's toolchain must agree.
+      - name: rust-version matches the toolchain
+        run: |
+          declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          actual="$(rustc --version | cut -d' ' -f2)"
+          echo "rust-version: $declared, rustc: $actual"
+          [ -n "$declared" ] && [ "${actual%.*}" = "$declared" ]
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo check --workspace --no-default-features --locked
+
   # Always runs: the contract is the synchronization point, so a missing openapi.yaml fails the job
   # instead of skipping it.
   protocol:
@@ -611,7 +649,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

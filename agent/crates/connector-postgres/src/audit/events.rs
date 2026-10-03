@@ -271,16 +271,16 @@ fn statement_signals(
 ) -> Vec<Signal> {
     let mut out = Vec::new();
     for p in parts {
-        if let Some(c) = p.copy {
-            if c.to {
-                match c.endpoint {
-                    CopyEndpoint::File => out.push(Signal::CopyToFile),
-                    CopyEndpoint::Program => out.push(Signal::CopyToProgram),
-                    CopyEndpoint::Client | CopyEndpoint::Unknown => {}
-                }
-                if c.whole_relation {
-                    out.push(Signal::FullTableCopy);
-                }
+        if let Some(c) = p.copy
+            && c.to
+        {
+            match c.endpoint {
+                CopyEndpoint::File => out.push(Signal::CopyToFile),
+                CopyEndpoint::Program => out.push(Signal::CopyToProgram),
+                CopyEndpoint::Client | CopyEndpoint::Unknown => {}
+            }
+            if c.whole_relation {
+                out.push(Signal::FullTableCopy);
             }
         }
         if p.kind.is_read()
@@ -321,10 +321,10 @@ impl DumpTracker {
     /// client; `true` once the session reached [`DUMP_MIN_RELATIONS`].
     pub(crate) fn copied(&mut self, session: &str, relations: &[RelationName]) -> bool {
         if !self.sessions.contains_key(session) {
-            if self.sessions.len() >= MAX_SESSIONS {
-                if let Some(old) = self.order.pop_front() {
-                    self.sessions.remove(&old);
-                }
+            if self.sessions.len() >= MAX_SESSIONS
+                && let Some(old) = self.order.pop_front()
+            {
+                self.sessions.remove(&old);
             }
             self.order.push_back(session.to_owned());
             self.sessions.insert(session.to_owned(), HashSet::new());
@@ -699,10 +699,10 @@ impl PgauditEvents {
         let mut confirmed: HashSet<String> = HashSet::new();
         let mut first_texts: HashMap<u64, &str> = HashMap::new();
         for r in &group {
-            if let Some(rel) = split_object_name(&r.audit.object_name) {
-                if rel.schema.as_deref() == Some("pg_catalog") {
-                    confirmed.insert(rel.name);
-                }
+            if let Some(rel) = split_object_name(&r.audit.object_name)
+                && rel.schema.as_deref() == Some("pg_catalog")
+            {
+                confirmed.insert(rel.name);
             }
             let text: &str = &r.audit.statement;
             if text != PREVIOUSLY_LOGGED {
@@ -758,17 +758,18 @@ impl PgauditEvents {
             let part = parts.entry(action).or_default();
             part.not_own_text |= !own_text;
             let mut named = false;
-            if !r.audit.object_name.is_empty() && is_relation_type(&r.audit.object_type) {
-                if let Some(rel) = split_object_name(&r.audit.object_name) {
-                    named = true;
-                    if is_catalog(&rel, rule) {
-                        // A named catalog relation (`pgaudit.log_catalog`,
-                        // `pg_stat_statements_info`): not application
-                        // data, and not an unknown object either.
-                        part.catalog_only = true;
-                    } else if !part.objects.contains(&rel) {
-                        part.objects.push(rel);
-                    }
+            if !r.audit.object_name.is_empty()
+                && is_relation_type(&r.audit.object_type)
+                && let Some(rel) = split_object_name(&r.audit.object_name)
+            {
+                named = true;
+                if is_catalog(&rel, rule) {
+                    // A named catalog relation (`pgaudit.log_catalog`,
+                    // `pg_stat_statements_info`): not application
+                    // data, and not an unknown object either.
+                    part.catalog_only = true;
+                } else if !part.objects.contains(&rel) {
+                    part.objects.push(rel);
                 }
             }
             if !named {
@@ -928,10 +929,10 @@ pub(crate) fn pss_events_counted(
         let all: Vec<&StatementInfo> = d.analysis.parts().iter().collect();
         // A panic here is counted when the same statement is converted
         // below (it panics there too, or is converted without this part).
-        if let Some(c) = databastion_core::isolate(|| copied_to_client(&all, rule)) {
-            if !c.is_empty() {
-                copied.entry(d.user).or_default().extend(c);
-            }
+        if let Some(c) = databastion_core::isolate(|| copied_to_client(&all, rule))
+            && !c.is_empty()
+        {
+            copied.entry(d.user).or_default().extend(c);
         }
     }
     let mut out = Vec::new();

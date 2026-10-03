@@ -335,10 +335,8 @@ async fn sample_unit(
             Err(e) => return Err(e),
         }
     }
-    if !sampled_any {
-        if let Some(e) = last_error {
-            return Err(e);
-        }
+    if !sampled_any && let Some(e) = last_error {
+        return Err(e);
     }
     Ok(UnitSample {
         columns,

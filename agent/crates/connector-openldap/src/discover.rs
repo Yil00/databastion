@@ -299,10 +299,10 @@ where
         let total = ordered.len();
         let mut current: Option<(NormalizedName, Groups)> = None;
         for (i, (container, raw)) in ordered.into_iter().enumerate() {
-            if current.as_ref().is_some_and(|(name, _)| *name != container) {
-                if let Some((name, groups)) = current.take() {
-                    flush(job, sink, &database, &name, groups, &mut totals).await?;
-                }
+            if current.as_ref().is_some_and(|(name, _)| *name != container)
+                && let Some((name, groups)) = current.take()
+            {
+                flush(job, sink, &database, &name, groups, &mut totals).await?;
             }
             if job.turn().await? == Paced::OutOfTime {
                 job.skip_out_of_time(sink, total - i);
