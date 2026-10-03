@@ -63,7 +63,7 @@ it_mysql() {
   require_services mysql mariadb percona
   mkdir -p dev/.state/tls
   compose exec -T mysql cat /var/lib/mysql/ca.pem > dev/.state/tls/mysql-ca.pem
-  compose exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
+  compose exec -T mariadb cat /var/lib/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
   compose exec -T percona cat /var/lib/mysql/ca.pem > dev/.state/tls/percona-ca.pem
   export DATABASTION_TEST_MYSQL_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MYSQL_PORT}/hr"
   export DATABASTION_TEST_MYSQL_ADMIN_URL="mysql://root:${MYSQL_ROOT_PASSWORD}@127.0.0.1:${MYSQL_PORT}/"

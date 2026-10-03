@@ -550,7 +550,7 @@ done
 log "copying the CA of target-mysql and target-mariadb (dev mysql/initdb/30-tls.sh, mariadb/tls-entrypoint.sh) for the agent"
 compose exec -T target-mysql cat /var/lib/mysql/ca.pem >"$T/mysql-ca.pem" \
   || fail "cannot read the CA of target-mysql"
-compose exec -T target-mariadb cat /var/lib/mysql/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \
+compose exec -T target-mariadb cat /var/lib/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \
   || fail "cannot read the CA of target-mariadb"
 for ca in mysql mariadb; do
   # A CA certificate (not MySQL's auto-generated material) with no private key next to it.

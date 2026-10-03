@@ -213,7 +213,8 @@ services:
       - ../../dev/mariadb/tls-entrypoint.sh:/usr/local/bin/databastion-tls-entrypoint.sh:ro
       - ./initdb/40-load-account.sh:/docker-entrypoint-initdb.d/40-load-account.sh:ro
       - target-mariadb-log:/var/log/databastion
-    tmpfs: [/var/lib/mysql, /run/mysqld, /tmp]
+    # /var/lib/databastion-tls: the dev TLS material (tls-entrypoint.sh), outside the datadir.
+    tmpfs: [/var/lib/mysql, /var/lib/databastion-tls, /run/mysqld, /tmp]
     networks:
       agent-net:
         aliases: [mariadb]
