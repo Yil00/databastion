@@ -19,6 +19,9 @@ databastion_dev_tls() {
     return 0
   fi
   tmp="$(mktemp -d)"
+  # The throwaway CA key must not outlive a failed step (set -e): removed on any exit.
+  # shellcheck disable=SC2064 # expanded now: $tmp is local to this function
+  trap "rm -rf '$tmp'" EXIT
   mkdir -p "$dir"
   printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' \
     'extendedKeyUsage=serverAuth' 'subjectAltName=DNS:localhost,DNS:mariadb,IP:127.0.0.1,IP:::1' > "$tmp/ext"
@@ -33,6 +36,7 @@ databastion_dev_tls() {
   install -m 0644 "$tmp/server-cert.pem" "$dir/server-cert.pem"
   install -m 0600 "$tmp/server-key.pem" "$dir/server-key.pem"
   rm -rf "$tmp"
+  trap - EXIT
   # Started as root (the image default): the server runs as `mysql` and must read the key.
   if [ "$(id -u)" = 0 ]; then
     chown -R mysql:mysql "$dir"
