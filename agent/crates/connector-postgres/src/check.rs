@@ -562,7 +562,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 normalize(database).as_str()
             ));
         }
-        let (text, probe_codes) = probe_notes(&probe, settings.audit_log.is_some());
+        let (text, probe_codes) = probe_notes(
+            &probe,
+            settings.audit_log.is_some(),
+            settings.audit_log.is_some() && log_readable,
+        );
         notes.extend(text);
         codes.extend(probe_codes);
         let key = (target.id.clone(), database.clone());
@@ -629,7 +633,13 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
 
 /// Explanations of one database's audit prerequisites (log detail and
 /// closed notes). `log_configured`: `postgres.audit_log` is set.
-fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<TargetNote>) {
+/// `log_read`: the configured pgaudit log is readable, i.e. it is the source the stream reads at
+/// Partial or Full; the row-count note only describes that source.
+fn probe_notes(
+    probe: &AuditProbe,
+    log_configured: bool,
+    log_read: bool,
+) -> (Vec<String>, Vec<TargetNote>) {
     let mut text = Vec::new();
     let mut codes = Vec::new();
     if (probe.pgaudit_installed || probe.pgaudit_loaded == Some(true)) && !log_configured {
@@ -662,7 +672,11 @@ fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<Ta
              carry no row count, so Full is not reached and volume signals are absent"
                 .to_owned(),
         );
-        codes.push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
+        // Not when `pg_stat_statements` is the source (log not configured or unreadable): its
+        // rows are counted.
+        if log_read {
+            codes.push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
+        }
     }
     (text, codes)
 }
@@ -1227,7 +1241,7 @@ mod tests {
             pgaudit_reads: false,
             ..AuditProbe::default()
         };
-        let (text, notes) = probe_notes(&loaded, false);
+        let (text, notes) = probe_notes(&loaded, false, false);
         assert_eq!(text.len(), notes.len());
         assert_registered(&notes);
         assert_eq!(
@@ -1242,12 +1256,12 @@ mod tests {
             pgaudit_loaded: Some(false),
             ..AuditProbe::default()
         };
-        let (_, notes) = probe_notes(&placeholders, true);
+        let (_, notes) = probe_notes(&placeholders, true, true);
         assert_eq!(
             notes_json(&notes),
             serde_json::json!([{"code": "audit.pgaudit_not_loaded"}])
         );
-        let (_, notes) = probe_notes(&AuditProbe::default(), false);
+        let (_, notes) = probe_notes(&AuditProbe::default(), false, false);
         assert!(notes.is_empty());
     }
 
@@ -1505,17 +1519,35 @@ mod tests {
             pgaudit_reads: true,
             ..AuditProbe::default()
         };
-        let (text, notes) = probe_notes(&p, true);
+        let (text, notes) = probe_notes(&p, true, true);
         assert_eq!(codes(&notes), ["audit.log_without_row_counts"]);
         assert_registered(&notes);
         assert_eq!(text.len(), 1);
         assert!(text[0].contains("pgaudit.log_rows"), "{text:?}");
+        // The pgaudit log configured but unreadable: `pg_stat_statements` is the source and
+        // counts rows, so the detail stays local and no note is sent.
+        let (text, notes) = probe_notes(&p, true, false);
+        assert!(
+            text.iter().any(|t| t.contains("pgaudit.log_rows")),
+            "{text:?}"
+        );
+        assert!(
+            !codes(&notes).contains(&"audit.log_without_row_counts"),
+            "{notes:?}"
+        );
+        // No log configured: the same.
+        let (_, notes) = probe_notes(&p, false, false);
+        assert!(
+            !codes(&notes).contains(&"audit.log_without_row_counts"),
+            "{notes:?}"
+        );
         // Row counts on: neither the detail nor the note.
         let (text, notes) = probe_notes(
             &AuditProbe {
                 pgaudit_rows: true,
                 ..p.clone()
             },
+            true,
             true,
         );
         assert!(text.is_empty(), "{text:?}");
@@ -1537,7 +1569,7 @@ mod tests {
                 ..p.clone()
             },
         ] {
-            let (_, notes) = probe_notes(&probe, true);
+            let (_, notes) = probe_notes(&probe, true, true);
             assert!(
                 !notes
                     .iter()
@@ -1559,7 +1591,7 @@ mod tests {
         };
         let mut merged = Notes::default();
         for _ in 0..2 {
-            let (_, notes) = probe_notes(&p, true);
+            let (_, notes) = probe_notes(&p, true, true);
             merged.extend(notes);
         }
         assert_eq!(codes(merged.as_slice()), ["audit.log_without_row_counts"]);
