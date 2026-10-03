@@ -62,6 +62,8 @@ jobs:
   # latest tag (a `feat` commit gives a minor version, only `fix` commits a patch version), so a
   # title written by hand can be wrong: 0.2.0 was planned as 0.1.1 (ROADMAP v0.1.x item (k)).
   # No token: the GitHub release step is turned off and nothing is pushed.
+  # Advisory only: the PR's own code runs here (.release-it.json hooks, npm ci), so keep the
+  # `pull_request` trigger and no secrets, and never feed this result to a privileged workflow.
   release-version:
     name: Release version
     if: github.event.pull_request.base.ref == 'main'
@@ -86,8 +88,10 @@ jobs:
           # release-it requires the branch main (.release-it.json); a local branch at the merge commit.
           git checkout --quiet -B main
           version="$(npx release-it --ci --release-version --no-github.release --no-git.requireUpstream)"
-          if ! printf '%s\n' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::release-it did not print a version: $version"
+          # The whole output must be one version: nothing else reaches the summary or a workflow command.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release-it did not print a single version (raw output in the log above)."
+            printf '%q\n' "$version"
             exit 1
           fi
           echo "### Release version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
