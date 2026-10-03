@@ -132,8 +132,11 @@ independent across columns. Without the agent key, a random key (OS CSPRNG) is d
 Fingerprints are the 50 smallest distinct ones, emitted sorted.
 
 **Unicode.** Typographic spaces and hyphens (no-break space U+00A0, U+2002–U+200A, narrow no-break
-space U+202F, U+2010–U+2013, minus sign U+2212) are read as ASCII space and `-` before detection
-(`06\u{a0}12\u{a0}34…`, as word processors and spreadsheets write numbers). Each value is put in canonical composition (NFC) before detection, so a value stored
+space U+202F, U+2010–U+2013, minus sign U+2212; U+2000 and U+2001 through their NFC form) are read as
+ASCII space and `-` before detection (`06\u{a0}12\u{a0}34…`, as word processors and spreadsheets write
+numbers), and by the value normalization behind `mask_as` and `HmacKey::fingerprint` too, so every
+caller gets for such a value the masked sample and fingerprint of its ASCII form (other look-alikes,
+such as the middle dot, em dash, ideographic space or fullwidth hyphen, are not folded anywhere). Each value is put in canonical composition (NFC) before detection, so a value stored
 decomposed (`e` + U+0301, as written by macOS and some ETLs) is recognized like its composed form
 (names, addresses, textual months, e-mail local parts). Tokens, masked samples and fingerprints are
 taken from the NFC value: fingerprints of names and addresses were already computed on NFC (no
@@ -211,7 +214,8 @@ sub-key `HMAC-SHA256(agent_local_key, "databastion/local-tag/v1" 0x00 purpose)`,
 with the purpose `audit-tail-cursor` to fingerprint the audit log bytes before a saved cursor position
 without storing them (see the agent README).
 
-Normalization: e-mail trimmed + lowercased; IBAN, card and NIR without separators, uppercase; phone
+Normalization: every value trimmed, NFC-composed and its typographic separators folded (above), then
+e-mail lowercased; IBAN, card and NIR without separators, uppercase; phone
 `+<digits>` when written with `+` (a trunk `(0)` dropped), national numbers as their digits (`0X…` →
 `+33X…` and `00…` → `+…` only with `PhoneRegion::Fr`, from the column or the agent configuration);
 birth date ISO `YYYY-MM-DD` from any accepted format (`01/02/1980` read day first); names

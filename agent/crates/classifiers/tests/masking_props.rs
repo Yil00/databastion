@@ -7,7 +7,10 @@
 //! - masking is stable, and re-masking a masked sample never reveals more;
 //! - fingerprints are deterministic per key, differ across keys and across
 //!   domains (classifiers, `db_user`), and have the contract shape;
-//! - no raw value appears in any `Debug` output.
+//! - no raw value appears in any `Debug` output;
+//! - typographic spaces and hyphens (U+00A0, U+2000–U+200A, U+202F,
+//!   U+2010–U+2013, U+2212) fingerprint and mask like their ASCII form, and
+//!   no separator mix lets more than 4 digits through.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -449,5 +452,105 @@ proptest! {
         let key = key(k);
         let c = ColumnClassifier::new().with_key(&key);
         prop_assert_eq!(c.classify("col_1", &a), c.classify("col_1", &b));
+    }
+}
+
+/// Typographic spaces folded to an ASCII space (U+2000 and U+2001 through
+/// their NFC form U+2002, U+2003).
+const TYPO_SPACES: [char; 13] = [
+    '\u{a0}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
+    '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{202f}',
+];
+/// Typographic hyphens folded to `-`.
+const TYPO_HYPHENS: [char; 5] = ['\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2212}'];
+
+/// `raw` with each ASCII space and `-` replaced by a typographic form, or
+/// kept, as `picks` says (cycled).
+fn typographic(raw: &str, picks: &[u8]) -> String {
+    let mut i = 0;
+    raw.chars()
+        .map(|c| {
+            let pick = usize::from(picks[i % picks.len()]);
+            i += 1;
+            match c {
+                ' ' if pick % 4 != 0 => TYPO_SPACES[pick % TYPO_SPACES.len()],
+                '-' if pick % 4 != 0 => TYPO_HYPHENS[pick % TYPO_HYPHENS.len()],
+                c => c,
+            }
+        })
+        .collect()
+}
+
+/// Digits, ASCII separators, the folded typographic separators and some
+/// that are not folded (middle dot, em dash, ideographic space, fullwidth
+/// and small hyphen-minus, zero-width space).
+fn separator_soup() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        prop_oneof![
+            4 => proptest::char::range('0', '9'),
+            1 => proptest::sample::select(vec![' ', '-', '.', '/', '(', ')', '+']),
+            2 => proptest::sample::select(TYPO_SPACES.to_vec()),
+            2 => proptest::sample::select(TYPO_HYPHENS.to_vec()),
+            1 => proptest::sample::select(vec![
+                '\u{b7}', '\u{2014}', '\u{3000}', '\u{ff0d}', '\u{fe63}', '\u{200b}',
+            ]),
+        ],
+        0..40,
+    )
+    .prop_map(|v| v.into_iter().collect())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A value written with typographic separators has the fingerprint and
+    /// the masked sample of its ASCII form, for every caller.
+    #[test]
+    fn typographic_separators_fingerprint_and_mask_like_ascii(
+        (c, raw) in classified(),
+        picks in proptest::collection::vec(any::<u8>(), 1..8),
+        k in any::<u8>(),
+    ) {
+        let typo = typographic(&raw, &picks);
+        let key = key(k);
+        prop_assert_eq!(
+            key.fingerprint(c, &RawSample::new(&typo)),
+            key.fingerprint(c, &RawSample::new(&raw)),
+            "{}", c
+        );
+        let m = mask_as(c, &RawSample::new(&typo));
+        prop_assert_eq!(&m, &mask_as(c, &RawSample::new(&raw)), "{}", c);
+        prop_assert!(masked_sample_conforms(m.as_str()));
+        prop_assert!(digits(m.as_str()).len() <= MAX_KEPT_RUN);
+        prop_assert!(!m.as_str().contains(typo.as_str()));
+    }
+
+    /// The column path gives the same findings either way.
+    #[test]
+    fn typographic_columns_classify_like_ascii_ones(
+        values in proptest::collection::vec(classified(), 1..12),
+        picks in proptest::collection::vec(any::<u8>(), 1..8),
+        k in any::<u8>(),
+    ) {
+        let ascii: Vec<String> = values.iter().map(|(_, v)| v.clone()).collect();
+        let typo: Vec<String> = ascii.iter().map(|v| typographic(v, &picks)).collect();
+        let a: Vec<RawSample<'_>> = ascii.iter().map(|v| RawSample::new(v)).collect();
+        let b: Vec<RawSample<'_>> = typo.iter().map(|v| RawSample::new(v)).collect();
+        let key = key(k);
+        let c = ColumnClassifier::new().with_key(&key);
+        prop_assert_eq!(c.classify("col_1", &a), c.classify("col_1", &b));
+    }
+
+    /// Whatever the separator mix, a masked sample keeps at most 4 digits
+    /// and conforms to the contract.
+    #[test]
+    fn any_separator_mix_is_masked_safely(c in any_classifier(), raw in separator_soup()) {
+        let m = mask_as(c, &RawSample::new(&raw));
+        prop_assert!(masked_sample_conforms(m.as_str()), "{}: {}", c, m.as_str());
+        prop_assert!(digits(m.as_str()).len() <= MAX_KEPT_RUN, "{}: {}", c, m.as_str());
+        let raw_digits = digits(&raw);
+        if raw_digits.len() > MAX_KEPT_RUN {
+            prop_assert!(!m.as_str().contains(raw.as_str()));
+        }
     }
 }
