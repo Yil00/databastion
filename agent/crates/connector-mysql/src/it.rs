@@ -1664,6 +1664,28 @@ async fn verify_full_tls_with_a_pinned_ca() {
     }
 }
 
+/// The dev servers' data directories hold databases only: a foreign
+/// directory there (the MariaDB TLS material used to live in
+/// `/var/lib/mysql/databastion-tls`) is listed as a schema
+/// `#mysql50#…` that Discovery would try to scan.
+#[tokio::test]
+async fn data_directory_holds_no_foreign_schema() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        let foreign = scalar(
+            &mut a,
+            "SELECT GROUP_CONCAT(SCHEMA_NAME) FROM information_schema.SCHEMATA \
+             WHERE SCHEMA_NAME LIKE '#mysql50#%' OR SCHEMA_NAME LIKE '%databastion-tls%'",
+        )
+        .await;
+        assert_eq!(foreign, None, "{}", server.name);
+    }
+}
+
 #[test]
 fn urls_are_parsed() {
     let u = parse_url("mysql://databastion:p%40ss@127.0.0.1:3307/support").unwrap();

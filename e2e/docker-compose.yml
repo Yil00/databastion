@@ -337,7 +337,8 @@ services:
       # server_audit file output (dev/mariadb/databastion.cnf), read-only in the agent
       # (mysql.audit_log); run.sh hands the volume to mysql 999:999, 0750.
       - target-mariadb-log:/var/log/databastion
-    tmpfs: [/var/lib/mysql, /run/mysqld, /tmp]
+    # /var/lib/databastion-tls: the dev TLS material (tls-entrypoint.sh), outside the datadir.
+    tmpfs: [/var/lib/mysql, /var/lib/databastion-tls, /run/mysqld, /tmp]
     networks:
       agent-net:
         aliases: [mariadb]

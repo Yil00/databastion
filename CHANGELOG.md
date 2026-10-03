@@ -10,6 +10,9 @@ The project follows [semantic versioning](https://semver.org/).
 ### 👷 CI
 - Release: the curated "Unreleased" notes are moved under the new version section of `CHANGELOG.md` (compared with the previous final tag, pre-release tags ignored) and become the draft GitHub release notes, with absolute links, by `scripts/changelog-release.mjs` from release-it; the generated commit list is no longer written. A release with an empty "Unreleased" section fails before any commit, tag or push, and the "Release version" PR check fails first (ROADMAP v0.1.x item (a))
 
+### 🐛 Bug Fixes
+- Dev / e2e MariaDB: the dev-only TLS material moved out of the data directory (`/var/lib/mysql/databastion-tls` → `/var/lib/databastion-tls`, a dedicated `mariadb-tls` volume in dev, a tmpfs in e2e and load), where the server took it for a database (`Invalid (old?) table or database name 'databastion-tls'` on 10.11, schema `#mysql50#databastion-tls`); the dev CA still survives restarts until `make dev-reset`, and the wrapper deletes the old copy from existing data volumes. Export the dev MariaDB CA from the new path
+
 ## [0.3.0](https://github.com/Yil00/databastion/compare/0.2.0...0.3.0) (2026-10-03)
 
 > **Upgrade impact (PostgreSQL)**: targets where pgaudit logs reads without row counts (`pgaudit.log_rows` off in a monitored database, or pgaudit before 1.6) now report **Partial** instead of Full, and the console says why (`audit.log_without_row_counts`). PostgreSQL 14 is the minimum tested version.
