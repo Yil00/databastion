@@ -1083,10 +1083,60 @@ struct AuthAttr {
     remote: Option<String>,
     #[serde(default, rename = "isClusterMember")]
     cluster_member: Option<bool>,
-    /// Error code of the attempt (5.0+; 4.4 logs a status string, never
-    /// copied).
+    /// Error code of the attempt ("Failed to authenticate" lines of 7.0+;
+    /// 4.4 logs a status string, never copied).
     #[serde(default)]
     result: ResultCode,
+    /// The status string of the attempt, never copied: only whether it is
+    /// `AuthenticationAbandoned`. MongoDB 5.0 and 6.0 log "Failed to
+    /// authenticate" without `result`, at debug level 3 only (an access
+    /// control verbosity of 3 or more), abandoned conversations included.
+    #[serde(default)]
+    error: AbandonedStatus,
+}
+
+/// Whether a status string names `AuthenticationAbandoned` (visited, never
+/// copied: it may quote the user name).
+#[derive(Default)]
+struct AbandonedStatus(bool);
+
+impl<'de> Deserialize<'de> for AbandonedStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = AbandonedStatus;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a status")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(v.starts_with("AuthenticationAbandoned:")))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<AbandonedStatus, E> {
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<AbandonedStatus, A::Error> {
+                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(AbandonedStatus(false))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<AbandonedStatus, A::Error> {
+                while s.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AbandonedStatus(false))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// A numeric `result`, or nothing: a status string (MongoDB 4.4, which may
@@ -1234,8 +1284,9 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let line: AuthLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let a = line.attr;
             // An abandoned conversation (the names may be empty then):
-            // valid, not an audit record.
-            if a.result.0 == Some(AUTH_ABANDONED) {
+            // valid, not an audit record. Without a numeric `result` (5.0
+            // and 6.0 at debug level), the status string says so.
+            if a.result.0 == Some(AUTH_ABANDONED) || (a.result.0.is_none() && a.error.0) {
                 return Ok(None);
             }
             let mut r = base(Kind::Auth {
@@ -1413,6 +1464,28 @@ mod tests {
         let r = parse_server_log(old.as_bytes()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Auth { ok: false });
         assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("mallory@admin"));
+        // MongoDB 6.0 (5.0 alike): a refused credential is "Authentication
+        // failed" (20249) with a status string in `error`, at the default
+        // verbosity; an abandoned conversation is only logged at debug
+        // level 3, as "Failed to authenticate" without `result`.
+        let v6_refused = r#"{"t":{"$date":"2026-10-03T10:00:00.000+00:00"},"s":"I","c":"ACCESS","id":20249,"ctx":"conn14","msg":"Authentication failed","attr":{"mechanism":"SCRAM-SHA-256","speculative":false,"principalName":"mallory","authenticationDatabase":"admin","remote":"10.0.0.9:1235","extraInfo":{},"error":"AuthenticationFailed: SCRAM authentication failed, storedKey mismatch"}}"#;
+        let r = parse_server_log(v6_refused.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
+        assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("mallory@admin"));
+        let v6_abandoned = r#"{"t":{"$date":"2026-10-03T10:00:00.000+00:00"},"s":"D3","c":"ACCESS","id":5286307,"ctx":"conn15","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:1236","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"exporter","db":"admin","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected"}}"#;
+        assert!(parse_server_log(v6_abandoned.as_bytes()).unwrap().is_none());
+        let v6_debug_refused = v6_abandoned.replace(
+            "AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected",
+            "AuthenticationFailed: SCRAM authentication failed, storedKey mismatch",
+        );
+        let r = parse_server_log(v6_debug_refused.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
+        // A numeric `result` decides when present.
+        let coded = ABANDONED_SPECULATIVE.replace(r#""result":337"#, r#""result":18"#);
+        let r = parse_server_log(coded.as_bytes()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Auth { ok: false });
         // `auditLog`: the same code in `result`.
         let audit = r#"{"atype":"authenticate","ts":{"$date":"2026-09-29T10:00:00.000Z"},"remote":{"ip":"10.0.0.9","port":51000},"users":[],"param":{"user":"exporter","db":"admin","mechanism":"SCRAM-SHA-256"},"result":337}"#;
         assert!(parse_audit_log(audit.as_bytes()).unwrap().is_none());

@@ -20,7 +20,7 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 
 | Service | Host port | Seeded database | Audit source | Audit level ([docs/08](../docs/08-engine-capabilities.md)) |
 |---------|-----------|-----------------|--------------|-------|
-| PostgreSQL 17.11 + pgaudit (`postgres`) | 5432 | `shop` (schemas `crm`, `billing`, `ops`) | pgaudit in `jsonlog`, `pg_stat_statements`, `log_connections` | Full |
+| PostgreSQL 17.11 + pgaudit (`postgres`) | 5432 | `shop` (schemas `crm`, `billing`, `ops`) | pgaudit in `jsonlog` with `pgaudit.log_rows = on` (needed for Full, ADR-0037), `pg_stat_statements`, `log_connections` | Full |
 | MariaDB 11.4 LTS (`mariadb`) | 3307 | `support` | `server_audit` plugin (`CONNECT,QUERY_DML,TABLE`), `performance_schema` | Partial (no row counts in the log) |
 | MySQL 8.4 LTS Community (`mysql`) | 3306 | `hr` | `performance_schema` history consumers (`events_statements_history_long`) | Partial |
 | Percona Server 8.4 (`percona`) | 3308 | `hr` (the MySQL seed) | `audit_log_filter` component, JSON (`log_all` for every account but `root@localhost`) | Partial (no row counts in the log) |
@@ -74,13 +74,37 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 ## Engine configuration
 - **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`, with `log_file_mode=0644` as a dev-only convenience (production: `0640` plus an ACL for the agent's OS user, ADR-0012).
-- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the `QUERY` / `TABLE` audit events (its connections are still logged). Log: `dev/.state/logs/mariadb/server_audit.log`, created `0644` through `UMASK=0644` as a dev-only convenience (production: the agent's OS user gets read access on the log directory only). `performance_schema` has `events_statements_current` on, without which MariaDB fills no statement history. TLS with dev-only material from [mariadb/initdb/30-tls.sh](mariadb/initdb/30-tls.sh) (below).
+- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the `QUERY` / `TABLE` audit events (its connections are still logged). Log: `dev/.state/logs/mariadb/server_audit.log`, created `0644` through `UMASK=0644` as a dev-only convenience (production: the agent's OS user gets read access on the log directory only). `performance_schema` has `events_statements_current` on, without which MariaDB fills no statement history. TLS with dev-only material from [mariadb/tls-entrypoint.sh](mariadb/tls-entrypoint.sh) (below), the service's entrypoint wrapper: it creates the material in the data volume before any server starts (MariaDB 10.11 aborts on a missing `ssl_*` file, even in the temporary server of the initialization) and runs the image's entrypoint.
 - **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements). The `FEDERATED` engine is enabled as a test fixture only (the connector test proves such a table is never read). TLS with dev-only material from [mysql/initdb/30-tls.sh](mysql/initdb/30-tls.sh) (below).
 - **Percona Server**: [percona/databastion.cnf](percona/databastion.cnf) and [percona/initdb/20-databastion.sh](percona/initdb/20-databastion.sh): the `audit_log_filter` component, installed at initialization, writes JSON to `dev/.state/logs/percona/audit_filter.log` (`0644` through `UMASK`, dev only; rotated at each server start). Every account is logged but `root@localhost`, which the healthcheck uses on the socket. Same seed and TLS script as MySQL.
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
 - **OpenLDAP**: image built from Debian's `slapd` package ([openldap/Dockerfile](openldap/Dockerfile)): osixia/openldap is unmaintained and the Bitnami catalog no longer publishes free versioned tags. Configuration in [openldap/config.ldif](openldap/config.ldif) (`olcAccessLogOps: reads writes session`, purge after 7 days). Healthchecks use `ldapi://` on `cn=config`, so they do not add entries to `cn=accesslog`. A dev-only custom schema (`cn=databastion-dev`: the `databastionContractor` class and its NIR, IBAN and code attributes, under `ou=contractors`) tests Discovery of custom attributes. LDAPS (1636) and StartTLS use a dev-only CA and server certificate (`localhost`, `127.0.0.1`, `openldap`) generated by [openldap/entrypoint.sh](openldap/entrypoint.sh) on the first start of the data volume (the CA key is deleted at once); get the CA with `docker compose -f dev/docker-compose.yml exec -T openldap cat /var/lib/ldap/tls/ca.pem`. For the SASL `EXTERNAL` integration test, [openldap/compose.ldapi.yml](openldap/compose.ldapi.yml) publishes the `ldapi://` socket directory to `dev/.state/ldapi/` (not part of `make dev`); CI then maps the runner's uid to the service DN with `olcAuthzRegexp` (see `.github/workflows/ci.yml`, job `agent-openldap`). A volume created before phase 6 has neither: `make dev-reset dev`.
 
 `make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb,percona}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
+
+### Other engine versions
+The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environment variables (unset or empty: the pinned defaults above). Pin every image by tag **and** index digest, as the repository does; the [engine-matrix workflow](../.github/workflows/engine-matrix.yml) lists the pinned versions it tests (PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8, MongoDB 6.0 / 7.0 / 8.0).
+
+| Variable | Service | Meaning |
+|----------|---------|---------|
+| `DATABASTION_DEV_POSTGRES_IMAGE` | `postgres` | Base image of [postgres/Dockerfile](postgres/Dockerfile) (`postgres:<version>-bookworm@sha256:…`); the pgaudit package follows its major |
+| `DATABASTION_DEV_POSTGRES_TAG` | `postgres` | Version in the local image name (`databastion-dev/postgres:<tag>-pgaudit`), so that builds of several majors do not overwrite each other; required with `DATABASTION_DEV_POSTGRES_IMAGE` (`dev/agent-it.sh` refuses one without the other), since e2e and the load harness use the default name |
+| `DATABASTION_DEV_POSTGRES_LOG_FORMAT` | `postgres` | `jsonlog` (default; PostgreSQL 15+) or `csvlog` (required on 13 and 14): the log is then `postgresql.csv`, which `make agent-it` reads |
+| `DATABASTION_DEV_MYSQL_IMAGE` | `mysql` | `mysql:<version>@sha256:…` |
+| `DATABASTION_DEV_MARIADB_IMAGE` | `mariadb` | `mariadb:<version>@sha256:…` |
+| `DATABASTION_DEV_MONGO_IMAGE` | `mongo` | `mongo:<version>@sha256:…` (5.0+, the connector's minimum) |
+
+A data volume is initialized by the engine version that created it: switch versions on fresh volumes (`make dev-reset` first), and keep the variables exported for `make agent-it` too. For example, PostgreSQL 14 (digest from the workflow):
+
+```sh
+make dev-reset
+export DATABASTION_DEV_POSTGRES_IMAGE='postgres:14.24-bookworm@sha256:dcc2ca942d8518144f387a0c2630188427835f984caaed0418b986928e761809'
+export DATABASTION_DEV_POSTGRES_TAG=14.24 DATABASTION_DEV_POSTGRES_LOG_FORMAT=csvlog
+make dev
+make agent-it ENGINE=postgres
+```
+
+The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
 
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
@@ -104,11 +128,12 @@ where pgaudit is loaded (the dev image). A skipped check prints `skipped: …`;
 or `all`) turns the listed skips into failures, as CI does for each server.
 
 The MySQL / MariaDB connector tests (`agent/crates/connector-mysql/src/it.rs`) run against the
-`mysql` and `mariadb` services the same way. Both servers use dev-only TLS material created at
-initialization by `initdb/30-tls.sh` (a throwaway CA, whose key is deleted, signs a certificate for
-`127.0.0.1`, `::1`, `localhost` and the service name), so that the tests use the connector's default
-`tls: verify_full` with the CA pinned. Export the CAs once the services are up (on volumes created
-before this script existed, run `make dev-reset dev` first):
+`mysql` and `mariadb` services the same way. Both servers use dev-only TLS material, created at
+initialization by `mysql/initdb/30-tls.sh` (MySQL) or before the first server start by the
+`mariadb/tls-entrypoint.sh` wrapper (MariaDB): a throwaway CA, whose key is deleted, signs a
+certificate for `127.0.0.1`, `::1`, `localhost` and the service name, so that the tests use the
+connector's default `tls: verify_full` with the CA pinned. Export the CAs once the services are up
+(on volumes created before these scripts existed, run `make dev-reset dev` first):
 
 ```sh
 set -a; . dev/.env; set +a

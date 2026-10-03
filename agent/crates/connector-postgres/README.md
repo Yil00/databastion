@@ -10,13 +10,15 @@ documentation (docs/08) builds on.
 
 | Level | Condition (same probe for `check()` and the stream) | Source |
 |---|---|---|
-| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, a volume source (`pgaudit.log_rows = on` or `pg_stat_statements`), **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log |
-| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no volume source or no recent record | pgaudit log |
+| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log |
+| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows` or no recent record | pgaudit log |
 | Limited | `pg_stat_statements` installed, loaded and showing other roles | `pg_stat_statements` |
 | None | none of the above | — |
 
 The source is re-evaluated every 5 minutes. `volume.large_result` on the
-pgaudit source needs `pgaudit.log_rows = on`.
+pgaudit source needs `pgaudit.log_rows = on`. `pg_stat_statements` is not a
+volume source for Full: the stream never polls it alongside the pgaudit log
+([ADR-0037](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md)).
 
 "pgaudit loaded" is proven, not assumed: a `pgaudit.*` value set in
 `postgresql.conf`, `ALTER DATABASE` or `ALTER ROLE` without pgaudit in

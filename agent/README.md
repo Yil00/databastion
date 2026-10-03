@@ -3,7 +3,7 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: phase 7, hardening before v0.1.0.** `agent.yaml`
+> **Status: released (v0.1.0, then v0.2.0).** `agent.yaml`
 > configuration, enrollment, `0600` identity storage, HTTPS uplink,
 > heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
 > detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /

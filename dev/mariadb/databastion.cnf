@@ -17,8 +17,9 @@ performance_schema = ON
 performance-schema-consumer-events-statements-current = ON
 performance-schema-consumer-events-statements-history = ON
 performance-schema-consumer-events-statements-history-long = ON
-# DEV-ONLY TLS material created by initdb/30-tls.sh (throwaway CA, certificate for 127.0.0.1 /
-# localhost / mariadb), so that the agent can use its default `tls: verify_full` with a pinned CA.
+# DEV-ONLY TLS material created by tls-entrypoint.sh before the server starts (throwaway CA,
+# certificate for 127.0.0.1 / localhost / mariadb), so that the agent can use its default
+# `tls: verify_full` with a pinned CA. MariaDB 10.11 aborts if one of these files is missing.
 ssl_ca = /var/lib/mysql/databastion-tls/ca.pem
 ssl_cert = /var/lib/mysql/databastion-tls/server-cert.pem
 ssl_key = /var/lib/mysql/databastion-tls/server-key.pem

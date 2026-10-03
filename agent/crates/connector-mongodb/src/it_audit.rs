@@ -138,22 +138,59 @@ async fn abandon_handshake(url: &Url, user: &str) {
     wire.shutdown().await;
 }
 
-/// "Failed to authenticate" lines (id 5286307) of the server log after
-/// byte `from`, as `(user, result)` (test accounts only).
+/// Failed authentication lines of the server log after byte `from`, as
+/// `(user, result)` (test accounts only): "Failed to authenticate"
+/// (5286307, MongoDB 7.0+, numeric `result`) and "Authentication failed"
+/// (20249, MongoDB 5.0 and 6.0, a status string in `error`, mapped to its
+/// code here).
 fn auth_failed_lines(log: &Path, from: u64) -> Vec<(String, i64)> {
     let bytes = std::fs::read(log).unwrap();
     let start = usize::try_from(from).unwrap().min(bytes.len());
     bytes[start..]
         .split(|b| *b == b'\n')
         .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
-        .filter(|v| v["id"] == 5_286_307)
-        .map(|v| {
-            (
-                v["attr"]["user"].as_str().unwrap_or_default().to_owned(),
-                v["attr"]["result"].as_i64().unwrap_or_default(),
-            )
+        .filter_map(|v| {
+            let attr = &v["attr"];
+            if v["id"] == 5_286_307 {
+                Some((
+                    attr["user"].as_str().unwrap_or_default().to_owned(),
+                    attr["result"].as_i64().unwrap_or_default(),
+                ))
+            } else if v["id"] == 20_249 {
+                let error = attr["error"].as_str().unwrap_or_default();
+                let code = [
+                    ("UserNotFound:", 11),
+                    ("AuthenticationFailed:", 18),
+                    ("AuthenticationAbandoned:", 337),
+                ]
+                .iter()
+                .find(|(name, _)| error.starts_with(name))
+                .map_or(-1, |(_, code)| *code);
+                Some((
+                    attr["principalName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    code,
+                ))
+            } else {
+                None
+            }
         })
         .collect()
+}
+
+/// The server's major version (`buildInfo`).
+async fn server_major(a: &Url) -> u32 {
+    let mut s = admin_session(a).await;
+    let build = crate::check::build_info(&mut s).await.unwrap();
+    s.close().await;
+    build
+        .version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected server version {:?}", build.version))
 }
 
 /// Waits (10 s at most) until the server log holds, after byte `from`, a
@@ -289,14 +326,20 @@ async fn audit_from_the_server_log() {
     reads(&a, "mongodump").await;
     reads(&a, "mongosh 2.3.0").await;
     // Handshakes abandoned by a client (existing accounts, the agent's own
-    // included): no auth_failure (e2e flake of #98: mongodump). mongod
-    // must have logged them (AuthenticationAbandoned, 337) before the
-    // failures below: the stream reads the log in order, so the failures
-    // it reports prove it read, and dropped, these lines first.
+    // included): no auth_failure (e2e flake of #98: mongodump). MongoDB
+    // 7.0+ logs them ("Failed to authenticate", AuthenticationAbandoned,
+    // 337) and must have done so before the failures below: the stream
+    // reads the log in order, so the failures it reports prove it read,
+    // and dropped, these lines first. MongoDB 5.0 and 6.0 log them at
+    // debug level 3 only: nothing at the default verbosity (checked below,
+    // once the later failures are logged).
+    let logs_abandoned = server_major(&a).await >= 7;
     let from = std::fs::metadata(&log).unwrap().len();
     abandon_handshake(&url, &a.user).await;
     abandon_handshake(&url, &url.user).await;
-    wait_auth_failed(&log, from, 337, &[&a.user, &url.user]).await;
+    if logs_abandoned {
+        wait_auth_failed(&log, from, 337, &[&a.user, &url.user]).await;
+    }
     // Two failed authentications: an unknown account (UserNotFound, 11)
     // and a wrong password on an existing one (AuthenticationFailed, 18).
     let (_d, nobody) = target(&url, "databastion_it_nobody", "wrong-password", "admin");
@@ -313,13 +356,18 @@ async fn audit_from_the_server_log() {
     );
     wait_auth_failed(&log, from, 11, &["databastion_it_nobody"]).await;
     wait_auth_failed(&log, from, 18, &[&a.user]).await;
-    // Nothing else failed meanwhile: exactly these four lines.
+    // Nothing else failed meanwhile: exactly these four lines (7.0+), or
+    // only the two refused credentials (5.0, 6.0: no abandoned line).
     let mut logged: Vec<i64> = auth_failed_lines(&log, from)
         .into_iter()
         .map(|(_, r)| r)
         .collect();
     logged.sort_unstable();
-    assert_eq!(logged, [11, 18, 337, 337]);
+    if logs_abandoned {
+        assert_eq!(logged, [11, 18, 337, 337]);
+    } else {
+        assert_eq!(logged, [11, 18]);
+    }
     // The agent's own Discovery.
     let (r, _findings) = scan(&t).await;
     r.unwrap();

@@ -368,7 +368,9 @@ proptest! {
 
     #[test]
     fn distinct_values_have_distinct_fingerprints(a in email(), b in email()) {
-        prop_assume!(a != b);
+        // Canonically equivalent values (one composed, one decomposed) are the same value: their
+        // fingerprints are equal by design (fingerprints_ignore_the_normalization_form).
+        prop_assume!(a.nfc().collect::<String>() != b.nfc().collect::<String>());
         let k = key(9);
         prop_assert_ne!(
             k.fingerprint(ClassifierId::Email, &RawSample::new(&a)),

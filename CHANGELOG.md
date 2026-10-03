@@ -1,21 +1,5 @@
 # Changelog
 
-## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
-
-### ✨ Features
-
-* **dev:** make targets, tutorial and README (supported databases, quick start) ([#116](https://github.com/Yil00/databastion/issues/116)) ([f2a9027](https://github.com/Yil00/databastion/commit/f2a90271fca388406caf4c0cdd2f2dbdd7035d39))
-
-### 🐛 Bug Fixes
-
-* **console:** force esbuild >= 0.25 under drizzle-kit (Dependabot esbuild advisory) ([#114](https://github.com/Yil00/databastion/issues/114)) ([d1c7515](https://github.com/Yil00/databastion/commit/d1c7515475650a40af5f4a7e6f35eb32318f9d5f))
-* **deploy:** refresh agent/fuzz/Cargo.lock on version bumps (P7) ([f44456f](https://github.com/Yil00/databastion/commit/f44456fd87093451240c9f8498d736069badf568))
-* **deploy:** scope RELEASE_TOKEN to the release-it step and pin the release toolchain (v0.1.x) ([#115](https://github.com/Yil00/databastion/issues/115)) ([92663bf](https://github.com/Yil00/databastion/commit/92663bf58b90664f61f488bee7cccd337adfbcac))
-
-### 📝 Documentation
-
-* v0.1.0 released, changelog tidy and v0.1.x follow-ups ([#113](https://github.com/Yil00/databastion/issues/113)) ([50b13b3](https://github.com/Yil00/databastion/commit/50b13b35f6e872885d334b30b997ca9ca78668b1))
-
 All notable changes to DataBastion are recorded here.
 
 This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
@@ -24,7 +8,28 @@ The project follows [semantic versioning](https://semver.org/).
 ## Unreleased
 
 ### ✨ Features
-- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section
+- PostgreSQL connector: a target at Partial because pgaudit logs reads without row counts (`pgaudit.log_rows` off, or pgaudit before 1.6) now sends the target note `audit.log_without_row_counts`, so the console shows why it is not Full; until now the reason was in the agent's local log only (`postgres` appended to the note's engines in `shared/protocol/target-notes.json`, a compatible registry change)
+
+### 👷 CI
+- Engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 14 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md). PostgreSQL 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`)
+- "Release version" PR check on PRs to `main`: shows the version release-it will compute and fails until the title is `release: X.Y.Z` with that version (or carries `[skip-release]`)
+
+### 🔒 Security
+- Release tooling: `basic-ftp` forced to 6.2.1 under `release-it` (GHSA-c475-qrg2-pj4r, a denial of service in its directory-listing parser; release-it never uses FTP), which turns the "Release tooling advisories" check green
+
+### 🐛 Bug Fixes
+- Dev / e2e / load MariaDB services: the dev-only TLS material is created by an entrypoint wrapper before any server starts (`dev/mariadb/tls-entrypoint.sh`, replacing `initdb/30-tls.sh`): MariaDB 10.11 refused to start with the configured `ssl_*` files missing
+- MongoDB connector: an abandoned authentication logged without a numeric `result` (MongoDB 5.0 and 6.0, "Failed to authenticate" at debug level 3) is recognized by its status string and gives no `auth_failure`
+- PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
+- PostgreSQL connector: the Full audit level requires `pgaudit.log_rows` on ([ADR-0037](docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md)); `pg_stat_statements` no longer counts as a volume source for Full, since the Full stream reads only the pgaudit log and its events carried no row count, so `volume.*` policies could never fire. **Upgrade impact**: a server with pgaudit logging reads but `pgaudit.log_rows` off (or pgaudit before 1.6) now reports Partial instead of Full, with the same events; set `pgaudit.log_rows = on` to get Full back
+- Version bumps update the root `package-lock.json` too, whose version stayed at `0.0.0`
+
+## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
+
+This release was planned as a patch release 0.1.1; the `feat` commit of #116 made release-it compute a minor version. No change to the agent, the protocol or the console runtime: upgrading from 0.1.0 is optional.
+
+### ✨ Features
+- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section (#116)
 
 ### 🐛 Bug Fixes
 - Version bumps refresh `agent/fuzz/Cargo.lock` too, which `main` was missing after the `0.1.0` back-merge (red "Agent fuzz smoke" and cargo-deny on `main` until the next release) (#112)
@@ -34,8 +39,8 @@ The project follows [semantic versioning](https://semver.org/).
 - `release.yml`: checked out without stored credentials, `RELEASE_TOKEN` given only to the release-it step and removed from the git configuration when it ends; Rust toolchain pinned to 1.85.0, the workspace `rust-version` (#115)
 
 ### 📝 Documentation
-- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make`
-- README: v0.1.0 status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start
+- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make` (#116)
+- README: release status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start (#116)
 
 ## [0.1.0](https://github.com/Yil00/databastion/releases/tag/0.1.0) (2026-09-30)
 

@@ -6,11 +6,15 @@
 //! - **Full**: the audit log configured in `agent.yaml`
 //!   (`postgres.audit_log`) is readable by the agent, pgaudit is loaded
 //!   with the `read` class in `pgaudit.log` for a monitored database, and
-//!   volumes are visible: `pgaudit.log_rows` is on, or `pg_stat_statements`
-//!   is usable (Limited prerequisites below).
-//! - **Partial**: the log is readable and pgaudit logs reads (without a
-//!   volume source), or only object audit is set (`pgaudit.role`, reads
-//!   of the objects granted to that role).
+//!   its records carry row counts: `pgaudit.log_rows` is proven on
+//!   ([`pgaudit_rows_on`]). `pg_stat_statements` is not a volume source for
+//!   Full: the Full stream reads the pgaudit log only (ADR-0037).
+//! - **Partial**: the log is readable and pgaudit logs reads without row
+//!   counts (`pgaudit.log_rows` off, or not defined before pgaudit 1.6),
+//!   or only object audit is set (`pgaudit.role`, reads of the objects
+//!   granted to that role). The stream still reads the pgaudit log; volume
+//!   signals are absent. Reads without row counts are reported with the
+//!   closed note `audit.log_without_row_counts`.
 //! - **Limited**: `pg_stat_statements` is installed in a monitored database
 //!   and loaded (its `pg_stat_statements_info` view, a member of the
 //!   extension, answers), and the role sees other users' statements
@@ -105,13 +109,32 @@ pub(crate) fn pgaudit_logs_reads(setting: &str) -> bool {
     items.iter().any(|i| i == "read" || i == "all") && !items.iter().any(|i| i == "-read")
 }
 
+/// Whether `pgaudit.log_rows` gives row counts: the library is loaded, it
+/// defines the setting (listed by `pg_settings` as a boolean; pgaudit
+/// before 1.6, built for PostgreSQL 13, does not), and its value is `on`.
+/// A value alone may be a placeholder that `current_setting()` still
+/// returns, while the records carry no row count.
+pub(crate) fn pgaudit_rows_on(library: bool, defined: bool, value: Option<&str>) -> bool {
+    library && defined && value.is_some_and(|v| v.eq_ignore_ascii_case("on"))
+}
+
 impl AuditProbe {
+    /// pgaudit is loaded and logs reads in this database, but its records carry no row count.
+    pub(crate) fn reads_without_row_counts(&self) -> bool {
+        self.pgaudit_loaded == Some(true) && self.pgaudit_reads && !self.pgaudit_rows
+    }
+
     /// Level proven in this database; `log_readable`: the configured audit
     /// log can be read by the agent.
+    ///
+    /// Full needs the row counts of the source it is read from (ADR-0037,
+    /// refining ADR-0015 decision 4): `pgaudit.log_rows`, since the stream
+    /// at Full reads the pgaudit log only and never polls
+    /// `pg_stat_statements`.
     pub(crate) fn level(&self, log_readable: bool) -> AuditLevel {
         let limited = self.pss_installed && self.pss_loaded && self.stats_visible;
         let pgaudit = self.pgaudit_loaded == Some(true);
-        if log_readable && pgaudit && self.pgaudit_reads && (self.pgaudit_rows || limited) {
+        if log_readable && pgaudit && self.pgaudit_reads && self.pgaudit_rows {
             AuditLevel::Full
         } else if log_readable && pgaudit && (self.pgaudit_reads || self.pgaudit_object_audit) {
             AuditLevel::Partial
@@ -499,6 +522,10 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         notes.push("the configured audit log is not readable by the agent".to_owned());
         codes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
     }
+    // ADR-0037 decision 4: a monitored database whose pgaudit logs reads without row counts, or
+    // whose pgaudit settings could not be read, caps the target at Partial, whatever the other
+    // databases reach.
+    let mut rows_gap = false;
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
             Ok(s) => s,
@@ -519,7 +546,27 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             Err(e) => return unreachable(&e),
         };
         level = level.max(probe.level(log_readable));
-        let (text, probe_codes) = probe_notes(&probe, settings.audit_log.is_some());
+        if probe.reads_without_row_counts() {
+            rows_gap = true;
+            notes.push(format!(
+                "database {}: pgaudit logs reads without row counts, so the target cannot \
+                 reach Full",
+                normalize(database).as_str()
+            ));
+        } else if probe.pgaudit_loaded.is_none() {
+            // Fail closed: settings that could not be read prove no row counts either.
+            rows_gap = true;
+            notes.push(format!(
+                "database {}: pgaudit settings could not be read, so the target cannot reach \
+                 Full",
+                normalize(database).as_str()
+            ));
+        }
+        let (text, probe_codes) = probe_notes(
+            &probe,
+            settings.audit_log.is_some(),
+            settings.audit_log.is_some() && log_readable,
+        );
         notes.extend(text);
         codes.extend(probe_codes);
         let key = (target.id.clone(), database.clone());
@@ -544,6 +591,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             report_notes(&r, &mut codes);
         }
     }
+    level = capped_without_row_counts(level, rows_gap);
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
         // ADR-0015 decision 4: Full once the log is actually read.
         level = AuditLevel::Partial;
@@ -585,7 +633,13 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
 
 /// Explanations of one database's audit prerequisites (log detail and
 /// closed notes). `log_configured`: `postgres.audit_log` is set.
-fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<TargetNote>) {
+/// `log_read`: the configured pgaudit log is readable, i.e. it is the source the stream reads at
+/// Partial or Full; the row-count note only describes that source.
+fn probe_notes(
+    probe: &AuditProbe,
+    log_configured: bool,
+    log_read: bool,
+) -> (Vec<String>, Vec<TargetNote>) {
     let mut text = Vec::new();
     let mut codes = Vec::new();
     if (probe.pgaudit_installed || probe.pgaudit_loaded == Some(true)) && !log_configured {
@@ -607,7 +661,34 @@ fn probe_notes(probe: &AuditProbe, log_configured: bool) -> (Vec<String>, Vec<Ta
         text.push("pgaudit.log does not include the read class".to_owned());
         codes.push(TargetNote::new(NoteCode::AuditPgauditReadClassMissing));
     }
+    if probe.reads_without_row_counts() {
+        // ADR-0037: the local detail names the setting; the closed note is the
+        // registered `audit.log_without_row_counts` (`postgres` since ROADMAP
+        // v0.1.x item (n)). Settings that could not be read get neither: they
+        // prove nothing about row counts (check() caps the level and says so
+        // locally).
+        text.push(
+            "pgaudit.log_rows is off or not defined (pgaudit before 1.6): the pgaudit records \
+             carry no row count, so Full is not reached and volume signals are absent"
+                .to_owned(),
+        );
+        // Not when `pg_stat_statements` is the source (log not configured or unreadable): its
+        // rows are counted.
+        if log_read {
+            codes.push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
+        }
+    }
     (text, codes)
+}
+
+/// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
+/// also logs their row counts.
+fn capped_without_row_counts(level: AuditLevel, rows_gap: bool) -> AuditLevel {
+    if level == AuditLevel::Full && rows_gap {
+        AuditLevel::Partial
+    } else {
+        level
+    }
 }
 
 fn summary(r: &Report) -> Vec<String> {
@@ -862,7 +943,13 @@ pub(crate) async fn audit_probe(
             p.pgaudit_loaded = Some(library && log.is_some());
             p.pgaudit_placeholders = !library && log.is_some();
             p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
-            p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
+            let rows_defined = rows
+                .first()
+                .map(|r| col::<Option<bool>>(r, 6))
+                .transpose()?
+                .flatten()
+                .unwrap_or(false);
+            p.pgaudit_rows = pgaudit_rows_on(library, rows_defined, setting(1)?.as_deref());
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
             p.pgaudit_log_level = setting(3)?;
             if p.pgaudit_loaded == Some(true) {
@@ -1078,6 +1165,10 @@ mod tests {
             .collect()
     }
 
+    fn codes(notes: &[TargetNote]) -> Vec<&'static str> {
+        notes.iter().map(|n| n.code().as_str()).collect()
+    }
+
     fn assert_registered(notes: &[TargetNote]) {
         let registered = registered_for_postgres();
         for n in notes {
@@ -1150,7 +1241,7 @@ mod tests {
             pgaudit_reads: false,
             ..AuditProbe::default()
         };
-        let (text, notes) = probe_notes(&loaded, false);
+        let (text, notes) = probe_notes(&loaded, false, false);
         assert_eq!(text.len(), notes.len());
         assert_registered(&notes);
         assert_eq!(
@@ -1165,12 +1256,12 @@ mod tests {
             pgaudit_loaded: Some(false),
             ..AuditProbe::default()
         };
-        let (_, notes) = probe_notes(&placeholders, true);
+        let (_, notes) = probe_notes(&placeholders, true, true);
         assert_eq!(
             notes_json(&notes),
             serde_json::json!([{"code": "audit.pgaudit_not_loaded"}])
         );
-        let (_, notes) = probe_notes(&AuditProbe::default(), false);
+        let (_, notes) = probe_notes(&AuditProbe::default(), false, false);
         assert!(notes.is_empty());
     }
 
@@ -1247,6 +1338,19 @@ mod tests {
     }
 
     #[test]
+    fn pgaudit_log_rows_is_proven_not_assumed() {
+        assert!(pgaudit_rows_on(true, true, Some("on")));
+        assert!(pgaudit_rows_on(true, true, Some("ON")));
+        assert!(!pgaudit_rows_on(true, true, Some("off")));
+        assert!(!pgaudit_rows_on(true, true, None));
+        // A placeholder: set, but not defined by the loaded pgaudit (1.5,
+        // PostgreSQL 13), or the library not loaded at all.
+        assert!(!pgaudit_rows_on(true, false, Some("on")));
+        assert!(!pgaudit_rows_on(false, false, Some("on")));
+        assert!(!pgaudit_rows_on(false, true, Some("on")));
+    }
+
+    #[test]
     fn audit_level_is_proven_not_assumed() {
         let full_prereqs = AuditProbe {
             pss_installed: true,
@@ -1262,22 +1366,40 @@ mod tests {
             pgaudit_log_catalog: None,
             pss_schema: None,
         };
-        // Full needs the audit log to be readable (ADR-0015 decision 4).
-        assert_eq!(full_prereqs.level(true), AuditLevel::Full);
+        // pgaudit reads and pg_stat_statements, no pgaudit.log_rows: Partial
+        // (ADR-0037). The Full stream reads the pgaudit log only, so
+        // pg_stat_statements is no volume source for it.
+        assert_eq!(full_prereqs.level(true), AuditLevel::Partial);
         assert_eq!(full_prereqs.level(false), AuditLevel::Limited);
-        // Volumes from pgaudit.log_rows alone.
-        let rows_only = AuditProbe {
-            pss_loaded: false,
+        // pgaudit.log_rows on: Full, with or without pg_stat_statements; the
+        // log must be readable (ADR-0015 decision 4).
+        let with_rows = AuditProbe {
             pgaudit_rows: true,
             ..full_prereqs.clone()
         };
+        assert_eq!(with_rows.level(true), AuditLevel::Full);
+        assert_eq!(with_rows.level(false), AuditLevel::Limited);
+        let rows_only = AuditProbe {
+            pss_loaded: false,
+            ..with_rows.clone()
+        };
         assert_eq!(rows_only.level(true), AuditLevel::Full);
-        // No volume source: Partial.
+        assert_eq!(rows_only.level(false), AuditLevel::None);
+        // No volume source at all: Partial.
         let no_volume = AuditProbe {
             pss_loaded: false,
             ..full_prereqs.clone()
         };
         assert_eq!(no_volume.level(true), AuditLevel::Partial);
+        // log_rows without the read class gives no Full.
+        assert_eq!(
+            AuditProbe {
+                pgaudit_reads: false,
+                ..with_rows.clone()
+            }
+            .level(true),
+            AuditLevel::Limited
+        );
         // pgaudit not logging reads: object audit only is Partial, else Limited.
         let no_reads = AuditProbe {
             pgaudit_reads: false,
@@ -1323,5 +1445,155 @@ mod tests {
         ] {
             assert_eq!(p.level(false), AuditLevel::None);
         }
+    }
+
+    /// The whole reads x rows x `pg_stat_statements` matrix, pgaudit loaded
+    /// and its log readable, no object audit (ADR-0037): Full only with
+    /// both the read class and `pgaudit.log_rows`.
+    #[test]
+    fn full_requires_pgaudit_log_rows() {
+        for reads in [false, true] {
+            for rows in [false, true] {
+                for pss in [false, true] {
+                    let p = AuditProbe {
+                        pss_installed: pss,
+                        pss_loaded: pss,
+                        stats_visible: pss,
+                        pgaudit_installed: true,
+                        pgaudit_loaded: Some(true),
+                        pgaudit_reads: reads,
+                        pgaudit_rows: rows,
+                        ..AuditProbe::default()
+                    };
+                    let expected = match (reads, rows, pss) {
+                        (true, true, _) => AuditLevel::Full,
+                        (true, false, _) => AuditLevel::Partial,
+                        (false, _, true) => AuditLevel::Limited,
+                        (false, _, false) => AuditLevel::None,
+                    };
+                    assert_eq!(
+                        p.level(true),
+                        expected,
+                        "reads {reads} rows {rows} pss {pss}"
+                    );
+                    // Without a readable log, pgaudit gives nothing.
+                    let unreadable = if pss {
+                        AuditLevel::Limited
+                    } else {
+                        AuditLevel::None
+                    };
+                    assert_eq!(
+                        p.level(false),
+                        unreadable,
+                        "reads {reads} rows {rows} pss {pss}"
+                    );
+                    // At Partial and Full the stream reads the pgaudit log.
+                    if reads {
+                        assert_eq!(
+                            crate::audit::source_for(p.level(true)),
+                            crate::audit::Source::Pgaudit
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_database_without_row_counts_caps_the_target() {
+        use AuditLevel::*;
+        for level in [None, Limited, Partial, Full] {
+            assert_eq!(capped_without_row_counts(level, false), level);
+        }
+        assert_eq!(capped_without_row_counts(Full, true), Partial);
+        for level in [None, Limited, Partial] {
+            assert_eq!(capped_without_row_counts(level, true), level);
+        }
+    }
+
+    #[test]
+    fn missing_log_rows_is_explained_and_noted() {
+        let p = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            ..AuditProbe::default()
+        };
+        let (text, notes) = probe_notes(&p, true, true);
+        assert_eq!(codes(&notes), ["audit.log_without_row_counts"]);
+        assert_registered(&notes);
+        assert_eq!(text.len(), 1);
+        assert!(text[0].contains("pgaudit.log_rows"), "{text:?}");
+        // The pgaudit log configured but unreadable: `pg_stat_statements` is the source and
+        // counts rows, so the detail stays local and no note is sent.
+        let (text, notes) = probe_notes(&p, true, false);
+        assert!(
+            text.iter().any(|t| t.contains("pgaudit.log_rows")),
+            "{text:?}"
+        );
+        assert!(
+            !codes(&notes).contains(&"audit.log_without_row_counts"),
+            "{notes:?}"
+        );
+        // No log configured: the same.
+        let (_, notes) = probe_notes(&p, false, false);
+        assert!(
+            !codes(&notes).contains(&"audit.log_without_row_counts"),
+            "{notes:?}"
+        );
+        // Row counts on: neither the detail nor the note.
+        let (text, notes) = probe_notes(
+            &AuditProbe {
+                pgaudit_rows: true,
+                ..p.clone()
+            },
+            true,
+            true,
+        );
+        assert!(text.is_empty(), "{text:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+        // pgaudit not logging reads, not loaded, or its settings not readable
+        // (`pgaudit_loaded: None`, capped by check() with a local detail only):
+        // no row-count note.
+        for probe in [
+            AuditProbe {
+                pgaudit_reads: false,
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_loaded: Some(false),
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_loaded: None,
+                ..p.clone()
+            },
+        ] {
+            let (_, notes) = probe_notes(&probe, true, true);
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| n.code() == NoteCode::AuditLogWithoutRowCounts),
+                "{probe:?}: {notes:?}"
+            );
+        }
+    }
+
+    /// Two databases without row counts give one note (check() merges the
+    /// per-database notes).
+    #[test]
+    fn row_count_note_is_deduplicated_across_databases() {
+        let p = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            ..AuditProbe::default()
+        };
+        let mut merged = Notes::default();
+        for _ in 0..2 {
+            let (_, notes) = probe_notes(&p, true, true);
+            merged.extend(notes);
+        }
+        assert_eq!(codes(merged.as_slice()), ["audit.log_without_row_counts"]);
     }
 }

@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey.svg" alt="Platform: Linux">
 </p>
 
-> **v0.1.0 — first release (MVP)**, published on 2026-09-30: [release notes and signed artifacts](https://github.com/Yil00/databastion/releases/tag/0.1.0). This is early-stage software: read the known limitations in the [CHANGELOG](CHANGELOG.md) and in [SECURITY.md](SECURITY.md#known-limitations-and-residual-risks) before relying on it. What comes next: [roadmap](docs/ROADMAP.md).
+> **v0.2.0** (2026-10-03), a maintenance release of the first release (MVP) v0.1.0 of 2026-09-30: [release notes and signed artifacts](https://github.com/Yil00/databastion/releases/latest). This is early-stage software: read the known limitations in the [CHANGELOG](CHANGELOG.md) and in [SECURITY.md](SECURITY.md#known-limitations-and-residual-risks) before relying on it. What comes next: [roadmap](docs/ROADMAP.md).
 
 ## Why
 Traditional DLPs monitor endpoints and the network. They know neither **where** sensitive data sits in your databases, nor **who** is exporting it in bulk (`pg_dump`, `mysqldump`, `mongoexport`, LDIF exports…).
@@ -26,19 +26,19 @@ DataBastion sits **as close to the data as possible**:
 - **Audit**: uses the engines' native logs to detect abnormal access and exports, weighted by the sensitivity of the data involved.
 
 ## Supported databases
-| Engine | Discovery | Audit (best level) | Audit source | Tested in CI | Notes |
+| Engine | Discovery | Audit (best level) | Audit source | Versions tested | Notes |
 |--------|-----------|--------------------|--------------|--------------|-------|
-| PostgreSQL | ✅ | Full with pgaudit (plus a volume source); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 17 (17.11, with pgaudit) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` otherwise; other versions not tested |
-| MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.4 (8.4.11) | Privileges held through roles evaluated on 8.0.19+ |
+| PostgreSQL | ✅ | Full with pgaudit and `pgaudit.log_rows = on` (Partial without it); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 14, 15, 16, 17, 18 (**17.11** with pgaudit on every change) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14. 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`, PostgreSQL 14+) |
+| MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.0, 8.4, 9.7 (**8.4.11** on every change) | Privileges held through roles evaluated on 8.0.19+ |
 | Percona Server for MySQL | ✅ | Partial, never Full | `audit_log` / `audit_log_filter` JSON log | 8.4 (8.4.11-11) | |
-| MariaDB | ✅ | Partial, never Full | `server_audit` log file, or `performance_schema` | 11.4 (11.4.13) | `PUBLIC` grants checked on 10.11+ |
-| MongoDB Community | ✅ | Limited (slow operations only) | Server log, profiler | 8.0 (8.0.32) | Requires MongoDB 5.0+ (enforced), SCRAM-SHA-256, one declared host |
+| MariaDB | ✅ | Partial, never Full | `server_audit` log file, or `performance_schema` | 10.11, 11.4, 11.8 (**11.4.13** on every change) | `PUBLIC` grants checked on 10.11+ |
+| MongoDB Community | ✅ | Limited (slow operations only) | Server log, profiler | 6.0, 7.0, 8.0 (**8.0.32** on every change) | Requires MongoDB 5.0+ (enforced), SCRAM-SHA-256, one declared host |
 | MongoDB Enterprise / Percona Server for MongoDB | ✅ | Partial, never Full | `auditLog` JSON file | Percona Server for MongoDB 8.0 (8.0.32-14) | MongoDB Enterprise: recorded log samples only |
 | OpenLDAP | ✅ | Full when reads and failed operations are proven logged for every naming context; Partial / Limited otherwise | `slapo-accesslog` (`cn=accesslog`) | Debian bookworm `slapd` (OpenLDAP 2.5) | |
 
 *CAS planned right after the MVP.*
 
-- **Tested in CI**: the versions exercised by the connector integration tests and the end-to-end tests. Other versions are expected to work but are not tested yet; a CI matrix of engine versions is planned for v0.1.x ([roadmap](docs/ROADMAP.md#v01x-follow-ups)).
+- **Versions tested**: the connector integration tests run weekly on every listed version, and on changes to the connectors or the dev images (engine-matrix workflow, [`.github/workflows/engine-matrix.yml`](.github/workflows/engine-matrix.yml); not a required check). The version in bold is also tested on every change, with the end-to-end tests. Percona Server and OpenLDAP: the version listed only. Other versions are expected to work but are not tested.
 - **Audit levels** (Full / Partial / Limited / None), their prerequisites and each engine's limits: [capability matrix](docs/08-engine-capabilities.md#matrix). Each target reports its actual level in the console.
 
 ## Quick start

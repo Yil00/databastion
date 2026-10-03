@@ -189,6 +189,10 @@ services:
   target-mariadb:
     <<: *hardening
     image: *mariadb-image
+    # dev/mariadb/tls-entrypoint.sh creates the TLS material, then runs the image's entrypoint
+    # (an entrypoint override drops the image's CMD: set it again).
+    entrypoint: ["/bin/bash", "/usr/local/bin/databastion-tls-entrypoint.sh"]
+    command: ["mariadbd"]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     cpus: ${LOAD_DB_CPUS:-2}
     environment:
@@ -206,7 +210,7 @@ services:
       - ../../dev/seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ../target-initdb/15-agent-password.sh:/docker-entrypoint-initdb.d/15-agent-password.sh:ro
       - ../../dev/mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
-      - ../../dev/mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
+      - ../../dev/mariadb/tls-entrypoint.sh:/usr/local/bin/databastion-tls-entrypoint.sh:ro
       - ./initdb/40-load-account.sh:/docker-entrypoint-initdb.d/40-load-account.sh:ro
       - target-mariadb-log:/var/log/databastion
     tmpfs: [/var/lib/mysql, /run/mysqld, /tmp]

@@ -1543,6 +1543,61 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         pre.own_addr, expected_client,
         "agent address as seen by the server"
     );
+    // `pgaudit.log_rows` exists from pgaudit 1.6 (PostgreSQL 14) on
+    // (docs/08-engine-capabilities.md): with pgaudit 1.5 (PostgreSQL 13),
+    // records carry no row count, so no `volume.large_result` on this source.
+    let log_rows: bool = a
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_settings \
+             WHERE name = 'pgaudit.log_rows' AND vartype = 'bool')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // The dev image installs the PGDG pgaudit of the server's major version: the probe above
+    // must find `log_rows` from PostgreSQL 14 on, or an under-report would pass unnoticed.
+    let server_version: i32 = a
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        log_rows,
+        server_version >= 140_000,
+        "pgaudit.log_rows defined on server_version_num {server_version}"
+    );
+    // Defined is not enough: the records carry row counts only when the
+    // value is on in the monitored database (the dev image sets it on), and
+    // Full needs them (ADR-0037).
+    let rows_on: Option<String> = admin(&adm, &u.dbname)
+        .await
+        .query_one("SELECT current_setting('pgaudit.log_rows', true)", &[])
+        .await
+        .unwrap()
+        .get(0);
+    // The dev, e2e and load images set it on: where pgaudit defines it, it must be on, so that a
+    // lost setting fails here instead of switching this test to its Partial branch unnoticed.
+    if log_rows {
+        assert!(
+            rows_on
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("on")),
+            "pgaudit.log_rows must be on in the dev image (got {rows_on:?})"
+        );
+    }
+    let expected_level = if log_rows {
+        AuditLevel::Full
+    } else {
+        AuditLevel::Partial
+    };
+    if !log_rows {
+        eprintln!(
+            "pgaudit.log_rows: not defined by this server's pgaudit (before 1.6, \
+             PostgreSQL 13): row counts and volume.large_result checked absent, and \
+             the level checked Partial instead of Full (ADR-0037)"
+        );
+    }
     a.batch_execute(
         "DROP TABLE IF EXISTS crm.it_audit_big; \
          CREATE TABLE crm.it_audit_big AS SELECT g AS id, 'x' || g AS v FROM generate_series(1, 20000) g",
@@ -1586,14 +1641,25 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         let mut events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
             has(ev, "customers", "signature.pg_dump")
-                && has(ev, "it_audit_big", "volume.large_result")
+                && (!log_rows || has(ev, "it_audit_big", "volume.large_result"))
                 && has(ev, "it_audit_big", "shape.full_table_read")
                 && has(ev, "customers", "signature.copy_to_program")
         })
         .await;
         task.abort();
         let health = connector.check(&t).await;
-        assert_eq!(health.audit_level, AuditLevel::Full, "{format}: {health:?}");
+        assert_eq!(health.audit_level, expected_level, "{format}: {health:?}");
+        // The reason for Partial reaches the console (ROADMAP v0.1.x item (n)).
+        assert_eq!(
+            health
+                .notes
+                .iter()
+                .any(|n| n.code() == NoteCode::AuditLogWithoutRowCounts),
+            !log_rows,
+            "{format}: {:?}",
+            health.notes
+        );
+        assert_registered_notes(&health.notes);
         let all: Vec<String> = events.iter().map(describe).collect();
         for d in &all {
             eprintln!("{format}: {d}");
@@ -1610,8 +1676,9 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
             has(&events, "invoices", "signature.pg_dump"),
             "{format}: {all:#?}"
         );
-        assert!(
+        assert_eq!(
             has(&events, "it_audit_big", "volume.large_result"),
+            log_rows,
             "{format}: {all:#?}"
         );
         assert!(
@@ -1635,7 +1702,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
                         .any(|o| o.object().as_str() == "it_audit_big")
             })
             .unwrap();
-        assert_eq!(big.rows(), Some(20_000), "pgaudit.log_rows");
+        assert_eq!(big.rows(), log_rows.then_some(20_000), "pgaudit.log_rows");
         assert_eq!(big.principal().account_name(), adm.user);
         assert_eq!(big.principal().client(), expected_client);
         // The value-bearing table name of the seed never leaves as is.

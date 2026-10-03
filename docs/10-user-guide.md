@@ -2,7 +2,7 @@
 
 How to install the console and an agent, enroll the agent, declare targets, give the agent least-privilege accounts, and read findings and incidents. This page only describes what the code on `dev` does; the component READMEs linked below hold the full reference.
 
-> **Status.** v0.1.0 was released on 2026-09-30 ([release](https://github.com/Yil00/databastion/releases/tag/0.1.0)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+> **Status.** v0.1.0, the first release, was published on 2026-09-30 and v0.2.0, a maintenance release with no change to the agent, the protocol or the console runtime, on 2026-10-03 ([latest release](https://github.com/Yil00/databastion/releases/latest)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
 
 New to DataBastion? The [tutorial](11-tutorial.md) walks through a first installation and a first scan step by step, and through a development setup with `make`.
 
@@ -125,7 +125,7 @@ Also:
 - At every heartbeat the agent checks each account and reports over-privilege and coverage problems as **target notes** on the agent page. A note about over-privilege means the account has more rights than recommended: remove them.
 
 ## 8. Audit prerequisites and levels
-What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations.
+What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)).
 
 ## 9. Discovery: scans and findings
 1. On the agent page, open **Scan** on a target (administrator). Parameters are optional: rows sampled per object (default 200), maximum duration (3600 s since #94, to leave room for paced scans), statement timeout (30 s), database / schema / object filters and classifiers. The agent caps them with its local `limits`.
