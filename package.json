@@ -14,6 +14,7 @@
     "release-it": "21.1.0"
   },
   "overrides": {
+    "basic-ftp": "6.2.1",
     "undici": "7.29.1"
   },
   "engines": {

@@ -7,6 +7,12 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🔒 Security
+- Release tooling: `basic-ftp` forced to 6.2.1 under `release-it` (GHSA-c475-qrg2-pj4r, a denial of service in its directory-listing parser; release-it never uses FTP), which turns the "Release tooling advisories" check green
+
+### 🐛 Bug Fixes
+- Version bumps update the root `package-lock.json` too, whose version stayed at `0.0.0`
+
 ## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
 
 This release was planned as a patch release 0.1.1; the `feat` commit of #116 made release-it compute a minor version. No change to the agent, the protocol or the console runtime: upgrading from 0.1.0 is optional.
