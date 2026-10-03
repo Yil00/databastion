@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
+
+### ✨ Features
+
+* **dev:** make targets, tutorial and README (supported databases, quick start) ([#116](https://github.com/Yil00/databastion/issues/116)) ([f2a9027](https://github.com/Yil00/databastion/commit/f2a90271fca388406caf4c0cdd2f2dbdd7035d39))
+
+### 🐛 Bug Fixes
+
+* **console:** force esbuild >= 0.25 under drizzle-kit (Dependabot esbuild advisory) ([#114](https://github.com/Yil00/databastion/issues/114)) ([d1c7515](https://github.com/Yil00/databastion/commit/d1c7515475650a40af5f4a7e6f35eb32318f9d5f))
+* **deploy:** refresh agent/fuzz/Cargo.lock on version bumps (P7) ([f44456f](https://github.com/Yil00/databastion/commit/f44456fd87093451240c9f8498d736069badf568))
+* **deploy:** scope RELEASE_TOKEN to the release-it step and pin the release toolchain (v0.1.x) ([#115](https://github.com/Yil00/databastion/issues/115)) ([92663bf](https://github.com/Yil00/databastion/commit/92663bf58b90664f61f488bee7cccd337adfbcac))
+
+### 📝 Documentation
+
+* v0.1.0 released, changelog tidy and v0.1.x follow-ups ([#113](https://github.com/Yil00/databastion/issues/113)) ([50b13b3](https://github.com/Yil00/databastion/commit/50b13b35f6e872885d334b30b997ca9ca78668b1))
+
 All notable changes to DataBastion are recorded here.
 
 This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
