@@ -1567,10 +1567,26 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         server_version >= 140_000,
         "pgaudit.log_rows defined on server_version_num {server_version}"
     );
+    // Defined is not enough: the records carry row counts only when the
+    // value is on in the monitored database (the dev image sets it on), and
+    // Full needs them (ADR-0037).
+    let rows_on: Option<String> = admin(&adm, &u.dbname)
+        .await
+        .query_one("SELECT current_setting('pgaudit.log_rows', true)", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let log_rows = log_rows && rows_on.is_some_and(|v| v.eq_ignore_ascii_case("on"));
+    let expected_level = if log_rows {
+        AuditLevel::Full
+    } else {
+        AuditLevel::Partial
+    };
     if !log_rows {
         eprintln!(
-            "pgaudit.log_rows: not defined by this server's pgaudit (before 1.6, \
-             PostgreSQL 13): row counts and volume.large_result checked absent instead"
+            "pgaudit.log_rows: off or not defined by this server's pgaudit (before 1.6, \
+             PostgreSQL 13): row counts and volume.large_result checked absent, and \
+             the level checked Partial instead of Full (ADR-0037)"
         );
     }
     a.batch_execute(
@@ -1623,7 +1639,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         .await;
         task.abort();
         let health = connector.check(&t).await;
-        assert_eq!(health.audit_level, AuditLevel::Full, "{format}: {health:?}");
+        assert_eq!(health.audit_level, expected_level, "{format}: {health:?}");
         let all: Vec<String> = events.iter().map(describe).collect();
         for d in &all {
             eprintln!("{format}: {d}");

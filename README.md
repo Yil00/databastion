@@ -28,7 +28,7 @@ DataBastion sits **as close to the data as possible**:
 ## Supported databases
 | Engine | Discovery | Audit (best level) | Audit source | Versions tested | Notes |
 |--------|-----------|--------------------|--------------|--------------|-------|
-| PostgreSQL | ✅ | Full with pgaudit (plus a volume source); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 14, 15, 16, 17, 18 (**17.11** with pgaudit on every change) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14. 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`, PostgreSQL 14+) |
+| PostgreSQL | ✅ | Full with pgaudit and `pgaudit.log_rows = on` (Partial without it); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 14, 15, 16, 17, 18 (**17.11** with pgaudit on every change) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14. 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`, PostgreSQL 14+) |
 | MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.0, 8.4, 9.7 (**8.4.11** on every change) | Privileges held through roles evaluated on 8.0.19+ |
 | Percona Server for MySQL | ✅ | Partial, never Full | `audit_log` / `audit_log_filter` JSON log | 8.4 (8.4.11-11) | |
 | MariaDB | ✅ | Partial, never Full | `server_audit` log file, or `performance_schema` | 10.11, 11.4, 11.8 (**11.4.13** on every change) | `PUBLIC` grants checked on 10.11+ |
