@@ -1649,6 +1649,17 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         task.abort();
         let health = connector.check(&t).await;
         assert_eq!(health.audit_level, expected_level, "{format}: {health:?}");
+        // The reason for Partial reaches the console (ROADMAP v0.1.x item (n)).
+        assert_eq!(
+            health
+                .notes
+                .iter()
+                .any(|n| n.code() == NoteCode::AuditLogWithoutRowCounts),
+            !log_rows,
+            "{format}: {:?}",
+            health.notes
+        );
+        assert_registered_notes(&health.notes);
         let all: Vec<String> = events.iter().map(describe).collect();
         for d in &all {
             eprintln!("{format}: {d}");
