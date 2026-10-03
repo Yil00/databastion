@@ -87,12 +87,13 @@ All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifac
 3. Open a `dev` → `main` PR titled `release: X.Y.Z`.
 4. On merge (the push of the merge commit to `main`), the CI ([release.yml](.github/workflows/release.yml), `release-it`, config [.release-it.json](.release-it.json)) waits for the maintainer's approval of the `release-it` environment, then:
    - computes the version from the commits and the latest tag,
-   - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, later the Helm chart),
+   - updates the version numbers with [scripts/bump-version.mjs](scripts/bump-version.mjs) (`package.json`, `console/package.json`, `agent/Cargo.toml` + `Cargo.lock`, `agent/fuzz/Cargo.lock` since #112, later the Helm chart),
    - generates the [CHANGELOG.md](CHANGELOG.md) section,
    - commits `chore(release): X.Y.Z` under the owner's noreply identity, creates the `X.Y.Z` tag and pushes it with `RELEASE_TOKEN`,
    - creates a **draft GitHub release**.
 5. The tag push starts [publish.yml](.github/workflows/publish.yml): its jobs that push images or sign wait in the `release` environment for the maintainer's approval (*Review deployments*: the image builds, then the signature, then the release assets). It builds and signs the images, the `.deb` files and `SHA256SUMS`, attaches them to the draft, and runs the installation test with them.
 6. The maintainer reviews the draft (assets present, publish run green), adds upgrade notes if needed, and **publishes** the release. Assets are only ever attached to a draft.
+   Until this is automated (a v0.1.x item in the [ROADMAP](docs/ROADMAP.md)), the generated section is inserted right after the `# Changelog` line, above the introduction, and lists only the commits since the previous tag, pre-releases included. After each release the maintainer moves the curated "Unreleased" notes under the new version section (merging the generated bullets into them), leaves an empty "Unreleased" section below the introduction, and pastes the curated notes into the draft release notes.
 7. Open a PR `main` → `dev` titled `chore: back-merge X.Y.Z into dev` and merge it with a **merge commit**, to bring back the version commit.
 
 To merge into `main` without publishing (CI, documentation…): add `[skip-release]` to the PR title, as on Portabase (GitHub copies the title into the merge or squash commit message, which `release.yml` reads: keep the default commit messages). **Required as long as there is no code**: without a `feat`/`fix` commit, release-it would publish an empty patch version.

@@ -54,6 +54,16 @@ function bumpCargo(path) {
   }
 }
 
+// Other Cargo workspaces that depend on the agent crates by path (agent/fuzz): their own version is
+// left as is, only their lockfile entries for the bumped crates are refreshed, so `--locked` builds
+// keep working after a release.
+function refreshCargoLock(manifest) {
+  const lock = manifest.replace(/Cargo\.toml$/, "Cargo.lock");
+  if (!existsSync(manifest) || !existsSync(lock)) return;
+  execFileSync("cargo", ["update", "--workspace", "--offline", "--manifest-path", manifest], { stdio: "inherit" });
+  updated.push(lock);
+}
+
 function bumpYamlKeys(path, keys) {
   if (!existsSync(path)) return;
   let text = readFileSync(path, "utf8");
@@ -67,6 +77,7 @@ function bumpYamlKeys(path, keys) {
 bumpJson("package.json");
 bumpJson("console/package.json");
 bumpCargo("agent/Cargo.toml");
+refreshCargoLock("agent/fuzz/Cargo.toml");
 bumpYamlKeys("helm/databastion/Chart.yaml", ["version", "appVersion"]);
 
 console.log(`version ${version} → ${updated.length ? updated.join(", ") : "no files"}`);

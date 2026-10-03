@@ -1,21 +1,27 @@
 # Changelog
 
-## [0.1.0](https://github.com/Yil00/databastion/compare/0.1.0-rc.2...0.1.0) (2026-09-30)
-
-### 🐛 Bug Fixes
-
-* **deploy:** fetch the agent dependencies before the release version bump (P7) ([#109](https://github.com/Yil00/databastion/issues/109)) ([df40ddb](https://github.com/Yil00/databastion/commit/df40ddbfbdd13977eac11d4976f6849cdf9524f6))
-
-### 📝 Documentation
-
-* holdout rotation, pre-release 0.1.0-rc.2 and deferred stability test (P7) ([#106](https://github.com/Yil00/databastion/issues/106)) ([7040877](https://github.com/Yil00/databastion/commit/70408776f9f6d0f867b0017d03810ac5aea53a7c))
-
 All notable changes to DataBastion are recorded here.
 
 This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
 The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
+
+### ✨ Features
+- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section
+
+### 🐛 Bug Fixes
+- Version bumps refresh `agent/fuzz/Cargo.lock` too, which `main` was missing after the `0.1.0` back-merge (red "Agent fuzz smoke" and cargo-deny on `main` until the next release) (#112)
+- Console: `esbuild` forced to 0.25 or later under the `drizzle-kit` development dependency (Dependabot advisory) (#114)
+
+### 🔒 Security
+- `release.yml`: checked out without stored credentials, `RELEASE_TOKEN` given only to the release-it step and removed from the git configuration when it ends; Rust toolchain pinned to 1.85.0, the workspace `rust-version` (#115)
+
+### 📝 Documentation
+- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make`
+- README: v0.1.0 status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start
+
+## [0.1.0](https://github.com/Yil00/databastion/releases/tag/0.1.0) (2026-09-30)
 
 ### ⚠️ Known limitations
 Details and rationale are in [docs/05-security.md](docs/05-security.md), [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) and the ADRs linked below; this list only points to them.
@@ -76,6 +82,7 @@ Details and rationale are in [docs/05-security.md](docs/05-security.md), [docs/0
 - Agent: an audit log truncated in place while the agent was stopped is detected through keyed fingerprints in the tail cursor and read from its start instead of resuming mid-file (`audit_cursor_reset_total`) (#97)
 - Console: one Discovery scan per agent at a time: a pending `discovery.scan` is delivered only after the agent's previous scan reaches a terminal state (which wakes the agent's held poll), so scans requested together no longer time out in the agent's queue before they start; claims serialized by a per-agent advisory lock taken in one lock order with revocation, the rotation-conflict lock, scan requests and Audit settings; dead scans swept at claim; a held scan of an online agent kept from expiring (refreshed to now + 1 h, at most 24 h after the request) and shown as "pending (waiting for the previous scan of this agent)"; `expires_at` raised to at least now + 1 h at delivery; a scan rejected by the contract check no longer holds the next one; `GET /jobs` limited to 20 requests per agent per 20 s (`429` + `Retry-After`) (#98, ADR-0036)
 - MongoDB: an authentication abandoned before any proof (result 337, e.g. a driver closing its pool mid-handshake) is no longer reported as a failed login (#100)
+- Deploy: fetch the agent dependencies before the release version bump (#109)
 
 ### 🐛 Agent classifiers
 - Value-based column classification: birth dates, person names and postal addresses are detected without a column-name hint (age distribution, name lexicon, address structure); broader phone, IBAN, NIR, AWS key and password-hash formats; card and e-mail precision rules (checksum consistency, personal mailboxes only)
@@ -101,6 +108,7 @@ Details and rationale are in [docs/05-security.md](docs/05-security.md), [docs/0
 - ADR-0036 (console Discovery scan scheduling, refines ADR-0035) records #98; the protocol, engine-capability and user-guide pages are updated for #98 and #100
 - ADR-0034 (release signing from the tag push) accepted; the user guide's installation sections point to `deploy/README.md` (#86)
 - ADR-0035 (Discovery pacing, accepted in #96); engine capabilities, security, protocol and user-guide pages updated for the paced Discovery and the MySQL / MariaDB audit-log grouping, which refines ADR-0023 (#93)
+- Holdout seed rotation, pre-release 0.1.0-rc.2 and deferred 72 h stability test (#106)
 
 ### 👷 CI
 - CI (documentation, gitleaks, console, agent, protocol), PR title and DCO checks

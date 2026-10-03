@@ -2,7 +2,9 @@
 
 How to install the console and an agent, enroll the agent, declare targets, give the agent least-privilege accounts, and read findings and incidents. This page only describes what the code on `dev` does; the component READMEs linked below hold the full reference.
 
-> **Status.** v0.1.0 is being prepared (ROADMAP [phase 7](ROADMAP.md#phase-7--hardening--v010-release)). No release has been published yet: the first pre-release is `0.1.0-rc.1`. The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is not done yet. Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+> **Status.** v0.1.0 was released on 2026-09-30 ([release](https://github.com/Yil00/databastion/releases/tag/0.1.0)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+
+New to DataBastion? The [tutorial](11-tutorial.md) walks through a first installation and a first scan step by step, and through a development setup with `make`.
 
 ## 1. What you deploy
 | Component | Where | Network |

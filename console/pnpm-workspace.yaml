@@ -9,3 +9,7 @@ onlyBuiltDependencies:
 # not allowed in the Apache-2.0 console image (I7, ADR-0005).
 ignoredOptionalDependencies:
   - sharp
+# drizzle-kit 0.31 (dev only) pulls esbuild 0.18 through the deprecated @esbuild-kit/core-utils;
+# esbuild < 0.25 has a dev-server advisory (GHSA-67mh-4wv8-2f99). Force a fixed version there.
+overrides:
+  '@esbuild-kit/core-utils>esbuild': ^0.25.0
