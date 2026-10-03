@@ -67,11 +67,14 @@ jobs:
             exit 1
           fi
 
+      # Checked out without stored credentials: RELEASE_TOKEN reaches git only inside the release-it
+      # step below, so no earlier step (npm ci, the toolchain, cargo fetch) can read it from
+      # .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
+          persist-credentials: false
 
       # Release exactly the approved push: commits that reached main while the approval was pending
       # get their own run.
@@ -86,11 +89,13 @@ jobs:
 
       - run: npm ci --ignore-scripts
 
+      # Pinned (the workspace's rust-version): the release commit's Cargo.lock does not depend on
+      # whichever stable release the runner gets.
       - name: Rust (to update agent/Cargo.lock)
         if: hashFiles('agent/Cargo.lock') != ''
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: stable
+          toolchain: 1.85.0
 
       # bump-version.mjs runs `cargo update --workspace --offline` to rewrite the workspace crate
       # versions in agent/Cargo.lock: the registry must be in the local cache first (a fresh runner
@@ -111,11 +116,17 @@ jobs:
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
 
+      # The only step that holds RELEASE_TOKEN: as GITHUB_TOKEN for release-it's GitHub release, and
+      # as a git credential set for this step's pushes and removed when it ends, even on failure.
       - name: release-it
         id: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
           VERSION=$(npx release-it --ci --release-version)
           echo "Computed version: $VERSION"
           npx release-it --ci
