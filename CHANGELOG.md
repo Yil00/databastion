@@ -18,6 +18,7 @@ The project follows [semantic versioning](https://semver.org/).
 - Dev / e2e / load MariaDB services: the dev-only TLS material is created by an entrypoint wrapper before any server starts (`dev/mariadb/tls-entrypoint.sh`, replacing `initdb/30-tls.sh`): MariaDB 10.11 refused to start with the configured `ssl_*` files missing
 - MongoDB connector: an abandoned authentication logged without a numeric `result` (MongoDB 5.0 and 6.0, "Failed to authenticate" at debug level 3) is recognized by its status string and gives no `auth_failure`
 - PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
+- PostgreSQL connector: the Full audit level requires `pgaudit.log_rows` on ([ADR-0037](docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md)); `pg_stat_statements` no longer counts as a volume source for Full, since the Full stream reads only the pgaudit log and its events carried no row count, so `volume.*` policies could never fire. **Upgrade impact**: a server with pgaudit logging reads but `pgaudit.log_rows` off (or pgaudit before 1.6) now reports Partial instead of Full, with the same events; set `pgaudit.log_rows = on` to get Full back
 - Version bumps update the root `package-lock.json` too, whose version stayed at `0.0.0`
 
 ## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
