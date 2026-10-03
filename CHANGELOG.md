@@ -8,12 +8,16 @@ The project follows [semantic versioning](https://semver.org/).
 ## Unreleased
 
 ### 👷 CI
+- Engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 14 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md). PostgreSQL 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`)
 - "Release version" PR check on PRs to `main`: shows the version release-it will compute and fails until the title is `release: X.Y.Z` with that version (or carries `[skip-release]`)
 
 ### 🔒 Security
 - Release tooling: `basic-ftp` forced to 6.2.1 under `release-it` (GHSA-c475-qrg2-pj4r, a denial of service in its directory-listing parser; release-it never uses FTP), which turns the "Release tooling advisories" check green
 
 ### 🐛 Bug Fixes
+- Dev / e2e / load MariaDB services: the dev-only TLS material is created by an entrypoint wrapper before any server starts (`dev/mariadb/tls-entrypoint.sh`, replacing `initdb/30-tls.sh`): MariaDB 10.11 refused to start with the configured `ssl_*` files missing
+- MongoDB connector: an abandoned authentication logged without a numeric `result` (MongoDB 5.0 and 6.0, "Failed to authenticate" at debug level 3) is recognized by its status string and gives no `auth_failure`
+- PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
 - Version bumps update the root `package-lock.json` too, whose version stayed at `0.0.0`
 
 ## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)

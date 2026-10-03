@@ -9,6 +9,8 @@
 # authentication), the MongoDB verify_full TLS server and the Percona Server for MongoDB auditLog
 # service, and SASL EXTERNAL over ldapi://. Dev-only credentials from dev/.env; nothing is printed
 # from them. Every docker call is bounded by `timeout`; the cargo runs by the caller's `timeout`.
+# The engine-matrix workflow (.github/workflows/engine-matrix.yml) runs this script against other
+# engine versions, selected by the DATABASTION_DEV_*_IMAGE variables of docker-compose.yml.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,9 +41,20 @@ cargo_it() { (cd agent && cargo test -p "$1" --all-features --locked -- --nocapt
 
 it_postgres() {
   require_services postgres
+  # Another PostgreSQL image needs its own tag: e2e and the load harness refer to the default name.
+  if [ -n "${DATABASTION_DEV_POSTGRES_IMAGE:-}" ] && [ -z "${DATABASTION_DEV_POSTGRES_TAG:-}" ]; then
+    echo "DATABASTION_DEV_POSTGRES_IMAGE is set: set DATABASTION_DEV_POSTGRES_TAG too (dev/README.md)" >&2
+    exit 2
+  fi
   export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
   export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
-  export DATABASTION_TEST_PG_AUDIT_LOG="$ROOT/dev/.state/logs/postgres/postgresql.json"
+  # The pgaudit log format of the service (docker-compose.yml): jsonlog by default, csvlog for
+  # PostgreSQL 14, where jsonlog does not exist (engine-matrix workflow).
+  case "${DATABASTION_DEV_POSTGRES_LOG_FORMAT:-jsonlog}" in
+    jsonlog) export DATABASTION_TEST_PG_AUDIT_LOG="$ROOT/dev/.state/logs/postgres/postgresql.json" ;;
+    csvlog) export DATABASTION_TEST_PG_AUDIT_CSVLOG="$ROOT/dev/.state/logs/postgres/postgresql.csv" ;;
+    *) echo "DATABASTION_DEV_POSTGRES_LOG_FORMAT must be jsonlog or csvlog" >&2; exit 2 ;;
+  esac
   export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
   cargo_it databastion-connector-postgres
 }

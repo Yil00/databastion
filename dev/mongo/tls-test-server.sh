@@ -39,7 +39,14 @@ set -a
 set +a
 
 image() {
-  sed -n 's/^    image: \(mongo:[^ ]*@sha256:[0-9a-f]*\)$/\1/p' "$DEV/docker-compose.yml" | head -n 1
+  # The `mongo` service line is `image: ${DATABASTION_DEV_MONGO_IMAGE:-mongo:<tag>@sha256:<digest>}`:
+  # the variable when set (engine-matrix workflow), else the pinned default.
+  if [ -n "${DATABASTION_DEV_MONGO_IMAGE:-}" ]; then
+    printf '%s\n' "$DATABASTION_DEV_MONGO_IMAGE"
+    return
+  fi
+  # shellcheck disable=SC2016 # a literal ${...} in the compose file, not a shell expansion
+  sed -n 's/^    image: \${DATABASTION_DEV_MONGO_IMAGE:-\(mongo:[^ }]*@sha256:[0-9a-f]*\)}$/\1/p' "$DEV/docker-compose.yml" | head -n 1
 }
 
 shell() {

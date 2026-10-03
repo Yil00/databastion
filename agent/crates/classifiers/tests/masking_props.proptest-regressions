@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 8ecdef86dc230539bb62b5117875220ba745c32fbb3a3313e39ac5dafb84ac4a # shrinks to values = [(PersonName, "Ni"), (Nir, "100010000000063")]
+cc 1f904fdd5d62458bacaea8b693733bee2cec310d3450907a1ee46e5e71ffbb5a # shrinks to a = "hélène.o@example.fr", b = "he\u{301}le\u{300}ne.o@example.fr"

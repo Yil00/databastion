@@ -329,9 +329,10 @@ jobs:
 
   # MySQL / MariaDB connector integration tests (P2-C) against the dev images (dev/mysql: MySQL
   # 8.4 with FEDERATED enabled as a fixture; dev/mariadb: MariaDB 11.4 with server_audit), seeded,
-  # with the documented agent grants and the dev-only TLS material of initdb/30-tls.sh. Every probe
-  # is required (DATABASTION_TEST_REQUIRE): kill on drop, no transaction across submit, views,
-  # FEDERATED, generated columns, read-only, over-privilege, TLS and authentication refusals.
+  # with the documented agent grants and the dev-only TLS material (dev/mysql/initdb/30-tls.sh,
+  # dev/mariadb/tls-entrypoint.sh). Every probe is required (DATABASTION_TEST_REQUIRE): kill on
+  # drop, no transaction across submit, views, FEDERATED, generated columns, read-only,
+  # over-privilege, TLS and authentication refusals.
   # Audit (P4-B) too: the MariaDB server_audit log, the Percona audit_log_filter JSON log
   # (dev/percona) and performance_schema, with real mysqldump / mariadb-dump runs inside the
   # containers.

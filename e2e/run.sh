@@ -346,8 +346,8 @@ targets:
       tls: disable_insecure
       audit_log: {path: /var/log/target-pg/postgresql.json, format: jsonlog}
   # ADR-0018 minimal accounts, TLS verified (default verify_full) against the CA that dev's
-  # initdb/30-tls.sh created in each target (copied out by this script); the host names are the
-  # targets' network aliases, named in their certificates.
+  # mysql/initdb/30-tls.sh or mariadb/tls-entrypoint.sh created in each target (copied out by this
+  # script); the host names are the targets' network aliases, named in their certificates.
   - id: mysql-e2e
     engine: mysql
     host: mysql
@@ -547,7 +547,7 @@ for svc in target-mysql target-mariadb target-mongo target-ldap; do
     sleep 2
   done
 done
-log "copying the CA of target-mysql and target-mariadb (dev initdb/30-tls.sh) for the agent"
+log "copying the CA of target-mysql and target-mariadb (dev mysql/initdb/30-tls.sh, mariadb/tls-entrypoint.sh) for the agent"
 compose exec -T target-mysql cat /var/lib/mysql/ca.pem >"$T/mysql-ca.pem" \
   || fail "cannot read the CA of target-mysql"
 compose exec -T target-mariadb cat /var/lib/mysql/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \

@@ -73,7 +73,7 @@ need, OpenLDAP also `NET_BIND_SERVICE` for 389 / 636; their data lives in `tmpfs
    stack, Mailpit and the five targets, wait for
    `/api/health/ready` through the proxy and for the MySQL / MariaDB / MongoDB / OpenLDAP targets to
    be healthy (MongoDB: a TCP connect to the container's own address, which only the final server
-   listens on; no command, nothing in its log); copy their CA (created by dev's `30-tls.sh` and
+   listens on; no command, nothing in its log); copy their CA (created by dev's `mysql/initdb/30-tls.sh`, `mariadb/tls-entrypoint.sh` and
    dev's OpenLDAP entrypoint, checked to be that CA and to hold no key) into the work directory,
    mounted into the agent as `ca_file`.
 3. `bootstrap-admin` with the random password (Docker secret file), log in through the user API

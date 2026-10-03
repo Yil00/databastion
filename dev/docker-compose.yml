@@ -5,6 +5,9 @@
 # - Engine logs used by Audit are written under dev/.state/logs/ (git-ignored). `make dev` creates
 #   those directories world-writable first, so the engines' non-root users can write to them; if you
 #   run `docker compose` directly, run `make dev-dirs` before.
+# - Engine versions: the DATABASTION_DEV_*_IMAGE variables override the PostgreSQL base image and
+#   the MySQL, MariaDB and MongoDB images (tag AND digest); unset, the pinned values below are used.
+#   The engine-matrix workflow (.github/workflows/engine-matrix.yml) sets them; see dev/README.md.
 name: databastion-dev
 
 x-healthcheck: &healthcheck
@@ -15,8 +18,12 @@ x-healthcheck: &healthcheck
 
 services:
   postgres:
-    build: ./postgres
-    image: databastion-dev/postgres:17.11-pgaudit
+    build:
+      context: ./postgres
+      args:
+        # Base image of dev/postgres/Dockerfile; the pgaudit package follows its PG_MAJOR.
+        PG_IMAGE: ${DATABASTION_DEV_POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652}
+    image: databastion-dev/postgres:${DATABASTION_DEV_POSTGRES_TAG:-17.11}-pgaudit
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -32,8 +39,10 @@ services:
       - log_disconnections=on
       - -c
       - logging_collector=on
+      # jsonlog needs PostgreSQL 15+: set DATABASTION_DEV_POSTGRES_LOG_FORMAT=csvlog for 14
+      # (the file is then postgresql.csv instead of postgresql.json).
       - -c
-      - log_destination=jsonlog
+      - log_destination=${DATABASTION_DEV_POSTGRES_LOG_FORMAT:-jsonlog}
       - -c
       - log_directory=/var/log/databastion
       - -c
@@ -54,7 +63,8 @@ services:
       - pgaudit.log_catalog=off
       - -c
       - pgaudit.log_parameter=off
-      # Rows per statement in the pgaudit records (P4-A: volume of each access, Full level).
+      # Rows per statement in the pgaudit records (P4-A: volume of each access, Full level). pgaudit
+      # 1.6+ (PostgreSQL 14+); on 13 it is a placeholder that the connector does not count.
       - -c
       - pgaudit.log_rows=on
       - -c
@@ -73,7 +83,11 @@ services:
       <<: *healthcheck
 
   mariadb:
-    image: mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
+    image: ${DATABASTION_DEV_MARIADB_IMAGE:-mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b}
+    # Creates the dev-only TLS material before any server starts (mariadb/tls-entrypoint.sh), then
+    # runs the image's entrypoint. An entrypoint override drops the image's CMD: set it again.
+    entrypoint: ["/bin/bash", "/usr/local/bin/databastion-tls-entrypoint.sh"]
+    command: ["mariadbd"]
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -89,14 +103,14 @@ services:
       - ./mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
       - ./seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
-      - ./mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
+      - ./mariadb/tls-entrypoint.sh:/usr/local/bin/databastion-tls-entrypoint.sh:ro
     healthcheck:
       # --connect fails while the entrypoint's temporary (--skip-networking) server is seeding.
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       <<: *healthcheck
 
   mysql:
-    image: mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d
+    image: ${DATABASTION_DEV_MYSQL_IMAGE:-mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d}
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -141,7 +155,7 @@ services:
       <<: *healthcheck
 
   mongo:
-    image: mongo:8.0.32@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2
+    image: ${DATABASTION_DEV_MONGO_IMAGE:-mongo:8.0.32@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2}
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}

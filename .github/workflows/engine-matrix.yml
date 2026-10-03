@@ -1,0 +1,172 @@
+name: Engine matrix
+
+# Connector integration tests (the "dev image" step of the ci.yml agent-pg / agent-mysql /
+# agent-mongodb jobs, through dev/agent-it.sh) against several versions of each engine: the dev
+# services of dev/docker-compose.yml with their image overridden by the DATABASTION_DEV_*_IMAGE
+# variables (ROADMAP v0.1.x follow-up (h)). Entries without an override run the pinned default
+# images, as ci.yml does. Percona Server (MySQL, MongoDB) and OpenLDAP stay single-version (ci.yml).
+# Not a required check: not part of the "CI result" gate of ci.yml.
+# Every image is pinned by tag AND index digest (multi-arch), like the rest of the repository.
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - ".github/workflows/engine-matrix.yml"
+      - "dev/docker-compose.yml"
+      - "dev/agent-it.sh"
+      - "dev/postgres/**"
+      - "dev/mysql/**"
+      - "dev/mariadb/**"
+      - "dev/mongo/**"
+      - "agent/crates/connector-postgres/**"
+      - "agent/crates/connector-mysql/**"
+      - "agent/crates/connector-mongodb/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: ${{ matrix.engine }} ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PostgreSQL (dev/postgres: the official image + PGDG pgaudit for its major). jsonlog
+          # needs PostgreSQL 15+: 14 writes the pgaudit log as csvlog. 14 is the minimum tested
+          # version: 13 (end of life) has no pg_stat_statements_info, through which the connector
+          # proves pg_stat_statements loaded (docs/08-engine-capabilities.md).
+          - engine: PostgreSQL
+            version: "14.24"
+            it: postgres
+            services: postgres
+            postgres_image: postgres:14.24-bookworm@sha256:dcc2ca942d8518144f387a0c2630188427835f984caaed0418b986928e761809
+            postgres_tag: "14.24"
+            postgres_log_format: csvlog
+          - engine: PostgreSQL
+            version: "15.19"
+            it: postgres
+            services: postgres
+            postgres_image: postgres:15.19-bookworm@sha256:539ceaaae49b3a7c8a04467cf00cc6788d8e3f1675df41860d86eebc4c40524f
+            postgres_tag: "15.19"
+          - engine: PostgreSQL
+            version: "16.15"
+            it: postgres
+            services: postgres
+            postgres_image: postgres:16.15-bookworm@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67
+            postgres_tag: "16.15"
+          - engine: PostgreSQL
+            version: "17.11 (default)"
+            it: postgres
+            services: postgres
+          - engine: PostgreSQL
+            version: "18.6"
+            it: postgres
+            services: postgres
+            postgres_image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
+            postgres_tag: "18.6"
+          # MySQL Community. dev/agent-it.sh mysql also runs the MariaDB and Percona services
+          # at their default versions: the same tests and DATABASTION_TEST_REQUIRE as ci.yml.
+          - engine: MySQL
+            version: "8.0.46"
+            it: mysql
+            services: mysql mariadb percona
+            mysql_image: mysql:8.0.46@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+          - engine: MySQL
+            version: "8.4.11 (default)"
+            it: mysql
+            services: mysql mariadb percona
+          - engine: MySQL
+            version: "9.7.2"
+            it: mysql
+            services: mysql mariadb percona
+            mysql_image: mysql:9.7.2@sha256:e2bde46db6563855d7177adb5f0b57b9dc663f5a20927a90f4259d3312068497
+          # MariaDB (the MySQL and Percona services at their default versions, as above).
+          - engine: MariaDB
+            version: "10.11.19"
+            it: mysql
+            services: mysql mariadb percona
+            mariadb_image: mariadb:10.11.19@sha256:7db29378d4fdab73f8123bbc2b48905c90d1a4b00cf848b028f1e81e623257f2
+          - engine: MariaDB
+            version: "11.4.13 (default)"
+            it: mysql
+            services: mysql mariadb percona
+          - engine: MariaDB
+            version: "11.8.9"
+            it: mysql
+            services: mysql mariadb percona
+            mariadb_image: mariadb:11.8.9@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+          # MongoDB Community (5.0+ is enforced by the connector).
+          - engine: MongoDB
+            version: "6.0.28"
+            it: mongodb
+            services: mongo
+            mongo_image: mongo:6.0.28@sha256:8b6d8f5bbedb25cb73517b65cf99f13aeb75ad5b157a56c479287a840bbad3ac
+          - engine: MongoDB
+            version: "7.0.43"
+            it: mongodb
+            services: mongo
+            mongo_image: mongo:7.0.43@sha256:1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b
+          - engine: MongoDB
+            version: "8.0.32 (default)"
+            it: mongodb
+            services: mongo
+    # Unset matrix fields are empty strings: docker-compose.yml and dev/agent-it.sh treat an empty
+    # variable as unset (`${VAR:-default}`), so the entry runs the pinned default.
+    env:
+      DATABASTION_DEV_POSTGRES_IMAGE: ${{ matrix.postgres_image }}
+      DATABASTION_DEV_POSTGRES_TAG: ${{ matrix.postgres_tag }}
+      DATABASTION_DEV_POSTGRES_LOG_FORMAT: ${{ matrix.postgres_log_format }}
+      DATABASTION_DEV_MYSQL_IMAGE: ${{ matrix.mysql_image }}
+      DATABASTION_DEV_MARIADB_IMAGE: ${{ matrix.mariadb_image }}
+      DATABASTION_DEV_MONGO_IMAGE: ${{ matrix.mongo_image }}
+      IT_ENGINE: ${{ matrix.it }}
+      SERVICES: ${{ matrix.services }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+          key: ${{ matrix.it }}
+      - name: Start the dev services
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          # shellcheck disable=SC2086 # SERVICES is a space-separated list of service names
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 $SERVICES
+          timeout 60 docker compose -f dev/docker-compose.yml images
+      # Same commands, variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the ci.yml
+      # job of this engine (dev/agent-it.sh); every probe is required.
+      - name: Connector integration tests
+        run: |
+          set -o pipefail
+          timeout 1800 dev/agent-it.sh "$IT_ENGINE" 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Service logs
+        if: failure()
+        run: |
+          # shellcheck disable=SC2086
+          timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 $SERVICES
+      # Last before Stop, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+          grep -nA12 "panicked at" "$RUNNER_TEMP/it.log" | head -n 120 || true
+      - name: Stop
+        if: always()
+        run: timeout 120 docker compose -f dev/docker-compose.yml down -v
