@@ -2,7 +2,7 @@
 
 All notable changes to DataBastion are recorded here.
 
-This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
+The notes of the next release are curated by hand in the "Unreleased" section; at each release they are moved automatically under the new version, and become the GitHub release notes, see [RELEASE.md](RELEASE.md). Do not edit the released sections by hand.
 The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
@@ -10,6 +10,11 @@ The project follows [semantic versioning](https://semver.org/).
 ### 👷 CI
 - "Agent MSRV (Rust 1.88.0)" job, required through "CI result": type-checks the agent workspace (every target, all features, and the minimal build) on exactly the workspace `rust-version`. The declared MSRV is raised from 1.85 to 1.88, the true minimum: the classifiers use let-chains and the protocol crate's `regress` 0.12 needs them too, so the workspace never built on 1.85. The `release.yml` toolchain pin follows (1.88.0). Released binaries are unaffected (built with Rust 1.94.1 in the agent `Dockerfile`)
 - Agent: clippy's lints gated on the MSRV now apply (nested `if`s collapsed into let-chains, `is_multiple_of`), no behavior change
+
+- Release: the curated "Unreleased" notes are moved under the new version section of `CHANGELOG.md` (compared with the previous final tag, pre-release tags ignored) and become the draft GitHub release notes, with absolute links, by `scripts/changelog-release.mjs` from release-it; the generated commit list is no longer written. A release with an empty "Unreleased" section fails before any commit, tag or push, and the "Release version" PR check fails first (ROADMAP v0.1.x item (a))
+
+### 🐛 Bug Fixes
+- Dev / e2e MariaDB: the dev-only TLS material moved out of the data directory (`/var/lib/mysql/databastion-tls` → `/var/lib/databastion-tls`, a dedicated `mariadb-tls` volume in dev, a tmpfs in e2e and load), where the server took it for a database (`Invalid (old?) table or database name 'databastion-tls'` on 10.11, schema `#mysql50#databastion-tls`); the dev CA still survives restarts until `make dev-reset`, and the wrapper deletes the old copy from existing data volumes. Export the dev MariaDB CA from the new path
 
 ## [0.3.0](https://github.com/Yil00/databastion/compare/0.2.0...0.3.0) (2026-10-03)
 

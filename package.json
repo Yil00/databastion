@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "release": "release-it",
-    "release:dry": "release-it --dry-run --ci",
+    "release:dry": "release-it --dry-run --ci && node scripts/changelog-release.mjs preview \"$(release-it --ci --release-version --no-github.release)\"",
     "bump": "node scripts/bump-version.mjs"
   },
   "devDependencies": {

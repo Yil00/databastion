@@ -135,6 +135,9 @@ jobs:
           timeout 60 python3 -m unittest discover -s ../scripts -p 'test_check_console_licenses.py'
           pnpm licenses list --prod --json > "$RUNNER_TEMP/console-licenses.json"
           python3 ../scripts/check_console_licenses.py "$RUNNER_TEMP/console-licenses.json"
+      # The CHANGELOG / release notes step of release.yml (root release tooling, node + git only).
+      - name: Release changelog script
+        run: timeout 60 python3 -m unittest discover -s ../scripts -p 'test_changelog_release.py'
       - run: pnpm lint
       - run: pnpm typecheck
       # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
@@ -399,7 +402,7 @@ jobs:
           compose() { timeout 60 docker compose -f dev/docker-compose.yml "$@"; }
           mkdir -p dev/.state/tls
           compose exec -T mysql cat /var/lib/mysql/ca.pem > dev/.state/tls/mysql-ca.pem
-          compose exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
+          compose exec -T mariadb cat /var/lib/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
           export DATABASTION_TEST_MYSQL_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MYSQL_PORT}/hr"
           export DATABASTION_TEST_MYSQL_ADMIN_URL="mysql://root:${MYSQL_ROOT_PASSWORD}@127.0.0.1:${MYSQL_PORT}/"
           export DATABASTION_TEST_MYSQL_CA_FILE="$PWD/dev/.state/tls/mysql-ca.pem"

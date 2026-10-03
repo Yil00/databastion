@@ -7,14 +7,22 @@
 # (`SSL_CTX_set_default_verify_paths failed`), including the temporary server of the
 # initialization, where 11.4 and later only log a warning. A throwaway CA signs a server
 # certificate for 127.0.0.1, ::1, localhost and the compose service name `mariadb`; the CA key is
-# deleted once the certificate is signed. Everything lives in the data directory, so the CA the
-# tests pin stays the same across restarts; it is only created when a file is missing (a new data
-# volume or tmpfs). Export the CA for the tests with:
-#   docker compose -f dev/docker-compose.yml exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem
+# deleted once the certificate is signed. Everything lives in /var/lib/databastion-tls, outside the
+# data directory (a directory in the datadir is taken for a database: `Invalid (old?) table or
+# database name` on 10.11, `#mysql50#databastion-tls` in the schema list). dev mounts a named volume
+# there, so the CA the tests pin stays the same across restarts until `down -v`; e2e and load mount
+# a tmpfs (read-only root file system), like their datadir. The material is only created when a
+# file is missing (a new volume or tmpfs). Export the CA for the tests with:
+#   docker compose -f dev/docker-compose.yml exec -T mariadb cat /var/lib/databastion-tls/ca.pem
 set -euo pipefail
 
 databastion_dev_tls() {
-  local dir=/var/lib/mysql/databastion-tls tmp
+  local dir=/var/lib/databastion-tls tmp
+  # Data volumes of older checkouts still hold the material in the datadir: drop that copy.
+  if [ -d /var/lib/mysql/databastion-tls ]; then
+    rm -rf /var/lib/mysql/databastion-tls
+    echo "databastion-tls-entrypoint: removed the old TLS material from the data directory" >&2
+  fi
   if [ -s "$dir/ca.pem" ] && [ -s "$dir/server-cert.pem" ] && [ -s "$dir/server-key.pem" ]; then
     return 0
   fi
@@ -23,6 +31,8 @@ databastion_dev_tls() {
   # shellcheck disable=SC2064 # expanded now: $tmp is local to this function
   trap "rm -rf '$tmp'" EXIT
   mkdir -p "$dir"
+  # A fresh volume is root 0755, a tmpfs 1777: readable by all, writable by its owner only.
+  chmod 0755 "$dir"
   printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' \
     'extendedKeyUsage=serverAuth' 'subjectAltName=DNS:localhost,DNS:mariadb,IP:127.0.0.1,IP:::1' > "$tmp/ext"
   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DataBastion dev CA (mariadb)" \
