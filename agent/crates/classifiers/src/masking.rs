@@ -273,7 +273,10 @@ fn group4(chars: &[char]) -> String {
 }
 
 fn mask_iban(norm: &str) -> String {
-    let chars: Vec<char> = norm.chars().collect();
+    // Every character of the value: zeroized on drop, sized up front (bytes >= chars) so that
+    // `extend` never reallocates and leaves a copy behind.
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(norm.len()));
+    chars.extend(norm.chars());
     if chars.len() < 15 {
         return FULLY_REDACTED.to_owned();
     }
@@ -287,7 +290,10 @@ fn mask_iban(norm: &str) -> String {
 }
 
 fn mask_card(norm: &str) -> String {
-    let chars: Vec<char> = norm.chars().collect();
+    // Every character of the value: zeroized on drop, sized up front (bytes >= chars) so that
+    // `extend` never reallocates and leaves a copy behind.
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(norm.len()));
+    chars.extend(norm.chars());
     if chars.len() < 12 {
         return FULLY_REDACTED.to_owned();
     }
@@ -339,7 +345,10 @@ fn country_code_len(digits: &str) -> usize {
 /// (`+1 *** *** **25`, `+33 * ** ** ** 78`, `+351 *** *** **5`); a national
 /// number keeps its last 2 digits only (`** ** ** ** 78`).
 fn mask_phone(raw: &str) -> String {
-    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    // Every digit of the number: zeroized on drop, sized up front so that `extend` never
+    // reallocates and leaves a copy behind.
+    let mut digits: Zeroizing<String> = Zeroizing::new(String::with_capacity(raw.len()));
+    digits.extend(raw.chars().filter(char::is_ascii_digit));
     let total = digits.len();
     if total < 8 {
         return FULLY_REDACTED.to_owned();
