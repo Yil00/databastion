@@ -601,7 +601,7 @@ an in-memory stream (`src/fake.rs`).
 ### MongoDB connector
 No driver crate ([ADR-0026](../docs/adr/0026-mongodb-connector.md) decision 1): the official
 `mongodb` crate pulls `webpki-roots` (CDLA-Permissive-2.0, outside `deny.toml`) as its only trust
-store without a CA file, needs Rust 1.88, compiles process spawning in, and follows the replica-set
+store without a CA file, needed Rust 1.88 (above the 1.85 then declared), compiles process spawning in, and follows the replica-set
 topology to hosts the server names (I5). The connector speaks a closed subset of the wire protocol
 itself (`crates/connector-mongodb/src/wire.rs`, `bson.rs`, `scram.rs`, `conn.rs`) over tokio and
 the same rustls crates:
@@ -837,7 +837,13 @@ cargo run -p databastion-protocol-codegen      # after changing shared/protocol/
 cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
 cargo run -- run --config /etc/databastion/agent.yaml
 fuzz/smoke.sh 10                               # parser fuzz targets, 10 s each (stable; fuzz/README.md)
+cargo +1.88.0 check --workspace --all-targets --all-features --locked   # MSRV (rust-version)
 ```
+
+The workspace `rust-version` (1.88) is a tested minimum: the "Agent MSRV" CI job type-checks every
+target on exactly that toolchain, and `release.yml` pins it. The other jobs, the Docker image and
+the released `.deb` build with a newer stable (the `Dockerfile` builder). Raise `rust-version`, the
+job's `toolchain` and the `release.yml` pin together.
 
 `agent.example.yaml` documents every configuration key. Logs are JSON on stdout; the filter is read from `DATABASTION_LOG`
 (e.g. `DATABASTION_LOG=debug`), default `info`.

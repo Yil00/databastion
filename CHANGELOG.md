@@ -7,6 +7,10 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 👷 CI
+- "Agent MSRV (Rust 1.88.0)" job, required through "CI result": type-checks the agent workspace (every target, all features, and the minimal build) on exactly the workspace `rust-version`. The declared MSRV is raised from 1.85 to 1.88, the true minimum: the classifiers use let-chains and the protocol crate's `regress` 0.12 needs them too, so the workspace never built on 1.85. The `release.yml` toolchain pin follows (1.88.0). Released binaries are unaffected (built with Rust 1.94.1 in the agent `Dockerfile`)
+- Agent: clippy's lints gated on the MSRV now apply (nested `if`s collapsed into let-chains, `is_multiple_of`), no behavior change
+
 ## [0.3.0](https://github.com/Yil00/databastion/compare/0.2.0...0.3.0) (2026-10-03)
 
 > **Upgrade impact (PostgreSQL)**: targets where pgaudit logs reads without row counts (`pgaudit.log_rows` off in a monitored database, or pgaudit before 1.6) now report **Partial** instead of Full, and the console says why (`audit.log_without_row_counts`). PostgreSQL 14 is the minimum tested version.
