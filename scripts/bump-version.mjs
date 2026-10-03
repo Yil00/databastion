@@ -24,6 +24,18 @@ function bumpJson(path) {
   updated.push(path);
 }
 
+// npm lockfile (root release tooling): the root package version is recorded twice. Left stale, every
+// `npm install` rewrites it and leaves the working tree dirty.
+function bumpPackageLock(path) {
+  if (!existsSync(path)) return;
+  const raw = readFileSync(path, "utf8");
+  const data = JSON.parse(raw);
+  data.version = version;
+  if (data.packages && data.packages[""]) data.packages[""].version = version;
+  writeFileSync(path, JSON.stringify(data, null, 2) + (raw.endsWith("\n") ? "\n" : ""));
+  updated.push(path);
+}
+
 // Replaces `version = "…"` only in the [workspace.package] (or [package]) section.
 function bumpCargo(path) {
   if (!existsSync(path)) return;
@@ -75,6 +87,7 @@ function bumpYamlKeys(path, keys) {
 }
 
 bumpJson("package.json");
+bumpPackageLock("package-lock.json");
 bumpJson("console/package.json");
 bumpCargo("agent/Cargo.toml");
 refreshCargoLock("agent/fuzz/Cargo.toml");
