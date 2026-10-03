@@ -105,6 +105,15 @@ pub(crate) fn pgaudit_logs_reads(setting: &str) -> bool {
     items.iter().any(|i| i == "read" || i == "all") && !items.iter().any(|i| i == "-read")
 }
 
+/// Whether `pgaudit.log_rows` gives row counts: the library is loaded, it
+/// defines the setting (listed by `pg_settings` as a boolean; pgaudit
+/// before 1.6, built for PostgreSQL 13, does not), and its value is `on`.
+/// A value alone may be a placeholder that `current_setting()` still
+/// returns, while the records carry no row count.
+pub(crate) fn pgaudit_rows_on(library: bool, defined: bool, value: Option<&str>) -> bool {
+    library && defined && value.is_some_and(|v| v.eq_ignore_ascii_case("on"))
+}
+
 impl AuditProbe {
     /// Level proven in this database; `log_readable`: the configured audit
     /// log can be read by the agent.
@@ -862,7 +871,13 @@ pub(crate) async fn audit_probe(
             p.pgaudit_loaded = Some(library && log.is_some());
             p.pgaudit_placeholders = !library && log.is_some();
             p.pgaudit_reads = log.as_deref().is_some_and(pgaudit_logs_reads);
-            p.pgaudit_rows = setting(1)?.is_some_and(|v| v.eq_ignore_ascii_case("on"));
+            let rows_defined = rows
+                .first()
+                .map(|r| col::<Option<bool>>(r, 6))
+                .transpose()?
+                .flatten()
+                .unwrap_or(false);
+            p.pgaudit_rows = pgaudit_rows_on(library, rows_defined, setting(1)?.as_deref());
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
             p.pgaudit_log_level = setting(3)?;
             if p.pgaudit_loaded == Some(true) {
@@ -1244,6 +1259,19 @@ mod tests {
         assert!(!pgaudit_logs_reads("write,ddl"));
         assert!(!pgaudit_logs_reads("none"));
         assert!(!pgaudit_logs_reads("readx"));
+    }
+
+    #[test]
+    fn pgaudit_log_rows_is_proven_not_assumed() {
+        assert!(pgaudit_rows_on(true, true, Some("on")));
+        assert!(pgaudit_rows_on(true, true, Some("ON")));
+        assert!(!pgaudit_rows_on(true, true, Some("off")));
+        assert!(!pgaudit_rows_on(true, true, None));
+        // A placeholder: set, but not defined by the loaded pgaudit (1.5,
+        // PostgreSQL 13), or the library not loaded at all.
+        assert!(!pgaudit_rows_on(true, false, Some("on")));
+        assert!(!pgaudit_rows_on(false, false, Some("on")));
+        assert!(!pgaudit_rows_on(false, true, Some("on")));
     }
 
     #[test]

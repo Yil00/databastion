@@ -367,7 +367,9 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
 /// not readable without `pg_read_all_settings`. `pg_settings` (readable by
 /// every role) hides placeholders and shows a string type for them; the
 /// library defines `pgaudit.log_catalog` as a boolean: that row is the
-/// proof.
+/// proof. `pgaudit.log_rows` needs the same proof on its own: pgaudit
+/// before 1.6 (the PostgreSQL 13 builds) does not define it, so a value
+/// set for it there is a placeholder and the records carry no row count.
 pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.log', true), \
        pg_catalog.current_setting('pgaudit.log_rows', true), \
@@ -375,7 +377,9 @@ pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.log_level', true), \
        EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
                WHERE s.name = 'pgaudit.log_catalog' AND s.vartype = 'bool'), \
-       pg_catalog.current_setting('pgaudit.log_catalog', true)";
+       pg_catalog.current_setting('pgaudit.log_catalog', true), \
+       EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
+               WHERE s.name = 'pgaudit.log_rows' AND s.vartype = 'bool')";
 
 /// Client address the server sees for this session (`NULL` on a Unix
 /// socket): tells the agent's own statements apart in the audit log.

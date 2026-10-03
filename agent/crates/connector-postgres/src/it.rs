@@ -1543,6 +1543,24 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         pre.own_addr, expected_client,
         "agent address as seen by the server"
     );
+    // `pgaudit.log_rows` exists from pgaudit 1.6 (PostgreSQL 14) on
+    // (docs/08-engine-capabilities.md): with pgaudit 1.5 (PostgreSQL 13),
+    // records carry no row count, so no `volume.large_result` on this source.
+    let log_rows: bool = a
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_settings \
+             WHERE name = 'pgaudit.log_rows' AND vartype = 'bool')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    if !log_rows {
+        eprintln!(
+            "pgaudit.log_rows: not defined by this server's pgaudit (before 1.6, \
+             PostgreSQL 13): row counts and volume.large_result checked absent instead"
+        );
+    }
     a.batch_execute(
         "DROP TABLE IF EXISTS crm.it_audit_big; \
          CREATE TABLE crm.it_audit_big AS SELECT g AS id, 'x' || g AS v FROM generate_series(1, 20000) g",
@@ -1586,7 +1604,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         let mut events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
             has(ev, "customers", "signature.pg_dump")
-                && has(ev, "it_audit_big", "volume.large_result")
+                && (!log_rows || has(ev, "it_audit_big", "volume.large_result"))
                 && has(ev, "it_audit_big", "shape.full_table_read")
                 && has(ev, "customers", "signature.copy_to_program")
         })
@@ -1610,8 +1628,9 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
             has(&events, "invoices", "signature.pg_dump"),
             "{format}: {all:#?}"
         );
-        assert!(
+        assert_eq!(
             has(&events, "it_audit_big", "volume.large_result"),
+            log_rows,
             "{format}: {all:#?}"
         );
         assert!(
@@ -1635,7 +1654,7 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
                         .any(|o| o.object().as_str() == "it_audit_big")
             })
             .unwrap();
-        assert_eq!(big.rows(), Some(20_000), "pgaudit.log_rows");
+        assert_eq!(big.rows(), log_rows.then_some(20_000), "pgaudit.log_rows");
         assert_eq!(big.principal().account_name(), adm.user);
         assert_eq!(big.principal().client(), expected_client);
         // The value-bearing table name of the seed never leaves as is.
