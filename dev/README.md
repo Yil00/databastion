@@ -74,7 +74,7 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 ## Engine configuration
 - **PostgreSQL**: image built from `postgres:17.11-bookworm` + `postgresql-17-pgaudit` (PGDG). `shared_preload_libraries=pgaudit,pg_stat_statements`. Following the docs/08 advice to restrict pgaudit, `pgaudit.log` is `none` server-wide and `read, write` on the `shop` database only; object audit covers the seeded tables through the `databastion_auditor` role (`pgaudit.role`). A `SELECT` on an audited table therefore logs both a `SESSION` and an `OBJECT` line. `pgaudit.log_parameter=off`. Logs: `dev/.state/logs/postgres/postgresql.json`, with `log_file_mode=0644` as a dev-only convenience (production: `0640` plus an ACL for the agent's OS user, ADR-0012).
-- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the `QUERY` / `TABLE` audit events (its connections are still logged). Log: `dev/.state/logs/mariadb/server_audit.log`, created `0644` through `UMASK=0644` as a dev-only convenience (production: the agent's OS user gets read access on the log directory only). `performance_schema` has `events_statements_current` on, without which MariaDB fills no statement history. TLS with dev-only material from [mariadb/initdb/30-tls.sh](mariadb/initdb/30-tls.sh) (below).
+- **MariaDB**: [mariadb/databastion.cnf](mariadb/databastion.cnf). The image's `healthcheck` user is excluded from the `QUERY` / `TABLE` audit events (its connections are still logged). Log: `dev/.state/logs/mariadb/server_audit.log`, created `0644` through `UMASK=0644` as a dev-only convenience (production: the agent's OS user gets read access on the log directory only). `performance_schema` has `events_statements_current` on, without which MariaDB fills no statement history. TLS with dev-only material from [mariadb/tls-entrypoint.sh](mariadb/tls-entrypoint.sh) (below), the service's entrypoint wrapper: it creates the material in the data volume before any server starts (MariaDB 10.11 aborts on a missing `ssl_*` file, even in the temporary server of the initialization) and runs the image's entrypoint.
 - **MySQL**: [mysql/databastion.cnf](mysql/databastion.cnf). No file log: the agent reads `performance_schema`, a ring buffer (10 000 statements). The `FEDERATED` engine is enabled as a test fixture only (the connector test proves such a table is never read). TLS with dev-only material from [mysql/initdb/30-tls.sh](mysql/initdb/30-tls.sh) (below).
 - **Percona Server**: [percona/databastion.cnf](percona/databastion.cnf) and [percona/initdb/20-databastion.sh](percona/initdb/20-databastion.sh): the `audit_log_filter` component, installed at initialization, writes JSON to `dev/.state/logs/percona/audit_filter.log` (`0644` through `UMASK`, dev only; rotated at each server start). Every account is logged but `root@localhost`, which the healthcheck uses on the socket. Same seed and TLS script as MySQL.
 - **MongoDB**: `--profile 1 --slowms $MONGO_SLOWMS`. `0` makes every operation visible in dev; use a higher value to reproduce the production trade-off (a fast `mongodump` can go unnoticed). Log: `dev/.state/logs/mongodb/mongod.log`.
@@ -128,11 +128,12 @@ where pgaudit is loaded (the dev image). A skipped check prints `skipped: …`;
 or `all`) turns the listed skips into failures, as CI does for each server.
 
 The MySQL / MariaDB connector tests (`agent/crates/connector-mysql/src/it.rs`) run against the
-`mysql` and `mariadb` services the same way. Both servers use dev-only TLS material created at
-initialization by `initdb/30-tls.sh` (a throwaway CA, whose key is deleted, signs a certificate for
-`127.0.0.1`, `::1`, `localhost` and the service name), so that the tests use the connector's default
-`tls: verify_full` with the CA pinned. Export the CAs once the services are up (on volumes created
-before this script existed, run `make dev-reset dev` first):
+`mysql` and `mariadb` services the same way. Both servers use dev-only TLS material, created at
+initialization by `mysql/initdb/30-tls.sh` (MySQL) or before the first server start by the
+`mariadb/tls-entrypoint.sh` wrapper (MariaDB): a throwaway CA, whose key is deleted, signs a
+certificate for `127.0.0.1`, `::1`, `localhost` and the service name, so that the tests use the
+connector's default `tls: verify_full` with the CA pinned. Export the CAs once the services are up
+(on volumes created before these scripts existed, run `make dev-reset dev` first):
 
 ```sh
 set -a; . dev/.env; set +a

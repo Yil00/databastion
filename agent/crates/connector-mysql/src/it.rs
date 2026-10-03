@@ -1,6 +1,6 @@
 //! Integration tests against MySQL and MariaDB servers: the dev environment
 //! (`make dev`: MySQL 8.4 and MariaDB 11.4, seeded, with the dev-only TLS
-//! material of `dev/{mysql,mariadb}/initdb/30-tls.sh`).
+//! material of `dev/mysql/initdb/30-tls.sh` and `dev/mariadb/tls-entrypoint.sh`).
 //!
 //! Per server (`MYSQL` or `MARIADB`):
 //! - `DATABASTION_TEST_<S>_URL`: the agent account on the seeded database

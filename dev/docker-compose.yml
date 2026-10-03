@@ -84,6 +84,10 @@ services:
 
   mariadb:
     image: ${DATABASTION_DEV_MARIADB_IMAGE:-mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b}
+    # Creates the dev-only TLS material before any server starts (mariadb/tls-entrypoint.sh), then
+    # runs the image's entrypoint. An entrypoint override drops the image's CMD: set it again.
+    entrypoint: ["/bin/bash", "/usr/local/bin/databastion-tls-entrypoint.sh"]
+    command: ["mariadbd"]
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -99,7 +103,7 @@ services:
       - ./mariadb/databastion.cnf:/etc/mysql/conf.d/databastion.cnf:ro
       - ./seed/out/mariadb.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
       - ./mariadb/initdb/20-databastion.sh:/docker-entrypoint-initdb.d/20-databastion.sh:ro
-      - ./mariadb/initdb/30-tls.sh:/docker-entrypoint-initdb.d/30-tls.sh:ro
+      - ./mariadb/tls-entrypoint.sh:/usr/local/bin/databastion-tls-entrypoint.sh:ro
     healthcheck:
       # --connect fails while the entrypoint's temporary (--skip-networking) server is seeding.
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
