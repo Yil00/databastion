@@ -11,8 +11,9 @@ make dev-reset    # stops, deletes volumes and dev/.state (the seed is reloaded 
 make dev-logs     # last 200 log lines of every service (TAIL=n to change)
 make seed         # regenerates dev/seed/out/* and dev/ground-truth.json
 make test-dev     # unit tests of the seed generator
+make agent-it     # connector integration tests against this environment (ENGINE=postgres|mysql|mongodb|openldap)
 ```
-`make help` lists every target. The CI workflow `.github/workflows/dev-env.yml` runs the same steps.
+`make help` lists every target by section (setup with `make install` / `make doctor`, console, agent, protocol, `make check`, end-to-end, release). The CI workflow `.github/workflows/dev-env.yml` runs the same steps as `make dev` / `make dev-smoke`; `make agent-it` ([agent-it.sh](agent-it.sh)) runs the "dev image" step of the CI connector jobs, with the variables shown below.
 
 ## Services
 All ports are published on **127.0.0.1 only**; host ports can be changed in `dev/.env`.
