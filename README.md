@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/platform-Linux-lightgrey.svg" alt="Platform: Linux">
 </p>
 
-> **v0.1.0 — first release (MVP)**, published on 2026-09-30: [release notes and signed artifacts](https://github.com/Yil00/databastion/releases/tag/0.1.0). This is early-stage software: read the known limitations in the [CHANGELOG](CHANGELOG.md) and in [SECURITY.md](SECURITY.md#known-limitations-and-residual-risks) before relying on it. What comes next: [roadmap](docs/ROADMAP.md).
+> **v0.2.0** (2026-10-03), a maintenance release of the first release (MVP) v0.1.0 of 2026-09-30: [release notes and signed artifacts](https://github.com/Yil00/databastion/releases/latest). This is early-stage software: read the known limitations in the [CHANGELOG](CHANGELOG.md) and in [SECURITY.md](SECURITY.md#known-limitations-and-residual-risks) before relying on it. What comes next: [roadmap](docs/ROADMAP.md).
 
 ## Why
 Traditional DLPs monitor endpoints and the network. They know neither **where** sensitive data sits in your databases, nor **who** is exporting it in bulk (`pg_dump`, `mysqldump`, `mongoexport`, LDIF exports…).
