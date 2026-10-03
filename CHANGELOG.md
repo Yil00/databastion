@@ -2,10 +2,13 @@
 
 All notable changes to DataBastion are recorded here.
 
-This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.
+The notes of the next release are curated by hand in the "Unreleased" section; at each release they are moved automatically under the new version, and become the GitHub release notes, see [RELEASE.md](RELEASE.md). Do not edit the released sections by hand.
 The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
+
+### 👷 CI
+- Release: the curated "Unreleased" notes are moved under the new version section of `CHANGELOG.md` (compared with the previous final tag, pre-release tags ignored) and become the draft GitHub release notes, with absolute links, by `scripts/changelog-release.mjs` from release-it; the generated commit list is no longer written. A release with an empty "Unreleased" section fails before any commit, tag or push, and the "Release version" PR check fails first (ROADMAP v0.1.x item (a))
 
 ## [0.3.0](https://github.com/Yil00/databastion/compare/0.2.0...0.3.0) (2026-10-03)
 

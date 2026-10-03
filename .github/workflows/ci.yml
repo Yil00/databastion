@@ -135,6 +135,9 @@ jobs:
           timeout 60 python3 -m unittest discover -s ../scripts -p 'test_check_console_licenses.py'
           pnpm licenses list --prod --json > "$RUNNER_TEMP/console-licenses.json"
           python3 ../scripts/check_console_licenses.py "$RUNNER_TEMP/console-licenses.json"
+      # The CHANGELOG / release notes step of release.yml (root release tooling, node + git only).
+      - name: Release changelog script
+        run: timeout 60 python3 -m unittest discover -s ../scripts -p 'test_changelog_release.py'
       - run: pnpm lint
       - run: pnpm typecheck
       # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
