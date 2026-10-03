@@ -521,8 +521,9 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         notes.push("the configured audit log is not readable by the agent".to_owned());
         codes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
     }
-    // ADR-0037 decision 4: a monitored database whose pgaudit logs reads without row counts caps
-    // the target at Partial, whatever the other databases reach.
+    // ADR-0037 decision 4: a monitored database whose pgaudit logs reads without row counts, or
+    // whose pgaudit settings could not be read, caps the target at Partial, whatever the other
+    // databases reach.
     let mut rows_gap = false;
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
@@ -547,8 +548,16 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         if probe.reads_without_row_counts() {
             rows_gap = true;
             notes.push(format!(
-                "database {}: pgaudit logs reads without row counts, the target is capped at \
-                 Partial",
+                "database {}: pgaudit logs reads without row counts, so the target cannot \
+                 reach Full",
+                normalize(database).as_str()
+            ));
+        } else if probe.pgaudit_loaded.is_none() {
+            // Fail closed: settings that could not be read prove no row counts either.
+            rows_gap = true;
+            notes.push(format!(
+                "database {}: pgaudit settings could not be read, so the target cannot reach \
+                 Full",
                 normalize(database).as_str()
             ));
         }
