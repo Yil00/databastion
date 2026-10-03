@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/Yil00/databastion/compare/0.2.0...0.3.0) (2026-10-03)
+
+### ✨ Features
+
+* **agent:** send audit.log_without_row_counts for PostgreSQL without pgaudit.log_rows (v0.1.x) ([#124](https://github.com/Yil00/databastion/issues/124)) ([758f558](https://github.com/Yil00/databastion/commit/758f558315aa3467ffd47c69566b338784592ac4))
+
+### 🐛 Bug Fixes
+
+* **agent:** PostgreSQL Full audit level requires pgaudit.log_rows (ADR-0037, v0.1.x) ([#123](https://github.com/Yil00/databastion/issues/123)) ([d6fcb8a](https://github.com/Yil00/databastion/commit/d6fcb8aac6181a9c5b615001d699e865dadd7e8a))
+* **deploy:** force basic-ftp 6.2.1 in the release tooling and bump package-lock.json (v0.1.x) ([#119](https://github.com/Yil00/databastion/issues/119)) ([3b962d9](https://github.com/Yil00/databastion/commit/3b962d94888b4a4d3916775bbbb7092716cb386b))
+
+### 📝 Documentation
+
+* 0.2.0 released, changelog tidy and release version check ([52b703f](https://github.com/Yil00/databastion/commit/52b703ffa7b18defb8edb8efcb28285f00ebf90e)), references [#116](https://github.com/Yil00/databastion/issues/116)
+* versions tested per engine in the README, ROADMAP item (h) done ([#122](https://github.com/Yil00/databastion/issues/122)) ([8087502](https://github.com/Yil00/databastion/commit/8087502f31a3d212f69b4c9dabbb2d60fc5d68ac))
+
+### 👷 CI
+
+* engine-matrix workflow for PostgreSQL, MySQL, MariaDB and MongoDB versions (v0.1.x) ([#121](https://github.com/Yil00/databastion/issues/121)) ([df1c9e2](https://github.com/Yil00/databastion/commit/df1c9e2126f49fc9841fe7eb979247e88c3dd20d))
+* show the version release-it will compute on PRs to main (v0.1.x) ([#120](https://github.com/Yil00/databastion/issues/120)) ([53cdffc](https://github.com/Yil00/databastion/commit/53cdffce8258408971b4049cfa4762eb97a1712a))
+
 All notable changes to DataBastion are recorded here.
 
 This file is **generated automatically** at each release from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/)), see [RELEASE.md](RELEASE.md). Do not edit it by hand, except for the "Unreleased" section.

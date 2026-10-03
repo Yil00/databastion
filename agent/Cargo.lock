@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "databastion-connector-mongodb",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-classifiers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "databastion-protocol",
  "getrandom 0.4.3",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-mongodb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-mysql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-openldap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-postgres"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "databastion-protocol-codegen",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-protocol-codegen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prettyplease",
  "quote",
