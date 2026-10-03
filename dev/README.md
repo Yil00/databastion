@@ -82,6 +82,30 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 
 `make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb,percona}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
 
+### Other engine versions
+The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environment variables (unset or empty: the pinned defaults above). Pin every image by tag **and** index digest, as the repository does; the [engine-matrix workflow](../.github/workflows/engine-matrix.yml) lists the pinned versions it tests (PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8, MongoDB 6.0 / 7.0 / 8.0).
+
+| Variable | Service | Meaning |
+|----------|---------|---------|
+| `DATABASTION_DEV_POSTGRES_IMAGE` | `postgres` | Base image of [postgres/Dockerfile](postgres/Dockerfile) (`postgres:<version>-bookworm@sha256:…`); the pgaudit package follows its major |
+| `DATABASTION_DEV_POSTGRES_TAG` | `postgres` | Version in the local image name (`databastion-dev/postgres:<tag>-pgaudit`), so that builds of several majors do not overwrite each other |
+| `DATABASTION_DEV_POSTGRES_LOG_FORMAT` | `postgres` | `jsonlog` (default; PostgreSQL 15+) or `csvlog` (required on 13 and 14): the log is then `postgresql.csv`, which `make agent-it` reads |
+| `DATABASTION_DEV_MYSQL_IMAGE` | `mysql` | `mysql:<version>@sha256:…` |
+| `DATABASTION_DEV_MARIADB_IMAGE` | `mariadb` | `mariadb:<version>@sha256:…` |
+| `DATABASTION_DEV_MONGO_IMAGE` | `mongo` | `mongo:<version>@sha256:…` (5.0+, the connector's minimum) |
+
+A data volume is initialized by the engine version that created it: switch versions on fresh volumes (`make dev-reset` first), and keep the variables exported for `make agent-it` too. For example, PostgreSQL 14 (digest from the workflow):
+
+```sh
+make dev-reset
+export DATABASTION_DEV_POSTGRES_IMAGE='postgres:14.24-bookworm@sha256:dcc2ca942d8518144f387a0c2630188427835f984caaed0418b986928e761809'
+export DATABASTION_DEV_POSTGRES_TAG=14.24 DATABASTION_DEV_POSTGRES_LOG_FORMAT=csvlog
+make dev
+make agent-it ENGINE=postgres
+```
+
+The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
+
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
 environment when these variables are set, and are skipped otherwise:

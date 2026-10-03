@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+- CI: engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md). PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
+
 ## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
 
 This release was planned as a patch release 0.1.1; the `feat` commit of #116 made release-it compute a minor version. No change to the agent, the protocol or the console runtime: upgrading from 0.1.0 is optional.
