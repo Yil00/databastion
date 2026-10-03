@@ -115,6 +115,26 @@ class ChangelogReleaseTest(unittest.TestCase):
                 self.assertEqual(r.stdout, "")
             self.assertEqual(self.read(), text)
 
+    def test_unclosed_fence_fails_and_writes_nothing(self) -> None:
+        # An unclosed fence, or ``` closed by ~~~, must not pull the 0.3.0 section into the release.
+        for notes in ("- a\n```\ncode", "- a\n```\ncode\n~~~"):
+            text = changelog(notes=notes)
+            self.write(text)
+            for args in (("changelog", "0.4.0"), ("notes", "0.4.0"), ("check",)):
+                r = self.run_script(*args)
+                self.assertEqual(r.returncode, 1, (notes, args, r.stdout))
+                self.assertIn("unclosed code fence", r.stderr)
+                self.assertEqual(r.stdout, "")
+            self.assertEqual(self.read(), text)
+
+    def test_tilde_fence_holds_backticks(self) -> None:
+        # A ``` line inside a ~~~ fence neither closes it nor opens another one.
+        notes = "- a\n~~~\n```\n## not a heading\n~~~\n- b"
+        self.write(changelog(notes=notes))
+        r = self.run_script("changelog", "0.4.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(notes + "\n\n" + OLDER, self.read())
+
     def test_missing_unreleased_fails(self) -> None:
         self.write(changelog(unreleased=False))
         r = self.run_script("changelog", "0.4.0")

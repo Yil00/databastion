@@ -39,16 +39,28 @@ const fail = (msg) => {
   throw new ChangelogError(msg);
 };
 
+// CommonMark fences: a fence opened by ``` (or ~~~) closes only with the same character, at least
+// as many times. Returns the open fence after `line` ("" when none).
+function nextFence(open, line) {
+  const m = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+  if (!m) return open;
+  if (!open) return m[1];
+  return m[1][0] === open[0] && m[1].length >= open.length && line.trim() === m[1] ? "" : open;
+}
+
 // Splits the changelog into its head (everything before "## Unreleased"), the Unreleased body and
 // the rest (from the next level-2 heading on). Headings inside fenced code blocks are ignored.
 export function parse(text) {
   const lines = text.split("\n");
-  let fence = false;
+  let fence = "";
   let start = -1;
   let end = lines.length;
   for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) fence = !fence;
-    if (fence) continue;
+    const inFence = fence !== "";
+    // A release heading inside a fence of the Unreleased notes means the fence was left open.
+    if (inFence && start >= 0 && /^## \[\d+\.\d+\.\d+/.test(lines[i])) fail('An unclosed code fence in "## Unreleased" would pull the older sections into this release: close it.');
+    fence = nextFence(fence, lines[i]);
+    if (inFence || fence) continue;
     if (start < 0) {
       if (UNRELEASED.test(lines[i])) start = i;
     } else if (/^## /.test(lines[i])) {
@@ -56,6 +68,7 @@ export function parse(text) {
       break;
     }
   }
+  if (start >= 0 && fence) fail('An unclosed code fence in "## Unreleased" would pull the older sections into this release: close it.');
   if (start < 0) fail('CHANGELOG.md has no "## Unreleased" section: add one, with the curated notes of this release, below the introduction.');
   return {
     head: lines.slice(0, start).join("\n"),
@@ -141,11 +154,13 @@ export function notesOf(text, version) {
   let notes;
   if (i >= 0) {
     let j = i + 1;
-    let fence = false;
+    let fence = "";
     for (; j < lines.length; j++) {
-      if (/^\s*(```|~~~)/.test(lines[j])) fence = !fence;
-      if (!fence && /^## /.test(lines[j])) break;
+      const inFence = fence !== "";
+      fence = nextFence(fence, lines[j]);
+      if (!inFence && !fence && /^## /.test(lines[j])) break;
     }
+    if (fence) fail(`An unclosed code fence in the ${version} section: close it.`);
     notes = trimBlankLines(lines.slice(i + 1, j)).join("\n");
   } else {
     notes = body;
@@ -166,15 +181,13 @@ function absolute(target, version) {
 // Rewrites relative Markdown link targets (inline `](target)` and reference definitions
 // `[label]: target`) outside code spans and fenced blocks.
 export function absoluteLinks(markdown, version) {
-  let fence = false;
+  let fence = "";
   return markdown
     .split("\n")
     .map((line) => {
-      if (/^\s*(```|~~~)/.test(line)) {
-        fence = !fence;
-        return line;
-      }
-      if (fence) return line;
+      const inFence = fence !== "";
+      fence = nextFence(fence, line);
+      if (inFence || fence) return line;
       const def = line.match(/^(\s{0,3}\[[^\]]+\]:\s*)(<?)(\S+?)(>?)(\s.*)?$/);
       if (def) {
         const abs = absolute(def[3], version);
