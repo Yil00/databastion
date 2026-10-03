@@ -158,12 +158,21 @@ jobs:
       # Same commands, variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the ci.yml
       # job of this engine (dev/agent-it.sh); every probe is required.
       - name: Connector integration tests
-        run: timeout 1800 dev/agent-it.sh "$IT_ENGINE"
+        run: |
+          set -o pipefail
+          timeout 1800 dev/agent-it.sh "$IT_ENGINE" 2>&1 | tee "$RUNNER_TEMP/it.log"
       - name: Service logs
         if: failure()
         run: |
           # shellcheck disable=SC2086
           timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 $SERVICES
+      # Last before Stop, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+          grep -nA12 "panicked at" "$RUNNER_TEMP/it.log" | head -n 120 || true
       - name: Stop
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
