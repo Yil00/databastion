@@ -563,12 +563,19 @@ async fn sessions_are_read_only_with_timeouts() {
         let mut session = Session::connect(&t, Timeouts::new(Duration::from_millis(1500)))
             .await
             .unwrap();
-        let (timeout, ro) = match server.flavor() {
+        // MariaDB names `transaction_isolation` so only from 11.1 on; `tx_isolation` exists on every
+        // supported release (10.11 included).
+        let (timeout, ro, isolation) = match server.flavor() {
             Flavor::Mysql => (
                 "@@session.max_execution_time",
                 "@@session.transaction_read_only",
+                "@@session.transaction_isolation",
             ),
-            Flavor::Mariadb => ("@@session.max_statement_time", "@@session.tx_read_only"),
+            Flavor::Mariadb => (
+                "@@session.max_statement_time",
+                "@@session.tx_read_only",
+                "@@session.tx_isolation",
+            ),
         };
         let mut tx = session.begin().await.unwrap();
         let row = tx
@@ -578,7 +585,7 @@ async fn sessions_are_read_only_with_timeouts() {
                     "SELECT {timeout}, {ro}, @@session.sql_mode, @@session.wait_timeout, \
                      @@session.net_read_timeout, @@session.net_write_timeout, \
                      @@session.lock_wait_timeout, @@session.character_set_results, \
-                     @@session.transaction_isolation"
+                     {isolation}"
                 ),
             )
             .await
