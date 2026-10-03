@@ -389,8 +389,10 @@ fn parse_fingerprint(s: &str) -> Option<[u8; 32]> {
         _ => None,
     };
     let mut out = [0u8; 32];
-    for (o, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
-        *o = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    // 64 digits: 32 pairs, no remainder.
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (o, [hi, lo]) in out.iter_mut().zip(pairs) {
+        *o = (nibble(*hi)? << 4) | nibble(*lo)?;
     }
     Some(out)
 }
