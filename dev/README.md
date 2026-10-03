@@ -88,7 +88,7 @@ The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environ
 | Variable | Service | Meaning |
 |----------|---------|---------|
 | `DATABASTION_DEV_POSTGRES_IMAGE` | `postgres` | Base image of [postgres/Dockerfile](postgres/Dockerfile) (`postgres:<version>-bookworm@sha256:…`); the pgaudit package follows its major |
-| `DATABASTION_DEV_POSTGRES_TAG` | `postgres` | Version in the local image name (`databastion-dev/postgres:<tag>-pgaudit`), so that builds of several majors do not overwrite each other |
+| `DATABASTION_DEV_POSTGRES_TAG` | `postgres` | Version in the local image name (`databastion-dev/postgres:<tag>-pgaudit`), so that builds of several majors do not overwrite each other; required with `DATABASTION_DEV_POSTGRES_IMAGE` (`dev/agent-it.sh` refuses one without the other), since e2e and the load harness use the default name |
 | `DATABASTION_DEV_POSTGRES_LOG_FORMAT` | `postgres` | `jsonlog` (default; PostgreSQL 15+) or `csvlog` (required on 13 and 14): the log is then `postgresql.csv`, which `make agent-it` reads |
 | `DATABASTION_DEV_MYSQL_IMAGE` | `mysql` | `mysql:<version>@sha256:…` |
 | `DATABASTION_DEV_MARIADB_IMAGE` | `mariadb` | `mariadb:<version>@sha256:…` |

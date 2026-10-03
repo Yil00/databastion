@@ -1555,6 +1555,18 @@ async fn pgaudit_log_gives_events_with_pg_dump_signatures() {
         .await
         .unwrap()
         .get(0);
+    // The dev image installs the PGDG pgaudit of the server's major version: the probe above
+    // must find `log_rows` from PostgreSQL 14 on, or an under-report would pass unnoticed.
+    let server_version: i32 = a
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        log_rows,
+        server_version >= 140_000,
+        "pgaudit.log_rows defined on server_version_num {server_version}"
+    );
     if !log_rows {
         eprintln!(
             "pgaudit.log_rows: not defined by this server's pgaudit (before 1.6, \

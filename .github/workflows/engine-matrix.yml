@@ -166,4 +166,4 @@ jobs:
           timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 $SERVICES
       - name: Stop
         if: always()
-        run: docker compose -f dev/docker-compose.yml down -v
+        run: timeout 120 docker compose -f dev/docker-compose.yml down -v

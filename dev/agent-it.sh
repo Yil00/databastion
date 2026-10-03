@@ -41,6 +41,11 @@ cargo_it() { (cd agent && cargo test -p "$1" --all-features --locked -- --nocapt
 
 it_postgres() {
   require_services postgres
+  # Another PostgreSQL image needs its own tag: e2e and the load harness refer to the default name.
+  if [ -n "${DATABASTION_DEV_POSTGRES_IMAGE:-}" ] && [ -z "${DATABASTION_DEV_POSTGRES_TAG:-}" ]; then
+    echo "DATABASTION_DEV_POSTGRES_IMAGE is set: set DATABASTION_DEV_POSTGRES_TAG too (dev/README.md)" >&2
+    exit 2
+  fi
   export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
   export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
   # The pgaudit log format of the service (docker-compose.yml): jsonlog by default, csvlog for
