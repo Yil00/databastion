@@ -7,6 +7,20 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ✨ Features
+- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section
+
+### 🐛 Bug Fixes
+- Version bumps refresh `agent/fuzz/Cargo.lock` too, which `main` was missing after the `0.1.0` back-merge (red "Agent fuzz smoke" and cargo-deny on `main` until the next release) (#112)
+- Console: `esbuild` forced to 0.25 or later under the `drizzle-kit` development dependency (Dependabot advisory) (#114)
+
+### 🔒 Security
+- `release.yml`: checked out without stored credentials, `RELEASE_TOKEN` given only to the release-it step and removed from the git configuration when it ends; Rust toolchain pinned to 1.85.0, the workspace `rust-version` (#115)
+
+### 📝 Documentation
+- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make`
+- README: v0.1.0 status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start
+
 ## [0.1.0](https://github.com/Yil00/databastion/releases/tag/0.1.0) (2026-09-30)
 
 ### ⚠️ Known limitations
