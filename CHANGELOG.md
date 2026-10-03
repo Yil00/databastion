@@ -7,7 +7,16 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
-- CI: engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md). PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
+### 👷 CI
+- Engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md)
+- "Release version" PR check on PRs to `main`: shows the version release-it will compute and fails until the title is `release: X.Y.Z` with that version (or carries `[skip-release]`)
+
+### 🔒 Security
+- Release tooling: `basic-ftp` forced to 6.2.1 under `release-it` (GHSA-c475-qrg2-pj4r, a denial of service in its directory-listing parser; release-it never uses FTP), which turns the "Release tooling advisories" check green
+
+### 🐛 Bug Fixes
+- PostgreSQL connector: `pgaudit.log_rows` counts as a volume source only when the loaded pgaudit defines it (not pgaudit 1.5, PostgreSQL 13, where a value set for it is a placeholder)
+- Version bumps update the root `package-lock.json` too, whose version stayed at `0.0.0`
 
 ## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
 
