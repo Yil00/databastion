@@ -7,8 +7,12 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.2.0](https://github.com/Yil00/databastion/compare/0.1.0...0.2.0) (2026-10-03)
+
+This release was planned as a patch release 0.1.1; the `feat` commit of #116 made release-it compute a minor version. No change to the agent, the protocol or the console runtime: upgrading from 0.1.0 is optional.
+
 ### ✨ Features
-- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section
+- Root `Makefile` targets for setup (`make install`, `make doctor`), the dev environment, the console, the agent (`make agent-build`, `make agent-run`, `make agent-it ENGINE=…`), the protocol checks, `make check` / `make ci`, the end-to-end and load tests and the release dry run; `make help` lists them by section (#116)
 
 ### 🐛 Bug Fixes
 - Version bumps refresh `agent/fuzz/Cargo.lock` too, which `main` was missing after the `0.1.0` back-merge (red "Agent fuzz smoke" and cargo-deny on `main` until the next release) (#112)
@@ -18,8 +22,8 @@ The project follows [semantic versioning](https://semver.org/).
 - `release.yml`: checked out without stored credentials, `RELEASE_TOKEN` given only to the release-it step and removed from the git configuration when it ends; Rust toolchain pinned to 1.85.0, the workspace `rust-version` (#115)
 
 ### 📝 Documentation
-- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make`
-- README: v0.1.0 status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start
+- Tutorial for newcomers ([docs/11-tutorial.md](docs/11-tutorial.md)): trying the release, and developing with `make` (#116)
+- README: release status, a "Supported databases" table with the audit levels and the versions tested in CI, and a quick start (#116)
 
 ## [0.1.0](https://github.com/Yil00/databastion/releases/tag/0.1.0) (2026-09-30)
 
