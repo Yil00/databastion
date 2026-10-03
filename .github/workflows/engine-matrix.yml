@@ -42,15 +42,9 @@ jobs:
       matrix:
         include:
           # PostgreSQL (dev/postgres: the official image + PGDG pgaudit for its major). jsonlog
-          # needs PostgreSQL 15+: 13 and 14 write the pgaudit log as csvlog
-          # (docs/08-engine-capabilities.md).
-          - engine: PostgreSQL
-            version: "13.23"
-            it: postgres
-            services: postgres
-            postgres_image: postgres:13.23-bookworm@sha256:f0cffcc050a9f1f3c78a9968e221badc1cdd02e2ae15b1de9b12bee1ba5ea2db
-            postgres_tag: "13.23"
-            postgres_log_format: csvlog
+          # needs PostgreSQL 15+: 14 writes the pgaudit log as csvlog. 14 is the minimum tested
+          # version: 13 (end of life) has no pg_stat_statements_info, through which the connector
+          # proves pg_stat_statements loaded (docs/08-engine-capabilities.md).
           - engine: PostgreSQL
             version: "14.24"
             it: postgres

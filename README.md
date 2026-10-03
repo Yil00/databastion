@@ -28,7 +28,7 @@ DataBastion sits **as close to the data as possible**:
 ## Supported databases
 | Engine | Discovery | Audit (best level) | Audit source | Tested in CI | Notes |
 |--------|-----------|--------------------|--------------|--------------|-------|
-| PostgreSQL | ✅ | Full with pgaudit (plus a volume source); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 17 (17.11, with pgaudit) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` otherwise; 13 to 18 tested by the engine-matrix workflow |
+| PostgreSQL | ✅ | Full with pgaudit (plus a volume source); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 17 (17.11, with pgaudit) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14; 14 to 18 tested by the engine-matrix workflow. 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`, PostgreSQL 14+) |
 | MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.4 (8.4.11) | Privileges held through roles evaluated on 8.0.19+ |
 | Percona Server for MySQL | ✅ | Partial, never Full | `audit_log` / `audit_log_filter` JSON log | 8.4 (8.4.11-11) | |
 | MariaDB | ✅ | Partial, never Full | `server_audit` log file, or `performance_schema` | 11.4 (11.4.13) | `PUBLIC` grants checked on 10.11+ |
@@ -38,7 +38,7 @@ DataBastion sits **as close to the data as possible**:
 
 *CAS planned right after the MVP.*
 
-- **Tested in CI**: the versions exercised by the connector integration tests and the end-to-end tests on every change. Other versions are tested by the engine-matrix workflow ([`.github/workflows/engine-matrix.yml`](.github/workflows/engine-matrix.yml), weekly and on changes to the connectors or the dev images; not a required check): PostgreSQL 13, 14, 15, 16, 17 and 18, MySQL 8.0, 8.4 and 9.7, MariaDB 10.11, 11.4 and 11.8, MongoDB 6.0, 7.0 and 8.0, with the same connector integration tests. Percona Server and OpenLDAP: the version above only.
+- **Tested in CI**: the versions exercised by the connector integration tests and the end-to-end tests on every change. Other versions are tested weekly by the engine-matrix workflow ([`.github/workflows/engine-matrix.yml`](.github/workflows/engine-matrix.yml), also on changes to the connectors or the dev images; not a required check), with the same connector integration tests, on exactly these versions: PostgreSQL 14, 15, 16, 17 and 18, MySQL 8.0, 8.4 and 9.7, MariaDB 10.11, 11.4 and 11.8, MongoDB 6.0, 7.0 and 8.0. Percona Server and OpenLDAP: the version above only.
 - **Audit levels** (Full / Partial / Limited / None), their prerequisites and each engine's limits: [capability matrix](docs/08-engine-capabilities.md#matrix). Each target reports its actual level in the console.
 
 ## Quick start

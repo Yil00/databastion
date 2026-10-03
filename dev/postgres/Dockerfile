@@ -9,7 +9,7 @@ FROM ${PG_IMAGE}
 
 # The images of PostgreSQL 18+ default to /var/lib/postgresql/<major>/docker and refuse a volume
 # mounted at /var/lib/postgresql/data: the data directory stays there for every major (the value
-# the images of 13 to 17 already use).
+# the images of 14 to 17 already use).
 ENV PGDATA=/var/lib/postgresql/data
 
 RUN set -eux; \

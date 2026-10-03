@@ -39,7 +39,7 @@ services:
       - log_disconnections=on
       - -c
       - logging_collector=on
-      # jsonlog needs PostgreSQL 15+: set DATABASTION_DEV_POSTGRES_LOG_FORMAT=csvlog for 13 and 14
+      # jsonlog needs PostgreSQL 15+: set DATABASTION_DEV_POSTGRES_LOG_FORMAT=csvlog for 14
       # (the file is then postgresql.csv instead of postgresql.json).
       - -c
       - log_destination=${DATABASTION_DEV_POSTGRES_LOG_FORMAT:-jsonlog}

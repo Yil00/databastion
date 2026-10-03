@@ -49,7 +49,7 @@ it_postgres() {
   export DATABASTION_TEST_PG_URL="postgresql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
   export DATABASTION_TEST_PG_ADMIN_URL="postgresql://postgres:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/shop"
   # The pgaudit log format of the service (docker-compose.yml): jsonlog by default, csvlog for
-  # PostgreSQL 13 and 14, where jsonlog does not exist (engine-matrix workflow).
+  # PostgreSQL 14, where jsonlog does not exist (engine-matrix workflow).
   case "${DATABASTION_DEV_POSTGRES_LOG_FORMAT:-jsonlog}" in
     jsonlog) export DATABASTION_TEST_PG_AUDIT_LOG="$ROOT/dev/.state/logs/postgres/postgresql.json" ;;
     csvlog) export DATABASTION_TEST_PG_AUDIT_CSVLOG="$ROOT/dev/.state/logs/postgres/postgresql.csv" ;;
