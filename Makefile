@@ -267,7 +267,7 @@ load-test: test-load ## LONG (about 1 h): load / database impact test (e2e/load/
 
 ##@ Release (maintainer)
 
-release-dry: ## release-it dry run (on branch main only, .release-it.json; needs `make install`)
+release-dry: ## release-it dry run, then the would-be CHANGELOG section and release notes (on branch main only; needs `make install`)
 	timeout 300 npm run release:dry
 
 bump: ## Align every component's version: VERSION=x.y.z (normally run by the release CI, not by hand)

@@ -316,12 +316,12 @@ where
         .filter(|d| !d.is_empty() && !is_system_database(d))
         .cloned()
         .collect();
-    if report.profile_find.contains("") {
-        if let Ok((listed, _)) = catalog::list_databases(session).await {
-            for d in listed {
-                if !is_system_database(&d) && !dbs.contains(&d) {
-                    dbs.push(d);
-                }
+    if report.profile_find.contains("")
+        && let Ok((listed, _)) = catalog::list_databases(session).await
+    {
+        for d in listed {
+            if !is_system_database(&d) && !dbs.contains(&d) {
+                dbs.push(d);
             }
         }
     }
@@ -470,10 +470,10 @@ fn load_profiler_cursors(
 /// would, and a later switch back starts at the newest entries rather than
 /// re-reading that period.
 fn forget_profiler_cursor(cfg: &AuditConfig) {
-    if let Some(store) = cfg.cursor(profiler::CURSOR) {
-        if let Err(e) = store.remove() {
-            tracing::warn!(error = %e, "profiler cursor not removed");
-        }
+    if let Some(store) = cfg.cursor(profiler::CURSOR)
+        && let Err(e) = store.remove()
+    {
+        tracing::warn!(error = %e, "profiler cursor not removed");
     }
 }
 
@@ -771,10 +771,10 @@ async fn profiler_run(
             let fresh = Session::connect(target, timeouts)
                 .await
                 .map_err(MgError::into_connector_error)?;
-            if let Some(old) = st.session.replace(fresh) {
-                if !old.is_broken() {
-                    old.close().await;
-                }
+            if let Some(old) = st.session.replace(fresh)
+                && !old.is_broken()
+            {
+                old.close().await;
             }
         }
         let session = st.session.as_mut().ok_or_else(internal)?;

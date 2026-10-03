@@ -4,6 +4,7 @@
     "release": true,
     "draft": true,
     "releaseName": "${version}",
+    "releaseNotes": "node scripts/changelog-release.mjs notes ${version}",
     "tokenRef": "GITHUB_TOKEN"
   },
   "git": {
@@ -23,8 +24,6 @@
   "npm": false,
   "plugins": {
     "@release-it/conventional-changelog": {
-      "infile": "CHANGELOG.md",
-      "header": "# Changelog",
       "preset": {
         "name": "conventionalcommits",
         "types": [
@@ -78,6 +77,9 @@
     }
   },
   "hooks": {
-    "after:bump": "node scripts/bump-version.mjs ${version}"
+    "after:bump": [
+      "node scripts/changelog-release.mjs changelog ${version}",
+      "node scripts/bump-version.mjs ${version}"
+    ]
   }
 }

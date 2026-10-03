@@ -587,10 +587,10 @@ pub(crate) async fn newest<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(0);
     };
     for e in batch.iter() {
-        if let (_, Value::Doc(d)) = e.map_err(bad)? {
-            if let Some(Value::Date(ts)) = d.get("ts").map_err(bad)? {
-                return Ok(ts);
-            }
+        if let (_, Value::Doc(d)) = e.map_err(bad)?
+            && let Some(Value::Date(ts)) = d.get("ts").map_err(bad)?
+        {
+            return Ok(ts);
         }
     }
     Ok(0)
@@ -611,11 +611,11 @@ pub(crate) async fn poll<S: AsyncRead + AsyncWrite + Unpin>(
         .doc("cursor")
         .map_err(bad)?
         .ok_or_else(|| bad(Malformed))?;
-    if let Some(id) = c.int("id").map_err(bad)? {
-        if id != 0 {
-            // `singleBatch` closes it; a server that did not is told to.
-            session.kill_cursor(db, "system.profile", id).await;
-        }
+    if let Some(id) = c.int("id").map_err(bad)?
+        && id != 0
+    {
+        // `singleBatch` closes it; a server that did not is told to.
+        session.kill_cursor(db, "system.profile", id).await;
     }
     let batch = c
         .array("firstBatch")

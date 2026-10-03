@@ -373,10 +373,10 @@ impl PsPoller {
 
     fn remember(&mut self, thread: u64, info: &ThreadInfo) {
         if !self.threads.contains_key(&thread) {
-            if self.threads.len() >= MAX_THREADS {
-                if let Some(old) = self.thread_order.pop_front() {
-                    self.threads.remove(&old);
-                }
+            if self.threads.len() >= MAX_THREADS
+                && let Some(old) = self.thread_order.pop_front()
+            {
+                self.threads.remove(&old);
             }
             self.thread_order.push_back(thread);
         }

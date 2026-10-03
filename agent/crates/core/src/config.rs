@@ -1302,10 +1302,10 @@ impl TargetConfig {
         if my.ca_file.is_some() && my.tls != MysqlTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
-        if let Some(log) = &my.audit_log {
-            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
-                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
-            }
+        if let Some(log) = &my.audit_log
+            && (!log.path.is_absolute() || log.path.as_os_str().len() > 4096)
+        {
+            return Err(invalid(f("audit_log.path"), "must be an absolute path"));
         }
         Ok(())
     }
@@ -1324,10 +1324,10 @@ impl TargetConfig {
         if mongo.ca_file.is_some() && mongo.tls != MongodbTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
-        if let Some(log) = &mongo.audit_log {
-            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
-                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
-            }
+        if let Some(log) = &mongo.audit_log
+            && (!log.path.is_absolute() || log.path.as_os_str().len() > 4096)
+        {
+            return Err(invalid(f("audit_log.path"), "must be an absolute path"));
         }
         // A MongoDB database name: 1 to 64 bytes, none of `/\. "$`, no NUL
         // or control character.
@@ -1412,10 +1412,10 @@ impl TargetConfig {
         if pg.ca_file.is_some() && pg.tls != PgTlsMode::VerifyFull {
             return Err(invalid(f("ca_file"), "only with tls: verify_full"));
         }
-        if let Some(log) = &pg.audit_log {
-            if !log.path.is_absolute() || log.path.as_os_str().len() > 4096 {
-                return Err(invalid(f("audit_log.path"), "must be an absolute path"));
-            }
+        if let Some(log) = &pg.audit_log
+            && (!log.path.is_absolute() || log.path.as_os_str().len() > 4096)
+        {
+            return Err(invalid(f("audit_log.path"), "must be an absolute path"));
         }
         Ok(())
     }

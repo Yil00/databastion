@@ -381,7 +381,7 @@ for svc in target-pg target-mariadb target-mongo; do
     sleep 2
   done
 done
-compose exec -T target-mariadb cat /var/lib/mysql/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \
+compose exec -T target-mariadb cat /var/lib/databastion-tls/ca.pem >"$T/mariadb-ca.pem" \
   || fail "cannot read the CA of target-mariadb"
 openssl x509 -in "$T/mariadb-ca.pem" -noout -subject 2>/dev/null | grep -q "DataBastion dev CA (mariadb)" \
   || fail "mariadb-ca.pem is not the dev CA of target-mariadb"

@@ -1064,23 +1064,24 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .collect();
     // `DO $$ … $$`: the body is code; its statements are analyzed too (one
     // level), so a `COPY … TO PROGRAM` inside a block is seen.
-    if statements.len() == 1 && word(statements[0].first()) == Some("do") {
-        if let Some(body) = do_body(text) {
-            // Same fail-closed rule as the outer text: a body whose
-            // reading depends on `standard_conforming_strings` (any role
-            // can `SET` it) gives no nested part.
-            if let Some(inner) = lex_unambiguous(body) {
-                for st in split_statements(&inner) {
-                    if let Some(st) = plpgsql_statement(st) {
-                        let info = statement_info(&st, opts, true);
-                        for r in &info.relations {
-                            if relations.len() < MAX_RELATIONS && !relations.contains(r) {
-                                relations.push(r.clone());
-                            }
+    if statements.len() == 1
+        && word(statements[0].first()) == Some("do")
+        && let Some(body) = do_body(text)
+    {
+        // Same fail-closed rule as the outer text: a body whose
+        // reading depends on `standard_conforming_strings` (any role
+        // can `SET` it) gives no nested part.
+        if let Some(inner) = lex_unambiguous(body) {
+            for st in split_statements(&inner) {
+                if let Some(st) = plpgsql_statement(st) {
+                    let info = statement_info(&st, opts, true);
+                    for r in &info.relations {
+                        if relations.len() < MAX_RELATIONS && !relations.contains(r) {
+                            relations.push(r.clone());
                         }
-                        if parts.len() < MAX_PARTS {
-                            parts.push(info);
-                        }
+                    }
+                    if parts.len() < MAX_PARTS {
+                        parts.push(info);
                     }
                 }
             }
@@ -1810,15 +1811,12 @@ fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
                         | "for"
                         | "when"
                         | "to"
-                ) {
-                    if let Some(f) = frames.last_mut() {
-                        f.in_from = false;
-                    }
+                ) && let Some(f) = frames.last_mut()
+                {
+                    f.in_from = false;
                 }
-                if from_list {
-                    if let Some(f) = frames.last_mut() {
-                        f.in_from = true;
-                    }
+                if from_list && let Some(f) = frames.last_mut() {
+                    f.in_from = true;
                 }
                 i += 1;
                 if reads {

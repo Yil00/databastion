@@ -135,6 +135,9 @@ jobs:
           timeout 60 python3 -m unittest discover -s ../scripts -p 'test_check_console_licenses.py'
           pnpm licenses list --prod --json > "$RUNNER_TEMP/console-licenses.json"
           python3 ../scripts/check_console_licenses.py "$RUNNER_TEMP/console-licenses.json"
+      # The CHANGELOG / release notes step of release.yml (root release tooling, node + git only).
+      - name: Release changelog script
+        run: timeout 60 python3 -m unittest discover -s ../scripts -p 'test_changelog_release.py'
       - run: pnpm lint
       - run: pnpm typecheck
       # Throwaway PostgreSQL 17 for the DB test suites (describe.skipIf(!hasDb): agent API, auth,
@@ -226,6 +229,44 @@ jobs:
       # included (deny.toml excludes them so that test-only crates do not trip the bans).
       - name: cargo-deny dev-dependencies (licenses, sources)
         run: cargo deny --config deny-dev.toml --locked check licenses sources
+
+  # The workspace `rust-version` (MSRV) is a promise: the workspace must build on exactly that
+  # toolchain, not only on the latest stable used by the other agent jobs. Type-checks every target
+  # (lib, bins, tests, benches) with all features, plus the minimal build (no connector). Tests run
+  # in the "Agent" job; agent/fuzz (own workspace, no rust-version, stable or nightly only) is
+  # left out. Bump `toolchain` together with `rust-version` in agent/Cargo.toml and the pin in
+  # release.yml. Required through ci-result.
+  agent-msrv:
+    name: Agent MSRV (Rust 1.88.0)
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+          key: msrv
+      # The declared rust-version and this job's toolchain must agree.
+      - name: rust-version matches the toolchain
+        run: |
+          declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          actual="$(rustc --version | cut -d' ' -f2)"
+          echo "rust-version: $declared, rustc: $actual"
+          [ -n "$declared" ] && [ "${actual%.*}" = "$declared" ]
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo check --workspace --no-default-features --locked
 
   # Always runs: the contract is the synchronization point, so a missing openapi.yaml fails the job
   # instead of skipping it.
@@ -361,7 +402,7 @@ jobs:
           compose() { timeout 60 docker compose -f dev/docker-compose.yml "$@"; }
           mkdir -p dev/.state/tls
           compose exec -T mysql cat /var/lib/mysql/ca.pem > dev/.state/tls/mysql-ca.pem
-          compose exec -T mariadb cat /var/lib/mysql/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
+          compose exec -T mariadb cat /var/lib/databastion-tls/ca.pem > dev/.state/tls/mariadb-ca.pem
           export DATABASTION_TEST_MYSQL_URL="mysql://databastion:${DATABASTION_DB_PASSWORD}@127.0.0.1:${MYSQL_PORT}/hr"
           export DATABASTION_TEST_MYSQL_ADMIN_URL="mysql://root:${MYSQL_ROOT_PASSWORD}@127.0.0.1:${MYSQL_PORT}/"
           export DATABASTION_TEST_MYSQL_CA_FILE="$PWD/dev/.state/tls/mysql-ca.pem"
@@ -608,7 +649,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

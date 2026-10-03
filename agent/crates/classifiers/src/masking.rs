@@ -53,7 +53,11 @@
 //! correlating with the same string under another. The key is the
 //! agent-local key loaded by the core (`<state_dir>/hmac.key`, 32 bytes) and
 //! handed to [`HmacKey::new`]. Normalization before hashing, so that equal
-//! values correlate: e-mail trimmed and lowercased; IBAN, card and NIR
+//! values correlate: every value is first trimmed, put in canonical
+//! composition (NFC) and its typographic spaces and hyphens (U+00A0,
+//! U+2000–U+200A, U+202F, U+2010–U+2013, U+2212) read as ASCII space and
+//! `-`, as the column classifier does before detection; then e-mail
+//! lowercased; IBAN, card and NIR
 //! without separators, uppercase; phone as `+<digits>` when written with `+`,
 //! national digits as is (`0X…` becomes `+33X…` and `00…` becomes `+…` only
 //! with [`PhoneRegion::Fr`]); birth date as ISO `YYYY-MM-DD`; names and
@@ -201,8 +205,14 @@ pub fn mask(_raw: &RawSample<'_>) -> MaskedSample {
 /// fully redacted.
 #[must_use]
 pub fn mask_as(classifier: ClassifierId, raw: &RawSample<'_>) -> MaskedSample {
-    match normalize(classifier, raw.expose(), PhoneRegion::Unknown) {
-        Some(norm) => MaskedSample::checked(format_masked(classifier, raw.expose(), &norm)),
+    // The layout comes from the prepared value too, so that a typographic
+    // separator is kept as its ASCII form (`06\u{a0}12…` masks like
+    // `06 12…`) instead of being dropped.
+    let Some(prepared) = prepare(raw.expose()) else {
+        return MaskedSample::redacted();
+    };
+    match normalize_prepared(classifier, &prepared, PhoneRegion::Unknown) {
+        Some(norm) => MaskedSample::checked(format_masked(classifier, &prepared, &norm)),
         None => MaskedSample::redacted(),
     }
 }
@@ -263,7 +273,10 @@ fn group4(chars: &[char]) -> String {
 }
 
 fn mask_iban(norm: &str) -> String {
-    let chars: Vec<char> = norm.chars().collect();
+    // Every character of the value: zeroized on drop, sized up front (bytes >= chars) so that
+    // `extend` never reallocates and leaves a copy behind.
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(norm.len()));
+    chars.extend(norm.chars());
     if chars.len() < 15 {
         return FULLY_REDACTED.to_owned();
     }
@@ -277,7 +290,10 @@ fn mask_iban(norm: &str) -> String {
 }
 
 fn mask_card(norm: &str) -> String {
-    let chars: Vec<char> = norm.chars().collect();
+    // Every character of the value: zeroized on drop, sized up front (bytes >= chars) so that
+    // `extend` never reallocates and leaves a copy behind.
+    let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(norm.len()));
+    chars.extend(norm.chars());
     if chars.len() < 12 {
         return FULLY_REDACTED.to_owned();
     }
@@ -329,7 +345,10 @@ fn country_code_len(digits: &str) -> usize {
 /// (`+1 *** *** **25`, `+33 * ** ** ** 78`, `+351 *** *** **5`); a national
 /// number keeps its last 2 digits only (`** ** ** ** 78`).
 fn mask_phone(raw: &str) -> String {
-    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    // Every digit of the number: zeroized on drop, sized up front so that `extend` never
+    // reallocates and leaves a copy behind.
+    let mut digits: Zeroizing<String> = Zeroizing::new(String::with_capacity(raw.len()));
+    digits.extend(raw.chars().filter(char::is_ascii_digit));
     let total = digits.len();
     if total < 8 {
         return FULLY_REDACTED.to_owned();
@@ -390,15 +409,58 @@ pub(crate) fn normalize(
     raw: &str,
     region: PhoneRegion,
 ) -> Option<Zeroizing<String>> {
+    normalize_prepared(classifier, &prepare(raw)?, region)
+}
+
+/// Typographic spaces and hyphens read as their ASCII form by the
+/// detectors and by [`normalize`]: no-break space U+00A0, the spaces
+/// U+2002–U+200A, narrow no-break space U+202F, the hyphens and dashes
+/// U+2010–U+2013 and the minus sign U+2212 (as word processors and
+/// spreadsheets write numbers). U+2000 and U+2001 are folded too, through
+/// their canonical composition (U+2002, U+2003).
+pub(crate) fn typographic(c: char) -> bool {
+    matches!(
+        c,
+        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{2010}'..='\u{2013}' | '\u{2212}'
+    )
+}
+
+/// ASCII form of a [`typographic`] separator (space or `-`); any other
+/// character is returned as is.
+pub(crate) fn fold_typographic(c: char) -> char {
+    match c {
+        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' => ' ',
+        '\u{2010}'..='\u{2013}' | '\u{2212}' => '-',
+        c => c,
+    }
+}
+
+/// The form every classifier normalizes and masks: trimmed, in canonical
+/// composition (NFC), typographic separators folded, in the order the
+/// column classifier applies them before detection, so that a token it
+/// found has the fingerprint and masked sample it would have here, and a
+/// direct caller gets the same result for `06\u{a0}12…` as for `06 12…`.
+/// Idempotent; ASCII values are only trimmed. `None` when empty or longer
+/// than the detectors' scan bound. Zeroized on drop.
+fn prepare(raw: &str) -> Option<Zeroizing<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > detect::MAX_SCAN_BYTES {
         return None;
     }
-    // Canonical composition first (as the column classifier does), so that
-    // a value stored decomposed (NFD) has the fingerprint of its composed
-    // form for every caller. ASCII values are unchanged.
-    let composed = Zeroizing::new(trimmed.nfc().collect::<String>());
-    let v = composed.as_str();
+    // Pre-sized so that no reallocation leaves an unzeroized copy of a raw
+    // prefix behind: NFC expands UTF-8 by at most 3 times (UAX #15), and
+    // folding only shrinks.
+    let mut buf = String::with_capacity(trimmed.len().saturating_mul(3));
+    buf.extend(trimmed.nfc().map(fold_typographic));
+    Some(Zeroizing::new(buf))
+}
+
+/// [`normalize`] of a value already [`prepare`]d.
+fn normalize_prepared(
+    classifier: ClassifierId,
+    v: &str,
+    region: PhoneRegion,
+) -> Option<Zeroizing<String>> {
     let z = |s: String| Zeroizing::new(s);
     match classifier {
         ClassifierId::Email => {
@@ -1595,6 +1657,119 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
+    }
+
+    /// Every typographic separator folded by `normalize` (U+2000 and
+    /// U+2001 through their NFC form).
+    const TYPOGRAPHIC_SPACES: [char; 13] = [
+        '\u{a0}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}',
+        '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{202f}',
+    ];
+    const TYPOGRAPHIC_HYPHENS: [char; 5] =
+        ['\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2212}'];
+
+    #[test]
+    fn typographic_separators_fingerprint_and_mask_like_ascii() {
+        let k = key(7);
+        let fp = |c, v: &str| k.fingerprint(c, &RawSample::new(v));
+        let fr = |v: &str| k.fingerprint_in(C::Phone, &RawSample::new(v), PhoneRegion::Fr);
+        let spaced = [
+            (C::Phone, "06 12 34 56 78"),
+            (C::Phone, "+33 6 12 34 56 78"),
+            (C::Phone, "+44 (0)20 7946 0958"),
+            (C::CardNumber, "4111 1111 1111 1111"),
+            (C::Iban, "FR76 3000 6000 0112 3456 7890 189"),
+            (C::Nir, "1 85 05 78 006 084 91"),
+            (C::PersonName, "Jane Doe"),
+            (C::PostalAddress, "10 rue des Lilas"),
+        ];
+        let hyphenated = [
+            (C::Phone, "202-555-0125"),
+            (C::CardNumber, "4111-1111-1111-1111"),
+            (C::Iban, "FR76-3000-6000-0112-3456-7890-189"),
+            (C::Nir, "1-85-05-78-006-084-91"),
+            (C::BirthDate, "1950-12-01"),
+            (C::Email, "jane-doe@example-mail.com"),
+            (C::PersonName, "Jean-Pierre Martin"),
+        ];
+        for (seps, values, ascii) in [
+            (&TYPOGRAPHIC_SPACES[..], &spaced[..], ' '),
+            (&TYPOGRAPHIC_HYPHENS[..], &hyphenated[..], '-'),
+        ] {
+            for &(c, v) in values {
+                let want = fp(c, v);
+                assert!(want.is_some(), "{c}");
+                for &sep in seps {
+                    let t = v.replace(ascii, &sep.to_string());
+                    assert_eq!(fp(c, &t), want, "{c} U+{:04X}", u32::from(sep));
+                    assert_eq!(m(c, &t), m(c, v), "{c} U+{:04X}", u32::from(sep));
+                    if c == C::Phone {
+                        assert_eq!(fr(&t), fr(v), "U+{:04X}", u32::from(sep));
+                    }
+                }
+            }
+        }
+        // The layout keeps the ASCII form of the separator.
+        assert_eq!(
+            m(C::Phone, "06\u{a0}12\u{a0}34\u{a0}56\u{a0}78"),
+            "** ** ** ** 78"
+        );
+        assert_eq!(m(C::Phone, "202\u{2011}555\u{2011}0125"), "***-***-**25");
+        // Separators mixed in one value, and around it (trimmed).
+        assert_eq!(
+            fp(
+                C::Phone,
+                "\u{202f}+33\u{a0}6 12\u{2009}34\u{202f}56\u{2007}78\u{a0}"
+            ),
+            fp(C::Phone, "+33612345678")
+        );
+    }
+
+    #[test]
+    fn other_separators_are_not_folded() {
+        // Not read as ASCII by the detectors either: a value written with
+        // them is not this classifier's (fully redacted, no fingerprint).
+        let k = key(7);
+        for sep in [
+            '\u{b7}', '\u{2014}', '\u{2015}', '\u{2027}', '\u{3000}', '\u{ff0d}', '\u{fe63}',
+            '\u{200b}',
+        ] {
+            let phone = ["06", "12", "34", "56", "78"].join(&sep.to_string());
+            assert_eq!(m(C::Phone, &phone), "***", "U+{:04X}", u32::from(sep));
+            assert!(k.fingerprint(C::Phone, &RawSample::new(&phone)).is_none());
+            let card = ["4111", "1111", "1111", "1111"].join(&sep.to_string());
+            assert_eq!(m(C::CardNumber, &card), "***", "U+{:04X}", u32::from(sep));
+            assert!(
+                k.fingerprint(C::CardNumber, &RawSample::new(&card))
+                    .is_none()
+            );
+        }
+        // A hyphen-like character that is not folded keeps a name distinct.
+        assert_ne!(
+            k.fingerprint(C::PersonName, &RawSample::new("Jean\u{2014}Pierre")),
+            k.fingerprint(C::PersonName, &RawSample::new("Jean-Pierre"))
+        );
+    }
+
+    #[test]
+    fn prepare_folds_once_and_leaves_ascii_alone() {
+        let p = |v: &str| prepare(v).map(|z| z.as_str().to_owned());
+        assert_eq!(p("  06 12-34.56/78 ").as_deref(), Some("06 12-34.56/78"));
+        assert_eq!(
+            p("06\u{a0}12\u{2000}34\u{2011}56\u{2212}78").as_deref(),
+            Some("06 12 34-56-78")
+        );
+        assert_eq!(p("e\u{301}"), Some("\u{e9}".to_owned()));
+        assert_eq!(p("\u{a0}\u{202f}"), None);
+        for v in ["\u{2010}x\u{a0}", "a\u{a0}\u{301}b", "\u{2001}\u{2010}1"] {
+            let once = p(v).unwrap_or_default();
+            assert_eq!(p(&once).unwrap_or_default(), once);
+        }
+        for c in TYPOGRAPHIC_SPACES.iter().chain(&TYPOGRAPHIC_HYPHENS) {
+            let s = c.to_string();
+            let folded = prepare(&format!("a{s}b")).unwrap_or_else(|| unreachable!());
+            assert!(folded.is_ascii(), "U+{:04X}", u32::from(*c));
+        }
     }
 
     fn hex(tag: &[u8]) -> String {

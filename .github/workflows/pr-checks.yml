@@ -100,6 +100,11 @@ jobs:
               echo "::notice::[skip-release] in the title: no release (it would be $version)."
               exit 0 ;;
           esac
+          # release.yml fails without curated notes (scripts/changelog-release.mjs): say it here first.
+          if ! node scripts/changelog-release.mjs check; then
+            echo "::error::Merging this PR would fail the release: CHANGELOG.md has no curated notes under \"## Unreleased\" (RELEASE.md, section 5)."
+            exit 1
+          fi
           expected="release: $version"
           if [ "$TITLE" != "$expected" ]; then
             echo "::error::Merging this PR releases $version: title it \"$expected\", or add [skip-release] to the title to merge without a release (RELEASE.md, section 5)."

@@ -56,7 +56,7 @@ use crate::id::ClassifierId;
 use crate::lexicon;
 use crate::masking::{
     FindingLocation, Fingerprint, HmacKey, MaskedFinding, MaskedSample, PhoneRegion, RawSample,
-    mask_as,
+    fold_typographic, mask_as, typographic,
 };
 
 /// Most values examined per column (contract `sample_rows` maximum).
@@ -408,7 +408,9 @@ impl ColumnClassifier<'_> {
             // no-break space, non-breaking hyphen, en dash, minus sign),
             // as word processors and spreadsheets write numbers
             // (`06\u{a0}12\u{a0}34\u{a0}56\u{a0}78`), read as their ASCII
-            // form. Zeroized on drop.
+            // form; the same fold as `masking::normalize`, so tokens taken
+            // from here keep their fingerprints and masked samples there.
+            // Zeroized on drop.
             let folded: Zeroizing<String>;
             let value: &str = if value.contains(typographic) {
                 // Folding only shrinks the value: no reallocation.
@@ -630,22 +632,6 @@ impl ColumnClassifier<'_> {
                 a.fps.pop_last();
             }
         }
-    }
-}
-
-/// Typographic spaces and hyphens folded by [`fold_typographic`].
-fn typographic(c: char) -> bool {
-    matches!(
-        c,
-        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{2010}'..='\u{2013}' | '\u{2212}'
-    )
-}
-
-fn fold_typographic(c: char) -> char {
-    match c {
-        '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' => ' ',
-        '\u{2010}'..='\u{2013}' | '\u{2212}' => '-',
-        c => c,
     }
 }
 

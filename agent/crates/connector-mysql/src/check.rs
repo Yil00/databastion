@@ -308,15 +308,16 @@ impl AuditProbe {
 /// `performance_schema`, else none. `check()` and the Audit stream use
 /// this same rule.
 pub(crate) fn choose(probe: &AuditProbe, file: Option<FileState>) -> (AuditLevel, Source) {
-    if let Some(f) = file {
-        if f.readable && probe.file_plugin(f.format) {
-            let level = if f.recent {
-                AuditLevel::Partial
-            } else {
-                AuditLevel::Limited
-            };
-            return (level, Source::File(f.format));
-        }
+    if let Some(f) = file
+        && f.readable
+        && probe.file_plugin(f.format)
+    {
+        let level = if f.recent {
+            AuditLevel::Partial
+        } else {
+            AuditLevel::Limited
+        };
+        return (level, Source::File(f.format));
     }
     match probe.ps() {
         Some((level, table)) => (level, Source::Ps(table)),
@@ -1075,36 +1076,36 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
             }
         }
     }
-    if p.server_audit.is_some() {
-        if let Some(rows) = optional(session, sql::SERVER_AUDIT_SETTINGS).await? {
-            let events = cell(&rows, 0, 2).unwrap_or("").to_ascii_uppercase();
-            p.server_audit = Some(ServerAudit {
-                logging: truthy(cell(&rows, 0, 0)),
-                file: cell(&rows, 0, 1).is_some_and(|v| v.eq_ignore_ascii_case("file")),
-                // Empty: every event.
-                statements: events.trim().is_empty()
-                    || events.split(',').any(|e| {
-                        let e = e.trim();
-                        e.starts_with("QUERY") || e == "TABLE"
-                    }),
-            });
-        }
+    if p.server_audit.is_some()
+        && let Some(rows) = optional(session, sql::SERVER_AUDIT_SETTINGS).await?
+    {
+        let events = cell(&rows, 0, 2).unwrap_or("").to_ascii_uppercase();
+        p.server_audit = Some(ServerAudit {
+            logging: truthy(cell(&rows, 0, 0)),
+            file: cell(&rows, 0, 1).is_some_and(|v| v.eq_ignore_ascii_case("file")),
+            // Empty: every event.
+            statements: events.trim().is_empty()
+                || events.split(',').any(|e| {
+                    let e = e.trim();
+                    e.starts_with("QUERY") || e == "TABLE"
+                }),
+        });
     }
-    if p.audit_log.is_some() {
-        if let Some(rows) = optional(session, sql::AUDIT_LOG_SETTINGS).await? {
-            let policy = cell(&rows, 0, 1).unwrap_or("").to_ascii_uppercase();
-            p.audit_log = Some((
-                cell(&rows, 0, 0).unwrap_or("").to_owned(),
-                matches!(policy.as_str(), "ALL" | "QUERIES"),
-            ));
-        }
+    if p.audit_log.is_some()
+        && let Some(rows) = optional(session, sql::AUDIT_LOG_SETTINGS).await?
+    {
+        let policy = cell(&rows, 0, 1).unwrap_or("").to_ascii_uppercase();
+        p.audit_log = Some((
+            cell(&rows, 0, 0).unwrap_or("").to_owned(),
+            matches!(policy.as_str(), "ALL" | "QUERIES"),
+        ));
     }
     // The audit_log_filter component is not a plugin: its variable exists
     // only when it is installed.
-    if let Some(rows) = optional(session, sql::AUDIT_LOG_FILTER_FORMAT).await? {
-        if let Some(format) = cell(&rows, 0, 0) {
-            p.audit_log_filter = Some(format.to_owned());
-        }
+    if let Some(rows) = optional(session, sql::AUDIT_LOG_FILTER_FORMAT).await?
+        && let Some(format) = cell(&rows, 0, 0)
+    {
+        p.audit_log_filter = Some(format.to_owned());
     }
     Ok(p)
 }
@@ -1291,12 +1292,11 @@ async fn mysql_role_privileges(
     }
     let using: Vec<(String, String)> = using.into_iter().collect();
     let mut evaluated = false;
-    if using.len() <= MAX_EVALUATED_ROLES {
-        if let Some(statement) = sql::show_grants_using(&using) {
-            if let Some(Some(rows)) = optional_complete(session, &statement).await? {
-                evaluated = merge_grant_lines(&rows, grants);
-            }
-        }
+    if using.len() <= MAX_EVALUATED_ROLES
+        && let Some(statement) = sql::show_grants_using(&using)
+        && let Some(Some(rows)) = optional_complete(session, &statement).await?
+    {
+        evaluated = merge_grant_lines(&rows, grants);
     }
     if !evaluated {
         grants.roles_unevaluated = grants.roles;
@@ -1338,10 +1338,10 @@ async fn mariadb_role_privileges(
         .await?
         .and_then(|r| cell(&r, 0, 0).map(str::to_owned));
     let mut evaluated = false;
-    if current.as_ref().is_some_and(|c| roles.contains(c)) {
-        if let Some(Some(rows)) = optional_complete(session, sql::SHOW_GRANTS_CURRENT_ROLE).await? {
-            evaluated = merge_grant_lines(&rows, grants);
-        }
+    if current.as_ref().is_some_and(|c| roles.contains(c))
+        && let Some(Some(rows)) = optional_complete(session, sql::SHOW_GRANTS_CURRENT_ROLE).await?
+    {
+        evaluated = merge_grant_lines(&rows, grants);
     }
     grants.roles_unevaluated = grants.roles - u64::from(evaluated);
     Ok(true)

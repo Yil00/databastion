@@ -160,10 +160,10 @@ fn processes(root: &Path) -> Vec<(DetectedTargetProcess, Engine)> {
             continue;
         };
         let comm = comm.trim_end_matches('\n');
-        if let Some((_, p, e)) = PROCESSES.iter().find(|(n, _, _)| *n == comm) {
-            if !out.contains(&(*p, *e)) {
-                out.push((*p, *e));
-            }
+        if let Some((_, p, e)) = PROCESSES.iter().find(|(n, _, _)| *n == comm)
+            && !out.contains(&(*p, *e))
+        {
+            out.push((*p, *e));
         }
     }
     out
