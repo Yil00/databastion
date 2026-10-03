@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ✨ Features
+- PostgreSQL connector: a target at Partial because pgaudit logs reads without row counts (`pgaudit.log_rows` off, or pgaudit before 1.6) now sends the target note `audit.log_without_row_counts`, so the console shows why it is not Full; until now the reason was in the agent's local log only (`postgres` appended to the note's engines in `shared/protocol/target-notes.json`, a compatible registry change)
+
 ### 👷 CI
 - Engine-matrix workflow (weekly, and on changes to the connectors or the dev images; not a required check) running the PostgreSQL, MySQL / MariaDB and MongoDB connector integration tests against PostgreSQL 14 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8 and MongoDB 6.0 / 7.0 / 8.0; the dev engine images can be overridden with `DATABASTION_DEV_*_IMAGE` (dev/README.md). PostgreSQL 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`)
 - "Release version" PR check on PRs to `main`: shows the version release-it will compute and fails until the title is `release: X.Y.Z` with that version (or carries `[skip-release]`)
