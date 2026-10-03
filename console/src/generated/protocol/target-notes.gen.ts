@@ -91,6 +91,7 @@ export const TARGET_NOTE_REGISTRY = {
   "audit.log_without_row_counts": {
     "description": "The audit log carries no row counts: result volumes are unknown.",
     "engines": [
+      "postgres",
       "mysql",
       "mariadb",
       "mongodb"
