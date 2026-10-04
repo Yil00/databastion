@@ -7,7 +7,7 @@ import { writeAudit } from "@/server/audit";
 import { deleteSession, OIDC_REFRESH_INTERVAL_MS, type Session } from "@/server/auth/session";
 
 import { mapClaims } from "./claims";
-import { refreshTokens, withUserinfo } from "./client";
+import { fetchUserinfo, refreshTokens, withUserinfo } from "./client";
 import { revokeRefreshTokensInBackground, type EndedSessionRow } from "./revoke";
 import { syncRole } from "./service";
 import { oidcProvider } from "./runtime";
@@ -16,8 +16,12 @@ import { decryptRefreshToken, encryptRefreshToken } from "./tokens";
 /**
  * Token refresh of an OIDC session (ADR-0038 decisions 9 and 13), on user activity, at most every
  * 5 minutes: one process claims the refresh with a conditional update. A failed refresh (provider
- * refusal, invalid `id_token`, filters no longer passed) ends the session. The mapped role is
- * applied again when the provider returns claims (a refreshed `id_token`, or userinfo).
+ * refusal, invalid `id_token`, filters no longer passed) ends the session. The filters and the
+ * mapped role are checked again when the provider returns claims: a refreshed `id_token` (merged
+ * with userinfo when `DATABASTION_OIDC_USE_USERINFO=1`), or, when the refresh response has no
+ * `id_token`, userinfo alone with `DATABASTION_OIDC_USE_USERINFO=1` (end-of-phase-8 review L2; its
+ * `sub` must be the session identity's, else the session ends). With neither, the refresh only
+ * proves the provider still honors the refresh token: role and filters are not re-checked.
  * A provider that is merely unreachable also ends the session: the console cannot tell a disabled
  * user from an outage, and fails closed.
  */
@@ -57,7 +61,14 @@ export async function refreshOidcSession(db: Database, session: Session): Promis
   try {
     const md = await provider.getMetadata();
     const { tokens, claims } = await refreshTokens(provider, md, refreshToken, ident.subject);
-    const merged = claims !== null ? await withUserinfo(provider, md, claims, tokens.accessToken) : null;
+    let merged: Record<string, unknown> | null = null;
+    if (claims !== null) merged = await withUserinfo(provider, md, claims, tokens.accessToken);
+    else if (provider.config.useUserinfo) {
+      const info = await fetchUserinfo(provider, md, tokens.accessToken);
+      // Bound to the session's identity: another subject's claims never apply to it.
+      if (typeof info.sub !== "string" || info.sub !== ident.subject) return end("refresh_subject");
+      merged = info;
+    }
     let role = session.user.role;
     if (merged !== null) {
       const mapping = mapClaims(merged, provider.config);

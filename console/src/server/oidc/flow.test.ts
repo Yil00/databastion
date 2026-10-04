@@ -342,30 +342,87 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     expect(await sessionOf(session)).toBeNull();
   });
 
-  it("admins approve pending logins only as NEW users, with the role they choose", async () => {
+  it("refresh without an id_token re-checks role and filters on userinfo, bound to the session's subject (end-of-phase-8 review L2)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1", DATABASTION_OIDC_USE_USERINFO: "1" });
+    const age = () => getDb().update(sessions).set({ refreshedAt: sql`now() - interval '6 minutes'` }).where(sql`${sessions.refreshTokenEnc} is not null`);
+    const { session } = await oidcLogin("sub-olga", { preferred_username: "olga", groups: ["databastion-admins"] }, { refreshToken: "rt-olga" });
+    expect((await sessionOf(session))?.user.role).toBe("admin");
+    // No id_token in the refresh answer: userinfo no longer lists the admin group, so she is demoted.
+    fp.refreshes.set("rt-olga", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-olga", preferred_username: "olga", groups: [] }, refreshToken: "rt-olga-2" });
+    const before = fp.hits["/userinfo"] ?? 0;
+    await age();
+    expect((await sessionOf(session))?.user.role).toBe("analyst");
+    expect(fp.hits["/userinfo"]).toBe(before + 1);
+    const [change] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.role_change"), sql`${auditLog.details}->>'to' = 'analyst'`, sql`${auditLog.details}->>'from' = 'admin'`)).orderBy(sql`${auditLog.id} desc`).limit(1);
+    expect(change?.details).toMatchObject({ source: "oidc" });
+    // Userinfo of another subject: the session ends.
+    fp.refreshes.set("rt-olga-2", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-someone-else", preferred_username: "olga", groups: ["databastion-admins"] } });
+    await age();
+    expect(await sessionOf(session)).toBeNull();
+    const [ended] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.logout"), sql`${auditLog.details}->>'reason' = 'refresh_subject'`));
+    expect(ended).toBeDefined();
+    // Filters are re-checked on userinfo too (a string groups claim is never a group).
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1", DATABASTION_OIDC_USE_USERINFO: "1", DATABASTION_OIDC_ALLOWED_GROUPS: "databastion-admins,databastion-analysts" });
+    const second = await oidcLogin("sub-olga", { preferred_username: "olga", groups: ["databastion-analysts"] }, { refreshToken: "rt-olga-3" });
+    fp.refreshes.set("rt-olga-3", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-olga", groups: "databastion-analysts" } });
+    await age();
+    expect(await sessionOf(second.session)).toBeNull();
+    expect(await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.logout"), sql`${auditLog.details}->>'reason' = 'refresh_group'`))).toHaveLength(1);
+    // Without userinfo, a refresh without an id_token proves only that the token is still honored:
+    // role and filters are not re-checked (documented residual risk).
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1" });
+    const third = await oidcLogin("sub-olga", { preferred_username: "olga", groups: ["databastion-analysts"] }, { refreshToken: "rt-olga-4" });
+    fp.refreshes.set("rt-olga-4", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-olga", groups: ["databastion-admins"] } });
+    const hits = fp.hits["/userinfo"] ?? 0;
+    await age();
+    expect((await sessionOf(third.session))?.user.role).toBe("analyst");
+    expect(fp.hits["/userinfo"] ?? 0).toBe(hits);
+  });
+
+  it("admins approve pending logins only as NEW users; with role sync on, only with the mapped role (end-of-phase-8 review L1)", async () => {
     configure();
     process.env.DATABASTION_LOCAL_LOGIN = "enabled";
     const admin = await localLogin("root");
     const analyst = await localLogin("carol");
     await oidcLogin("sub-hank", { preferred_username: "hank", email: "hank@example.com", email_verified: true, groups: ["databastion-admins"] });
     const list = await handleListPendingLogins(userReq("GET", "/api/oidc/pending-logins", { cookie: admin.cookie }));
-    const { pending } = (await list.json()) as { pending: { id: string; subject: string; issuer: string; mappedRole: string }[] };
+    const { pending } = (await list.json()) as { pending: { id: string; subject: string; issuer: string; mappedRole: string; syncedRole: string | null }[] };
     const p = pending.find((x) => x.subject === "sub-hank");
-    expect(p).toMatchObject({ issuer: fp.issuer, mappedRole: "admin" });
+    expect(p).toMatchObject({ issuer: fp.issuer, mappedRole: "admin", syncedRole: "admin" });
     const id = p?.id ?? "";
     // Analysts cannot list nor approve.
     expect((await handleListPendingLogins(userReq("GET", "/api/oidc/pending-logins", { cookie: analyst.cookie }))).status).toBe(403);
     expect((await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: analyst.cookie, csrf: analyst.csrf, body: { role: "admin" } }), id)).status).toBe(403);
     // Unknown fields (e.g. an attempt to bind an existing user) are refused.
     expect((await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role: "analyst", user_id: "x" } }), id)).status).toBe(400);
-    const ok = await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role: "analyst" } }), id);
+    // Role sync on: approving hank as analyst would be overridden to admin at his first login.
+    const mismatch = await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role: "analyst" } }), id);
+    expect(mismatch.status).toBe(409);
+    expect(await mismatch.json()).toEqual({ error: "role_mismatch" });
+    const [refusal] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.pending_login_approve"), eq(auditLog.outcome, "failure")));
+    expect(refusal?.details).toMatchObject({ reason: "role_mismatch", role: "analyst", mapped_role: "admin", subject: "sub-hank" });
+    expect(await getDb().select().from(users).where(eq(users.username, "hank"))).toHaveLength(0);
+    // Nora is mapped to analyst: an admin approval is refused, the analyst one creates her, and
+    // her first login keeps that role.
+    await oidcLogin("sub-nora", { preferred_username: "nora", groups: [] });
+    const [nora] = await getDb().select().from(oidcPendingLogins).where(eq(oidcPendingLogins.subject, "sub-nora"));
+    const approve = (pid: string, role: string) => handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${pid}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role } }), pid);
+    expect((await approve(nora?.id ?? "", "admin")).status).toBe(409);
+    expect((await approve(nora?.id ?? "", "analyst")).status).toBe(201);
+    const noraSso = await oidcLogin("sub-nora", { preferred_username: "nora", groups: [] });
+    expect((await sessionOf(noraSso.session))?.user.role).toBe("analyst");
+    expect(await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.role_change"), eq(auditLog.targetId, (await getDb().select().from(users).where(eq(users.username, "nora")))[0]?.id ?? "")))).toHaveLength(0);
+    // Role sync off (SKIP_ROLE_SYNC): the administrator chooses the role.
+    configure({ DATABASTION_OIDC_SKIP_ROLE_SYNC: "1" });
+    const listOff = (await (await handleListPendingLogins(userReq("GET", "/api/oidc/pending-logins", { cookie: admin.cookie }))).json()) as { pending: { subject: string; syncedRole: string | null }[] };
+    expect(listOff.pending.find((x) => x.subject === "sub-hank")).toMatchObject({ syncedRole: null });
+    const ok = await approve(id, "analyst");
     expect(ok.status).toBe(201);
     const [hank] = await getDb().select().from(users).where(eq(users.username, "hank"));
     expect(hank).toMatchObject({ role: "analyst", ssoOnly: true, passwordHash: null });
-    const [entry] = await getDb().select().from(auditLog).where(eq(auditLog.action, "user.pending_login_approve"));
-    expect(entry).toMatchObject({ targetId: hank?.id, details: { role: "analyst", issuer: fp.issuer, subject: "sub-hank", email_verified: true } });
-    // Hank logs in; role managed in the console under SKIP_ROLE_SYNC, else synced.
-    configure({ DATABASTION_OIDC_SKIP_ROLE_SYNC: "1" });
+    const [entry] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.pending_login_approve"), eq(auditLog.targetId, hank?.id ?? "")));
+    expect(entry).toMatchObject({ outcome: "success", details: { role: "analyst", issuer: fp.issuer, subject: "sub-hank", email_verified: true } });
+    // Hank logs in; role managed in the console under SKIP_ROLE_SYNC.
     const hankSso = await oidcLogin("sub-hank", { preferred_username: "hank", groups: ["databastion-admins"] });
     expect((await sessionOf(hankSso.session))?.user.role).toBe("analyst");
     // Discard.

@@ -34,6 +34,8 @@ export interface PendingItem {
   emailVerified: boolean;
   groups: string[];
   mappedRole: Role | null;
+  /** Role applied at the first login while role sync is on (the only role it can be approved with); `null` when role sync is off. */
+  syncedRole: Role | null;
   attempts: number;
   lastAttemptAt: string;
 }
@@ -48,6 +50,7 @@ const ERRORS: Record<string, string> = {
   invalid_username: "Invalid username (lower-case letters, digits, '.', '_' or '-', up to 64 characters).",
   invalid_password: "The password must be 12 to 1024 characters long.",
   not_found: "Not found (already handled or expired).",
+  role_mismatch: "Role sync is on: this login can only be approved with the role the identity provider maps it to.",
   last_identity: "This single sign-on user has no other login method: disable the user instead.",
   no_other_login_method: "The local login is not available to this user (DATABASTION_LOCAL_LOGIN): unlinking would leave no login method. Disable the user instead.",
 };
@@ -68,6 +71,7 @@ export function UsersAdmin({
   pending,
   evicted,
   oidcEnabled,
+  roleSyncOn = false,
   currentUserId,
   csrfToken,
 }: {
@@ -75,6 +79,8 @@ export function UsersAdmin({
   pending: PendingItem[];
   evicted: number;
   oidcEnabled: boolean;
+  /** Role sync on (a role expression, `SKIP_ROLE_SYNC` off): approvals use the mapped role only. */
+  roleSyncOn?: boolean;
   currentUserId: string;
   csrfToken: string;
 }) {
@@ -208,6 +214,7 @@ export function UsersAdmin({
             <p className="text-sm text-muted-foreground">
               Refused logins of identities unknown to the console (sign-up is off). Approving one creates a NEW user bound to that issuer and subject; it never links an existing account. Pending logins
               expire after 7 days; at most 1000 are kept.
+              {roleSyncOn && " Role sync is on: the identity provider sets the role at every login, so a pending login can only be approved with its mapped role."}
               {evicted > 0 && ` ${evicted} older pending login${evicted === 1 ? " was" : "s were"} evicted at that cap.`}
             </p>
             {pending.length === 0 ? (
@@ -221,6 +228,7 @@ export function UsersAdmin({
                     <TableHead>Login</TableHead>
                     <TableHead>E-mail</TableHead>
                     <TableHead>Groups</TableHead>
+                    {roleSyncOn && <TableHead>Mapped role</TableHead>}
                     <TableHead>Last attempt</TableHead>
                     <TableHead />
                   </TableRow>
@@ -235,27 +243,18 @@ export function UsersAdmin({
                         {p.email ?? ""} {!p.emailVerified && <Badge variant="destructive">email_verified: false</Badge>}
                       </TableCell>
                       <TableCell className="max-w-48 text-xs break-all">{p.groups.join(", ")}</TableCell>
+                      {roleSyncOn && (
+                        <TableCell>
+                          <Badge variant={p.syncedRole === "admin" ? "default" : "outline"}>{p.syncedRole ?? "analyst"}</Badge>
+                        </TableCell>
+                      )}
                       <TableCell>
                         {p.lastAttemptAt} ({p.attempts})
                       </TableCell>
                       <TableCell className="flex justify-end gap-2">
-                        <ConfirmDialog
-                          trigger="Approve as analyst"
-                          title="Create a new analyst?"
-                          description={`A new user ${p.login ?? ""} bound to subject ${p.subject} of ${p.issuer}.`}
-                          confirmLabel="Approve"
-                          disabled={p.login === null}
-                          onConfirm={() => call(`/api/oidc/pending-logins/${p.id}`, "POST", { role: "analyst" }).then(() => undefined)}
-                        />
-                        <ConfirmDialog
-                          trigger="Approve as admin"
-                          title="Create a new administrator?"
-                          description={`A new ADMINISTRATOR ${p.login ?? ""} bound to subject ${p.subject} of ${p.issuer}. Check the issuer and subject, not only the e-mail.`}
-                          confirmLabel="Approve as admin"
-                          variant="destructive"
-                          disabled={p.login === null}
-                          onConfirm={() => call(`/api/oidc/pending-logins/${p.id}`, "POST", { role: "admin" }).then(() => undefined)}
-                        />
+                        {(roleSyncOn ? [p.syncedRole ?? "analyst"] : (["analyst", "admin"] as const)).map((role) => (
+                          <ApproveDialog key={role} pending={p} role={role} synced={roleSyncOn} onApprove={() => call(`/api/oidc/pending-logins/${p.id}`, "POST", { role }).then(() => undefined)} />
+                        ))}
                         <Button size="sm" variant="ghost" onClick={() => call(`/api/oidc/pending-logins/${p.id}`, "DELETE")}>
                           Discard
                         </Button>
@@ -269,5 +268,30 @@ export function UsersAdmin({
         </Card>
       )}
     </div>
+  );
+}
+
+/** Approval of a pending login as a new user with `role` (with role sync on, the mapped role only). */
+function ApproveDialog({ pending: p, role, synced, onApprove }: { pending: PendingItem; role: Role; synced: boolean; onApprove: () => Promise<void> }) {
+  const why = synced ? " Role sync is on: this is the role the identity provider maps this identity to, applied again at every login." : "";
+  return role === "admin" ? (
+    <ConfirmDialog
+      trigger="Approve as admin"
+      title="Create a new administrator?"
+      description={`A new ADMINISTRATOR ${p.login ?? ""} bound to subject ${p.subject} of ${p.issuer}. Check the issuer and subject, not only the e-mail.${why}`}
+      confirmLabel="Approve as admin"
+      variant="destructive"
+      disabled={p.login === null}
+      onConfirm={onApprove}
+    />
+  ) : (
+    <ConfirmDialog
+      trigger="Approve as analyst"
+      title="Create a new analyst?"
+      description={`A new user ${p.login ?? ""} bound to subject ${p.subject} of ${p.issuer}.${why}`}
+      confirmLabel="Approve"
+      disabled={p.login === null}
+      onConfirm={onApprove}
+    />
   );
 }

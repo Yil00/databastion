@@ -223,22 +223,22 @@ dependencies) for the claim expressions. Code: `src/server/oidc/`.
 | `DATABASTION_OIDC_DISPLAY_NAME` | `Single sign-on` | Label of the "Sign in with ..." button |
 | `DATABASTION_OIDC_ID_TOKEN_ALGS` | `RS256,PS256,ES256` | Allowed `id_token` algorithms, intersected with the provider's `id_token_signing_alg_values_supported`. Allowed values: `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`; `none` and `HS*` are refused at startup |
 | `DATABASTION_OIDC_CA_FILE` | unset | Extra CA (PEM) for the provider's endpoints, added to the system roots. There is no "skip verify" option |
-| `DATABASTION_OIDC_USE_USERINFO` | unset | `1`: call the userinfo endpoint; its `sub` must equal the `id_token`'s, and its claims are merged **under** those of the `id_token` |
+| `DATABASTION_OIDC_USE_USERINFO` | unset | `1`: call the userinfo endpoint; its `sub` must equal the `id_token`'s, and its claims are merged **under** those of the `id_token`. With refresh on, a refresh answer without an `id_token` is checked on userinfo alone (see "Sessions and logout"): userinfo must then release the claims the role, groups and allow-list expressions read |
 | `DATABASTION_OIDC_LOGIN_ATTRIBUTE_PATH` | `preferred_username` | JMESPath expression of the console username (display attribute). Lower-cased; must match `^[a-z0-9][a-z0-9._-]{0,63}$`, else the login is refused (`username`) |
 | `DATABASTION_OIDC_EMAIL_ATTRIBUTE_PATH` | `email` | Display attribute. `email_verified` is always read from the standard claim |
 | `DATABASTION_OIDC_NAME_ATTRIBUTE_PATH` | `name` | Display attribute |
-| `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH` | unset | Expression yielding an array of strings (at most 256, each at most 256 characters, else the login is refused) |
-| `DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH` | unset | Expression that must yield exactly `admin` or `analyst`, e.g. `contains(groups, 'databastion-admins') && 'admin' \|\| contains(groups, 'databastion-analysts') && 'analyst'` (no unconditional fallback: a user in neither group gets no role). Anything else (another string, another case, a non-string, an evaluation error) is **no role**. Unset: roles are managed in the console (no role sync) |
+| `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH` | unset | Expression yielding an array of strings (at most 256, each at most 256 characters, else the login is refused). Non-string entries are dropped; any other value, **a single string included**, is no groups at all (it never passes `ALLOWED_GROUPS`, and the role expression sees `null`) |
+| `DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH` | unset | Expression that must yield exactly `admin` or `analyst`, e.g. `contains(groups, 'databastion-admins') && 'admin' \|\| contains(groups, 'databastion-analysts') && 'analyst'` (no unconditional fallback: a user in neither group gets no role). Anything else (another string, another case, a non-string, an evaluation error) is **no role**. In this expression, `groups` is the **validated** groups list (the result of `GROUPS_ATTRIBUTE_PATH`, or the raw `groups` claim when that is unset), and the claim at a plain `GROUPS_ATTRIBUTE_PATH` (e.g. `realm_access.roles`) is replaced by it too; see "Role expression and groups" below. Unset: roles are managed in the console (no role sync) |
 | `DATABASTION_OIDC_ROLE_ATTRIBUTE_STRICT` | `1` | A login whose role expression yields no role is refused (`role`). `0`: such a login gets `analyst`, never `admin` |
 | `DATABASTION_OIDC_ALLOWED_GROUPS` | unset | Comma-separated; when set, at least one mapped group must match (needs `GROUPS_ATTRIBUTE_PATH`) |
 | `DATABASTION_OIDC_ALLOWED_DOMAINS` | unset | Comma-separated domains; when set, `email_verified` must be `true` and the domain after the **last** `@` must equal one of them exactly (case-insensitive). Never a suffix match: `example.com` admits neither `evil-example.com` nor `sub.example.com` |
 | `DATABASTION_OIDC_ALLOW_SIGN_UP` | `0` | `1`: an unknown identity that passes the filters becomes a console user. The console refuses to start unless `ALLOWED_GROUPS` is set, or `ROLE_ATTRIBUTE_PATH` with strict mode. `0`: the attempt is refused and recorded as a **pending login** (Users page) |
 | `DATABASTION_OIDC_SKIP_ROLE_SYNC` | unset | `1`: roles are managed in the console; a user created by sign-up starts with the mapped role under strict mode, else `analyst` |
 | `DATABASTION_OIDC_AUTO_LOGIN` | unset | `1`: `/login` redirects straight to the provider; `/login?local=1` still shows the local form (unless the local login is `disabled`), and so does a failed attempt (no redirect loop) |
-| `DATABASTION_OIDC_USE_REFRESH_TOKEN` | unset | `1`: the refresh token is kept, encrypted (HKDF subkey `oidc-tokens.v1`), and refreshed at most every 5 minutes on user activity; the role is synced again when the provider returns claims; a failed refresh (also a provider outage) ends the session |
+| `DATABASTION_OIDC_USE_REFRESH_TOKEN` | unset | `1`: the refresh token is kept, encrypted (HKDF subkey `oidc-tokens.v1`), and refreshed at most every 5 minutes on user activity; the filters and the role are checked again only when the refresh yields claims (a new `id_token`, or userinfo with `USE_USERINFO=1`); a failed refresh (also a provider outage) ends the session |
 | `DATABASTION_OIDC_SESSION_MAX_AGE` | `12h` | Absolute lifetime of an OIDC session, `5m` to `12h` (`8h`, `90m`, `3600s`). The 2 h idle timeout applies too |
 | `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` | unset | Where the browser goes after logout, instead of the provider's `end_session_endpoint` |
-| `DATABASTION_LOCAL_LOGIN` | `enabled` with OIDC off, `admins` with OIDC on | `enabled`: every local user; `admins`: local administrators only (break-glass path; others get the same `401` as a wrong password); `disabled` (only when set explicitly): `/api/auth/login` answers `404` and the form is hidden, recovery needs host access |
+| `DATABASTION_LOCAL_LOGIN` | `enabled` with OIDC off, `admins` with OIDC on | `enabled`: every local user (with OIDC on, the web process logs a **warning** at startup: use it only as a migration window, see "Migrating local users"); `admins`: local administrators only (break-glass path; others get the same `401` as a wrong password); `disabled` (only when set explicitly): `/api/auth/login` answers `404` and the form is hidden, recovery needs host access |
 
 Register at the provider: redirect URI `<DATABASTION_PUBLIC_URL>/api/auth/oidc/callback`, post-logout
 redirect URI `<DATABASTION_PUBLIC_URL>/login`, a confidential client with the standard flow (and
@@ -250,6 +250,19 @@ roles). Never base them on `email`, `preferred_username`, `name` or any attribut
 the provider: a user changing their own e-mail or username to `databastion-admins` must not become
 an administrator.
 
+**Role expression and groups** (end-of-phase-8 review L5). JMESPath `contains()` is a substring
+test on a string, so a groups claim sent as the string `x-databastion-admins-y` would satisfy
+`contains(groups, 'databastion-admins')`. The console therefore never lets the role expression see
+an unvalidated groups value: it runs on the claims where `groups` is replaced by the validated list
+(an array of strings within the bounds above; `null` when the claim is a string or any other
+non-array value), and where the claim at `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH`, when that is a
+plain field path (`groups`, `realm_access.roles`, `resource_access."client".roles`, optionally ending
+in `[*]`), is replaced the same way. A string groups claim is refused rather than wrapped into a
+one-element list: a provider that sends one is misconfigured (Keycloak: a non-multivalued mapper),
+and with strict mode the login is refused (`role`), else it gets `analyst`. Write role expressions
+against `groups`; any other claim they read is raw, so never apply `contains()` to a claim that can
+be a string.
+
 **Identity key.** A login finds its user by (`iss`, `sub`) only (`user_identities`), never by
 e-mail or username: there is no automatic linking. A login claim equal to an existing username is
 refused (`username`), not merged. A local user links single sign-on **from their own local
@@ -260,7 +273,13 @@ subject. Administrators cannot link an identity to someone else's account, but c
 (Users page, `user.identity_unlink`; its sessions end), unless it would leave the user without a
 login method: the only identity of a single sign-on user (`409 last_identity`), or the only identity
 of a local user who cannot use the local login in the current `DATABASTION_LOCAL_LOGIN` mode
-(`disabled`, or `admins` for a non-administrator: `409 no_other_login_method`). They approve pending logins only as **new** users, choosing the role. Pending
+(`disabled`, or `admins` for a non-administrator: `409 no_other_login_method`). They approve pending logins only as **new** users. With role sync off (no
+role expression, or `DATABASTION_OIDC_SKIP_ROLE_SYNC=1`) they choose the role. With role sync on,
+the first login would apply the mapped role anyway, so the Users page shows each pending login's
+mapped role (the role expression's result when it was recorded, `analyst` when it yielded none) and
+offers approval with that role only; the API refuses another role with `409 role_mismatch` (audited
+as a failed `user.pending_login_approve`). The provider's mapping still applies at every login, so
+a later change of the user's groups changes the role. Pending
 logins show the issuer and subject first and flag `email_verified: false`; they expire after 7 days
 and are capped at 1000 (the least recent attempt is evicted; evictions are counted and shown).
 
@@ -284,13 +303,25 @@ are logged) and is retried with backoff while the provider is down: the console 
 local login keeps working.
 
 **Sessions and logout.** An OIDC login creates the usual console session (`SameSite=Strict`,
-2 h idle), tagged `oidc` with the provider's `sid`. The mapped role is applied at each login (and
-refresh) unless role sync is off; a demotion ends the user's other sessions; each change is audited
+2 h idle), tagged `oidc` with the provider's `sid`. The mapped role is applied at each login, and
+at each refresh that yields claims, unless role sync is off; a demotion ends the user's other sessions; each change is audited
 `user.role_change` with its source (`oidc` or `user`). A user disabled in the console cannot log in
 by any method. Logout stays a `POST` with the CSRF token: it deletes the session, revokes a held
 refresh token at the provider's `revocation_endpoint` (RFC 7009), and answers `200 {redirect_url}`
 for RP-initiated logout (`client_id`, `logout_hint` = the subject, `post_logout_redirect_uri`) when
 the provider advertises an `end_session_endpoint` or `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` is set.
+**Refresh** (end-of-phase-8 review L2): when the refresh answer carries a new `id_token`, it is
+validated (same `sub`, no nonce), merged with userinfo when `DATABASTION_OIDC_USE_USERINFO=1`, and
+the filters and role mapping run again. When it carries none (optional in OIDC Core 12.2; some providers never
+return one), the console calls userinfo with the new access token if
+`DATABASTION_OIDC_USE_USERINFO=1` (same transport rules and 64 KiB cap), requires its `sub` to equal
+the session identity's subject (else the session ends, `user.logout` with reason
+`refresh_subject`), and runs the filters and role mapping on the userinfo claims alone: a filter no
+longer passed ends the session (`refresh_<reason>`). Userinfo must then release the groups claim.
+With neither an `id_token` nor userinfo, a refresh only shows that the provider still honors the
+refresh token (a user disabled there is cut off), not that their groups or role still hold: a
+removal from the admin group then takes effect at the next login, at most
+`DATABASTION_OIDC_SESSION_MAX_AGE` later.
 **Residual risk**: without refresh, a user disabled at the provider keeps their console session up
 to `DATABASTION_OIDC_SESSION_MAX_AGE`. Refresh tokens of sessions that end otherwise (user disabled,
 demotion, unlinked identity, expired or idle sessions purged, failed refresh) are revoked at the
@@ -334,6 +365,22 @@ refresh token).
 system alert `user.local_login` (channels flagged "system alerts", within the hourly budget of
 system alerts) and its `user.login` entry carries `break_glass: true`. With `admins`, the web
 process logs an **error** at startup when no enabled local administrator with a password exists.
+
+**Migrating local users** (end-of-phase-8 review L4). With OIDC on, the default
+`DATABASTION_LOCAL_LOGIN=admins` locks existing non-administrator local users out of the password
+form at once. To move them to single sign-on:
+1. Before turning OIDC on (or for the migration only), set `DATABASTION_LOCAL_LOGIN=enabled`; the web
+   process logs a warning at startup for as long as it stays so. Announce a short window.
+2. Each local user signs in with their password, opens **Account** and chooses **Link single
+   sign-on** (a fresh authentication at the provider). From then on they sign in through the
+   provider, and with role sync on their role follows the provider's mapping.
+3. Follow the window on the Users page ("Login" column: `local password` and `SSO` entries) and in
+   the console audit log (`user.identity_link`). Local administrator logins keep raising the
+   `user.local_login` system alert during the window; non-administrator local logins raise none
+   (their `user.login` entries carry no `method: oidc`).
+4. Revert: remove `DATABASTION_LOCAL_LOGIN` (back to `admins`) and restart; the warning stops.
+   Disable the local users who did not link (they can no longer sign in anyway: their attempts are
+   failed `user.login` entries with reason `local_login_admins_only`).
 
 **End-to-end setup** (Keycloak dev realm, P8-D): the e2e scenario sets `DATABASTION_OIDC_ENABLED=1`,
 `DATABASTION_OIDC_ISSUER_URL` (the realm URL), `DATABASTION_OIDC_CLIENT_ID`,

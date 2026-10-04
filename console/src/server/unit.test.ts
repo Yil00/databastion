@@ -139,6 +139,16 @@ describe("startupWarnings", () => {
     expect(startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
     expect(startupWarnings(env({ NODE_ENV: "development" }))).toHaveLength(0);
   });
+
+  it("warns when the local login stays enabled for every local user while OIDC is on (end-of-phase-8 review L4)", () => {
+    const oidc = { NODE_ENV: "development", DATABASTION_OIDC_ENABLED: "1" };
+    const warned = (e: Record<string, string>) => startupWarnings(env(e)).some((w) => w.startsWith("DATABASTION_LOCAL_LOGIN=enabled while OIDC is enabled"));
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "enabled" })).toBe(true);
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "admins" })).toBe(false);
+    expect(warned(oidc)).toBe(false);
+    expect(warned({ NODE_ENV: "development", DATABASTION_LOCAL_LOGIN: "enabled" })).toBe(false);
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "bogus" })).toBe(false);
+  });
 });
 
 describe("startupErrors (P1-D N3)", () => {

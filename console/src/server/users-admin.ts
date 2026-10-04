@@ -53,6 +53,8 @@ export async function listUsers(db: Database): Promise<UserView[]> {
 
 export interface PendingLoginView {
   id: string;
+  /** Role applied at the first login when role sync is on (see {@link syncedRoleOf}); `null` when off. */
+  syncedRole: Role | null;
   issuer: string;
   subject: string;
   login: string | null;
@@ -67,7 +69,7 @@ export interface PendingLoginView {
   expiresAt: string;
 }
 
-export async function listPendingLogins(db: Database): Promise<{ pending: PendingLoginView[]; evicted: number }> {
+export async function listPendingLogins(db: Database, roleSyncOn = false): Promise<{ pending: PendingLoginView[]; evicted: number }> {
   const rows = await db
     .select()
     .from(oidcPendingLogins)
@@ -85,6 +87,7 @@ export async function listPendingLogins(db: Database): Promise<{ pending: Pendin
       displayName: p.displayName,
       groups: p.groups,
       mappedRole: p.mappedRole,
+      syncedRole: syncedRoleOf(p.mappedRole, roleSyncOn),
       attempts: p.attempts,
       createdAt: p.createdAt.toISOString(),
       lastAttemptAt: p.lastAttemptAt.toISOString(),
@@ -103,11 +106,39 @@ export type AdminResult<T = object> = ({ ok: true } & T) | { ok: false; status: 
 
 const fail = (status: number, code: string) => ({ ok: false as const, status, code });
 
-/** Approves a pending login as a NEW user (role chosen by the administrator) bound to its (`iss`, `sub`). */
-export async function approvePendingLogin(db: Database, id: string, role: Role, actor: AdminActor): Promise<AdminResult<{ userId: string }>> {
+/**
+ * Role a pending login gets at its first login when role sync is on (end-of-phase-8 review L1): the
+ * role mapped by the provider, or `analyst` when the expression yielded none (non-strict mode; a
+ * strict refusal is never recorded as pending). `null` when role sync is off: the administrator
+ * chooses.
+ */
+export function syncedRoleOf(mappedRole: Role | null, roleSyncOn: boolean): Role | null {
+  return roleSyncOn ? (mappedRole ?? "analyst") : null;
+}
+
+/**
+ * Approves a pending login as a NEW user bound to its (`iss`, `sub`). With role sync off, the
+ * administrator chooses the role. With role sync on, the first login would apply the mapped role
+ * anyway, so only that role is accepted (`409 role_mismatch` otherwise, audited as a failure).
+ */
+export async function approvePendingLogin(db: Database, id: string, role: Role, actor: AdminActor, roleSyncOn = false): Promise<AdminResult<{ userId: string }>> {
   return db.transaction(async (tx) => {
     const [p] = await tx.select().from(oidcPendingLogins).where(and(eq(oidcPendingLogins.id, id), gt(oidcPendingLogins.expiresAt, sql`now()`))).for("update");
     if (!p) return fail(404, "not_found");
+    const synced = syncedRoleOf(p.mappedRole, roleSyncOn);
+    if (synced !== null && synced !== role) {
+      await writeAudit(tx, {
+        actorType: "user",
+        actorId: actor.userId,
+        action: "user.pending_login_approve",
+        outcome: "failure",
+        targetType: "oidc_pending_login",
+        targetId: p.id,
+        sourceIp: actor.ip,
+        details: { reason: "role_mismatch", role, mapped_role: synced, issuer: p.issuer, subject: p.subject },
+      });
+      return fail(409, "role_mismatch");
+    }
     if (p.login === null || !USERNAME.test(p.login)) return fail(409, "invalid_login");
     const [taken] = await tx.select({ id: users.id }).from(users).where(eq(users.username, p.login));
     if (taken) return fail(409, "username_taken");

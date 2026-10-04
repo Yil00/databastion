@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { compileExpression, emailDomain, mapClaims, type ClaimMappingConfig } from "./claims";
+import { compileExpression, emailDomain, mapClaims, plainPath, type ClaimMappingConfig } from "./claims";
 
 const base: ClaimMappingConfig = {
   loginPath: compileExpression("preferred_username"),
@@ -112,5 +112,46 @@ describe("JMESPath truthiness on claim objects (security review L2)", () => {
     // A claim named hasOwnProperty makes truthiness tests on its object an error: no role.
     expect(mapClaims(raw, keycloak("x && 'admin' || 'analyst'"))).toMatchObject({ ok: false, reason: "role" });
     expect(({} as Record<string, unknown>).role).toBeUndefined();
+  });
+});
+
+describe("the role expression sees the validated groups (end-of-phase-8 review L5)", () => {
+  // The documented example (docs/10-user-guide.md, console/README.md, deploy/docker-compose.example.yml).
+  const DOC_ROLE = "contains(groups, 'databastion-admins') && 'admin' || contains(groups, 'databastion-analysts') && 'analyst'";
+  const doc = (over: Partial<ClaimMappingConfig> = {}) => cfg({ rolePath: compileExpression(DOC_ROLE), ...over });
+
+  it("a string groups claim is never a substring match: the documented example does not yield admin", () => {
+    const claims = { preferred_username: "u", groups: "x-databastion-admins-y" };
+    expect(mapClaims(claims, doc())).toMatchObject({ ok: false, reason: "role" });
+    const lax = mapClaims(claims, doc({ roleStrict: false }));
+    expect(lax).toMatchObject({ ok: true, effectiveRole: "analyst", identity: { role: null, groups: [] } });
+    // Also without a groups expression (the raw `groups` claim), and for an exact string.
+    expect(mapClaims(claims, doc({ groupsPath: null, roleStrict: false }))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    expect(mapClaims({ preferred_username: "u", groups: "databastion-admins" }, doc({ roleStrict: false }))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    // A string group never passes the group filter either.
+    expect(mapClaims({ preferred_username: "u", groups: "databastion-admins" }, doc({ allowedGroups: ["databastion-admins"] }))).toMatchObject({ ok: false, reason: "group" });
+    // The array form still maps.
+    expect(mapClaims({ preferred_username: "u", groups: ["databastion-admins"] }, doc())).toMatchObject({ ok: true, effectiveRole: "admin" });
+    expect(mapClaims({ preferred_username: "u", groups: ["x-databastion-admins-y", "databastion-analysts"] }, doc())).toMatchObject({ ok: true, effectiveRole: "analyst" });
+  });
+
+  it("replaces the claim at a plain groups path, and exposes the mapped groups as `groups`", () => {
+    const nested = { preferred_username: "u", realm_access: { roles: "x-databastion-admins-y" } };
+    const viaPath = cfg({ groupsPath: compileExpression("realm_access.roles"), rolePath: compileExpression("contains(realm_access.roles, 'databastion-admins') && 'admin' || 'analyst'"), roleStrict: false });
+    expect(mapClaims(nested, viaPath)).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    const viaGroups = cfg({ groupsPath: compileExpression("realm_access.roles"), rolePath: compileExpression(DOC_ROLE) });
+    expect(mapClaims({ preferred_username: "u", groups: ["databastion-admins"], realm_access: { roles: ["databastion-analysts"] } }, viaGroups)).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    const quoted = cfg({ groupsPath: compileExpression('resource_access."databastion-console".roles[*]'), rolePath: compileExpression(DOC_ROLE) });
+    expect(mapClaims({ preferred_username: "u", resource_access: { "databastion-console": { roles: ["databastion-admins"] } } }, quoted)).toMatchObject({ ok: true, effectiveRole: "admin" });
+    // A filtering groups expression: the role expression sees its result.
+    const filtered = cfg({ groupsPath: compileExpression("groups[?starts_with(@, 'databastion-')]"), rolePath: compileExpression(DOC_ROLE) });
+    expect(mapClaims({ preferred_username: "u", groups: ["databastion-analysts", "other"] }, filtered)).toMatchObject({ ok: true, effectiveRole: "analyst", identity: { groups: ["databastion-analysts"] } });
+  });
+
+  it("parses plain paths only", () => {
+    expect(plainPath("groups")).toEqual(["groups"]);
+    expect(plainPath("realm_access.roles[*]")).toEqual(["realm_access", "roles"]);
+    expect(plainPath('resource_access."a-b".roles')).toEqual(["resource_access", "a-b", "roles"]);
+    for (const p of ["groups[?x]", "a..b", "a.", "foo(bar)", "a[0]", "a | b"]) expect(plainPath(p)).toBeNull();
   });
 });
