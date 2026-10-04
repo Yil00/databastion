@@ -64,6 +64,8 @@ export const NOTIFICATION_EVENTS = [
   "agent.integrity",
   "agent.batches_dropped",
   "agent.audit_stream_stopped",
+  "user.local_login",
+  "user.role_sync",
   "channel.test",
   "notifications.suppressed",
   "system_alerts.suppressed",
@@ -80,6 +82,8 @@ export const SYSTEM_ALERT_EVENTS = [
   "agent.integrity",
   "agent.batches_dropped",
   "agent.audit_stream_stopped",
+  "user.local_login",
+  "user.role_sync",
 ] as const;
 export type SystemAlertEvent = (typeof SYSTEM_ALERT_EVENTS)[number];
 

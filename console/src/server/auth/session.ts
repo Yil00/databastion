@@ -1,16 +1,19 @@
 import { createHmac } from "node:crypto";
 
-import { and, eq, gt, lte, or, sql } from "drizzle-orm";
+import { and, eq, gt, lte, ne, or, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { sessions, users } from "@/db/schema";
 import { randomToken, safeEqual, sha256Hex } from "@/server/crypto";
+import { revokeRefreshTokensInBackground, type EndedSessionRow } from "@/server/oidc/revoke";
+import { encryptRefreshToken } from "@/server/oidc/tokens";
 
 /**
  * Cookie sessions for console users.
  * - The cookie carries 256 random bits; the database stores only their SHA-256.
  * - `HttpOnly`, `SameSite=Strict`, `Path=/`; `Secure` (and the `__Host-` prefix) in production.
- * - Absolute lifetime 12 h, idle timeout 2 h.
+ * - Absolute lifetime 12 h (OIDC sessions: `DATABASTION_OIDC_SESSION_MAX_AGE`, at most 12 h), idle
+ *   timeout 2 h. Each session records its method (`local` / `oidc`, ADR-0038 decision 13).
  * - CSRF token: HMAC-SHA256 keyed by the session token (never stored), sent back by the UI in
  *   `X-CSRF-Token` on every state-changing request, in addition to the Origin check and SameSite.
  */
@@ -57,11 +60,36 @@ export function readSessionToken(req: Request): string | null {
   return null;
 }
 
-export async function createSession(db: Database, userId: string) {
+export interface OidcSessionOptions {
+  identityId: string;
+  /** The provider's `sid` claim (bounded, validated by the caller). */
+  providerSid: string | null;
+  /** Kept encrypted (`oidc-tokens.v1`) only with `DATABASTION_OIDC_USE_REFRESH_TOKEN=1`. */
+  refreshToken: string | null;
+  /** Absolute lifetime, `DATABASTION_OIDC_SESSION_MAX_AGE` (at most 12 h). */
+  ttlMs: number;
+}
+
+export async function createSession(db: Database, userId: string, oidc?: OidcSessionOptions) {
   const token = randomToken("dbu_");
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await db.insert(sessions).values({ tokenHash: sha256Hex(token), userId, expiresAt });
-  return { token, expiresAt, csrfToken: csrfTokenFor(token) };
+  const tokenHash = sha256Hex(token);
+  const ttlMs = oidc ? Math.min(oidc.ttlMs, SESSION_TTL_MS) : SESSION_TTL_MS;
+  const expiresAt = new Date(Date.now() + ttlMs);
+  await db.insert(sessions).values({
+    tokenHash,
+    userId,
+    expiresAt,
+    ...(oidc
+      ? {
+          method: "oidc" as const,
+          identityId: oidc.identityId,
+          providerSid: oidc.providerSid,
+          refreshTokenEnc: oidc.refreshToken === null ? null : encryptRefreshToken(oidc.refreshToken, tokenHash),
+          refreshedAt: sql`now()`,
+        }
+      : {}),
+  });
+  return { token, expiresAt, csrfToken: csrfTokenFor(token), maxAgeS: Math.floor(ttlMs / 1000) };
 }
 
 export interface SessionUser {
@@ -74,7 +102,12 @@ export interface Session {
   token: string;
   tokenHash: string;
   user: SessionUser;
+  method: "local" | "oidc";
+  identityId: string | null;
 }
+
+/** OIDC refresh of a session due for it (`DATABASTION_OIDC_USE_REFRESH_TOKEN=1`), every 5 min at most. */
+export const OIDC_REFRESH_INTERVAL_MS = 5 * 60_000;
 
 export async function loadSession(db: Database, req: Request): Promise<Session | null> {
   const token = readSessionToken(req);
@@ -88,6 +121,10 @@ export async function loadSession(db: Database, req: Request): Promise<Session |
       role: users.role,
       disabledAt: users.disabledAt,
       lastSeenAt: sessions.lastSeenAt,
+      method: sessions.method,
+      identityId: sessions.identityId,
+      hasRefreshToken: sql<boolean>`${sessions.refreshTokenEnc} is not null`,
+      refreshedAt: sessions.refreshedAt,
     })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))
@@ -103,12 +140,32 @@ export async function loadSession(db: Database, req: Request): Promise<Session |
   if (Date.now() - row.lastSeenAt.getTime() > 60_000) {
     await db.update(sessions).set({ lastSeenAt: sql`now()` }).where(eq(sessions.tokenHash, tokenHash));
   }
-  return { token, tokenHash, user: { id: row.id, username: row.username, role: row.role } };
+  const session: Session = {
+    token,
+    tokenHash,
+    user: { id: row.id, username: row.username, role: row.role },
+    method: row.method,
+    identityId: row.identityId,
+  };
+  if (row.method === "oidc" && row.hasRefreshToken && (row.refreshedAt === null || Date.now() - row.refreshedAt.getTime() >= OIDC_REFRESH_INTERVAL_MS)) {
+    // Imported lazily: the OIDC client is only loaded by consoles that use refresh tokens.
+    const { refreshOidcSession } = await import("@/server/oidc/refresh");
+    return refreshOidcSession(db, session);
+  }
+  return session;
 }
 
-export async function deleteSession(db: Database, tokenHash: string): Promise<void> {
-  await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash));
+/**
+ * Deletes one session. A refresh token it held is revoked at the provider in the background (best
+ * effort, security review L5) unless `revokeRefresh` is false (logout revokes it itself, inline).
+ */
+export async function deleteSession(db: Pick<Database, "delete">, tokenHash: string, opts: { revokeRefresh?: boolean } = {}): Promise<void> {
+  const rows = await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash)).returning(ENDED);
+  if (opts.revokeRefresh !== false) revokeRefreshTokensInBackground(rows);
 }
+
+/** Columns of deleted sessions needed to revoke their refresh tokens (L5). */
+const ENDED = { h: sessions.tokenHash, enc: sessions.refreshTokenEnc };
 
 /** Deletes expired and idle sessions (run on every login). */
 export async function purgeStaleSessions(db: Database): Promise<number> {
@@ -116,13 +173,37 @@ export async function purgeStaleSessions(db: Database): Promise<number> {
   const rows = await db
     .delete(sessions)
     .where(or(lte(sessions.expiresAt, sql`now()`), lte(sessions.lastSeenAt, idleLimit)))
-    .returning({ h: sessions.tokenHash });
+    .returning(ENDED);
+  revokeRefreshTokensInBackground(rows);
+  return rows.length;
+}
+
+/** Ends every session of a user except `keepTokenHash` (a demotion at login or refresh, ADR-0038 decision 9). */
+/**
+ * Revocation of the refresh tokens of deleted rows: into `deferred` when the caller runs in a
+ * transaction (it schedules them after the commit, so a rollback revokes nothing), else now.
+ */
+function ended(rows: EndedSessionRow[], deferred: EndedSessionRow[] | undefined): void {
+  if (deferred) deferred.push(...rows);
+  else revokeRefreshTokensInBackground(rows);
+}
+
+export async function revokeOtherSessions(db: Pick<Database, "delete">, userId: string, keepTokenHash: string | null, deferred?: EndedSessionRow[]): Promise<number> {
+  const where = keepTokenHash === null ? eq(sessions.userId, userId) : and(eq(sessions.userId, userId), ne(sessions.tokenHash, keepTokenHash));
+  const rows = await db.delete(sessions).where(where).returning(ENDED);
+  ended(rows, deferred);
   return rows.length;
 }
 
 /** Ends every session of a user (password change, account disabled, suspected compromise). */
-export async function revokeAllSessions(db: Database, userId: string): Promise<number> {
-  const rows = await db.delete(sessions).where(eq(sessions.userId, userId)).returning({ h: sessions.tokenHash });
+export async function revokeAllSessions(db: Pick<Database, "delete">, userId: string, deferred?: EndedSessionRow[]): Promise<number> {
+  return revokeOtherSessions(db, userId, null, deferred);
+}
+
+/** Ends the sessions opened with one OIDC identity (before unlinking it). */
+export async function revokeIdentitySessions(db: Pick<Database, "delete">, identityId: string, deferred?: EndedSessionRow[]): Promise<number> {
+  const rows = await db.delete(sessions).where(eq(sessions.identityId, identityId)).returning(ENDED);
+  ended(rows, deferred);
   return rows.length;
 }
 

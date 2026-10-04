@@ -1,5 +1,6 @@
 import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
+import { oidcStartupFatal } from "./oidc/config";
 import { trustedProxyHops } from "./request";
 
 /**
@@ -42,6 +43,10 @@ function serverKeyUsable(env: NodeJS.ProcessEnv): boolean {
  * disabled protections and the process starts). `null`: start. Never contains configuration values.
  */
 export function startupFatal(env: NodeJS.ProcessEnv = process.env): string | null {
+  // ADR-0038: an OIDC or local-login configuration error is fatal in every environment (OIDC is an
+  // explicit opt-in, and it needs the server key even where the override below applies).
+  const oidc = oidcStartupFatal(env);
+  if (oidc !== null) return oidc;
   if (env.NODE_ENV !== "production") return null;
   // L5 (P3-C): the alerting dev flag needs a second explicit opt-in in production.
   const alerting = alertingFatal(env);
