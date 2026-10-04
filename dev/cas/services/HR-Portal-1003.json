@@ -1,0 +1,65 @@
+{
+  "@class": "org.apereo.cas.services.OidcRegisteredService",
+  "id": 1003,
+  "name": "HR-Portal",
+  "evaluationOrder": 30,
+  "serviceId": "^https://hr\\.example\\.com/oidc/callback$",
+  "clientId": "hr-portal",
+  "clientSecret": "dev-only-cas-oidc-client-secret-dATWpwFH9QAEnFQN0dBa4hwm",
+  "supportedGrantTypes": [
+    "java.util.HashSet",
+    [
+      "authorization_code"
+    ]
+  ],
+  "supportedResponseTypes": [
+    "java.util.HashSet",
+    [
+      "code"
+    ]
+  ],
+  "scopes": [
+    "java.util.HashSet",
+    [
+      "openid",
+      "profile",
+      "email"
+    ]
+  ],
+  "description": "HR portal (FAKE data; its client secret is a dev-only value in clear)",
+  "contacts": [
+    "java.util.ArrayList",
+    [
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Noé Simon",
+        "email": "noe.simon@example.com",
+        "phone": "09 72 10 39 22",
+        "department": "Human Resources",
+        "type": "TECHNICAL"
+      },
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Jean Bernard",
+        "email": "jean.bernard@example.com",
+        "phone": "02 61 91 72 74",
+        "department": "Human Resources",
+        "type": "ADMINISTRATIVE"
+      }
+    ]
+  ],
+  "attributeReleasePolicy": {
+    "@class": "org.apereo.cas.services.ReturnStaticAttributeReleasePolicy",
+    "allowedAttributes": {
+      "@class": "java.util.LinkedHashMap",
+      "hotline": [
+        "java.util.ArrayList",
+        [
+          "04 65 71 76 25",
+          "09 72 10 33 83",
+          "05 36 49 07 32"
+        ]
+      ]
+    }
+  }
+}

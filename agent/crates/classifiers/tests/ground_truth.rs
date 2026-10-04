@@ -12,7 +12,10 @@
 //! - LDAP attributes other than `mail` under the team container
 //!   `ou=<person name>,ou=teams,…`: the ground truth only labels `mail` there
 //!   although `cn`, `sn`, `telephonenumber`… hold the same kind of data as
-//!   under `ou=people`.
+//!   under `ou=people`;
+//! - CAS (`engine: cas`): the JSON service registry `dev/cas/services` and the
+//!   audit log of the CAS dev service are not seed files of this test (read
+//!   by `connector-cas`, P8-D).
 //!
 //! Phase 2 exit criterion: recall ≥ 90 % and precision ≥ 85 % per
 //! classifier. Run with `--nocapture` to see the per-classifier table
@@ -306,9 +309,10 @@ fn load_truth() -> Truth {
 }
 
 fn excluded(key: &Key) -> bool {
-    key.0 == "openldap"
-        && (key.4 == "userpassword"
-            || (key.2.as_deref() == Some(TEAM_CONTAINER) && key.4 != "mail"))
+    key.0 == "cas"
+        || (key.0 == "openldap"
+            && (key.4 == "userpassword"
+                || (key.2.as_deref() == Some(TEAM_CONTAINER) && key.4 != "mail")))
 }
 
 /// A location for the report, with normalized names (seed names can embed

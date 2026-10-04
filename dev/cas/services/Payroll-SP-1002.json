@@ -1,0 +1,30 @@
+{
+  "@class": "org.apereo.cas.support.saml.services.SamlRegisteredService",
+  "id": 1002,
+  "name": "Payroll-SP",
+  "evaluationOrder": 20,
+  "serviceId": "https://payroll.example.net/shibboleth",
+  "description": "Payroll service provider (FAKE data; the dev image has no SAML2 IdP module)",
+  "metadataLocation": "https://payroll.example.net/Shibboleth.sso/Metadata",
+  "contacts": [
+    "java.util.ArrayList",
+    [
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Léa Thomas",
+        "email": "lea.thomas@example.com",
+        "phone": "01 99 00 63 97",
+        "department": "Payroll",
+        "type": "TECHNICAL"
+      },
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Louis Garcia",
+        "email": "louis.garcia@example.org",
+        "phone": "01 99 00 87 84",
+        "department": "Payroll",
+        "type": "ADMINISTRATIVE"
+      }
+    ]
+  ]
+}
