@@ -28,7 +28,7 @@ jobs:
   dev-env:
     name: Dev environment
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dev credentials (dev-only example values)
@@ -43,6 +43,17 @@ jobs:
         run: make dev UP_TIMEOUT=900 WAIT_TIMEOUT=600
       - name: Smoke tests
         run: make dev-smoke
+      # The dev Keycloak image comes from the project's Docker Hub repository: its digest must be the
+      # one the project publishes on quay.io, its canonical registry.
+      - name: Keycloak image provenance (Docker Hub index digest equals quay.io)
+        run: |
+          ref=$(sed -n 's/.*DATABASTION_DEV_KEYCLOAK_IMAGE:-\(keycloak\/keycloak:[^@]*\)@\(sha256:[0-9a-f]*\)}.*/\1 \2/p' dev/docker-compose.yml)
+          read -r image pinned <<<"$ref"
+          [ -n "$image" ] && [ -n "$pinned" ] || { echo "::error::no pinned keycloak image in dev/docker-compose.yml"; exit 1; }
+          hub=$(timeout 120 docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          quay=$(timeout 120 docker buildx imagetools inspect "quay.io/$image" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          echo "pinned $pinned, Docker Hub $hub, quay.io $quay"
+          [ "$pinned" = "$hub" ] && [ "$hub" = "$quay" ] || { echo "::error::keycloak image digests differ"; exit 1; }
       # Opt-in Keycloak (OIDC test realm, ADR-0038): import, healthcheck and realm checks.
       - name: Keycloak (OIDC test realm)
         run: |
@@ -51,8 +62,8 @@ jobs:
       - name: Service status and logs
         if: failure()
         run: |
-          docker compose -f dev/docker-compose.yml ps -a
-          timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300
+          docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak ps -a
+          timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak logs --no-color --tail=300
       - name: Stop
         if: always()
         run: make dev-reset

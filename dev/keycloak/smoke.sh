@@ -90,6 +90,18 @@ if printf '%s' "$ADMIN_PASSWORD" | "${CURL[@]}" -o "$tmp/token.json" \
       "len(d) == 1 and d[0]['publicClient'] is False and d[0]['clientAuthenticatorType'] == 'client-secret' and d[0]['standardFlowEnabled'] is True and not d[0]['implicitFlowEnabled'] and not d[0]['directAccessGrantsEnabled'] and not d[0]['serviceAccountsEnabled']"
     check "client: PKCE S256 required, exact redirect and post-logout URIs" "$tmp/clients.json" \
       "d[0]['attributes'].get('pkce.code.challenge.method') == 'S256' and d[0]['redirectUris'] == ['http://localhost:3000/api/auth/oidc/callback'] and d[0]['attributes'].get('post.logout.redirect.uris') == 'http://localhost:3000/login' and not d[0]['attributes'].get('backchannel.logout.url')"
+    # The realm file holds `${KEYCLOAK_CONSOLE_CLIENT_SECRET}`: prove it was substituted at import
+    # (compared in Python, neither value printed).
+    cid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["id"])' "$tmp/clients.json")
+    if api client-secret "clients/$cid/client-secret"; then
+      if KC_EXPECTED_SECRET=${KEYCLOAK_CONSOLE_CLIENT_SECRET:-dev-only-keycloak-console-client-secret} python3 - "$tmp/client-secret.json" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f).get("value", "")
+sys.exit(0 if value and "${" not in value and value == os.environ["KC_EXPECTED_SECRET"] else 1)
+PY
+      then ok "client secret substituted from dev/.env at import"; else ko "client secret substituted from dev/.env at import"; fi
+    else ko "client secret readable"; fi
     check "client: groups claim in the id_token, full path off" "$tmp/clients.json" \
       "any(m['protocolMapper'] == 'oidc-group-membership-mapper' and m['config'].get('claim.name') == 'groups' and m['config'].get('full.path') == 'false' and m['config'].get('id.token.claim') == 'true' for m in d[0].get('protocolMappers', []))"
   else ko "client readable"; fi
@@ -99,7 +111,7 @@ if printf '%s' "$ADMIN_PASSWORD" | "${CURL[@]}" -o "$tmp/token.json" \
       "{'databastion-admins', 'databastion-analysts', 'contractors'} <= {g['name'] for g in d}"
   else ko "groups readable"; fi
 
-  # user <username> <email> <emailVerified> <group>
+  # user <username> <email> <emailVerified> <group, or - for none>
   user() {
     local name=$1 email=$2 verified=$3 group=$4 id
     if ! api "user-$name" "users?username=$name&exact=true"; then ko "user $name readable"; return; fi
@@ -107,7 +119,11 @@ if printf '%s' "$ADMIN_PASSWORD" | "${CURL[@]}" -o "$tmp/token.json" \
       "len(d) == 1 and d[0]['enabled'] and d[0]['email'] == '$email' and d[0]['emailVerified'] is $verified"
     id=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0]["id"] if d else "")' "$tmp/user-$name.json")
     if [ -n "$id" ] && api "groups-$name" "users/$id/groups"; then
-      check "user $name: member of $group only" "$tmp/groups-$name.json" "[g['name'] for g in d] == ['$group']"
+      if [ "$group" = "-" ]; then
+        check "user $name: member of no group" "$tmp/groups-$name.json" "d == []"
+      else
+        check "user $name: member of $group only" "$tmp/groups-$name.json" "[g['name'] for g in d] == ['$group']"
+      fi
     else ko "user $name groups readable"; fi
   }
   user admin.alice admin.alice@databastion.test True databastion-admins
@@ -115,6 +131,7 @@ if printf '%s' "$ADMIN_PASSWORD" | "${CURL[@]}" -o "$tmp/token.json" \
   user outsider.carol outsider.carol@databastion.test True contractors
   user unverified.dave unverified.dave@databastion.test False databastion-analysts
   user mallory admin.alice@databastion.test True databastion-analysts
+  user nogroup.erin nogroup.erin@databastion.test True -
 else
   ko "admin API token (KEYCLOAK_ADMIN_PASSWORD from dev/.env)"
 fi

@@ -18,21 +18,27 @@
       "name": "databastion-admins",
       "path": "/databastion-admins",
       "attributes": {
-        "description": ["Mapped to the console role admin by the dev role expression (dev/README.md)"]
+        "description": [
+          "Mapped to the console role admin by the dev role expression (dev/README.md)"
+        ]
       }
     },
     {
       "name": "databastion-analysts",
       "path": "/databastion-analysts",
       "attributes": {
-        "description": ["Mapped to the console role analyst by the dev role expression (dev/README.md)"]
+        "description": [
+          "Mapped to the console role analyst by the dev role expression (dev/README.md)"
+        ]
       }
     },
     {
       "name": "contractors",
       "path": "/contractors",
       "attributes": {
-        "description": ["Not an allowed group: its members must be refused by DATABASTION_OIDC_ALLOWED_GROUPS"]
+        "description": [
+          "Not an allowed group: its members must be refused by DATABASTION_OIDC_ALLOWED_GROUPS"
+        ]
       }
     }
   ],
@@ -56,7 +62,9 @@
       "frontchannelLogout": false,
       "rootUrl": "http://localhost:3000",
       "baseUrl": "/agents",
-      "redirectUris": ["http://localhost:3000/api/auth/oidc/callback"],
+      "redirectUris": [
+        "http://localhost:3000/api/auth/oidc/callback"
+      ],
       "webOrigins": [],
       "attributes": {
         "pkce.code.challenge.method": "S256",
@@ -97,10 +105,16 @@
       "emailVerified": true,
       "firstName": "Alice",
       "lastName": "Admin",
-      "groups": ["/databastion-admins"],
+      "groups": [
+        "/databastion-admins"
+      ],
       "requiredActions": [],
       "credentials": [
-        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
       ]
     },
     {
@@ -110,10 +124,16 @@
       "emailVerified": true,
       "firstName": "Bob",
       "lastName": "Analyst",
-      "groups": ["/databastion-analysts"],
+      "groups": [
+        "/databastion-analysts"
+      ],
       "requiredActions": [],
       "credentials": [
-        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
       ]
     },
     {
@@ -123,10 +143,16 @@
       "emailVerified": true,
       "firstName": "Carol",
       "lastName": "Outsider",
-      "groups": ["/contractors"],
+      "groups": [
+        "/contractors"
+      ],
       "requiredActions": [],
       "credentials": [
-        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
       ]
     },
     {
@@ -136,10 +162,16 @@
       "emailVerified": false,
       "firstName": "Dave",
       "lastName": "Unverified",
-      "groups": ["/databastion-analysts"],
+      "groups": [
+        "/databastion-analysts"
+      ],
       "requiredActions": [],
       "credentials": [
-        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
       ]
     },
     {
@@ -149,10 +181,33 @@
       "emailVerified": true,
       "firstName": "Alice",
       "lastName": "Admin",
-      "groups": ["/databastion-analysts"],
+      "groups": [
+        "/databastion-analysts"
+      ],
       "requiredActions": [],
       "credentials": [
-        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "nogroup.erin",
+      "enabled": true,
+      "email": "nogroup.erin@databastion.test",
+      "emailVerified": true,
+      "firstName": "Erin",
+      "lastName": "Nogroup",
+      "groups": [],
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_DEV_USER_PASSWORD}",
+          "temporary": false
+        }
       ]
     }
   ]
