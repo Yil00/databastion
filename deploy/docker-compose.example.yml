@@ -68,7 +68,7 @@ services:
       # DATABASTION_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
       # Role and group claims must be set by the provider's administrators only, never by users.
       # DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: groups
-      # DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(groups[*], 'databastion-admins') && 'admin' || 'analyst'"
+      # DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(groups, 'databastion-admins') && 'admin' || contains(groups, 'databastion-analysts') && 'analyst'"
       # DATABASTION_OIDC_ALLOWED_GROUPS: databastion-admins,databastion-analysts
       # Private CA of the provider (mounted read-only), added to the system roots:
       # DATABASTION_OIDC_CA_FILE: /run/secrets/oidc_ca
