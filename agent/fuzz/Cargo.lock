@@ -187,6 +187,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "databastion-connector-cas"
+version = "0.3.1"
+dependencies = [
+ "databastion-classifiers",
+ "databastion-core",
+ "regex",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "databastion-connector-mongodb"
 version = "0.3.1"
 dependencies = [
@@ -253,6 +270,7 @@ dependencies = [
 name = "databastion-fuzz"
 version = "0.0.0"
 dependencies = [
+ "databastion-connector-cas",
  "databastion-connector-mongodb",
  "databastion-connector-openldap",
  "libfuzzer-sys",

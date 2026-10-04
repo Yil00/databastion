@@ -15,6 +15,8 @@ tests of each connector (`src/proptests.rs`).
 | `openldap_message` | `…::fuzz::message` | One `LDAPMessage`; an entry is also reduced as an accesslog entry |
 | `openldap_filter` | `…::fuzz::search_filter` | One logged search filter (`reqFilter`) |
 | `openldap_accesslog` | `…::fuzz::accesslog` | One `cn=accesslog` entry, NUL-separated attribute values |
+| `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
+| `cas_audit_log` | `…::fuzz::audit_log` | One CAS JSON audit log line; `what` reducer, time parser, event builder |
 
 The connectors expose these entry points only with their `fuzzing` feature, which the agent binary
 never enables. This directory is its own Cargo workspace: `cargo test` and `cargo clippy` in

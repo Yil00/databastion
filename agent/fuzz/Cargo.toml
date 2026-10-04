@@ -1,7 +1,8 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
 # server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
-# cn=accesslog entries. See README.md.
+# cn=accesslog entries; CAS service definitions and JSON audit log lines. See
+# README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
 # in agent/ never build it, and the agent binary never links libFuzzer. The
@@ -20,6 +21,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 databastion-connector-mongodb = { path = "../crates/connector-mongodb", features = ["fuzzing"] }
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
+databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
 
 [workspace]
 members = ["."]
@@ -86,6 +88,20 @@ bench = false
 [[bin]]
 name = "openldap_accesslog"
 path = "fuzz_targets/openldap_accesslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cas_registry"
+path = "fuzz_targets/cas_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cas_audit_log"
+path = "fuzz_targets/cas_audit_log.rs"
 test = false
 doc = false
 bench = false

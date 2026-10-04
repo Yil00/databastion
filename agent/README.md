@@ -22,6 +22,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector: Discovery, `check()` and Audit through `cn=accesslog` (phase 6, [ADR-0029](../docs/adr/0029-openldap-connector.md), [README](crates/connector-openldap/README.md)) |
+| `databastion-connector-cas` | `crates/connector-cas` | Apereo CAS connector, local files only: JSON service registry Discovery, JSON audit log Audit, `check()` (phase 8, [ADR-0041](../docs/adr/0041-cas-connector.md), [README](crates/connector-cas/README.md)); not wired into the core until the `cas` protocol values land (P8-C) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
 

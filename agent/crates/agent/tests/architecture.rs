@@ -19,11 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 4] = [
+const CONNECTORS: [&str; 5] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
     "connector-openldap",
+    "connector-cas",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
@@ -314,6 +315,45 @@ fn cargo_metadata() -> serde_json::Value {
 /// dependency on `databastion-protocol` is `databastion-core`, whose
 /// crate-private uplink is the only user of the generated types. Complements
 /// the manifest text guard above.
+/// The CAS connector reads local files only and opens no network
+/// connection of any kind (ADR-0041 decisions 2 and 13): no TLS crate, no
+/// tokio `net` feature, no socket type in its sources.
+#[test]
+fn cas_connector_opens_no_network_connection() {
+    let krate = workspace_root().join("crates").join("connector-cas");
+    let manifest = fs::read_to_string(krate.join("Cargo.toml")).unwrap();
+    for (key, _) in declared_dependencies(&manifest) {
+        assert!(
+            !key.contains("rustls") && !key.contains("tls") && key != "socket2",
+            "connector-cas depends on {key}"
+        );
+    }
+    for line in code_lines(&manifest).filter(|l| l.starts_with("tokio")) {
+        assert!(
+            !line.contains("\"net\""),
+            "connector-cas enables tokio's net feature"
+        );
+    }
+    let mut sources = Vec::new();
+    rust_sources(&krate.join("src"), &mut sources);
+    for source in sources {
+        let text = fs::read_to_string(&source).unwrap();
+        for api in [
+            "TcpStream",
+            "UnixStream",
+            "tokio::net",
+            "std::net::Tcp",
+            "ToSocketAddrs",
+        ] {
+            assert!(
+                !code_lines(&text).any(|l| l.contains(api)),
+                "{} uses {api}",
+                source.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn only_core_depends_on_protocol_types() {
     let metadata = cargo_metadata();
