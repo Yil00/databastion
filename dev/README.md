@@ -12,6 +12,8 @@ make dev-logs     # last 200 log lines of every service (TAIL=n to change)
 make seed         # regenerates dev/seed/out/* and dev/ground-truth.json
 make test-dev     # unit tests of the seed generator
 make agent-it     # connector integration tests against this environment (ENGINE=postgres|mysql|mongodb|openldap)
+make dev-keycloak        # opt-in: Keycloak with the OIDC test realm (below), waits until healthy
+make dev-keycloak-smoke  # checks its discovery document, JWKS and seeded realm
 ```
 `make help` lists every target by section (setup with `make install` / `make doctor`, console, agent, protocol, `make check`, end-to-end, release). The CI workflow `.github/workflows/dev-env.yml` runs the same steps as `make dev` / `make dev-smoke`; `make agent-it` ([agent-it.sh](agent-it.sh)) runs the "dev image" step of the CI connector jobs, with the variables shown below.
 
@@ -28,6 +30,7 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | Percona Server for MongoDB 8.0 (`psmdb`, opt-in: profile `psmdb`) | 27019 | `app` (the MongoDB seed) | `auditLog` JSON file (`auditAuthorizationSuccess`) in `dev/.state/logs/psmdb/auditLog.json` | Partial ([ADR-0027](../docs/adr/0027-mongodb-audit.md): once a successful `authCheck` was read) |
 | OpenLDAP (Debian slapd) (`openldap`) | 1389 (LDAPS 1636) | `dc=example,dc=org` | `slapo-accesslog` in `cn=accesslog` (`reads writes session`) | Full ([ADR-0029](../docs/adr/0029-openldap-connector.md): once each naming context shows a search record) |
 | Mailpit (`mailpit`) | SMTP 1025, UI 8025 | | | |
+| Keycloak 26.8 (`keycloak`, opt-in: profile `keycloak`) | 8180 | realm `databastion` ([below](#keycloak-oidc-test-realm)) | | |
 | Prometheus (`prometheus`) | 9090 | | | |
 | Grafana (`grafana`) | 3001 | | | |
 
@@ -105,6 +108,62 @@ make agent-it ENGINE=postgres
 ```
 
 The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
+
+## Keycloak (OIDC test realm)
+An OpenID Connect provider for the console's OIDC login ([ADR-0038](../docs/adr/0038-console-oidc-login.md), ROADMAP P8-A and P8-D), used by the console integration tests and, later, the end-to-end login scenario. It is **opt-in** (Compose profile `keycloak`), like `psmdb`: Keycloak needs about half a GiB of memory and 30 to 60 s to start, which only the OIDC work needs, so `make dev` stays as fast as before.
+
+```sh
+make dev-keycloak        # docker compose -f dev/docker-compose.yml --profile keycloak up -d --wait keycloak
+make dev-keycloak-smoke  # dev/keycloak/smoke.sh: discovery, JWKS, client, mapper, groups, users, user profile
+make dev-down            # also stops it (dev-down and dev-reset include the opt-in profiles)
+```
+
+- Image `keycloak/keycloak:26.8.0`, pinned by tag and index digest. It is the Keycloak project's own Docker Hub repository, which carries the same releases as `quay.io/keycloak/keycloak`; `DATABASTION_DEV_KEYCLOAK_IMAGE` overrides it (e.g. `quay.io/keycloak/keycloak:<version>@sha256:…`).
+- `start-dev --import-realm`: dev mode (embedded H2 database, HTTP), realm imported from [keycloak/databastion-realm.json](keycloak/databastion-realm.json). There is no volume: every new container imports the realm again, so `make dev-down` (or `docker compose … rm -sf keycloak`) discards whatever was changed in it, such as the edits of the attribute-editing user below.
+- Published on `127.0.0.1:8180` only (`KEYCLOAK_PORT`); the management interface (port 9000, `/health/ready`, used by the healthcheck) is not published. Admin console: <http://127.0.0.1:8180/admin/> (user `admin`, password `KEYCLOAK_ADMIN_PASSWORD`, a temporary bootstrap administrator of the `master` realm).
+- **Issuer**: `http://127.0.0.1:8180/realms/databastion`, fixed by `KC_HOSTNAME` whatever host name a request uses. ADR-0038 decision 2 requires `https://` for the issuer and every endpoint, except that "a plain-HTTP issuer is accepted only on a loopback address and outside production": this service relies on that exception, so the console must run in development mode (`pnpm dev`), not as a production build. The issuer uses `127.0.0.1` and the console `localhost`, two different sites: the provider's redirect to the callback is then a cross-site navigation, as in production, which is what the `SameSite=Lax` state cookie of decision 5 is for. Open the console at <http://localhost:3000>, not `127.0.0.1:3000`, or the redirect URI will not match.
+- Credentials: `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_CONSOLE_CLIENT_SECRET` and `KEYCLOAK_DEV_USER_PASSWORD` in [.env.example](.env.example), **dev-only** values. The realm file holds no secret: Keycloak resolves its `${KEYCLOAK_CONSOLE_CLIENT_SECRET}` and `${KEYCLOAK_DEV_USER_PASSWORD}` placeholders from the container environment at import time. Unlike the other services, the Compose file falls back to the `.env.example` values when they are missing from `dev/.env`, since Compose interpolates the services of inactive profiles too: an older `dev/.env` keeps `make dev` working.
+
+### Realm `databastion`
+- Client `databastion-console`: confidential (`client-secret`), standard flow (authorization code) only: no implicit flow, no direct access (password) grant, no service account, no device or CIBA grant. PKCE with `S256` required. Redirect URI `http://localhost:3000/api/auth/oidc/callback` (`<DATABASTION_PUBLIC_URL>/api/auth/oidc/callback`, decision 16), post-logout redirect URI `http://localhost:3000/login`, front-channel logout off, back-channel logout URL empty (back-channel logout is a planned addition, decision 13). The `iss` parameter is sent in authorization responses (RFC 9207).
+- Mapper `groups` (group membership): claim `groups`, group names without their path (`databastion-admins`, not `/databastion-admins`), in the ID token and the userinfo response, not in the access token.
+- Groups `databastion-admins`, `databastion-analysts`, and `contractors` (not an allowed group).
+- Users can edit their username (`editUsernameAllowed`), e-mail and first and last names (the default user profile gives `edit` to `user` on those attributes; the smoke test checks it), and duplicate e-mails are allowed. No self-registration, no password reset, no e-mail verification flow.
+
+Users (password `KEYCLOAK_DEV_USER_PASSWORD` for all, `dev-only-keycloak-user` by default; every e-mail is under the reserved `.test` domain):
+
+| Username | E-mail (`email_verified`) | Groups | Tests |
+|----------|---------------------------|--------|-------|
+| `admin.alice` | `admin.alice@databastion.test` (true) | `databastion-admins` | Role `admin` mapped from the group; pending login then approval when sign-up is off (the default); self-service linking to a local user |
+| `analyst.bob` | `analyst.bob@databastion.test` (true) | `databastion-analysts` | Role `analyst` mapped from the group |
+| `outsider.carol` | `outsider.carol@databastion.test` (true) | `contractors` | Refused by `DATABASTION_OIDC_ALLOWED_GROUPS` (`user.login_denied`, reason `group`), or by strict role mode without it (reason `role`) |
+| `unverified.dave` | `unverified.dave@databastion.test` (**false**) | `databastion-analysts` | Refused by `DATABASTION_OIDC_ALLOWED_DOMAINS=databastion.test` (reason `email_unverified`); without the domain filter, an `analyst` whose pending login is flagged `email_verified: false` |
+| `mallory` | `admin.alice@databastion.test` (true) | `databastion-analysts` | Attribute-editing user (decision 7, decision 17): seeded with Alice's e-mail and name (`Alice Admin`), and can change her username, e-mail and name in the account console (<http://127.0.0.1:8180/realms/databastion/account>), e.g. the username to the name of an existing console user such as `admin`. Expected: never `admin` (her role comes from her group only), never linked to Alice's account (identities are keyed by (`iss`, `sub`)), and refused (reason `username`) when her login claim equals an existing console username |
+
+Mallory's e-mail is seeded as verified to stand for the worst case, a provider that keeps a user-edited e-mail verified (Keycloak normally marks an e-mail changed by its user as unverified).
+
+### Running the console against it
+From `console/`, in development mode (`pnpm dev`), with the console's usual development variables (database, `DATABASTION_ENCRYPTION_KEY`, which OIDC requires) and:
+
+```sh
+export DATABASTION_PUBLIC_URL=http://localhost:3000
+export DATABASTION_OIDC_ENABLED=1
+export DATABASTION_OIDC_ISSUER_URL=http://127.0.0.1:8180/realms/databastion
+export DATABASTION_OIDC_CLIENT_ID=databastion-console
+export DATABASTION_OIDC_CLIENT_SECRET=dev-only-keycloak-console-client-secret   # KEYCLOAK_CONSOLE_CLIENT_SECRET
+export DATABASTION_OIDC_DISPLAY_NAME="Keycloak (dev)"
+export DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH=groups
+export DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH="contains(groups, 'databastion-admins') && 'admin' || contains(groups, 'databastion-analysts') && 'analyst'"
+export DATABASTION_OIDC_ROLE_ATTRIBUTE_STRICT=1
+export DATABASTION_OIDC_ALLOWED_GROUPS=databastion-admins,databastion-analysts
+# Optional: refuse unverified e-mails (unverified.dave) and other domains.
+export DATABASTION_OIDC_ALLOWED_DOMAINS=databastion.test
+```
+
+- The role expression reads the `groups` claim only, which only the realm's administrators set; it must never read `email`, `preferred_username` or `name` (decision 7), which `mallory` controls. A user in neither group gets `false`, a non-string, so no role; a token without a `groups` claim makes `contains` fail, which also counts as no role.
+- The defaults do the rest: login claim `preferred_username`, e-mail `email`, name `name`, scopes `openid profile email`, `RS256` signatures (the realm's only signing key), `client_secret_basic`, no sign-up (`DATABASTION_OIDC_ALLOW_SIGN_UP=0`: first logins become pending logins), local login `admins` while OIDC is on.
+- `DATABASTION_OIDC_CA_FILE` is not needed: the issuer is plain HTTP on a loopback address. A production build of the console (`pnpm build && pnpm start`) refuses it.
+- Logout ends the Keycloak session through RP-initiated logout (`end_session_endpoint`, `post_logout_redirect_uri` `http://localhost:3000/login`); with `DATABASTION_OIDC_USE_REFRESH_TOKEN=1`, the refresh token is revoked first (`revocation_endpoint`).
 
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this

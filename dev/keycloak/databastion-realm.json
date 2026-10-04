@@ -1,0 +1,159 @@
+{
+  "realm": "databastion",
+  "displayName": "DataBastion (DEV-ONLY test realm, ADR-0038)",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": true,
+  "editUsernameAllowed": true,
+  "verifyEmail": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "bruteForceProtected": false,
+  "internationalizationEnabled": false,
+  "groups": [
+    {
+      "name": "databastion-admins",
+      "path": "/databastion-admins",
+      "attributes": {
+        "description": ["Mapped to the console role admin by the dev role expression (dev/README.md)"]
+      }
+    },
+    {
+      "name": "databastion-analysts",
+      "path": "/databastion-analysts",
+      "attributes": {
+        "description": ["Mapped to the console role analyst by the dev role expression (dev/README.md)"]
+      }
+    },
+    {
+      "name": "contractors",
+      "path": "/contractors",
+      "attributes": {
+        "description": ["Not an allowed group: its members must be refused by DATABASTION_OIDC_ALLOWED_GROUPS"]
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "databastion-console",
+      "name": "DataBastion console (DEV-ONLY)",
+      "description": "DEV-ONLY confidential client for a console on http://localhost:3000. The secret comes from KEYCLOAK_CONSOLE_CLIENT_SECRET (dev/.env).",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "consentRequired": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KEYCLOAK_CONSOLE_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "frontchannelLogout": false,
+      "rootUrl": "http://localhost:3000",
+      "baseUrl": "/agents",
+      "redirectUris": ["http://localhost:3000/api/auth/oidc/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/login",
+        "backchannel.logout.url": "",
+        "backchannel.logout.session.required": "true",
+        "backchannel.logout.revoke.offline.tokens": "false",
+        "exclude.issuer.from.auth.response": "false",
+        "require.pushed.authorization.requests": "false",
+        "oauth2.device.authorization.grant.enabled": "false",
+        "oidc.ciba.grant.enabled": "false",
+        "standard.token.exchange.enabled": "false",
+        "use.refresh.tokens": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin.alice",
+      "enabled": true,
+      "email": "admin.alice@databastion.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Admin",
+      "groups": ["/databastion-admins"],
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+      ]
+    },
+    {
+      "username": "analyst.bob",
+      "enabled": true,
+      "email": "analyst.bob@databastion.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Analyst",
+      "groups": ["/databastion-analysts"],
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+      ]
+    },
+    {
+      "username": "outsider.carol",
+      "enabled": true,
+      "email": "outsider.carol@databastion.test",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Outsider",
+      "groups": ["/contractors"],
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+      ]
+    },
+    {
+      "username": "unverified.dave",
+      "enabled": true,
+      "email": "unverified.dave@databastion.test",
+      "emailVerified": false,
+      "firstName": "Dave",
+      "lastName": "Unverified",
+      "groups": ["/databastion-analysts"],
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+      ]
+    },
+    {
+      "username": "mallory",
+      "enabled": true,
+      "email": "admin.alice@databastion.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Admin",
+      "groups": ["/databastion-analysts"],
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_DEV_USER_PASSWORD}", "temporary": false }
+      ]
+    }
+  ]
+}
