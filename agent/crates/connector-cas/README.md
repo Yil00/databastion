@@ -132,7 +132,12 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   `auth_failure`, `SERVICE_TICKET_CREATED` → `read` of the matching service,
   `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`; other actions are
   counted only.
-- `what` (which can hold a ticket id, a live SSO bearer credential) is reduced
+- `what` (which can hold a ticket id, a live SSO bearer credential) is a
+  string or, as CAS 8.0 writes it, an object such as
+  `{"service": "https://…", "ticketId": "ST-1-…"}`: from an object only the
+  string `service` is read, every other key (`ticketId`, `principal`,
+  `credential`…) and nested value is skipped without being copied, and a
+  duplicate `service` drops the record. It is reduced
   to the service URL's scheme and host at parse time, used only to pick a
   registry entry, then dropped. Ticket ids are never kept, logged,
   fingerprinted nor reported. Only a literal `@` ends a userinfo there; an

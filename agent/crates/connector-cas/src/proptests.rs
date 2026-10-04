@@ -265,6 +265,77 @@ proptest! {
     }
 
     #[test]
+    fn mutated_object_what_lines_never_panic(
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>(), any::<u8>()), 0..8),
+    ) {
+        let line = br#"{"who": "jdoe", "what": {"service": "https://a.example.org/", "ticketId": "ST-1-****-cas01"}, "action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z"}"#;
+        let _ = parse_record(&mutate(line.to_vec(), &edits), UtcOffset(0));
+    }
+
+    #[test]
+    fn object_what_keeps_only_the_service_host(
+        ticket in marker(),
+        path in marker(),
+        extra in proptest::collection::vec(("[a-zA-Z]{1,12}", 0u8..4), 0..6),
+        service_first in any::<bool>(),
+        nested_service in any::<bool>(),
+    ) {
+        // Random extra keys (never `service`) holding ticket markers as
+        // strings, URLs, arrays and nested objects, before or after the
+        // `service` key.
+        let mut fields: Vec<String> = vec![format!(
+            r#""ticketId": {}"#,
+            lit(&format!("ST-1-{ticket}"))
+        )];
+        for (k, kind) in &extra {
+            if k == "service" {
+                continue;
+            }
+            let v = match kind {
+                0 => lit(&format!("TGT-1-{ticket}")),
+                1 => lit(&format!("https://evil.example.net/{ticket}")),
+                2 => format!("[{}, {{\"service\": {}}}]", lit(&ticket), lit("https://evil.example.net/")),
+                _ => format!(
+                    "{{\"service\": {}, \"id\": {}}}",
+                    lit(&format!("https://evil.example.net/{ticket}")),
+                    lit(&ticket)
+                ),
+            };
+            fields.push(format!("{}: {v}", lit(k)));
+        }
+        if nested_service {
+            fields.push(format!(r#""principal": {{"service": {}}}"#, lit("https://evil.example.net/")));
+        }
+        let service = format!(
+            r#""service": {}"#,
+            lit(&format!("https://app.example.org/{path}?ticket={ticket}"))
+        );
+        if service_first {
+            fields.insert(0, service);
+        } else {
+            fields.push(service);
+        }
+        let line = format!(
+            r#"{{"who": "jdoe", "what": {{{}}}, "action": "SERVICE_TICKET_CREATED", "when": 1791115200000}}"#,
+            fields.join(", ")
+        );
+        let r = parse_record(line.as_bytes(), UtcOffset(0));
+        // Generated keys may repeat each other but never `service`.
+        let r = r.unwrap();
+        let host = r.service.as_ref().map(crate::parse::url::ServiceHost::as_url);
+        prop_assert_eq!(host.as_deref(), Some("https://app.example.org/"));
+        let mut b = Builder::new(key(), &[], ClientAddrMode::Truncated, None);
+        let mut out = Vec::new();
+        b.push(&r, UNIX_EPOCH + Duration::from_secs(1_800_000_000), &mut out);
+        b.flush(SystemTime::now(), true, &mut out);
+        let dbg = format!("{out:?} {r:?} {b:?}");
+        for m in [&ticket, &path] {
+            prop_assert!(!dbg.contains(m.as_str()), "{} leaked", m);
+        }
+        prop_assert!(!dbg.contains("evil"));
+    }
+
+    #[test]
     fn only_closed_facts_reach_events(
         who in marker(),
         ticket in marker(),
