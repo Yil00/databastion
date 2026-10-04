@@ -483,3 +483,63 @@ fn a_one_batch_spool_still_takes_findings_and_signature_batches() {
     assert_eq!(spool.counters.rejected_batches, 1);
     assert_eq!(spool.counters.dropped_batches, 3);
 }
+
+/// A findings batch of engine `cas` (gated by `engine.cas`, ADR-0042).
+fn cas_batch() -> ResultBatch {
+    let version = ClassifiersVersion::try_from("2026.09.1").unwrap();
+    let target = TargetId::try_from("cas-prod").unwrap();
+    let findings = masked(1, "email");
+    to_batches(MaskedResults::Findings {
+        job_id: Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        classifiers_version: &version,
+        target_id: &target,
+        engine: Engine::Cas,
+        findings: &findings,
+    })
+    .batches
+    .remove(0)
+}
+
+#[test]
+fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
+    let dir = TempDir::new();
+    let mut spool = Spool::open(dir.path(), &config(1 << 20, 3)).unwrap();
+    let held = |gates: &[&'static str]| gates.contains(&"engine.cas");
+    for _ in 0..3 {
+        spool.push(&cas_batch()).unwrap();
+    }
+    assert_eq!(spool.held_batches(held), 3);
+    assert!(spool.front_sendable(|_| true, held).is_none());
+    // The bound applies to held batches like any other: a new batch
+    // evicts the oldest (counted).
+    let pg = batches(1).remove(0);
+    spool.push(&pg).unwrap();
+    assert_eq!(spool.len(), 3);
+    assert_eq!(spool.counters.dropped_batches, 1);
+    assert_eq!(spool.counters.dropped_items, 1);
+    assert_eq!(spool.held_batches(held), 2);
+    // The sendable batch is found behind the held ones.
+    assert_eq!(
+        spool.front_sendable(|_| true, held).unwrap().1.batch_id(),
+        pg.batch_id()
+    );
+    // A held file is never read: removing them from disk is not noticed
+    // (no quarantine) while they are held.
+    for e in fs::read_dir(dir.path().join("spool")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::write(&p, b"not a batch").unwrap();
+        }
+    }
+    let _ = spool.front_sendable(|_| false, held);
+    assert_eq!(spool.counters.quarantined, 0);
+    // Reloaded (agent restart): the tokens come from the files again.
+    let dir2 = TempDir::new();
+    let mut again = Spool::open(dir2.path(), &config(1 << 20, 8)).unwrap();
+    again.push(&cas_batch()).unwrap();
+    drop(again);
+    let mut again = Spool::open(dir2.path(), &config(1 << 20, 8)).unwrap();
+    assert_eq!(again.held_batches(held), 1);
+    assert!(again.front_sendable(|_| true, held).is_none());
+    assert!(again.front_sendable(|_| true, |_| false).is_some());
+}

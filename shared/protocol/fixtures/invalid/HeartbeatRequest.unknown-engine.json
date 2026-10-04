@@ -1,0 +1,22 @@
+{
+  "ts": "2026-10-04T09:00:00Z",
+  "agent_version": "0.4.0",
+  "uptime_s": 60,
+  "connectors": [
+    "cas"
+  ],
+  "targets": [
+    {
+      "target_id": "cas-prod",
+      "engine": "apereo_cas",
+      "reachable": true,
+      "audit_level": "partial"
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

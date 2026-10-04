@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-09-29
 - **Refines**: [ADR-0013](0013-frozen-error-codes.md) (which stays Accepted), its rule that a compatible change is an optional field: optional fields added after protocol 0.1.0 are sent only once the receiver announced it accepts them
+- **Refined by**: [ADR-0042](0042-hold-items-of-unlisted-engines.md) (decision 9 for engine values gated by ADR-0039 decision 8: items of an unlisted engine are held, not stripped)
 - **Context references**: ROADMAP P4-D (protocol follow-up to the P4-A and P4-C security reviews), its security review (M1: an agent upgraded before the console loses every heartbeat), `shared/protocol/openapi.yaml` ("Compatibility and capability negotiation", `Capability`, `HeartbeatResponse.accepts`, `HeartbeatRequest.accepts`)
 
 ## Context

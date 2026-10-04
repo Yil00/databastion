@@ -4884,3 +4884,248 @@ async fn long_poll_intervals_never_crash_the_audit_worker() {
         run.await.expect("the audit worker did not panic");
     }
 }
+
+/// Spools findings of `engine` through the core's conversion, as a scan
+/// of a target of that engine would.
+fn spool_engine_findings(rt: &Runtime, engine: databastion_protocol::Engine, n: usize) {
+    let found = crate::spool::tests::masked(n, "email");
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("t-1").unwrap(),
+        engine,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &found,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cas_findings_wait_for_engine_cas_and_survive_a_console_that_rejects_the_value() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // The first `cas` batch meets a console that does not know the value
+    // (a rolled-back build or a replica not upgraded yet, ADR-0022
+    // decision 8): `400` `enum` on the engine of every item, as Ajv
+    // answers. Then the console accepts it.
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![
+                Step::Ack(false),
+                Step::Details(&[
+                    ("/findings/0/location/engine", "enum"),
+                    ("/findings/1/location/engine", "enum"),
+                ]),
+            ]
+            .into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, E::Cas, 2);
+    spool_engine_findings(&rt, E::Postgres, 3);
+
+    // No `engine.cas` yet: the `cas` batch is held, the other one goes.
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].to_string().contains("\"cas\""));
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    // Listed: sent, rejected with `enum` by an older replica: the
+    // capabilities are cleared and the items kept, held again.
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["findings"][0]["location"]["engine"], "cas");
+    assert!(!rt.console_caps.console_accepts(token::ENGINE_CAS));
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 1);
+    assert_eq!(status.dropped_items.unwrap().0, 0);
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 2, "still held");
+
+    // Listed again: the same items, under a new batch_id, accepted.
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_ne!(sent[2]["batch_id"], sent[1]["batch_id"]);
+    assert_eq!(sent[2]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+#[tokio::test]
+async fn cas_items_rejected_for_another_reason_are_dropped_not_held() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Details(&[("/findings/1/sampled", "maximum")])].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    spool_engine_findings(&rt, databastion_protocol::Engine::Cas, 3);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    // The ordinary rule: the capabilities stay, the item is dropped.
+    assert!(rt.console_caps.console_accepts(token::ENGINE_CAS));
+    assert_eq!(rt.lock_spool().status().dropped_items.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn heartbeats_and_enrollment_carry_only_accepted_engines() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // The enrollment request of `enrolled` went through `enroll`.
+    let enroll: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/enroll"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    for body in &enroll {
+        assert!(!body["connectors"].to_string().contains("cas"), "{body}");
+    }
+    let rt = runtime(&env);
+    let hb = serde_json::to_string(&rt.build_heartbeat().await.unwrap()).unwrap();
+    assert!(!hb.contains("\"cas\""), "{hb}");
+    assert!(!hb.contains("cas_audit_log"), "{hb}");
+}
+
+#[tokio::test]
+async fn cas_items_rejected_with_enum_again_while_listed_are_dropped() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let both: &[(&str, &str)] = &[
+        ("/findings/0/location/engine", "enum"),
+        ("/findings/1/location/engine", "enum"),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Details(both), Step::Details(both)].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    spool_engine_findings(&rt, E::Cas, 2);
+    drain(&rt).await;
+    // First `enum`: kept, held (capabilities cleared).
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    // Listed again, sent again, `enum` again: the console will not take
+    // them, so they are dropped (counted), never held a second time
+    // (ADR-0042 decision 4).
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 2);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 0);
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    // The ordinary path: the capabilities are not cleared again (the cas
+    // targets do not flap absent) and nothing more counts as stripped.
+    assert!(rt.console_caps.console_accepts(token::ENGINE_CAS));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    assert_eq!(
+        sent_batches(&server).await.len(),
+        2,
+        "nothing left to cycle"
+    );
+}
+
+#[tokio::test]
+async fn cas_events_rejected_with_enum_on_their_source_are_kept_and_held() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Event 1 (`cas_audit_log`) has its source refused; event 2 (`cas`) an
+    // `enum` on another field: dropped by the ordinary rule.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[
+            ("/events/0/source", "enum"),
+            ("/events/1/action", "enum"),
+        ])],
+    )
+    .await;
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ENGINE_CAS,
+            token::TARGET_STATUS_NOTES,
+        ],
+    );
+    let cas: databastion_protocol::EventsBatch = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/EventsBatch.cas.json"
+    ))
+    .unwrap();
+    let body = databastion_protocol::EventsBatch {
+        batch_id: databastion_protocol::new_batch_id(),
+        events: cas.events.into_iter().take(2).collect(),
+    };
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&body).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!rt.console_caps.console_accepts(token::ENGINE_CAS));
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 1, "event 0 kept and held");
+    assert_eq!(status.dropped_items.unwrap().0, 1);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(sent[1]["events"][0]["source"], "cas_audit_log");
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+#[tokio::test]
+async fn a_held_batch_survives_an_agent_restart() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, databastion_protocol::Engine::Cas, 2);
+    drain(&rt).await;
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    drop(rt);
+    // A new process: nothing is listed before its first heartbeat
+    // response, so the reloaded batch is held again, then sent.
+    let rt = runtime(&env);
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    drain(&rt).await;
+    assert!(sent_batches(&server).await.is_empty());
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    assert_eq!(metric(&rt, "spool_held_batches"), 0.0);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["findings"][0]["location"]["engine"], "cas");
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}

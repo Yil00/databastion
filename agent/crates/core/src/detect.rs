@@ -90,6 +90,9 @@ fn family(engine: Engine) -> u8 {
         Engine::Mysql | Engine::Mariadb => 1,
         Engine::Mongodb => 2,
         Engine::Openldap => 3,
+        // Never detected (ADR-0041 decision 3: no local detection of CAS,
+        // whose `java` command line carries secrets); its own family.
+        Engine::Cas => 4,
     }
 }
 

@@ -12,7 +12,13 @@
  * `target_status.notes` is stored for the latest heartbeat and rendered, and the
  * `job_progress.coverage` counters are stored with the job's progress and shown with the target's
  * latest scan (src/lib/scan-coverage.ts).
+ *
+ * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
+ * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
+ * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):
+ * `cas` targets, connectors, findings (service registry and audit log locations) and `cas_audit_log`
+ * events are validated, stored and rendered like those of any engine.
  */
-export const CONSOLE_ACCEPTS = ["access_event.bytes", "job_progress.coverage", "target_status.notes"] as const;
+export const CONSOLE_ACCEPTS = ["access_event.bytes", "engine.cas", "job_progress.coverage", "target_status.notes"] as const;
 
 export type ConsoleCapability = (typeof CONSOLE_ACCEPTS)[number];

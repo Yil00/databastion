@@ -260,6 +260,38 @@ describe("OpenLDAP events (ADR-0029)", () => {
   });
 });
 
+describe("CAS events (ADR-0041)", () => {
+  const FP = `hmac-sha256:${"7c".repeat(32)}`;
+
+  it("labels a service ticket read and a registry change by service", () => {
+    expect(objectsLabel([{ database: "service_registry", schema: "oidc", object: "HR_Portal" }], 3, "cas")).toBe("service HR_Portal (oidc)");
+    expect(objectsLabel([{ database: "service_registry", object: "*" }], 3, "cas")).toBe("service *");
+    expect(objectsLabel([{ database: "service_registry", object: "service_registry" }], 3, "cas")).toBe("service registry");
+  });
+
+  it("shows a CAS user fingerprint, and the * aggregate as several accounts, never as an account", () => {
+    const fp = renderToStaticMarkup(<PrincipalLabel principal={FP} fingerprinted engine="cas" />);
+    expect(fp).toContain("CAS user fingerprint");
+    expect(fp).toContain("cas.clear_principals");
+    const agg = renderToStaticMarkup(<PrincipalLabel principal="*" fingerprinted={false} engine="cas" />);
+    expect(agg).toContain("several accounts");
+    expect(agg).toContain("volume.failed_logins_many_accounts");
+    // `*` is only the aggregate on CAS: elsewhere it is shown as sent.
+    expect(renderToStaticMarkup(<PrincipalLabel principal="*" fingerprinted={false} engine="postgres" />)).toBe('<span class="break-all">*</span>');
+    const i = {
+      access: { eventId: null, principal: "*", database: null, bucket: new Date(NOW), score: 0, rows: null, signals: ["volume.failed_logins_many_accounts"], lastEventAt: null, anomaly: false, overflow: false },
+      location: null,
+      engine: "cas",
+    };
+    expect(incidentLocation(i)).toBe("several accounts (*) on (no object)");
+    expect(incidentLocation({ ...i, access: { ...i.access, principal: FP, database: "service_registry" } })).toBe("fingerprinted CAS user on store service_registry");
+  });
+
+  it("engine of the CAS audit source", () => {
+    expect(auditSourceEngine("cas_audit_log")).toBe("cas");
+  });
+});
+
 describe("incidents raised from access events", () => {
   it("show the principal and database instead of a finding location", () => {
     const i: IncidentView = {

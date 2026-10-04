@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { incidentsHref } from "@/lib/incidents-filter";
-import { isFingerprint, isLdapEngine } from "@/lib/location-labels";
+import { isAggregatePrincipal, isCasEngine, isFingerprint, isLdapEngine } from "@/lib/location-labels";
 import type { IncidentStatus, Severity } from "@/lib/incident-lifecycle";
 import type { IncidentView } from "@/server/incidents";
 
@@ -37,9 +37,19 @@ export function IncidentStatusBadge({ status }: { status: IncidentStatus }) {
 export function incidentLocation(i: Pick<IncidentView, "location" | "access" | "engine">): string {
   if (i.access?.overflow) return "hourly limit of new incidents reached: further matches counted here";
   const ldap = isLdapEngine(i.engine);
+  const cas = isCasEngine(i.engine);
   if (i.access) {
-    const who = isFingerprint(i.access.principal) ? (ldap ? "fingerprinted LDAP principal" : "fingerprinted account") : i.access.principal;
-    const where = i.access.database === null ? "(no object)" : ldap ? `naming context ${i.access.database}` : i.access.database;
+    const who = isFingerprint(i.access.principal)
+      ? ldap
+        ? "fingerprinted LDAP principal"
+        : cas
+          ? "fingerprinted CAS user"
+          : "fingerprinted account"
+      : isAggregatePrincipal(i.access.principal, i.engine)
+        ? "several accounts (*)"
+        : i.access.principal;
+    const where =
+      i.access.database === null ? "(no object)" : ldap ? `naming context ${i.access.database}` : cas ? `store ${i.access.database}` : i.access.database;
     return `${who} on ${where}`;
   }
   return i.location ? locationLabel(i.location, i.engine) : "(finding no longer available)";

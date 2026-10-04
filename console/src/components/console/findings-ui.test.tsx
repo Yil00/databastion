@@ -101,6 +101,24 @@ describe("FindingsTable", () => {
     expect(locationLabel(ldap)).toBe("dc=example,dc=org / ou=people,dc=example,dc=org / inetOrgPerson / mail");
   });
 
+  it("CAS locations name their parts: store, service type, service, path; the audit log's field (ADR-0041)", () => {
+    const registry = finding({
+      targetId: "cas-prod",
+      engine: "cas",
+      databaseName: "service_registry",
+      schemaName: "oidc",
+      objectName: "HR_Portal",
+      fieldName: "contacts[].email",
+    });
+    const html = renderToStaticMarkup(<FindingsTable findings={[registry]} csrfToken="csrf" now={NOW} canMark />);
+    for (const label of ["store", "service type", "service", "path"]) expect(html).toContain(`>${label}</dt>`);
+    expect(html).toContain(">contacts[].email</dd>");
+    expect(locationLabel(registry, "cas")).toBe("store service_registry / service type oidc / service HR_Portal / path contacts[].email");
+    expect(
+      locationLabel({ databaseName: "audit_trail", schemaName: null, objectName: "audit_log", fieldName: "who" }, "cas"),
+    ).toBe("store audit_trail / log audit_log / field who");
+  });
+
   it("summary links filter by target and classifier", () => {
     const html = renderToStaticMarkup(
       <FindingsSummary
