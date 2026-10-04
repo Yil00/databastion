@@ -26,6 +26,7 @@ jobs:
       protocol: ${{ steps.detect.outputs.protocol }}
       e2e: ${{ steps.e2e.outputs.e2e }}
       packaging: ${{ steps.e2e.outputs.packaging }}
+      oidc: ${{ steps.e2e.outputs.oidc }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,6 +69,14 @@ jobs:
             e2e=false
           fi
           echo "e2e=$e2e" | tee -a "$GITHUB_OUTPUT"
+          # OIDC login scenario (e2e/oidc.sh): the console, the e2e harness, the Keycloak dev realm
+          # and its image pin.
+          if [ -z "$changed" ] || grep -qE '^(console/|e2e/|deploy/initdb/|dev/keycloak/|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            oidc=true
+          else
+            oidc=false
+          fi
+          echo "oidc=$oidc" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
               || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
@@ -630,6 +639,48 @@ jobs:
         with:
           name: e2e-logs
           path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # End-to-end OIDC login scenario (e2e/README.md "OIDC login scenario", ROADMAP P8-D, ADR-0038):
+  # the console image against Keycloak (dev realm, image pinned in dev/docker-compose.yml) over
+  # HTTPS with a throwaway CA (DATABASTION_OIDC_CA_FILE): role from the group, refused group, no
+  # groups claim under strict mapping, the attribute-editing user refused admin (reason username),
+  # pending login, self-service link, logout; no secret nor one-time OIDC value in the console's
+  # logs or database. Not part of ci-result yet: it becomes required once it has run green on dev.
+  e2e-oidc:
+    name: E2E OIDC login (Keycloak)
+    needs: detect
+    if: needs.detect.outputs.oidc == 'true' && needs.detect.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-oidc-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/oidc.sh
+      - name: Unit tests of the scenario driver
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_oidc*.py' -v
+      - name: Run e2e/oidc.sh
+        run: timeout 1320 e2e/oidc.sh
+      # oidc.sh redacts every generated secret and every one-time OIDC value it saw from the logs
+      # on exit, whatever the result (and masks the secrets in the job log).
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-oidc-logs
+          path: e2e-oidc-logs/
           retention-days: 7
           if-no-files-found: ignore
 

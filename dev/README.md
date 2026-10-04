@@ -110,7 +110,7 @@ make agent-it ENGINE=postgres
 The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
 
 ## Keycloak (OIDC test realm)
-An OpenID Connect provider for the console's OIDC login ([ADR-0038](../docs/adr/0038-console-oidc-login.md), ROADMAP P8-A and P8-D), used by the console integration tests and, later, the end-to-end login scenario. It is **opt-in** (Compose profile `keycloak`), like `psmdb`: Keycloak needs about half a GiB of memory and 30 to 60 s to start, which only the OIDC work needs, so `make dev` stays as fast as before.
+An OpenID Connect provider for the console's OIDC login ([ADR-0038](../docs/adr/0038-console-oidc-login.md), ROADMAP P8-A and P8-D), used by the console integration tests and by the end-to-end login scenario ([e2e/README.md](../e2e/README.md#oidc-login-scenario), which generates its realm from this one with HTTPS redirect URIs and its own secrets). It is **opt-in** (Compose profile `keycloak`), like `psmdb`: Keycloak needs about half a GiB of memory and 30 to 60 s to start, which only the OIDC work needs, so `make dev` stays as fast as before.
 
 ```sh
 make dev-keycloak        # docker compose -f dev/docker-compose.yml --profile keycloak up -d --wait keycloak
