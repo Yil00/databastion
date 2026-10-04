@@ -27,6 +27,7 @@ jobs:
       e2e: ${{ steps.e2e.outputs.e2e }}
       packaging: ${{ steps.e2e.outputs.packaging }}
       oidc: ${{ steps.e2e.outputs.oidc }}
+      cas: ${{ steps.e2e.outputs.cas }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,6 +78,14 @@ jobs:
             oidc=false
           fi
           echo "oidc=$oidc" | tee -a "$GITHUB_OUTPUT"
+          # CAS target end to end (e2e/cas.sh): the agent, the console, the e2e harness, the CAS dev
+          # service (its overlay build, configuration and registry) and the ground truth.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/cas/|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            cas=true
+          else
+            cas=false
+          fi
+          echo "cas=$cas" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
               || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
@@ -683,6 +692,53 @@ jobs:
         with:
           name: e2e-oidc-logs
           path: e2e-oidc-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # End-to-end CAS target (e2e/README.md "CAS target", ROADMAP P8-D, ADR-0041 decision 14): the
+  # console and agent images with the CAS 8.0 dev overlay (dev/cas, built from locked, SHA-256
+  # verified Maven Central sources) and its JPA ticket registry: the cas target's level and notes,
+  # Discovery against dev/ground-truth.json, Audit (logins, service tickets, a credential-stuffing
+  # burst, truncated client addresses, incidents), the CAS store guard on the real ticket table
+  # (encrypted, then clear tickets, a renamed copy, the ticket-id tripwire) and I2 (no ground-truth
+  # value, client secret, ticket id of the run or typed name in the console database, the logs or
+  # the agent's state). A job of its own (the overlay build and CAS start add about 5 minutes to the
+  # required e2e job and a Maven Central dependency); not part of ci-result until it has run green
+  # on dev.
+  e2e-cas:
+    name: E2E CAS target
+    needs: detect
+    if: needs.detect.outputs.cas == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-cas-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/cas.sh e2e/target-initdb/40-cas.sh
+      - name: Unit tests of the scenario driver
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_cas*.py' -v
+      - name: Run e2e/cas.sh
+        # Within the job budget (45 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 2280 e2e/cas.sh
+      # cas.sh redacts every generated secret, every ticket of the run and every typed name of a
+      # failed login from the logs on exit, whatever the result (and masks them in the job log).
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-cas-logs
+          path: e2e-cas-logs/
           retention-days: 7
           if-no-files-found: ignore
 

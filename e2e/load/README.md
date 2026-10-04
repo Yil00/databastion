@@ -201,6 +201,66 @@ test remains the reference.
 
 A check without data (a sample series missing, a workload that printed no summary) counts as failed.
 
+## CAS target
+[ADR-0041](../../docs/adr/0041-cas-connector.md) decision 14 ("Load"), ROADMAP P8-D. [`cas.sh`](cas.sh)
+runs the e2e CAS stack ([`../docker-compose.cas.yml`](../docker-compose.cas.yml), the CAS 8.0 dev
+overlay and its JPA ticket registry, see [e2e/README.md](../README.md#cas-target)) with
+[`docker-compose.cas.yml`](docker-compose.cas.yml) here (CPU limits `LOAD_CAS_CPUS` / `LOAD_DB_CPUS`,
+default 2, and 60 s healthchecks), Compose project `databastion-load-cas`. The CAS connector reads
+local files only: there is no database to measure for its sources. The CI job is `load-cas` in
+[`load.yml`](../../.github/workflows/load.yml), next to `load`, with the same triggers (artifact
+`load-cas-results`).
+
+1. Workload from the host, [`../cas_scenario.py`](../cas_scenario.py) `load`: `LOAD_CAS_RATE`
+   successful logins per second (default 4, the three e-mail users in turn, each with a validated
+   service ticket) and `LOAD_CAS_FAIL_RATE` failed ones (default 1, random names, one client
+   address: past 16 names in 10 minutes they join the `*` aggregate), on `LOAD_CAS_WORKERS` threads
+   (16): `LOAD_CAS_WARMUP_S` (90) not measured (a freshly started CAS is several times slower for
+   its first minute or two: the first local run measured a p95 of 5 s cold against 0.45 s warm),
+   then `LOAD_BASELINE_S` without Audit and `LOAD_SOAK_S` with Audit on `cas-load`: about 17 audit
+   records per second (four per login: authentication, ticket-granting ticket, service ticket, its
+   validation). The defaults leave CAS headroom on its 2 CPUs: in a local run at 10 logins per
+   second it was saturated (p95 of the credential POST above 1 s, the schedule finishing late), which
+   measures CAS's queue, not the agent. A workload window ends when its last login returned. The
+   dev `log4j2.xml` rotates the log at 10 MB: a long run (or a higher rate) crosses a rotation.
+2. The same report as `run.sh` ([`loadlib.py report`](loadlib.py)), on the target `cas-load`
+   (container `cas`): `issued` is the records that give an event (per successful login a `connect`
+   and a `read`, per failed one an `auth_failure`), so `audit.cas-load.events_accounted` (0.99 to
+   1.01) compares the sum of `aggregated_count` of the stored `connect`, `read` and `auth_failure`
+   events with them; `p95_latency_ms` is the credential POST's p95 with and without Audit (the
+   agent only reads the log); the CAS container's CPU with and without Audit; the records of those
+   actions in the CAS audit log and its rotations since the Audit run started (source side, not
+   asserted); the agent's CPU, RSS, growth, spool and counters as in `run.sh`.
+3. The CAS store guard's ticket aggregate: after the workload, `cas_tickets` holds the run's
+   ticket-granting tickets (thousands; CAS keeps them for 8 hours). One Discovery scan of the
+   PostgreSQL target `casdb-load` (the ADR-0012 role with the decision 6 column grants), measured as
+   the database scans of `run.sh`: `discovery.casdb-load.db_cpu_impact_pct` < 2 % of `cas-db`'s CPU
+   capacity.
+
+```sh
+e2e/load/cas.sh                                     # about 25 minutes (images built first)
+LOAD_SOAK_S=120 LOAD_BASELINE_S=60 e2e/load/cas.sh  # a quick look
+LOAD_SKIP_BUILD=1 e2e/load/cas.sh                   # reuse the images built by e2e/cas.sh
+```
+
+Results go to `$LOAD_RESULTS_DIR` (default `e2e/load/.results-cas/`), logs to `$LOAD_LOG_DIR`
+(default `e2e/load/.logs-cas/`); the TLS proxy listens on `127.0.0.1:${LOAD_HTTPS_PORT:-8543}` and
+CAS on `127.0.0.1:${LOAD_CAS_PORT:-8282}`. `LOAD_SKIP_BUILD=1` (ignored under GitHub Actions) uses
+`databastion-console:e2e`, `databastion-agent:e2e` and `databastion-dev/cas:8.0.2-overlay`
+(`E2E_CONSOLE_IMAGE`, `E2E_AGENT_IMAGE`, `E2E_CAS_IMAGE` name other tags). Secrets are generated,
+registered, scanned for and redacted as in `run.sh`.
+
+**Status**: no CI run yet. A local run (2026-10-04, 10 logins and 2 failed logins per second, 60 s
+without and 120 s with Audit, `LOAD_IDLE_S=20`; a 4-CPU host shared with everything else) passed
+every check: 2640 events for 2640 records issued and 2640 in the CAS audit log (one rotation
+crossed), drained 70 s after the workload (the 60 s aggregation window included), the agent at
+0.0014 core and 18.6 MiB peak RSS without growth, nothing spooled or dropped; the ticket aggregate's
+scan of 1800 tickets took 1.2 s and 1.1 % of `cas-db`'s 2 CPUs (26 ms of CPU, mostly the fixed cost
+of a session: a one-object scan is short). CAS itself was saturated at that rate (above), hence the
+lower defaults. With them and a 30 s warm-up (60 s with Audit), the next local run also passed: 540
+events for 540 records, p95 of the credential POST 551 ms without Audit and 306 ms with it, CAS at
+1.4 to 1.6 cores, the agent at 0.001 core and 18 MiB. The numbers of record come from the CI job.
+
 ## Not covered, and why
 - **Prometheus / Grafana**: not used. The agent has no metrics listener (invariant I1, ADR-0004;
   `metrics.local_listen` is rejected by the configuration loader today), so there is nothing to scrape

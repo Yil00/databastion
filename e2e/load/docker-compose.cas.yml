@@ -1,0 +1,19 @@
+# CAS load run (e2e/load/cas.sh, e2e/load/README.md "CAS target"): merged over
+# e2e/docker-compose.yml and e2e/docker-compose.cas.yml (project databastion-load-cas). Only the
+# measurement settings change: CAS and its ticket database get a fixed CPU limit (their "capacity"),
+# and their healthchecks run every 2 s while starting, then every 60 s (each check is a process in
+# the measured cgroup).
+
+services:
+  cas:
+    cpus: ${LOAD_CAS_CPUS:-2}
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 300s
+  cas-db:
+    cpus: ${LOAD_DB_CPUS:-2}
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 60s
