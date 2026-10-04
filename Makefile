@@ -101,7 +101,7 @@ dev/.env:
 	cp dev/.env.example dev/.env
 
 dev-dirs: ## Create the engine log directories (world-writable: engines run as non-root users)
-	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS))
+	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS)) dev/.state/cas
 	chmod 0777 $(addprefix dev/.state/logs/,$(LOG_DIRS))
 
 dev-metrics-token: ## Create dev/.state/metrics_token (48 random chars, 0600) if missing; never committed
@@ -139,7 +139,7 @@ dev-reset: ## Stop and delete volumes and dev/.state (reloads the seed on next `
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down -v --remove-orphans
 	@# The CAS files belong to the CAS user and the agent's group (dev/cas/files-init.sh): removed
 	@# by the same one-shot container, as the host user cannot.
-	if [ -e dev/.state/cas ] || [ -e dev/.state/logs/cas ]; then \
+	if [ -e dev/.state/cas/services ] || [ -e dev/.state/logs/cas ]; then \
 	  timeout 120 $(COMPOSE) run --rm --no-deps -T cas-files-init sh /usr/local/bin/files-init.sh clean; fi
 	rm -rf dev/.state
 

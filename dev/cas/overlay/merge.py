@@ -9,7 +9,8 @@ build.gradle to the published apereo/cas war. Python standard library and the JD
 - The war's libraries are identified by its CycloneDX SBOM (group, name, version), so that two
   artifacts with the same name in different groups (Jackson 2 and Jackson 3 modules) are told
   apart; a jar of the war that the SBOM does not list is matched by file name.
-- A resolved jar already in WEB-INF/lib (same file name) is skipped. A resolved artifact that the
+- A resolved jar already in WEB-INF/lib (same file name) is skipped if its content is the same
+  (SHA-256); a different content under the same name fails the build. A resolved artifact that the
   war holds under another version fails the build: the war and the modules come from the same CAS
   BOM, so it means a drift to look at, never a silent second copy on the class path.
 - New jars are added STORED (uncompressed), as Spring Boot's launcher needs nested jars.
@@ -17,6 +18,7 @@ build.gradle to the published apereo/cas war. Python standard library and the JD
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -57,7 +59,13 @@ def main(war: str, modules: str, version: str, boot: str, out: str) -> int:
             continue
         group, name, ver, file = line.split()
         if file in libs:
-            same += 1
+            with zipfile.ZipFile(war) as z:
+                in_war = hashlib.sha256(z.read(LIB + file)).hexdigest()
+            resolved = hashlib.sha256(Path(modules, file).read_bytes()).hexdigest()
+            if in_war != resolved:
+                conflicts.append(f"{group}:{name}:{ver}: {file} differs from the war's copy (SHA-256)")
+            else:
+                same += 1
             continue
         other = known.get((group, name), set()) - {ver}
         prefix = re.compile(re.escape(name) + r"-[0-9][^/]*\.jar")

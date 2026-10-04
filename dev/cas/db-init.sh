@@ -22,6 +22,10 @@ init)
   [ -n "${DEV_CAS_DB_PASSWORD:-}" ] || { echo "db-init: DEV_CAS_DB_PASSWORD is empty" >&2; exit 1; }
   # The password goes through a psql variable read from the environment, never a command line.
   psql -d postgres <<'SQL'
+-- The password is not recorded: no utility statement in pg_stat_statements for this session, and
+-- a failing statement is not logged (as dev/postgres/initdb/20-databastion.sh).
+SET pg_stat_statements.track_utility = off;
+SET log_min_error_statement = panic;
 \getenv cas_password DEV_CAS_DB_PASSWORD
 SELECT 'CREATE ROLE cas LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'cas') \gexec
 ALTER ROLE cas WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS

@@ -317,7 +317,9 @@ services:
     volumes:
       - ./cas/files-init.sh:/usr/local/bin/files-init.sh:ro
       - ./cas/services:/src/services:ro
-      - ./.state:/state
+      # Only the CAS parts of .state (`make dev-dirs` creates both), not the metrics token.
+      - ./.state/cas:/state/cas
+      - ./.state/logs:/state/logs
     restart: "no"
 
   # Role and database `cas` in the dev PostgreSQL (cas/db-init.sh). The client image is the

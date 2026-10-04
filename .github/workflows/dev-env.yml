@@ -71,7 +71,12 @@ jobs:
         if: failure()
         run: |
           docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas ps -a
-          timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas logs --no-color --tail=300
+          # Every service but cas, whose log prints the keys CAS generates at start (dev only).
+          services=$(docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas config --services | grep -vx cas)
+          # shellcheck disable=SC2086 # a space-separated list of service names
+          timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas logs --no-color --tail=300 $services
+          # cas: its log lines without the generated keys.
+          timeout 60 docker compose -f dev/docker-compose.yml --profile cas logs --no-color --tail=300 cas | grep -viE 'generated .*key|key \[' || true
       - name: Stop
         if: always()
         run: make dev-reset

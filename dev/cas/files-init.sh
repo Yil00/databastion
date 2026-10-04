@@ -4,6 +4,8 @@
 # whose group is not root's). Gives the host-mounted CAS files the permissions
 # of ADR-0041 decision 6: owner the CAS user, group the agent's group, nothing writable by the
 # agent, nothing readable by others.
+# Only dev/.state/cas and dev/.state/logs are mounted (at /state/cas and /state/logs; `make dev-dirs`
+# creates them), never the rest of dev/.state (the metrics token).
 #   setup  dev/cas/services (mounted at /src/services) copied to dev/.state/cas/services: directory
 #          0750, files 0640; dev/.state/logs/cas (CAS writes cas_audit.log there, 0640): directory
 #          2750, setgid so that every log file gets the agent's group.
@@ -27,7 +29,6 @@ dir() {
 case "${1:-setup}" in
 setup)
   reg=/state/cas/services
-  install -d -m 0755 /state/cas
   dir "$reg" 0750
   # Synchronized in place (CAS keeps the directory mounted): stale entries go, every definition
   # is (re)installed as a fresh single-link file.
@@ -43,13 +44,14 @@ setup)
     n=$((n + 1))
   done
   logs=/state/logs/cas
-  mkdir -p /state/logs
   dir "$logs" 2750
-  find "$logs" -mindepth 1 -type f -exec chown "$CAS_UID:$AGENT_GID" {} + -exec chmod 0640 {} +
+  # Regular files only, never through a symlink (CAS, which owns the directory, may be running).
+  find "$logs" -mindepth 1 -type f ! -type l -exec chown -h "$CAS_UID:$AGENT_GID" {} + \
+    -exec chmod 0640 {} +
   echo "files-init: $n service definition(s) staged; registry 0750 and log directory 2750, owner $CAS_UID, group $AGENT_GID"
   ;;
 clean)
-  rm -rf /state/cas /state/logs/cas
+  rm -rf /state/cas/services /state/logs/cas
   ;;
 *)
   echo "usage: files-init.sh setup|clean" >&2

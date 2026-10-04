@@ -2,13 +2,14 @@
 # Smoke test of the opt-in Apereo CAS dev service (`make dev-cas` first; run with
 # `make dev-cas-smoke`). Checks, from the host:
 # - the registry is loaded: a registered service is accepted, an unknown one refused, the OIDC
-#   discovery document is served (the OIDC services loaded);
+#   discovery document is served (the OIDC services loaded); no actuator endpoint is served;
 # - a fake user logs in through /cas/login for a registered service, and the service ticket is
 #   validated (p3/serviceValidate); a login with a wrong password fails;
 # - the audit log, read as the agent (uid 10001, its group), holds one JSON object per line with
 #   the records of these actions (AUTHENTICATION_SUCCESS, SERVICE_TICKET_CREATED for that service,
-#   SERVICE_TICKET_VALIDATE_SUCCESS, AUTHENTICATION_FAILED), no `headers` key, and not the service
-#   ticket in clear (CAS masks ticket ids in its logs);
+#   SERVICE_TICKET_VALIDATE_SUCCESS, AUTHENTICATION_FAILED), no `headers` key, neither password
+#   (the right one nor the wrong one typed) and not the service ticket in clear (CAS masks ticket
+#   ids in its logs);
 # - the ADR-0041 decision 6 permissions: registry directory 0750 and files 0640, log directory 2750
 #   and log 0640, owner the CAS user, group the agent's; the agent can read them and write none
 #   (even through a read-write mount); another user can read none; the ticket table is readable
@@ -42,9 +43,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 # as <uid:gid> <shell command>: runs a command in the cas-files-init container definition (busybox,
-# no network) as that user, with dev/.state mounted read-write at /state: denials come from the
-# permissions, not from a read-only mount.
-as() { "${C[@]}" run --rm --no-deps -T -u "$1" --entrypoint sh cas-files-init -c "$2"; }
+# no network) as that user, with the CAS parts of dev/.state mounted read-write under /state:
+# denials come from the permissions, not from a read-only mount. Non-root users get no capability
+# at all (the service's own are for its root setup step).
+as() {
+  local caps=()
+  [ "${1%%:*}" = 0 ] || caps=(--cap-drop ALL)
+  "${C[@]}" run --rm --no-deps -T "${caps[@]}" -u "$1" --entrypoint sh cas-files-init -c "$2"
+}
 
 # urlenc <text>
 urlenc() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
@@ -64,7 +70,8 @@ login() {
 }
 
 echo "# Service registry ($BASE)"
-code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/login?service=$(urlenc "$SERVICE")" || true)
+# The first login page after a start is slow (webflow initialization): a longer budget.
+code=$("${CURL[@]}" --max-time 90 -o /dev/null -w '%{http_code}' "$BASE/login?service=$(urlenc "$SERVICE")" || true)
 if [ "$code" = 200 ]; then ok "registered CAS service accepted (login form)"
 else ko "registered CAS service accepted (HTTP $code; is the service up? make dev-cas)"; fi
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/login?service=$(urlenc https://unknown.example.net/)" || true)
@@ -80,6 +87,12 @@ PY
 else
   ko "OIDC discovery document reachable"
 fi
+
+for endpoint in health env; do
+  code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/actuator/$endpoint" || true)
+  if [ "$code" != 200 ]; then ok "actuator endpoint $endpoint not served (HTTP $code)"
+  else ko "actuator endpoint $endpoint not served (HTTP 200)"; fi
+done
 
 echo "# Login, service ticket, failed login"
 st=""
@@ -160,6 +173,16 @@ PY
 done
 cat "$tmp/audit.out" 2>/dev/null || true
 [ "$got" = 1 ] || ko "audit records of the smoke actions (see above)"
+# Neither the password nor the wrong one typed at the failed login is in the audit log (compared
+# in Python, values passed through the environment, never printed).
+if [ -s "$tmp/audit.log" ] && SMOKE_PW="$USER_PASSWORD" python3 - "$tmp/audit.log" <<'PY'
+import os, sys
+log = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+pw = os.environ["SMOKE_PW"]
+sys.exit(1 if pw in log or f"wrong-{pw}" in log else 0)
+PY
+then ok "neither the password nor the wrong one is in the audit log"
+else ko "a password (or the wrong one) is in the audit log, or the log is empty"; fi
 if [ -s "$tmp/st" ]; then
   if python3 - "$tmp/audit.log" "$tmp/st" <<'PY'
 import sys
