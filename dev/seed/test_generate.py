@@ -87,7 +87,7 @@ class Outputs(unittest.TestCase):
     def test_ground_truth_shape(self):
         locs = self.truth["locations"]
         engines = {loc["engine"] for loc in locs}
-        self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap"})
+        self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap", "cas"})
         for loc in locs:
             for key in ("engine", "database", "object", "expected_classifiers", "negative_control",
                         "name_contains_value"):
@@ -98,6 +98,11 @@ class Outputs(unittest.TestCase):
                 self.assertTrue(loc.get("values"), loc)
             if loc["name_contains_value"]:
                 self.assertTrue(loc["name_values"] and loc["name_value_classifiers"], loc)
+            if loc.get("never_sampled"):
+                # A credential: no classifier, not a negative control, its values listed (I2).
+                self.assertEqual(loc["expected_classifiers"], [], loc["field"])
+                self.assertFalse(loc["negative_control"])
+                self.assertTrue(loc.get("values"), loc["field"])
         self.assertTrue(any(loc["negative_control"] for loc in locs))
 
     def test_value_bearing_names_present(self):
@@ -128,6 +133,62 @@ class Outputs(unittest.TestCase):
                 needle = v if loc["engine"] == "mongodb" else v.replace("'", "''")
                 if needle not in content:
                     self.fail(f"{loc['engine']} {loc['object']}.{loc['field']}: value not in seed file")
+
+class CasRegistry(unittest.TestCase):
+    """dev/cas/services (opt-in CAS dev service) against the ground truth and the CAS config."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = g.build()
+        cls.truth = json.loads(cls.files["ground-truth.json"])
+        cls.services = {k: json.loads(v) for k, v in cls.files.items()
+                        if k.startswith(g.CAS_SERVICES + "/")}
+        cls.cas = [loc for loc in cls.truth["locations"] if loc["engine"] == "cas"]
+
+    def test_definitions(self):
+        self.assertGreaterEqual(len(self.services), 5)
+        kinds = set()
+        for path, d in self.services.items():
+            self.assertEqual(path, f"{g.CAS_SERVICES}/{d['name']}-{d['id']}.json")
+            self.assertIn(d["@class"], g.CAS_CLASS.values(), path)
+            self.assertTrue(d["serviceId"], path)
+            kinds.add(d["@class"])
+        self.assertEqual(kinds, set(g.CAS_CLASS.values()))
+        self.assertEqual(len({d["id"] for d in self.services.values()}), len(self.services))
+
+    def test_registry_directory_holds_definitions_only(self):
+        # connector-cas refuses a registry directory holding CAS configuration or key material.
+        committed = sorted(p.name for p in (g.DEV_DIR / g.CAS_SERVICES).iterdir())
+        self.assertEqual(committed, sorted(p.rsplit("/", 1)[1] for p in self.services))
+
+    def test_values_are_in_the_definitions(self):
+        text = "".join(self.files[p] for p in self.services)
+        for loc in self.cas:
+            if loc["database"] != "service_registry":
+                continue
+            for v in loc.get("values", []):
+                self.assertIn(json.dumps(v, ensure_ascii=False)[1:-1], text, loc["field"])
+
+    def test_secrets_are_dev_only_and_listed(self):
+        secrets = [v for loc in self.cas if loc.get("never_sampled") for v in loc["values"]]
+        self.assertEqual(len(secrets), 3)
+        for v in secrets:
+            if v.startswith("Basic "):
+                import base64
+                v = base64.b64decode(v[len("Basic "):]).decode()
+            self.assertTrue(v.startswith(("dev-only-", "{cipher}")), "not marked as fake")
+        forms = {d.get("clientSecret", "")[:8] for d in self.services.values() if "clientSecret" in d}
+        self.assertEqual(forms, {"dev-only", "{cipher}"})
+
+    def test_logins_match_the_cas_configuration(self):
+        props = (g.DEV_DIR / "cas" / "config" / "cas.properties").read_text(encoding="utf-8")
+        line = next(l for l in props.splitlines() if l.startswith("cas.authn.accept.users="))
+        logins = [u.split("::", 1)[0] for u in line.split("=", 1)[1].split(",")]
+        self.assertEqual(sorted(logins), sorted([*g.CAS_USERS, g.CAS_SERVICE_USER]))
+        who = [loc for loc in self.cas if loc["database"] == "audit_trail"]
+        self.assertEqual(len(who), 1)
+        self.assertEqual(who[0]["values"], sorted(g.CAS_USERS))
+
 
 if __name__ == "__main__":
     unittest.main()

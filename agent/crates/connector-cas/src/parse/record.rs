@@ -9,9 +9,16 @@
 //! noted). **A record with a duplicate kept key is dropped.** A line that
 //! is not one JSON object, or lacks a valid `action` or `when`, is dropped.
 //!
-//! `what` can hold a ticket id (a live SSO bearer credential): it is held
-//! in a zeroizing buffer only while the record is parsed, then reduced to
-//! the service URL's scheme and host **for service-ticket issuance only**
+//! `what` can hold a ticket id (a live SSO bearer credential). It is a
+//! string (`ST-1-… for https://…`) or, as CAS 8.0 writes it, a JSON object
+//! (`{"service": "https://…", "ticketId": "ST-1-…"}`). From the object only
+//! the string value of the `service` key is read; every other key
+//! (`ticketId`, `principal`, `credential`, unknown keys) and every nested
+//! value is skipped with `IgnoredAny`, never copied, and a duplicate
+//! `service` drops the record. Any other JSON type (`null`, a number, an
+//! array) names no service. The text kept is held in a zeroizing buffer
+//! only while the record is parsed, then reduced to the service URL's
+//! scheme and host **for service-ticket issuance only**
 //! ([`super::url::service_of`]) and dropped. Nothing else of it is kept.
 //!
 //! The `DEFAULT` (`WHO: … WHAT: …`) format is not supported (ADR-0041 open
@@ -31,7 +38,8 @@ use crate::config::UtcOffset;
 
 /// Longest `who` kept, in bytes (cut on a character boundary).
 pub const MAX_WHO_BYTES: usize = 1024;
-/// Longest `what` examined, in bytes (a longer one is cut first).
+/// Longest `what` (or object-form `service`) examined, in bytes (a longer
+/// one is cut first).
 const MAX_WHAT_BYTES: usize = 8192;
 /// Longest `action` accepted, in bytes.
 const MAX_ACTION_BYTES: usize = 128;
@@ -232,6 +240,117 @@ impl<'de> Visitor<'de> for TextSeed {
     }
 }
 
+/// The keys of an object-form `what`: only `service` is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhatKey {
+    Service,
+    Other,
+}
+
+struct WhatKeySeed;
+
+impl<'de> de::DeserializeSeed<'de> for WhatKeySeed {
+    type Value = WhatKey;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<WhatKey, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl Visitor<'_> for WhatKeySeed {
+    type Value = WhatKey;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a key")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<WhatKey, E> {
+        Ok(if v == "service" {
+            WhatKey::Service
+        } else {
+            WhatKey::Other
+        })
+    }
+}
+
+/// `what`: the text to reduce (the string form, or the `service` string of
+/// the object form; bounded, zeroized), and whether the object form had a
+/// duplicate `service`.
+struct What {
+    text: Option<Zeroizing<String>>,
+    duplicate: bool,
+}
+
+struct WhatSeed;
+
+impl<'de> de::DeserializeSeed<'de> for WhatSeed {
+    type Value = What;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<What, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl WhatSeed {
+    fn none() -> What {
+        What {
+            text: None,
+            duplicate: false,
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for WhatSeed {
+    type Value = What;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string or an object")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<What, E> {
+        Ok(What {
+            text: Some(bounded_owned(v, MAX_WHAT_BYTES)),
+            duplicate: false,
+        })
+    }
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<What, E> {
+        Ok(Self::none())
+    }
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<What, E> {
+        Ok(Self::none())
+    }
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<What, E> {
+        Ok(Self::none())
+    }
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<What, E> {
+        Ok(Self::none())
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<What, E> {
+        Ok(Self::none())
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<What, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Self::none())
+    }
+    // Only `service` is read (a string, or nothing for any other type);
+    // every other key and value is skipped without being copied.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<What, A::Error> {
+        let mut service: Option<Option<Zeroizing<String>>> = None;
+        let mut duplicate = false;
+        while let Some(k) = map.next_key_seed(WhatKeySeed)? {
+            match k {
+                WhatKey::Service => {
+                    let v = map.next_value_seed(TextSeed(MAX_WHAT_BYTES))?.0;
+                    if service.replace(v).is_some() {
+                        duplicate = true;
+                    }
+                }
+                WhatKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(What {
+            text: service.flatten(),
+            duplicate,
+        })
+    }
+}
+
 /// `when`: a string or an epoch number.
 enum When {
     Text(Zeroizing<String>),
@@ -284,7 +403,7 @@ impl<'de> Visitor<'de> for WhenSeed {
 #[derive(Default)]
 struct Raw {
     who: Option<Option<Zeroizing<String>>>,
-    what: Option<Option<Zeroizing<String>>>,
+    what: Option<What>,
     action: Option<Option<Zeroizing<String>>>,
     when: Option<When>,
     client: Option<Option<Zeroizing<String>>>,
@@ -307,7 +426,13 @@ impl<'de> Visitor<'de> for RecordVisitor {
         while let Some(k) = map.next_key_seed(KeySeed)? {
             let slot = match k {
                 K::Who => &mut r.who,
-                K::What => &mut r.what,
+                K::What => {
+                    let w = map.next_value_seed(WhatSeed)?;
+                    if w.duplicate || r.what.replace(w).is_some() {
+                        r.duplicate = true;
+                    }
+                    continue;
+                }
                 K::Action => &mut r.action,
                 K::Client => &mut r.client,
                 K::Agent => &mut r.agent,
@@ -330,7 +455,6 @@ impl<'de> Visitor<'de> for RecordVisitor {
             };
             let max = match k {
                 K::Who => MAX_WHO_BYTES,
-                K::What => MAX_WHAT_BYTES,
                 K::Action => MAX_ACTION_BYTES + 1,
                 _ => 256,
             };
@@ -414,7 +538,7 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
     .ok_or(RecordError::Invalid)?;
     // `what` is read only for service-ticket issuance, then dropped
     // (zeroized) whatever the action.
-    let what = raw.what.flatten();
+    let what = raw.what.and_then(|w| w.text);
     let service = if action.issues_for_service() {
         what.as_deref().and_then(|w| service_of(w))
     } else {
@@ -474,6 +598,123 @@ mod tests {
         for leak in ["jdoe", "ST-", "example", "192.0"] {
             assert!(!dbg.contains(leak), "{leak}");
         }
+    }
+
+    /// A CAS 8.0.2 `SERVICE_TICKET_CREATED` record: `what` is an object
+    /// (ticket id masked by CAS here; `clear` puts it in clear).
+    fn cas_802(ticket: &str) -> Vec<u8> {
+        line(&format!(
+            r#""who": "jdoe", "what": {{"service": "https://intranet.example.org/login?x=1",
+                 "ticketId": "{ticket}"}},
+               "action": "SERVICE_TICKET_CREATED", "application": "CAS",
+               "when": "2026-10-04T12:00:00.123Z", "clientIpAddress": "192.0.2.10",
+               "serverIpAddress": "198.51.100.1", "userAgent": "Mozilla/5.0 (X11; Linux)""#
+        ))
+    }
+
+    #[test]
+    fn an_object_what_names_its_service_only() {
+        for ticket in [
+            "ST-1-********************-cas01",
+            "ST-1-FAKEclearTICKETvalue-cas01",
+        ] {
+            let r = parse_record(&cas_802(ticket), UTC).unwrap();
+            assert_eq!(r.action, Action::ServiceTicketCreated);
+            assert_eq!(
+                r.service.as_ref().map(ServiceHost::as_url).as_deref(),
+                Some("https://intranet.example.org/")
+            );
+            let dbg = format!("{r:?}");
+            for leak in ["ST-", "FAKE", "cas01", "intranet", "jdoe"] {
+                assert!(!dbg.contains(leak), "{leak}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_service_key_of_an_object_what_is_read() {
+        let service = |what: &str| {
+            parse_record(
+                &line(&format!(
+                    r#""action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": {what}"#
+                )),
+                UTC,
+            )
+            .map(|r| r.service.as_ref().map(ServiceHost::as_url))
+        };
+        // Other keys (ticket ids, principals, credentials, nested values)
+        // are skipped, wherever they are and whatever they hold.
+        assert_eq!(
+            service(
+                r#"{"ticketId": "ST-1-FAKE for https://evil.example.net/",
+                    "principal": {"id": "https://evil.example.net/", "attributes": {"mail": ["a@b.c"]}},
+                    "credential": ["https://evil.example.net/"],
+                    "service": "https://app.example.org/x", "extra": [[{"service": "https://evil.example.net/"}]]}"#
+            ),
+            Ok(Some("https://app.example.org/".to_owned()))
+        );
+        // No (string) service: no service, the record is kept.
+        for what in [
+            "null",
+            "3",
+            "true",
+            r#"["https://app.example.org/"]"#,
+            "{}",
+            r#"{"ticketId": "ST-1-FAKE for https://app.example.org/"}"#,
+            r#"{"service": null}"#,
+            r#"{"service": {"id": "https://app.example.org/"}}"#,
+            r#"{"Service": "https://app.example.org/"}"#,
+        ] {
+            assert_eq!(service(what), Ok(None), "{what}");
+        }
+        // A duplicate `service`, or `what` twice, drops the record.
+        for what in [
+            r#"{"service": "https://app.example.org/", "service": "https://evil.example.net/"}"#,
+            r#"{"service": null, "service": "https://evil.example.net/"}"#,
+            r#"{"service": "https://app.example.org/"}, "what": "https://evil.example.net/""#,
+            r#""https://app.example.org/", "what": {"service": "https://evil.example.net/"}"#,
+        ] {
+            assert_eq!(service(what), Err(RecordError::Invalid), "{what}");
+        }
+        // Absent `what`.
+        let r = parse_record(
+            &line(r#""action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z""#),
+            UTC,
+        )
+        .unwrap();
+        assert!(r.service.is_none());
+        // Skipped values are skipped without recursion (serde_json's
+        // `IgnoredAny` path), so deep nesting (bounded by the tailer's line
+        // cap) neither overflows the stack nor hides `service`.
+        let nest = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        for depth in [100, 100_000] {
+            assert_eq!(
+                service(&format!(
+                    r#"{{"ticketId": {}, "service": "https://app.example.org/"}}"#,
+                    nest(depth)
+                )),
+                Ok(Some("https://app.example.org/".to_owned()))
+            );
+        }
+        // The `service` string is bounded like the string form.
+        let long = format!("https://app.example.org/{}", "a".repeat(2 * MAX_WHAT_BYTES));
+        assert_eq!(
+            service(&format!(r#"{{"service": "{long}"}}"#)),
+            Ok(Some("https://app.example.org/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_object_what_is_ignored_for_other_actions() {
+        let r = parse_record(
+            &line(
+                r#""who": "jdoe", "what": {"service": "https://app.example.org/", "ticketId": "TGT-1-FAKE"},
+                   "action": "TICKET_GRANTING_TICKET_CREATED", "when": 1791115200000"#,
+            ),
+            UTC,
+        )
+        .unwrap();
+        assert!(r.service.is_none());
     }
 
     #[test]

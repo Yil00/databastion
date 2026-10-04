@@ -1,0 +1,53 @@
+{
+  "@class": "org.apereo.cas.services.CasRegisteredService",
+  "id": 1005,
+  "name": "Badge-Sync",
+  "evaluationOrder": 50,
+  "serviceId": "^https://badges\\.example\\.org/.*",
+  "description": "Badge printing; attributes released through a REST endpoint (FAKE data)",
+  "contacts": [
+    "java.util.ArrayList",
+    [
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Sophia Brown",
+        "email": "sophia.brown@example.com",
+        "phone": "+33 3 53 01 07 83",
+        "department": "Facilities",
+        "type": "TECHNICAL"
+      },
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Camille Garcia",
+        "email": "camille.garcia@example.com",
+        "phone": "03 53 01 73 05",
+        "department": "Facilities",
+        "type": "ADMINISTRATIVE"
+      }
+    ]
+  ],
+  "accessStrategy": {
+    "@class": "org.apereo.cas.services.DefaultRegisteredServiceAccessStrategy",
+    "requiredAttributes": {
+      "@class": "java.util.HashMap",
+      "mail": [
+        "java.util.HashSet",
+        [
+          "jade.michel@example.net",
+          "noe.david@example.org",
+          "chloe.richard1@example.org",
+          "anais.lefevre@example.org"
+        ]
+      ]
+    }
+  },
+  "attributeReleasePolicy": {
+    "@class": "org.apereo.cas.services.ReturnRestfulAttributeReleasePolicy",
+    "endpoint": "https://badges.example.org/api/cas/release",
+    "method": "POST",
+    "headers": {
+      "@class": "java.util.LinkedHashMap",
+      "Authorization": "Basic ZGV2LW9ubHktYmFkZ2Utc3luYzo4djM2R2JnRFE5OEJ0ZWd3SlREU240NTU="
+    }
+  }
+}
