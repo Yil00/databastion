@@ -256,7 +256,7 @@ CAS on `127.0.0.1:${LOAD_CAS_PORT:-8282}`. `LOAD_SKIP_BUILD=1` (ignored under Gi
 (`E2E_CONSOLE_IMAGE`, `E2E_AGENT_IMAGE`, `E2E_CAS_IMAGE` name other tags). Secrets are generated,
 registered, scanned for and redacted as in `run.sh`.
 
-**Status**: no CI run yet. A local run (2026-10-04, 10 logins and 2 failed logins per second, 60 s
+**Status**: first CI run on `dev` 684966d (run 37235163505, PASS): 4 logins and 1 failed login per second for 600 s with Audit, 5 400 events for 5 400 records, drain 65.2 s, CAS POST p95 +0.8 ms, agent 0.0007 core and 17.9 MiB peak RSS without growth, ticket-aggregate scan 0.803 % of a 2-CPU server (0.03 % over 60 s); see [docs/08](../../docs/08-engine-capabilities.md). Earlier, A local run (2026-10-04, 10 logins and 2 failed logins per second, 60 s
 without and 120 s with Audit, `LOAD_IDLE_S=20`; a 4-CPU host shared with everything else) passed
 every check: 2640 events for 2640 records issued and 2640 in the CAS audit log (one rotation
 crossed), drained 70 s after the workload (the 60 s aggregation window included), the agent at

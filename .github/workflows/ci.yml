@@ -658,7 +658,7 @@ jobs:
   # HTTPS with a throwaway CA (DATABASTION_OIDC_CA_FILE): role from the group, refused group, no
   # groups claim under strict mapping, the attribute-editing user refused admin (reason username),
   # pending login, self-service link, logout; no secret nor one-time OIDC value in the console's
-  # logs or database. Not part of ci-result yet: it becomes required once it has run green on dev.
+  # logs or database. Required through ci-result (since the end-of-phase-8 review, L3).
   e2e-oidc:
     name: E2E OIDC login (Keycloak)
     needs: detect
@@ -703,8 +703,8 @@ jobs:
   # (encrypted, then clear tickets, a renamed copy, the ticket-id tripwire) and I2 (no ground-truth
   # value, client secret, ticket id of the run or typed name in the console database, the logs or
   # the agent's state). A job of its own (the overlay build and CAS start add about 5 minutes to the
-  # required e2e job and a Maven Central dependency); not part of ci-result until it has run green
-  # on dev.
+  # required e2e job and a Maven Central dependency). Required through ci-result (since the
+  # end-of-phase-8 review, L3).
   e2e-cas:
     name: E2E CAS target
     needs: detect
@@ -758,7 +758,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
