@@ -38,7 +38,7 @@ AGENT_CONFIG ?=
 	agent-fuzz agent-run \
 	protocol-lint protocol-append-only protocol-test protocol-drift protocol-check \
 	docs-check shell-lint test-scripts test-e2e test-load fmt lint test check ci \
-	e2e load-test \
+	e2e e2e-oidc load-test \
 	release-dry bump
 
 ##@ Help
@@ -242,14 +242,14 @@ protocol-check: protocol-lint protocol-append-only protocol-test protocol-drift 
 docs-check: ## Internal Markdown links (CI)
 	timeout 120 python3 scripts/check-md-links.py
 
-shell-lint: ## shellcheck of the load harness (CI), dev/agent-it.sh and dev/keycloak/smoke.sh
-	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh dev/agent-it.sh dev/keycloak/smoke.sh
+shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and dev/keycloak/smoke.sh
+	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'
 	timeout 60 .github/scripts/test_check_release_settings.sh
 
-test-e2e: ## Unit tests of the e2e I2 leak scanner (CI)
+test-e2e: ## Unit tests of the e2e I2 leak scanner and the OIDC scenario driver (CI)
 	timeout 120 python3 -m unittest discover -s e2e -p 'test_*.py' -v
 
 test-load: ## Unit tests of the load harness (CI)
@@ -269,6 +269,9 @@ ci: check console-licenses console-build agent-holdout agent-build-minimal agent
 
 e2e: test-e2e ## LONG: end-to-end harness in containers (e2e/run.sh, at most E2E_TIMEOUT s)
 	timeout $(E2E_TIMEOUT) e2e/run.sh
+
+e2e-oidc: test-e2e ## End-to-end OIDC login scenario against Keycloak (e2e/oidc.sh, a few minutes)
+	timeout 1320 e2e/oidc.sh
 
 load-test: test-load ## LONG (about 1 h): load / database impact test (e2e/load/run.sh, at most LOAD_TIMEOUT s)
 	timeout $(LOAD_TIMEOUT) e2e/load/run.sh
