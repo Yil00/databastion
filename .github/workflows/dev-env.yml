@@ -43,6 +43,11 @@ jobs:
         run: make dev UP_TIMEOUT=900 WAIT_TIMEOUT=600
       - name: Smoke tests
         run: make dev-smoke
+      # Opt-in Keycloak (OIDC test realm, ADR-0038): import, healthcheck and realm checks.
+      - name: Keycloak (OIDC test realm)
+        run: |
+          make dev-keycloak UP_TIMEOUT=600 WAIT_TIMEOUT=300
+          make dev-keycloak-smoke
       - name: Service status and logs
         if: failure()
         run: |
