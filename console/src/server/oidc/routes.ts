@@ -69,7 +69,8 @@ function ipKey(req: Request): string | null {
 async function overIpLimit(limiter: RateLimiter, req: Request): Promise<boolean> {
   const key = ipKey(req);
   if (key === null) return false;
-  return (await limiter.hitShared(key)).limited;
+  // Counted unless already at the limit (never refunded): `limit` requests per window.
+  return !(await limiter.reserveShared(key)).ok;
 }
 
 async function auditRateLimited(ip: string | null): Promise<void> {
@@ -143,6 +144,7 @@ export async function handleOidcCallback(req: Request): Promise<Response> {
       await auditRateLimited(ip);
       return failurePage(429);
     }
+    // Checked here, counted by `deny` (failed callbacks only).
     if ((await oidcFailedCallbacks.checkShared("global")).limited) {
       await auditRateLimited(ip);
       return failurePage(429);
