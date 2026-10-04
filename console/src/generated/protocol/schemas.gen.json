@@ -143,7 +143,7 @@
       "pattern": "^/(run|var/run|tmp|var/lib/mysql)(/\\.?[A-Za-z0-9_-][A-Za-z0-9._-]*)+$"
     },
     "ClientAddress": {
-      "description": "IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket\nconnection. Never a host name.\n\nA per-target agent option `client_addr: clear | truncated | omitted` may reduce it before the\nuplink (ADR-0041 open question 8, refining ADR-0007; default `truncated` on `cas` targets, whose\naudit trail holds every end user's address, `clear` elsewhere): `truncated` keeps the network\npart only, IPv4 `/24` and IPv6 `/56`, with the host bits set to zero (`198.51.100.77` ->\n`198.51.100.0`, `2001:db8:1:2a3::1` -> `2001:db8:1:200::`); `omitted` leaves `client_addr`\nout. A truncated address is still an address literal of this schema: the console cannot tell\nit from a full one, and counts or matches it as given. Signals that depend on the address\n(`volume.failed_logins_many_accounts`) are computed by the agent on the full address before the\nreduction.\n",
+      "description": "IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket\nconnection. Never a host name.\n\nA per-target agent option `client_addr: clear | truncated | omitted` may reduce it before the\nuplink (ADR-0041 open question 8, refining ADR-0007; default `truncated` on `cas` targets, whose\naudit trail holds every end user's address, `clear` elsewhere). `truncated` keeps the network\npart only, with the host bits set to zero:\n- IPv4: `/24` (`198.51.100.77` -> `198.51.100.0`);\n- an IPv6 address embedding a client IPv4 is reduced through that IPv4 first:\n  IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) addresses are converted to\n  IPv4, then `/24`; 6to4 (`2002::/16`, the IPv4 in bits 16 to 47) is truncated to `/40`, the\n  prefix and the IPv4's `/24`;\n- any other IPv6: `/56` (`2001:db8:1:2a3::1` -> `2001:db8:1:200::`). For Teredo\n  (`2001::/32`) this zeroes the flags and the obfuscated client port and IPv4 (bits 64 to 127)\n  and keeps only the Teredo server's first 24 bits.\n`omitted` leaves `client_addr` out. A truncated address is still an address literal of this\nschema: the console cannot tell it from a full one, and counts or matches it as given. Signals\nthat depend on the address (`volume.failed_logins_many_accounts`) are computed by the agent on\nthe full address before the reduction.\n",
       "type": "string",
       "minLength": 2,
       "maxLength": 45,
@@ -163,7 +163,7 @@
       ]
     },
     "Engine": {
-      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0039 decision 8, ADR-0022). Every later engine value follows the\nsame rule with its own `engine.<value>` token.\n",
+      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token.\n",
       "type": "string",
       "enum": [
         "postgres",

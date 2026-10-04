@@ -349,6 +349,19 @@ fn is_unknown_field(d: &databastion_protocol::ErrorDetail) -> bool {
 /// console built before an engine value answers (ADR-0039 decision 8).
 const UNKNOWN_VALUE_KEYWORD: &str = "enum";
 
+/// The field of an item that carries its engine value: `Location.engine`
+/// of a finding, `AccessEvent.source` of an event (ADR-0042). An `enum`
+/// detail counts as an unknown engine value only on exactly that field: the
+/// console also answers `enum` for, e.g., an unregistered classifier
+/// (`/findings/<i>/classifier`), which no later listing of a token cures.
+fn engine_field(prefix: &str) -> &'static str {
+    if prefix == "/findings/" {
+        "location/engine"
+    } else {
+        "source"
+    }
+}
+
 /// Item indices pointed at by `details`, and those of them pointed at with
 /// the keywords `additionalProperties` and `enum` (each sorted, deduplicated).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -378,13 +391,13 @@ fn item_pointers(path: &str, error: &databastion_protocol::Error) -> Option<Poin
     };
     for d in &error.details {
         let rest = d.pointer.as_str().strip_prefix(prefix)?;
-        let index = rest.split('/').next()?;
+        let (index, field) = rest.split_once('/').unwrap_or((rest, ""));
         let index = index.parse::<usize>().ok()?;
         p.items.push(index);
         if is_unknown_field(d) {
             p.unknown_field.push(index);
         }
-        if d.keyword.as_str() == UNKNOWN_VALUE_KEYWORD {
+        if d.keyword.as_str() == UNKNOWN_VALUE_KEYWORD && field == engine_field(prefix) {
             p.unknown_value.push(index);
         }
     }
@@ -501,6 +514,19 @@ pub(crate) struct ResultBatch {
     /// decision 8; sorted, deduplicated, usually empty): the batch is held
     /// until the console lists every one.
     gates: Vec<&'static str>,
+    /// Its gated-engine items were already kept once after a `400` `enum`
+    /// (ADR-0042 decision 4): a second such rejection drops them. Kept in
+    /// memory with the spool entry, not in the file.
+    kept_once: bool,
+}
+
+/// Whether a batch carrying the engine tokens `gates` must wait: one of
+/// them is not listed by the console (see [`ResultBatch::held_back`]).
+pub(crate) fn held_back(
+    gates: &[&'static str],
+    caps: &crate::capabilities::ConsoleCapabilities,
+) -> bool {
+    !gates.iter().all(|t| caps.console_accepts(t))
 }
 
 /// The token gating a finding: that of its location's engine.
@@ -563,6 +589,7 @@ impl Parsed {
             bytes: bytes?,
             signature: self.signature(),
             gates: self.gates(),
+            kept_once: false,
         })
     }
 
@@ -603,7 +630,25 @@ impl ResultBatch {
             bytes,
             signature,
             gates,
+            kept_once: false,
         })
+    }
+
+    /// Capability tokens of the engine values its items carry (sorted).
+    pub(crate) fn gates(&self) -> &[&'static str] {
+        &self.gates
+    }
+
+    /// Whether its gated-engine items were already kept once after a `400`
+    /// `enum` (see [`stripped`](Self::stripped)).
+    pub(crate) fn kept_once(&self) -> bool {
+        self.kept_once
+    }
+
+    /// The same batch, marked as kept once (restored from its spool entry).
+    pub(crate) fn with_kept_once(mut self, kept_once: bool) -> Self {
+        self.kept_once = kept_once;
+        self
     }
 
     /// Whether an item carries a value of an engine added after protocol
@@ -617,8 +662,9 @@ impl ResultBatch {
     /// list (an older console would reject it with `400` `enum`). It stays
     /// spooled (the spool's bounds apply) and is sent once the token is
     /// listed.
+    #[cfg(test)]
     pub(crate) fn held_back(&self, caps: &crate::capabilities::ConsoleCapabilities) -> bool {
-        !self.gates.iter().all(|t| caps.console_accepts(t))
+        held_back(&self.gates, caps)
     }
 
     /// An events batch holding a `signature.*` signal.
@@ -689,7 +735,9 @@ impl ResultBatch {
                 events: keep(&b.events, drop),
             }),
         }
-        .into_batch()?;
+        .into_batch()?
+        // Splits and item drops keep the mark (ADR-0042 decision 4).
+        .with_kept_once(self.kept_once);
         Ok((out.len > 0).then_some(out))
     }
 
@@ -717,7 +765,11 @@ impl ResultBatch {
     /// them); the others were rejected for another reason and are left out.
     /// Returns the batch (`None` if nothing is left) and the number of
     /// items left out. The result carries no gated field, so it is stripped
-    /// at most once.
+    /// at most once. Gated-engine items are kept **once** (ADR-0042
+    /// decision 4): a batch already [`kept_once`](Self::kept_once) was sent
+    /// while the token was listed, so the same `enum` again means the
+    /// console will not take them; they are left out (counted). The
+    /// replacement of a batch that kept some is marked kept once.
     pub(crate) fn stripped(
         &self,
         rejected: &[usize],
@@ -726,7 +778,10 @@ impl ResultBatch {
     ) -> Result<(Option<Self>, usize), Unserializable> {
         let parsed = Self::decode(self.findings, &self.bytes).ok_or(Unserializable)?;
         let mut left_out = 0usize;
-        let out = match parsed {
+        // Gated-engine items may be kept only once.
+        let keep_values = !self.kept_once;
+        let mut kept_values = false;
+        let mut out = match parsed {
             // No gated finding field exists: only the rejected items go,
             // except those of a gated engine rejected as an unknown value.
             Parsed::Findings(b) => {
@@ -736,8 +791,14 @@ impl ResultBatch {
                     .into_iter()
                     .enumerate()
                     .filter(|(i, f)| {
-                        rejected.binary_search(i).is_err()
-                            || (unknown_value.binary_search(i).is_ok() && finding_gate(f).is_some())
+                        if rejected.binary_search(i).is_err() {
+                            return true;
+                        }
+                        let keep = keep_values
+                            && unknown_value.binary_search(i).is_ok()
+                            && finding_gate(f).is_some();
+                        kept_values |= keep;
+                        keep
                     })
                     .map(|(_, f)| f)
                     .collect();
@@ -752,10 +813,15 @@ impl ResultBatch {
                 let mut events = Vec::with_capacity(b.events.len());
                 for (i, mut e) in b.events.into_iter().enumerate() {
                     let field = unknown.binary_search(&i).is_ok() && event_carries_gated(&e);
-                    let value = unknown_value.binary_search(&i).is_ok() && event_gate(&e).is_some();
-                    if rejected.binary_search(&i).is_ok() && !field && !value {
-                        left_out += 1;
-                        continue;
+                    let value = keep_values
+                        && unknown_value.binary_search(&i).is_ok()
+                        && event_gate(&e).is_some();
+                    if rejected.binary_search(&i).is_ok() {
+                        if !field && !value {
+                            left_out += 1;
+                            continue;
+                        }
+                        kept_values |= value;
                     }
                     strip_gated_event(&mut e);
                     events.push(e);
@@ -767,6 +833,7 @@ impl ResultBatch {
             }
         }
         .into_batch()?;
+        out.kept_once = self.kept_once || kept_values;
         Ok(((out.len > 0).then_some(out), left_out))
     }
 
@@ -1244,6 +1311,7 @@ mod tests {
             bytes: b"not a batch".to_vec(),
             signature: false,
             gates: Vec::new(),
+            kept_once: false,
         };
         assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
         assert_eq!(batch.halves().unwrap_err(), Unserializable);
@@ -1562,6 +1630,31 @@ mod tests {
     }
 
     #[test]
+    fn cas_items_are_kept_once_then_dropped() {
+        // ADR-0042 decision 4: the first `enum` keeps them (marked); the
+        // same rejection of the marked batch, sent while the token was
+        // listed, drops them.
+        let batch = cas_findings_and_postgres();
+        assert!(!batch.kept_once());
+        let (again, left_out) = batch.stripped(&[1, 3], &[], &[1, 3]).unwrap();
+        let again = again.unwrap();
+        assert_eq!((again.len(), left_out), (4, 0));
+        assert!(again.kept_once());
+        // Item positions are unchanged (nothing was left out).
+        let (last, left_out) = again.stripped(&[1, 3], &[], &[1, 3]).unwrap();
+        let last = last.unwrap();
+        assert_eq!((last.len(), left_out), (2, 2));
+        assert!(last.kept_once(), "the mark stays with the batch");
+        // A split or an ordinary item drop keeps the mark.
+        assert!(again.without(&[0]).unwrap().unwrap().kept_once());
+        let (a, b) = again.halves().unwrap().unwrap();
+        assert!(a.kept_once() && b.kept_once());
+        // A batch kept for no gated-engine item is not marked.
+        let (plain, _) = batch.stripped(&[0], &[], &[]).unwrap();
+        assert!(!plain.unwrap().kept_once());
+    }
+
+    #[test]
     fn classify_reports_unknown_field_details() {
         let body = |details: &str| {
             format!(r#"{{"code":"invalid_request","message":"Invalid.","details":[{details}]}}"#)
@@ -1596,12 +1689,18 @@ mod tests {
                 unknown_value: vec![],
             }
         );
-        // An older console's answer to a `cas` value (ADR-0039 decision 8).
+        // An older console's answer to a `cas` value (ADR-0042): `enum`
+        // counts as an unknown engine value on exactly the engine field,
+        // never on another field (an unregistered classifier) nor on a
+        // look-alike path.
         let value = body(
             &[
                 d("/findings/3/location/engine", "enum"),
                 d("/findings/1/classifier", "enum"),
+                d("/findings/4/location/engine/x", "enum"),
+                d("/findings/5/location", "enum"),
                 d("/findings/0/sampled", "maximum"),
+                d("/findings/2/location/engine", "maximum"),
             ]
             .join(","),
         );
@@ -1609,9 +1708,26 @@ mod tests {
             classify("/findings", StatusCode::BAD_REQUEST, None, value.as_bytes()),
             UplinkError::ItemsRejected {
                 status: 400,
-                items: vec![0, 1, 3],
+                items: vec![0, 1, 2, 3, 4, 5],
                 unknown_field: vec![],
-                unknown_value: vec![1, 3],
+                unknown_value: vec![3],
+            }
+        );
+        let value = body(
+            &[
+                d("/events/2/source", "enum"),
+                d("/events/1/action", "enum"),
+                d("/events/0/principal/client_addr", "enum"),
+            ]
+            .join(","),
+        );
+        assert_eq!(
+            classify("/events", StatusCode::BAD_REQUEST, None, value.as_bytes()),
+            UplinkError::ItemsRejected {
+                status: 400,
+                items: vec![0, 1, 2],
+                unknown_field: vec![],
+                unknown_value: vec![2],
             }
         );
         let status = body(&d("/progress", "additionalProperties"));

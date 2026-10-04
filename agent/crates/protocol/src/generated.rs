@@ -835,13 +835,20 @@ connection. Never a host name.
 
 A per-target agent option `client_addr: clear | truncated | omitted` may reduce it before the
 uplink (ADR-0041 open question 8, refining ADR-0007; default `truncated` on `cas` targets, whose
-audit trail holds every end user's address, `clear` elsewhere): `truncated` keeps the network
-part only, IPv4 `/24` and IPv6 `/56`, with the host bits set to zero (`198.51.100.77` ->
-`198.51.100.0`, `2001:db8:1:2a3::1` -> `2001:db8:1:200::`); `omitted` leaves `client_addr`
-out. A truncated address is still an address literal of this schema: the console cannot tell
-it from a full one, and counts or matches it as given. Signals that depend on the address
-(`volume.failed_logins_many_accounts`) are computed by the agent on the full address before the
-reduction.
+audit trail holds every end user's address, `clear` elsewhere). `truncated` keeps the network
+part only, with the host bits set to zero:
+- IPv4: `/24` (`198.51.100.77` -> `198.51.100.0`);
+- an IPv6 address embedding a client IPv4 is reduced through that IPv4 first:
+  IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) addresses are converted to
+  IPv4, then `/24`; 6to4 (`2002::/16`, the IPv4 in bits 16 to 47) is truncated to `/40`, the
+  prefix and the IPv4's `/24`;
+- any other IPv6: `/56` (`2001:db8:1:2a3::1` -> `2001:db8:1:200::`). For Teredo
+  (`2001::/32`) this zeroes the flags and the obfuscated client port and IPv4 (bits 64 to 127)
+  and keeps only the Teredo server's first 24 bits.
+`omitted` leaves `client_addr` out. A truncated address is still an address literal of this
+schema: the console cannot tell it from a full one, and counts or matches it as given. Signals
+that depend on the address (`volume.failed_logins_many_accounts`) are computed by the agent on
+the full address before the reduction.
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -1315,7 +1322,8 @@ impl ::std::convert::TryFrom<::std::string::String> for Edition {
 pub struct EmptyParams {}
 /**Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after
 protocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the
-capability `engine.cas` (ADR-0039 decision 8, ADR-0022). Every later engine value follows the
+capability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent
+handling in ADR-0042). Every later engine value follows the
 same rule with its own `engine.<value>` token.
 */
 #[derive(

@@ -1239,10 +1239,20 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::cursor_resets() as f64);
         }
-        let spool = self.lock_spool().counters;
+        let (spool, held) = {
+            let spool = self.lock_spool();
+            // Batches waiting for an engine token the console has not listed
+            // (ADR-0042; a gauge, from the spool entries only).
+            let held = spool.held_batches(|gates| uplink::held_back(gates, &self.console_caps));
+            (spool.counters, held)
+        };
         for (name, value) in [
             ("spool_quarantined_total", spool.quarantined),
             ("spool_rejected_batches_total", spool.rejected_batches),
+            (
+                "spool_held_batches",
+                u64::try_from(held).unwrap_or(u64::MAX),
+            ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1641,7 +1651,7 @@ impl Runtime {
             // (ADR-0039 decision 8) waits, spooled; the others still go.
             self.lock_spool().front_sendable(
                 |findings| !parked.is_parked(findings, now),
-                |batch| !batch.held_back(&self.console_caps),
+                |gates| uplink::held_back(gates, &self.console_caps),
             )
         };
         let Some((key, batch)) = front else {

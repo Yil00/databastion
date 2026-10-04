@@ -5003,3 +5003,124 @@ async fn heartbeats_and_enrollment_carry_only_accepted_engines() {
     assert!(!hb.contains("\"cas\""), "{hb}");
     assert!(!hb.contains("cas_audit_log"), "{hb}");
 }
+
+#[tokio::test]
+async fn cas_items_rejected_with_enum_again_while_listed_are_dropped() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let both: &[(&str, &str)] = &[
+        ("/findings/0/location/engine", "enum"),
+        ("/findings/1/location/engine", "enum"),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Details(both), Step::Details(both)].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    spool_engine_findings(&rt, E::Cas, 2);
+    drain(&rt).await;
+    // First `enum`: kept, held (capabilities cleared).
+    assert_eq!(sent_batches(&server).await.len(), 1);
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    // Listed again, sent again, `enum` again: the console will not take
+    // them, so they are dropped (counted), never held a second time
+    // (ADR-0042 decision 4).
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    assert_eq!(sent_batches(&server).await.len(), 2);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 0);
+    assert_eq!(status.dropped_items.unwrap().0, 2);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    assert_eq!(
+        sent_batches(&server).await.len(),
+        2,
+        "nothing left to cycle"
+    );
+}
+
+#[tokio::test]
+async fn cas_events_rejected_with_enum_on_their_source_are_kept_and_held() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    // Event 1 (`cas_audit_log`) has its source refused; event 2 (`cas`) an
+    // `enum` on another field: dropped by the ordinary rule.
+    let (_env, rt) = events_runtime(
+        &server,
+        vec![Step::Details(&[
+            ("/events/0/source", "enum"),
+            ("/events/1/action", "enum"),
+        ])],
+    )
+    .await;
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ENGINE_CAS,
+            token::TARGET_STATUS_NOTES,
+        ],
+    );
+    let cas: databastion_protocol::EventsBatch = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/EventsBatch.cas.json"
+    ))
+    .unwrap();
+    let body = databastion_protocol::EventsBatch {
+        batch_id: databastion_protocol::new_batch_id(),
+        events: cas.events.into_iter().take(2).collect(),
+    };
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&body).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!rt.console_caps.console_accepts(token::ENGINE_CAS));
+    let status = rt.lock_spool().status();
+    assert_eq!(status.batches.0, 1, "event 0 kept and held");
+    assert_eq!(status.dropped_items.unwrap().0, 1);
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(sent[1]["events"][0]["source"], "cas_audit_log");
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+#[tokio::test]
+async fn a_held_batch_survives_an_agent_restart() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, databastion_protocol::Engine::Cas, 2);
+    drain(&rt).await;
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    drop(rt);
+    // A new process: nothing is listed before its first heartbeat
+    // response, so the reloaded batch is held again, then sent.
+    let rt = runtime(&env);
+    assert_eq!(metric(&rt, "spool_held_batches"), 1.0);
+    drain(&rt).await;
+    assert!(sent_batches(&server).await.is_empty());
+    accept_tokens(&rt, &[token::ENGINE_CAS]);
+    assert_eq!(metric(&rt, "spool_held_batches"), 0.0);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["findings"][0]["location"]["engine"], "cas");
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
