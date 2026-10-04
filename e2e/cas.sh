@@ -511,12 +511,28 @@ docker inspect "$cas_cid" --format '{{json .NetworkSettings.Networks}}' \
   | jq -e --arg n "${PROJECT}_agent-net" 'has($n) | not' >/dev/null || fail "CAS has an endpoint on agent-net"
 cas_ip="$(docker inspect "$cas_cid" --format '{{json .NetworkSettings.Networks}}' | jq -r --arg n "${PROJECT}_cas-backend" '.[$n].IPAddress')"
 [[ "$cas_ip" =~ ^[0-9.]+$ ]] || fail "no address of CAS on cas-backend"
-reach="$(timeout 60 docker run --rm --network "container:$(compose ps -q agent)" --cap-drop ALL \
-  busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e sh -c \
-  "nslookup cas-db >/dev/null 2>&1 && nc -w 3 cas-db 5432 </dev/null >/dev/null 2>&1 || echo control-failed
-   if nslookup cas >/dev/null 2>&1; then echo resolves; fi; if nc -w 3 $cas_ip 8080 </dev/null >/dev/null 2>&1; then echo connects; fi; echo probed")" \
-  || fail "cannot run the reachability probe in the agent's network namespace"
-[ "$reach" = probed ] || fail "from the agent's network namespace, CAS $(tr '\n' ' ' <<<"$reach")"
+# The probe: the pinned PostgreSQL image (cas-db's, already present), bash and getent only, so its
+# behaviour does not depend on a busybox build. Each step prints its exit code; nothing secret.
+PROBE_IMAGE="$(sed -n 's/^    image: \(postgres:[^ ]*@sha256:[0-9a-f]*\)$/\1/p' "$HERE/docker-compose.cas.yml" | head -n 1)"
+[ -n "$PROBE_IMAGE" ] || fail "no pinned PostgreSQL image in docker-compose.cas.yml for the network probe"
+docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1 || timeout 300 docker pull -q "$PROBE_IMAGE" >/dev/null \
+  || fail "cannot pull the network probe image $PROBE_IMAGE"
+# shellcheck disable=SC2016 # expanded by the probe's shell, on purpose
+PROBE='step() { local name="$1"; shift; "$@" >/dev/null 2>&1; echo "$name=$?"; }
+tcp() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2"; }
+step control_resolve getent hosts cas-db
+step control_connect tcp cas-db 5432
+step cas_resolve getent hosts cas
+step cas_connect tcp "$CAS_IP" 8080'
+probe_rc=0
+reach="$(timeout 90 docker run --rm --network "container:$(compose ps -q agent)" --cap-drop ALL --user 65534:65534 \
+  --entrypoint bash -e "CAS_IP=$cas_ip" "$PROBE_IMAGE" -c "$PROBE" 2>&1)" || probe_rc=$?
+# Expected: cas-db resolves and answers (the probe works), CAS neither resolves nor answers.
+if [ "$probe_rc" != 0 ] || ! grep -qx 'control_resolve=0' <<<"$reach" || ! grep -qx 'control_connect=0' <<<"$reach" \
+    || grep -qx 'cas_resolve=0' <<<"$reach" || ! grep -qE '^cas_connect=[1-9][0-9]*$' <<<"$reach"; then
+  fail "network probe from the agent's namespace (exit $probe_rc): $(tr '\n' ' ' <<<"$reach") (expected control_resolve=0 control_connect=0, cas_resolve and cas_connect non-zero)"
+fi
+log "network probe from the agent's namespace: $(tr '\n' ' ' <<<"$reach")"
 log "the agent cannot resolve nor reach CAS (no agent-net endpoint, ${cas_ip}:8080 unreachable from its namespace)"
 log "target ${DB_TARGET}: $(target_json "$DB_TARGET" | jq -c '{engine, reachable, auditLevel, notes: [.notes[]?.code]}')"
 phase_done enroll
