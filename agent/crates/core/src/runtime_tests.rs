@@ -5032,12 +5032,17 @@ async fn cas_items_rejected_with_enum_again_while_listed_are_dropped() {
     // Listed again, sent again, `enum` again: the console will not take
     // them, so they are dropped (counted), never held a second time
     // (ADR-0042 decision 4).
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
     accept_tokens(&rt, &[token::ENGINE_CAS]);
     drain(&rt).await;
     assert_eq!(sent_batches(&server).await.len(), 2);
     let status = rt.lock_spool().status();
     assert_eq!(status.batches.0, 0);
     assert_eq!(status.dropped_items.unwrap().0, 2);
+    // The ordinary path: the capabilities are not cleared again (the cas
+    // targets do not flap absent) and nothing more counts as stripped.
+    assert!(rt.console_caps.console_accepts(token::ENGINE_CAS));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
     accept_tokens(&rt, &[token::ENGINE_CAS]);
     drain(&rt).await;
     assert_eq!(

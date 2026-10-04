@@ -1050,7 +1050,8 @@ components:
         - IPv4: `/24` (`198.51.100.77` -> `198.51.100.0`);
         - an IPv6 address embedding a client IPv4 is reduced through that IPv4 first:
           IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) addresses are converted to
-          IPv4, then `/24`; 6to4 (`2002::/16`, the IPv4 in bits 16 to 47) is truncated to `/40`, the
+          IPv4, then `/24`, except `::` and `::1`, which are not IPv4 clients and are sent as is
+          (never reduced to `0.0.0.0`); 6to4 (`2002::/16`, the IPv4 in bits 16 to 47) is truncated to `/40`, the
           prefix and the IPv4's `/24`;
         - any other IPv6: `/56` (`2001:db8:1:2a3::1` -> `2001:db8:1:200::`). For Teredo
           (`2001::/32`) this zeroes the flags and the obfuscated client port and IPv4 (bits 64 to 127)

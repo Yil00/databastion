@@ -1733,14 +1733,18 @@ impl Runtime {
             // engine added after protocol 0.1.0 (ADR-0039 decision 8): those
             // items are kept and held until a heartbeat response lists the
             // engine's token again (a rolled-back console, or a replica that
-            // does not accept it yet, ADR-0022 decision 8).
+            // does not accept it yet, ADR-0022 decision 8). Only once
+            // (ADR-0042 decision 4): a batch already kept once takes the
+            // ordinary path below, without clearing the capabilities again.
             Err(CallError::Uplink(UplinkError::ItemsRejected {
                 status: 400,
                 items,
                 unknown_field,
                 unknown_value,
             })) if (!unknown_field.is_empty() && batch.carries_gated())
-                || (!unknown_value.is_empty() && batch.carries_gated_engine()) =>
+                || (!unknown_value.is_empty()
+                    && batch.carries_gated_engine()
+                    && !batch.kept_once()) =>
             {
                 Ok(self.resend_stripped(
                     &key,
@@ -1758,12 +1762,25 @@ impl Runtime {
             })) if batch.carries_gated() => {
                 Ok(self.resend_stripped(&key, &batch, &[], &[], &[], failures))
             }
-            Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                items,
+                unknown_value,
+                ..
+            })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
-                tracing::warn!(
-                    items = dropped,
-                    "console rejected batch items; resending the rest"
-                );
+                if batch.kept_once() && !unknown_value.is_empty() {
+                    tracing::warn!(
+                        items = dropped,
+                        "console refused the engine value again after one resend while \
+                         listing its token: items dropped after one resend (ADR-0042); \
+                         resending the rest"
+                    );
+                } else {
+                    tracing::warn!(
+                        items = dropped,
+                        "console rejected batch items; resending the rest"
+                    );
+                }
                 let rest: Vec<ResultBatch> = match batch.without(&items) {
                     Ok(rest) => rest.into_iter().collect(),
                     Err(uplink::Unserializable) => {
