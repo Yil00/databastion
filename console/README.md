@@ -261,7 +261,10 @@ in `[*]`), is replaced the same way. A string groups claim is refused rather tha
 one-element list: a provider that sends one is misconfigured (Keycloak: a non-multivalued mapper),
 and with strict mode the login is refused (`role`), else it gets `analyst`. Write role expressions
 against `groups`; any other claim they read is raw, so never apply `contains()` to a claim that can
-be a string.
+be a string. **Behaviour change** (#147): when `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH` points to
+another claim (e.g. `realm_access.roles`), `groups` in the role expression is that mapped list, no
+longer the raw `groups` claim; the web process logs a startup **warning** when the role expression
+reads `groups` while the groups path is not `groups` itself.
 
 **Identity key.** A login finds its user by (`iss`, `sub`) only (`user_identities`), never by
 e-mail or username: there is no automatic linking. A login claim equal to an existing username is
@@ -317,7 +320,15 @@ return one), the console calls userinfo with the new access token if
 `DATABASTION_OIDC_USE_USERINFO=1` (same transport rules and 64 KiB cap), requires its `sub` to equal
 the session identity's subject (else the session ends, `user.logout` with reason
 `refresh_subject`), and runs the filters and role mapping on the userinfo claims alone: a filter no
-longer passed ends the session (`refresh_<reason>`). Userinfo must then release the groups claim.
+longer passed ends the session (`refresh_<reason>`). Those userinfo claims go through the whole
+mapping, so userinfo must then release every claim it reads: the login claim
+(`DATABASTION_OIDC_LOGIN_ATTRIBUTE_PATH`, else the session ends with `refresh_username`), `email` and
+`email_verified` when `DATABASTION_OIDC_ALLOWED_DOMAINS` is set, and the groups claim (and whatever
+else the role expression reads). Only a JSON userinfo response is supported: a signed or encrypted
+one (`application/jwt`) is refused, which ends the session at each refresh. Any refresh token the
+provider rotated in a refresh that ends the session is revoked too, best effort.
+When refresh is on with role sync but without `DATABASTION_OIDC_USE_USERINFO=1`, the web process
+logs a startup **warning**.
 With neither an `id_token` nor userinfo, a refresh only shows that the provider still honors the
 refresh token (a user disabled there is cut off), not that their groups or role still hold: a
 removal from the admin group then takes effect at the next login, at most

@@ -1,6 +1,6 @@
 import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
-import { localLoginMode, oidcEnabled, oidcStartupFatal } from "./oidc/config";
+import { localLoginMode, oidcConfigWarnings, oidcEnabled, oidcStartupFatal } from "./oidc/config";
 import { trustedProxyHops } from "./request";
 
 /**
@@ -28,6 +28,7 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
   warnings.push(...alertingWarnings(env));
   const localLogin = localLoginWarning(env);
   if (localLogin !== null) warnings.push(localLogin);
+  warnings.push(...oidcConfigWarnings(env));
   return warnings;
 }
 

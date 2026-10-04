@@ -47,6 +47,7 @@ export interface CompiledExpression {
 
 interface JmesPathModule {
   compile(expression: string): unknown;
+  tokenize(expression: string): { type: string; value: unknown }[];
   search(data: unknown, expression: string): unknown;
 }
 const jp = jmespath as unknown as JmesPathModule;
@@ -163,6 +164,26 @@ export function plainPath(source: string): string[] | null {
     if (rest.length === 0) return null;
   }
   return segments.length > 0 ? segments : null;
+}
+
+/**
+ * Whether `expr` reads a field named `groups` that is not reached through a dot (the top-level
+ * name the role expression sees as the validated groups list). Used for a startup warning only.
+ */
+export function readsTopLevelGroups(expr: CompiledExpression): boolean {
+  let tokens: { type: string; value: unknown }[];
+  try {
+    tokens = jp.tokenize(expr.source);
+  } catch {
+    return false;
+  }
+  return tokens.some((t, i) => (t.type === "UnquotedIdentifier" || t.type === "QuotedIdentifier") && t.value === "groups" && tokens[i - 1]?.type !== "Dot");
+}
+
+/** Whether `GROUPS_ATTRIBUTE_PATH` is the top-level `groups` claim itself (`groups`, `groups[*]`). */
+export function groupsPathIsGroups(groupsPath: CompiledExpression): boolean {
+  const p = plainPath(groupsPath.source);
+  return p !== null && p.length === 1 && p[0] === "groups";
 }
 
 function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {

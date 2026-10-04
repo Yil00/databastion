@@ -355,10 +355,13 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     expect(fp.hits["/userinfo"]).toBe(before + 1);
     const [change] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.role_change"), sql`${auditLog.details}->>'to' = 'analyst'`, sql`${auditLog.details}->>'from' = 'admin'`)).orderBy(sql`${auditLog.id} desc`).limit(1);
     expect(change?.details).toMatchObject({ source: "oidc" });
-    // Userinfo of another subject: the session ends.
-    fp.refreshes.set("rt-olga-2", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-someone-else", preferred_username: "olga", groups: ["databastion-admins"] } });
+    // Userinfo of another subject: the session ends, and both the stored and the just-rotated
+    // refresh tokens are revoked (review of #147, I1).
+    fp.refreshes.set("rt-olga-2", { claims: { sub: "sub-olga" }, noIdToken: true, userinfo: { sub: "sub-someone-else", preferred_username: "olga", groups: ["databastion-admins"] }, refreshToken: "rt-olga-rotated" });
     await age();
     expect(await sessionOf(session)).toBeNull();
+    await settleRevocationsForTests();
+    expect(fp.revoked).toEqual(expect.arrayContaining(["rt-olga-2", "rt-olga-rotated"]));
     const [ended] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.logout"), sql`${auditLog.details}->>'reason' = 'refresh_subject'`));
     expect(ended).toBeDefined();
     // Filters are re-checked on userinfo too (a string groups claim is never a group).

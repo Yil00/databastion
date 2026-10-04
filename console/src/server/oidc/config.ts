@@ -4,7 +4,7 @@ import { isIP } from "node:net";
 import { ConfigError, readEnvOrFile, type Env, type FileReader } from "@/config/env";
 import { serverSubkey } from "@/server/crypto";
 
-import { compileExpression, type CompiledExpression } from "./claims";
+import { compileExpression, groupsPathIsGroups, readsTopLevelGroups, type CompiledExpression } from "./claims";
 
 /**
  * OIDC login configuration (ADR-0038 decision 16), read from the environment only (never from a
@@ -300,6 +300,32 @@ export function loadOidcConfig(env: Env = process.env, readFile: FileReader = (p
     redirectUri: `${publicOrigin}/api/auth/oidc/callback`,
     allowHttp,
   };
+}
+
+/**
+ * OIDC configuration warnings logged at startup (end-of-phase-8 review of #147), or none when OIDC
+ * is off or misconfigured (then {@link oidcStartupFatal} reports it). Never contains a value.
+ */
+export function oidcConfigWarnings(env: Env = process.env): string[] {
+  let cfg: OidcConfig | null;
+  try {
+    cfg = loadOidcConfig(env);
+  } catch {
+    return [];
+  }
+  if (cfg === null) return [];
+  const warnings: string[] = [];
+  if (cfg.rolePath !== null && cfg.groupsPath !== null && !groupsPathIsGroups(cfg.groupsPath) && readsTopLevelGroups(cfg.rolePath)) {
+    warnings.push(
+      `${V}ROLE_ATTRIBUTE_PATH reads \`groups\` while ${V}GROUPS_ATTRIBUTE_PATH is another path: in the role expression, \`groups\` is the list mapped by ${V}GROUPS_ATTRIBUTE_PATH, not the raw \`groups\` claim (console/README.md, "Role expression and groups").`,
+    );
+  }
+  if (cfg.useRefreshToken && !cfg.skipRoleSync && !cfg.useUserinfo) {
+    warnings.push(
+      `${V}USE_REFRESH_TOKEN=1 with role sync on but without ${V}USE_USERINFO=1: a refresh that returns no id_token does not re-check groups or role, so role changes at the provider apply only at the next id_token or login.`,
+    );
+  }
+  return warnings;
 }
 
 /**
