@@ -8,7 +8,8 @@ It detects, audits and (eventually) prevents leaks of sensitive data **as close 
 - MySQL / MariaDB
 - MongoDB
 - OpenLDAP
-- CAS (Central Authentication Service) — *phase 1.5, outside the MVP*
+- CAS (Central Authentication Service) — *planned after the MVP, ROADMAP phase 8*
+- Microsoft SQL Server, Redis, Valkey, SQLite and Firebird — *planned, ROADMAP phases 9 and 10 ([ADR-0039](adr/0039-engine-scope-expansion.md)); not supported yet*
 
 ## Problem addressed
 Traditional DLPs monitor workstations, email or the network. They do not know **where** sensitive data lives in databases, nor **who** is extracting it in bulk (`pg_dump`, `mysqldump`, `mongoexport`, LDIF exports, `SELECT *` on a customer table…). DataBastion answers these two questions:
@@ -43,8 +44,8 @@ Full details: [04-mvp-scope.md](04-mvp-scope.md).
 ### Deliberately excluded
 - Windows / macOS / iOS
 - Endpoint agents on user workstations
-- Real-time Prevention mode (phase 2)
-- CAS (phase 1.5)
+- Real-time Prevention mode: blocking is Enterprise; the Community edition plans recommended actions and response hooks only ([ADR-0040](adr/0040-prevention-mode-scope.md), ROADMAP phase 12)
+- CAS (ROADMAP phase 8)
 
 ## Name
 Chosen name: **DataBastion**. History of candidates: [06-project-name.md](06-project-name.md).
