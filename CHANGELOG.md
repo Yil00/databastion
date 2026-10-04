@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ✨ Features
+- Console login with OpenID Connect ([ADR-0038](docs/adr/0038-console-oidc-login.md), ROADMAP P8-A): Authorization Code + PKCE with discovery from the issuer, strict `id_token` validation, identities keyed by (issuer, subject) and never by e-mail, JMESPath claim mapping to the `admin` / `analyst` roles (strict by default), allowed groups and domains, pending logins approved as new users (sign-up off by default), self-service "Link single sign-on", role sync, optional encrypted refresh tokens, RP-initiated logout with token revocation, rate limits and audit entries. `DATABASTION_LOCAL_LOGIN` (`enabled` / `admins` / `disabled`; `admins` by default with OIDC on) with a `user.local_login` system alert on break-glass logins. New Users page (local users, roles, disable, pending logins) and Account page. Configuration: `DATABASTION_OIDC_*` in [console/README.md](console/README.md#single-sign-on-oidc)
+
 ### 📝 Documentation
 - Roadmap after the MVP: phases 8 (console OIDC login, CAS connector), 9 (Microsoft SQL Server, Redis, Valkey), 10 (SQLite, Firebird), 11 (Helm, mTLS, OTLP, gRPC, event storage at scale), 12 (recommended actions and response hooks) and 13+, with a per-owner view ([docs/ROADMAP.md](docs/ROADMAP.md#after-the-mvp)). Nothing in these phases is implemented yet
 - ADR-0038 (proposed): console login with OpenID Connect; ADR-0039 (proposed): engine scope expansion, with end-of-life engine versions (PostgreSQL 12 / 13, MySQL 5.7, MongoDB 4.x) not supported; ADR-0040 (accepted): prevention mode scope, Community gets recommended actions and response hooks only, blocking stays Enterprise
