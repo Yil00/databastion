@@ -950,6 +950,8 @@ pub enum EventSource {
     MongodbLog,
     /// OpenLDAP `cn=accesslog`.
     OpenldapAccesslog,
+    /// Apereo CAS JSON audit log (ADR-0041).
+    CasAuditLog,
 }
 
 impl EventSource {
@@ -967,6 +969,7 @@ impl EventSource {
             Self::MongodbProfiler => "mongodb_profiler",
             Self::MongodbLog => "mongodb_log",
             Self::OpenldapAccesslog => "openldap_accesslog",
+            Self::CasAuditLog => "cas_audit_log",
         }
     }
 }
@@ -1013,11 +1016,18 @@ pub enum Signal {
     /// by value (presence tests and `objectClass` assertions only): the
     /// shape of an LDIF export or a bulk `ldapsearch` (ADR-0029).
     BulkSearch,
+    /// `volume.failed_logins_many_accounts`: one client address with
+    /// failed authentications for at least 16 distinct principals within
+    /// 10 minutes (CAS, ADR-0041 decision 8).
+    FailedLoginsManyAccounts,
+    /// `volume.failed_logins_one_account`: one principal with at least 20
+    /// failed authentications within 10 minutes (CAS, ADR-0041 decision 8).
+    FailedLoginsOneAccount,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -1029,6 +1039,8 @@ impl Signal {
         Self::Mongodump,
         Self::Mongoexport,
         Self::BulkSearch,
+        Self::FailedLoginsManyAccounts,
+        Self::FailedLoginsOneAccount,
     ];
 
     /// Contract value.
@@ -1046,6 +1058,8 @@ impl Signal {
             Self::Mongodump => "signature.mongodump",
             Self::Mongoexport => "signature.mongoexport",
             Self::BulkSearch => "shape.bulk_search",
+            Self::FailedLoginsManyAccounts => "volume.failed_logins_many_accounts",
+            Self::FailedLoginsOneAccount => "volume.failed_logins_one_account",
         }
     }
 }
@@ -1078,6 +1092,8 @@ impl ClientAddr {
 const MAX_ACCOUNT_BYTES: usize = 1024;
 /// Contract `Principal.application.maxLength`.
 const MAX_APPLICATION_CHARS: usize = 64;
+/// `db_user` of the several-accounts aggregate (contract `Principal`).
+pub const MANY_ACCOUNTS: &str = "*";
 
 /// Who accessed. Account names may leave in clear (ADR-0007); the core
 /// replaces a name that does not match the contract pattern, and every
@@ -1086,6 +1102,8 @@ const MAX_APPLICATION_CHARS: usize = 64;
 pub struct EventPrincipal {
     account: String,
     send_name: bool,
+    /// The `*` aggregate of several accounts (CAS failed-login floods).
+    many_accounts: bool,
     client: Option<ClientAddr>,
     application: Option<String>,
 }
@@ -1094,6 +1112,7 @@ impl fmt::Debug for EventPrincipal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventPrincipal")
             .field("send_name", &self.send_name)
+            .field("many_accounts", &self.many_accounts)
             .field("client", &self.client)
             .finish_non_exhaustive()
     }
@@ -1114,9 +1133,34 @@ impl EventPrincipal {
         Self {
             account: bounded(raw, MAX_ACCOUNT_BYTES),
             send_name: true,
+            many_accounts: false,
             client: None,
             application: None,
         }
+    }
+
+    /// Several accounts (`db_user` `*`): the aggregate of the failed
+    /// authentications of one client address on a CAS target (ADR-0041
+    /// decision 7). The core sends `*` only for this principal, and only on
+    /// a `cas_audit_log` `auth_failure` event carrying
+    /// [`Signal::FailedLoginsManyAccounts`]; it drops any other event
+    /// built with it. An account merely named `*` is never this principal
+    /// (the core fingerprints it).
+    #[must_use]
+    pub fn many_accounts() -> Self {
+        Self {
+            account: MANY_ACCOUNTS.to_owned(),
+            send_name: true,
+            many_accounts: true,
+            client: None,
+            application: None,
+        }
+    }
+
+    /// Whether this is the [`Self::many_accounts`] aggregate.
+    #[must_use]
+    pub fn is_many_accounts(&self) -> bool {
+        self.many_accounts
     }
 
     /// The account of a failed authentication: always fingerprinted (the

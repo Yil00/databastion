@@ -51,8 +51,9 @@ const CONFIG_STEMS: [(&str, &[&str]); 3] = [
     ("cas", &["yml", "yaml", "properties"]),
 ];
 /// Extensions of key material: their presence refuses the directory.
-const KEY_EXTENSIONS: [&str; 9] = [
-    "jwks", "jks", "p12", "pem", "key", "pfx", "jceks", "keystore", "bcfks",
+const KEY_EXTENSIONS: [&str; 13] = [
+    "jwks", "jwk", "jks", "p12", "pkcs12", "p8", "pem", "der", "key", "pfx", "jceks", "keystore",
+    "bcfks",
 ];
 
 /// Why a declared source is not read (kinds only, never a path).
@@ -95,10 +96,35 @@ impl Policy {
         refuse_agent_writable: true,
     };
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const TESTS: Self = Self {
         refuse_agent_writable: false,
     };
+
+    /// The policy of the agent: [`Self::STRICT`], except in the tests of
+    /// other crates that called [`allow_agent_owned_files_for_tests`].
+    pub(crate) fn agent() -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        if RELAXED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Self::TESTS;
+        }
+        Self::STRICT
+    }
+}
+
+/// Test support only (feature `test-support`, enabled from other crates'
+/// `[dev-dependencies]`, never by the agent binary; checked by the
+/// architecture tests): accept files the test's own user could write.
+#[cfg(any(test, feature = "test-support"))]
+static RELAXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test support only (see [`RELAXED`]): lets the tests of other crates run
+/// the connector on files they created themselves (every file a test
+/// creates is its own, and the tests may run as root).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn allow_agent_owned_files_for_tests() {
+    RELAXED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Ownership and mode facts of a file, for [`writable_by`].
@@ -352,6 +378,53 @@ pub(crate) struct Tail {
     pub(crate) bytes: Zeroizing<Vec<u8>>,
 }
 
+/// Whether `path` names the file `meta` describes, without following a
+/// symlink as its last component (`lstat`).
+fn names(path: &Path, meta: &std::fs::Metadata) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|now| {
+        now.file_type().is_file() && (now.dev(), now.ino()) == (meta.dev(), meta.ino())
+    })
+}
+
+/// The checks of an opened audit log (`meta` from `fstat` on its handle,
+/// `path` the path it was opened by, without following a last-component
+/// symlink): a regular file with one hard link, not writable by the agent
+/// (owner, mode bits, `faccessat(W_OK)`, ancestors). The path-based checks
+/// are bound to the handle: `path` must name the same `(st_dev, st_ino)`
+/// before and after them. Shared by this crate's own reads and the core
+/// tailer's open check ([`log_open_check`]).
+pub(crate) fn check_opened_log(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    policy: Policy,
+) -> Result<(), Refusal> {
+    if !meta.file_type().is_file() {
+        return Err(Refusal::NotReadable);
+    }
+    // A hard link to the log could be any file of the CAS user's.
+    if meta.nlink() != 1 {
+        return Err(Refusal::NotReadable);
+    }
+    if !names(path, meta) {
+        return Err(Refusal::ResolvedChanged);
+    }
+    if policy.refuse_agent_writable {
+        let me = Me::current();
+        let name =
+            CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Refusal::NotReadable)?;
+        if writable_by(owner(meta), &me)
+            || access_writable(CWD, &name)
+            || ancestor_writable(path, &me)
+        {
+            return Err(Refusal::Writable);
+        }
+        if !names(path, meta) {
+            return Err(Refusal::ResolvedChanged);
+        }
+    }
+    Ok(())
+}
+
 /// Opens the audit log at `path` (resolved at load: the final component is
 /// not followed) with the checks of the module documentation.
 fn open_log(path: &Path, policy: Policy) -> Result<(File, u64), Refusal> {
@@ -363,21 +436,37 @@ fn open_log(path: &Path, policy: Policy) -> Result<(File, u64), Refusal> {
     .map_err(|_| Refusal::NotReadable)?;
     let file = File::from(fd);
     let meta = file.metadata().map_err(|_| Refusal::NotReadable)?;
-    if !meta.file_type().is_file() {
-        return Err(Refusal::NotReadable);
-    }
-    if policy.refuse_agent_writable {
-        let me = Me::current();
-        let name =
-            CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Refusal::NotReadable)?;
-        if writable_by(owner(&meta), &me)
-            || access_writable(CWD, &name)
-            || ancestor_writable(path, &me)
-        {
-            return Err(Refusal::Writable);
-        }
-    }
+    check_opened_log(path, &meta, policy)?;
     Ok((file, meta.len()))
+}
+
+/// The core tailer's open check for the CAS audit log (security review of
+/// #138 L2): run on the tailer's own handle after every (re)open, it
+/// refuses a file whose declared path no longer resolves where it did at
+/// load, and applies [`check_opened_log`]. The last refusal is kept in
+/// `last` (kinds only) for the stream's report.
+pub(crate) fn log_open_check(
+    declared: crate::config::ResolvedPath,
+    policy: Policy,
+    last: std::sync::Arc<std::sync::Mutex<Option<Refusal>>>,
+) -> databastion_core::audit::tail::OpenCheck {
+    std::sync::Arc::new(move |f: &databastion_core::audit::tail::OpenedFile<'_>| {
+        let verdict = if declared.still_resolves() {
+            check_opened_log(f.path, f.meta, policy)
+        } else {
+            Err(Refusal::ResolvedChanged)
+        };
+        let mut slot = last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = verdict.err();
+        verdict.map_err(|r| match r {
+            Refusal::Writable => std::io::ErrorKind::PermissionDenied,
+            Refusal::NotReadable | Refusal::ConfigFiles | Refusal::ResolvedChanged => {
+                std::io::ErrorKind::InvalidInput
+            }
+        })
+    })
 }
 
 /// Reads the last `max` bytes of the audit log at `path` (see
@@ -515,6 +604,10 @@ pub(crate) mod tests {
             "CAS.yml",
             "application.YML",
             "Application.properties",
+            "client.jwk",
+            "signing.P8",
+            "store.pkcs12",
+            "cert.der",
         ] {
             let dir = TempDir::new("config");
             std::fs::write(dir.path().join("App-1.json"), b"{}").unwrap();
@@ -525,6 +618,29 @@ pub(crate) mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_hard_linked_or_replaced_log_is_refused() {
+        let dir = TempDir::new("log-links");
+        let log = dir.path().join("cas_audit.log");
+        std::fs::write(&log, b"{}\n").unwrap();
+        assert!(read_log_tail(&log, 10, Policy::TESTS).is_ok());
+        let extra = dir.path().join("copy.log");
+        std::fs::hard_link(&log, &extra).unwrap();
+        assert_eq!(
+            read_log_tail(&log, 10, Policy::TESTS).err(),
+            Some(Refusal::NotReadable)
+        );
+        std::fs::remove_file(&extra).unwrap();
+        // The path-based checks are bound to the handle's inode.
+        let meta = std::fs::metadata(&log).unwrap();
+        std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+        std::fs::write(&log, b"{}\n").unwrap();
+        assert_eq!(
+            check_opened_log(&log, &meta, Policy::TESTS),
+            Err(Refusal::ResolvedChanged)
+        );
     }
 
     #[test]

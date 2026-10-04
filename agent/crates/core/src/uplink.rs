@@ -997,13 +997,29 @@ fn event_item(
     let id =
         |n: &databastion_classifiers::names::NormalizedName| Identifier::try_from(n.as_str()).ok();
     let p = e.principal();
+    // `db_user` `*` means "several accounts" (contract `Principal`): only the
+    // CAS failed-login aggregate carries it, on a `cas_audit_log`
+    // `auth_failure` with `volume.failed_logins_many_accounts`. Any other
+    // event built with that principal is dropped (counted), and an account
+    // merely named `*` is sent as its fingerprint.
+    if p.is_many_accounts()
+        && !(e.source() == databastion_classifiers::masking::EventSource::CasAuditLog
+            && e.action() == EventAction::AuthFailure
+            && e.signals()
+                .contains(&databastion_classifiers::masking::Signal::FailedLoginsManyAccounts))
+    {
+        return None;
+    }
+    let send_name = p.send_name()
+        && (p.is_many_accounts()
+            || p.account_name() != databastion_classifiers::masking::MANY_ACCOUNTS);
     let client = p.client().map(|c| match c {
         ClientAddr::Ip(ip) => ip.to_string(),
         ClientAddr::Local => "local".to_owned(),
     });
     let principal = sanitize::principal(
         p.account_name(),
-        p.send_name(),
+        send_name,
         client.as_deref(),
         p.application(),
         fingerprints,
@@ -1243,6 +1259,77 @@ mod tests {
             n.ts_last.map(|t| t.0),
             Some(at(past + Duration::from_secs(30)))
         );
+    }
+
+    #[test]
+    fn only_the_cas_failed_login_aggregate_is_sent_as_star() {
+        use databastion_classifiers::masking::{
+            EventAction, EventPrincipal, EventSource, Signal as S,
+        };
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let target = TargetId::try_from("cas-prod").unwrap();
+        struct Fp;
+        impl sanitize::Fingerprinter for Fp {
+            fn fingerprint(&self, _: &str) -> Option<databastion_protocol::Fingerprint> {
+                databastion_protocol::Fingerprint::try_from(
+                    format!("hmac-sha256:{}", "0".repeat(64)).as_str(),
+                )
+                .ok()
+            }
+        }
+        let item = |e: &MaskedEvent| {
+            event_item(&target, e, &Fp, now).map(|i| serde_json::to_value(i).unwrap())
+        };
+        let agg = |source, action, signal: Option<S>| {
+            let e = MaskedEvent::new(source, action, EventPrincipal::many_accounts(), now)
+                .with_aggregate(40, now);
+            match signal {
+                Some(s) => e.with_signal(s),
+                None => e,
+            }
+        };
+        let ok = item(&agg(
+            EventSource::CasAuditLog,
+            EventAction::AuthFailure,
+            Some(S::FailedLoginsManyAccounts),
+        ))
+        .unwrap();
+        assert_eq!(ok["principal"]["db_user"], "*");
+        // Anywhere else, the aggregate principal drops the event.
+        for e in [
+            agg(EventSource::CasAuditLog, EventAction::AuthFailure, None),
+            agg(
+                EventSource::CasAuditLog,
+                EventAction::AuthFailure,
+                Some(S::FailedLoginsOneAccount),
+            ),
+            agg(
+                EventSource::CasAuditLog,
+                EventAction::Connect,
+                Some(S::FailedLoginsManyAccounts),
+            ),
+            agg(
+                EventSource::Pgaudit,
+                EventAction::AuthFailure,
+                Some(S::FailedLoginsManyAccounts),
+            ),
+        ] {
+            assert!(item(&e).is_none(), "{e:?}");
+        }
+        // An account named `*` is never sent as `*`.
+        for source in [EventSource::Pgaudit, EventSource::CasAuditLog] {
+            let named = MaskedEvent::new(
+                source,
+                EventAction::AuthFailure,
+                EventPrincipal::account("*"),
+                now,
+            )
+            .with_signal(S::FailedLoginsManyAccounts);
+            let v = item(&named).unwrap();
+            assert!(v["principal"].get("db_user").is_none(), "{v}");
+            assert!(v["principal"]["db_user_fingerprint"].is_string(), "{v}");
+        }
     }
 
     fn reply(status: u16, json: bool, body: &[u8]) -> Reply {

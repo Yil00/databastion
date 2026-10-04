@@ -149,9 +149,17 @@ proptest! {
         }
         prop_assert!(out.contains(&format!("//{host}{path}")), "{:?}", out);
         let delimiters = special.iter().any(|c| matches!(*c, "/" | "?" | "#"));
+        let encoded = special.iter().any(|c| c.contains('%'));
         if !relative && !delimiters && !before.to_ascii_lowercase().contains("http") {
-            let h = service_of(&text).unwrap();
-            prop_assert_eq!(h.as_url(), format!("https://{host}/"));
+            // An authority holding `%` names no service (review of #138);
+            // otherwise the host after the last literal `@`.
+            match service_of(&text) {
+                Some(h) => {
+                    prop_assert!(!encoded);
+                    prop_assert_eq!(h.as_url(), format!("https://{host}/"));
+                }
+                None => prop_assert!(encoded),
+            }
         }
     }
 

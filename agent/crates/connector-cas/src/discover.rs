@@ -25,8 +25,10 @@
 //!   parser bound in `skipped_limit`; a parser panic in `skipped_error`.
 //!   A refused source counts as one object not readable.
 //!
-//! TODO(P8-C): called from `Connector::discover` once the `cas` engine is
-//! wired into the core; [`CasError`] then maps to `ConnectorError`.
+//! Called from `Connector::discover` ([`crate::connector`]), where
+//! [`CasError`] maps to `ConnectorError`. [`index_registry`] builds the
+//! service index alone (no classification) for an audit stream that starts
+//! before any scan.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,7 +111,7 @@ pub async fn discover(
     sink: &FindingSink,
     state: &Arc<CasState>,
 ) -> Result<(), CasError> {
-    discover_with(settings, job, sink, state, Policy::STRICT).await
+    discover_with(settings, job, sink, state, Policy::agent()).await
 }
 
 pub(crate) async fn discover_with(
@@ -318,6 +320,51 @@ async fn scan_registry(
         sink.submit(f).await?;
     }
     Ok(())
+}
+
+/// Reads and parses the registry for the service index only (no value is
+/// classified nor kept): the audit stream's service match when no
+/// Discovery scan ran since the agent started. `None` when the target
+/// declares no registry or it is refused. Blocking I/O: call from a
+/// blocking thread.
+pub(crate) fn index_registry(
+    settings: &CasSettings,
+    policy: Policy,
+) -> Option<(ServiceIndex, RegistryFacts)> {
+    let dir = settings.registry_dir.as_ref()?;
+    if !dir.still_resolves() {
+        return None;
+    }
+    let listing = fsread::list_registry(dir.path(), policy).ok()?;
+    let mut facts = RegistryFacts {
+        skipped: listing.over_cap,
+        ..RegistryFacts::default()
+    };
+    let mut index = ServiceIndex::default();
+    for name in &listing.files {
+        // Err(true): refused because the agent could write it.
+        let parsed = databastion_core::isolate(|| match listing.read(name, policy) {
+            Err(skip) => Err(skip == FileSkip::Writable),
+            Ok(bytes) => parse_definition(&bytes).map_err(|_| false),
+        })
+        .unwrap_or(Err(false));
+        match parsed {
+            Ok(def) => {
+                if def.client_secret == SecretForm::Clear {
+                    facts.clear_secrets = facts.clear_secrets.saturating_add(1);
+                }
+                let _ = index.add(&def);
+            }
+            Err(writable) => {
+                facts.skipped = facts.skipped.saturating_add(1);
+                if writable {
+                    facts.writable = facts.writable.saturating_add(1);
+                }
+            }
+        }
+    }
+    index.finish();
+    Some((index, facts))
 }
 
 async fn scan_audit_log(

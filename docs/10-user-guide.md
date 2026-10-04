@@ -98,7 +98,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb` or `openldap`;
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below);
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -108,6 +108,13 @@ Each target has:
   - OpenLDAP: `openldap.accesslog_base` (read over LDAP) and `openldap.clear_principals`.
 
 The example file documents each key with its range. After changing `agent.yaml`, restart the agent.
+
+**Apereo CAS targets** (`engine: cas`, [ADR-0041](adr/0041-cas-connector.md)) are local files on the agent's host, nothing else: no `host`, `port`, `socket`, `account` or `secret` (refused), and the agent never contacts CAS. Declare a `cas:` block with at least one of `service_registry.json_dir` (the JSON service registry directory) and `audit_log.path` (the audit log), optionally `audit_log.timezone` (`UTC` or `±HH:MM`), `clear_principals` (service accounts sent by name; end users are fingerprinted) and `client_addr` (`truncated` by default: IPv4 `/24`, IPv6 `/56`; `clear`; `omitted`). The CAS side needs:
+- `cas.audit.engine.audit-format: JSON`, written to a file by the audit log's logger with a layout that writes the message alone (`%m%n`), one record per line; preferably without request headers (`cas.audit.engine.http-request-headers` empty, or `auditable-fields` without `headers`), else the note `security.audit_headers_logged`;
+- client secrets of OAuth / OIDC services encrypted (`security.client_secrets_in_clear` counts the clear ones), and the ticket registry's `crypto.enabled: true` when it lives in a database;
+- the agent's OS user with **read** access to the registry directory and the audit log through a group without write permission (`0640` files, `0750` directory), no write access anywhere on the path (refused, `privilege.registry_writable` / `audit.log_not_readable`), and **no access to the CAS configuration** (`cas.properties`, `cas.yml`): a registry directory holding configuration or key files is refused (`privilege.config_readable`).
+
+A console older than the `cas` engine (it does not list `engine.cas`) shows no CAS target: the agent keeps its findings and events spooled until the console is upgraded. CAS stores held in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP (JPA ticket and service tables, MongoDB collections) are read by those engines' targets; their CAS store guard is a later release. Levels and limits: [08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas).
 
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
@@ -125,7 +132,7 @@ Also:
 - At every heartbeat the agent checks each account and reports over-privilege and coverage problems as **target notes** on the agent page. A note about over-privilege means the account has more rights than recommended: remove them.
 
 ## 8. Audit prerequisites and levels
-What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)).
+What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. CAS never reaches Full either: Partial means authentications and ticket issuance are logged. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)).
 
 ## 9. Discovery: scans and findings
 1. On the agent page, open **Scan** on a target (administrator). Parameters are optional: rows sampled per object (default 200), maximum duration (3600 s since #94, to leave room for paced scans), statement timeout (30 s), database / schema / object filters and classifiers. The agent caps them with its local `limits`.

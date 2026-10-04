@@ -9,11 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["postgres", "mysql", "mongodb", "openldap"]
+default = ["postgres", "mysql", "mongodb", "openldap", "cas"]
 postgres = ["dep:databastion-connector-postgres"]
 mysql = ["dep:databastion-connector-mysql"]
 mongodb = ["dep:databastion-connector-mongodb"]
 openldap = ["dep:databastion-connector-openldap"]
+cas = ["dep:databastion-connector-cas"]
 
 [dependencies]
 databastion-core.workspace = true
@@ -21,14 +22,23 @@ databastion-connector-postgres = { workspace = true, optional = true }
 databastion-connector-mysql = { workspace = true, optional = true }
 databastion-connector-mongodb = { workspace = true, optional = true }
 databastion-connector-openldap = { workspace = true, optional = true }
+databastion-connector-cas = { workspace = true, optional = true }
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-# tests/architecture.rs parses `cargo metadata`.
+# tests/architecture.rs parses `cargo metadata`; tests/cas_runtime.rs reads
+# the request bodies of its mock console.
 serde_json = "1"
+# tests/cas_runtime.rs: the CAS connector in the runtime against a mock
+# console (bound to 127.0.0.1 by wiremock, test code only), on files the
+# test's own user created (`test-support` switches, never in the binary).
+databastion-core = { workspace = true, features = ["test-support"] }
+databastion-connector-cas = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+wiremock = "0.6"
 
 [lints]
 workspace = true

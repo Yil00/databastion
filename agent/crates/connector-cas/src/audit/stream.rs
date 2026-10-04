@@ -3,16 +3,20 @@
 //! The core tailer (`databastion_core::audit::tail`) follows the file: one
 //! record per line ([`Framing::Lines`], at most 1 MiB per line, longer ones
 //! dropped and counted), rotation and keyed truncation fingerprints,
-//! persisted positions, refusal of a file the agent could write. Before
-//! each poll, the declared path must still resolve where it did at load
-//! and pass this crate's checks (no writable ancestor, `faccessat`).
-//! Each record is parsed and converted under per-record panic isolation
-//! (ADR-0032): a record that makes a parser panic costs that record only.
+//! persisted positions, refusal of a file the agent could write, and
+//! `O_NOFOLLOW` on every (re)open. This crate's checks run as the tailer's
+//! open check on the tailer's own handle after every (re)open (security
+//! review of #138 L2): the declared path still resolves where it did at
+//! load, a regular file with one hard link, not writable by the agent
+//! (owner, mode, `faccessat`, ancestors), the path bound to the handle's
+//! `(st_dev, st_ino)`. Before each poll, the same checks also run on the
+//! path. Each record is parsed and converted under per-record panic
+//! isolation (ADR-0032): a record that makes a parser panic costs that
+//! record only.
 //!
-//! TODO(P8-C): the async loop (`Connector::audit_stream`) wraps
-//! [`AuditRunner::poll`] in `spawn_blocking`, submits the events once they
-//! are `MaskedEvent`s and calls [`AuditRunner::commit`] after them, as the
-//! MongoDB and OpenLDAP streams do.
+//! The async loop (`Connector::audit_stream`, [`crate::connector`]) wraps
+//! [`AuditRunner::poll`] in `spawn_blocking`, submits the events as
+//! `MaskedEvent`s and calls [`AuditRunner::commit`] after them.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -107,6 +111,8 @@ pub struct AuditRunner {
     /// Tailer counters (oversized, damaged) already reported.
     reported: (u64, u64),
     policy: Policy,
+    /// Why the tailer's open check last refused the file.
+    refused: Arc<std::sync::Mutex<Option<Refusal>>>,
 }
 
 impl std::fmt::Debug for AuditRunner {
@@ -128,7 +134,7 @@ impl AuditRunner {
         builder: Builder,
         state: Arc<CasState>,
     ) -> Option<Self> {
-        Self::with_policy(settings, store, builder, state, Policy::STRICT)
+        Self::with_policy(settings, store, builder, state, Policy::agent())
     }
 
     pub(crate) fn with_policy(
@@ -139,13 +145,17 @@ impl AuditRunner {
         policy: Policy,
     ) -> Option<Self> {
         let log = settings.audit_log.clone()?;
+        let refused = Arc::new(std::sync::Mutex::new(None));
+        let check = fsread::log_open_check(log.path.clone(), policy, Arc::clone(&refused));
         Some(Self {
-            tailer: Tailer::new(log.path.path().to_path_buf(), Framing::Lines, store),
+            tailer: Tailer::new(log.path.path().to_path_buf(), Framing::Lines, store)
+                .with_open_check(check),
             settings: log,
             builder,
             state,
             reported: (0, 0),
             policy,
+            refused,
         })
     }
 
@@ -159,13 +169,17 @@ impl AuditRunner {
             return Err(Refusal::ResolvedChanged);
         }
         fsread::check_log(self.settings.path.path(), self.policy)?;
-        // `check_log` above already refused a log the agent could write;
-        // a permission error of the tailer is an `EACCES` on open (review
-        // of #138 I3): not readable.
-        let polled = self
-            .tailer
-            .poll()
-            .map_err(|TailError::Unreadable(_)| Refusal::NotReadable)?;
+        // A refusal of the tailer's open check (on its own handle) is
+        // reported as such; any other error of the tailer (an `EACCES` on
+        // open, review of #138 I3, a symlink refused by `O_NOFOLLOW`) is
+        // "not readable".
+        let polled = self.tailer.poll().map_err(|TailError::Unreadable(_)| {
+            self.refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or(Refusal::NotReadable)
+        })?;
         let lines: Vec<Zeroizing<Vec<u8>>> = polled.records;
         let batch = parse_lines(&lines, self.settings.offset, now);
         drop(lines);
@@ -297,6 +311,75 @@ mod tests {
             snap.evidence.level(now).0,
             databastion_core::AuditLevel::Partial
         );
+    }
+
+    #[test]
+    fn a_symlink_or_hard_link_swapped_in_at_rotation_is_never_read() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let dir = TempDir::new("stream-swap");
+        append(&dir, "");
+        let s = settings(&dir);
+        let state = Arc::new(CasState::default());
+        let b = Builder::new(key(), &[], ClientAddrMode::Truncated, None);
+        let mut r =
+            AuditRunner::with_policy(&s, None, b, Arc::clone(&state), Policy::TESTS).unwrap();
+        let now = SystemTime::now();
+        assert!(r.poll(now).unwrap().events.is_empty());
+        let when = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let other = dir.path().join("elsewhere.log");
+        std::fs::write(
+            &other,
+            format!(
+                "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"who\": \"planted\", \"when\": {when}}}\n"
+            ),
+        )
+        .unwrap();
+        let log = dir.path().join("cas_audit.log");
+        // Rotation, then a symlink in place of the new file.
+        std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+        std::os::unix::fs::symlink(&other, &log).unwrap();
+        assert!(r.poll(now).is_err());
+        // A hard link to another file in place of the new file.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::hard_link(&other, &log).unwrap();
+        assert_eq!(r.poll(now).err(), Some(Refusal::NotReadable));
+        // A regular file again: read from its start.
+        std::fs::remove_file(&log).unwrap();
+        append(
+            &dir,
+            &format!(
+                "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"who\": \"real\", \"when\": {when}}}\n"
+            ),
+        );
+        let p = r.poll(now).unwrap();
+        assert_eq!(p.events.len(), 1);
+        assert!(!format!("{:?}", p.events).contains("planted"));
+    }
+
+    #[test]
+    fn the_tailer_runs_the_crate_checks_on_its_own_handle() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let dir = TempDir::new("stream-hook");
+        append(&dir, "");
+        let s = settings(&dir);
+        let log = s.audit_log.as_ref().unwrap().path.clone();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let check = fsread::log_open_check(log.clone(), Policy::TESTS, Arc::clone(&last));
+        let mut t = Tailer::new(log.path().to_path_buf(), Framing::Lines, None)
+            .with_open_check(Arc::clone(&check));
+        assert!(t.poll().is_ok());
+        assert_eq!(*last.lock().unwrap(), None);
+        // Rotation to a hard-linked file: refused on the tailer's handle,
+        // without any check of this crate before the poll.
+        std::fs::rename(log.path(), dir.path().join("cas_audit.log.1")).unwrap();
+        let other = dir.path().join("other.log");
+        std::fs::write(&other, b"{}\n").unwrap();
+        std::fs::hard_link(&other, log.path()).unwrap();
+        assert!(t.poll().is_err());
+        assert_eq!(*last.lock().unwrap(), Some(Refusal::NotReadable));
     }
 
     #[test]

@@ -237,6 +237,7 @@ name = "databastion-agent"
 version = "0.3.1"
 dependencies = [
  "clap",
+ "databastion-connector-cas",
  "databastion-connector-mongodb",
  "databastion-connector-mysql",
  "databastion-connector-openldap",
@@ -246,6 +247,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -267,6 +269,7 @@ dependencies = [
 name = "databastion-connector-cas"
 version = "0.3.1"
 dependencies = [
+ "async-trait",
  "databastion-classifiers",
  "databastion-core",
  "proptest",
@@ -274,7 +277,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",

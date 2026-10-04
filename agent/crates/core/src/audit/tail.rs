@@ -56,12 +56,18 @@
 //!   opening, so a FIFO or a device is never read).
 //! - The file must **not be writable by the agent's own account**: not
 //!   owned by its effective uid, not world-writable, not group-writable
-//!   for one of its groups; checked on the opened handle, so after
-//!   following symlinks (end-of-phase-4 review L4). An audit log is
-//!   written by the database server; one the agent's account could write
-//!   would not be evidence of what the server did. Such a file is refused
-//!   like an unreadable one (`PermissionDenied`: `audit.log_not_readable`
-//!   in `check()`).
+//!   for one of its groups; checked on the opened handle (end-of-phase-4
+//!   review L4). An audit log is written by the database server; one the
+//!   agent's account could write would not be evidence of what the server
+//!   did. Such a file is refused like an unreadable one
+//!   (`PermissionDenied`: `audit.log_not_readable` in `check()`).
+//! - The path is opened with `O_NOFOLLOW` (security review of #138 L2): a
+//!   symlink as its last component is refused (directories above it are
+//!   still resolved), at the first open and at every reopen after a
+//!   rotation, so a symlink swapped in at rotation time cannot redirect the
+//!   tailer to another file. A source can add its own checks of every
+//!   opened file ([`Tailer::with_open_check`]), run on the opened handle
+//!   after each (re)open; a file they refuse is not read.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -468,6 +474,8 @@ pub struct Tailer {
     pub oversized: u64,
     /// Rotations or truncations seen.
     pub rotations: u64,
+    /// The source's checks of every opened file.
+    open_check: Option<OpenCheck>,
 }
 
 /// Test support only: accept log files the agent's user could write
@@ -517,15 +525,40 @@ fn writable_by_agent(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+/// A file the tailer has just opened, handed to a source's
+/// [`OpenCheck`]: its configured path, the opened handle and the handle's
+/// metadata (`fstat`).
+pub struct OpenedFile<'a> {
+    /// The configured path (its last component is not a symlink).
+    pub path: &'a std::path::Path,
+    /// The opened handle (read-only).
+    pub file: &'a File,
+    /// Metadata of the handle.
+    pub meta: &'a std::fs::Metadata,
+}
+
+/// A source's own checks of every file the tailer opens (first open and
+/// every reopen after a rotation), run after the tailer's: an error refuses
+/// the file (`TailError::Unreadable` with that kind), which is then not
+/// read. It must decide on the handle (`fstat`), or bind any check made on
+/// the path to the handle's `(st_dev, st_ino)`.
+pub type OpenCheck =
+    std::sync::Arc<dyn Fn(&OpenedFile<'_>) -> Result<(), std::io::ErrorKind> + Send + Sync>;
+
 /// Opens the log without blocking (a FIFO or device planted at the path
-/// cannot block the open: `O_NONBLOCK`, `O_NOCTTY`), then checks the
+/// cannot block the open: `O_NONBLOCK`, `O_NOCTTY`) and without following
+/// a symlink as its last component (`O_NOFOLLOW`), then checks the
 /// **handle** is a regular file (no stat-then-open race) not owned by the
-/// agent's own user. Blocking I/O: call from a blocking thread.
-fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailError> {
+/// agent's own user, then runs the source's `check`. Blocking I/O: call
+/// from a blocking thread.
+fn open_regular(
+    path: &std::path::Path,
+    check: Option<&OpenCheck>,
+) -> Result<(File, u64, u64, u64), TailError> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|e| TailError::Unreadable(std::io::Error::from(e).kind()))?;
@@ -544,6 +577,14 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
         );
         return Err(TailError::Unreadable(std::io::ErrorKind::PermissionDenied));
     }
+    if let Some(check) = check {
+        check(&OpenedFile {
+            path,
+            file: &file,
+            meta: &meta,
+        })
+        .map_err(TailError::Unreadable)?;
+    }
     Ok((file, meta.dev(), meta.ino(), meta.len()))
 }
 
@@ -551,7 +592,7 @@ fn open_regular(path: &std::path::Path) -> Result<(File, u64, u64, u64), TailErr
 /// and the source choice). Blocking I/O: call from a blocking thread.
 #[must_use]
 pub fn readable(path: &std::path::Path) -> bool {
-    open_regular(path).is_ok_and(|(mut f, _, _, _)| {
+    open_regular(path, None).is_ok_and(|(mut f, _, _, _)| {
         let mut b = [0u8; 1];
         f.read(&mut b).is_ok()
     })
@@ -573,7 +614,16 @@ impl Tailer {
             replay: None,
             oversized: 0,
             rotations: 0,
+            open_check: None,
         }
+    }
+
+    /// Adds the source's own checks of every file this tailer opens (see
+    /// [`OpenCheck`]).
+    #[must_use]
+    pub fn with_open_check(mut self, check: OpenCheck) -> Self {
+        self.open_check = Some(check);
+        self
     }
 
     /// Damaged records dropped by the splitter
@@ -608,7 +658,7 @@ impl Tailer {
         if self.file.is_some() {
             return Ok(());
         }
-        let (mut file, dev, ino, len) = open_regular(&self.path)?;
+        let (mut file, dev, ino, len) = open_regular(&self.path, self.open_check.as_ref())?;
         let start = match self.load_cursor() {
             Some(mut c) if c.dev == dev && c.ino == ino => {
                 // A replay whose end lies before the offset is not one the
@@ -762,14 +812,17 @@ impl Tailer {
                 });
             }
             // At the end of the open file: has the path moved to a new file?
-            match std::fs::metadata(&self.path) {
+            // `lstat`: a symlink put in its place is a change too, and the
+            // reopen refuses it (`O_NOFOLLOW`).
+            match std::fs::symlink_metadata(&self.path) {
                 Ok(meta)
-                    if meta.file_type().is_file() && (meta.dev(), meta.ino()) != (dev, ino) =>
+                    if (meta.file_type().is_file() || meta.file_type().is_symlink())
+                        && (meta.dev(), meta.ino()) != (dev, ino) =>
                 {
                     self.rotations += 1;
                     tracing::info!("audit log rotated; following the new file");
                     self.file = None;
-                    match open_regular(&self.path) {
+                    match open_regular(&self.path, self.open_check.as_ref()) {
                         Ok((file, dev, ino, _)) => {
                             self.file = Some((file, dev, ino));
                             self.offset = 0;
@@ -1473,6 +1526,61 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("opening a FIFO blocked");
         assert!(!ok && err);
+    }
+
+    #[test]
+    fn a_symlinked_log_is_refused_at_open_and_at_rotation() {
+        let d = Dir::new("symlink");
+        let elsewhere = d.0.join("other.log");
+        append(&elsewhere, "secret history\n");
+        // A symlink as the configured path: never opened.
+        let link = d.0.join("linked.log");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let mut t = Tailer::new(link.clone(), Framing::Lines, None);
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        assert!(!readable(&link));
+
+        // A symlink swapped in at rotation time is refused, and nothing of
+        // its target is read.
+        let log = d.0.join("audit.log");
+        append(&log, "old\n");
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = std::sync::Arc::clone(&opened);
+        let check: OpenCheck = std::sync::Arc::new(move |f: &OpenedFile<'_>| {
+            assert!(f.meta.file_type().is_file());
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None).with_open_check(check);
+        assert!(lines(t.poll().unwrap()).is_empty());
+        assert_eq!(opened.load(std::sync::atomic::Ordering::Relaxed), 1);
+        std::fs::rename(&log, d.0.join("audit.log.1")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        assert_eq!(opened.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // A regular file again: opened, and the source's check runs again.
+        std::fs::remove_file(&log).unwrap();
+        append(&log, "");
+        assert!(lines(t.poll().unwrap()).is_empty());
+        assert_eq!(opened.load(std::sync::atomic::Ordering::Relaxed), 2);
+        append(&log, "b\n");
+        let got = lines(t.poll().unwrap());
+        assert_eq!(got, ["b"]);
+    }
+
+    #[test]
+    fn a_refusing_open_check_keeps_the_file_unread() {
+        let d = Dir::new("check");
+        let log = d.0.join("audit.log");
+        append(&log, "x\n");
+        let check: OpenCheck =
+            std::sync::Arc::new(|_: &OpenedFile<'_>| Err(std::io::ErrorKind::PermissionDenied));
+        let mut t = Tailer::new(log, Framing::Lines, None).with_open_check(check);
+        assert_eq!(
+            t.poll().err(),
+            Some(TailError::Unreadable(std::io::ErrorKind::PermissionDenied))
+        );
     }
 
     #[test]

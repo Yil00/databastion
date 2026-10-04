@@ -114,10 +114,11 @@ pub struct AuditRecord {
     pub when: SystemTime,
     /// `clientIpAddress` when it is one IP literal.
     pub client: Option<IpAddr>,
-    /// First product token of `userAgent` (e.g. `python-requests/2.32`).
-    /// TODO(P8-C): it goes through the contract `Principal.application`
-    /// sanitization (`EventPrincipal::with_application`) when the event
-    /// becomes a `MaskedEvent`.
+    /// First product token of `userAgent` (e.g. `python-requests/2.32`),
+    /// already reduced like the contract `Principal.application`: every
+    /// character outside `[A-Za-z0-9._:/+-]` becomes `_`, at most 64
+    /// characters (`EventPrincipal::with_application` applies the same rule
+    /// again when the event is built).
     pub user_agent: Option<String>,
     /// Scheme and host of the service, for service-ticket issuance.
     pub service: Option<ServiceHost>,
@@ -365,15 +366,25 @@ impl<'de> Visitor<'de> for RecordVisitor {
     }
 }
 
-/// The first product token of a user agent, at most 64 characters.
+/// The first product token of a user agent (up to the first blank), at
+/// most 64 characters, reduced to the contract `Principal.application`
+/// alphabet: any other character becomes `_` (a token of `_` only is
+/// dropped).
 fn first_token(ua: &str) -> Option<String> {
     let t: String = ua
         .split_whitespace()
         .next()?
         .chars()
         .take(MAX_AGENT_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '+' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    (!t.is_empty()).then_some(t)
+    (!t.is_empty() && !t.bytes().all(|b| b == b'_')).then_some(t)
 }
 
 /// Parses one audit log line (see the module documentation).
@@ -581,6 +592,33 @@ mod tests {
         ] {
             assert_eq!(client(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn user_agents_keep_a_sanitized_first_token() {
+        let ua = |a: &str| {
+            parse_record(
+                &line(&format!(
+                    r#""action": "AUTHENTICATION_SUCCESS", "when": "2026-10-04T12:00:00Z", "userAgent": {a}"#
+                )),
+                UTC,
+            )
+            .unwrap()
+            .user_agent
+        };
+        assert_eq!(
+            ua(r#""python-requests/2.32.3 extra""#).as_deref(),
+            Some("python-requests/2.32.3")
+        );
+        assert_eq!(
+            ua(r#""curl/8.5.0;<script>\u0007é""#).as_deref(),
+            Some("curl/8.5.0__script___")
+        );
+        assert_eq!(ua(r#""é€""#), None);
+        assert_eq!(ua(r#""   ""#), None);
+        assert_eq!(ua("3"), None);
+        let long = ua(&format!("\"{}\"", "A".repeat(300))).unwrap();
+        assert_eq!(long.len(), MAX_AGENT_CHARS);
     }
 
     #[test]

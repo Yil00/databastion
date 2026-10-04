@@ -8,6 +8,11 @@
 //! service registry) are read by that engine's connector, with the CAS
 //! store guard (ADR-0041 decision 5, a later task).
 //!
+//! [`CasConnector`] is the `Connector` of the `cas` engine ([`connector`]);
+//! the `cas:` block of a target is validated and resolved by the core
+//! (`databastion_core::config::cas`, re-exported in [`config`]). A `cas`
+//! target is never detected locally (ADR-0041 decision 3, I5).
+//!
 //! - Discovery ([`discover`]): the JSON service registry, opened with
 //!   `openat` / `fstat` checks ([`fsread`]: no symlink, `st_nlink` = 1, no
 //!   file the agent could write, directories holding CAS configuration
@@ -30,12 +35,10 @@
 //! logged, fingerprinted nor reported. The audit record's `what` (which can
 //! hold one) is dropped once reduced; the registry holds none.
 //!
-//! TODO(P8-C): wired to the protocol types in P8-C. The `cas` engine, the
-//! `cas_audit_log` source, the target notes and the two signals are added
-//! to the contract on another branch; until then this crate keeps its own
-//! closed types ([`notes`], [`audit::events::CasEvent`], [`check::CasHealth`])
-//! and is not wired into the agent core (no `Connector` implementation
-//! yet).
+//! The crate's closed types ([`notes`], [`audit::events::CasEvent`],
+//! [`check::CasHealth`]) are mapped exhaustively to the core's
+//! (`NoteCode`, `TargetHealth`) and to the masked types
+//! (`MaskedEvent`, `Signal`) before they leave the crate.
 
 #![forbid(unsafe_code)]
 // Log and file input is sliced in this crate: slicing a string must be
@@ -45,6 +48,7 @@
 pub mod audit;
 pub mod check;
 pub mod config;
+pub mod connector;
 pub mod discover;
 pub mod fsread;
 pub mod notes;
@@ -64,6 +68,15 @@ pub use audit::events::{Builder, CasEvent, CasPrincipal};
 pub use audit::stream::AuditRunner;
 pub use check::{CasHealth, check};
 pub use config::{CasSettings, ClientAddrMode, ConfigError};
+pub use connector::CasConnector;
 pub use discover::{CasError, discover};
 pub use notes::{CasNote, CasNoteCode, CasSignal};
 pub use state::CasState;
+
+/// Test support only (feature `test-support`, enabled from other crates'
+/// `[dev-dependencies]`, never by the agent binary): lets their tests run
+/// the connector on files the test's own user created (see
+/// [`fsread::allow_agent_owned_files_for_tests`]).
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use fsread::allow_agent_owned_files_for_tests;

@@ -7,11 +7,16 @@ database client, no actuator endpoint, no CAS credential. CAS stores held in
 PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP are read by that engine's
 connector, with the CAS store guard (ADR-0041 decision 5, a later task).
 
-**Status**: the crate is complete for the file sources but **not wired into
-the agent core yet**: the `cas` engine, the `cas_audit_log` source, its target
-notes and its two signals are added to the protocol in P8-C. Until then a
-`cas` target cannot be declared in `agent.yaml`, and the crate keeps its own
-closed types (`CasNoteCode`, `CasSignal`, `CasEvent`, `CasHealth`).
+**Status**: wired into the agent (P8-B second part): `CasConnector` is the
+`Connector` of the `cas` engine, compiled into the binary with the `cas` Cargo
+feature (default). The `cas:` block of a target belongs to the core's schema
+(`databastion_core::config::cas`, re-exported in `config`), validated and
+resolved when `agent.yaml` is loaded. The crate's closed types
+(`CasNoteCode`, `CasSignal`, `CasEvent`, `CasHealth`) are mapped exhaustively
+to the core's `NoteCode` / `TargetHealth` and to the masked `MaskedEvent` /
+`Signal` before they leave the crate. Its targets, findings and events reach
+a console that lists `engine.cas` only (ADR-0042: held in the spool until
+then).
 
 ## Target
 
@@ -29,9 +34,10 @@ targets:
       client_addr: truncated               # clear | truncated (default) | omitted
 ```
 
-Absolute paths only, resolved when the configuration is loaded and refused
-under `/proc`, `/sys`, `/dev` and the agent's own directories. No `host`,
-`port`, `account` or `secret`.
+Absolute paths only, resolved when the configuration is loaded (or reloaded)
+and refused under `/proc`, `/sys`, `/dev` and the agent's `state_dir`. No
+`host`, `port`, `socket`, `account` or `secret` (refused by the core). Never
+detected locally (I5).
 
 ## Permissions
 
@@ -70,14 +76,29 @@ refused as a whole, and those files are never opened.
 - URLs (`scheme://…`, protocol-relative `//…`, and the escaped `\/\/` and
   `%2F%2F` forms) lose everything up to the last `@` or `%40` of the URL (the
   userinfo, whatever characters the password holds), then their query
-  string and fragment, before classification. An `@` before the `//` (JDBC
-  `thin:scott/tiger@//db`) drops everything before it; without a `//`, an
-  `@` preceded by `:` or `/` (`user:pass@host`, JDBC `scott/tiger@db:1521:SID`)
-  drops everything up to it. Plain e-mail addresses are kept.
+  string, fragment and `;` parameters (JDBC SQL Server `;password=…`, path
+  parameters such as `;jsessionid=`), before classification. An `@` before
+  the `//` (JDBC `thin:scott/tiger@//db`) drops everything before it;
+  without a `//`, an `@` preceded by `:`, `%3A`, `/`, `;` or `|`
+  (`user:pass@host`, JDBC `scott/tiger@db:1521:SID`) drops everything up to
+  the last `@`, then the query string and fragment go, and the `;`
+  parameters when a `:` precedes them (`jdbc:sqlserver:db;password=…`).
+  Plain e-mail addresses are kept; a `;`-separated address list reads as a
+  userinfo and loses all but its last domain (over-stripping, accepted).
+  **Residual forms** (not stripped): a credential in a token without `//`,
+  `@` nor `?`, `#`, `;` (`user:password` alone, `password=…` as plain
+  text), one separated from its URL by a blank, a quote or a backquote (the
+  token ends there), a password whose userinfo is not followed by an `@`
+  (`https://host/?` with a custom header scheme, `sftp://user,pass:host`),
+  and encodings other than the percent and JSON-escaped forms above
+  (double percent-encoding, HTML entities, base64). Such a value is still
+  only classified: what leaves is a masked sample (at most 4 characters of
+  it kept) or a fingerprint, never the value.
 - Besides the four names of ADR-0041 decision 3, a directory holding
   `application[-*]`, `cas[-*]` or `bootstrap[-*]` `.yml` / `.yaml` /
   `.properties` files, or key material (`thekeystore`, `*.jwks`, `*.jks`,
-  `*.p12`, `*.pem`, `*.key`, `*.pfx`, `*.jceks`, `*.keystore`, `*.bcfks`), is
+  `*.jwk`, `*.p12`, `*.pkcs12`, `*.p8`, `*.pem`, `*.der`, `*.key`, `*.pfx`,
+  `*.jceks`, `*.keystore`, `*.bcfks`), is
   refused as a whole. An entry on another device than the
   directory (a mount point) is skipped.
 - Per scan, at most 32 MiB of values are pooled, and at most 512 `serviceId`
@@ -91,6 +112,14 @@ refused as a whole, and those files are never opened.
   log is classified as `audit_trail` / `audit_log` / `who`.
 
 ## Audit log
+
+The core tailer opens the log with `O_NOFOLLOW` (first open and every reopen
+after a rotation) and runs this crate's checks on its own handle after each
+(re)open (`Tailer::with_open_check`): the declared path still resolves where
+it did at load, a regular file with one hard link, not writable by the agent
+(owner, mode, `faccessat`, ancestors), the path bound to the handle's
+`(st_dev, st_ino)`. A symlink or a hard link swapped in at rotation is never
+read (security review of #138 L2).
 
 CAS must write the JSON audit format, one record per line, with a log layout
 that writes the message alone (`%m%n`), and should not log request headers
@@ -106,7 +135,16 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 - `what` (which can hold a ticket id, a live SSO bearer credential) is reduced
   to the service URL's scheme and host at parse time, used only to pick a
   registry entry, then dropped. Ticket ids are never kept, logged,
-  fingerprinted nor reported.
+  fingerprinted nor reported. Only a literal `@` ends a userinfo there; an
+  authority holding `%` or `\`, or followed by an `@` before the next `/`,
+  `?` or `#`, names no service (`*`), as does a lookup that reaches a
+  `serviceId` pattern that cannot be evaluated (Java-only syntax, or beyond
+  the compiled-pattern budget) before a match. The service index is the one
+  of the last Discovery scan, or is built when the stream starts if no scan
+  ran since the agent started.
+- `userAgent` keeps its first product token, reduced to the contract
+  `Principal.application` alphabet (`[A-Za-z0-9._:/+-]`, others become `_`)
+  and 64 characters.
 - Principals are fingerprinted except `clear_principals`; failed
   authentications always are.
 - Client addresses: IPv4-mapped and IPv4-compatible IPv6 addresses are read
@@ -120,15 +158,18 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   address and minute with the principal `*`) and
   `volume.failed_logins_one_account` (one principal, 20 failures within
   10 minutes). Client addresses come from `X-Forwarded-For` by default and are
-  only as trustworthy as the proxy in front of CAS.
+  only as trustworthy as the proxy in front of CAS. The windows are keyed by
+  tags of a random key made when the stream starts (never persisted nor
+  sent); failures aggregated because a window was full are counted in the
+  heartbeat metric `audit_window_overflow_total`. The `*` principal is
+  `EventPrincipal::many_accounts`: the core sends `db_user` `*` only for it,
+  on a `cas_audit_log` `auth_failure` with the many-accounts signal.
 - Level: never Full; Partial with a successful authentication and a service
   ticket in the last 24 h; Limited with one of them; None before any record.
 
 ## Not done yet
 
-The core tailer opens the audit log without `O_NOFOLLOW` and without this
-crate's validation hook: a gate for the wiring PR after P8-C (security review
-of #138 L2). YAML registries, the OIDC / OAuth token issuance actions (names to verify
-against CAS 8.0), the core wiring and the console rendering (P8-C), the CAS
-store guard in the other connectors, the CAS dev service and the end-to-end,
-I2 and load tests (P8-D).
+YAML registries, the OIDC / OAuth token issuance actions (names to verify
+against CAS 8.0), the CAS store guard in the other connectors (ticket
+registry metadata, `security.ticket_registry_unencrypted`), the CAS dev
+service and the end-to-end, I2 and load tests (P8-D).

@@ -73,6 +73,8 @@ fn compiled_connectors() -> Vec<Box<dyn Connector>> {
         Box::new(databastion_connector_mongodb::MongodbConnector::new()),
         #[cfg(feature = "openldap")]
         Box::new(databastion_connector_openldap::OpenldapConnector::new()),
+        #[cfg(feature = "cas")]
+        Box::new(databastion_connector_cas::CasConnector::new()),
     ]
 }
 
@@ -278,5 +280,6 @@ mod tests {
             engines.contains(&Engine::Openldap),
             cfg!(feature = "openldap")
         );
+        assert_eq!(engines.contains(&Engine::Cas), cfg!(feature = "cas"));
     }
 }

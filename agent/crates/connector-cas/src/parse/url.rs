@@ -5,14 +5,22 @@
 //!   URL in it (any token holding `//`: `scheme://…` and protocol-relative
 //!   `//…`) loses everything up to the **last** `@` (or `%40`) of the token
 //!   (the userinfo, whatever characters the password holds: `/`, `?`,
-//!   `#`, `:`, `%`), then its query string and fragment. Over-stripping (a
-//!   path holding `@`, a `?` of a regular expression `serviceId`) is
-//!   accepted. The result is a zeroizing buffer.
+//!   `#`, `:`, `%`), then its query string, fragment and `;` parameters
+//!   (JDBC SQL Server `;password=…`, path parameters). A token without
+//!   `//` loses everything up to its last `@` / `%40` when what precedes
+//!   it holds `:`, `%3A`, `/`, `;` or `|` (`user:pass@host`, JDBC
+//!   `scott/tiger@db`), then its query string and fragment, and its `;`
+//!   parameters when it holds a `:` before them (`jdbc:…;password=…`).
+//!   Over-stripping (a path holding `@`, a `?` of a regular expression
+//!   `serviceId`) is accepted. The result is a zeroizing buffer. Residual
+//!   forms are listed in the crate README.
 //! - [`service_of`]: the audit record's `what` is reduced to the scheme and
 //!   host of the first `http(s)://` URL it holds (searched without copying
 //!   `what`), used only to select a registry entry; the ticket id, the
 //!   userinfo, the path and the query string are dropped, and the host
-//!   itself never leaves the agent.
+//!   itself never leaves the agent. Only a literal `@` ends a userinfo; an
+//!   authority holding `%` or `\`, or followed by an `@` before the next
+//!   `/`, `?` or `#`, names no service (`*`).
 
 use zeroize::Zeroizing;
 
@@ -60,39 +68,60 @@ fn separator(t: &str) -> Option<(usize, usize)> {
     })
 }
 
-/// Index of the first `?`, `#`, `%3F` or `%23` (any case) of `t`.
-fn query_start(t: &str) -> usize {
+/// Index of the first `?`, `#`, `%3F` or `%23` (any case) of `t`, and of
+/// the first `;` or `%3B` too with `params`.
+fn query_start(t: &str, params: bool) -> usize {
     let b = t.as_bytes();
     (0..b.len())
         .find(|&i| {
             matches!(b.get(i), Some(b'?' | b'#'))
+                || (params && b.get(i) == Some(&b';'))
                 || b.get(i..i + 3).is_some_and(|w| {
-                    w.eq_ignore_ascii_case(b"%3f") || w.eq_ignore_ascii_case(b"%23")
+                    w.eq_ignore_ascii_case(b"%3f")
+                        || w.eq_ignore_ascii_case(b"%23")
+                        || (params && w.eq_ignore_ascii_case(b"%3b"))
                 })
         })
         .unwrap_or(b.len())
 }
 
+/// Whether the text before an `@` of a token without `//` is a userinfo
+/// (or a JDBC `user/password`): it holds `:`, `%3A`, `/`, `;` or `|`. A
+/// plain e-mail address's local part holds none of them.
+fn looks_like_userinfo(head: &str) -> bool {
+    head.contains([':', '/', ';', '|'])
+        || head
+            .as_bytes()
+            .windows(3)
+            .any(|w| w.eq_ignore_ascii_case(b"%3a"))
+}
+
 /// Appends one blank-free token, its URL credentials removed:
 /// - with a `//` (any form): an `@` before it drops everything up to that
 ///   `@` (JDBC `thin:scott/tiger@//db`); after it, everything up to the
-///   last `@` / `%40`, then the query and the fragment;
-/// - without one: an `@` preceded by `:` or `/` in the token (`user:pass@host`,
-///   JDBC `scott/tiger@db:1521:SID`) drops everything up to the last `@`.
-///   A plain e-mail address (no `:` nor `/` before its `@`) is kept, so it
-///   can still be classified.
+///   last `@` / `%40`, then the query, the fragment and the `;` parameters
+///   (JDBC SQL Server `//db:1433;user=sa;password=…`);
+/// - without one: an `@` preceded by a userinfo ([`looks_like_userinfo`]:
+///   `user:pass@host`, `user%3Apass@host`, JDBC `scott/tiger@db:1521:SID`)
+///   drops everything up to the last `@`; then the query and the fragment
+///   go, and the `;` parameters when a `:` precedes them
+///   (`jdbc:sqlserver:db;password=…`). A plain e-mail address (no
+///   userinfo character before its `@`) is kept, so it can still be
+///   classified.
 fn push_token(out: &mut String, token: &str) {
     let Some((i, len)) = separator(token) else {
         let cut = after_last_at(token);
-        let creds = cut > 0
-            && token
-                .get(..cut)
-                .is_some_and(|h| h.contains(':') || h.contains('/'));
-        out.push_str(if creds {
+        let creds = cut > 0 && token.get(..cut).is_some_and(looks_like_userinfo);
+        let rest = if creds {
             token.get(cut..).unwrap_or("")
         } else {
             token
-        });
+        };
+        let rest = rest.get(..query_start(rest, false)).unwrap_or("");
+        let params = rest
+            .find(';')
+            .is_some_and(|semi| rest.get(..semi).is_some_and(|h| h.contains(':')));
+        out.push_str(rest.get(..query_start(rest, params)).unwrap_or(""));
         return;
     };
     let head = token.get(..i).unwrap_or("");
@@ -101,7 +130,7 @@ fn push_token(out: &mut String, token: &str) {
     out.push_str("//");
     let tail = token.get(i + len..).unwrap_or("");
     let tail = tail.get(after_last_at(tail)..).unwrap_or("");
-    out.push_str(tail.get(..query_start(tail)).unwrap_or(""));
+    out.push_str(tail.get(..query_start(tail, true)).unwrap_or(""));
 }
 
 /// Removes the userinfo, query string and fragment of every URL in `s`
@@ -197,16 +226,32 @@ pub fn service_of(what: &str) -> Option<ServiceHost> {
     .filter_map(|(p, s)| find(p).map(|i| (i, *s, p.len())))
     .min_by_key(|(i, _, _)| *i)?;
     let tail = what.get(i + len..)?;
-    // The authority ends at the first `/`, `?`, `#` (or a delimiter);
-    // the host follows its last `@` / `%40`. An `@` of the path or the
-    // query is never read (an end user could otherwise choose the
-    // service); a password holding `/` leaves garbage, which is not a
-    // valid host or matches no service.
+    // The authority ends at the first `/`, `?`, `#` (or a delimiter); the
+    // host follows its last literal `@`. An `@` of the path or the query
+    // is never read (an end user could otherwise choose the service); a
+    // password holding `/` leaves garbage, which is not a valid host or
+    // matches no service. Ambiguous forms name no service (review of #138
+    // L1): an authority holding `%` (an encoded `@` or delimiter) or `\`,
+    // or an `@` left after the authority before the next `/`, `?` or `#`
+    // (a userinfo holding a delimiter such as `,` or `;`).
     let stop =
         |b: u8| matches!(b, b'/' | b'?' | b'#' | b',' | b';' | b')' | b'}' | b'|') || ends_url(b);
     let end = tail.bytes().position(stop).unwrap_or(tail.len());
     let authority = tail.get(..end)?;
-    let host_port = authority.get(after_last_at(authority)..)?;
+    if authority.contains(['%', '\\']) {
+        return None;
+    }
+    let rest = tail.get(end..)?;
+    let next = rest
+        .bytes()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    if rest.get(..next)?.contains('@') {
+        return None;
+    }
+    let host_port = authority
+        .rfind('@')
+        .map_or(Some(authority), |at| authority.get(at + 1..))?;
     let host = if host_port.starts_with('[') {
         host_port.get(..=host_port.find(']')?)?
     } else {
@@ -270,6 +315,36 @@ mod tests {
             ),
             ("://@?#", "://"),
             ("é://é@é/é?é", "é://é/é"),
+            // Review of #138 L-follow-ups: queries without `//`, `;`
+            // parameters, other userinfo separators.
+            ("svc:fake-pass@db.example.org?token=abc", "db.example.org"),
+            (
+                "jdbc:mysql:db.example.org?password=hunter2-SECRET",
+                "jdbc:mysql:db.example.org",
+            ),
+            (
+                "jdbc:sqlserver://db.example.org:1433;user=sa;password=hunter2-SECRET",
+                "jdbc:sqlserver://db.example.org:1433",
+            ),
+            (
+                "jdbc:sqlserver:db.example.org;password=hunter2-SECRET",
+                "jdbc:sqlserver:db.example.org",
+            ),
+            (
+                "https://h.example.org/app;jsessionid=FAKE0000",
+                "https://h.example.org/app",
+            ),
+            ("https://u;p@h.example.org/a", "https://h.example.org/a"),
+            ("u%3Ahunter2-SECRET@h.example.org", "h.example.org"),
+            ("u;hunter2-SECRET@h.example.org", "h.example.org"),
+            ("u|hunter2-SECRET@h.example.org", "h.example.org"),
+            // Over-stripping accepted: a `;`-separated address list reads
+            // as a userinfo.
+            ("jane.doe@example.org;john.roe@example.org", "example.org"),
+            (
+                "jane.doe@example.org,john.roe@example.org",
+                "jane.doe@example.org,john.roe@example.org",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(strip_credentials(input).as_str(), expected, "{input}");
@@ -305,6 +380,17 @@ mod tests {
             "https://u:p@hr.example.org/x?y=@other.example.org",
         ] {
             assert_eq!(s(w).as_deref(), Some("https://hr.example.org/"), "{w}");
+        }
+        // Ambiguous authorities name no service (review of #138).
+        for w in [
+            "https://u%40evil.example.org@hr.example.org/",
+            "https://evil.example.org%2F@hr.example.org/",
+            "https://u\\@hr.example.org/",
+            "https://u:p,w@hr.example.org/x",
+            "https://u:p;w@hr.example.org/x",
+            "https://u:p|w@hr.example.org/x",
+        ] {
+            assert_eq!(s(w), None, "{w}");
         }
         assert_eq!(s("TGT-9-FAKEfake-cas01"), None);
         assert_eq!(s("https://exa_mple.org/"), None);
