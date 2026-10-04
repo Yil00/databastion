@@ -28,15 +28,15 @@ DataBastion sits **as close to the data as possible**:
 ## Supported databases
 | Engine | Discovery | Audit (best level) | Audit source | Versions tested | Notes |
 |--------|-----------|--------------------|--------------|--------------|-------|
-| PostgreSQL | ✅ | Full with pgaudit and `pgaudit.log_rows = on` (Partial without it); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 14, 15, 16, 17, 18 (**17.11** with pgaudit on every change) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14. 14 is the minimum tested version: 13 (end of life) is not tested, and its `pg_stat_statements` Audit mode is unavailable (the connector relies on `pg_stat_statements_info`, PostgreSQL 14+) |
-| MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.0, 8.4, 9.7 (**8.4.11** on every change) | Privileges held through roles evaluated on 8.0.19+ |
+| PostgreSQL | ✅ | Full with pgaudit and `pgaudit.log_rows = on` (Partial without it); Limited with `pg_stat_statements` only | pgaudit log (`jsonlog` / `csvlog`), `pg_stat_statements` | 14, 15, 16, 17, 18 (**17.11** with pgaudit on every change) | pgaudit `jsonlog` needs PostgreSQL 15+, `csvlog` on 14. 14 is the minimum supported version: end-of-life versions (12, 13) are not supported ([ADR-0039](docs/adr/0039-engine-scope-expansion.md)), and the `pg_stat_statements` Audit mode relies on `pg_stat_statements_info` (PostgreSQL 14+) |
+| MySQL Community | ✅ | Partial / Limited, never Full | `performance_schema` | 8.0, 8.4, 9.7 (**8.4.11** on every change) | Requires MySQL 8.0+ (enforced; 5.7, end of life, is not supported). Privileges held through roles evaluated on 8.0.19+ |
 | Percona Server for MySQL | ✅ | Partial, never Full | `audit_log` / `audit_log_filter` JSON log | 8.4 (8.4.11-11) | |
 | MariaDB | ✅ | Partial, never Full | `server_audit` log file, or `performance_schema` | 10.11, 11.4, 11.8 (**11.4.13** on every change) | `PUBLIC` grants checked on 10.11+ |
-| MongoDB Community | ✅ | Limited (slow operations only) | Server log, profiler | 6.0, 7.0, 8.0 (**8.0.32** on every change) | Requires MongoDB 5.0+ (enforced), SCRAM-SHA-256, one declared host |
+| MongoDB Community | ✅ | Limited (slow operations only) | Server log, profiler | 6.0, 7.0, 8.0 (**8.0.32** on every change) | Requires MongoDB 5.0+ (enforced; 4.x, end of life, is not supported), SCRAM-SHA-256, one declared host |
 | MongoDB Enterprise / Percona Server for MongoDB | ✅ | Partial, never Full | `auditLog` JSON file | Percona Server for MongoDB 8.0 (8.0.32-14) | MongoDB Enterprise: recorded log samples only |
 | OpenLDAP | ✅ | Full when reads and failed operations are proven logged for every naming context; Partial / Limited otherwise | `slapo-accesslog` (`cn=accesslog`) | Debian bookworm `slapd` (OpenLDAP 2.5) | |
 
-*CAS planned right after the MVP.*
+*Planned, not supported yet*: CAS (ROADMAP phase 8), Microsoft SQL Server, Redis and Valkey (phase 9), SQLite and Firebird (phase 10). Their expected audit levels are lower than the engines above for some (Redis and Valkey Limited at best, SQLite Discovery only): see the [roadmap](docs/ROADMAP.md#after-the-mvp) and [ADR-0039](docs/adr/0039-engine-scope-expansion.md), proposed. End-of-life engine versions are not supported.
 
 - **Versions tested**: the connector integration tests run weekly on every listed version, and on changes to the connectors or the dev images (engine-matrix workflow, [`.github/workflows/engine-matrix.yml`](.github/workflows/engine-matrix.yml); not a required check). The version in bold is also tested on every change, with the end-to-end tests. Percona Server and OpenLDAP: the version listed only. Other versions are expected to work but are not tested.
 - **Audit levels** (Full / Partial / Limited / None), their prerequisites and each engine's limits: [capability matrix](docs/08-engine-capabilities.md#matrix). Each target reports its actual level in the console.
@@ -78,7 +78,7 @@ Details: [architecture](docs/02-architecture.md) · [security](docs/05-security.
 | License | Apache 2.0 | Commercial |
 | Discovery + Audit, all connectors | ✅ | ✅ |
 | Policies, incidents, email / webhook alerting | ✅ | ✅ |
-| Local auth (OIDC planned), console audit log | ✅ | ✅ |
+| Local auth (OIDC planned, [ADR-0038](docs/adr/0038-console-oidc-login.md)), console audit log | ✅ | ✅ |
 | Multi-tenancy, fine-grained RBAC, SAML / SCIM | | ✅ |
 | Advanced Prevention mode, SIEM export, compliance reports | | ✅ |
 | Support & SLA | | ✅ |

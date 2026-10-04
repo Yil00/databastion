@@ -1,7 +1,7 @@
 # MVP scope – DataBastion
 
 ## MVP objective
-Ship a first **useful and stable** version (v0.1.0), focused on Linux and the priority use cases. Breakdown into phases: [ROADMAP.md](ROADMAP.md).
+Ship a first **useful and stable** version (v0.1.0), focused on Linux and the priority use cases. Breakdown into phases: [ROADMAP.md](ROADMAP.md); phase numbers below refer to its phases after the MVP.
 
 ## Included in the MVP
 - Web console (Next.js): agents, targets, findings, incidents, policies
@@ -23,14 +23,16 @@ Auditing depends on what the engine logs natively. DataBastion **does not promis
 ## Deliberately excluded from the MVP
 | Item | Reason | Planned phase |
 |---------|--------|--------------|
-| CAS | Lower priority | 1.5 |
-| Real-time Prevention mode | Requires proxy / hooks | 2 |
-| Helm / Kubernetes | Compose is enough for the MVP | 2 |
-| Agent ↔ console mTLS | Token + TLS are enough for the MVP | 2 |
-| Advanced machine learning | Too heavy for an MVP | 2/3 |
-| Multi-tenancy, fine-grained RBAC, SAML | Enterprise ([EDITIONS.md](EDITIONS.md)) | 2+ |
-| Windows / macOS / iOS | High complexity | 3+ |
-| Endpoint agent on user workstations | Outside the "as close to the database as possible" positioning | 3+ |
+| CAS | Lower priority | 8 |
+| Console login with OIDC | Local accounts are enough for the MVP | 8 ([ADR-0038](adr/0038-console-oidc-login.md), proposed) |
+| Microsoft SQL Server, Redis, Valkey, SQLite, Firebird | Wider engine scope after the MVP | 9 and 10 ([ADR-0039](adr/0039-engine-scope-expansion.md), proposed) |
+| Helm / Kubernetes | Compose is enough for the MVP | 11 |
+| Agent ↔ console mTLS | Token + TLS are enough for the MVP | 11 (ADR first) |
+| Real-time Prevention mode | Requires being in the data path | Community: recommended actions and response hooks, phase 12; blocking proxy: Enterprise ([ADR-0040](adr/0040-prevention-mode-scope.md)) |
+| Advanced machine learning | Too heavy for an MVP | Enterprise ([EDITIONS.md](EDITIONS.md)) |
+| Multi-tenancy, fine-grained RBAC, SAML | Enterprise ([EDITIONS.md](EDITIONS.md)) | Enterprise |
+| Windows / macOS / iOS | High complexity | 13+ |
+| Endpoint agent on user workstations | Outside the "as close to the database as possible" positioning | Not planned |
 
 ## MVP success criteria
 - Console + one agent deployed in **under 15 minutes** via Docker Compose

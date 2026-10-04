@@ -7,6 +7,10 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 📝 Documentation
+- Roadmap after the MVP: phases 8 (console OIDC login, CAS connector), 9 (Microsoft SQL Server, Redis, Valkey), 10 (SQLite, Firebird), 11 (Helm, mTLS, OTLP, gRPC, event storage at scale), 12 (recommended actions and response hooks) and 13+, with a per-owner view ([docs/ROADMAP.md](docs/ROADMAP.md#after-the-mvp)). Nothing in these phases is implemented yet
+- ADR-0038 (proposed): console login with OpenID Connect; ADR-0039 (proposed): engine scope expansion, with end-of-life engine versions (PostgreSQL 12 / 13, MySQL 5.7, MongoDB 4.x) not supported; ADR-0040 (accepted): prevention mode scope, Community gets recommended actions and response hooks only, blocking stays Enterprise
+
 ## [0.3.1](https://github.com/Yil00/databastion/compare/0.3.0...0.3.1) (2026-10-04)
 
 ### 👷 CI

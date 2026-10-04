@@ -8,7 +8,7 @@ DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-ope
 │               (this repository, public)                  │
 │  • Console: agents, targets, findings, incidents         │
 │  • Agent + PostgreSQL, MySQL/MariaDB, MongoDB,           │
-│    OpenLDAP connectors (and CAS in phase 1.5)            │
+│    OpenLDAP connectors (CAS and more engines planned)    │
 │  • Discovery + Audit, standard classifiers               │
 │  • Simple policies, email / webhook alerting             │
 │  • Local auth + OIDC                                     │
@@ -37,6 +37,8 @@ DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-ope
 3. A Community feature is never removed to be moved into Enterprise.
 
 > Difference from the initial table: **OIDC** and the baseline **audit log** stay in Community. What moves to Enterprise is SAML/SCIM and the *advanced* audit log (export, retention, tamper-proofing).
+
+Prevention: the Community edition offers recommended actions and response hooks, never in the data path; the blocking proxy, session kill and grant revocation are Enterprise ([ADR-0040](adr/0040-prevention-mode-scope.md)).
 
 ## Licenses
 - Community Edition → [Apache License 2.0](../LICENSE)
