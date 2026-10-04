@@ -265,6 +265,36 @@ proptest! {
     #[test]
     fn grant_lines_never_panic(line in "\\PC{0,200}") {
         let _ = crate::grants::parse_line(&line);
+        // The CAS store guard's reading of the same line never panics and
+        // understands no line `parse_line` refuses.
+        let selects = crate::grants::select_grants(&line);
+        if crate::grants::parse_line(&line).is_none() {
+            prop_assert_eq!(selects, None);
+        }
+    }
+
+    /// The CAS store guard's `SELECT` grants keep the quoted table and
+    /// column names as data, whatever they hold.
+    #[test]
+    fn select_grants_keep_quoted_names(
+        db in "\\PC{1,24}",
+        table in "\\PC{1,24}",
+        column in "\\PC{1,24}",
+    ) {
+        let line = format!(
+            "GRANT INSERT, SELECT ({}) ON {}.{} TO `u`@`%`",
+            quoted(&column),
+            quoted(&db),
+            quoted(&table),
+        );
+        prop_assert_eq!(
+            crate::grants::select_grants(&line),
+            Some(vec![crate::grants::SelectGrant {
+                db: Some(db),
+                table: Some(table),
+                columns: Some(vec![column]),
+            }])
+        );
     }
 
     /// Names are data: whatever a quoted database, table, grantee or

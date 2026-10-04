@@ -644,6 +644,10 @@ struct Runtime {
     /// Targets whose audit stream was stopped after [`AUDIT_MAX_PANICS`]
     /// panics in a row, with that count (reported as a target note).
     audit_parked: Mutex<std::collections::HashMap<String, u32>>,
+    /// Per target, the CAS store guard tally of its latest Discovery scan
+    /// (ADR-0041 decision 5): `coverage.cas_guard_tripped` and
+    /// `security.ticket_registry_unencrypted` in the target's notes.
+    cas_guards: Mutex<std::collections::HashMap<String, Arc<crate::cas_guard::ScanGuard>>>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
     /// Longest wait for a scan's findings to be acknowledged before its
@@ -829,6 +833,7 @@ impl Runtime {
             check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_parked: Mutex::new(std::collections::HashMap::new()),
+            cas_guards: Mutex::new(std::collections::HashMap::new()),
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
             turns: Mutex::new(crate::checks::TurnState::default()),
@@ -1130,6 +1135,21 @@ impl Runtime {
                 (AuditLevel::None, notes)
             }
             None => (level, notes),
+        };
+        // The CAS store guard's findings of the latest scan (counts only;
+        // not on `cas` targets, whose notes do not list these codes).
+        let notes = {
+            let mut notes = notes;
+            if target.engine != crate::config::TargetEngine::Cas
+                && let Some(g) = self
+                    .cas_guards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&target.id)
+            {
+                notes.extend(g.notes());
+            }
+            notes
         };
         let audit_source = match connector {
             Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
@@ -2839,6 +2859,11 @@ impl Runtime {
         // security review): derived from the job id.
         let seed = id.get().as_u64_pair().1;
         let scan = scan.with_cancel(token).with_rotation(seed);
+        // The guard tally of this scan replaces the previous scan's.
+        self.cas_guards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target_id.as_str().to_owned(), Arc::clone(scan.cas_guard()));
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());

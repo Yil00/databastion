@@ -48,6 +48,8 @@ tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
 # graph (`exclude-dev`), the shipped binary never links it.
 wiremock = "0.6"
 tracing-subscriber.workspace = true
+# Property tests of the CAS store guard in the shared sampling path.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

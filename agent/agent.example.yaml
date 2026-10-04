@@ -73,6 +73,13 @@ targets:
       # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
       # the membership as an expected warning instead of over-privilege.
       extended_grants: false
+      # CAS store guard (always on, ADR-0041): CAS stores under custom names,
+      # in addition to the built-in names, column shapes and the ticket-id
+      # tripwire. Ticket registries are never sampled (ticket counts only).
+      # cas_stores:
+      #   ticket_registry: [sso_tickets]
+      #   service_registry: [cas_services]
+      #   audit_trail: [cas_audit]
       # pgaudit server log file (P4-A), read by the agent on this host (never
       # through SQL); a fixed log_filename, rotation by rename or truncation
       # is followed. Readable by the agent user, never writable by it:

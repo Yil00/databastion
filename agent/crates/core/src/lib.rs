@@ -11,6 +11,9 @@
 //!   They only carry masked types from `databastion_classifiers::masking`.
 //! - [`audit`]: persisted audit cursors ([`audit::CursorStore`]), and
 //!   (crate-private) pre-aggregation and the `audit.configure` filter.
+//! - [`cas_guard`]: the CAS store guard of every database and directory
+//!   connector (ADR-0041 decision 5): store recognition, column rules,
+//!   ticket registry metadata.
 //! - [`notes`]: closed target notes ([`NoteCode`], [`TargetNote`]) that
 //!   `check()` reports with [`TargetHealth`].
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
@@ -38,6 +41,7 @@
 pub mod audit;
 mod backoff;
 mod capabilities;
+pub mod cas_guard;
 mod checks;
 pub mod config;
 pub mod connector;

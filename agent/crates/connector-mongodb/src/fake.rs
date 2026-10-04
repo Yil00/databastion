@@ -159,6 +159,17 @@ fn frame(response_to: i32, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Whether an aggregate's first stage is a `$group`.
+fn group_stage(body: &Doc<'_>) -> bool {
+    body.array("pipeline")
+        .unwrap()
+        .and_then(|p| match p.iter().next() {
+            Some(Ok((_, Value::Doc(stage)))) => stage.doc("$group").unwrap(),
+            _ => None,
+        })
+        .is_some()
+}
+
 fn keys_have(body: &Doc<'_>, key: &str) -> bool {
     body.get(key).unwrap().is_some()
 }
@@ -369,6 +380,27 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                         )
                         .i32("ok", 1)
                         .finish(),
+                    // The CAS store guard's `$group` on `type`.
+                    Some(c) if name == "aggregate" && group_stage(&body) => {
+                        let mut groups: Vec<(String, i64)> = Vec::new();
+                        for d in &c.docs {
+                            let t = Doc::new(d)
+                                .unwrap()
+                                .str("type")
+                                .unwrap()
+                                .unwrap_or("")
+                                .to_owned();
+                            match groups.iter_mut().find(|(k, _)| *k == t) {
+                                Some((_, n)) => *n += 1,
+                                None => groups.push((t, 1)),
+                            }
+                        }
+                        let docs: Vec<Vec<u8>> = groups
+                            .iter()
+                            .map(|(t, n)| DocBuf::new().str("_id", t).i64("n", *n).finish())
+                            .collect();
+                        cursor_reply(&db, &c.name, &docs, 0)
+                    }
                     Some(c) => {
                         let n = usize::try_from(size.unwrap_or(0)).unwrap();
                         let docs: Vec<Vec<u8>> = c.docs.iter().take(n).cloned().collect();
@@ -538,6 +570,18 @@ fn target() -> TargetConfig {
 }
 
 async fn run_scan(script: Script) -> (Result<u64, ConnectorError>, Vec<MaskedFinding>, Log) {
+    let (r, findings, log, _) = run_scan_job(script).await;
+    (r.map(|o| o.timeseries_refused), findings, log)
+}
+
+async fn run_scan_job(
+    script: Script,
+) -> (
+    Result<discover::ScanOutcome, ConnectorError>,
+    Vec<MaskedFinding>,
+    Log,
+    ScanJob,
+) {
     let t = target();
     let job = ScanJob::new(
         ScanParams::contract_defaults(),
@@ -563,7 +607,7 @@ async fn run_scan(script: Script) -> (Result<u64, ConnectorError>, Vec<MaskedFin
     while let Some(f) = rx.recv().await {
         out.push(f);
     }
-    (r, out, log)
+    (r, out, log, job)
 }
 
 #[tokio::test]
@@ -1335,4 +1379,214 @@ async fn profiler_polls_are_bounded_and_resume_after_what_was_read() {
         .unwrap_err();
     assert!(!e.fatal);
     s.close().await;
+}
+
+// ------------------------------------------------------- CAS store guard
+
+/// Fake ticket ids (never valid anywhere).
+const TICKETS: [&str; 3] = [
+    "TGT-1-FakeTgtValueAaaaaaaaaaaaaaaa-cas01",
+    "ST-2-FakeStValueBbbbbbbbbbbbbbbbb-cas01",
+    "ST-3-FakeStValueCcccccccccccccccc-cas01",
+];
+const PRINCIPAL: &str = "ticket.owner@example.org";
+
+fn ticket_doc(id: &str, kind: &str) -> Vec<u8> {
+    DocBuf::new()
+        .str("_id", id)
+        .str("type", kind)
+        .str(
+            "json",
+            &format!("{{\"id\":\"{id}\",\"principal\":\"{PRINCIPAL}\"}}"),
+        )
+        .str("principal", PRINCIPAL)
+        .date("expireAt", 1_800_000_000_000)
+        .finish()
+}
+
+/// ADR-0041 decisions 5 and 14 over the wire: a ticket collection under a
+/// built-in name (never read, its `type` counts only), one renamed
+/// (recognized by its document shape, dropped unclassified), a plain
+/// collection with ticket-id-shaped values (the tripwire), an audit trail
+/// (ticket ids excluded by projection, principals without masked samples)
+/// and a service registry (no masked samples, no `secret.*` fingerprints).
+#[tokio::test]
+async fn cas_store_guard_over_the_wire() {
+    let tgt = "org.apereo.cas.ticket.TicketGrantingTicketImpl";
+    let st = "org.apereo.cas.ticket.ServiceTicketImpl";
+    let enc = "org.apereo.cas.ticket.registry.EncodedTicket";
+    let refs: Vec<Vec<u8>> = (0..30)
+        .map(|i| {
+            DocBuf::new()
+                .str("_id", &format!("r{i}"))
+                .str("ref", if i % 7 == 0 { TICKETS[2] } else { "ref-x" })
+                .str("email", &format!("guard.user{i}@example.com"))
+                .finish()
+        })
+        .collect();
+    let audit: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            DocBuf::new()
+                .str("principal", &format!("audit.user{i}@example.net"))
+                .str("actionPerformed", "SERVICE_TICKET_CREATED")
+                .str("clientIpAddress", &format!("192.0.2.{i}"))
+                .finish()
+        })
+        .collect();
+    let services: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            DocBuf::new()
+                .str("@class", "org.apereo.cas.services.OidcRegisteredService")
+                .str("serviceId", &format!("https://app{i}.example.com/.*"))
+                .str("clientSecret", &format!("AKIA{i:0>16}"))
+                .str("description", &format!("owner{i}@example.com"))
+                .finish()
+        })
+        .collect();
+    let script = Script {
+        databases: vec![(
+            "cas".to_owned(),
+            vec![
+                FakeColl::new(
+                    "serviceTicketsCollection",
+                    vec![ticket_doc(TICKETS[1], st), ticket_doc("x-1", enc)],
+                ),
+                FakeColl::new(
+                    "sso_sessions_v2",
+                    vec![ticket_doc(TICKETS[0], tgt), ticket_doc(TICKETS[1], st)],
+                ),
+                FakeColl::new("app_sessions", refs),
+                FakeColl::new("MongoDbCasAuditRepository", audit),
+                FakeColl::new("cas-service-registry", services),
+            ],
+        )],
+        ..Script::default()
+    };
+    let (r, findings, log, job) = run_scan_job(script).await;
+    let outcome = r.unwrap();
+    let received = log.lock().unwrap().clone();
+    let reads = |coll: &str| -> Vec<Received> {
+        received
+            .iter()
+            .filter(|c| c.collection.as_deref() == Some(coll))
+            .cloned()
+            .collect()
+    };
+    // Built-in name: one `$group` aggregate, no `find` nor `count`.
+    let built_in = reads("serviceTicketsCollection");
+    assert_eq!(built_in.len(), 1, "{built_in:?}");
+    assert_eq!(built_in[0].name, "aggregate");
+    // Renamed: read once (shape recognized), then its `$group`.
+    assert!(
+        reads("sso_sessions_v2")
+            .iter()
+            .any(|c| c.name == "aggregate" && c.size.is_none())
+    );
+    // The audit trail is read without its ticket ids and headers.
+    let audit_find = reads("MongoDbCasAuditRepository");
+    assert!(
+        audit_find
+            .iter()
+            .any(|c| c.name == "find" && c.keys.iter().any(|k| k == "projection")),
+        "{audit_find:?}"
+    );
+    assert_eq!(job.cas_guard().registries(), 2);
+    assert_eq!(job.cas_guard().unencrypted(), 3);
+    assert_eq!(job.cas_guard().tripped(), 1);
+    let at = |object: &str, field: &str| {
+        findings
+            .iter()
+            .filter(|f| {
+                let l = f.location().unwrap();
+                l.object.as_str() == object && l.field.as_str() == field
+            })
+            .collect::<Vec<_>>()
+    };
+    for f in &findings {
+        let o = f.location().unwrap().object.as_str();
+        assert!(
+            o != "sso_sessions_v2" && o != "serviceTicketsCollection",
+            "{f:?}"
+        );
+    }
+    assert!(at("app_sessions", "ref").is_empty());
+    assert_eq!(at("app_sessions", "email").len(), 1, "{findings:?}");
+    let principal = at("MongoDbCasAuditRepository", "principal");
+    assert_eq!(principal.len(), 1, "{findings:?}");
+    assert!(principal[0].masked_samples().is_empty());
+    let registry: Vec<_> = findings
+        .iter()
+        .filter(|f| f.location().unwrap().object.as_str() == "cas-service-registry")
+        .collect();
+    assert!(!registry.is_empty(), "{findings:?}");
+    for f in &registry {
+        assert!(f.masked_samples().is_empty(), "{f:?}");
+        if f.classifier().is_secret() {
+            assert!(f.fingerprints().is_empty(), "{f:?}");
+        }
+    }
+    let text = format!("{findings:?}");
+    for v in TICKETS.iter().chain([&PRINCIPAL]) {
+        assert!(!text.contains(v), "{v} leaked");
+    }
+    // Recorded for check(): both ticket registries and the audit trail.
+    let mut recorded: Vec<&str> = outcome
+        .cas_stores
+        .iter()
+        .map(|(_, c, _)| c.as_str())
+        .collect();
+    recorded.sort_unstable();
+    assert_eq!(
+        recorded,
+        [
+            "MongoDbCasAuditRepository",
+            "serviceTicketsCollection",
+            "sso_sessions_v2"
+        ]
+    );
+}
+
+#[test]
+fn find_scopes_of_connection_status() {
+    use crate::privileges::{FindScope, find_scopes};
+    let p = |res: DocBuf, actions: &[&str]| {
+        DocBuf::new()
+            .doc("resource", res)
+            .array_str("actions", actions)
+            .finish()
+    };
+    let privileges = [
+        p(
+            DocBuf::new()
+                .str("db", "cas")
+                .str("collection", "cas_tickets"),
+            &["find"],
+        ),
+        p(
+            DocBuf::new().str("db", "app").str("collection", ""),
+            &["find", "listCollections"],
+        ),
+        p(
+            DocBuf::new().str("db", "x").str("collection", "y"),
+            &["insert"],
+        ),
+        p(DocBuf::new().bool("cluster", true), &["find"]),
+        p(DocBuf::new().bool("anyResource", true), &["anyAction"]),
+        p(DocBuf::new().str("db", "").str("collection", ""), &["find"]),
+    ];
+    let reply = DocBuf::new()
+        .doc(
+            "authInfo",
+            DocBuf::new().raw(0x04, "authenticatedUserPrivileges", &array_of(&privileges)),
+        )
+        .finish();
+    assert_eq!(
+        find_scopes(Doc::new(&reply).unwrap()).unwrap(),
+        [
+            FindScope::Collection("cas".into(), "cas_tickets".into()),
+            FindScope::Database("app".into()),
+            FindScope::Any,
+            FindScope::Any,
+        ]
+    );
 }

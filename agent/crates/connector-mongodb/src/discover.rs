@@ -18,6 +18,7 @@ use databastion_classifiers::masking::{FindingLocation, RawSample};
 use databastion_classifiers::names::{
     NormalizedName, PathPart, normalize_field_path, normalize_path,
 };
+use databastion_core::cas_guard::{self, StoreKind, TicketCounts};
 use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 use std::future::Future;
@@ -71,32 +72,155 @@ pub(crate) fn method(estimated: Option<u64>, n: u32) -> Method {
     }
 }
 
-/// The read command of one collection.
+/// Fields of a CAS audit trail document never returned by the server
+/// (CAS store guard, ADR-0041 decision 5: ticket ids, request headers with
+/// cookies, extra info), excluded by projection.
+pub(crate) const AUDIT_EXCLUDED: [&str; 8] = [
+    "resourceOperatedUpon",
+    "AUD_RESOURCE",
+    "headers",
+    "AUD_HEADERS",
+    "extraInfo",
+    "AUD_EXTRA_INFO",
+    "clientInfo.headers",
+    "clientInfo.extraInfo",
+];
+
+fn audit_projection() -> DocBuf {
+    AUDIT_EXCLUDED
+        .iter()
+        .fold(DocBuf::new(), |d, f| d.i32(f, 0))
+}
+
+/// The read command of one collection (tests: the scan uses
+/// [`read_command_for`]).
+#[cfg(test)]
 pub(crate) fn read_command(collection: &str, method: Method, n: u32) -> DocBuf {
+    read_command_for(collection, method, n, None)
+}
+
+/// [`read_command`] for a collection the CAS store guard recognized by
+/// name: an audit trail is read without the fields it must never give.
+pub(crate) fn read_command_for(
+    collection: &str,
+    method: Method,
+    n: u32,
+    kind: Option<StoreKind>,
+) -> DocBuf {
     let n = i64::from(n.max(1));
+    let audit = kind == Some(StoreKind::AuditTrail);
+    let find = |d: DocBuf| {
+        if audit {
+            d.doc("projection", audit_projection())
+        } else {
+            d
+        }
+    };
     match method {
         Method::Sample => DocBuf::new()
             .str("aggregate", collection)
-            .array(
-                "pipeline",
-                vec![DocBuf::new().doc("$sample", DocBuf::new().i64("size", n))],
-            )
+            .array("pipeline", {
+                let mut stages = vec![DocBuf::new().doc("$sample", DocBuf::new().i64("size", n))];
+                if audit {
+                    stages.push(DocBuf::new().doc("$project", audit_projection()));
+                }
+                stages
+            })
             // One more than the sample: the pipeline is exhausted in the
             // first reply, so the server closes the cursor.
             .doc("cursor", DocBuf::new().i64("batchSize", n + 1))
             .bool("allowDiskUse", false),
-        Method::Natural => DocBuf::new()
-            .str("find", collection)
-            .doc("filter", DocBuf::new())
-            .i64("limit", n)
-            .i64("batchSize", n)
-            .bool("singleBatch", true),
-        Method::NaturalView => DocBuf::new()
-            .str("find", collection)
-            .doc("filter", DocBuf::new())
-            .i64("limit", n)
-            .i64("batchSize", n + 1),
+        Method::Natural => find(
+            DocBuf::new()
+                .str("find", collection)
+                .doc("filter", DocBuf::new()),
+        )
+        .i64("limit", n)
+        .i64("batchSize", n)
+        .bool("singleBatch", true),
+        Method::NaturalView => find(
+            DocBuf::new()
+                .str("find", collection)
+                .doc("filter", DocBuf::new()),
+        )
+        .i64("limit", n)
+        .i64("batchSize", n + 1),
     }
+}
+
+/// Most `type` values read from a ticket registry collection.
+const MAX_TICKET_TYPES: i64 = 256;
+
+/// The CAS store guard's only read of a ticket registry collection
+/// (ADR-0041 decision 5): `$group` on `type` with a count, nothing else.
+pub(crate) fn ticket_types_command(collection: &str) -> DocBuf {
+    DocBuf::new()
+        .str("aggregate", collection)
+        .array(
+            "pipeline",
+            vec![
+                DocBuf::new().doc(
+                    "$group",
+                    DocBuf::new()
+                        .str("_id", "$type")
+                        .doc("n", DocBuf::new().i32("$sum", 1)),
+                ),
+                DocBuf::new().i64("$limit", MAX_TICKET_TYPES),
+            ],
+        )
+        .doc(
+            "cursor",
+            DocBuf::new().i64("batchSize", MAX_TICKET_TYPES + 1),
+        )
+        .bool("allowDiskUse", false)
+}
+
+/// Runs [`ticket_types_command`]: ticket counts per `type`. An open
+/// cursor in the reply is killed.
+pub(crate) async fn ticket_metadata<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    db: &str,
+    collection: &str,
+) -> Result<TicketCounts, MgError> {
+    let reply = session
+        .command(
+            Stage::Sample,
+            db,
+            ticket_types_command(collection),
+            Kind::Read,
+        )
+        .await?;
+    let bad = |_| non_fatal(FailureCode::Internal);
+    let (cursor_id, counts) = {
+        let doc = reply.doc();
+        let cursor = doc.doc("cursor").ok().flatten();
+        let cursor_id = cursor.and_then(|c| c.int("id").ok().flatten()).unwrap_or(0);
+        let counts = (|| {
+            let batch = cursor
+                .ok_or(non_fatal(FailureCode::Internal))?
+                .array("firstBatch")
+                .map_err(bad)?
+                .ok_or(non_fatal(FailureCode::Internal))?;
+            let mut counts = TicketCounts::default();
+            for element in batch.iter() {
+                let (_, Value::Doc(group)) = element.map_err(bad)? else {
+                    return Err(non_fatal(FailureCode::Internal));
+                };
+                // A `type` that is not a string (or absent) counts as an
+                // unknown kind stored in clear.
+                let kind = group.str("_id").ok().flatten().unwrap_or("");
+                let n = group.int("n").map_err(bad)?.unwrap_or(0);
+                counts.add(kind, u64::try_from(n).unwrap_or(0));
+            }
+            Ok(counts)
+        })();
+        (cursor_id, counts)
+    };
+    drop(reply);
+    if cursor_id != 0 {
+        session.kill_cursor(db, collection, cursor_id).await;
+    }
+    counts
 }
 
 /// A sampled collection: the values by normalized path, the estimate.
@@ -104,7 +228,14 @@ pub(crate) struct Sampled {
     pub(crate) collector: Collector,
     pub(crate) estimated_rows: Option<u64>,
     pub(crate) method: Method,
+    /// Top-level field names of the documents read (at most
+    /// [`MAX_TOP_KEYS`]), for the CAS store guard's shape recognition;
+    /// only compared, never logged.
+    pub(crate) top_keys: Vec<String>,
 }
+
+/// Most top-level field names kept per collection.
+const MAX_TOP_KEYS: usize = 64;
 
 impl std::fmt::Debug for Sampled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -148,11 +279,25 @@ fn non_fatal(code: FailureCode) -> MgError {
 /// time-series collection it would unpack every bucket), then one `find`
 /// or `aggregate`, walked into a [`Collector`] of at most `n` values per
 /// path. An open cursor in the reply is killed.
+#[cfg(test)]
 pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session<S>,
     db: &str,
     collection: &Collection,
     n: u32,
+) -> Result<Sampled, MgError> {
+    sample_collection_for(session, db, collection, n, None).await
+}
+
+/// [`sample_collection`] for a collection the CAS store guard recognized
+/// by name (`kind`): an audit trail is read without the fields it must
+/// never give ([`read_command_for`]).
+pub(crate) async fn sample_collection_for<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    db: &str,
+    collection: &Collection,
+    n: u32,
+    kind: Option<StoreKind>,
 ) -> Result<Sampled, MgError> {
     let estimated_rows = match collection.kind {
         CollKind::Collection => Some(count(session, db, &collection.name).await?),
@@ -166,13 +311,14 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
         .command(
             Stage::Sample,
             db,
-            read_command(&collection.name, method, n),
+            read_command_for(&collection.name, method, n, kind),
             Kind::Read,
         )
         .await?;
     // The cursor id is read first: whatever happens to the documents, an
     // open cursor is killed before returning (no session id is sent, so
     // closing the connection would not release it).
+    let mut top_keys: Vec<String> = Vec::new();
     let (cursor_id, parsed) = {
         let doc = reply.doc();
         let bad = |_| non_fatal(FailureCode::Internal);
@@ -196,6 +342,17 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 documents.push(document);
             }
+            for document in &documents {
+                for element in document.iter() {
+                    let (key, _) = element.map_err(bad)?;
+                    if top_keys.len() < MAX_TOP_KEYS
+                        && let Ok(k) = std::str::from_utf8(key)
+                        && !top_keys.iter().any(|t| t == k)
+                    {
+                        top_keys.push(k.to_owned());
+                    }
+                }
+            }
             // First the shape (which object levels are maps keyed by
             // data), then the values.
             let mut collector = Collector::with_shape(n as usize, Shape::learn(&documents));
@@ -214,6 +371,7 @@ pub(crate) async fn sample_collection<S: AsyncRead + AsyncWrite + Unpin>(
         collector: parsed?,
         estimated_rows,
         method,
+        top_keys,
     })
 }
 
@@ -252,22 +410,33 @@ pub(crate) async fn discover(
         return Err(MgError::new(FailureCode::Internal, Stage::Connect).into_connector_error());
     };
     let timeouts = Timeouts::new(job.statement_timeout());
-    let refused = scan(job, sink, target, || Session::connect(target, timeouts)).await?;
+    let outcome = scan(job, sink, target, || Session::connect(target, timeouts)).await?;
     // What the server refused is reported by `check()` (observed, never
     // predicted from the privileges).
-    state.record_scan(&target.id, refused);
+    state.record_scan(&target.id, outcome.timeseries_refused);
+    state.record_cas_stores(&target.id, outcome.cas_stores);
     Ok(())
+}
+
+/// What a scan leaves for `check()`.
+#[derive(Debug, Default)]
+pub(crate) struct ScanOutcome {
+    /// Time-series collections the server refused to the account.
+    pub(crate) timeseries_refused: u64,
+    /// CAS ticket registries and audit trails recognized (raw database and
+    /// collection names, never logged), for the guard's privilege check.
+    pub(crate) cas_stores: Vec<(String, String, StoreKind)>,
 }
 
 /// The scan, with the way sessions are opened (tests use a scripted
 /// server). Returns how many time-series collections the server refused
-/// to the account.
+/// to the account, and the CAS stores it recognized.
 pub(crate) async fn scan<S, F, Fut>(
     job: &ScanJob,
     sink: &FindingSink,
     target: &TargetConfig,
     mut connect: F,
-) -> Result<u64, ConnectorError>
+) -> Result<ScanOutcome, ConnectorError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut() -> Fut,
@@ -280,7 +449,7 @@ where
     // checked or opened, so a session never goes stale during it.
     if job.turn().await? == Paced::OutOfTime {
         job.skip_out_of_time(sink, 1);
-        return Ok(0);
+        return Ok(ScanOutcome::default());
     }
     let (databases, truncated) = {
         let s = ensure(&mut slot, target, &mut connect).await?;
@@ -288,7 +457,7 @@ where
             Paced::Done(r) => r.map_err(|e| fail(target, e))?,
             Paced::OutOfTime => {
                 job.skip_out_of_time(sink, 1);
-                return Ok(0);
+                return Ok(ScanOutcome::default());
             }
         }
     };
@@ -304,6 +473,8 @@ where
         });
     }
     let mut totals = Totals::default();
+    let stores = job.cas_stores();
+    let mut cas_stores: Vec<(String, String, StoreKind)> = Vec::new();
     let mut selected: Vec<&String> = databases
         .iter()
         .filter(|d| job.includes_database(d))
@@ -395,9 +566,30 @@ where
                 out_of_time = true;
                 break;
             }
+            // CAS store guard (ADR-0041 decision 5): a ticket registry
+            // known by name is never sampled.
+            let named = cas_guard::recognize_name(stores, [unit.name.as_str()]);
+            if named == Some(StoreKind::TicketRegistry) {
+                let s = ensure(&mut slot, target, &mut connect).await?;
+                match job.paced(ticket_metadata(s, db, &unit.name)).await? {
+                    Paced::Done(r) => {
+                        ticket_registry(job, sink, target, &db_name, &object, r);
+                        cas_stores.push((db.clone(), unit.name.clone(), StoreKind::TicketRegistry));
+                        continue;
+                    }
+                    Paced::OutOfTime => {
+                        job.skip_out_of_time(sink, units.len() - i);
+                        out_of_time = true;
+                        break;
+                    }
+                }
+            }
             let sampled = {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                match job.paced(sample_collection(s, db, unit, n)).await? {
+                match job
+                    .paced(sample_collection_for(s, db, unit, n, named))
+                    .await?
+                {
                     Paced::Done(r) => r,
                     Paced::OutOfTime => {
                         job.skip_out_of_time(sink, units.len() - i);
@@ -449,6 +641,37 @@ where
                     continue;
                 }
             };
+            let kind = named.or_else(|| {
+                cas_guard::recognize_shape(sampled.top_keys.iter().map(String::as_str))
+            });
+            if kind == Some(StoreKind::TicketRegistry) {
+                // Recognized by its document shape: the documents read are
+                // dropped (zeroized) unclassified; its metadata only.
+                drop(sampled);
+                let s = ensure(&mut slot, target, &mut connect).await?;
+                match job.paced(ticket_metadata(s, db, &unit.name)).await? {
+                    Paced::Done(r) => ticket_registry(job, sink, target, &db_name, &object, r),
+                    Paced::OutOfTime => {
+                        job.skip_out_of_time(sink, units.len() - i);
+                        out_of_time = true;
+                        break;
+                    }
+                }
+                cas_stores.push((db.clone(), unit.name.clone(), StoreKind::TicketRegistry));
+                continue;
+            }
+            if let Some(kind) = kind {
+                if kind == StoreKind::AuditTrail {
+                    cas_stores.push((db.clone(), unit.name.clone(), kind));
+                }
+                tracing::info!(
+                    target_id = %target.id,
+                    database = db_name.as_str(),
+                    object = object.as_str(),
+                    store = kind.as_str(),
+                    "CAS store guard applied"
+                );
+            }
             sink.add_coverage(ScanCoverage {
                 sampled: 1,
                 ..ScanCoverage::default()
@@ -459,7 +682,8 @@ where
             // Nothing is open on the server from here on.
             for (field, values) in sampled.collector.into_paths() {
                 let samples: Vec<RawSample<'_>> = values.iter().map(|v| v.as_sample()).collect();
-                for finding in job.classify(field.as_str(), &samples) {
+                let rule = cas_guard::document_rule(kind, field.as_str());
+                for finding in job.classify_guarded(field.as_str(), &samples, rule) {
                     let mut finding = finding.into_finding(FindingLocation {
                         database: db_name.clone(),
                         schema: None,
@@ -490,7 +714,43 @@ where
         not_sampled = totals.unsupported,
         "target scanned"
     );
-    Ok(totals.timeseries_refused)
+    Ok(ScanOutcome {
+        timeseries_refused: totals.timeseries_refused,
+        cas_stores,
+    })
+}
+
+/// Reports a CAS ticket registry collection (metadata only): counted as a
+/// kind the connector does not sample; its ticket counts kept for the
+/// target's notes. A failed aggregate leaves the encryption not evaluated.
+fn ticket_registry(
+    job: &ScanJob,
+    sink: &FindingSink,
+    target: &TargetConfig,
+    db: &NormalizedName,
+    object: &NormalizedName,
+    counts: Result<TicketCounts, MgError>,
+) {
+    sink.add_coverage(ScanCoverage {
+        unsupported: 1,
+        ..ScanCoverage::default()
+    });
+    match counts {
+        Ok(c) => job.record_ticket_registry(&c),
+        Err(e) => tracing::info!(
+            target_id = %target.id,
+            database = db.as_str(),
+            object = object.as_str(),
+            server_code = e.server_code,
+            "CAS ticket registry: type counts not readable, encryption not evaluated"
+        ),
+    }
+    tracing::info!(
+        target_id = %target.id,
+        database = db.as_str(),
+        object = object.as_str(),
+        "CAS ticket registry: not sampled (CAS store guard, metadata only)"
+    );
 }
 
 #[derive(Debug, Default)]

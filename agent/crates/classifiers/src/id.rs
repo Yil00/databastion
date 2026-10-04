@@ -90,6 +90,14 @@ impl ClassifierId {
         }
     }
 
+    /// Whether this is a `secret.*` classifier (a credential: never
+    /// fingerprinted where the CAS store guard applies, ADR-0041
+    /// decision 5).
+    #[must_use]
+    pub const fn is_secret(self) -> bool {
+        matches!(self, Self::AwsKey | Self::PasswordHash)
+    }
+
     /// Maps a known id (e.g. from a job's `classifiers` filter) back to its
     /// variant. `None` for an unknown id: the caller decides whether that
     /// rejects the job. Never returns caller-provided text.
@@ -108,6 +116,13 @@ impl fmt::Display for ClassifierId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_classifiers_are_the_secret_prefix() {
+        for c in ClassifierId::ALL {
+            assert_eq!(c.is_secret(), c.as_str().starts_with("secret."), "{c}");
+        }
+    }
 
     /// Contract `ClassifierId` pattern `^[a-z]+(\.[a-z0-9_]+)+$`, 3..=64.
     fn matches_contract(id: &str) -> bool {

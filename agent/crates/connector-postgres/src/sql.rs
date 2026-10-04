@@ -258,6 +258,75 @@ pub(crate) fn sample_statement(
     })
 }
 
+// ------------------------------------------------------------ CAS guard
+
+/// Every column name of one relation (`$1`: `oid`), readable or not (the
+/// catalog is readable by every role), with whether the role can `SELECT`
+/// it: the CAS store guard recognizes a ticket registry or an audit trail
+/// by its column shape even when only its metadata columns are granted
+/// (ADR-0041 decisions 5 and 6).
+pub(crate) const ALL_COLUMNS: &str = "SELECT a.attname, \
+       pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT') \
+     FROM pg_catalog.pg_attribute a \
+     WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY a.attnum LIMIT 1600";
+
+/// The CAS store guard's only read of a ticket registry (ADR-0041
+/// decision 5): the ticket count per `type`, nothing else. `FROM ONLY` one
+/// relation; `$1`: row limit.
+pub(crate) fn ticket_type_counts(schema: &str, relation: &str, column: &str) -> Option<String> {
+    Some(format!(
+        "SELECT {c}::pg_catalog.text, pg_catalog.count(*) FROM ONLY {}.{} GROUP BY 1 LIMIT $1",
+        quote_ident(schema)?,
+        quote_ident(relation)?,
+        c = quote_ident(column)?,
+    ))
+}
+
+/// Normalized name key of a catalog name in SQL (letters and digits,
+/// lower-cased), as `databastion_core::cas_guard::name_key`.
+macro_rules! name_key {
+    ($col:literal) => {
+        concat!(
+            "pg_catalog.lower(pg_catalog.regexp_replace(",
+            $col,
+            ", '[^[:alnum:]]', '', 'g'))"
+        )
+    };
+}
+
+/// `check()` of the CAS store guard, at every heartbeat (ADR-0041
+/// decision 6): the columns of the relations that may be CAS stores (a
+/// name key in `$1`, or a `body` / `json` / `AUD_RESOURCE` column), with
+/// whether the role can `SELECT` each one, directly, through a role
+/// (membership with `INHERIT`), through `PUBLIC`, through a table grant
+/// or through `pg_read_all_data` (`has_column_privilege` covers them all).
+/// Columns: relation oid, relation name, column name, readable.
+pub(crate) const CAS_GUARD_COLUMNS: &str = concat!(
+    "WITH cand AS ( \
+       SELECT c.oid FROM pg_catalog.pg_class c \
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+       WHERE c.relkind IN ('r', 'p', 'm', 'v', 'f') AND ",
+    user_schema!(),
+    " AND ",
+    not_extension_member!(),
+    " AND (",
+    name_key!("c.relname"),
+    " = ANY ($1) \
+          OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute x \
+             WHERE x.attrelid = c.oid AND x.attnum > 0 AND NOT x.attisdropped \
+               AND ",
+    name_key!("x.attname"),
+    " IN ('body', 'json', 'audresource'))) \
+       ORDER BY c.oid LIMIT 256) \
+     SELECT c.oid, c.relname, a.attname, \
+       pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') \
+     FROM cand JOIN pg_catalog.pg_class c ON c.oid = cand.oid \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 \
+       AND NOT a.attisdropped \
+     ORDER BY c.oid, a.attnum LIMIT 20000"
+);
+
 // ------------------------------------------------------------------ check()
 
 /// Attributes of the current role. `pg_roles` is read for boolean columns
@@ -488,6 +557,9 @@ pub(crate) fn all_statements() -> Vec<String> {
         pss_counters("public", false).unwrap(),
         pss_texts("public", true).unwrap(),
         pss_texts("public", false).unwrap(),
+        ALL_COLUMNS.to_owned(),
+        ticket_type_counts("s", "t", "type").unwrap(),
+        CAS_GUARD_COLUMNS.to_owned(),
         sample_statement("s", "t", &["c"], true).unwrap(),
         sample_statement("s", "t", &["c"], false).unwrap(),
     ]

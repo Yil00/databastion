@@ -545,6 +545,37 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             Ok(p) => p,
             Err(e) => return unreachable(&e),
         };
+        // CAS store guard (ADR-0041 decision 6): at every heartbeat, so a
+        // ticket table recreated with a table grant is reported at once.
+        match cas_guard_readable(&session, timeouts, target.cas_stores()).await {
+            Ok(0) => {}
+            Ok(n) => {
+                notes.push(format!(
+                    "database {}: the agent's role can read credential columns of {n} CAS \
+                     ticket registry or audit trail relation(s) (grant SELECT on the metadata \
+                     columns only)",
+                    normalize(database).as_str()
+                ));
+                codes.merge(
+                    TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(n),
+                    databastion_core::CountMerge::Sum,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    stage = e.stage.as_str(),
+                    sqlstate = e.sqlstate(),
+                    "CAS store guard privilege check failed"
+                );
+                // Not evaluated: never read as least privilege.
+                codes.add(
+                    TargetNote::new(NoteCode::CheckStageFailed)
+                        .with_labels([databastion_core::NoteLabel::stage("check")]),
+                );
+            }
+        }
         level = level.max(probe.level(log_readable));
         if probe.reads_without_row_counts() {
             rows_gap = true;
@@ -863,6 +894,72 @@ pub(crate) async fn prerequisites_with(
 
 /// Runs one statement in its own read-only transaction (a failing probe
 /// does not abort the others).
+/// How many CAS ticket registry or audit trail relations of the session's
+/// database have a credential column the role can `SELECT` (directly,
+/// through a role or `PUBLIC`, a table grant or `pg_read_all_data`;
+/// ADR-0041 decision 6). Recognized by name (built-in and `cas_stores`)
+/// and by column shape, whatever the column grants.
+pub(crate) async fn cas_guard_readable(
+    session: &Session,
+    timeouts: Timeouts,
+    stores: Option<&databastion_core::cas_guard::CasStores>,
+) -> Result<u64, PgError> {
+    use databastion_core::cas_guard;
+    let keys = cas_guard::known_name_keys(stores);
+    let tx = session.begin(timeouts).await?;
+    let rows = match tx
+        .query(
+            Stage::Check,
+            sql::CAS_GUARD_COLUMNS,
+            &[(&keys, tokio_postgres::types::Type::TEXT_ARRAY)],
+        )
+        .await
+    {
+        Ok(rows) => {
+            tx.commit().await?;
+            rows
+        }
+        Err(e) => {
+            tx.rollback().await;
+            return Err(e);
+        }
+    };
+    // Per relation: its name and its (column, readable) list.
+    type Columns = Vec<(String, bool)>;
+    let mut relations: Vec<(u32, String, Columns)> = Vec::new();
+    for row in &rows {
+        let oid: u32 = col(row, 0)?;
+        let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Check);
+        let (Some(name), Some(column)) = (
+            crate::wire::catalog_text(row, 1).map_err(get)?,
+            crate::wire::catalog_text(row, 2).map_err(get)?,
+        ) else {
+            continue;
+        };
+        let readable: bool = col(row, 3)?;
+        match relations.last_mut() {
+            Some((o, _, cols)) if *o == oid => cols.push((column, readable)),
+            _ => relations.push((oid, name, vec![(column, readable)])),
+        }
+    }
+    let mut count = 0u64;
+    for (_, name, columns) in &relations {
+        let kind = cas_guard::recognize(
+            stores,
+            [name.as_str()],
+            columns.iter().map(|(c, _)| c.as_str()),
+        );
+        let Some(kind) = kind else { continue };
+        if columns
+            .iter()
+            .any(|(c, readable)| *readable && cas_guard::is_credential_column(kind, c))
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 async fn probe(
     session: &Session,
     timeouts: Timeouts,

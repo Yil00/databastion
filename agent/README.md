@@ -804,6 +804,28 @@ over-privilege and Audit tests, `DATABASTION_TEST_LDAP_EXPORT_CMD` for a real pa
 the handshake, StartTLS injection, hostile responses and a scan also run against a scripted
 server over an in-memory stream (`src/fake.rs`); property tests in `src/proptests.rs`.
 
+### CAS store guard
+The PostgreSQL, MySQL / MariaDB, MongoDB and OpenLDAP connectors guard Apereo CAS stores
+([ADR-0041](../docs/adr/0041-cas-connector.md) decisions 5 and 6), on by default:
+`databastion_core::cas_guard` recognizes them by name (built-in names, case-insensitive on
+letters and digits, schema-agnostic), by the target's `cas_stores` lists
+(`targets[].<engine>.cas_stores.{ticket_registry,service_registry,audit_trail}`, at most 64 names
+each) and by column shape, and gives each column a rule (`ColumnRule`): a ticket registry is
+never sampled (one `type, count(*)` aggregate, `TicketCounts`), the audit trail's ticket-id,
+header and extra-info columns are never selected, `AUD_USER` keeps no masked sample, a service
+registry body keeps no masked sample nor `secret.*` fingerprint (`ScanJob::classify_guarded`).
+The ticket-id tripwire runs in `ScanJob::classify` for every connector
+(`databastion_classifiers::cas::is_ticket_id`): one ticket-id-shaped value drops the whole column
+before classification. The core keeps each target's latest scan tally (`ScanGuard`) and adds
+`coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted` to its notes; each
+connector's `check()` evaluates `privilege.ticket_credentials_readable` at every heartbeat
+(PostgreSQL `has_column_privilege`; MySQL / MariaDB `information_schema.COLUMNS` and the roles'
+`SHOW GRANTS`; MongoDB `connectionStatus`). Integration tests: `connector-postgres`
+`src/it_cas_guard.rs`, `connector-mysql` `src/it/cas_guard_it.rs` (fixtures created by the
+tests in their own database), and scripted-server tests in `connector-mongodb` and
+`connector-openldap` `src/fake.rs`. Behaviour per engine:
+[docs/08](../docs/08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap).
+
 ### CAS connector
 Apereo CAS targets ([ADR-0041](../docs/adr/0041-cas-connector.md), reference: the
 [connector README](crates/connector-cas/README.md)): **local files only**, no network

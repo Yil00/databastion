@@ -821,3 +821,190 @@ async fn a_stale_handing_entry_is_read_once_and_cleared() {
     assert!(events.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Fake ticket ids (never valid anywhere).
+const CAS_TICKETS: [&str; 2] = [
+    "TGT-1-FakeTgtValueAaaaaaaaaaaaaaaa-cas01",
+    "ST-2-FakeStValueBbbbbbbbbbbbbbbbb-cas01",
+];
+
+/// The dev tree plus CAS entries: a service registry container (one entry
+/// recognized by the built-in object class, one by its `description`), a
+/// container whose `cn` values are ticket ids (the tripwire), and ticket
+/// entries under an object class listed in `cas_stores` (never read).
+fn cas_tree(id: i32, req: &Request) -> Vec<Vec<u8>> {
+    let Request::Search {
+        base,
+        scope,
+        filter,
+        ..
+    } = req
+    else {
+        return tree(id, req);
+    };
+    let mut out = Vec::new();
+    match (base.as_str(), scope) {
+        ("dc=example,dc=org", 2) if filter.starts_with("(|(objectClass=organizationalUnit)") => {
+            for dn in [
+                "dc=example,dc=org",
+                "ou=services,dc=example,dc=org",
+                "ou=sessions,dc=example,dc=org",
+                "ou=tickets,dc=example,dc=org",
+            ] {
+                out.push(encode::entry(id, dn, &[]));
+            }
+        }
+        ("ou=services,dc=example,dc=org", 1) => {
+            for i in 0..20 {
+                let mail = format!("owner{i}@example.com");
+                let secret = format!("AKIA{i:0>16}");
+                let class: &[u8] = if i % 2 == 0 {
+                    b"casRegisteredService"
+                } else {
+                    b"inetOrgPerson"
+                };
+                let body = format!(
+                    "{{\"@class\":\"org.apereo.cas.services.OidcRegisteredService\",\
+                     \"clientSecret\":\"{secret}\",\"id\":{i}}}"
+                );
+                out.push(encode::entry(
+                    id,
+                    &format!("uid=s{i},ou=services,dc=example,dc=org"),
+                    &[
+                        ("structuralObjectClass", &[b"inetOrgPerson"]),
+                        ("objectClass", &[b"top", class]),
+                        ("mail", &[mail.as_bytes()]),
+                        ("cn", &[secret.as_bytes()]),
+                        ("description", &[body.as_bytes()]),
+                    ],
+                ));
+            }
+        }
+        ("ou=sessions,dc=example,dc=org", 1) => {
+            for i in 0..20 {
+                let mail = format!("session{i}@example.com");
+                let cn = if i % 7 == 0 {
+                    CAS_TICKETS[0]
+                } else {
+                    "session"
+                };
+                out.push(encode::entry(
+                    id,
+                    &format!("uid=x{i},ou=sessions,dc=example,dc=org"),
+                    &[
+                        ("structuralObjectClass", &[b"inetOrgPerson"]),
+                        ("mail", &[mail.as_bytes()]),
+                        ("cn", &[cn.as_bytes()]),
+                    ],
+                ));
+            }
+        }
+        ("ou=tickets,dc=example,dc=org", 1) => {
+            out.push(encode::entry(
+                id,
+                "cn=t1,ou=tickets,dc=example,dc=org",
+                &[
+                    ("structuralObjectClass", &[b"inetOrgPerson"]),
+                    ("objectClass", &[b"top", b"ssoTicket"]),
+                    ("cn", &[CAS_TICKETS[1].as_bytes()]),
+                    ("mail", &[b"ticket.owner@example.org"]),
+                ],
+            ));
+        }
+        _ => return tree(id, req),
+    }
+    out.push(encode::done(id, 0));
+    out
+}
+
+/// ADR-0041 decisions 5 and 14 (security review M5): OpenLDAP service
+/// registry entries keep no masked sample nor `secret.*` fingerprint, a
+/// ticket-id-shaped attribute trips the guard, and entries of a ticket
+/// object class listed in `cas_stores` are not read.
+#[tokio::test]
+async fn cas_store_guard_over_the_scripted_directory() {
+    let t = databastion_core::AgentConfig::parse(
+        "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, engine: \
+         openldap, host: 127.0.0.1, account: a, secret: {env: PW}, openldap: {tls: disable, \
+         cas_stores: {ticket_registry: [ssoTicket]}}}]}",
+    )
+    .unwrap()
+    .targets[0]
+        .clone();
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &t,
+        &Limits::default(),
+        Arc::new(HmacKey::new(&[7u8; 32]).unwrap()),
+    );
+    let (sink, mut rx) = FindingSink::channel(1024);
+    let logs = crate::i2::Logs::default();
+    let _guard = logs.capture();
+    crate::discover::scan(&job, &sink, &t, || async {
+        let (client, _) = serve(directory(AGENT, cas_tree));
+        Session::establish(
+            client,
+            timeouts(),
+            Auth::Simple {
+                dn: AGENT,
+                password: "pw",
+            },
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    drop(sink);
+    let mut findings: Vec<MaskedFinding> = Vec::new();
+    while let Some(f) = rx.recv().await {
+        findings.push(f);
+    }
+    let in_container = |c: &str| -> Vec<&MaskedFinding> {
+        findings
+            .iter()
+            .filter(|f| {
+                f.location()
+                    .unwrap()
+                    .schema
+                    .as_ref()
+                    .unwrap()
+                    .as_str()
+                    .starts_with(c)
+            })
+            .collect()
+    };
+    let services = in_container("ou=services");
+    assert!(
+        services.iter().any(|f| f.classifier().is_secret()),
+        "{findings:?}"
+    );
+    assert!(
+        services
+            .iter()
+            .any(|f| f.classifier().as_str() == "pii.email")
+    );
+    for f in &services {
+        assert!(f.masked_samples().is_empty(), "{f:?}");
+        if f.classifier().is_secret() {
+            assert!(f.fingerprints().is_empty(), "{f:?}");
+        }
+    }
+    let sessions = in_container("ou=sessions");
+    assert_eq!(sessions.len(), 1, "{findings:?}");
+    assert_eq!(sessions[0].location().unwrap().field.as_str(), "mail");
+    assert_eq!(job.cas_guard().tripped(), 1);
+    assert!(in_container("ou=tickets").is_empty(), "{findings:?}");
+    let values: Vec<String> = CAS_TICKETS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(["ticket.owner@example.org".to_owned()])
+        .chain((0..20).map(|i| format!("AKIA{i:0>16}")))
+        .collect();
+    crate::i2::assert_clean(
+        "serialized findings",
+        &crate::i2::findings_text(&findings),
+        &values,
+        &[],
+    );
+    crate::i2::assert_clean("scan logs", &logs.text(), &values, &[AGENT]);
+}

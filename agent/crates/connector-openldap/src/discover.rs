@@ -16,6 +16,7 @@ use databastion_classifiers::masking::{FindingLocation, RawSample};
 use databastion_classifiers::names::{
     NormalizedName, normalize_ldap_attribute, normalize_ldap_dn, normalize_path,
 };
+use databastion_core::cas_guard::{self, ColumnRule, StoreKind};
 use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -80,6 +81,9 @@ pub(crate) fn text_value(raw: &[u8], time: bool) -> Option<Zeroizing<String>> {
 struct Group {
     entries: u64,
     fields: HashMap<NormalizedName, Vec<Zeroizing<String>>>,
+    /// The group holds CAS service registry entries (CAS store guard):
+    /// classified without masked samples nor `secret.*` fingerprints.
+    cas_registry: bool,
 }
 
 impl Group {
@@ -469,13 +473,45 @@ async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
         if !groups.contains_key(&object) && groups.len() >= MAX_CLASSES_PER_CONTAINER {
             return;
         }
-        groups.entry(object).or_default().add(schema, &e, n);
+        // CAS store guard (ADR-0041 decision 5, security review M5).
+        match cas_entry(job.cas_stores(), &e) {
+            Some(StoreKind::TicketRegistry) => {
+                tracing::info!(
+                    object = object.as_str(),
+                    "CAS ticket entry not read (CAS store guard)"
+                );
+            }
+            kind => {
+                let group = groups.entry(object).or_default();
+                group.cas_registry |= kind == Some(StoreKind::ServiceRegistry);
+                group.add(schema, &e, n);
+            }
+        }
     };
     let outcome = s.search(Stage::Sample, &search, &mut on_entry).await?;
     if let Some(e) = outcome.error(Stage::Sample) {
         return Err(e);
     }
     Ok((outcome.entries, outcome.references))
+}
+
+/// The CAS store an LDAP entry belongs to: a ticket registry or service
+/// registry object class (built-in `casRegisteredService`, or listed in
+/// the target's `cas_stores`), or a `description` that is a CAS service
+/// definition (an `@class` of ADR-0041 decision 4's closed map).
+fn cas_entry(stores: Option<&cas_guard::CasStores>, e: &Entry) -> Option<StoreKind> {
+    let classes = e
+        .values("objectClass")
+        .filter_map(|v| std::str::from_utf8(v).ok());
+    if let Some(kind) =
+        cas_guard::recognize_name(stores, classes).filter(|k| *k != StoreKind::AuditTrail)
+    {
+        return Some(kind);
+    }
+    e.values("description")
+        .filter_map(|v| std::str::from_utf8(v).ok())
+        .any(cas_guard::is_service_definition)
+        .then_some(StoreKind::ServiceRegistry)
 }
 
 /// Classifies and submits the groups of one normalized container. Nothing
@@ -499,12 +535,22 @@ async fn flush(
             sampled: 1,
             ..ScanCoverage::default()
         });
+        let rule = if group.cas_registry {
+            tracing::info!(
+                object = object.as_str(),
+                store = StoreKind::ServiceRegistry.as_str(),
+                "CAS store guard applied"
+            );
+            ColumnRule::NoSamplesNoSecretFingerprints
+        } else {
+            ColumnRule::Sampled
+        };
         let mut fields: Vec<_> = group.fields.into_iter().collect();
         fields.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (field, values) in fields {
             let samples: Vec<RawSample<'_>> =
                 values.iter().map(|v| RawSample::new(v.as_str())).collect();
-            for finding in job.classify(field.as_str(), &samples) {
+            for finding in job.classify_guarded(field.as_str(), &samples, rule) {
                 sink.submit(finding.into_finding(FindingLocation {
                     database: database.clone(),
                     schema: Some(container.clone()),

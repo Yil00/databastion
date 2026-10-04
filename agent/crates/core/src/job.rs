@@ -250,6 +250,8 @@ pub struct ScanJob {
     pacer: Pacer,
     /// Where the object order starts (see [`ScanJob::rotate`]).
     rotation: u64,
+    /// What the CAS store guard saw in this scan (shared by the clones).
+    guard: Arc<crate::cas_guard::ScanGuard>,
 }
 
 impl Default for ScanJob {
@@ -266,6 +268,7 @@ impl Default for ScanJob {
             key: None,
             pacer: Pacer::new(limits.discovery_duty_cycle_percent),
             rotation: 0,
+            guard: Arc::default(),
         }
     }
 }
@@ -307,6 +310,7 @@ impl ScanJob {
             pacer: Pacer::new(limits.discovery_duty_cycle_percent)
                 .with_deadline(Instant::now() + max_duration),
             rotation: 0,
+            guard: Arc::default(),
         }
     }
 
@@ -502,10 +506,100 @@ impl ScanJob {
 
     /// Classifies one column (name + sampled values). At most
     /// [`Self::sample_rows`] values are examined.
+    ///
+    /// The CAS store guard's ticket-id tripwire runs first (ADR-0041
+    /// decision 5): when one of the values has the shape of a CAS ticket
+    /// id (`databastion_classifiers::cas::is_ticket_id`), nothing of the
+    /// column is classified (no finding, no masked sample, no
+    /// fingerprint), the column counts in `coverage.cas_guard_tripped`, and
+    /// the connector must drop its values without reading the column again
+    /// in this scan. Connectors classify each column once per scan.
     #[must_use]
     pub fn classify(&self, column_name: &str, values: &[RawSample<'_>]) -> Vec<ColumnFinding> {
         let n = values.len().min(self.sample_rows as usize);
-        self.column_classifier().classify(column_name, &values[..n])
+        let values = &values[..n];
+        if values
+            .iter()
+            .any(databastion_classifiers::cas::is_ticket_id)
+        {
+            self.guard.trip();
+            tracing::warn!(
+                target_id = self.target.as_ref().map_or("", |t| t.id.as_str()),
+                "CAS store guard: a column or field held a ticket-id-shaped value; its values \
+                 were dropped before classification and it is not read further in this scan"
+            );
+            return Vec::new();
+        }
+        self.column_classifier().classify(column_name, values)
+    }
+
+    /// [`Self::classify`] under a CAS store guard rule
+    /// ([`crate::cas_guard::column_rule`]): nothing for
+    /// [`ColumnRule::NeverRead`](crate::cas_guard::ColumnRule::NeverRead)
+    /// (the connector should not have read it), findings without masked
+    /// samples, and without the fingerprints of `secret.*` classifiers, as
+    /// the rule says.
+    #[must_use]
+    pub fn classify_guarded(
+        &self,
+        column_name: &str,
+        values: &[RawSample<'_>],
+        rule: crate::cas_guard::ColumnRule,
+    ) -> Vec<ColumnFinding> {
+        use crate::cas_guard::ColumnRule;
+        if rule == ColumnRule::NeverRead {
+            return Vec::new();
+        }
+        let found = self.classify(column_name, values);
+        match rule {
+            ColumnRule::Sampled | ColumnRule::NeverRead => found,
+            ColumnRule::NoMaskedSamples => found
+                .into_iter()
+                .map(ColumnFinding::without_masked_samples)
+                .collect(),
+            ColumnRule::NoSamplesNoSecretFingerprints => found
+                .into_iter()
+                .map(|f| {
+                    let secret = f.classifier().is_secret();
+                    let f = f.without_masked_samples();
+                    if secret { f.without_fingerprints() } else { f }
+                })
+                .collect(),
+        }
+    }
+
+    /// The target's `cas_stores` lists (`agent.yaml`), if any.
+    #[must_use]
+    pub fn cas_stores(&self) -> Option<&crate::cas_guard::CasStores> {
+        self.target.as_ref().and_then(TargetConfig::cas_stores)
+    }
+
+    /// Records the metadata of a ticket registry read by the guard's
+    /// aggregate (counts only), logged per kind and kept for the target's
+    /// `security.ticket_registry_unencrypted` note.
+    pub fn record_ticket_registry(&self, counts: &crate::cas_guard::TicketCounts) {
+        use crate::cas_guard::TicketKind;
+        self.guard.add_registry(counts);
+        tracing::info!(
+            target_id = self.target.as_ref().map_or("", |t| t.id.as_str()),
+            encrypted = counts.encrypted(),
+            unencrypted = counts.unencrypted(),
+            tgt = counts.clear_of(TicketKind::Tgt),
+            st = counts.clear_of(TicketKind::St),
+            pt = counts.clear_of(TicketKind::Pt),
+            pgt = counts.clear_of(TicketKind::Pgt),
+            oauth_code = counts.clear_of(TicketKind::OauthCode),
+            oauth_access_token = counts.clear_of(TicketKind::OauthAccessToken),
+            oauth_refresh_token = counts.clear_of(TicketKind::OauthRefreshToken),
+            other = counts.clear_of(TicketKind::Other),
+            "CAS ticket registry: metadata only (ticket counts by kind)"
+        );
+    }
+
+    /// What the CAS store guard saw in this scan so far.
+    #[must_use]
+    pub fn cas_guard(&self) -> &Arc<crate::cas_guard::ScanGuard> {
+        &self.guard
     }
 }
 

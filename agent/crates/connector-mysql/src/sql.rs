@@ -286,6 +286,69 @@ pub(crate) fn sample_statement(
     })
 }
 
+// ------------------------------------------------------------ CAS guard
+
+/// The CAS store guard's only read of a ticket registry (ADR-0041
+/// decision 5): the ticket count per `type` (cut to 256 characters),
+/// nothing else, under the per-statement timeout of [`sample_statement`].
+#[must_use]
+pub(crate) fn ticket_type_counts(
+    flavor: Flavor,
+    statement_ms: u32,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    let c = quote_ident(column)?;
+    let from = format!("{}.{}", quote_ident(schema)?, quote_ident(table)?);
+    let select =
+        format!("SELECT LEFT(CAST({c} AS CHAR), 256), COUNT(*) FROM {from} GROUP BY 1 LIMIT 256");
+    let ms = statement_ms.max(100);
+    Some(match flavor {
+        Flavor::Mysql => select.replacen(
+            "SELECT",
+            &format!("SELECT /*+ MAX_EXECUTION_TIME({ms}) */"),
+            1,
+        ),
+        Flavor::Mariadb => format!(
+            "SET STATEMENT max_statement_time = {}.{:03} FOR {select}",
+            ms / 1000,
+            ms % 1000
+        ),
+    })
+}
+
+/// `check()` of the CAS store guard, at every heartbeat (ADR-0041
+/// decision 6): the columns the account can see (`information_schema`
+/// lists those it holds a privilege on, directly, through its enabled
+/// roles or `PUBLIC`) of the tables that may be CAS stores: a name key in
+/// `keys` (letters and digits, lower-cased), or a `body` / `json` /
+/// `AUD_RESOURCE` column. Columns: schema, table, column, privileges.
+/// `None` when a key cannot be quoted.
+#[must_use]
+pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
+    let mut list = Vec::with_capacity(keys.len());
+    for k in keys {
+        list.push(quote_str(k)?);
+    }
+    if list.is_empty() {
+        list.push("''".to_owned());
+    }
+    Some(format!(
+        "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.PRIVILEGES \
+         FROM information_schema.COLUMNS c \
+         WHERE LOWER(c.TABLE_SCHEMA) NOT IN \
+           ('mysql', 'sys', 'information_schema', 'performance_schema') \
+           AND (REGEXP_REPLACE(LOWER(c.TABLE_NAME), '[^a-z0-9]', '') IN ({}) \
+             OR (c.TABLE_SCHEMA, c.TABLE_NAME) IN ( \
+               SELECT x.TABLE_SCHEMA, x.TABLE_NAME FROM information_schema.COLUMNS x \
+               WHERE LOWER(x.COLUMN_NAME) IN ('body', 'json', 'aud_resource', 'audresource'))) \
+         ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION \
+         LIMIT 20000",
+        list.join(", ")
+    ))
+}
+
 // ------------------------------------------------------------------ check()
 
 /// The current account as it appears in the `GRANTEE` column of the
@@ -670,10 +733,12 @@ mod tests {
             PS_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
+            cas_guard_columns(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
         ];
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
             v.push(sample_statement(flavor, 1000, "s", "t", &[("c", Sampled::Text)], 10).unwrap());
+            v.push(ticket_type_counts(flavor, 1000, "s", "t", "type").unwrap());
         }
         v
     }

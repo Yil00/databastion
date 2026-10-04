@@ -5,6 +5,7 @@
 //! ADR-0003). See [`masking`] for the type boundary that enforces it.
 //!
 //! - [`id`]: the frozen classifier ids and [`id::CLASSIFIERS_VERSION`];
+//! - [`cas`]: the CAS ticket-id value tripwire (ADR-0041 decision 5);
 //! - [`column`]: column-level classification (name + bounded sample);
 //! - [`detect`], [`validate`], [`hints`]: detectors, checksums, name hints
 //!   (the detectors use an internal lexicon of given names, surnames, month
@@ -18,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cas;
 pub mod column;
 pub mod detect;
 pub mod hints;
