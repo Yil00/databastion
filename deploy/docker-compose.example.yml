@@ -58,6 +58,24 @@ services:
       # System alerts per notification channel and hour, all agents together (default 20).
       # Heartbeats and integrity events raise them here too: keep the worker's value.
       # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
+      # Single sign-on with OpenID Connect (ADR-0038; every variable: console/README.md, "Single
+      # sign-on (OIDC)"). Register the redirect URI https://<DATABASTION_DOMAIN>/api/auth/oidc/callback
+      # and the post-logout URI https://<DATABASTION_DOMAIN>/login at the provider, then uncomment,
+      # and add oidc_client_secret to "secrets:" below and at the end of this file.
+      # DATABASTION_OIDC_ENABLED: "1"
+      # DATABASTION_OIDC_ISSUER_URL: https://sso.example.com/realms/acme   # exact issuer
+      # DATABASTION_OIDC_CLIENT_ID: databastion
+      # DATABASTION_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      # Role and group claims must be set by the provider's administrators only, never by users.
+      # DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: groups
+      # DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(groups[*], 'databastion-admins') && 'admin' || 'analyst'"
+      # DATABASTION_OIDC_ALLOWED_GROUPS: databastion-admins,databastion-analysts
+      # Private CA of the provider (mounted read-only), added to the system roots:
+      # DATABASTION_OIDC_CA_FILE: /run/secrets/oidc_ca
+      # Defaults: sign-up off (pending logins approved on the Users page), strict role mapping,
+      # 12 h sessions, and DATABASTION_LOCAL_LOGIN=admins (local administrators only, the
+      # break-glass path; each such login raises a user.local_login system alert).
+      # DATABASTION_LOCAL_LOGIN: admins
       TZ: Europe/Paris
     secrets: [db_url, encryption_key, metrics_token]
     user: "10001:10001"
@@ -195,6 +213,8 @@ secrets:
                                       # (scrape_configs: authorization.credentials_file)
   admin_password:
     file: ./secrets/admin_password    # first administrator (bootstrap-admin only); delete it afterwards
+  # oidc_client_secret:
+  #   file: ./secrets/oidc_client_secret  # OIDC client secret (DATABASTION_OIDC_CLIENT_SECRET_FILE)
 
 volumes:
   postgres-data:

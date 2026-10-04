@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-28
+- **Refined by**: [ADR-0041](0041-cas-connector.md) open question 8 (per-target reduction of client addresses)
 
 ## Context
 [ADR-0003](0003-data-minimization-at-source.md) states that no raw sensitive value leaves the agent, and details what a Discovery finding may carry. Audit access events ([09-agent-protocol.md](../09-agent-protocol.md#access-event-agent--console)) come from other sources: database audit logs (pgaudit, `server_audit`, MongoDB `auditLog`), `pg_stat_statements`, the OpenLDAP `cn=accesslog`. These sources contain query text with literals (`WHERE email = 'jane.doe@example.com'`), MongoDB filter documents, LDAP search filters and entry DNs (`uid=jdoe,ou=people,dc=example,dc=com`). Forwarding them as-is would move sensitive values to the console, which ADR-0003 forbids but does not spell out for events.

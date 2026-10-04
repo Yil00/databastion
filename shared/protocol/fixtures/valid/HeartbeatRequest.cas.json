@@ -1,0 +1,87 @@
+{
+  "ts": "2026-10-04T09:00:00Z",
+  "agent_version": "0.4.0",
+  "uptime_s": 7200,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap",
+    "cas"
+  ],
+  "targets": [
+    {
+      "target_id": "cas-prod",
+      "engine": "cas",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "cas_audit_log",
+      "notes": [
+        {
+          "code": "audit.auth_failures_not_seen"
+        },
+        {
+          "code": "coverage.registry_files_skipped",
+          "count": 2
+        },
+        {
+          "code": "security.client_secrets_in_clear",
+          "count": 1
+        },
+        {
+          "code": "security.audit_headers_logged"
+        },
+        {
+          "code": "audit.records_dropped",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "target_id": "cas-staging",
+      "engine": "cas",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "audit.log_format_unsupported"
+        },
+        {
+          "code": "privilege.config_readable"
+        },
+        {
+          "code": "privilege.registry_writable",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "target_id": "cas-db",
+      "engine": "postgres",
+      "server_version": "17.2",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "pg_stat_statements",
+      "notes": [
+        {
+          "code": "security.ticket_registry_unencrypted",
+          "count": 1520
+        },
+        {
+          "code": "privilege.ticket_credentials_readable"
+        },
+        {
+          "code": "coverage.cas_guard_tripped",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

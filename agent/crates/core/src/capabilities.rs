@@ -8,11 +8,20 @@
 //! listed it: before the first response, when the list is absent, and after
 //! a heartbeat rejected with `400` (e.g. a console rolled back), nothing is
 //! accepted.
+//!
+//! Engines added after protocol 0.1.0 are negotiated the same way (ADR-0039
+//! decision 8): `Engine`, `Connector` and `AuditSource` are closed enums
+//! without a fallback value, so a console built before `cas` rejects any
+//! body naming it. Until the console lists `engine.cas`, the agent sends no
+//! `cas` connector, target, detected target, finding or event
+//! ([`engine_token`], [`ConsoleCapabilities::accepts_engine`]).
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 
-use databastion_protocol::CapabilityList;
+use databastion_protocol::{
+    AuditSource, CapabilityList, Connector, ConnectorList, Engine, HeartbeatRequest, TargetId,
+};
 
 /// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
 /// generated type does not enforce `maxItems`).
@@ -27,6 +36,47 @@ pub(crate) mod token {
     pub(crate) const ACCESS_EVENT_BYTES: &str = "access_event.bytes";
     /// `JobProgress.objects_sampled` and `skipped_*`.
     pub(crate) const JOB_PROGRESS_COVERAGE: &str = "job_progress.coverage";
+    /// The `cas` values of `Engine` and `Connector`, and `cas_audit_log` of
+    /// `AuditSource` (ADR-0041 decision 12).
+    pub(crate) const ENGINE_CAS: &str = "engine.cas";
+}
+
+/// The token gating an `Engine` value (ADR-0039 decision 8): `None` for the
+/// engines of protocol 0.1.0, always sendable. Exhaustive on purpose: a new
+/// contract engine does not compile until it is given its token.
+pub(crate) fn engine_token(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Postgres | Engine::Mysql | Engine::Mariadb | Engine::Mongodb | Engine::Openldap => {
+            None
+        }
+        Engine::Cas => Some(token::ENGINE_CAS),
+    }
+}
+
+/// The token gating a `Connector` value (see [`engine_token`]).
+pub(crate) fn connector_token(connector: Connector) -> Option<&'static str> {
+    match connector {
+        Connector::Postgres | Connector::Mysql | Connector::Mongodb | Connector::Openldap => None,
+        Connector::Cas => Some(token::ENGINE_CAS),
+    }
+}
+
+/// The token gating an `AuditSource` value: the token of its engine (see
+/// [`engine_token`]).
+pub(crate) fn audit_source_token(source: AuditSource) -> Option<&'static str> {
+    match source {
+        AuditSource::Pgaudit
+        | AuditSource::PgStatStatements
+        | AuditSource::PgStatActivity
+        | AuditSource::MariadbServerAudit
+        | AuditSource::MysqlAuditLog
+        | AuditSource::PerformanceSchema
+        | AuditSource::MongodbAuditLog
+        | AuditSource::MongodbProfiler
+        | AuditSource::MongodbLog
+        | AuditSource::OpenldapAccesslog => None,
+        AuditSource::CasAuditLog => Some(token::ENGINE_CAS),
+    }
 }
 
 /// What the console accepts, from its latest heartbeat response.
@@ -39,8 +89,9 @@ impl ConsoleCapabilities {
     /// Replaces the set with the `accepts` of a heartbeat response (absent:
     /// nothing is accepted). Only the first [`MAX_CAPABILITIES`] tokens are
     /// kept, so a hostile or buggy console cannot grow the set.
-    pub(crate) fn record(&self, accepts: Option<&CapabilityList>) {
-        let set = accepts
+    /// Returns whether the set changed.
+    pub(crate) fn record(&self, accepts: Option<&CapabilityList>) -> bool {
+        let set: BTreeSet<String> = accepts
             .map(|list| {
                 list.iter()
                     .take(MAX_CAPABILITIES)
@@ -48,15 +99,39 @@ impl ConsoleCapabilities {
                     .collect()
             })
             .unwrap_or_default();
-        *self
+        let mut accepted = self
             .accepted
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = set;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = *accepted != set;
+        *accepted = set;
+        changed
     }
 
     /// Forgets every capability (heartbeat rejected with `400`).
     pub(crate) fn clear(&self) {
         self.record(None);
+    }
+
+    /// Whether the console accepts `token`, or nothing needs accepting
+    /// (`None`: a value of protocol 0.1.0).
+    pub(crate) fn accepts_gate(&self, token: Option<&str>) -> bool {
+        token.is_none_or(|t| self.console_accepts(t))
+    }
+
+    /// Whether an `Engine` value may be sent (ADR-0039 decision 8).
+    pub(crate) fn accepts_engine(&self, engine: Engine) -> bool {
+        self.accepts_gate(engine_token(engine))
+    }
+
+    /// Whether a `Connector` value may be sent.
+    pub(crate) fn accepts_connector(&self, connector: Connector) -> bool {
+        self.accepts_gate(connector_token(connector))
+    }
+
+    /// Whether an `AuditSource` value may be sent.
+    pub(crate) fn accepts_audit_source(&self, source: AuditSource) -> bool {
+        self.accepts_gate(audit_source_token(source))
     }
 
     /// Whether the latest heartbeat response listed `token`.
@@ -66,6 +141,49 @@ impl ConsoleCapabilities {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(token)
     }
+}
+
+/// Removes from a heartbeat every value of an engine the console has not
+/// accepted (ADR-0039 decision 8, ADR-0041 decision 12): such connectors,
+/// targets and detected targets are left out, and the `audit_source` of a
+/// kept target is dropped if its own token is not accepted. Returns the ids
+/// of the targets left out (the caller logs that the console is too old).
+pub(crate) fn withhold_unaccepted_engines(
+    heartbeat: &mut HeartbeatRequest,
+    caps: &ConsoleCapabilities,
+) -> Vec<TargetId> {
+    heartbeat
+        .connectors
+        .0
+        .retain(|c| caps.accepts_connector(*c));
+    let mut withheld = Vec::new();
+    heartbeat.targets.retain(|t| {
+        let keep = caps.accepts_engine(t.engine);
+        if !keep {
+            withheld.push(t.target_id.clone());
+        }
+        keep
+    });
+    for t in &mut heartbeat.targets {
+        if t.audit_source
+            .is_some_and(|s| !caps.accepts_audit_source(s))
+        {
+            t.audit_source = None;
+        }
+    }
+    heartbeat
+        .detected_targets
+        .retain(|d| caps.accepts_engine(d.engine));
+    withheld
+}
+
+/// The connectors sent in `/enroll`: those of protocol 0.1.0 only, since
+/// enrollment precedes every heartbeat response, so no engine token can be
+/// known yet. The others are reported by the first heartbeat whose
+/// predecessor's response listed their token.
+pub(crate) fn enroll_connectors(mut connectors: ConnectorList) -> ConnectorList {
+    connectors.0.retain(|c| connector_token(*c).is_none());
+    connectors
 }
 
 #[cfg(test)]
@@ -124,6 +242,122 @@ mod tests {
         assert!(caps.console_accepts("filler.f0"));
         assert!(caps.console_accepts(&format!("filler.f{}", MAX_CAPABILITIES - 1)));
         assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
+    }
+
+    #[test]
+    fn engines_of_protocol_0_1_0_need_no_token() {
+        let caps = ConsoleCapabilities::default();
+        for e in [
+            Engine::Postgres,
+            Engine::Mysql,
+            Engine::Mariadb,
+            Engine::Mongodb,
+            Engine::Openldap,
+        ] {
+            assert_eq!(engine_token(e), None);
+            assert!(caps.accepts_engine(e));
+        }
+        for c in [
+            Connector::Postgres,
+            Connector::Mysql,
+            Connector::Mongodb,
+            Connector::Openldap,
+        ] {
+            assert!(caps.accepts_connector(c));
+        }
+        assert!(caps.accepts_audit_source(AuditSource::OpenldapAccesslog));
+    }
+
+    #[test]
+    fn cas_is_sent_only_while_the_console_lists_engine_cas() {
+        let caps = ConsoleCapabilities::default();
+        assert!(!caps.accepts_engine(Engine::Cas));
+        assert!(!caps.accepts_connector(Connector::Cas));
+        assert!(!caps.accepts_audit_source(AuditSource::CasAuditLog));
+        assert!(caps.record(Some(&list(&[token::ENGINE_CAS]))));
+        assert!(caps.accepts_engine(Engine::Cas));
+        assert!(caps.accepts_connector(Connector::Cas));
+        assert!(caps.accepts_audit_source(AuditSource::CasAuditLog));
+        assert!(!caps.record(Some(&list(&[token::ENGINE_CAS]))), "unchanged");
+        caps.clear();
+        assert!(!caps.accepts_engine(Engine::Cas));
+        // A similar token is not the engine's.
+        caps.record(Some(&list(&["engine.cas_v2", "engines.cas"])));
+        assert!(!caps.accepts_engine(Engine::Cas));
+    }
+
+    #[test]
+    fn engine_tokens_are_contract_capabilities_named_after_the_value() {
+        let gated = [(
+            engine_token(Engine::Cas),
+            connector_token(Connector::Cas),
+            audit_source_token(AuditSource::CasAuditLog),
+            "cas",
+        )];
+        for (engine, connector, source, value) in gated {
+            let token = engine.unwrap();
+            assert_eq!(token, format!("engine.{value}"));
+            assert_eq!(connector, Some(token));
+            assert_eq!(source, Some(token));
+            assert!(databastion_protocol::Capability::try_from(token).is_ok());
+        }
+    }
+
+    /// The contract fixture of a heartbeat reporting `cas` targets.
+    fn cas_heartbeat() -> HeartbeatRequest {
+        serde_json::from_str(include_str!(
+            "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.cas.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_heartbeat_reports_no_cas_value_until_the_console_lists_engine_cas() {
+        let caps = ConsoleCapabilities::default();
+        let mut hb = cas_heartbeat();
+        hb.detected_targets.push(
+            serde_json::from_value(serde_json::json!({"engine": "cas", "port": 8443})).unwrap(),
+        );
+        hb.detected_targets.push(
+            serde_json::from_value(serde_json::json!({"engine": "postgres", "port": 5432}))
+                .unwrap(),
+        );
+        let withheld = withhold_unaccepted_engines(&mut hb, &caps);
+        assert_eq!(
+            withheld.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+            ["cas-prod", "cas-staging"]
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(!json.contains("\"cas\""), "{json}");
+        assert!(!json.contains("cas_audit_log"), "{json}");
+        assert_eq!(hb.connectors.0.len(), 4);
+        assert_eq!(hb.targets.len(), 1);
+        assert_eq!(hb.detected_targets.len(), 1);
+        // What is left is what a console built before `cas` accepts: the
+        // generated types of that console are the 0.1.0 enums.
+        for t in &hb.targets {
+            assert!(engine_token(t.engine).is_none());
+        }
+
+        // Listed: everything is reported.
+        caps.record(Some(&list(&[token::ENGINE_CAS])));
+        let mut hb = cas_heartbeat();
+        let before = serde_json::to_value(&hb).unwrap();
+        assert!(withhold_unaccepted_engines(&mut hb, &caps).is_empty());
+        assert_eq!(serde_json::to_value(&hb).unwrap(), before);
+    }
+
+    #[test]
+    fn enrollment_lists_only_the_connectors_of_protocol_0_1_0() {
+        let all: ConnectorList = serde_json::from_value(serde_json::json!([
+            "postgres", "mysql", "mongodb", "openldap", "cas"
+        ]))
+        .unwrap();
+        let sent = enroll_connectors(all);
+        assert_eq!(
+            serde_json::to_value(&sent).unwrap(),
+            serde_json::json!(["postgres", "mysql", "mongodb", "openldap"])
+        );
     }
 
     #[test]

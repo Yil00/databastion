@@ -15,7 +15,7 @@ const MESSAGES: Record<number, string> = {
   503: "The console is busy. Try again in a moment.",
 };
 
-export function LoginForm() {
+export function LoginForm({ adminsOnly = false }: { adminsOnly?: boolean }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -47,6 +47,7 @@ export function LoginForm() {
     <Card>
       <CardContent>
         <form onSubmit={submit} className="flex flex-col gap-4">
+          {adminsOnly && <p className="text-sm text-muted-foreground">Local login is reserved for administrators (break-glass).</p>}
           <div className="flex flex-col gap-2">
             <Label htmlFor="username">Username</Label>
             <Input id="username" name="username" autoComplete="username" required maxLength={64} />

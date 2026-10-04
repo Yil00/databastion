@@ -1,0 +1,17 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1b",
+  "events": [
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:01:00Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c",
+        "client_addr": "198.51.100.0/24"
+      },
+      "action": "connect",
+      "objects": [],
+      "source": "cas_audit_log",
+      "aggregated_count": 1
+    }
+  ]
+}

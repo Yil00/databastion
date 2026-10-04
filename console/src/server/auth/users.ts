@@ -54,12 +54,15 @@ export interface LoginUser {
   passwordHash: string;
 }
 
-/** Enabled user by login name, or null (unknown, malformed or disabled). No argon2id work. */
+/**
+ * Enabled local user by login name, or null (unknown, malformed, disabled, or a single sign-on user
+ * without a local password: ADR-0038 decision 11). No argon2id work.
+ */
 export async function findLoginUser(db: Database, username: string): Promise<LoginUser | null> {
   const name = username.trim().toLowerCase();
   if (!USERNAME.test(name)) return null;
   const [user] = await db.select().from(users).where(eq(users.username, name)).limit(1);
-  if (!user || user.disabledAt) return null;
+  if (!user || user.disabledAt || user.passwordHash === null) return null;
   return { id: user.id, username: user.username, role: user.role, passwordHash: user.passwordHash };
 }
 

@@ -518,6 +518,25 @@ export class RateLimiter {
     return { ok: true, refund: this.sharedRefund(cfg, key, r.window.windowStartMs, this.charge(key)) };
   }
 
+  /**
+   * Gives one hit of `key`'s CURRENT window back, here and in the store, without the reservation's
+   * refund closure (another request, possibly in another process, counted it): e.g. an OIDC start
+   * refunded by the callback that completed the flow. Best effort: a store failure is ignored.
+   */
+  async giveBackShared(key: string): Promise<void> {
+    const w = this.current(key);
+    if (w && w.count > 0) w.count--;
+    const cfg = this.activeShared();
+    if (!cfg) return;
+    await this.settled(key);
+    const sk = this.storeKey(cfg, key);
+    const found = await this.storeCall(() => cfg.store.check([sk]));
+    if (found === FAILED) return;
+    const win = found.get(storeKeyId(sk));
+    if (!win || win.count === 0) return;
+    await this.storeCall(() => cfg.store.refund(sk, win.windowStartMs));
+  }
+
   /** Counts an attempt across all processes even when over the limit (never refuses); returns its refund. */
   async chargeShared(key: string): Promise<Refund> {
     const cfg = this.activeShared();

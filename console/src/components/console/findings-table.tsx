@@ -3,7 +3,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
-import { isLdapEngine, locationPartLabels } from "@/lib/location-labels";
+import { hasNamedLocationParts, locationPartLabels } from "@/lib/location-labels";
 import type { FindingSummaryRow, FindingView } from "@/server/findings";
 
 import { FalsePositiveButton } from "./false-positive-button";
@@ -26,19 +26,19 @@ export function findingsHref(q: { agent?: string; target?: string; classifier?: 
 type LocationParts = Pick<FindingView, "databaseName" | "schemaName" | "objectName" | "fieldName">;
 
 /**
- * A finding location on one line. OpenLDAP (ADR-0029 decision 6): each part is named (naming
- * context, container, object class, attribute), since `schema` and `object` do not mean a schema
- * and a table there.
+ * A finding location on one line. OpenLDAP (ADR-0029 decision 6) and CAS (ADR-0041 decision 4):
+ * each part is named (naming context, container, object class, attribute; store, service type,
+ * service, path), since `schema` and `object` do not mean a schema and a table there.
  */
 export function locationLabel(f: LocationParts, engine: string | null = null): string {
-  if (!isLdapEngine(engine)) return [f.databaseName, f.schemaName, f.objectName, f.fieldName].filter((p) => p !== null).join(" / ");
-  return ldapParts(f, engine)
+  if (!hasNamedLocationParts(engine)) return [f.databaseName, f.schemaName, f.objectName, f.fieldName].filter((p) => p !== null).join(" / ");
+  return namedParts(f, engine)
     .map(([label, value]) => `${label} ${value}`)
     .join(" / ");
 }
 
-function ldapParts(f: LocationParts, engine: string | null): [string, string][] {
-  const l = locationPartLabels(engine);
+function namedParts(f: LocationParts, engine: string | null): [string, string][] {
+  const l = locationPartLabels(engine, f.databaseName);
   const parts: [string, string | null][] = [
     [l.database, f.databaseName],
     [l.schema, f.schemaName],
@@ -48,12 +48,12 @@ function ldapParts(f: LocationParts, engine: string | null): [string, string][] 
   return parts.filter((p): p is [string, string] => p[1] !== null);
 }
 
-/** The location cell: OpenLDAP parts one per line with their LDAP names; other engines on one line. */
+/** The location cell: OpenLDAP and CAS parts one per line with their names; other engines on one line. */
 export function LocationCell({ location, engine }: { location: LocationParts; engine: string | null }) {
-  if (!isLdapEngine(engine)) return <>{locationLabel(location)}</>;
+  if (!hasNamedLocationParts(engine)) return <>{locationLabel(location)}</>;
   return (
     <dl className="grid grid-cols-[max-content_1fr] gap-x-2 text-xs">
-      {ldapParts(location, engine).map(([label, value]) => (
+      {namedParts(location, engine).map(([label, value]) => (
         <div key={label} className="contents">
           <dt className="text-muted-foreground">{label}</dt>
           <dd className="break-all">{value}</dd>
