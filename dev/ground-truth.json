@@ -5122,6 +5122,319 @@
    "negative_control": true,
    "note": "record names, not person names",
    "object": "databastionContractor"
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.person_name"
+   ],
+   "field": "contacts[].name",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "Camille David",
+    "Camille Garcia",
+    "Louis Leroy",
+    "Sophia Brown"
+   ]
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.email"
+   ],
+   "field": "contacts[].email",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "camille.david@example.org",
+    "camille.garcia@example.com",
+    "louis.leroy@example.net",
+    "sophia.brown@example.com"
+   ]
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.phone"
+   ],
+   "field": "contacts[].phone",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "+33 3 53 01 07 83",
+    "02 61 91 51 32",
+    "03 53 01 73 05",
+    "05 36 49 27 59"
+   ]
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "contacts[].department",
+   "name_contains_value": false,
+   "negative_control": true,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*"
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.person_name"
+   ],
+   "field": "contacts[].name",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "Camille Richard",
+    "Jean Bernard",
+    "Noé Simon"
+   ]
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.email"
+   ],
+   "field": "contacts[].email",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "camille.richard@example.org",
+    "jean.bernard@example.com",
+    "noe.simon@example.com"
+   ]
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.phone"
+   ],
+   "field": "contacts[].phone",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*",
+   "values": [
+    "02 61 91 52 05",
+    "02 61 91 72 74",
+    "09 72 10 39 22"
+   ]
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "contacts[].department",
+   "name_contains_value": false,
+   "negative_control": true,
+   "note": "values of every service of the type, pooled (ADR-0041 decision 4)",
+   "object": "*"
+  },
+  {
+   "container": "saml",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.person_name"
+   ],
+   "field": "contacts[].name",
+   "name_contains_value": false,
+   "negative_control": false,
+   "object": "Payroll-SP",
+   "values": [
+    "Louis Garcia",
+    "Léa Thomas"
+   ]
+  },
+  {
+   "container": "saml",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.email"
+   ],
+   "field": "contacts[].email",
+   "name_contains_value": false,
+   "negative_control": false,
+   "object": "Payroll-SP",
+   "values": [
+    "lea.thomas@example.com",
+    "louis.garcia@example.org"
+   ]
+  },
+  {
+   "container": "saml",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.phone"
+   ],
+   "field": "contacts[].phone",
+   "name_contains_value": false,
+   "negative_control": false,
+   "object": "Payroll-SP",
+   "values": [
+    "01 99 00 63 97",
+    "01 99 00 87 84"
+   ]
+  },
+  {
+   "container": "saml",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "contacts[].department",
+   "name_contains_value": false,
+   "negative_control": true,
+   "object": "Payroll-SP"
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.email"
+   ],
+   "field": "access_strategy.required_attributes.*[]",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "required-attribute values (an e-mail allow-list)",
+   "object": "Badge-Sync",
+   "values": [
+    "anais.lefevre@example.org",
+    "chloe.richard1@example.org",
+    "jade.michel@example.net",
+    "noe.david@example.org"
+   ]
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.phone"
+   ],
+   "field": "attribute_release_policy.allowed_attributes.*[]",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "static attribute release values",
+   "object": "HR-Portal",
+   "values": [
+    "04 65 71 76 25",
+    "05 36 49 07 32",
+    "09 72 10 33 83"
+   ]
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "attribute_release_policy.allowed_attributes[]",
+   "name_contains_value": false,
+   "negative_control": true,
+   "note": "attribute names, not values",
+   "object": "Intranet"
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "properties.*.values[]",
+   "name_contains_value": false,
+   "negative_control": true,
+   "note": "cost center code",
+   "object": "Intranet"
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "client_secret",
+   "name_contains_value": false,
+   "negative_control": false,
+   "never_sampled": true,
+   "note": "OIDC client secret in clear: never sampled; counted as security.client_secrets_in_clear",
+   "object": "HR-Portal",
+   "values": [
+    "dev-only-cas-oidc-client-secret-dATWpwFH9QAEnFQN0dBa4hwm"
+   ]
+  },
+  {
+   "container": "oidc",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "client_secret",
+   "name_contains_value": false,
+   "negative_control": false,
+   "never_sampled": true,
+   "note": "OIDC client secret in the {cipher} form: never sampled",
+   "object": "Expenses",
+   "values": [
+    "{cipher}eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..wgLCSVAg1TL8InTm.yZwrx7KMSarlNG6VMNLFhuLO6ALkLSkjKYsLJhLOdvz1Jsg2.BNmhb0fxIjAsjt0fivofX7"
+   ]
+  },
+  {
+   "container": "cas",
+   "database": "service_registry",
+   "engine": "cas",
+   "expected_classifiers": [],
+   "field": "attribute_release_policy.headers.authorization",
+   "name_contains_value": false,
+   "negative_control": false,
+   "never_sampled": true,
+   "note": "Authorization header of the RESTful release policy: never sampled",
+   "object": "Badge-Sync",
+   "values": [
+    "Basic ZGV2LW9ubHktYmFkZ2Utc3luYzo4djM2R2JnRFE5OEJ0ZWd3SlREU240NTU="
+   ]
+  },
+  {
+   "container": null,
+   "database": "audit_trail",
+   "engine": "cas",
+   "expected_classifiers": [
+    "pii.email"
+   ],
+   "field": "who",
+   "name_contains_value": false,
+   "negative_control": false,
+   "note": "logins of the accepted users (cas.authn.accept.users); present once they logged in",
+   "object": "audit_log",
+   "values": [
+    "camille.martin@example.org",
+    "hugo.durand@example.net",
+    "olivia.smith@example.com"
+   ]
   }
  ],
  "notes": [
@@ -5132,10 +5445,19 @@
   "name_contains_value: the object, container or key names embed values (ADR-0009, security review M2). name_values must never reach the console (invariant I2 test, P2-E).",
   "expected_normalized_name: name expected on the uplink after normalization (ADR-0009).",
   "values: every distinct seeded value of the location; none may appear in clear text in the console database (P2-E).",
-  "MySQL / MariaDB: Discovery excludes the system schemas mysql, information_schema, performance_schema and sys (docs/05-security.md)."
+  "MySQL / MariaDB: Discovery excludes the system schemas mysql, information_schema, performance_schema and sys (docs/05-security.md).",
+  "never_sampled: a credential (CAS client secret, Authorization header) the connector never samples, masks nor fingerprints; expects no classifier, and its values must never reach the console, the agent logs or the spool (ADR-0041 decision 14).",
+  "cas: locations as connector-cas reports them (ADR-0041 decision 4); the registry is dev/cas/services, the audit log dev/.state/logs/cas/cas_audit.log."
  ],
  "seed": 20260928,
  "targets": {
+  "cas": {
+   "databases": [
+    "service_registry",
+    "audit_trail"
+   ],
+   "service": "cas"
+  },
   "mariadb": {
    "databases": [
     "support"

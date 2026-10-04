@@ -1,0 +1,3 @@
+// Dev-only CAS overlay (dev/cas/Dockerfile): resolves the CAS modules the dev image adds to the
+// published apereo/cas war. Never part of the release assets.
+rootProject.name = 'databastion-dev-cas-overlay'

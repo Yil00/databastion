@@ -28,7 +28,8 @@ jobs:
   dev-env:
     name: Dev environment
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # The opt-in CAS step builds its overlay image (about 170 MB of modules from Maven Central).
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dev credentials (dev-only example values)
@@ -59,11 +60,18 @@ jobs:
         run: |
           make dev-keycloak UP_TIMEOUT=600 WAIT_TIMEOUT=300
           make dev-keycloak-smoke
+      # Opt-in Apereo CAS (target of the CAS connector, ADR-0041): overlay image build (modules
+      # resolved from Maven Central, versions locked and SHA-256-verified, dev/cas/overlay), then
+      # registry, login, service ticket, audit log, file permission and ticket table grant checks.
+      - name: Apereo CAS (overlay build, registry, audit trail)
+        run: |
+          make dev-cas UP_TIMEOUT=1500 WAIT_TIMEOUT=600
+          make dev-cas-smoke
       - name: Service status and logs
         if: failure()
         run: |
-          docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak ps -a
-          timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak logs --no-color --tail=300
+          docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas ps -a
+          timeout 120 docker compose -f dev/docker-compose.yml --profile psmdb --profile keycloak --profile cas logs --no-color --tail=300
       - name: Stop
         if: always()
         run: make dev-reset

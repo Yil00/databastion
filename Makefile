@@ -12,7 +12,7 @@ WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb percona psmdb
 # Opt-in dev services (Compose profiles), stopped by dev-down / dev-reset too.
-DEV_OPT_IN := --profile psmdb --profile keycloak
+DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas
 # pnpm at the version pinned by console/package.json (`packageManager`), through corepack.
 PNPM ?= corepack pnpm
 export COREPACK_ENABLE_DOWNLOAD_PROMPT ?= 0
@@ -31,7 +31,8 @@ AGENT_CONFIG ?=
 
 .PHONY: help \
 	install doctor \
-	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-down dev-reset dev-logs dev-ps seed seed-check test-dev \
+	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-down \
+	dev-reset dev-logs dev-ps seed seed-check test-dev \
 	console-dev console-worker console-migrate console-lint console-typecheck console-test console-build \
 	console-licenses \
 	agent-build agent-build-minimal agent-fmt agent-lint agent-test agent-holdout agent-deny agent-it \
@@ -125,11 +126,21 @@ dev-keycloak: dev/.env ## Start the opt-in Keycloak service (OIDC test realm, AD
 dev-keycloak-smoke: dev/.env ## Smoke-test the running Keycloak service (discovery, JWKS, seeded realm)
 	timeout 180 dev/keycloak/smoke.sh
 
+dev-cas: dev/.env dev-dirs ## Start the opt-in Apereo CAS service (ADR-0041 target; builds its overlay image) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile cas up -d --build --wait --wait-timeout $(WAIT_TIMEOUT) cas cas-db-grants
+
+dev-cas-smoke: dev/.env ## Smoke-test the running CAS service (registry, login, service ticket, audit log, permissions)
+	timeout 300 dev/cas/smoke.sh
+
 dev-down: ## Stop the dev environment (keeps data volumes)
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down --remove-orphans
 
 dev-reset: ## Stop and delete volumes and dev/.state (reloads the seed on next `make dev`)
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down -v --remove-orphans
+	@# The CAS files belong to the CAS user and the agent's group (dev/cas/files-init.sh): removed
+	@# by the same one-shot container, as the host user cannot.
+	if [ -e dev/.state/cas ] || [ -e dev/.state/logs/cas ]; then \
+	  timeout 120 $(COMPOSE) run --rm --no-deps -T cas-files-init sh /usr/local/bin/files-init.sh clean; fi
 	rm -rf dev/.state
 
 dev-logs: ## Show the last TAIL (200) log lines of every service (not followed)
@@ -242,8 +253,9 @@ protocol-check: protocol-lint protocol-append-only protocol-test protocol-drift 
 docs-check: ## Internal Markdown links (CI)
 	timeout 120 python3 scripts/check-md-links.py
 
-shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and dev/keycloak/smoke.sh
-	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh
+shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and the Keycloak and CAS dev scripts
+	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
+	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'

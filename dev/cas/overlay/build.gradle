@@ -1,0 +1,60 @@
+// Dev-only CAS overlay (ADR-0041 open question 7): the published apereo/cas image is the CAS
+// overlay with the core modules only (no JSON service registry, no OIDC, no JPA ticket registry),
+// so dev/cas/Dockerfile adds these modules to its war. This build only resolves them: versions come
+// from the CAS BOM of the image's CAS version and the Spring Boot BOM of its war (as the official
+// overlay's Spring Boot plugin applies it), every transitive version is locked
+// (gradle.lockfile) and every downloaded file is checked against gradle/verification-metadata.xml
+// (SHA-256). merge.py then adds the jars the war does not already hold.
+//
+// Not included: the SAML2 IdP module (cas-server-support-saml-idp). It needs OpenSAML, published
+// in the Shibboleth repository only, not in Maven Central; the dev registry's SAML definition is
+// then a file for the agent's Discovery that CAS itself does not load (dev/README.md).
+//
+// After changing a dependency or CAS_VERSION (dev/README.md, "Apereo CAS"):
+//   gradle -PcasVersion=<version> -PspringBootVersion=<the war's Spring-Boot-Version> \
+//     dependencies --write-locks --write-verification-metadata sha256
+plugins {
+    id 'java'
+}
+
+def casVersion = providers.gradleProperty('casVersion').get()
+def springBootVersion = providers.gradleProperty('springBootVersion').get()
+
+repositories {
+    mavenCentral()
+}
+
+dependencyLocking {
+    lockAllConfigurations()
+}
+
+dependencies {
+    runtimeOnly platform("org.apereo.cas:cas-server-support-bom:${casVersion}")
+    runtimeOnly platform("org.springframework.boot:spring-boot-dependencies:${springBootVersion}")
+    runtimeOnly 'org.apereo.cas:cas-server-support-json-service-registry'
+    runtimeOnly 'org.apereo.cas:cas-server-support-oidc'
+    runtimeOnly 'org.apereo.cas:cas-server-support-jpa-ticket-registry'
+    runtimeOnly 'org.postgresql:postgresql'
+}
+
+// Copies the resolved jars to build/modules and lists them (group, name, version, file) in
+// build/modules/modules.txt for merge.py.
+tasks.register('modules') {
+    def out = layout.buildDirectory.dir('modules')
+    outputs.dir(out)
+    doLast {
+        def dir = out.get().asFile
+        project.delete(dir)
+        dir.mkdirs()
+        def lines = []
+        configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts
+            .findAll { it.extension == 'jar' }
+            .sort { it.file.name }
+            .each { a ->
+                def id = a.moduleVersion.id
+                project.copy { from a.file; into dir }
+                lines << "${id.group} ${id.name} ${id.version} ${a.file.name}"
+            }
+        new File(dir, 'modules.txt').text = lines.join('\n') + '\n'
+    }
+}

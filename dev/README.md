@@ -14,6 +14,8 @@ make test-dev     # unit tests of the seed generator
 make agent-it     # connector integration tests against this environment (ENGINE=postgres|mysql|mongodb|openldap)
 make dev-keycloak        # opt-in: Keycloak with the OIDC test realm (below), waits until healthy
 make dev-keycloak-smoke  # checks its discovery document, JWKS and seeded realm
+make dev-cas             # opt-in: Apereo CAS with a seeded registry and audit trail (below)
+make dev-cas-smoke       # logs a fake user in, then checks the audit log, permissions and grants
 ```
 `make help` lists every target by section (setup with `make install` / `make doctor`, console, agent, protocol, `make check`, end-to-end, release). The CI workflow `.github/workflows/dev-env.yml` runs the same steps as `make dev` / `make dev-smoke`; `make agent-it` ([agent-it.sh](agent-it.sh)) runs the "dev image" step of the CI connector jobs, with the variables shown below.
 
@@ -31,6 +33,7 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | OpenLDAP (Debian slapd) (`openldap`) | 1389 (LDAPS 1636) | `dc=example,dc=org` | `slapo-accesslog` in `cn=accesslog` (`reads writes session`) | Full ([ADR-0029](../docs/adr/0029-openldap-connector.md): once each naming context shows a search record) |
 | Mailpit (`mailpit`) | SMTP 1025, UI 8025 | | | |
 | Keycloak 26.8 (`keycloak`, opt-in: profile `keycloak`) | 8180 | realm `databastion` ([below](#keycloak-oidc-test-realm)) | | |
+| Apereo CAS 8.0.2 (`cas`, opt-in: profile `cas`) | 8280 | JSON service registry `cas/services` ([below](#apereo-cas)) | JSON audit log `dev/.state/logs/cas/cas_audit.log` | Partial ([ADR-0041](../docs/adr/0041-cas-connector.md): never Full) |
 | Prometheus (`prometheus`) | 9090 | | | |
 | Grafana (`grafana`) | 3001 | | | |
 
@@ -166,6 +169,39 @@ export DATABASTION_OIDC_ALLOWED_DOMAINS=databastion.test
 - `DATABASTION_OIDC_CA_FILE` is not needed: the issuer is plain HTTP on a loopback address. A production build of the console (`pnpm build && pnpm start`) refuses it.
 - Logout ends the Keycloak session through RP-initiated logout (`end_session_endpoint`, `post_logout_redirect_uri` `http://localhost:3000/login`); with `DATABASTION_OIDC_USE_REFRESH_TOKEN=1`, the refresh token is revoked first (`revocation_endpoint`).
 
+## Apereo CAS
+The target of the CAS connector ([ADR-0041](../docs/adr/0041-cas-connector.md) decision 14, ROADMAP P8-D): a CAS 8.0 server with a seeded JSON service registry, static fake users, the JSON audit trail and a JPA ticket registry in the `postgres` service. Opt-in (Compose profile `cas`), like Keycloak: CAS needs about 1 GiB of memory and one to two minutes to start.
+
+```sh
+make dev-cas         # builds the image (first time: a few minutes), starts postgres and CAS, sets the grants
+make dev-cas-smoke   # dev/cas/smoke.sh (below)
+make dev-down        # also stops it; make dev-reset also removes its files (see "Files")
+```
+
+- **Image** ([cas/Dockerfile](cas/Dockerfile)): the published `apereo/cas:8.0.2` image (pinned by tag and index digest) is the CAS overlay with the core modules only, without the JSON service registry, OIDC or the JPA ticket registry, and CAS reads no module from mounted files. As ADR-0041 open question 7 allows, the build adds those modules to its war: [cas/overlay/build.gradle](cas/overlay/build.gradle) resolves them from Maven Central against the CAS and Spring Boot BOMs of the war, every version locked ([gradle.lockfile](cas/overlay/gradle.lockfile)) and every file checked against [verification-metadata.xml](cas/overlay/gradle/verification-metadata.xml) (SHA-256, `--dependency-verification strict`); [cas/overlay/merge.py](cas/overlay/merge.py) adds the jars the war lacks and fails on any version conflict with it (the war's SBOM gives its versions). The image runs as an unprivileged `cas` user (uid / gid 10041). It is dev-only, carries no secret, and is never a release asset. Not included: the SAML2 IdP module, which needs OpenSAML, published only in the Shibboleth repository: the SAML definition below is a Discovery fixture that CAS itself logs as not loadable. A new CAS version: change `CAS_IMAGE`, `CAS_VERSION` and `SPRING_BOOT_VERSION` together in the Dockerfile (the war's `Spring-Boot-Version`), then regenerate the lock and the metadata as the first comment of `build.gradle` says.
+- **Configuration** ([cas/config/cas.properties](cas/config/cas.properties), [cas/config/log4j2.xml](cas/config/log4j2.xml)), mounted read-only: plain HTTP published on `127.0.0.1:8280` only (`CAS_PORT`), as Keycloak; the agent never contacts CAS (ADR-0041 decision 9) and no actuator endpoint is exposed (the healthcheck reads a static resource, since every request to `/cas/login` writes an audit record). CAS generates its cookie, webflow and ticket keys at each start and prints them in its own log: dev only.
+- **Users** (password `CAS_DEV_USER_PASSWORD`, `dev-only-cas-user` by default): `camille.martin@example.org`, `hugo.durand@example.net`, `olivia.smith@example.com` (e-mail-shaped logins, listed in `ground-truth.json` as the audit trail's `who`), and the service account `svc-monitoring` (a candidate for `clear_principals`).
+- **Service registry** ([cas/services](cas/services), generated by `make seed` from [seed/generate.py](seed/generate.py), never edited by hand): `Intranet-1001` (CAS protocol, used by the smoke test: `https://intranet.example.org/…`), `Badge-Sync-1005` (CAS protocol, an e-mail allow-list in `requiredAttributes`, a RESTful attribute release policy with a fake `Authorization` header), `Payroll-SP-1002` (SAML), `HR-Portal-1003` (OIDC, dev-only client secret in clear, static release values: phone numbers), `Expenses-1004` (OIDC, client secret in the `{cipher}` form). Contacts follow the fake-data conventions below. CAS loads four of them (not the SAML one).
+- **Audit trail**: `cas.audit.engine.audit-format=JSON`, single-line, written by the `org.apereo.inspektr` logger with the message alone (`%m%n`) to `dev/.state/logs/cas/cas_audit.log` (rolled at 10 MB, three files kept). Auditable fields `who`, `what`, `when`, `action`, client and server addresses and user agent; no request headers, no validation assertion. CAS 8.0.2 writes `what` as a JSON object (for example `{"service": …, "ticketId": "ST-1-****…"}`, ticket ids partly masked by CAS's log appender) and `when` without a UTC offset (the container's zone is UTC).
+- **Ticket registry**: JPA in the database `cas` of the `postgres` service (role `cas`, password `CAS_DB_PASSWORD`; [cas/db-init.sh](cas/db-init.sh), not audited by pgaudit). CAS 8.0.2 creates the table `cas_tickets` (`id`, `type`, `body`, `parent_id`, `principal_id`, `service`, `attributes`, `creation_time`, `expiration_time`, `last_used_time`). Tickets are encrypted (the CAS default: `type` is then `org.apereo.cas.ticket.registry.DefaultEncodedTicket`); `DATABASTION_DEV_CAS_TICKET_CRYPTO=false make dev-cas` stores them in clear (`type` is then the ticket class, such as `org.apereo.cas.ticket.TicketGrantingTicketImpl`, and `body` holds the ticket). Each start empties the table (the keys of the previous start are gone). The agent's account `databastion` gets `CONNECT` on `cas`, `USAGE` on `public` and, once CAS has created the table, `SELECT (type, creation_time, expiration_time)` on `cas_tickets` only (decision 6, one-shot `cas-db-grants`): the guard's `SELECT type, count(*) … GROUP BY type` works, `id`, `body`, `principal_id`, `service` and `attributes` stay unreadable. No distributed locking (one node; it would need a lock table the JPA registry does not create).
+- **Files** (decision 6 permissions, one-shot `cas-files-init`, [cas/files-init.sh](cas/files-init.sh)): the registry is copied to `dev/.state/cas/services` (directory `0750`, files `0640`) and mounted read-only into CAS; the log directory `dev/.state/logs/cas` is `2750` (setgid) and CAS creates its logs `0640`. Owner: the CAS user (10041); group: the agent's (10001, the uid / gid of the agent image and of the e2e agent; `DATABASTION_DEV_AGENT_GID` changes it). So an agent running as uid 10001 reads them and can write none of them, nor their directories; the host user cannot read them either. Read the log as the agent would: `docker compose -f dev/docker-compose.yml run --rm --no-deps -T -u 10001:10001 --entrypoint cat cas-files-init /state/logs/cas/cas_audit.log`. `make dev-reset` removes them through the same one-shot container. An agent running on the host as your own user **refuses** these sources, by design: the checkout's directories are its own, and connector-cas refuses a file with an ancestor directory the agent can write (`privilege.registry_writable`, `audit.log_not_readable`); run the agent as another user or in a container (the e2e harness).
+
+A `cas` target for an agent that sees these files at `/etc/cas/services` and `/var/log/cas` (container mounts):
+
+```yaml
+targets:
+  - id: dev-cas
+    engine: cas
+    cas:
+      service_registry:
+        json_dir: /etc/cas/services
+      audit_log:
+        path: /var/log/cas/cas_audit.log
+      clear_principals: [svc-monitoring]
+```
+
+`make dev-cas-smoke` ([cas/smoke.sh](cas/smoke.sh)) checks, from the host: a registered service is accepted and an unknown one refused, the OIDC discovery document; a fake user's login through `/cas/login` and its service ticket validated (`/cas/p3/serviceValidate`), a failed login; then, reading as uid 10001, that the audit log holds one JSON object per line with the `AUTHENTICATION_SUCCESS`, `SERVICE_TICKET_CREATED` (for that service), `SERVICE_TICKET_VALIDATE_SUCCESS` and `AUTHENTICATION_FAILED` records, no `headers` key and not the service ticket in clear; the modes, owner and group above, that uid 10001 can read and not write (even through a read-write mount) and that another uid can read nothing; and the ticket table grants. Nothing secret is printed.
+
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
 environment when these variables are set, and are skipped otherwise:
@@ -292,12 +328,13 @@ export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-comp
 Audit keys of `DATABASTION_TEST_REQUIRE` for MongoDB: `mongo-log`, `mongodump`, `psmdb-audit`.
 
 ## Seed data and ground truth
-[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
+[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/), the CAS service registry in [cas/services/](cas/services/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
 
-All values are fake: `example.com/.org/.net` e-mails, French phone numbers in the ARCEP ranges reserved for fiction, UK 07700 900xxx, US 555-01xx, IBANs with valid mod-97 on fictitious bank codes, NIRs with a valid key, Luhn-valid card numbers from the 411111 / 555555 test ranges, AWS-shaped keys containing `EXAMPLE`.
+All values are fake: `example.com/.org/.net` e-mails, CAS client secrets and `Authorization` header starting with `dev-only` (or a `{cipher}` value of random characters), French phone numbers in the ARCEP ranges reserved for fiction, UK 07700 900xxx, US 555-01xx, IBANs with valid mod-97 on fictitious bank codes, NIRs with a valid key, Luhn-valid card numbers from the 411111 / 555555 test ranges, AWS-shaped keys containing `EXAMPLE`.
 
-`ground-truth.json` lists every seeded location (engine, database, container, object, field) with the expected classifiers and the seeded values, plus:
+`ground-truth.json` lists every seeded location (engine, database, container, object, field) with the expected classifiers and the seeded values (CAS: the registry and audit-trail locations as connector-cas reports them, [above](#apereo-cas)), plus:
 - **negative controls** (`negative_control: true`): look-alike columns (`email_opt_in`, Luhn-invalid 16-digit references, year-named columns…) that must produce no finding;
+- **credentials never sampled** (`never_sampled: true`, CAS): the client secrets and the `Authorization` header of the registry. No classifier is expected there; their `values` must never reach the console, the agent's logs or the spool (ADR-0041 decision 14);
 - **value-bearing names** (`name_contains_value: true`, [ADR-0009](../docs/adr/0009-name-normalization-and-item-sanitization.md), security review M2): MongoDB dynamic keys that are e-mail addresses or digit-only phone numbers, an LDAP `ou=` named after a person, SQL tables whose names embed a phone number, a person name or an e-mail address. Their `name_values` must never reach the console (invariant I2 test, P2-E).
 
 Classifier ids in the ground truth are provisional until the classifier set is frozen (P2-A).

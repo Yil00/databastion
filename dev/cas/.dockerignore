@@ -1,0 +1,7 @@
+# Build context of dev/cas/Dockerfile: the overlay sources only.
+*
+!overlay/settings.gradle
+!overlay/build.gradle
+!overlay/gradle.lockfile
+!overlay/gradle/verification-metadata.xml
+!overlay/merge.py
