@@ -81,12 +81,23 @@ pub fn object_name(def: &Definition) -> NormalizedName {
         .map_or(wildcard, |id| normalize_path(&format!("service_{id}")))
 }
 
+/// The `serviceId` pattern of an indexed service.
+enum Pattern {
+    Compiled(Regex),
+    /// Does not compile (Java-only syntax): never matches.
+    Invalid,
+    /// Beyond [`PATTERN_BUDGET`]: whether it matches is unknown, so a
+    /// lookup that reaches it stops with no service (review of #138: a
+    /// lower-priority catch-all must not take its requests).
+    Unknown,
+}
+
 /// One indexed service.
 struct Entry {
     order: i64,
     service_type: ServiceType,
     object: NormalizedName,
-    pattern: Option<Regex>,
+    pattern: Pattern,
 }
 
 /// The services of a registry, for the audit service match.
@@ -133,9 +144,9 @@ impl ServiceIndex {
                 .size_limit(PATTERN_SIZE_LIMIT)
                 .dfa_size_limit(PATTERN_SIZE_LIMIT)
                 .build()
-                .ok()
+                .map_or(Pattern::Invalid, Pattern::Compiled)
         } else {
-            None
+            Pattern::Unknown
         };
         self.entries.push(Entry {
             order: d.evaluation_order.unwrap_or(i64::MAX),
@@ -165,14 +176,22 @@ impl ServiceIndex {
     }
 
     /// The first service (in evaluation order) whose pattern matches
-    /// `scheme://host/`: its type and normalized name.
+    /// `scheme://host/`: its type and normalized name. `None` when none
+    /// matches, or when a service whose pattern was not compiled for the
+    /// budget comes first (it might match).
     #[must_use]
     pub fn lookup(&self, host: &ServiceHost) -> Option<(ServiceType, &NormalizedName)> {
         let url = host.as_url();
-        self.entries
-            .iter()
-            .find(|e| e.pattern.as_ref().is_some_and(|p| p.is_match(&url)))
-            .map(|e| (e.service_type, &e.object))
+        for e in &self.entries {
+            match &e.pattern {
+                Pattern::Compiled(p) if p.is_match(&url) => {
+                    return Some((e.service_type, &e.object));
+                }
+                Pattern::Compiled(_) | Pattern::Invalid => {}
+                Pattern::Unknown => return None,
+            }
+        }
+        None
     }
 }
 
@@ -253,9 +272,18 @@ mod tests {
         assert_eq!(idx.len(), 3);
         let mut big = ServiceIndex::default();
         let budget = PATTERN_BUDGET / (2 * PATTERN_SIZE_LIMIT);
-        for i in 0..=budget {
-            assert_eq!(big.add(&defs[1]), i < budget, "{i}");
+        for i in 0..budget {
+            assert!(big.add(&defs[2]), "{i}");
         }
+        // Beyond the budget, a high-priority service (order 1) has no
+        // pattern: the catch-all (order 100) does not take its requests.
+        assert!(!big.add(&defs[1]));
+        assert!(!big.add(&defs[0]));
+        big.finish();
+        assert!(
+            big.lookup(&service_of("https://hr.example.org/x").unwrap())
+                .is_none()
+        );
         let host = |u: &str| service_of(u).unwrap();
         let (t, o) = idx.lookup(&host("https://hr.example.org/x")).unwrap();
         assert_eq!((t, o.as_str()), (ServiceType::Cas, "HR"));

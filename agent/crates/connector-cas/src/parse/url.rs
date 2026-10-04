@@ -39,20 +39,69 @@ fn after_last_at(t: &str) -> usize {
     cut
 }
 
-/// Appends one blank-free token, its URL credentials removed.
+/// Where the `//` of a URL starts in `t`, and its length: `//`, the
+/// JSON-escaped `\/\/` or the percent-encoded `%2F%2F` (any case).
+fn separator(t: &str) -> Option<(usize, usize)> {
+    let b = t.as_bytes();
+    (0..b.len()).find_map(|i| {
+        let rest = b.get(i..)?;
+        if rest.starts_with(b"//") {
+            Some((i, 2))
+        } else if rest.starts_with(b"\\/\\/") {
+            Some((i, 4))
+        } else if rest
+            .get(..6)
+            .is_some_and(|w| w.eq_ignore_ascii_case(b"%2f%2f"))
+        {
+            Some((i, 6))
+        } else {
+            None
+        }
+    })
+}
+
+/// Index of the first `?`, `#`, `%3F` or `%23` (any case) of `t`.
+fn query_start(t: &str) -> usize {
+    let b = t.as_bytes();
+    (0..b.len())
+        .find(|&i| {
+            matches!(b.get(i), Some(b'?' | b'#'))
+                || b.get(i..i + 3).is_some_and(|w| {
+                    w.eq_ignore_ascii_case(b"%3f") || w.eq_ignore_ascii_case(b"%23")
+                })
+        })
+        .unwrap_or(b.len())
+}
+
+/// Appends one blank-free token, its URL credentials removed:
+/// - with a `//` (any form): an `@` before it drops everything up to that
+///   `@` (JDBC `thin:scott/tiger@//db`); after it, everything up to the
+///   last `@` / `%40`, then the query and the fragment;
+/// - without one: an `@` preceded by `:` or `/` in the token (`user:pass@host`,
+///   JDBC `scott/tiger@db:1521:SID`) drops everything up to the last `@`.
+///   A plain e-mail address (no `:` nor `/` before its `@`) is kept, so it
+///   can still be classified.
 fn push_token(out: &mut String, token: &str) {
-    let Some(i) = token.find("//") else {
-        out.push_str(token);
+    let Some((i, len)) = separator(token) else {
+        let cut = after_last_at(token);
+        let creds = cut > 0
+            && token
+                .get(..cut)
+                .is_some_and(|h| h.contains(':') || h.contains('/'));
+        out.push_str(if creds {
+            token.get(cut..).unwrap_or("")
+        } else {
+            token
+        });
         return;
     };
-    let (head, tail) = token.split_at(i + 2);
+    let head = token.get(..i).unwrap_or("");
+    let head = head.get(after_last_at(head)..).unwrap_or("");
     out.push_str(head);
+    out.push_str("//");
+    let tail = token.get(i + len..).unwrap_or("");
     let tail = tail.get(after_last_at(tail)..).unwrap_or("");
-    let end = tail
-        .bytes()
-        .position(|b| matches!(b, b'?' | b'#'))
-        .unwrap_or(tail.len());
-    out.push_str(tail.get(..end).unwrap_or(""));
+    out.push_str(tail.get(..query_start(tail)).unwrap_or(""));
 }
 
 /// Removes the userinfo, query string and fragment of every URL in `s`
@@ -148,14 +197,16 @@ pub fn service_of(what: &str) -> Option<ServiceHost> {
     .filter_map(|(p, s)| find(p).map(|i| (i, *s, p.len())))
     .min_by_key(|(i, _, _)| *i)?;
     let tail = what.get(i + len..)?;
-    // The URL token, then everything up to its last `@` dropped (the
-    // userinfo, whatever it holds).
-    let token_end = tail.bytes().position(ends_url).unwrap_or(tail.len());
-    let token = tail.get(..token_end)?;
-    let token = token.get(after_last_at(token)..)?;
-    let stop = |b: u8| matches!(b, b'/' | b'?' | b'#' | b',' | b';' | b')' | b'}' | b'|');
-    let end = token.bytes().position(stop).unwrap_or(token.len());
-    let host_port = token.get(..end)?;
+    // The authority ends at the first `/`, `?`, `#` (or a delimiter);
+    // the host follows its last `@` / `%40`. An `@` of the path or the
+    // query is never read (an end user could otherwise choose the
+    // service); a password holding `/` leaves garbage, which is not a
+    // valid host or matches no service.
+    let stop =
+        |b: u8| matches!(b, b'/' | b'?' | b'#' | b',' | b';' | b')' | b'}' | b'|') || ends_url(b);
+    let end = tail.bytes().position(stop).unwrap_or(tail.len());
+    let authority = tail.get(..end)?;
+    let host_port = authority.get(after_last_at(authority)..)?;
     let host = if host_port.starts_with('[') {
         host_port.get(..=host_port.find(']')?)?
     } else {
@@ -199,6 +250,24 @@ mod tests {
             ("//u:p@h.example.org/a", "//h.example.org/a"),
             ("https://u%3Ap%40h.example.org/a", "https://h.example.org/a"),
             ("https://u:p%40x@h.example.org/a", "https://h.example.org/a"),
+            (
+                "jdbc:oracle:thin:scott/tiger@//db.example.org:1521/svc",
+                "//db.example.org:1521/svc",
+            ),
+            ("jdbc:oracle:thin:scott/tiger@db:1521:SID", "db:1521:SID"),
+            ("svc:fake-pass@db.example.org", "db.example.org"),
+            (
+                "https:\\/\\/u:p@h.example.org\\/x?q",
+                "https://h.example.org\\/x",
+            ),
+            (
+                "https%3A%2f%2Fu%3Ap%40h.example.org%2Fx%3Fq",
+                "https%3A//h.example.org%2Fx",
+            ),
+            (
+                "contact jane.doe@example.org now",
+                "contact jane.doe@example.org now",
+            ),
             ("://@?#", "://"),
             ("é://é@é/é?é", "é://é/é"),
         ];
@@ -223,10 +292,20 @@ mod tests {
             s("https://[2001:db8::1]:8443/x").as_deref(),
             Some("https://[2001:db8::1]/")
         );
-        assert_eq!(
+        assert_ne!(
             s("ST-1 for https://svc:pa/ss@H.example.org/x").as_deref(),
             Some("https://h.example.org/")
         );
+        // An `@` in the path or the query never chooses the host.
+        for w in [
+            "https://hr.example.org/app?login_hint=jane%40example.com",
+            "https://hr.example.org/app?x=%40other.example.org",
+            "https://hr.example.org/u@other.example.org/x",
+            "https://hr.example.org#@other.example.org",
+            "https://u:p@hr.example.org/x?y=@other.example.org",
+        ] {
+            assert_eq!(s(w).as_deref(), Some("https://hr.example.org/"), "{w}");
+        }
         assert_eq!(s("TGT-9-FAKEfake-cas01"), None);
         assert_eq!(s("https://exa_mple.org/"), None);
         assert_eq!(s("https://"), None);

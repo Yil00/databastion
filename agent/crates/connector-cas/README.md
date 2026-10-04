@@ -67,18 +67,23 @@ refused as a whole, and those files are never opened.
   `{cipher}` value or a five-segment compact JWE counts as encrypted (a JWS
   is readable); services holding one in clear are counted
   (`security.client_secrets_in_clear`).
-- URLs (`scheme://…` and protocol-relative `//…`) lose everything up to the
-  last `@` or `%40` of the URL (the userinfo, whatever characters the
-  password holds), then their query string and fragment, before
-  classification.
+- URLs (`scheme://…`, protocol-relative `//…`, and the escaped `\/\/` and
+  `%2F%2F` forms) lose everything up to the last `@` or `%40` of the URL (the
+  userinfo, whatever characters the password holds), then their query
+  string and fragment, before classification. An `@` before the `//` (JDBC
+  `thin:scott/tiger@//db`) drops everything before it; without a `//`, an
+  `@` preceded by `:` or `/` (`user:pass@host`, JDBC `scott/tiger@db:1521:SID`)
+  drops everything up to it. Plain e-mail addresses are kept.
 - Besides the four names of ADR-0041 decision 3, a directory holding
   `application[-*]`, `cas[-*]` or `bootstrap[-*]` `.yml` / `.yaml` /
-  `.properties` files, or key material (`*.jwks`, `*.jks`, `*.p12`, `*.pem`,
-  `*.key`), is refused as a whole. An entry on another device than the
+  `.properties` files, or key material (`thekeystore`, `*.jwks`, `*.jks`,
+  `*.p12`, `*.pem`, `*.key`, `*.pfx`, `*.jceks`, `*.keystore`, `*.bcfks`), is
+  refused as a whole. An entry on another device than the
   directory (a mount point) is skipped.
 - Per scan, at most 32 MiB of values are pooled, and at most 512 `serviceId`
   patterns are compiled (64 KiB each); a file beyond either budget counts as
-  skipped for a limit. Registry files the agent could write are counted and
+  skipped for a limit, and a service ticket whose lookup reaches a service
+  without a compiled pattern names no service (`*`). Registry files the agent could write are counted and
   reported as `privilege.registry_writable`.
 - Locations: `service_registry` / service type / service name (or `*`) /
   field path (`contacts[].email`, `properties.*.values[]`).
@@ -105,7 +110,7 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 - Principals are fingerprinted except `clear_principals`; failed
   authentications always are.
 - Client addresses: IPv4-mapped and IPv4-compatible IPv6 addresses are read
-  as IPv4. `truncated` keeps an IPv4 /24 and an IPv6 /56; for 6to4
+  as IPv4; `::` and `::1` are sent as is. `truncated` keeps an IPv4 /24 and an IPv6 /56; for 6to4
   (`2002::/16`) the embedded IPv4 address is cut to its /24; for Teredo
   (`2001::/32`) the /56 zeroes the obfuscated client address and port.
   Failures without a parseable address share one "unknown address" window

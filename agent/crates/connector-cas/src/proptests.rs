@@ -112,7 +112,7 @@ proptest! {
         let dbg = format!("{d:?}");
         prop_assert!(!dbg.contains(&secret) && !dbg.contains(&user));
         // The description is kept (a value to classify).
-        if !value.trim().is_empty() && !value.contains("://") {
+        if !value.trim().is_empty() && *strip_credentials(&value) == value {
             prop_assert!(d.values.iter().any(|s| *s.value == value));
         }
     }
@@ -148,7 +148,8 @@ proptest! {
             prop_assert!(!out.contains(m.as_str()), "{} in {:?}", m, out);
         }
         prop_assert!(out.contains(&format!("//{host}{path}")), "{:?}", out);
-        if !relative && !before.to_ascii_lowercase().contains("http") {
+        let delimiters = special.iter().any(|c| matches!(*c, "/" | "?" | "#"));
+        if !relative && !delimiters && !before.to_ascii_lowercase().contains("http") {
             let h = service_of(&text).unwrap();
             prop_assert_eq!(h.as_url(), format!("https://{host}/"));
         }
@@ -182,6 +183,46 @@ proptest! {
             Some(ClientAddr::Ip(IpAddr::V6(r))) => prop_assert_eq!(u128::from(r) & ((1u128 << 72) - 1), 0),
             other => prop_assert!(false, "{:?}", other),
         }
+    }
+
+    /// Credentials outside the plain `scheme://` form (review of #138):
+    /// JDBC, scheme-less userinfo, escaped `//`.
+    #[test]
+    fn other_credential_forms_are_stripped(
+        user in marker(),
+        pass in marker(),
+        query in marker(),
+        form in 0usize..6,
+        upper in any::<bool>(),
+        host in "[a-z]{1,10}\\.example\\.org",
+    ) {
+        let enc = if upper { "%2F%2F" } else { "%2f%2f" };
+        let text = match form {
+            0 => format!("jdbc:oracle:thin:{user}/{pass}@//{host}:1521/svc"),
+            1 => format!("jdbc:oracle:thin:{user}/{pass}@{host}:1521:SID"),
+            2 => format!("{user}:{pass}@{host}"),
+            3 => format!("https:\\/\\/{user}:{pass}@{host}\\/x?q={query}"),
+            4 => format!("https:{enc}{user}%3A{pass}%40{host}%2Fx%3Fq%3D{query}"),
+            _ => format!("ldap://{user}:{pass}@{host}/o?{query}"),
+        };
+        let out = strip_credentials(&format!("x {text} y"));
+        for m in [&user, &pass, &query] {
+            prop_assert!(!out.contains(m.as_str()), "{} in {:?}", m, out);
+        }
+        prop_assert!(out.contains(&host));
+    }
+
+    /// An `@` or `%40` in the path, query or fragment never chooses the
+    /// service host.
+    #[test]
+    fn query_at_signs_never_choose_the_host(
+        other in "[a-z]{1,10}\\.example\\.com",
+        sep in prop::sample::select(vec!["/", "/a?x=", "?x=", "#", "/a/"]),
+        at in prop::sample::select(vec!["@", "%40", "%40%40", "@@"]),
+    ) {
+        let what = format!("ST-1 for https://hr.example.org{sep}{at}{other}");
+        let got = service_of(&what).map(|h| h.as_url());
+        prop_assert_eq!(got.as_deref(), Some("https://hr.example.org/"));
     }
 
     #[test]

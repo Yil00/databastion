@@ -181,7 +181,8 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
 /// is cut to its /24 (the /40 prefix is kept, the rest zeroed); Teredo
 /// (`2001::/32`) keeps its prefix and part of the server address, its
 /// obfuscated client address and port are zeroed by the /56. Mapped and
-/// compatible addresses are IPv4 first ([`canonical`]).
+/// compatible addresses are IPv4 first ([`canonical`]); `::` and `::1` are
+/// sent as is.
 #[must_use]
 pub fn reduce(ip: IpAddr, mode: ClientAddrMode) -> Option<ClientAddr> {
     let ip = canonical(ip);
@@ -190,6 +191,8 @@ pub fn reduce(ip: IpAddr, mode: ClientAddrMode) -> Option<ClientAddr> {
         ClientAddrMode::Clear => Some(ClientAddr::Ip(ip)),
         ClientAddrMode::Truncated => Some(ClientAddr::Ip(match ip {
             IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_ff00).into()),
+            // `::` and `::1` carry no client: sent as is.
+            IpAddr::V6(v6) if u128::from(v6) <= 1 => ip,
             IpAddr::V6(v6) => {
                 let bits = u128::from(v6);
                 let keep = if bits >> 112 == 0x2002 { 40 } else { 56 };
@@ -843,7 +846,8 @@ mod tests {
             reduce("::ffff:192.0.2.77".parse().unwrap(), ClientAddrMode::Clear),
             ClientAddr::parse("192.0.2.77")
         );
-        assert_eq!(r("::1"), ClientAddr::parse("::"));
+        assert_eq!(r("::1"), ClientAddr::parse("::1"));
+        assert_eq!(r("::"), ClientAddr::parse("::"));
         // 6to4: the embedded IPv4 cut to its /24.
         assert_eq!(
             r("2002:c000:024d:1234::1"),

@@ -36,11 +36,12 @@ pub const MAX_REGISTRY_FILES: usize = 4096;
 /// Largest registry file read, in bytes.
 pub const MAX_REGISTRY_FILE_BYTES: u64 = 1024 * 1024;
 /// CAS configuration file names: their presence refuses the directory.
-const CONFIG_FILE_NAMES: [&str; 4] = [
+const CONFIG_FILE_NAMES: [&str; 5] = [
     "cas.properties",
     "cas.yml",
     "application.yml",
     "application.properties",
+    "thekeystore",
 ];
 /// Configuration name stems (`<stem>.<ext>` and `<stem>-<profile>.<ext>`)
 /// and their extensions (review of #138 I1).
@@ -50,7 +51,9 @@ const CONFIG_STEMS: [(&str, &[&str]); 3] = [
     ("cas", &["yml", "yaml", "properties"]),
 ];
 /// Extensions of key material: their presence refuses the directory.
-const KEY_EXTENSIONS: [&str; 5] = ["jwks", "jks", "p12", "pem", "key"];
+const KEY_EXTENSIONS: [&str; 9] = [
+    "jwks", "jks", "p12", "pem", "key", "pfx", "jceks", "keystore", "bcfks",
+];
 
 /// Why a declared source is not read (kinds only, never a path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +205,8 @@ impl std::fmt::Debug for Listing {
 /// case-insensitively): `cas.properties`, `cas.yml`, `application.yml`,
 /// `application.properties`, `application[-*].{yml,yaml,properties}`,
 /// `cas[-*].{yml,yaml,properties}`, `bootstrap[-*].{yml,yaml,properties}`,
-/// `*.jwks`, `*.jks`, `*.p12`, `*.pem`, `*.key`.
+/// `thekeystore`, `*.jwks`, `*.jks`, `*.p12`, `*.pem`, `*.key`, `*.pfx`,
+/// `*.jceks`, `*.keystore`, `*.bcfks`.
 fn is_config_name(name: &[u8]) -> bool {
     if CONFIG_FILE_NAMES
         .iter()
