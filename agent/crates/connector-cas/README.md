@@ -5,7 +5,7 @@ Apereo CAS connector of the DataBastion agent (phase 8,
 only** and opens no network connection of any kind: no HTTP client, no
 database client, no actuator endpoint, no CAS credential. CAS stores held in
 PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP are read by that engine's
-connector, with the CAS store guard (ADR-0041 decision 5, a later task).
+connector, with the CAS store guard (ADR-0041 decision 5, #141).
 
 **Status**: wired into the agent (P8-B second part): `CasConnector` is the
 `Connector` of the `cas` engine, compiled into the binary with the `cas` Cargo

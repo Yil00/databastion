@@ -4,12 +4,14 @@ How to install the console and an agent, enroll the agent, declare targets, give
 
 > **Status.** v0.1.0, the first release, was published on 2026-09-30, v0.2.0, a maintenance release, and v0.3.0 (PostgreSQL audit levels: Full requires `pgaudit.log_rows`, [ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)), both on 2026-10-03, then v0.3.1 on 2026-10-04 (MSRV Rust 1.88, masking of typographic separators, automated release notes) ([latest release](https://github.com/Yil00/databastion/releases/latest)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
 
+> **On `dev`, not released yet** (phase 8, [ROADMAP](ROADMAP.md#phase-8--oidc-login--cas-connector)): console login with OpenID Connect and the Users page ([section 3](#single-sign-on-with-openid-connect)), and Apereo CAS targets with the CAS store guard in the other connectors ([section 6](#6-declare-targets)). They ship with the next release; the phase 8 end-to-end tests for CAS and the end-of-phase security review are still open.
+
 New to DataBastion? The [tutorial](11-tutorial.md) walks through a first installation and a first scan step by step, and through a development setup with `make`.
 
 ## 1. What you deploy
 | Component | Where | Network |
 |-----------|-------|---------|
-| **Console**: `web`, `worker`, one-shot `migrate`, internal PostgreSQL 17 | One host, behind an HTTPS reverse proxy | Inbound HTTPS from users and agents; outbound from the worker to the SMTP relay and webhook receivers |
+| **Console**: `web`, `worker`, one-shot `migrate`, internal PostgreSQL 17 | One host, behind an HTTPS reverse proxy | Inbound HTTPS from users and agents; outbound from the worker to the SMTP relay and webhook receivers, and from `web` to the OpenID Connect provider when single sign-on is on |
 | **Agent**: `databastion-agent`, one per host or network zone | Close to the monitored databases; on the database host itself when Audit reads a log file | Outbound HTTPS to the console and connections to its declared targets only; **no listening port** (I1) |
 
 The agent is the only client of the console's agent API. Database credentials stay in the agent's configuration on its host (I3); the console only receives locations, masked samples and keyed fingerprints (I2). Architecture: [02-architecture.md](02-architecture.md). Security model: [05-security.md](05-security.md).
@@ -45,10 +47,47 @@ The bundled Caddy proxy (`proxy` profile) is the only published port. To use you
 Check: `GET /api/health/ready` answers `200`, and you can sign in. `secrets/encryption_key` protects the secrets the console stores: keep a copy offline.
 
 Notes:
-- 0.1 has one user role in practice: the bootstrap administrator. There is no user-management page or API yet; the `analyst` role exists in the schema but no account can be created with it from the console.
+- Roles: `admin` and `analyst` (read-only). Released versions up to 0.3.1 have no user-management page: the bootstrap administrator is the only account. On `dev` (next release), administrators create local users, change roles and disable accounts on the **Users** page (`/users`); the console always keeps one enabled administrator ([console/README.md](../console/README.md#first-administrator)).
 - Without a usable `DATABASTION_ENCRYPTION_KEY`, the web and worker processes refuse to start in production. Changing it later makes the stored masked samples and notification channel secrets unusable ([console/README.md](../console/README.md#configuration)).
 - Prometheus metrics: `/metrics` on the dedicated port `9464`, with the `metrics_token` as bearer token ([console/README.md](../console/README.md#metrics)). Never publish that port: it must be reachable only by Prometheus, on the internal network.
 - Plan the internal database's `max_connections` from the sizing in [console/README.md](../console/README.md#docker-image).
+
+### Single sign-on with OpenID Connect
+*On `dev`, not released yet (ROADMAP P8-A, [ADR-0038](adr/0038-console-oidc-login.md)).* The console can sign users in through one OpenID Connect provider (Keycloak, Microsoft Entra ID, Okta, Authentik…). Every setting is in [console/README.md, "Single sign-on (OIDC)"](../console/README.md#single-sign-on-oidc); the security model and residual risks in [05-security.md](05-security.md#console-login-with-openid-connect). OIDC needs `DATABASTION_PUBLIC_URL` and a usable `DATABASTION_ENCRYPTION_KEY`: without them the console refuses to start.
+
+**1. Register a client at the provider.** A confidential client (client secret), standard flow (authorization code) only, PKCE `S256` if the provider enforces a method, redirect URI `https://<console>/api/auth/oidc/callback` and post-logout redirect URI `https://<console>/login`. Release the user's groups in the ID token through a claim **only the provider's administrators can set**. With Keycloak (a realm `acme`):
+- *Clients* → *Create client*: client type OpenID Connect, client id `databastion`; *Client authentication* on; *Standard flow* only (no direct access grants, no implicit flow); the two URIs above; under *Advanced*, PKCE method `S256`;
+- the client's *Client scopes* tab → `databastion-dedicated` → *Configure a new mapper* → *Group Membership*: token claim name `groups`, *Full group path* off, *Add to ID token* on;
+- groups `databastion-admins` and `databastion-analysts`, with the users as members;
+- the client secret from the client's *Credentials* tab, stored in a file on the console host.
+
+The [Keycloak dev realm](../dev/README.md#keycloak-oidc-test-realm) is a complete example, with test users for each refusal case.
+
+**2. Configure the console** in the environment of the `console` service of `compose.yaml`, where [docker-compose.example.yml](../deploy/docker-compose.example.yml) has the commented lines, with the secret `oidc_client_secret` (the client secret file) declared at the end of the file and added to that service's `secrets:`:
+
+```yaml
+DATABASTION_OIDC_ENABLED: "1"
+DATABASTION_OIDC_ISSUER_URL: https://sso.example.com/realms/acme      # exact issuer, https://
+DATABASTION_OIDC_CLIENT_ID: databastion
+DATABASTION_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+DATABASTION_OIDC_DISPLAY_NAME: Keycloak
+DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: groups
+DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(groups, 'databastion-admins') && 'admin' || contains(groups, 'databastion-analysts') && 'analyst'"
+DATABASTION_OIDC_ALLOWED_GROUPS: databastion-admins,databastion-analysts
+# DATABASTION_OIDC_CA_FILE: /run/secrets/oidc_ca                      # provider behind a private CA
+```
+
+- **Groups and roles.** The role expression must yield exactly `admin` or `analyst`; anything else is no role, and with strict mode (`DATABASTION_OIDC_ROLE_ATTRIBUTE_STRICT=1`, the default) such a login is refused. The role is applied again at each login. Never base the role, groups or domains on `email`, `preferred_username` or `name`: users can often edit them at the provider.
+- **New users.** Sign-up is off by default: a first login of an unknown identity is refused and listed as a **pending login** on the Users page, where an administrator approves it as a new user (choosing the role) or discards it. `DATABASTION_OIDC_ALLOW_SIGN_UP=1` creates the user directly, and requires `DATABASTION_OIDC_ALLOWED_GROUPS` or a strict role expression.
+- **Sessions** last at most `DATABASTION_OIDC_SESSION_MAX_AGE` (12 h by default) with the usual 2 h idle timeout. A user disabled at the provider keeps an open console session until then, unless `DATABASTION_OIDC_USE_REFRESH_TOKEN=1` (the session then ends at the first failed refresh). Disable the user in the console as well to end their sessions at once.
+
+**3. Local login.** `DATABASTION_LOCAL_LOGIN` keeps the password form for local accounts:
+- `admins` (the default while OIDC is on): local administrators only, the **break-glass** path if the provider is down or misconfigured. Each such login raises the `user.local_login` system alert on the channels flagged for system alerts; keep at least one local administrator with a strong password, stored offline (the console logs an error at startup when there is none);
+- `enabled`: every local user; `disabled` (only when set explicitly): no local login at all, and recovery then needs access to the console host.
+
+**4. Linking and unlinking.** An existing local user binds their provider identity themselves: sign in locally, open **Account**, choose **Link single sign-on**, and authenticate again at the provider. Identities are matched by issuer and subject, never by e-mail or username: a provider user whose username or e-mail equals an existing console account is refused, not merged, and administrators cannot link an identity to someone else's account. An administrator can unlink a wrongly linked identity on the Users page (its sessions end), but not the last way a user can sign in.
+
+Check: the login page shows "Sign in with Keycloak"; a first login of a member of `databastion-analysts` appears as a pending login on the Users page and, once approved, lands on `/agents` as an analyst; a user outside both groups is refused with a `user.login_denied` entry (reason `group`) in the console audit log.
 
 ## 4. Install an agent
 Deploy the agent on the host or network of the databases it monitors, not next to the console. Two ways:
@@ -98,14 +137,15 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below);
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; on `dev`, not released yet);
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
   - PostgreSQL: `postgres.audit_log: {path, format: jsonlog | csvlog}` (the pgaudit server log; without it, Audit uses `pg_stat_statements`);
   - MySQL / MariaDB: `mysql.audit_log: {path, format: server_audit | json}` (without it, `performance_schema`);
   - MongoDB: `mongodb.audit_log: {path, format: audit_log | server_log}` (without it, the profiler if granted);
-  - OpenLDAP: `openldap.accesslog_base` (read over LDAP) and `openldap.clear_principals`.
+  - OpenLDAP: `openldap.accesslog_base` (read over LDAP) and `openldap.clear_principals`;
+  - every engine block (on `dev`): `cas_stores`, the names of Apereo CAS stores kept under custom names (`ticket_registry`, `service_registry`, `audit_trail`), for the CAS store guard below.
 
 The example file documents each key with its range. After changing `agent.yaml`, restart the agent.
 
@@ -114,7 +154,7 @@ The example file documents each key with its range. After changing `agent.yaml`,
 - client secrets of OAuth / OIDC services encrypted (`security.client_secrets_in_clear` counts the clear ones), and the ticket registry's `crypto.enabled: true` when it lives in a database;
 - the agent's OS user with **read** access to the registry directory and the audit log through a group without write permission (`0640` files, `0750` directory), no write access anywhere on the path (refused, `privilege.registry_writable` / `audit.log_not_readable`), and **no access to the CAS configuration** (`cas.properties`, `cas.yml`): a registry directory holding configuration or key files is refused (`privilege.config_readable`).
 
-A console older than the `cas` engine (it does not list `engine.cas`) shows no CAS target: the agent keeps its findings and events spooled until the console is upgraded. CAS stores held in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP (JPA ticket and service tables, MongoDB collections) are read by those engines' targets; their CAS store guard is a later release. Levels and limits: [08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas).
+A console older than the `cas` engine (it does not list `engine.cas`) shows no CAS target: the agent keeps its findings and events spooled until the console is upgraded. CAS stores held in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP (JPA ticket and service tables, MongoDB collections) are read by those engines' targets, under the **CAS store guard**, on by default: ticket registries are never sampled (ticket counts only), ticket ids are dropped before classification wherever they appear, and the agent reports an account that can read ticket or audit-trail credential columns (`privilege.ticket_credentials_readable`) at every heartbeat ([08-engine-capabilities.md](08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap)). List stores kept under custom names in that target's `cas_stores`. Levels and limits: [08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas).
 
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
@@ -125,6 +165,7 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | MySQL / MariaDB | per-database `SELECT`, `REQUIRE SSL`, host restricted to the agent | no grant with a log file source; `SELECT ON performance_schema.*` only when it is the source | [ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md), [ADR-0025](adr/0025-mysql-mariadb-role-privileges-and-heartbeat-checks.md), [connector README](../agent/crates/connector-mysql/README.md) |
 | MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256, `authenticationRestrictions` with `clientSource` = the agent's address(es) | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
 | OpenLDAP | service DN with `read` on the tree; rule `{0}` names **every** credential attribute of the loaded schemas (`userPassword`, `userPKCS12`, and the Samba, Kerberos, ppolicy… ones where loaded), never readable; a `peername.ip` restriction to the agent's address, since the accesslog records no client address | `read` on `cn=accesslog` only while Audit runs for the target (otherwise `privilege.accesslog_without_audit`) | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
+| Apereo CAS (`cas`, on `dev`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.
@@ -164,7 +205,7 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 ## 11. Policies, incidents and notifications
 - **Policies** (administrator): a policy applies to findings or to access events (fixed at creation). Conditions on findings: classifiers or families (`pii.*`), agents, targets, engines, location globs, confidence and match thresholds. Conditions on access events: signals or families, actions, principals, objects, minimum rows, score or sensitivity, baseline anomaly ([console/README.md](../console/README.md#audit-correlation)). Action: create an incident with a severity, and notify up to 5 channels. **Exceptions** (with a mandatory reason and an optional expiry) silence a scope. Model: [ADR-0014](adr/0014-policy-and-incident-model.md), [console/README.md](../console/README.md#policies-and-incidents).
 - **Incidents**: active incidents by default, most severe first. An incident shows its finding (with masked samples) or its events, its lifecycle and its notifications. Lifecycle: `open` → `acknowledged` → `resolved`, or `false_positive` (administrator). `resolved` means remediated: if a later scan still sees the data, a new incident opens.
-- **Notifications** (administrator): e-mail (SMTP with STARTTLS or TLS) and HMAC-signed webhook (`https://` only) channels, with a test button. Webhook receivers must escape the names they render, because a database account name is chosen by the client ([console/README.md](../console/README.md#alerting)). Channels flagged for system alerts also receive the console's own alerts: silent agent, agent integrity, dropped batches, stopped Audit stream, within an hourly budget per channel.
+- **Notifications** (administrator): e-mail (SMTP with STARTTLS or TLS) and HMAC-signed webhook (`https://` only) channels, with a test button. Webhook receivers must escape the names they render, because a database account name is chosen by the client ([console/README.md](../console/README.md#alerting)). Channels flagged for system alerts also receive the console's own alerts: silent agent, agent integrity, dropped batches, stopped Audit stream and, with OIDC on `dev`, break-glass local administrator logins (`user.local_login`) and role sync guards (`user.role_sync`), within an hourly budget per channel.
 
 ## 12. Upgrading
 Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
