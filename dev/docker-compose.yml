@@ -248,6 +248,50 @@ services:
       test: ["CMD", "ldapsearch", "-Q", "-Y", "EXTERNAL", "-H", "ldapi:///", "-b", "cn=config", "-s", "base", "-LLL", "dn"]
       <<: *healthcheck
 
+  # Keycloak (phase 8, P8-D): OpenID Connect provider for the console's OIDC login (ADR-0038
+  # decision 17), with the seeded realm keycloak/databastion-realm.json. Opt-in (profile
+  # `keycloak`): `make dev-keycloak`. Dev mode (`start-dev`: embedded H2, HTTP), no volume: the realm
+  # is imported again in every new container, so `make dev-down` discards any edit made in it.
+  # Plain HTTP on a loopback address is what ADR-0038 decision 2 allows outside production. The
+  # issuer is http://127.0.0.1:<port>/realms/databastion (KC_HOSTNAME): another site than the
+  # console on http://localhost:3000, so the login is a cross-site navigation, as in production.
+  # Credentials: dev/.env. Unlike the other services, they fall back to the DEV-ONLY values of
+  # .env.example, so that a dev/.env copied before this service keeps `make dev` working (Compose
+  # interpolates the services of inactive profiles too).
+  keycloak:
+    image: ${DATABASTION_DEV_KEYCLOAK_IMAGE:-keycloak/keycloak:26.8.0@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc}
+    profiles: [keycloak]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      # Temporary administrator of the master realm (admin console, admin API of the smoke test).
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-dev-only-keycloak-admin}
+      # Placeholders of the realm file, resolved at import time.
+      KEYCLOAK_CONSOLE_CLIENT_SECRET: ${KEYCLOAK_CONSOLE_CLIENT_SECRET:-dev-only-keycloak-console-client-secret}
+      KEYCLOAK_DEV_USER_PASSWORD: ${KEYCLOAK_DEV_USER_PASSWORD:-dev-only-keycloak-user}
+      KC_HOSTNAME: http://127.0.0.1:${KEYCLOAK_PORT:-8180}
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      # The management interface (9000: health) is not published; the healthcheck reads it inside.
+      - "127.0.0.1:${KEYCLOAK_PORT:-8180}:8080"
+    volumes:
+      - ./keycloak/databastion-realm.json:/opt/keycloak/data/import/databastion-realm.json:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # The image has no curl or wget: an HTTP/1.0 request in bash on the management port.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000
+          && printf 'GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
+          && IFS= read -r status <&3
+          && [[ $$status == *' 200 '* ]]
+      <<: *healthcheck
+      start_period: 60s
+
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     environment:
