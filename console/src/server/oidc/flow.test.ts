@@ -13,6 +13,8 @@ import { loadOidcConfig, type OidcConfig } from "./config";
 import { OidcProvider } from "./provider";
 import { handleOidcCallback, handleOidcStart, oidcCallbackPerIp, oidcFailedCallbacks, oidcStartPerIp } from "./routes";
 import { setOidcProviderForTests } from "./runtime";
+import { MAX_PENDING_LOGINS, pendingEvictions, recordPendingLogin } from "./service";
+import { handleApprovePendingLogin, handleCreateUser, handleDiscardPendingLogin, handleListPendingLogins, handleUpdateUser } from "@/server/users-api";
 import { pkceChallenge } from "./state-cookie";
 
 const ORIGIN = "http://console.test";
@@ -326,6 +328,81 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     await age();
     expect(await sessionOf(session)).toBeNull();
     expect(await sessionOf(session)).toBeNull();
+  });
+
+  it("admins approve pending logins only as NEW users, with the role they choose", async () => {
+    configure();
+    process.env.DATABASTION_LOCAL_LOGIN = "enabled";
+    const admin = await localLogin("root");
+    const analyst = await localLogin("carol");
+    await oidcLogin("sub-hank", { preferred_username: "hank", email: "hank@example.com", email_verified: true, groups: ["databastion-admins"] });
+    const list = await handleListPendingLogins(userReq("GET", "/api/oidc/pending-logins", { cookie: admin.cookie }));
+    const { pending } = (await list.json()) as { pending: { id: string; subject: string; issuer: string; mappedRole: string }[] };
+    const p = pending.find((x) => x.subject === "sub-hank");
+    expect(p).toMatchObject({ issuer: fp.issuer, mappedRole: "admin" });
+    const id = p?.id ?? "";
+    // Analysts cannot list nor approve.
+    expect((await handleListPendingLogins(userReq("GET", "/api/oidc/pending-logins", { cookie: analyst.cookie }))).status).toBe(403);
+    expect((await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: analyst.cookie, csrf: analyst.csrf, body: { role: "admin" } }), id)).status).toBe(403);
+    // Unknown fields (e.g. an attempt to bind an existing user) are refused.
+    expect((await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role: "analyst", user_id: "x" } }), id)).status).toBe(400);
+    const ok = await handleApprovePendingLogin(userReq("POST", `/api/oidc/pending-logins/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body: { role: "analyst" } }), id);
+    expect(ok.status).toBe(201);
+    const [hank] = await getDb().select().from(users).where(eq(users.username, "hank"));
+    expect(hank).toMatchObject({ role: "analyst", ssoOnly: true, passwordHash: null });
+    const [entry] = await getDb().select().from(auditLog).where(eq(auditLog.action, "user.pending_login_approve"));
+    expect(entry).toMatchObject({ targetId: hank?.id, details: { role: "analyst", issuer: fp.issuer, subject: "sub-hank", email_verified: true } });
+    // Hank logs in; role managed in the console under SKIP_ROLE_SYNC, else synced.
+    configure({ DATABASTION_OIDC_SKIP_ROLE_SYNC: "1" });
+    const hankSso = await oidcLogin("sub-hank", { preferred_username: "hank", groups: ["databastion-admins"] });
+    expect((await sessionOf(hankSso.session))?.user.role).toBe("analyst");
+    // Discard.
+    await oidcLogin("sub-ivy", { preferred_username: "ivy", groups: [] });
+    const [ivy] = await getDb().select().from(oidcPendingLogins).where(eq(oidcPendingLogins.subject, "sub-ivy"));
+    expect((await handleDiscardPendingLogin(userReq("DELETE", `/api/oidc/pending-logins/${ivy?.id}`, { cookie: admin.cookie, csrf: admin.csrf }), ivy?.id ?? "")).status).toBe(200);
+    expect(await getDb().select().from(oidcPendingLogins).where(eq(oidcPendingLogins.subject, "sub-ivy"))).toHaveLength(0);
+  });
+
+  it("user management: roles, disabling (ends sessions, blocks OIDC), last-admin and role-sync guards", async () => {
+    configure();
+    process.env.DATABASTION_LOCAL_LOGIN = "enabled";
+    const admin = await localLogin("root");
+    const [root] = await getDb().select().from(users).where(eq(users.username, "root"));
+    const created = await handleCreateUser(userReq("POST", "/api/users", { cookie: admin.cookie, csrf: admin.csrf, body: { username: "Judy", password: PASSWORD, role: "analyst" } }));
+    expect(created.status).toBe(201);
+    const { userId: judy } = (await created.json()) as { userId: string };
+    expect((await handleCreateUser(userReq("POST", "/api/users", { cookie: admin.cookie, csrf: admin.csrf, body: { username: "judy", password: PASSWORD, role: "analyst" } }))).status).toBe(409);
+    const patch = (id: string, body: unknown) => handleUpdateUser(userReq("PATCH", `/api/users/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body }), id);
+    expect((await patch(root?.id ?? "", { disabled: true })).status).toBe(409); // self
+    expect((await patch(judy, { role: "admin" })).status).toBe(200);
+    const judySession = await localLogin("judy");
+    expect((await patch(judy, { disabled: true })).status).toBe(200);
+    expect(await sessionOf(judySession.cookie)).toBeNull();
+    expect((await localLogin("judy")).res.status).toBe(401);
+    // A user bound to an OIDC identity keeps the provider's role while role sync is on.
+    const [hank] = await getDb().select().from(users).where(eq(users.username, "hank"));
+    expect((await patch(hank?.id ?? "", { role: "admin" })).status).toBe(409);
+    configure({ DATABASTION_OIDC_SKIP_ROLE_SYNC: "1" });
+    expect((await patch(hank?.id ?? "", { role: "admin" })).status).toBe(200);
+    expect((await patch(hank?.id ?? "", { role: "analyst" })).status).toBe(200);
+    const changes = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.role_change"), sql`${auditLog.details}->>'source' = 'user'`));
+    expect(changes.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("caps pending logins at 1000, evicting the least recent attempt and counting evictions", async () => {
+    await getDb().delete(oidcPendingLogins);
+    await getDb()
+      .insert(oidcPendingLogins)
+      .values(Array.from({ length: MAX_PENDING_LOGINS }, (_, i) => ({ issuer: fp.issuer, subject: `bulk-${i}`, lastAttemptAt: new Date(Date.now() - (i + 1) * 1000), expiresAt: new Date(Date.now() + 86_400_000) })));
+    const before = await pendingEvictions(getDb());
+    const mapped = { login: "newest", email: null, emailVerified: false, name: null, groups: [], role: null };
+    await getDb().transaction((tx) => recordPendingLogin(tx, { issuer: fp.issuer, subject: "newest", sid: null, mapped, effectiveRole: "analyst" }));
+    const rows = await getDb().select({ subject: oidcPendingLogins.subject }).from(oidcPendingLogins);
+    expect(rows).toHaveLength(MAX_PENDING_LOGINS);
+    expect(rows.some((r) => r.subject === `bulk-${MAX_PENDING_LOGINS - 1}`)).toBe(false);
+    expect(rows.some((r) => r.subject === "newest")).toBe(true);
+    expect(await pendingEvictions(getDb())).toBe(before + 1);
+    await getDb().delete(oidcPendingLogins);
   });
 
   it("rate limits /start and the callback per client IP", async () => {

@@ -36,11 +36,14 @@ export default async function ConsoleLayout({ children }: { children: ReactNode 
               <Link href="/enrollment-tokens" className="hover:underline">
                 Enrollment tokens
               </Link>
+              <Link href="/users" prefetch={false} className="hover:underline">
+                Users
+              </Link>
             </>
           )}
-          <span className="ml-auto text-muted-foreground">
+          <Link href="/account" prefetch={false} className="ml-auto text-muted-foreground hover:underline">
             {session.user.username} ({session.user.role})
-          </span>
+          </Link>
           <LogoutButton csrfToken={session.csrfToken} />
         </nav>
       </header>

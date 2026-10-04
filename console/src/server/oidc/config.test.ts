@@ -112,7 +112,7 @@ describe("OIDC configuration (ADR-0038 decision 16)", () => {
   });
 
   it("is fatal at startup in every environment", () => {
-    expect(startupFatal(env({ DATABASTION_OIDC_CLIENT_ID: undefined }))).toMatch(/OIDC login configuration error/);
-    expect(startupFatal(env())).toBeNull();
+    expect(startupFatal(env({ DATABASTION_OIDC_CLIENT_ID: undefined }) as NodeJS.ProcessEnv)).toMatch(/OIDC login configuration error/);
+    expect(startupFatal(env() as NodeJS.ProcessEnv)).toBeNull();
   });
 });
