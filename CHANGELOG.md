@@ -14,6 +14,7 @@ The project follows [semantic versioning](https://semver.org/).
 ### 📝 Documentation
 - Roadmap after the MVP: phases 8 (console OIDC login, CAS connector), 9 (Microsoft SQL Server, Redis, Valkey), 10 (SQLite, Firebird), 11 (Helm, mTLS, OTLP, gRPC, event storage at scale), 12 (recommended actions and response hooks) and 13+, with a per-owner view ([docs/ROADMAP.md](docs/ROADMAP.md#after-the-mvp)). Nothing in these phases is implemented yet
 - ADR-0038 (accepted): console login with OpenID Connect; ADR-0039 (proposed): engine scope expansion, with end-of-life engine versions (PostgreSQL 12 / 13, MySQL 5.7, MongoDB 4.x) not supported; ADR-0040 (accepted): prevention mode scope, Community gets recommended actions and response hooks only, blocking stays Enterprise
+- ADR-0041 (accepted): Apereo CAS connector design. Maintained CAS lines only (8.0.x; 7.3.x until its end of life on 2026-12-31); a `connector-cas` that reads local files only (JSON / YAML service registry, JSON audit log) and opens no network connection; a CAS store guard in the existing database and OpenLDAP connectors (by name, column shape and a ticket-id value tripwire), so ticket ids, audit-trail resources and headers are never sampled and the ticket registry gives only counts and whether its encryption is on; client secrets never sampled; Audit never Full (Partial once successful authentications are logged); no CAS actuator endpoint used. Nothing is implemented yet
 
 ## [0.3.1](https://github.com/Yil00/databastion/compare/0.3.0...0.3.1) (2026-10-04)
 
