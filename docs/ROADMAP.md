@@ -6,7 +6,7 @@ Legend: `[ ]` to do · `[~]` in progress · `[x]` done. Update this file at the 
 
 Items prefixed with **Gate** come from a security review: they block the completion of the workstream they sit in, which cannot be checked off while a gate is open.
 
-**Current phase: v0.1.x follow-ups** – v0.1.0 was released on 2026-09-30 (tag `0.1.0`) v0.2.0, a maintenance release, and v0.3.0 on 2026-10-03 (tags `0.2.0`, `0.3.0`); phases 0 to 7 are closed. The follow-up list keeps its v0.1.x name. Open items tagged v0.1.x stay in the phase 7 list, and the items found by the release are in [v0.1.x follow-ups](#v01x-follow-ups).
+**Current phase: v0.1.x follow-ups** – v0.1.0 was released on 2026-09-30 (tag `0.1.0`), v0.2.0, a maintenance release, and v0.3.0 on 2026-10-03 (tags `0.2.0`, `0.3.0`); phases 0 to 7 are closed. The follow-up list keeps its v0.1.x name. Open items tagged v0.1.x stay in the phase 7 list, and the items found by the release are in [v0.1.x follow-ups](#v01x-follow-ups).
 
 ---
 
@@ -122,6 +122,8 @@ End-of-phase-7 security review: verdict **NOT READY** until the packaging PR #86
 **v0.2.0 released** on 2026-10-03 (release PR #117, tag `0.2.0` on `main`, `chore(release): 0.2.0`): #112 to #116, `main` green again. It was planned as 0.1.1, but release-it computes the version from the commits and the `feat` commit of #116 gave a minor bump; the version is now checked before the release PR is merged (item (k), [RELEASE.md § 5](../RELEASE.md#5-release-walkthrough)).
 
 **v0.3.0 released** on 2026-10-03 (release PR #125, tag `0.3.0` on `main`, `chore(release): 0.3.0`): #119 to #124, items (h), (j), (k), (l) and (n); computed as a minor version by release-it (the `feat` commit of #124) and confirmed by the "Release version" check before the merge.
+
+**v0.3.1 released** on 2026-10-04 (release PR #131, tag `0.3.1`): #127 to #130, items (a), (g), (i) and (m); the first release whose CHANGELOG section and release notes were written by `scripts/changelog-release.mjs`, with no manual tidy.
 
 ### v0.1.x follow-ups
 *Found by the v0.1.0 release and its reviews. The earlier items tagged v0.1.x stay in the phase 7 list above.*
