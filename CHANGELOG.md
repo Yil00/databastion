@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ✨ Features
+- Dev environment: opt-in Keycloak 26.8 service (`make dev-keycloak`, Compose profile `keycloak`, `127.0.0.1:8180`) with a seeded `databastion` realm for the console's OIDC login ([ADR-0038](docs/adr/0038-console-oidc-login.md) decision 17): confidential client `databastion-console` (authorization code with PKCE S256 only, callback `http://localhost:3000/api/auth/oidc/callback`), a `groups` claim in the ID token, admin and analyst groups, and users for the role mapping, a refused group, an unverified e-mail and an attribute-editing user who imitates the administrator. `make dev-keycloak-smoke` checks its discovery document, JWKS and realm; [dev/README.md](dev/README.md#keycloak-oidc-test-realm) gives the console's `DATABASTION_OIDC_*` values. `make dev-down` and `make dev-reset` now also stop the opt-in services (`psmdb`, `keycloak`)
+
 ### 📝 Documentation
 - Roadmap after the MVP: phases 8 (console OIDC login, CAS connector), 9 (Microsoft SQL Server, Redis, Valkey), 10 (SQLite, Firebird), 11 (Helm, mTLS, OTLP, gRPC, event storage at scale), 12 (recommended actions and response hooks) and 13+, with a per-owner view ([docs/ROADMAP.md](docs/ROADMAP.md#after-the-mvp)). Nothing in these phases is implemented yet
 - ADR-0038 (proposed): console login with OpenID Connect; ADR-0039 (proposed): engine scope expansion, with end-of-life engine versions (PostgreSQL 12 / 13, MySQL 5.7, MongoDB 4.x) not supported; ADR-0040 (accepted): prevention mode scope, Community gets recommended actions and response hooks only, blocking stays Enterprise
