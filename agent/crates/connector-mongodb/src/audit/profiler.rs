@@ -311,8 +311,18 @@ pub(crate) fn projection() -> DocBuf {
     ] {
         p = p.i32(field, 1);
     }
+    // The agent's own CAS store guard key probe, compared whole on the
+    // server (the pipeline itself never crosses the wire).
+    let kp = DocBuf::new().list(
+        "$eq",
+        DocBuf::new().str("0", "$command.pipeline").doc(
+            "1",
+            DocBuf::new().array("$literal", crate::discover::key_probe_pipeline()),
+        ),
+    );
     p.doc("cmd", cmd)
         .doc("tr", tr)
+        .doc("kp", kp)
         .doc("fk", fk)
         .doc("lim", lim)
         .doc("st", st)
@@ -469,6 +479,7 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
     let op = string(doc, "op")?.unwrap_or_default();
     // Truncated (or not an object): the shape is unknown.
     let odd = doc.flag("tr")?.unwrap_or(false);
+    let key_probe = doc.flag("kp")?.unwrap_or(false);
     let written = [
         count(doc, "ninserted")?,
         count(doc, "nModified")?,
@@ -540,7 +551,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
                         _ => StageKind::Other,
                     });
                 }
-                Some(Pipeline::from_stages(kinds))
+                let mut p = Pipeline::from_stages(kinds);
+                p.own_key_probe = key_probe;
+                Some(p)
             }
             None => None,
         },
@@ -740,6 +753,40 @@ mod tests {
         let mut out = String::new();
         visit(Doc::new(bytes).unwrap(), &mut out);
         out
+    }
+
+    /// PR #141 E2E follow-up: the server compares the command pipeline
+    /// with the agent's key probe (`kp`); only that flag marks the entry
+    /// as the probe, and the projection asks for it.
+    #[test]
+    fn the_key_probe_is_flagged_by_the_server() {
+        let entry = |kp: Option<bool>| {
+            let mut d = DocBuf::new()
+                .date("ts", 5)
+                .str("op", "command")
+                .str("ns", "app.customers")
+                .i32("nreturned", 1)
+                .str("user", "databastion@admin")
+                .str("cmd", "aggregate")
+                .i32("fk", -1)
+                .null("lim")
+                .list("st", DocBuf::new().str("0", "other").str("1", "$project"))
+                .bool("tr", false);
+            if let Some(kp) = kp {
+                d = d.bool("kp", kp);
+            }
+            d.finish()
+        };
+        let probe = |kp| {
+            let (_, r) = record_of(&Doc::new(&entry(kp)).unwrap()).unwrap().unwrap();
+            assert_eq!(r.kind, Kind::Op(Cmd::Aggregate));
+            r.shape.pipeline.unwrap().own_key_probe
+        };
+        assert!(probe(Some(true)));
+        assert!(!probe(Some(false)));
+        assert!(!probe(None));
+        let projection = String::from_utf8_lossy(&projection().finish()).into_owned();
+        assert!(projection.contains("kp") && projection.contains("$objectToArray"));
     }
 
     /// End-of-phase-5 review I1: a truncated command (or one that is not

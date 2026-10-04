@@ -312,3 +312,205 @@ fn object_order_rotates_per_scan() {
     assert!(empty.is_empty());
     assert_eq!(job.clone().with_rotation(3).rotation_offset(0), None);
 }
+
+/// Log lines of a closure, as JSON (every level).
+fn logs_of(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
+}
+
+/// ADR-0041 decision 5: one ticket-id-shaped value drops the whole column
+/// before classification, and the drop is counted for the target note.
+#[test]
+fn ticket_id_tripwire_drops_the_column() {
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &target(),
+        &limits(200, 30_000, 3_600),
+        key(),
+    );
+    let raw = [
+        "jane.doe@example.org",
+        "john.smith@example.org",
+        "TGT-42-q8XkLmZz0FAKE-cas01",
+        "anna.berg@example.org",
+    ];
+    let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+    let logs = logs_of(|| assert!(job.classify("email", &values).is_empty()));
+    assert!(!logs.contains("TGT-42"), "{logs}");
+    assert!(!logs.contains("example.org"), "{logs}");
+    assert!(logs.contains("CAS store guard"), "{logs}");
+    assert_eq!(job.cas_guard().tripped(), 1);
+    // The clones share the tally; another column without ticket ids is
+    // classified as usual.
+    let clone = job.clone();
+    let clean: Vec<RawSample<'_>> = raw
+        .iter()
+        .filter(|v| !v.starts_with("TGT"))
+        .map(|v| RawSample::new(v))
+        .collect();
+    assert_eq!(clone.classify("email", &clean).len(), 1);
+    assert_eq!(
+        clone
+            .classify_guarded("x", &values, crate::cas_guard::ColumnRule::NoMaskedSamples)
+            .len(),
+        0
+    );
+    assert_eq!(job.cas_guard().tripped(), 2);
+    let notes = job.cas_guard().notes();
+    assert_eq!(notes[0].code(), crate::NoteCode::CoverageCasGuardTripped);
+    assert_eq!(notes[0].count(), Some(2));
+}
+
+/// PR #141 review M4 / L1: a value with only the generic ticket shape, or
+/// a named ticket id inside it, is dropped alone (never classified,
+/// masked nor fingerprinted) and counted; the rest of the column is
+/// classified; the column is not tripped.
+#[test]
+fn generic_or_embedded_ticket_ids_drop_the_value_only() {
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &target(),
+        &limits(200, 30_000, 3_600),
+        key(),
+    );
+    let raw = [
+        "jane.doe@example.org",
+        "INV-2026-jane.doe@example.org",
+        "john.smith@example.org",
+        "https://app.example.org/?ticket=ST-7-FAKEsecret-cas01",
+        "anna.berg@example.org",
+    ];
+    let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+    let mut found = Vec::new();
+    let logs = logs_of(|| found = job.classify("email", &values));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].sampled(), 3);
+    assert_eq!(found[0].matched(), 3);
+    for m in found[0].masked_samples() {
+        let m = format!("{m:?}");
+        assert!(!m.contains("INV") && !m.contains("ST-7"), "{m}");
+    }
+    assert!(
+        !logs.contains("FAKEsecret") && !logs.contains("INV-2026"),
+        "{logs}"
+    );
+    assert_eq!(job.cas_guard().tripped(), 0);
+    assert_eq!(job.cas_guard().values_dropped(), 2);
+    assert!(job.cas_guard().notes().is_empty());
+}
+
+/// ADR-0041 decision 5: the audit trail principal and the service registry
+/// body keep no masked sample; the body keeps no `secret.*` fingerprint;
+/// never-read columns give nothing.
+#[test]
+fn guarded_rules_strip_samples_and_secret_fingerprints() {
+    use crate::cas_guard::ColumnRule;
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &target(),
+        &limits(200, 30_000, 3_600),
+        key(),
+    );
+    let body = [
+        r#"{"@class":"org.apereo.cas.services.OidcRegisteredService","clientSecret":"AKIAIOSFODNN7EXAMPLE","contacts":[{"email":"jane.doe@example.org"}]}"#,
+        r#"{"@class":"org.apereo.cas.services.CasRegisteredService","contacts":[{"email":"john.smith@example.org"}],"k":"AKIAI44QH8DHBEXAMPLE"}"#,
+        r#"{"@class":"org.apereo.cas.services.CasRegisteredService","contacts":[{"email":"anna.berg@example.org"}],"k":"AKIAJ55QH8DHBEXAMPLE"}"#,
+    ];
+    let values: Vec<RawSample<'_>> = body.iter().map(|v| RawSample::new(v)).collect();
+    let plain = job.classify("body", &values);
+    assert!(
+        plain.iter().any(|f| f.classifier().is_secret()),
+        "{plain:?}"
+    );
+    let guarded = job.classify_guarded("body", &values, ColumnRule::NoSamplesNoSecretFingerprints);
+    assert!(!guarded.is_empty());
+    for f in &guarded {
+        assert!(f.masked_samples().is_empty(), "{f:?}");
+        if f.classifier().is_secret() {
+            assert!(f.fingerprints().is_empty(), "{f:?}");
+        }
+    }
+    assert!(
+        guarded
+            .iter()
+            .any(|f| !f.classifier().is_secret() && !f.fingerprints().is_empty()),
+        "non-secret fingerprints are kept: {guarded:?}"
+    );
+    let users = [
+        "jane.doe@example.org",
+        "john.smith@example.org",
+        "anna.berg@example.org",
+    ];
+    let values: Vec<RawSample<'_>> = users.iter().map(|v| RawSample::new(v)).collect();
+    let principal = job.classify_guarded("AUD_USER", &values, ColumnRule::NoMaskedSamples);
+    assert_eq!(principal.len(), 1);
+    assert!(principal[0].masked_samples().is_empty());
+    assert!(!principal[0].fingerprints().is_empty());
+    assert!(
+        job.classify_guarded("AUD_RESOURCE", &values, ColumnRule::NeverRead)
+            .is_empty()
+    );
+    assert_eq!(job.cas_guard().tripped(), 0);
+}
+
+mod guard_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Wherever a ticket id sits among other values, and whatever the
+        /// rule, nothing of the column reaches a finding, a masked sample,
+        /// a fingerprint or a log line.
+        #[test]
+        fn a_ticket_id_never_reaches_a_finding_or_a_log(
+            others in proptest::collection::vec("[a-z]{3,8}\\.[a-z]{3,8}@example\\.(org|com)", 1..20),
+            prefix in "(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)",
+            n in 1u32..100_000,
+            tail in "[A-Za-z0-9]{8,24}",
+            pos in any::<prop::sample::Index>(),
+            rule in prop::sample::select(vec![
+                crate::cas_guard::ColumnRule::Sampled,
+                crate::cas_guard::ColumnRule::NoMaskedSamples,
+                crate::cas_guard::ColumnRule::NoSamplesNoSecretFingerprints,
+            ]),
+        ) {
+            let job = ScanJob::new(
+                ScanParams::contract_defaults(),
+                &target(),
+                &limits(200, 30_000, 3_600),
+                key(),
+            );
+            let ticket = format!("{prefix}-{n}-{tail}");
+            let mut raw = others.clone();
+            raw.insert(pos.index(raw.len() + 1), ticket.clone());
+            let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+            let mut found = Vec::new();
+            let logs = logs_of(|| found = job.classify_guarded("email", &values, rule));
+            prop_assert!(found.is_empty());
+            prop_assert!(!logs.contains(&ticket));
+            prop_assert!(!logs.contains(&tail));
+            prop_assert_eq!(job.cas_guard().tripped(), 1);
+        }
+    }
+}

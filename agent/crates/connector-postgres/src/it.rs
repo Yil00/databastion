@@ -35,7 +35,7 @@ use crate::conn::{Session, Timeouts};
 use crate::discover::normalize;
 use crate::error::Stage;
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const PROBE_DB: &str = "databastion_probe";
 const EXT_ROLE: &str = "databastion_it_ext";
@@ -51,11 +51,11 @@ const MARKERS: [&str; 6] = [
 ];
 
 #[derive(Debug, Clone)]
-struct Url {
+pub(crate) struct Url {
     host: String,
     port: u16,
-    user: String,
-    password: String,
+    pub(crate) user: String,
+    pub(crate) password: String,
     dbname: String,
 }
 
@@ -90,7 +90,7 @@ fn skip(prerequisite: &str, message: &str) {
     eprintln!("skipped: {message}");
 }
 
-fn agent_url() -> Option<Url> {
+pub(crate) fn agent_url() -> Option<Url> {
     let u = url("DATABASTION_TEST_PG_URL");
     if u.is_none() {
         skip(
@@ -102,7 +102,7 @@ fn agent_url() -> Option<Url> {
     u
 }
 
-fn admin_url() -> Option<Url> {
+pub(crate) fn admin_url() -> Option<Url> {
     let u = url("DATABASTION_TEST_PG_ADMIN_URL");
     if u.is_none() {
         skip(
@@ -114,7 +114,7 @@ fn admin_url() -> Option<Url> {
 }
 
 /// A private temporary directory holding the target secret file.
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
@@ -144,7 +144,7 @@ thread_local! {
 
 /// A declared target for `u` (password in a `0600` file), TLS disabled
 /// (loopback test server) unless [`TLS`] says otherwise.
-fn target(
+pub(crate) fn target(
     u: &Url,
     user: &str,
     password: &str,
@@ -190,18 +190,18 @@ async fn raw_client(u: &Url, user: &str, password: &str, db: &str) -> tokio_post
     client
 }
 
-async fn admin(u: &Url, db: &str) -> tokio_postgres::Client {
+pub(crate) async fn admin(u: &Url, db: &str) -> tokio_postgres::Client {
     raw_client(u, &u.user, &u.password, db).await
 }
 
-fn key() -> Arc<HmacKey> {
+pub(crate) fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
 
 /// Local limits of the scans here: Discovery pacing off (these tests are
 /// about sampling; pacing is covered by `databastion_core::pacing`, the
 /// core's runtime tests and the load harness of #92).
-fn unpaced() -> Limits {
+pub(crate) fn unpaced() -> Limits {
     Limits {
         discovery_duty_cycle_percent: 100,
         ..Limits::default()
@@ -252,7 +252,7 @@ fn key_of(schema: &str, object: &str, field: &str, classifier: &'static str) -> 
 /// Captures every log line of the current thread (current-thread runtime:
 /// the connector's spawned tasks run here too).
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Logs {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -265,7 +265,7 @@ impl std::io::Write for Logs {
 }
 
 impl Logs {
-    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+    pub(crate) fn capture(&self) -> tracing::subscriber::DefaultGuard {
         let logs = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
@@ -275,7 +275,7 @@ impl Logs {
         tracing::subscriber::set_default(subscriber)
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }

@@ -129,6 +129,14 @@ pub(crate) struct Pipeline {
     pub(crate) pass_through: bool,
     /// A stage writes (`$out`, `$merge`).
     pub(crate) writes: bool,
+    /// Exactly the CAS store guard's key probe of the MongoDB connector
+    /// (`discover::key_probe_command`): `$sample` of 1, then a `$project`
+    /// of the top-level key names only. Returns no value of a document.
+    pub(crate) own_key_probe: bool,
+    /// Exactly the CAS store guard's ticket type count
+    /// (`discover::ticket_types_command`): `$group` on the `type` field
+    /// (any ASCII case) with `$sum: 1`, then `$limit` 256.
+    pub(crate) own_type_count: bool,
 }
 
 /// A pipeline stage, classified by its operator (never kept as text).
@@ -137,6 +145,14 @@ pub(crate) enum StageKind {
     PassThrough,
     Write,
     Other,
+    /// `{$sample: {size: 1}}` (an `Other` stage).
+    SampleOne,
+    /// The key probe's `$project` (a pass-through stage).
+    KeyProject,
+    /// The ticket type count's `$group` (an `Other` stage).
+    TypeGroup,
+    /// `{$limit: 256}` (an `Other` stage).
+    Limit256,
 }
 
 impl StageKind {
@@ -152,15 +168,21 @@ impl StageKind {
 
 impl Pipeline {
     pub(crate) fn from_stages(stages: impl IntoIterator<Item = StageKind>) -> Self {
+        let stages: Vec<StageKind> = stages.into_iter().collect();
         let mut p = Self {
             pass_through: true,
             writes: false,
+            own_key_probe: stages == [StageKind::SampleOne, StageKind::KeyProject],
+            own_type_count: stages == [StageKind::TypeGroup, StageKind::Limit256],
         };
         for s in stages {
             match s {
-                StageKind::PassThrough => {}
+                StageKind::PassThrough | StageKind::KeyProject => {}
                 StageKind::Write => p.writes = true,
-                StageKind::Other => p.pass_through = false,
+                StageKind::Other
+                | StageKind::SampleOne
+                | StageKind::TypeGroup
+                | StageKind::Limit256 => p.pass_through = false,
             }
         }
         p
@@ -599,12 +621,183 @@ impl<'de> Deserialize<'de> for Limit {
     }
 }
 
-/// A pipeline stage: its operator (first key) classified, values skipped.
+/// An expected value shape: the agent's own guard stages are recognized
+/// by comparing each value with a fixed tree, never keeping it.
+enum Exp {
+    /// A number equal to this one (plain, or extended JSON `$numberInt`,
+    /// `$numberLong`, `$numberDouble`).
+    Int(i64),
+    /// This exact string.
+    Str(&'static str),
+    /// `$type` in any ASCII case.
+    TypePath,
+    /// A document with exactly these keys, in this order.
+    Map(&'static [(&'static str, Exp)]),
+}
+
+const SAMPLE_ONE: Exp = Exp::Map(&[("size", Exp::Int(1))]);
+const KEY_PROJECT: Exp = Exp::Map(&[
+    ("_id", Exp::Int(0)),
+    (
+        "k",
+        Exp::Map(&[(
+            "$map",
+            Exp::Map(&[
+                ("input", Exp::Map(&[("$objectToArray", Exp::Str("$$ROOT"))])),
+                ("as", Exp::Str("f")),
+                ("in", Exp::Str("$$f.k")),
+            ]),
+        )]),
+    ),
+]);
+const TYPE_GROUP: Exp = Exp::Map(&[
+    ("_id", Exp::TypePath),
+    ("n", Exp::Map(&[("$sum", Exp::Int(1))])),
+]);
+const LIMIT_256: Exp = Exp::Int(256);
+
+/// A map key equal to one of these names (compared, never kept).
+struct KeyIn(&'static [&'static str]);
+
+impl<'de> de::DeserializeSeed<'de> for KeyIn {
+    type Value = bool;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        struct V(&'static [&'static str]);
+        impl Visitor<'_> for V {
+            type Value = bool;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+                Ok(self.0.contains(&v))
+            }
+        }
+        d.deserialize_str(V(self.0))
+    }
+}
+
+/// A number written as text (extended JSON) equal to `n`.
+struct NumText(i64);
+
+impl<'de> de::DeserializeSeed<'de> for NumText {
+    type Value = bool;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(ExpVisitor(&Exp::Int(self.0), true))
+    }
+}
+
+impl<'de> de::DeserializeSeed<'de> for &Exp {
+    type Value = bool;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(ExpVisitor(self, false))
+    }
+}
+
+/// Compares a value with an [`Exp`]; `.1`: a number may be text.
+struct ExpVisitor<'e>(&'e Exp, bool);
+
+impl<'de> Visitor<'de> for ExpVisitor<'_> {
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
+        Ok(matches!(self.0, Exp::Int(n) if *n == v))
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
+        Ok(matches!(self.0, Exp::Int(n) if i64::try_from(v).is_ok_and(|v| v == *n)))
+    }
+    #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<bool, E> {
+        Ok(matches!(self.0, Exp::Int(n) if v == *n as f64))
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+        Ok(match self.0 {
+            Exp::Str(s) => v == *s,
+            Exp::TypePath => {
+                v.len() == 5 && v.starts_with('$') && v[1..].eq_ignore_ascii_case("type")
+            }
+            Exp::Int(n) if self.1 => {
+                v.parse::<i64>().is_ok_and(|x| x == *n)
+                    || v.parse::<f64>().is_ok_and(|x| {
+                        #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+                        let eq = x == *n as f64;
+                        eq
+                    })
+            }
+            _ => false,
+        })
+    }
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_none<E: de::Error>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        let mut ok = true;
+        match self.0 {
+            Exp::Map(fields) => {
+                let mut i = 0;
+                while let Some(key_ok) = match fields.get(i) {
+                    Some((k, _)) => map.next_key_seed(KeyIn(std::slice::from_ref(k)))?,
+                    None => map.next_key::<IgnoredAny>()?.map(|_| false),
+                } {
+                    match fields.get(i) {
+                        Some((_, e)) if key_ok => ok &= map.next_value_seed(e)?,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                            ok = false;
+                        }
+                    }
+                    i += 1;
+                }
+                Ok(ok && i == fields.len())
+            }
+            // Extended JSON: `{"$numberLong": "1"}`.
+            Exp::Int(n) => {
+                let mut seen = 0;
+                while let Some(key_ok) =
+                    map.next_key_seed(KeyIn(&["$numberInt", "$numberLong", "$numberDouble"]))?
+                {
+                    seen += 1;
+                    if key_ok && seen == 1 {
+                        ok &= map.next_value_seed(NumText(*n))?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                        ok = false;
+                    }
+                }
+                Ok(ok && seen == 1)
+            }
+            _ => {
+                while map.next_key::<IgnoredAny>()?.is_some() {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// A pipeline stage: its operator (first key) classified, values skipped
+/// (except the agent's own guard stages, compared with a fixed shape).
 struct Stage(StageKind);
 
 impl<'de> Deserialize<'de> for Stage {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Op(StageKind);
+        /// The operator's kind, and the own guard stage it may be.
+        struct Op(StageKind, Option<(&'static Exp, StageKind)>);
         impl<'de> Deserialize<'de> for Op {
             fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 struct V;
@@ -614,7 +807,14 @@ impl<'de> Deserialize<'de> for Stage {
                         f.write_str("a key")
                     }
                     fn visit_str<E: de::Error>(self, v: &str) -> Result<Op, E> {
-                        Ok(Op(StageKind::from_operator(v)))
+                        let own = match v {
+                            "$sample" => Some((&SAMPLE_ONE, StageKind::SampleOne)),
+                            "$project" => Some((&KEY_PROJECT, StageKind::KeyProject)),
+                            "$group" => Some((&TYPE_GROUP, StageKind::TypeGroup)),
+                            "$limit" => Some((&LIMIT_256, StageKind::Limit256)),
+                            _ => None,
+                        };
+                        Ok(Op(StageKind::from_operator(v), own))
                     }
                 }
                 d.deserialize_str(V)
@@ -631,9 +831,18 @@ impl<'de> Deserialize<'de> for Stage {
                 let mut first = true;
                 while first {
                     first = false;
-                    if let Some(Op(k)) = map.next_key::<Op>()? {
+                    if let Some(Op(k, own)) = map.next_key::<Op>()? {
                         kind = k;
-                        map.next_value::<IgnoredAny>()?;
+                        match own {
+                            Some((exp, own_kind)) => {
+                                if map.next_value_seed(exp)? {
+                                    kind = own_kind;
+                                }
+                            }
+                            None => {
+                                map.next_value::<IgnoredAny>()?;
+                            }
+                        }
                     } else {
                         return Ok(Stage(StageKind::Other));
                     }
@@ -1542,13 +1751,55 @@ mod tests {
             );
             parse_server_log(line.as_bytes()).unwrap().unwrap()
         };
+        // The CAS store guard's own pipelines, recognized by their exact
+        // shape only (PR #141 E2E follow-up).
+        let probe = r#"[{"$sample":{"size":1}},{"$project":{"_id":0,"k":{"$map":{"input":{"$objectToArray":"$$ROOT"},"as":"f","in":"$$f.k"}}}}]"#;
+        let p = agg(probe).shape.pipeline.unwrap();
+        assert!(p.own_key_probe && !p.own_type_count && !p.pass_through);
+        let long = probe.replace(r#""size":1"#, r#""size":{"$numberLong":"1"}"#);
+        assert!(agg(&long).shape.pipeline.unwrap().own_key_probe);
+        for not in [
+            probe.replace(r#""size":1"#, r#""size":2"#),
+            probe.replace(r#""as":"f""#, r#""as":"f","x":1"#),
+            probe.replace(r#""_id":0,"#, ""),
+            probe.replace("$$f.k", "$$f.v"),
+            probe.replace("$$ROOT", "$address"),
+            probe.replace(r#"}}}}]"#, r#"}}}},{"$limit":1}]"#),
+            probe.replace(r#""size":1"#, r#""size":{"$numberLong":"1","x":1}"#),
+        ] {
+            let p = agg(&not).shape.pipeline.unwrap();
+            assert!(!p.own_key_probe, "{not}");
+        }
+        let count = r#"[{"$group":{"_id":"$Type","n":{"$sum":1}}},{"$limit":256}]"#;
+        let p = agg(count).shape.pipeline.unwrap();
+        assert!(p.own_type_count && !p.own_key_probe && !p.pass_through);
+        assert!(
+            agg(&count.replace("$Type", "$type"))
+                .shape
+                .pipeline
+                .unwrap()
+                .own_type_count
+        );
+        for not in [
+            count.replace("$Type", "$email"),
+            count.replace(r#""$sum":1"#, r#""$sum":"$amount""#),
+            count.replace(r#""$sum":1"#, r#""$push":"$email""#),
+            count.replace("256", "100000"),
+            count.replace(r#",{"$limit":256}"#, ""),
+            count.replace(r#""n":"#, r#""m":{"$first":"$email"},"n":"#),
+        ] {
+            let p = agg(&not).shape.pipeline.unwrap();
+            assert!(!p.own_type_count, "{not}");
+        }
         let r = agg(r#"[{"$project":{"email":1}},{"$sort":{"_id":1}}]"#);
         assert_eq!(r.kind, Kind::Op(Cmd::Aggregate));
         assert_eq!(
             r.shape.pipeline,
             Some(Pipeline {
                 pass_through: true,
-                writes: false
+                writes: false,
+                own_key_probe: false,
+                own_type_count: false,
             })
         );
         let r = agg(r#"[{"$match":{"email":"jane@example.com"}}]"#);

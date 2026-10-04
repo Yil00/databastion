@@ -286,6 +286,90 @@ pub(crate) fn sample_statement(
     })
 }
 
+// ------------------------------------------------------------ CAS guard
+
+/// The CAS store guard's only read of a ticket registry (ADR-0041
+/// decision 5): the ticket count per `type` (cut to 256 characters),
+/// nothing else, under the per-statement timeout of [`sample_statement`].
+#[must_use]
+pub(crate) fn ticket_type_counts(
+    flavor: Flavor,
+    statement_ms: u32,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    let c = quote_ident(column)?;
+    let from = format!("{}.{}", quote_ident(schema)?, quote_ident(table)?);
+    let select =
+        format!("SELECT LEFT(CAST({c} AS CHAR), 256), COUNT(*) FROM {from} GROUP BY 1 LIMIT 256");
+    let ms = statement_ms.max(100);
+    Some(match flavor {
+        Flavor::Mysql => select.replacen(
+            "SELECT",
+            &format!("SELECT /*+ MAX_EXECUTION_TIME({ms}) */"),
+            1,
+        ),
+        Flavor::Mariadb => format!(
+            "SET STATEMENT max_statement_time = {}.{:03} FOR {select}",
+            ms / 1000,
+            ms % 1000
+        ),
+    })
+}
+
+/// Normalized name key of a catalog name in SQL, as
+/// `databastion_core::cas_guard::name_key` (PR #141 review L7): the part
+/// after the last `.`, every character but an ASCII letter or digit
+/// removed (binary collation and an explicit list: no case folding beyond
+/// ASCII), then lower-cased.
+macro_rules! name_key {
+    ($col:literal) => {
+        concat!(
+            "LOWER(REGEXP_REPLACE(SUBSTRING_INDEX(CONVERT(",
+            $col,
+            " USING utf8mb4) COLLATE utf8mb4_bin, '.', -1), \
+             '[^ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]', ''))"
+        )
+    };
+}
+
+/// Most rows of [`cas_guard_columns`]; one more is read to tell a cut list
+/// (then reported as not evaluated, PR #141 review L2).
+pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
+
+/// `check()` of the CAS store guard (ADR-0041 decision 6): the columns of
+/// the tables that may be CAS stores (a name key in `keys`, or a `body` /
+/// `json` / `AUD_RESOURCE` / `AUD_USER` column) the account can see, with
+/// its privileges on each. Tables matched by name come first (PR #141
+/// review L2); at most [`CAS_GUARD_MAX_ROWS`] + 1 rows. `None` when a key
+/// cannot be quoted. Columns: schema, table, column, privileges.
+#[must_use]
+pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
+    let mut list = Vec::with_capacity(keys.len());
+    for k in keys {
+        list.push(quote_str(k)?);
+    }
+    if list.is_empty() {
+        list.push("''".to_owned());
+    }
+    let list = list.join(", ");
+    Some(format!(
+        "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.PRIVILEGES \
+         FROM information_schema.COLUMNS c \
+         WHERE LOWER(c.TABLE_SCHEMA) NOT IN \
+           ('mysql', 'sys', 'information_schema', 'performance_schema') \
+           AND ({key} IN ({list}) \
+             OR (c.TABLE_SCHEMA, c.TABLE_NAME) IN ( \
+               SELECT x.TABLE_SCHEMA, x.TABLE_NAME FROM information_schema.COLUMNS x \
+               WHERE {xkey} IN ('body', 'json', 'audresource', 'auduser'))) \
+         ORDER BY ({key} IN ({list})) DESC, c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION \
+         LIMIT 20001",
+        key = name_key!("c.TABLE_NAME"),
+        xkey = name_key!("x.COLUMN_NAME"),
+    ))
+}
+
 // ------------------------------------------------------------------ check()
 
 /// The current account as it appears in the `GRANTEE` column of the
@@ -670,10 +754,12 @@ mod tests {
             PS_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
+            cas_guard_columns(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
         ];
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
             v.push(sample_statement(flavor, 1000, "s", "t", &[("c", Sampled::Text)], 10).unwrap());
+            v.push(ticket_type_counts(flavor, 1000, "s", "t", "type").unwrap());
         }
         v
     }

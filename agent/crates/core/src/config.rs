@@ -363,6 +363,12 @@ pub struct PostgresTargetConfig {
     /// Without it, Audit uses `pg_stat_statements` (Limited).
     #[serde(default)]
     pub audit_log: Option<PgAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a PostgreSQL server log file.
@@ -400,6 +406,7 @@ impl Default for PostgresTargetConfig {
             ca_file: None,
             extended_grants: false,
             audit_log: None,
+            cas_stores: None,
         }
     }
 }
@@ -455,6 +462,12 @@ pub struct MysqlTargetConfig {
     /// (Partial or Limited).
     #[serde(default)]
     pub audit_log: Option<MysqlAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a MySQL / MariaDB audit log file.
@@ -537,6 +550,12 @@ pub struct MongodbTargetConfig {
     /// uses the profiler when the account can read `system.profile`.
     #[serde(default)]
     pub audit_log: Option<MongodbAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a MongoDB log file read by the Audit connector.
@@ -573,6 +592,7 @@ impl Default for MongodbTargetConfig {
             ca_file: None,
             auth_source: default_mongodb_auth_source(),
             audit_log: None,
+            cas_stores: None,
         }
     }
 }
@@ -649,6 +669,13 @@ pub struct OpenldapTargetConfig {
     /// agent's own DN is always sent by name.
     #[serde(default)]
     pub clear_principals: Vec<String>,
+    /// CAS stores under custom names (ADR-0041 decision 5): LDAP object
+    /// classes of service registry entries (`service_registry`; their
+    /// entries are classified without masked samples nor `secret.*`
+    /// fingerprints) and of ticket entries (`ticket_registry`; never
+    /// read). `audit_trail` is not used on OpenLDAP.
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 fn default_accesslog_base() -> String {
@@ -663,6 +690,7 @@ impl Default for OpenldapTargetConfig {
             bind: OpenldapBind::default(),
             accesslog_base: default_accesslog_base(),
             clear_principals: Vec::new(),
+            cas_stores: None,
         }
     }
 }
@@ -709,6 +737,19 @@ pub enum OpenldapBind {
 }
 
 impl TargetConfig {
+    /// The `cas_stores` lists of the target's engine block (PostgreSQL,
+    /// MySQL / MariaDB, MongoDB, OpenLDAP), if any.
+    #[must_use]
+    pub fn cas_stores(&self) -> Option<&crate::cas_guard::CasStores> {
+        match self.engine {
+            TargetEngine::Postgres => self.postgres.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Mysql | TargetEngine::Mariadb => self.mysql.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Mongodb => self.mongodb.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Cas => None,
+        }
+    }
+
     /// The validated `cas` block of an `engine: cas` target, its paths
     /// resolved when the configuration was loaded. `None` for other
     /// engines (and for a target that did not come from
@@ -1249,6 +1290,28 @@ impl TargetConfig {
                 "must be 1 to 128 characters without control characters",
             ));
         }
+        for (block, stores) in [
+            (
+                "postgres",
+                self.postgres.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "mysql",
+                self.mysql.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "mongodb",
+                self.mongodb.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "openldap",
+                self.openldap.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+        ] {
+            if let Some(Err((key, reason))) = stores.map(crate::cas_guard::CasStores::validate) {
+                return Err(invalid(f(&format!("{block}.cas_stores.{key}")), reason));
+            }
+        }
         if let Some(pg) = &self.postgres {
             self.validate_postgres(pg, i)?;
         }
@@ -1705,6 +1768,38 @@ targets:
         let message = err(&text);
         assert!(message.contains("secret.env"), "{message}");
         assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    /// ADR-0041 decision 5: `targets[].<engine>.cas_stores`, bounded.
+    #[test]
+    fn cas_stores_are_per_engine_block_and_bounded() {
+        let yaml = |block: &str| {
+            format!(
+                "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - {{id: t, \
+                 engine: postgres, host: db, account: a, secret: {{env: PW}}, postgres: {{{block}}}}}\n"
+            )
+        };
+        let c = AgentConfig::parse(&yaml(
+            "cas_stores: {ticket_registry: [sso_tix], service_registry: [Apps], audit_trail: [Trail]}",
+        ))
+        .unwrap();
+        let stores = c.targets[0].cas_stores().unwrap();
+        assert_eq!(stores.ticket_registry, ["sso_tix"]);
+        assert_eq!(stores.audit_trail, ["Trail"]);
+        assert!(
+            AgentConfig::parse(&yaml("databases: [shop]"))
+                .unwrap()
+                .targets[0]
+                .cas_stores()
+                .is_none()
+        );
+        let e = AgentConfig::parse(&yaml("cas_stores: {ticket_registry: [\"\"]}")).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("postgres.cas_stores.ticket_registry"),
+            "{e}"
+        );
+        assert!(AgentConfig::parse(&yaml("cas_stores: {tickets: [x]}")).is_err());
     }
 
     #[test]

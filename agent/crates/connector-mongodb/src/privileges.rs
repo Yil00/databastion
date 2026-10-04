@@ -176,6 +176,65 @@ const WRITE_NAMES: &[&str] = &[
     "validate",
 ];
 
+/// Where the account can `find` (CAS store guard, ADR-0041 decision 6:
+/// MongoDB has no field-level privilege, so `find` on a ticket registry or
+/// an audit trail collection reads its credentials).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FindScope {
+    /// Every database (`anyResource`, an empty database name, or a
+    /// resource not understood: fail closed).
+    Any,
+    /// Every collection of one database.
+    Database(String),
+    /// One collection.
+    Collection(String, String),
+}
+
+/// The `find` (or `anyAction`) scopes of a `connectionStatus` reply with
+/// `showPrivileges`.
+pub(crate) fn find_scopes(reply: Doc<'_>) -> Result<Vec<FindScope>, Malformed> {
+    let privileges = reply
+        .doc("authInfo")?
+        .ok_or(Malformed)?
+        .array("authenticatedUserPrivileges")?
+        .ok_or(Malformed)?;
+    let mut out = Vec::new();
+    for (i, element) in privileges.iter().enumerate() {
+        if i >= MAX_PRIVILEGES {
+            out.push(FindScope::Any);
+            break;
+        }
+        let (_, Value::Doc(p)) = element? else {
+            return Err(Malformed);
+        };
+        let list = p.array("actions")?.ok_or(Malformed)?;
+        let mut find = false;
+        for a in list.iter() {
+            let (_, Value::Str(s)) = a? else {
+                return Err(Malformed);
+            };
+            find |= s == b"find" || s == b"anyAction";
+        }
+        if !find {
+            continue;
+        }
+        let res = match p.doc("resource")? {
+            Some(d) => resource(d)?,
+            None => None,
+        };
+        out.push(match res {
+            Some(Resource::Cluster | Resource::Buckets { .. }) => continue,
+            Some(Resource::Namespace { db: "", .. }) => FindScope::Any,
+            Some(Resource::Namespace { db, collection: "" }) => FindScope::Database(db.to_owned()),
+            Some(Resource::Namespace { db, collection }) => {
+                FindScope::Collection(db.to_owned(), collection.to_owned())
+            }
+            Some(Resource::Any) | None => FindScope::Any,
+        });
+    }
+    Ok(out)
+}
+
 impl PrivilegeReport {
     /// Evaluates the `authInfo.authenticatedUserPrivileges` of a
     /// `connectionStatus` reply.

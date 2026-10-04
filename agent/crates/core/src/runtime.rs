@@ -644,6 +644,11 @@ struct Runtime {
     /// Targets whose audit stream was stopped after [`AUDIT_MAX_PANICS`]
     /// panics in a row, with that count (reported as a target note).
     audit_parked: Mutex<std::collections::HashMap<String, u32>>,
+    /// Per target and database, the CAS store guard tallies of its latest
+    /// completed Discovery scans (ADR-0041 decision 5, PR #141 review L6):
+    /// `coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted`
+    /// in the target's notes.
+    cas_guards: Mutex<std::collections::HashMap<String, crate::cas_guard::TargetTally>>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
     /// Longest wait for a scan's findings to be acknowledged before its
@@ -829,6 +834,7 @@ impl Runtime {
             check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_parked: Mutex::new(std::collections::HashMap::new()),
+            cas_guards: Mutex::new(std::collections::HashMap::new()),
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
             turns: Mutex::new(crate::checks::TurnState::default()),
@@ -1130,6 +1136,21 @@ impl Runtime {
                 (AuditLevel::None, notes)
             }
             None => (level, notes),
+        };
+        // The CAS store guard's findings of the latest scan (counts only;
+        // not on `cas` targets, whose notes do not list these codes).
+        let notes = {
+            let mut notes = notes;
+            if target.engine != crate::config::TargetEngine::Cas
+                && let Some(g) = self
+                    .cas_guards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&target.id)
+            {
+                notes.extend(g.total().notes());
+            }
+            notes
         };
         let audit_source = match connector {
             Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
@@ -3021,6 +3042,17 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         outcome.out_of_time = scan.pacer().out_of_time();
+        // The guard tally of a completed scan replaces the previous scans'
+        // for the databases it covered; a running or failed scan leaves the
+        // notes as they were.
+        if outcome.error.is_none() {
+            self.cas_guards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.as_str().to_owned())
+                .or_default()
+                .merge_scan(scan.cas_guard(), outcome.out_of_time);
+        }
         outcome
     }
 
