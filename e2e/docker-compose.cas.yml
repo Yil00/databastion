@@ -1,0 +1,162 @@
+# CAS target end to end (ROADMAP P8-D, ADR-0041 decision 14): merged over docker-compose.yml by
+# e2e/cas.sh only (`-f docker-compose.yml -f docker-compose.cas.yml`, project databastion-e2e-cas).
+# The main e2e run (run.sh) never reads this file. Only db, migrate, web, worker, proxy,
+# bootstrap-admin, cas-db, cas-files, cas, agent and agent-files are started: none of the other
+# targets of docker-compose.yml.
+#
+#   cas        the CAS 8.0 overlay image of the dev service (dev/cas/Dockerfile: JSON service
+#              registry, OIDC, JPA ticket registry), with dev's cas.properties and log4j2.xml
+#              (mounted read-only). Plain HTTP published on 127.0.0.1 only (the agent never
+#              contacts CAS, ADR-0041 decision 9; the scenario e2e/cas_scenario.py drives it from
+#              the host). Its passwords come from Docker secrets, exported by the wrapper below for
+#              the CAS process only (never in the container's environment, so never in
+#              `docker inspect`).
+#   cas-db     the JPA ticket registry's PostgreSQL (database `cas`, owner `cas`), network alias
+#              `postgres` (the JDBC URL of dev's cas.properties). Also the agent's PostgreSQL target
+#              `casdb-e2e` for the CAS store guard (ADR-0041 decisions 5 and 6): the agent's role
+#              (target-initdb/01-agent-role.sh) gets the column grants on `cas_tickets` from cas.sh
+#              once CAS created the table.
+#   cas-files  one-shot: dev/cas/files-init.sh on two volumes, with the ADR-0041 decision 6
+#              permissions: the registry (cas-registry: directory 0750, definitions 0640) and the
+#              audit log directory (cas-log: 2750, the log 0640), owner the CAS user (10041),
+#              group the agent's (10001). The agent reads both through read-only mounts: nothing it
+#              could write, no symlink (ADR-0041 decision 3, ADR-0043).
+
+services:
+  cas-db:
+    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The entrypoint starts as root to prepare PGDATA, then drops to `postgres`.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/cas_db_admin_password
+      POSTGRES_DB: cas
+    secrets: [cas_db_admin_password, target_agent_password, cas_db_password]
+    volumes:
+      - ./target-initdb/01-agent-role.sh:/docker-entrypoint-initdb.d/01-agent-role.sh:ro
+      - ./target-initdb/40-cas.sh:/docker-entrypoint-initdb.d/40-cas.sh:ro
+    tmpfs: [/var/lib/postgresql/data, /var/run/postgresql, /tmp]
+    # pg_stat_statements: the agent role's own statements (not asserted here; the PostgreSQL
+    # connector's check() reads it when present).
+    command: [postgres, -c, shared_preload_libraries=pg_stat_statements]
+    networks:
+      agent-net:
+        aliases: [postgres]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d cas"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  cas-files:
+    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    profiles: [tools]
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_AGENT_GID: "10001"
+    command: ["sh", "/usr/local/bin/files-init.sh", "setup"]
+    volumes:
+      - ../dev/cas/files-init.sh:/usr/local/bin/files-init.sh:ro
+      - ../dev/cas/services:/src/services:ro
+      - cas-registry:/state/cas/services
+      - cas-log:/state/logs/cas
+    restart: "no"
+
+  cas:
+    build:
+      context: ../dev/cas
+    image: ${E2E_CAS_IMAGE:-databastion-dev/cas:8.0.2-overlay}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Not read-only (as dev's): CAS unpacks its war and writes its OIDC keystore (/var/lib/cas).
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        DEV_CAS_USER_PASSWORD="$$(cat /run/secrets/cas_user_password)"
+        DEV_CAS_DB_PASSWORD="$$(cat /run/secrets/cas_db_password)"
+        export DEV_CAS_USER_PASSWORD DEV_CAS_DB_PASSWORD
+        exec /docker/entrypoint.sh
+    environment:
+      DEV_CAS_SERVER_NAME: "http://127.0.0.1:${E2E_CAS_PORT:-8281}"
+      # cas.sh restarts CAS with `false` for the clear-ticket variant
+      # (security.ticket_registry_unencrypted).
+      DEV_CAS_TICKET_CRYPTO: "${E2E_CAS_TICKET_CRYPTO:-true}"
+      LOGGING_CONFIG: file:/etc/cas/config/log4j2.xml
+      JVM_MEM_OPTS: -Xms256m -Xmx1g
+    secrets: [cas_user_password, cas_db_password]
+    volumes:
+      - ../dev/cas/config/cas.properties:/etc/cas/config/cas.properties:ro
+      - ../dev/cas/config/log4j2.xml:/etc/cas/config/log4j2.xml:ro
+      # nocopy: an empty volume would otherwise take the image's /var/log/cas (owner and group
+      # cas, 0750) over the permissions cas-files gave it.
+      - {type: volume, source: cas-registry, target: /etc/cas/services, read_only: true, volume: {nocopy: true}}
+      - {type: volume, source: cas-log, target: /var/log/cas, volume: {nocopy: true}}
+    ports:
+      - "127.0.0.1:${E2E_CAS_PORT:-8281}:8080"
+    # agent-net: the ticket registry's database (cas-db); cas-net: the published port (an internal
+    # network cannot publish one).
+    networks: [agent-net, cas-net]
+    depends_on:
+      cas-db:
+        condition: service_healthy
+    healthcheck:
+      # As dev's: a static resource (every request to /cas/login writes an audit record).
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080
+          && printf 'GET /cas/images/cas-logo.png HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
+          && IFS= read -r status <&3
+          && [[ $$status == *' 200 '* ]]
+      interval: 3s
+      timeout: 5s
+      start_period: 180s
+      retries: 80
+
+  agent:
+    # Only the mounts of this run: agent.yaml, the console CA, the secrets volume, and the CAS
+    # registry and audit log, read-only. The agent runs as 10001:10001, the group of the CAS files.
+    group_add: !reset []
+    volumes: !override
+      - agent-state:/var/lib/databastion
+      - agent-secrets:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by cas.sh}/agent/agent.yaml:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by cas.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      - cas-registry:/srv/cas/services:ro
+      - cas-log:/var/log/cas:ro
+    depends_on: !override
+      proxy:
+        condition: service_started
+      cas-db:
+        condition: service_healthy
+
+  agent-files:
+    # The agent's state (spool, audit cursors) is read from it at the end of the run (I2 scan).
+    volumes: !override
+      - agent-state:/state
+      - agent-secrets:/secrets
+
+networks:
+  cas-net: {}
+
+volumes:
+  cas-registry: {}
+  cas-log: {}
+
+secrets:
+  cas_db_admin_password:
+    file: ${E2E_WORK_DIR:?set by cas.sh}/secrets/cas_db_admin_password
+  cas_db_password:
+    file: ${E2E_WORK_DIR:?set by cas.sh}/secrets/cas_db_password
+  cas_user_password:
+    file: ${E2E_WORK_DIR:?set by cas.sh}/secrets/cas_user_password

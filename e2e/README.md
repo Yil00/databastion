@@ -13,7 +13,8 @@ real `mongodump`) and the OpenLDAP target (`cn=accesslog`,
 gates** of phase 7; and a password-bearing DCL statement on the Audit path (PostgreSQL `CREATE USER`
 / `ALTER ROLE … PASSWORD`, MariaDB `CREATE USER` / `ALTER USER … IDENTIFIED BY`, phase 7); see also
 [Adding an Audit target](#adding-an-audit-target). The console's OIDC login against Keycloak (P8-D)
-is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario).
+is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario), and so
+is the Apereo CAS target (P8-D): [CAS target](#cas-target).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
 It runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/`, `dev/seed/out/`,
@@ -439,7 +440,92 @@ image as for `run.sh` (`E2E_CONSOLE_IMAGE`), and
 pinned image, which must carry the same digest (e.g.
 `mirror.gcr.io/keycloak/keycloak@sha256:…`).
 
+## CAS target
+ROADMAP P8-D, [ADR-0041](../docs/adr/0041-cas-connector.md) decision 14: a `cas` target with
+Discovery, Audit and the I2 check, and the CAS store guard against a real JPA ticket table.
+[`cas.sh`](cas.sh) merges [`docker-compose.cas.yml`](docker-compose.cas.yml) over this stack (Compose
+project `databastion-e2e-cas`, Compose v2.24 or later for `!override`) and starts only `db`,
+`migrate`, `web`, `worker`, `proxy`, `cas-db`, `cas` and `agent`; [`run.sh`](run.sh) never reads the
+override. The CI job is `e2e-cas` in [`ci.yml`](../.github/workflows/ci.yml) (45 min budget, `cas.sh`
+at most 2400 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`, `dev/cas/`,
+`dev/ground-truth.json`, `dev/docker-compose.yml` or `ci.yml` change, and is not part of the
+required `CI result` check until it has run green on `dev`. It is a job of its own rather than a
+part of `run.sh`: building the CAS overlay (its modules come from Maven Central, locked and
+SHA-256 verified, [dev/README.md](../dev/README.md#apereo-cas)) and starting CAS add about five
+minutes and an external dependency to the required `e2e` job.
+
+| Service | Image | Role |
+|---------|-------|------|
+| `cas` | [`dev/cas`](../dev/cas/Dockerfile) (CAS 8.0.2 overlay: JSON service registry, OIDC, JPA ticket registry) | The dev service's image and configuration ([`cas.properties`](../dev/cas/config/cas.properties), [`log4j2.xml`](../dev/cas/config/log4j2.xml), mounted read-only): static users, the JSON audit trail to `/var/log/cas/cas_audit.log`, tickets encrypted by default. Plain HTTP published on `127.0.0.1:${E2E_CAS_PORT:-8281}` only (the agent never contacts CAS, ADR-0041 decision 9). The users' and database passwords are Docker secrets that a wrapper exports for the CAS process only (`cas.sh` checks that no password is in the container's environment). On `agent-net` (its database) and `cas-net` (the published port) |
+| `cas-db` | PostgreSQL 17 (pinned) | The JPA ticket registry's database `cas` (owner `cas`, network alias `postgres` as in the dev JDBC URL), and the agent's PostgreSQL target `casdb-e2e`: [`target-initdb/01-agent-role.sh`](target-initdb/01-agent-role.sh) (the ADR-0012 minimal role) and [`40-cas.sh`](target-initdb/40-cas.sh) (the role `cas`, `USAGE` on `public` for the agent, no `PUBLIC` access); once CAS created `cas_tickets`, `cas.sh` grants the agent `SELECT (type, creation_time, expiration_time)` only (ADR-0041 decision 6) and checks the table's shape and grants |
+| `cas-files` | busybox (pinned) | One-shot, no network: [`dev/cas/files-init.sh`](../dev/cas/files-init.sh) on the volumes `cas-registry` (the definitions of [`dev/cas/services`](../dev/cas/services), directory `0750`, files `0640`) and `cas-log` (directory `2750`, the log `0640`), owner the CAS user (10041), group the agent's (10001). CAS mounts them without the image's copy-up (`nocopy`), the agent read-only at `/srv/cas/services` and `/var/log/cas`: nothing it could write, no symlink (ADR-0041 decision 3, [ADR-0043](../docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)); `cas.sh` checks every mode, owner and link count |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Targets `cas-e2e` (`engine: cas`, `json_dir`, `audit_log`, `clear_principals: [svc-monitoring]`, client addresses `truncated` by default) and `casdb-e2e` (`databases: [cas]`, the CAS store guard on by default) |
+
+**Scenario.** The CAS traffic comes from [`cas_scenario.py`](cas_scenario.py) (Python standard
+library, unit tests in [`test_cas_scenario.py`](test_cas_scenario.py)) on the host, as a browser:
+the login form, the credentials, the service ticket from the redirect, its validation. Every login
+uses a fresh cookie jar (no SSO reuse).
+1. The agent is online with both targets; the console lists `engine.cas` (ADR-0042), so the `cas`
+   target is reported: reachable, audit level **None** with `audit.limited_pending_first_record`
+   before any record.
+2. Two `access_event` policies on `cas-e2e` (every `read`; `volume.failed_logins_many_accounts`),
+   Audit enabled on `cas-e2e`.
+3. Two logins of each of the three e-mail users and one of `svc-monitoring`, each with a validated
+   service ticket for `https://intranet.example.org/login` (`Intranet`); then 20 failed logins from
+   the host, each with a distinct typed name (one of them a random password-like string) and a random
+   password: a credential-stuffing burst from one client address.
+4. Discovery of both targets. `cas-e2e`: [`i2_check.py findings`](i2_check.py) with every expected
+   classifier and no negative control, and every `cas` location of the ground truth with an expected
+   classifier found (contacts, the static release value, the required-attribute value, the audit
+   trail's `who`), none on a credential field (`never_sampled`).
+5. Audit: the heartbeat level becomes **Partial** (`cas_audit_log`), with
+   `security.client_secrets_in_clear` (count 1: HR-Portal) and none of the "not seen", unreadable,
+   unsupported-format, dropped, headers, writable or skipped notes. Events, exactly: 6 `connect`
+   fingerprinted plus 1 of `svc-monitoring` in clear, 7 `read` of `service_registry` / `Intranet`
+   (the object-form `what` of CAS 8.0, #143), 16 `auth_failure` with their own fingerprinted
+   principal (the 16th with the signal) and the 4 others in the `*` aggregate with
+   `volume.failed_logins_many_accounts`; every client address truncated to its /24, none stored as CAS
+   logged it; no principal in clear but `svc-monitoring` and `*`; incidents of both policies (failed
+   logins share one incident per client network, ADR-0031 decision 1: the stuffing incident links
+   the `*` aggregate).
+6. CAS store guard, real table: `cas_tickets` holds encoded tickets only; the agent logged
+   `CAS ticket registry: metadata only` with `encrypted` > 0 and `unencrypted` 0 and did not sample
+   it; the next heartbeat reports neither `security.ticket_registry_unencrypted`,
+   `privilege.ticket_credentials_readable` nor `coverage.cas_guard_tripped`; no finding on it.
+7. CAS store guard, clear tickets: the table emptied, CAS restarted with
+   `cas.ticket.registry.jpa.crypto.enabled=false`, one more login per e-mail user with the service
+   tickets left unvalidated (they stay in the table, ids in clear); then, as the superuser, a copy
+   `sso_archive` of the table (clear ids, bodies and principals) and a plain table `app_sessions`
+   holding every service ticket of the run next to contact e-mails, both readable in full by the
+   agent. The run's ticket-granting ticket ids are read from the copy and searched like the service
+   tickets. After a new scan: `security.ticket_registry_unencrypted`,
+   `privilege.ticket_credentials_readable` (count 1: the copy, recognized by its column shape; the
+   real table keeps its column grants) and `coverage.cas_guard_tripped`; no finding on either
+   ticket table nor on `app_sessions.session_ref`, and `app_sessions.contact` found (positive
+   control).
+8. I2 and secret hygiene: no `cas` value of the ground truth (the `never_sampled` client secrets
+   and header included; positive control: a canary file holding one) in a `pg_dump` of the console
+   database, the exports of its Audit tables, the findings, events, incidents and agent pages, the
+   agent's state volume (spool, cursors, settings) or the logs of every container but CAS and
+   `cas-db` (the target side). No service ticket, ticket-granting ticket, ticket-granting cookie,
+   nor SHA-256 / SHA-512 of a ticket, no typed name of a failed login, no password (typed or
+   generated) in the same places (positive control: the copy of the ticket table holds tickets of the
+   run); no generated secret in any log, CAS's included. CAS logs the typed names itself: they are
+   redacted from the kept logs like the secrets.
+
+```sh
+e2e/cas.sh                         # builds the console, agent and CAS images first
+E2E_SKIP_BUILD=1 e2e/cas.sh        # reuse them (E2E_CONSOLE_IMAGE, E2E_AGENT_IMAGE, E2E_CAS_IMAGE)
+E2E_CAS_PORT=9281 e2e/cas.sh       # if 8281 is taken on 127.0.0.1
+```
+
+Logs go to `e2e/.logs-cas/` (`E2E_LOG_DIR`, ignored by git). Behind a TLS-intercepting proxy the CAS
+overlay cannot be built as is (Gradle must trust the proxy's CA): build it beforehand with a local
+Gradle base image that trusts it (`docker build --build-arg GRADLE_IMAGE=<that image> -t
+databastion-dev/cas:8.0.2-overlay dev/cas`, never committed), then run with `E2E_SKIP_BUILD=1`.
+
 ## Load / database impact
 The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to
 measure the database CPU impact of Discovery, the Audit path under a sustained workload and the
-agent's resource use. It runs in its own workflow, outside the required `CI result` check.
+agent's resource use, and, with [`load/cas.sh`](load/README.md#cas-target), the CAS target under a
+login workload. It runs in its own workflow, outside the required `CI result` check.

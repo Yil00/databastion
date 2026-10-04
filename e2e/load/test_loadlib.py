@@ -429,6 +429,41 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(rep["pass"])
         self.assertIn("discovery.pg-load.db_cpu_impact_pct", self.names(ck, None))
 
+    def test_cas_run(self) -> None:
+        # The facts e2e/load/cas.sh writes: the login workload on cas-load (container cas, no scan of
+        # its own: the connector reads files), the ticket aggregate's scan on casdb-load (cas-db).
+        facts, samples, hbs = scenario()
+        ren = {"pg-load": "cas-load"}
+        cas_facts = []
+        for f in facts:
+            f = dict(f)
+            if f.get("kind") in ("scan", "findings"):
+                f["target"] = "casdb-load"
+            elif f.get("kind") == "target":
+                cas_facts.append({"kind": "target", "target": "casdb-load", "container": "cas-db"})
+                f = {"kind": "target", "target": "cas-load", "container": "cas"}
+            elif "target" in f:
+                f["target"] = ren[f["target"]]
+            if f.get("kind") == "workload":
+                f.update({"tool": "cas_scenario", "rate": 10, "logins": f["issued"] // 2, "failed_logins": 0})
+            cas_facts.append(f)
+        cas_facts[0] = {"kind": "config", "harness": "cas", "cas_login_rate": 10}
+        for smp in samples:
+            if "target-pg" in smp["c"]:
+                c = smp["c"].pop("target-pg")
+                smp["c"]["cas"] = dict(c)
+                smp["c"]["cas-db"] = dict(c)
+        rep, ck = L.build_report(cas_facts, samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True])
+        names = {c["name"] for c in ck.items}
+        self.assertIn("audit.cas-load.events_accounted", names)
+        self.assertIn("audit.cas-load.p95_latency_ms", names)
+        self.assertIn("discovery.casdb-load.db_cpu_impact_pct", names)
+        self.assertNotIn("discovery.cas-load.db_cpu_impact_pct", names)
+        self.assertEqual(rep["audit"]["cas-load"]["tool"], "cas_scenario")
+        self.assertIsNotNone(rep["audit"]["cas-load"]["db_cores_audit_on"])
+        self.assertIn("| casdb-load |", L.render_markdown(rep))
+
     def test_limits_from_env(self) -> None:
         lim = L.Limits.from_env({"LOAD_LIMIT_DISCOVERY_PCT": "1.5", "LOAD_LIMIT_SPOOL_MAX_BATCHES": "7",
                                  "LOAD_LIMIT_DRAIN_S": ""})

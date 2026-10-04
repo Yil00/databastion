@@ -38,7 +38,7 @@ jobs:
       - name: Unit tests (seed generator, sampler, analysis)
         run: timeout 120 python3 -m unittest discover -s e2e/load -p 'test_*.py' -v
       - name: shellcheck
-        run: shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh
+        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/initdb/*.sh
 
   load:
     name: Load / database impact
@@ -81,5 +81,50 @@ jobs:
         with:
           name: load-logs
           path: load-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The CAS target (e2e/load/README.md "CAS target", ADR-0041 decision 14): a CAS login workload
+  # with and without Audit (events against the audit records, CAS login latency, CAS CPU), the agent's
+  # CPU / RSS while it tails the busy audit log, and the CAS store guard's ticket aggregate on the
+  # JPA ticket table the workload filled. In parallel with the database run, same triggers.
+  load-cas:
+    name: Load / CAS target
+    needs: unit
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-cas-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-cas-results
+      LOAD_SOAK_S: ${{ inputs.soak_s || '600' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+      - name: Run e2e/load/cas.sh
+        run: e2e/load/cas.sh
+      # Counters, timings and latencies only (run.sh's format): no ticket, no secret (cas.sh redacts
+      # every generated secret from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: load-cas-results
+          path: load-cas-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: load-cas-logs
+          path: load-cas-logs/
           retention-days: 7
           if-no-files-found: ignore

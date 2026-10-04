@@ -1,3 +1,5 @@
 .logs/
 .results/
 __pycache__/
+.logs-cas/
+.results-cas/
