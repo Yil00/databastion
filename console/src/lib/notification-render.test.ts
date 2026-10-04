@@ -170,3 +170,11 @@ describe("user.local_login system alert (ADR-0038 decision 11)", () => {
     expect(m.text).toContain("break-glass");
   });
 });
+
+describe("user.role_sync system alert (security review L3)", () => {
+  it("explains both kinds", () => {
+    const base = { event: "user.role_sync" as const, occurred_at: "2026-10-04T12:00:00.000Z", url: null, user_id: "01890a5d-ac96-774b-bcce-b302099a8057", username: "kate" };
+    expect(renderEmail({ ...base, kind: "last_admin_kept" }).subject).toBe("[DataBastion] Last administrator kept: kate");
+    expect(renderEmail({ ...base, kind: "local_admin_demoted" }).text).toContain("break-glass");
+  });
+});

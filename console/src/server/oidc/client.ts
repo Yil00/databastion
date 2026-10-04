@@ -28,6 +28,12 @@ export function authorizationUrl(md: ProviderMetadata, p: OidcProvider, s: FlowS
   q.set("nonce", s.nonce);
   q.set("code_challenge", pkceChallenge(s.verifier));
   q.set("code_challenge_method", "S256");
+  if (s.purpose === "link") {
+    // Security review L1: linking binds an identity to an account, so it needs a fresh
+    // authentication at the provider, not a reused provider session (`auth_time` checked).
+    q.set("prompt", "login");
+    q.set("max_age", "0");
+  }
   return u.toString();
 }
 

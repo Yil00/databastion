@@ -1,9 +1,11 @@
-import { and, asc, count, eq, lte, sql } from "drizzle-orm";
+import { and, asc, count, eq, isNull, lte, ne, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { meta, oidcPendingLogins, userIdentities, users } from "@/db/schema";
 import { writeAudit } from "@/server/audit";
 import { createSession, revokeOtherSessions } from "@/server/auth/session";
+import { consoleUrl } from "@/server/alerting-config";
+import { enqueueSystemAlert } from "@/server/notifications";
 
 import type { LoginDeniedReason, MappedIdentity, Role } from "./claims";
 import type { OidcConfig } from "./config";
@@ -62,6 +64,68 @@ export function initialRole(cfg: Pick<OidcConfig, "skipRoleSync" | "roleStrict" 
   return effectiveRole;
 }
 
+/** Serializes changes to the set of enabled administrators (shared with users-admin.ts). */
+export const ADMIN_SET_LOCK = 7234039;
+
+async function otherEnabledAdmin(tx: Tx, userId: string): Promise<boolean> {
+  const [row] = await tx.select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), isNull(users.disabledAt), ne(users.id, userId))).limit(1);
+  return row !== undefined;
+}
+
+async function roleSyncAlert(tx: Tx, userId: string, username: string, kind: "last_admin_kept" | "local_admin_demoted"): Promise<void> {
+  const at = new Date();
+  await enqueueSystemAlert(tx, {
+    // At most one per user, kind and hour (a refused demotion repeats at every login).
+    subjectKey: `user:${userId}|role_sync:${kind}|hour:${at.toISOString().slice(0, 13)}`,
+    agentId: null,
+    securityEventId: null,
+    payload: { event: "user.role_sync", occurred_at: at.toISOString(), url: consoleUrl("/users"), user_id: userId, username, kind },
+  });
+}
+
+/**
+ * Applies a role mapped by the provider (login or refresh, ADR-0038 decision 9) and returns the
+ * resulting role. Security review L3: role sync never demotes the last enabled administrator (the
+ * role is kept, the refusal audited and alerted), and demoting an account that holds a local
+ * password (a break-glass account) raises a system alert. A demotion ends the user's other sessions.
+ */
+export async function syncRole(tx: Tx, userId: string, from: Role, to: Role, ctx: { ip: string | null; keepTokenHash: string | null }): Promise<Role> {
+  if (from === to) return from;
+  const demotion = from === "admin";
+  if (demotion) {
+    await tx.execute(sql`select pg_advisory_xact_lock(${ADMIN_SET_LOCK})`);
+  }
+  const [u] = await tx.select({ username: users.username, passwordHash: users.passwordHash }).from(users).where(eq(users.id, userId));
+  if (!u) return from;
+  if (demotion && !(await otherEnabledAdmin(tx, userId))) {
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "user.role_change",
+      outcome: "failure",
+      targetType: "user",
+      targetId: userId,
+      sourceIp: ctx.ip,
+      details: { source: "oidc", from, to, reason: "last_admin" },
+    });
+    await roleSyncAlert(tx, userId, u.username, "last_admin_kept");
+    return from;
+  }
+  await tx.update(users).set({ role: to }).where(eq(users.id, userId));
+  await writeAudit(tx, {
+    actorType: "system",
+    action: "user.role_change",
+    targetType: "user",
+    targetId: userId,
+    sourceIp: ctx.ip,
+    details: { source: "oidc", from, to },
+  });
+  if (demotion) {
+    await revokeOtherSessions(tx, userId, ctx.keepTokenHash);
+    if (u.passwordHash !== null) await roleSyncAlert(tx, userId, u.username, "local_admin_demoted");
+  }
+  return to;
+}
+
 async function bumpIdentity(tx: Tx, identityId: string, m: MappedIdentity): Promise<void> {
   await tx
     .update(userIdentities)
@@ -90,22 +154,13 @@ export async function completeOidcLogin(
       .limit(1);
     let userId: string;
     let identityId: string;
-    let demoted = false;
     if (found) {
       if (found.disabledAt) return { ok: false, reason: "disabled", userId: found.userId };
       userId = found.userId;
       identityId = found.identityId;
       if (!cfg.skipRoleSync && found.role !== id.effectiveRole) {
-        await tx.update(users).set({ role: id.effectiveRole }).where(eq(users.id, userId));
-        await writeAudit(tx, {
-          actorType: "system",
-          action: "user.role_change",
-          targetType: "user",
-          targetId: userId,
-          sourceIp: actor.ip,
-          details: { source: "oidc", from: found.role, to: id.effectiveRole },
-        });
-        demoted = found.role === "admin";
+        // A demotion ends every existing session of the user (the new one carries the new role).
+        await syncRole(tx, userId, found.role, id.effectiveRole, { ip: actor.ip, keepTokenHash: null });
       }
       await bumpIdentity(tx, identityId, id.mapped);
     } else {
@@ -137,8 +192,6 @@ export async function completeOidcLogin(
         details: { method: "oidc", role, issuer: id.issuer, subject: id.subject },
       });
     }
-    // A demotion ends the user's other sessions (decision 9); the new one carries the new role.
-    if (demoted) await revokeOtherSessions(tx, userId, null);
     await tx.update(users).set({ lastLoginAt: sql`now()` }).where(eq(users.id, userId));
     const session = await createSession(tx as unknown as Database, userId, {
       identityId,

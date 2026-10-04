@@ -1,13 +1,14 @@
 import { and, eq, isNotNull, lt, or, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { sessions, userIdentities, users } from "@/db/schema";
+import { sessions, userIdentities } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
 import { writeAudit } from "@/server/audit";
-import { deleteSession, OIDC_REFRESH_INTERVAL_MS, revokeOtherSessions, type Session } from "@/server/auth/session";
+import { deleteSession, OIDC_REFRESH_INTERVAL_MS, type Session } from "@/server/auth/session";
 
 import { mapClaims } from "./claims";
 import { refreshTokens, withUserinfo } from "./client";
+import { syncRole } from "./service";
 import { oidcProvider } from "./runtime";
 import { decryptRefreshToken, encryptRefreshToken } from "./tokens";
 
@@ -62,18 +63,7 @@ export async function refreshOidcSession(db: Database, session: Session): Promis
       if (!mapping.ok) return end(`refresh_${mapping.reason}`);
       if (!provider.config.skipRoleSync && mapping.effectiveRole !== role) {
         const from = role;
-        role = mapping.effectiveRole;
-        await db.transaction(async (tx) => {
-          await tx.update(users).set({ role }).where(eq(users.id, session.user.id));
-          await writeAudit(tx, {
-            actorType: "system",
-            action: "user.role_change",
-            targetType: "user",
-            targetId: session.user.id,
-            details: { source: "oidc", from, to: role },
-          });
-          if (from === "admin") await revokeOtherSessions(tx, session.user.id, session.tokenHash);
-        });
+        role = await db.transaction((tx) => syncRole(tx, session.user.id, from, mapping.effectiveRole, { ip: null, keepTokenHash: session.tokenHash }));
       }
     }
     if (tokens.refreshToken !== null && tokens.refreshToken !== refreshToken) {

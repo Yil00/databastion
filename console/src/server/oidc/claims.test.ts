@@ -85,3 +85,32 @@ describe("claim mapping (ADR-0038 decision 7)", () => {
     expect(() => compileExpression("groups[")).toThrow();
   });
 });
+
+describe("JMESPath truthiness on claim objects (security review L2)", () => {
+  const keycloak = (expr: string) => cfg({ rolePath: compileExpression(expr), groupsPath: null });
+  const claims = { preferred_username: "kc", realm_access: { roles: ["offline_access", "databastion-admin"] }, resource_access: { databastion: { roles: ["viewer"] } } };
+
+  it("evaluates Keycloak-style realm_access.roles expressions with && / || / ! and filters", () => {
+    expect(mapClaims(claims, keycloak("realm_access && contains(realm_access.roles, 'databastion-admin') && 'admin' || 'analyst'"))).toMatchObject({ ok: true, effectiveRole: "admin" });
+    expect(mapClaims(claims, keycloak("contains(realm_access.roles, 'nope') && 'admin' || 'analyst'"))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    expect(mapClaims(claims, keycloak("!missing && 'analyst' || 'admin'"))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    expect(mapClaims(claims, keycloak("!realm_access && 'admin' || 'analyst'"))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    expect(mapClaims(claims, keycloak("missing || resource_access.databastion && 'analyst'"))).toMatchObject({ ok: true, effectiveRole: "analyst" });
+    expect(mapClaims(claims, keycloak("length(realm_access.roles[?@ == 'databastion-admin']) > `0` && 'admin' || 'analyst'"))).toMatchObject({ ok: true, effectiveRole: "admin" });
+    const list = { preferred_username: "kc", grants: [{ name: "databastion", role: "admin" }, { name: "other", role: "x" }] };
+    expect(mapClaims(list, keycloak("grants[?name == 'databastion'].role | [0]"))).toMatchObject({ ok: true, effectiveRole: "admin" });
+  });
+
+  it("keeps __proto__, constructor and hasOwnProperty claim keys as data, without pollution", () => {
+    const raw = JSON.parse('{"preferred_username":"kc","__proto__":{"role":"admin"},"constructor":"admin","x":{"hasOwnProperty":"admin"}}') as Record<string, unknown>;
+    expect(mapClaims(raw, keycloak("role"))).toMatchObject({ ok: false, reason: "role" });
+    expect(mapClaims(raw, keycloak("__proto__.role"))).toMatchObject({ ok: true, effectiveRole: "admin" });
+    expect(mapClaims(raw, keycloak("constructor"))).toMatchObject({ ok: true, effectiveRole: "admin" });
+    // Nothing inherited is reachable when the claim is absent.
+    expect(mapClaims({ preferred_username: "kc" }, keycloak("constructor"))).toMatchObject({ ok: false, reason: "role" });
+    expect(mapClaims({ preferred_username: "kc" }, keycloak("toString"))).toMatchObject({ ok: false, reason: "role" });
+    // A claim named hasOwnProperty makes truthiness tests on its object an error: no role.
+    expect(mapClaims(raw, keycloak("x && 'admin' || 'analyst'"))).toMatchObject({ ok: false, reason: "role" });
+    expect(({} as Record<string, unknown>).role).toBeUndefined();
+  });
+});

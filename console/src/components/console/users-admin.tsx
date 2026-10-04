@@ -22,7 +22,7 @@ export interface UserItem {
   hasPassword: boolean;
   disabledAt: string | null;
   lastLoginAt: string | null;
-  identities: { issuer: string; subject: string; email: string | null }[];
+  identities: { id: string; issuer: string; subject: string; email: string | null }[];
 }
 
 export interface PendingItem {
@@ -48,6 +48,7 @@ const ERRORS: Record<string, string> = {
   invalid_username: "Invalid username (lower-case letters, digits, '.', '_' or '-', up to 64 characters).",
   invalid_password: "The password must be 12 to 1024 characters long.",
   not_found: "Not found (already handled or expired).",
+  last_identity: "This single sign-on user has no other login method: disable the user instead.",
 };
 
 async function errorOf(res: Response | null): Promise<string> {
@@ -121,7 +122,25 @@ export function UsersAdmin({
                 <Badge variant={u.role === "admin" ? "default" : "outline"}>{u.role}</Badge>
               </TableCell>
               <TableCell className="text-sm">
-                {[u.hasPassword ? "local password" : null, ...u.identities.map((i) => `SSO ${i.subject}${i.email ? ` (${i.email})` : ""}`)].filter(Boolean).join(", ")}
+                {u.hasPassword && <div>local password</div>}
+                {u.identities.map((i) => (
+                  <div key={i.id} className="flex items-center gap-2">
+                    <span className="break-all">
+                      SSO <span className="font-mono text-xs">{i.subject}</span>
+                      {i.email ? ` (${i.email})` : ""}
+                    </span>
+                    {!(u.ssoOnly && u.identities.length === 1) && (
+                      <ConfirmDialog
+                        trigger="Unlink"
+                        title={`Unlink this identity from ${u.username}?`}
+                        description={`Subject ${i.subject} of ${i.issuer}. Its sessions end now; it can no longer sign in to this account.`}
+                        confirmLabel="Unlink"
+                        variant="destructive"
+                        onConfirm={() => call(`/api/users/${u.id}/identities/${i.id}/unlink`, "POST").then(() => undefined)}
+                      />
+                    )}
+                  </div>
+                ))}
               </TableCell>
               <TableCell>{u.lastLoginAt ?? "never"}</TableCell>
               <TableCell>{u.disabledAt ? <Badge variant="outline">disabled</Badge> : "enabled"}</TableCell>

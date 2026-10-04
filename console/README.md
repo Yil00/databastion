@@ -253,8 +253,12 @@ an administrator.
 **Identity key.** A login finds its user by (`iss`, `sub`) only (`user_identities`), never by
 e-mail or username: there is no automatic linking. A login claim equal to an existing username is
 refused (`username`), not merged. A local user links single sign-on **from their own local
-session** (Account page, "Link single sign-on"); administrators cannot link an identity to someone
-else's account, and approve pending logins only as **new** users, choosing the role. Pending
+session** (Account page, "Link single sign-on"). The link flow asks the provider for a fresh
+authentication (`prompt=login`, `max_age=0`) and refuses an `id_token` whose `auth_time` is older
+than the start of the link (60 s of skew); the Account page then shows the linked issuer and
+subject. Administrators cannot link an identity to someone else's account, but can **unlink** one
+(Users page, `user.identity_unlink`; its sessions end), except the only identity of a single sign-on
+user. They approve pending logins only as **new** users, choosing the role. Pending
 logins show the issuer and subject first and flag `email_verified: false`; they expire after 7 days
 and are capped at 1000 (the least recent attempt is evicted; evictions are counted and shown).
 
@@ -286,18 +290,37 @@ refresh token at the provider's `revocation_endpoint` (RFC 7009), and answers `2
 for RP-initiated logout (`client_id`, `logout_hint` = the subject, `post_logout_redirect_uri`) when
 the provider advertises an `end_session_endpoint` or `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` is set.
 **Residual risk**: without refresh, a user disabled at the provider keeps their console session up
-to `DATABASTION_OIDC_SESSION_MAX_AGE`.
+to `DATABASTION_OIDC_SESSION_MAX_AGE`. Refresh tokens of sessions that end otherwise (user disabled,
+demotion, unlinked identity, expired or idle sessions purged, failed refresh) are revoked at the
+provider in the background, best effort (two attempts, at most 100 per action): the local action
+never waits for the provider. After a logout the browser lands on `/login?logged_out=1`, where
+auto-login does not apply (it would sign the user straight back in).
+
+**Role sync guards** (security review L3): role sync never demotes the **last enabled
+administrator**: the role is kept, a `user.role_change` failure (`reason: last_admin`) is audited and
+the system alert `user.role_sync` (`kind: last_admin_kept`) is raised (at most once per user and
+hour). Demoting an account that also holds a local password (a break-glass administrator) raises
+`user.role_sync` (`kind: local_admin_demoted`).
+
+**Provider metadata** (discovery document) is cached for the life of the process once fetched: after
+the provider changes its endpoints or its supported algorithms, restart the console. The JWKS is
+refreshed as described above.
 
 **Rate limits** (shared by every console process, failing closed, see "Shared rate limits"):
-`/api/auth/oidc/start` (and the link start) 30 per client IP (when known) per 5 minutes; the
-callback 30 per client IP per 5 minutes; failed callbacks 300 per 5 minutes globally (beyond, every
-callback answers `429` until the window ends).
+only unfinished or failed flows count, so many users behind one NAT address are not throttled
+(security review M1). Per client IP (when known), per 5 minutes: 60 starts (`/api/auth/oidc/start`
+and the link start; a start is given back when its callback succeeds) and 30 callbacks (refunded on
+success). Globally: 300 failed callbacks per 5 minutes, counting only failures of the code exchange
+or of the `id_token` validation after a valid, unconsumed state cookie, and checked only once the
+state cookie is valid: cookie-less or forged callbacks cost their sender's per-IP budget only, so
+they cannot block single sign-on for everyone.
 
 **Audit log**: `user.login` (`details.method = oidc`), `user.login_denied` with a reason from a
 closed list (`state`, `nonce`, `iss`, `token`, `id_token`, `provider_error`, `rate_limited` (at most
 one entry a minute per process), `group`, `domain`, `email_unverified`, `role`, `sign_up`,
 `disabled`, `username`), `user.signup`, `user.pending_login_approve` / `_discard`,
 `user.identity_link` (with the session method and the issuer and subject; failures with a reason),
+`user.identity_unlink`,
 `user.role_change`, `user.create`, `user.disable`, `user.enable`. Entries reference the user id.
 Tokens, codes, the state, the nonce and raw claims are never logged nor stored (only the encrypted
 refresh token).
@@ -326,10 +349,11 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP, per username + IP, and per username (slow-down, never a lock-out; see "Brute-force protection") |
 | `POST /api/auth/logout` | Ends the session (CSRF). OIDC sessions: refresh token revoked at the provider when held, then `200 {redirect_url}` for RP-initiated logout when available; otherwise `204` |
-| `GET /api/auth/oidc/start` | OIDC only: `302` to the provider with the encrypted state cookie; rate limited per IP |
+| `GET /api/auth/oidc/start` | OIDC only: `302` to the provider with the encrypted state cookie; unfinished starts rate limited per IP |
 | `GET /api/auth/oidc/callback` | OIDC only: the provider's redirect (`query` mode); answers a same-origin page navigating to `/agents` (or a generic failure page) |
 | `POST /api/auth/oidc/link` | "Link single sign-on" (CSRF, local session only, `409 local_session_required` otherwise): `200 {redirect_url}` |
 | `GET` / `POST /api/users` | List users / create a local user `{username, password, role}` (admin, CSRF); `201 {userId}`, `409 username_taken`. Audited `user.create` |
+| `POST /api/users/{id}/identities/{identity_id}/unlink` | Unlink an OIDC identity (admin, CSRF): its sessions end; `409 last_identity` for the only identity of a single sign-on user. Audited `user.identity_unlink` |
 | `PATCH /api/users/{id}` | `{role}` or `{disabled}` (admin, CSRF). `409 self`, `409 last_admin` (the console keeps one enabled administrator), `409 role_managed_by_provider` (an SSO-bound user while role sync is on). Disabling ends the user's sessions. Audited `user.role_change` (source `user`) / `user.disable` / `user.enable` |
 | `GET /api/oidc/pending-logins` | Pending OIDC logins and the eviction count (admin) |
 | `POST` / `DELETE /api/oidc/pending-logins/{id}` | Approve as a NEW user `{role}` (`201 {userId}`; `409 username_taken`, `identity_bound`, `invalid_login`) / discard (admin, CSRF). Audited |
@@ -654,7 +678,7 @@ least N x 16 + 20 connections, plus PostgreSQL's reserved and administration con
 | Sessions (`sessions`) | token SHA-256, user, times, method (`local` / `oidc`), OIDC identity and provider `sid`; the OIDC refresh token (`DATABASTION_OIDC_USE_REFRESH_TOKEN=1` only) AES-256-GCM under the HKDF subkey `oidc-tokens.v1`, AAD = `"databastion.oidc-tokens.v1" ‖ 0x01 ‖ session token hash`. Access and ID tokens are never stored |
 | OIDC identities (`user_identities`) | (issuer, subject) of each bound identity, unique, and its display attributes (e-mail, `email_verified`, name), refreshed at each login |
 | Pending OIDC logins (`oidc_pending_logins`) | issuer, subject, mapped login, e-mail, `email_verified`, name, groups (at most 64), mapped role, attempts and times; never raw claims or tokens. At most 1000 rows, 7-day expiry; evictions counted in `meta` (`oidc.pending_logins_evicted`) |
-| Consumed OIDC states (`oidc_consumed_states`) | SHA-256 of each consumed `state`, until its cookie's expiry (insert and delete only for the runtime role, migration `0038`) |
+| Consumed OIDC states (`oidc_consumed_states`) | SHA-256 of each consumed `state`, until its cookie's expiry. Insert-only for the runtime role; expired rows are deleted only through the owner-defined `databastion_prune_oidc_consumed_states` (migration `0039`), so an unexpired record cannot be removed to replay its state |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
@@ -985,7 +1009,8 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
   `agent.integrity`, `agent.batches_dropped`, `agent.audit_stream_stopped`, `user.local_login`
   (P8-A: a local administrator logged in while OIDC is enabled; payload `user_id`, `username`,
-  `source_ip`), `channel.test`, `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `source_ip`), `user.role_sync` (P8-A: OIDC role sync kept the last administrator or demoted a
+  break-glass one; payload `user_id`, `username`, `kind`), `channel.test`, `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -1072,7 +1097,7 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   episode, one integrity alert per agent, kind and hour, one dropped-batches alert per agent and
   hour) do not bound a fleet: N misbehaving agents would send N alerts an hour to each channel.
   So all system alerts (`agent.silent`, `agent.recovered`, `agent.integrity`,
-  `agent.batches_dropped`, `agent.audit_stream_stopped`, `user.local_login`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
+  `agent.batches_dropped`, `agent.audit_stream_stopped`, `user.local_login`, `user.role_sync`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
   20) per channel and UTC clock hour, whatever the agent. It is a hard limit, shared by every
   console process: the count lives in `system_alert_budgets`, one row per (channel, hour), charged
   by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <

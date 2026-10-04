@@ -22,7 +22,8 @@ export function LogoutButton({ csrfToken }: { csrfToken: string }) {
             return;
           }
         }
-        router.replace("/login");
+        // `logged_out=1` keeps OIDC auto-login from signing the user straight back in (review L4).
+        router.replace("/login?logged_out=1");
         router.refresh();
       }}
     >

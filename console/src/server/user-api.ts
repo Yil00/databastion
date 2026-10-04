@@ -419,7 +419,8 @@ export function handleLogout(req: Request): Promise<Response> {
       subject = row?.subject ?? null;
       refreshToken = row?.enc ? decryptRefreshToken(row.enc, g.session.tokenHash) : null;
     }
-    await deleteSession(db, g.session.tokenHash);
+    // The refresh token is revoked inline below (not in the background).
+    await deleteSession(db, g.session.tokenHash, { revokeRefresh: false });
     let redirectUrl: string | null = null;
     let revoked: boolean | null = null;
     const provider = g.session.method === "oidc" ? oidcProvider() : null;

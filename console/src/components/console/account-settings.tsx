@@ -57,7 +57,19 @@ export function AccountSettings({
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3 text-sm">
-        {linked && <p role="status">Single sign-on linked: you can now sign in with {providerName ?? "single sign-on"}.</p>}
+        {linked && (
+          <p role="status">
+            Single sign-on linked
+            {identities[0] ? (
+              <>
+                {" "}
+                to the identity <span className="font-mono text-xs break-all">{identities[0].subject}</span>
+                {identities[0].email ? ` (${identities[0].email})` : ""} at <span className="font-mono text-xs break-all">{identities[0].issuer}</span>
+              </>
+            ) : null}
+            : you can now sign in with {providerName ?? "single sign-on"}. If this is not your identity, ask an administrator to unlink it.
+          </p>
+        )}
         {linkError && (
           <p role="alert" className="text-destructive">
             The single sign-on identity could not be linked (already bound to a user, session expired, or refused by the login rules).

@@ -10,6 +10,7 @@ import {
   listUsers,
   setUserDisabled,
   setUserRole,
+  unlinkIdentity,
   type AdminResult,
   type Role,
 } from "@/server/users-admin";
@@ -111,5 +112,15 @@ export function handleDiscardPendingLogin(req: Request, id: string): Promise<Res
     if (!g.ok) return g.response;
     if (!UUID.test(id)) return error(404, "not_found");
     return result(await discardPendingLogin(getDb(), id, { userId: g.session.user.id, ip: g.ip }));
+  });
+}
+
+/** `POST /api/users/:id/identities/:identityId/unlink` (admin, CSRF; audited `user.identity_unlink`). */
+export function handleUnlinkIdentity(req: Request, id: string, identityId: string): Promise<Response> {
+  return guardedUser("user.identity_unlink", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "user.identity_unlink" });
+    if (!g.ok) return g.response;
+    if (!UUID.test(id) || !UUID.test(identityId)) return error(404, "not_found");
+    return result(await unlinkIdentity(getDb(), id, identityId, { userId: g.session.user.id, ip: g.ip }));
   });
 }

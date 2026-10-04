@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
-import { lte, sql } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { oidcConsumedStates } from "@/db/schema";
@@ -134,7 +134,10 @@ export async function consumeState(db: Database, s: FlowState): Promise<boolean>
   return rows.length === 1;
 }
 
-/** Deletes expired consumed-state records (run on callbacks, bounded). */
+/**
+ * Deletes expired consumed-state records (run on callbacks, at most 1000). Through an owner-defined
+ * function (migration `0039`): the runtime role cannot delete an unexpired record.
+ */
 export async function pruneConsumedStates(db: Database): Promise<void> {
-  await db.delete(oidcConsumedStates).where(lte(oidcConsumedStates.expiresAt, sql`now()`));
+  await db.execute(sql`select public.databastion_prune_oidc_consumed_states(1000)`);
 }

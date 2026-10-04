@@ -3,10 +3,10 @@ import { and, asc, desc, eq, gt, isNull, ne, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { oidcPendingLogins, userIdentities, users } from "@/db/schema";
 import { writeAudit } from "@/server/audit";
-import { revokeAllSessions } from "@/server/auth/session";
+import { revokeAllSessions, revokeIdentitySessions } from "@/server/auth/session";
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, USERNAME } from "@/server/auth/users";
 import { argon2Hash } from "@/server/crypto";
-import { pendingEvictions } from "@/server/oidc/service";
+import { ADMIN_SET_LOCK, pendingEvictions } from "@/server/oidc/service";
 
 /**
  * User management (ADR-0038 consequences): local users, roles, disabling, and the OIDC pending
@@ -26,13 +26,13 @@ export interface UserView {
   disabledAt: string | null;
   createdAt: string;
   lastLoginAt: string | null;
-  identities: { issuer: string; subject: string; email: string | null }[];
+  identities: { id: string; issuer: string; subject: string; email: string | null }[];
 }
 
 export async function listUsers(db: Database): Promise<UserView[]> {
   const rows = await db.select().from(users).orderBy(asc(users.username)).limit(1000);
   const idents = await db
-    .select({ userId: userIdentities.userId, issuer: userIdentities.issuer, subject: userIdentities.subject, email: userIdentities.email })
+    .select({ id: userIdentities.id, userId: userIdentities.userId, issuer: userIdentities.issuer, subject: userIdentities.subject, email: userIdentities.email })
     .from(userIdentities)
     .limit(5000);
   return rows.map((u) => ({
@@ -44,7 +44,7 @@ export async function listUsers(db: Database): Promise<UserView[]> {
     disabledAt: u.disabledAt?.toISOString() ?? null,
     createdAt: u.createdAt.toISOString(),
     lastLoginAt: u.lastLoginAt?.toISOString() ?? null,
-    identities: idents.filter((i) => i.userId === u.id).map(({ issuer, subject, email }) => ({ issuer, subject, email })),
+    identities: idents.filter((i) => i.userId === u.id).map(({ id, issuer, subject, email }) => ({ id, issuer, subject, email })),
   }));
 }
 
@@ -180,9 +180,10 @@ async function otherEnabledAdmin(tx: Pick<Database, "select">, userId: string): 
 export async function setUserRole(db: Database, id: string, role: Role, actor: AdminActor, roleSyncOn: boolean): Promise<AdminResult> {
   if (id === actor.userId) return fail(409, "self");
   return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(7234039)`);
+    // Lock order everywhere: the user row, then the admin-set lock (as OIDC role sync does).
     const [u] = await tx.select({ role: users.role }).from(users).where(eq(users.id, id)).for("update");
     if (!u) return fail(404, "not_found");
+    await tx.execute(sql`select pg_advisory_xact_lock(${ADMIN_SET_LOCK})`);
     if (u.role === role) return { ok: true as const };
     if (roleSyncOn) {
       const [ident] = await tx.select({ id: userIdentities.id }).from(userIdentities).where(eq(userIdentities.userId, id)).limit(1);
@@ -208,9 +209,9 @@ export async function setUserRole(db: Database, id: string, role: Role, actor: A
 export async function setUserDisabled(db: Database, id: string, disabled: boolean, actor: AdminActor): Promise<AdminResult> {
   if (id === actor.userId) return fail(409, "self");
   return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(7234039)`);
     const [u] = await tx.select({ role: users.role, disabledAt: users.disabledAt }).from(users).where(eq(users.id, id)).for("update");
     if (!u) return fail(404, "not_found");
+    await tx.execute(sql`select pg_advisory_xact_lock(${ADMIN_SET_LOCK})`);
     if ((u.disabledAt !== null) === disabled) return { ok: true as const };
     if (disabled && u.role === "admin" && !(await otherEnabledAdmin(tx, id))) return fail(409, "last_admin");
     await tx.update(users).set({ disabledAt: disabled ? sql`now()` : null }).where(eq(users.id, id));
@@ -231,7 +232,10 @@ export async function setUserDisabled(db: Database, id: string, disabled: boolea
 export async function accountView(db: Database, userId: string): Promise<UserView | null> {
   const [u] = await db.select().from(users).where(eq(users.id, userId));
   if (!u) return null;
-  const idents = await db.select({ issuer: userIdentities.issuer, subject: userIdentities.subject, email: userIdentities.email }).from(userIdentities).where(eq(userIdentities.userId, userId));
+  const idents = await db
+    .select({ id: userIdentities.id, issuer: userIdentities.issuer, subject: userIdentities.subject, email: userIdentities.email })
+    .from(userIdentities)
+    .where(eq(userIdentities.userId, userId));
   return {
     id: u.id,
     username: u.username,
@@ -243,4 +247,32 @@ export async function accountView(db: Database, userId: string): Promise<UserVie
     lastLoginAt: u.lastLoginAt?.toISOString() ?? null,
     identities: idents,
   };
+}
+
+/**
+ * Unlinks an OIDC identity from a user (security review L1: undo a wrong self-service link). The
+ * sessions opened with that identity end (their refresh tokens are revoked in the background).
+ * Refused for the only identity of a single sign-on user (it would have no login method left).
+ */
+export async function unlinkIdentity(db: Database, userId: string, identityId: string, actor: AdminActor): Promise<AdminResult> {
+  return db.transaction(async (tx) => {
+    const [u] = await tx.select({ ssoOnly: users.ssoOnly }).from(users).where(eq(users.id, userId)).for("update");
+    if (!u) return fail(404, "not_found");
+    const idents = await tx.select({ id: userIdentities.id, issuer: userIdentities.issuer, subject: userIdentities.subject }).from(userIdentities).where(eq(userIdentities.userId, userId));
+    const ident = idents.find((i) => i.id === identityId);
+    if (!ident) return fail(404, "not_found");
+    if (u.ssoOnly && idents.length === 1) return fail(409, "last_identity");
+    await revokeIdentitySessions(tx, identityId);
+    await tx.delete(userIdentities).where(eq(userIdentities.id, identityId));
+    await writeAudit(tx, {
+      actorType: "user",
+      actorId: actor.userId,
+      action: "user.identity_unlink",
+      targetType: "user",
+      targetId: userId,
+      sourceIp: actor.ip,
+      details: { issuer: ident.issuer, subject: ident.subject },
+    });
+    return { ok: true as const };
+  });
 }

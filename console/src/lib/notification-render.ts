@@ -155,6 +155,20 @@ export interface UserLocalLoginPayload {
   source_ip: string | null;
 }
 
+/**
+ * P8-A (security review L3): OIDC role sync either refused to demote the last enabled
+ * administrator (`last_admin_kept`), or demoted an account that holds a local password, a
+ * break-glass account (`local_admin_demoted`). Console data only.
+ */
+export interface UserRoleSyncPayload {
+  event: "user.role_sync";
+  occurred_at: string;
+  url: string | null;
+  user_id: string;
+  username: string;
+  kind: "last_admin_kept" | "local_admin_demoted";
+}
+
 export interface ChannelTestPayload {
   event: "channel.test";
   occurred_at: string;
@@ -205,6 +219,7 @@ export type NotificationPayload =
   | AgentBatchesDroppedPayload
   | AgentAuditStreamStoppedPayload
   | UserLocalLoginPayload
+  | UserRoleSyncPayload
   | ChannelTestPayload;
 
 /** Webhook body: the payload plus the format version and the delivery id. */
@@ -229,6 +244,7 @@ const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
   "agent.batches_dropped": "Dropped batches",
   "agent.audit_stream_stopped": "Audit streams stopped",
   "user.local_login": "Local administrator logins",
+  "user.role_sync": "Administrator role sync",
 };
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
@@ -364,6 +380,24 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
           `The local administrator ${name} (id ${p.user_id}) logged in with a password at ${p.occurred_at}${p.source_ip ? ` from ${one(p.source_ip, 64)}` : ""}, while single sign-on is enabled.`,
           "Local administrator logins are the break-glass path (DATABASTION_LOCAL_LOGIN). If nobody expected this login, check the console audit log and change that account's password.",
         ].join("\n") + `\n${link(p.url)}${FOOTER}`,
+      };
+    }
+    case "user.role_sync": {
+      const p = payload;
+      const name = one(p.username, 64);
+      const text =
+        p.kind === "last_admin_kept"
+          ? [
+              `The identity provider no longer maps the administrator ${name} (id ${p.user_id}) to the admin role, but it is the last enabled administrator of the console: its role was kept.`,
+              "Check the role mapping (DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH) and the user's groups at the provider, or name another administrator.",
+            ]
+          : [
+              `The identity provider demoted ${name} (id ${p.user_id}) from admin to analyst. This account also holds a local password: it was a break-glass administrator.`,
+              "If the console must keep a local break-glass administrator, check the role mapping, or give that role back on the Users page with role sync off.",
+            ];
+      return {
+        subject: p.kind === "last_admin_kept" ? `[DataBastion] Last administrator kept: ${name}` : `[DataBastion] Break-glass administrator demoted: ${name}`,
+        text: text.join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
     case "system_alerts.suppressed": {

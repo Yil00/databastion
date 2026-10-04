@@ -5,6 +5,7 @@ import { and, eq, gt, lte, ne, or, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { sessions, users } from "@/db/schema";
 import { randomToken, safeEqual, sha256Hex } from "@/server/crypto";
+import { revokeRefreshTokensInBackground } from "@/server/oidc/revoke";
 import { encryptRefreshToken } from "@/server/oidc/tokens";
 
 /**
@@ -154,9 +155,17 @@ export async function loadSession(db: Database, req: Request): Promise<Session |
   return session;
 }
 
-export async function deleteSession(db: Database, tokenHash: string): Promise<void> {
-  await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash));
+/**
+ * Deletes one session. A refresh token it held is revoked at the provider in the background (best
+ * effort, security review L5) unless `revokeRefresh` is false (logout revokes it itself, inline).
+ */
+export async function deleteSession(db: Pick<Database, "delete">, tokenHash: string, opts: { revokeRefresh?: boolean } = {}): Promise<void> {
+  const rows = await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash)).returning(ENDED);
+  if (opts.revokeRefresh !== false) revokeRefreshTokensInBackground(rows);
 }
+
+/** Columns of deleted sessions needed to revoke their refresh tokens (L5). */
+const ENDED = { h: sessions.tokenHash, enc: sessions.refreshTokenEnc };
 
 /** Deletes expired and idle sessions (run on every login). */
 export async function purgeStaleSessions(db: Database): Promise<number> {
@@ -164,20 +173,28 @@ export async function purgeStaleSessions(db: Database): Promise<number> {
   const rows = await db
     .delete(sessions)
     .where(or(lte(sessions.expiresAt, sql`now()`), lte(sessions.lastSeenAt, idleLimit)))
-    .returning({ h: sessions.tokenHash });
+    .returning(ENDED);
+  revokeRefreshTokensInBackground(rows);
   return rows.length;
 }
 
 /** Ends every session of a user except `keepTokenHash` (a demotion at login or refresh, ADR-0038 decision 9). */
 export async function revokeOtherSessions(db: Pick<Database, "delete">, userId: string, keepTokenHash: string | null): Promise<number> {
   const where = keepTokenHash === null ? eq(sessions.userId, userId) : and(eq(sessions.userId, userId), ne(sessions.tokenHash, keepTokenHash));
-  const rows = await db.delete(sessions).where(where).returning({ h: sessions.tokenHash });
+  const rows = await db.delete(sessions).where(where).returning(ENDED);
+  revokeRefreshTokensInBackground(rows);
   return rows.length;
 }
 
 /** Ends every session of a user (password change, account disabled, suspected compromise). */
-export async function revokeAllSessions(db: Database, userId: string): Promise<number> {
-  const rows = await db.delete(sessions).where(eq(sessions.userId, userId)).returning({ h: sessions.tokenHash });
+export async function revokeAllSessions(db: Pick<Database, "delete">, userId: string): Promise<number> {
+  return revokeOtherSessions(db, userId, null);
+}
+
+/** Ends the sessions opened with one OIDC identity (before unlinking it). */
+export async function revokeIdentitySessions(db: Pick<Database, "delete">, identityId: string): Promise<number> {
+  const rows = await db.delete(sessions).where(eq(sessions.identityId, identityId)).returning(ENDED);
+  revokeRefreshTokensInBackground(rows);
   return rows.length;
 }
 

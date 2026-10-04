@@ -22,6 +22,7 @@ export type AuditAction =
   | "user.pending_login_approve"
   | "user.pending_login_discard"
   | "user.identity_link"
+  | "user.identity_unlink"
   | "user.role_change"
   | "enrollment_token.create"
   | "enrollment_token.revoke"

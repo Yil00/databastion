@@ -14,7 +14,8 @@ import { OidcProvider } from "./provider";
 import { handleOidcCallback, handleOidcStart, oidcCallbackPerIp, oidcFailedCallbacks, oidcStartPerIp } from "./routes";
 import { setOidcProviderForTests } from "./runtime";
 import { MAX_PENDING_LOGINS, pendingEvictions, recordPendingLogin } from "./service";
-import { handleApprovePendingLogin, handleCreateUser, handleDiscardPendingLogin, handleListPendingLogins, handleUpdateUser } from "@/server/users-api";
+import { handleApprovePendingLogin, handleCreateUser, handleDiscardPendingLogin, handleListPendingLogins, handleUnlinkIdentity, handleUpdateUser } from "@/server/users-api";
+import { settleRevocationsForTests } from "./revoke";
 import { pkceChallenge } from "./state-cookie";
 
 const ORIGIN = "http://console.test";
@@ -259,8 +260,19 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     expect(res.status).toBe(200);
     const url = new URL(((await res.json()) as { redirect_url: string }).redirect_url);
     const s: Started = { state: url.searchParams.get("state") ?? "", nonce: url.searchParams.get("nonce") ?? "", challenge: "", cookie: cookieOf(res, "databastion_oidc") };
-    fp.codes.set("link-1", { claims: idClaims(fp, "sub-carol", s.nonce, { preferred_username: "carol.sso", groups: [] }) });
-    const done = await callback(s, { code: "link-1" });
+    // Review L1: a link forces a fresh authentication at the provider.
+    expect(url.searchParams.get("prompt")).toBe("login");
+    expect(url.searchParams.get("max_age")).toBe("0");
+    const now = Math.floor(Date.now() / 1000);
+    // A reused provider session (auth_time before the link started) is refused.
+    fp.codes.set("link-0", { claims: idClaims(fp, "sub-carol", s.nonce, { preferred_username: "carol.sso", groups: [], auth_time: now - 3600 }) });
+    expect((await callback(s, { code: "link-0" })).status).toBe(400);
+    expect(await getDb().select().from(userIdentities).where(eq(userIdentities.subject, "sub-carol"))).toHaveLength(0);
+    const again = await handleOidcLink(userReq("POST", "/api/auth/oidc/link", { cookie: local.cookie, csrf: local.csrf }));
+    const url2 = new URL(((await again.json()) as { redirect_url: string }).redirect_url);
+    const s2: Started = { state: url2.searchParams.get("state") ?? "", nonce: url2.searchParams.get("nonce") ?? "", challenge: "", cookie: cookieOf(again, "databastion_oidc") };
+    fp.codes.set("link-1", { claims: idClaims(fp, "sub-carol", s2.nonce, { preferred_username: "carol.sso", groups: [], auth_time: now }) });
+    const done = await callback(s2, { code: "link-1" });
     expect(await done.text()).toContain("/account?linked=1");
     const [carol] = await getDb().select().from(users).where(eq(users.username, "carol"));
     const [ident] = await getDb().select().from(userIdentities).where(eq(userIdentities.subject, "sub-carol"));
@@ -405,19 +417,102 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     await getDb().delete(oidcPendingLogins);
   });
 
-  it("rate limits /start and the callback per client IP", async () => {
-    configure();
+  it("rate limits failed or unfinished flows per client IP, never successful ones (review M1)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1" });
     process.env.DATABASTION_TRUSTED_PROXY_HOPS = "1";
+    // A NAT office: many successful logins from one address are not throttled.
+    const nat = { "X-Forwarded-For": "192.0.2.10" };
+    for (let i = 0; i < 70; i++) {
+      const s = await start(nat);
+      fp.codes.set(`nat-${i}`, { claims: idClaims(fp, "sub-nat", s.nonce, { preferred_username: "nat", groups: [] }) });
+      expect((await callback(s, { code: `nat-${i}` }, nat)).status).toBe(200);
+    }
+    // Unfinished starts count: 60 per IP.
     const ip = { "X-Forwarded-For": "203.0.113.7" };
-    for (let i = 0; i < 30; i++) await start(ip);
-    const res = await handleOidcStart(new Request(`${ORIGIN}/api/auth/oidc/start`, { headers: ip }));
-    expect(res.status).toBe(429);
-    const other = await handleOidcStart(new Request(`${ORIGIN}/api/auth/oidc/start`, { headers: { "X-Forwarded-For": "203.0.113.8" } }));
-    expect(other.status).toBe(302);
-    oidcCallbackPerIp.clear();
+    for (let i = 0; i < 60; i++) await start(ip);
+    expect((await handleOidcStart(new Request(`${ORIGIN}/api/auth/oidc/start`, { headers: ip }))).status).toBe(429);
+    expect((await handleOidcStart(new Request(`${ORIGIN}/api/auth/oidc/start`, { headers: { "X-Forwarded-For": "203.0.113.8" } }))).status).toBe(302);
+    // Failed callbacks count: 30 per IP.
     const s = await start({ "X-Forwarded-For": "203.0.113.9" });
     for (let i = 0; i < 30; i++) await callback(s, { code: "nope" }, { "X-Forwarded-For": "198.51.100.1" });
     expect((await callback(s, { code: "nope" }, { "X-Forwarded-For": "198.51.100.1" })).status).toBe(429);
     expect(await denials("rate_limited")).toBeGreaterThanOrEqual(1);
+  });
+
+  it("cookie-less or garbage callbacks never exhaust the global budget (review M1)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1" });
+    delete process.env.DATABASTION_TRUSTED_PROXY_HOPS; // unknown client IPs: no per-IP limit
+    const junk = await start();
+    for (let i = 0; i < 320; i++) {
+      await handleOidcCallback(new Request(`${ORIGIN}/api/auth/oidc/callback?state=x${i}&code=c`));
+      if (i % 2 === 0) await handleOidcCallback(new Request(`${ORIGIN}/api/auth/oidc/callback?error=access_denied&state=${junk.state}`));
+    }
+    expect((await oidcFailedCallbacks.checkShared("global")).limited).toBe(false);
+    const ok = await oidcLogin("sub-after-flood", { preferred_username: "after.flood", groups: [] });
+    expect(ok.res.status).toBe(200);
+    // A failed code exchange after a valid state is charged to the global budget.
+    const before = await oidcFailedCallbacks.countShared("global");
+    const s = await start();
+    expect((await callback(s, { code: "unknown-code" })).status).toBe(400);
+    expect(await oidcFailedCallbacks.countShared("global")).toBe(before + 1);
+  });
+
+  it("role sync never demotes the last enabled admin, and alerts on a break-glass demotion (review L3)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1" });
+    const [ch] = await getDb().select().from(notificationChannels).where(eq(notificationChannels.slug, "ops"));
+    if (!ch) await getDb().insert(notificationChannels).values({ slug: "ops", type: "email", systemAlerts: true, config: { host: "smtp.example.com", port: 587, tls: "starttls", from: "a@example.com", recipients: ["b@example.com"], username: null } });
+    await oidcLogin("sub-kate", { preferred_username: "kate", groups: ["databastion-admins"] });
+    const [kate] = await getDb().select().from(users).where(eq(users.username, "kate"));
+    const others = await getDb().select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), sql`${users.disabledAt} is null`, sql`${users.id} <> ${kate?.id}`));
+    await getDb().update(users).set({ disabledAt: new Date() }).where(sql`${users.id} in ${others.map((o) => o.id)}`);
+    try {
+      const kept = await oidcLogin("sub-kate", { preferred_username: "kate", groups: [] });
+      expect((await sessionOf(kept.session))?.user.role).toBe("admin");
+      const [refused] = await getDb().select().from(auditLog).where(and(eq(auditLog.action, "user.role_change"), eq(auditLog.outcome, "failure")));
+      expect(refused?.details).toMatchObject({ source: "oidc", reason: "last_admin" });
+      const alerts = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.event, "user.role_sync"));
+      expect(alerts.some((a) => (a.payload as { kind?: string }).kind === "last_admin_kept")).toBe(true);
+    } finally {
+      await getDb().update(users).set({ disabledAt: null }).where(sql`${users.id} in ${others.map((o) => o.id)}`);
+    }
+    // Carol (local password, linked) made admin, then demoted by the provider: break-glass alert.
+    await getDb().update(users).set({ role: "admin", disabledAt: null }).where(eq(users.username, "carol"));
+    configure();
+    await oidcLogin("sub-carol", { preferred_username: "carol.sso", groups: [] });
+    const [carol] = await getDb().select().from(users).where(eq(users.username, "carol"));
+    expect(carol?.role).toBe("analyst");
+    const alerts = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.event, "user.role_sync"));
+    expect(alerts.some((a) => (a.payload as { kind?: string }).kind === "local_admin_demoted")).toBe(true);
+  });
+
+  it("revokes refresh tokens when sessions end other than by logout, and admins can unlink identities (reviews L5, L1)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1" });
+    process.env.DATABASTION_LOCAL_LOGIN = "enabled";
+    const admin = await localLogin("root");
+    await oidcLogin("sub-leo", { preferred_username: "leo", groups: [] }, { refreshToken: "rt-leo" });
+    const [leo] = await getDb().select().from(users).where(eq(users.username, "leo"));
+    const patch = (id: string, body: unknown) => handleUpdateUser(userReq("PATCH", `/api/users/${id}`, { cookie: admin.cookie, csrf: admin.csrf, body }), id);
+    expect((await patch(leo?.id ?? "", { disabled: true })).status).toBe(200);
+    await settleRevocationsForTests();
+    expect(fp.revoked).toContain("rt-leo");
+    // Unlink: refused for the only identity of an SSO-only user; allowed for a linked local user.
+    const [leoIdent] = await getDb().select().from(userIdentities).where(eq(userIdentities.userId, leo?.id ?? ""));
+    const unlink = (userId: string, identityId: string, csrf = admin.csrf) =>
+      handleUnlinkIdentity(userReq("POST", `/api/users/${userId}/identities/${identityId}/unlink`, { cookie: admin.cookie, csrf }), userId, identityId);
+    expect((await unlink(leo?.id ?? "", leoIdent?.id ?? "")).status).toBe(409);
+    await getDb().update(users).set({ role: "analyst" }).where(eq(users.username, "carol"));
+    const carolSso = await oidcLogin("sub-carol", { preferred_username: "carol.sso", groups: [] }, { refreshToken: "rt-carol" });
+    const [carol] = await getDb().select().from(users).where(eq(users.username, "carol"));
+    const [carolIdent] = await getDb().select().from(userIdentities).where(eq(userIdentities.userId, carol?.id ?? ""));
+    expect((await unlink(carol?.id ?? "", carolIdent?.id ?? "", "bad")).status).toBe(403);
+    expect((await unlink(carol?.id ?? "", carolIdent?.id ?? "")).status).toBe(200);
+    expect(await sessionOf(carolSso.session)).toBeNull();
+    await settleRevocationsForTests();
+    expect(fp.revoked).toContain("rt-carol");
+    const [entry] = await getDb().select().from(auditLog).where(eq(auditLog.action, "user.identity_unlink"));
+    expect(entry).toMatchObject({ targetId: carol?.id, details: { issuer: fp.issuer, subject: "sub-carol" } });
+    // The unlinked identity is now unknown: no login into Carol's account.
+    configure();
+    expect((await oidcLogin("sub-carol", { preferred_username: "carol.sso", groups: [] })).res.status).toBe(400);
   });
 });

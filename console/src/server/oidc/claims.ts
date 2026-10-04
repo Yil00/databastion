@@ -57,13 +57,32 @@ export function compileExpression(source: string): CompiledExpression {
   return { source };
 }
 
-/** Deep copy with null-prototype objects: claim names such as `__proto__` stay plain data. */
+const ownKey = Object.prototype.hasOwnProperty;
+
+/**
+ * Deep copy for evaluation. Objects have a null prototype, so claim names such as `__proto__` or
+ * `constructor` are plain own data (no prototype pollution, nothing inherited is reachable from an
+ * expression), with a non-enumerable own `hasOwnProperty`: jmespath 0.16.0 calls
+ * `obj.hasOwnProperty(key)` when testing an object's truthiness (`a && …`, `!a`, `a || …`, filters).
+ * A claim literally named `hasOwnProperty` replaces it: truthiness tests on that object then throw,
+ * which is an evaluation error (no role), never a wrong result.
+ */
 function plain(value: unknown, depth = 0): unknown {
   if (depth > 32) return null;
   if (Array.isArray(value)) return value.map((v) => plain(v, depth + 1));
   if (value !== null && typeof value === "object") {
     const out = Object.create(null) as Record<string, unknown>;
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = plain(v, depth + 1);
+    Object.defineProperty(out, "hasOwnProperty", {
+      value: function (this: object, k: PropertyKey) {
+        return ownKey.call(this, k);
+      },
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      Object.defineProperty(out, k, { value: plain(v, depth + 1), enumerable: true, writable: true, configurable: true });
+    }
     return out;
   }
   return value;
