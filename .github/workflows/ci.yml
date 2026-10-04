@@ -729,7 +729,8 @@ jobs:
       - name: Unit tests of the scenario driver
         run: timeout 120 python3 -m unittest discover -s e2e -p 'test_cas*.py' -v
       - name: Run e2e/cas.sh
-        run: timeout 2400 e2e/cas.sh
+        # Within the job budget (45 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 2280 e2e/cas.sh
       # cas.sh redacts every generated secret, every ticket of the run and every typed name of a
       # failed login from the logs on exit, whatever the result (and masks them in the job log).
       - name: Upload container logs

@@ -98,7 +98,7 @@ P="$W/secret-patterns"
 mkdir -p "$P"
 register_secret() {
   local name="$1" value="$2"
-  [ -n "$value" ] && [ "$value" != null ] || return 0
+  if [ -z "$value" ] || [ "$value" = null ]; then return 0; fi
   printf '%s\n' "$value" >"$P/$name"
   if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$value"; fi
 }
@@ -310,8 +310,13 @@ done
 casdb_sql() {
   timeout 60 docker compose "${COMPOSE_ARGS[@]}" exec -T cas-db psql -XAt -v ON_ERROR_STOP=1 -U postgres -d cas -c "$1"
 }
+# The same in read-only transactions, for the queries that only read.
+casdb_ro() {
+  timeout 60 docker compose "${COMPOSE_ARGS[@]}" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" cas-db \
+    psql -XAt -v ON_ERROR_STOP=1 -U postgres -d cas -c "$1"
+}
 deadline=$(( $(date +%s) + 180 ))
-until [ "$(casdb_sql "SELECT to_regclass('public.cas_tickets') IS NOT NULL")" = t ]; do
+until [ "$(casdb_ro "SELECT to_regclass('public.cas_tickets') IS NOT NULL")" = t ]; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "no table cas_tickets within 180 s"
   sleep 2
 done
@@ -353,8 +358,9 @@ api() {
 status_of() { head -n1 <<<"$1"; }
 body_of() { tail -n +2 <<<"$1"; }
 api_json() { printf '%s' "$3" >"$W/req.json"; api "$1" "$2" "$W/req.json"; }
+# Read-only transactions: the harness only reads the console database.
 console_sql() {
-  timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T db psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
+  timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" db psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
 }
 files_root() { timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps agent-files "$1"; }
 files_agent() {
@@ -573,7 +579,7 @@ phase_done drain
 # ------------------------------------------------------------------------------ ticket aggregate
 # The CAS store guard's only read of the JPA ticket table the workload filled (ADR-0041 decision 5):
 # a Discovery scan of the PostgreSQL target, measured as run.sh measures its scans.
-n_tickets="$(casdb_sql "SELECT count(*) FROM public.cas_tickets")"
+n_tickets="$(casdb_ro "SELECT count(*) FROM public.cas_tickets")"
 log "Discovery scan of ${DB_TARGET} (the ticket aggregate over ${n_tickets} tickets)"
 printf '{"sample_rows":200,"max_duration_s":900,"statement_timeout_ms":30000}' >"$W/scan-req.json"
 sleep 2

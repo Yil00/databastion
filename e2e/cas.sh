@@ -83,8 +83,9 @@ done
 # The CAS image is the dev service's (dev/docker-compose.yml): the same tag, built from dev/cas.
 dev_cas="$(sed -n 's/^    image: \(databastion-dev\/cas:[^ ]*\)$/\1/p' "$HERE/../dev/docker-compose.yml")"
 e2e_cas="$(sed -n 's/.*E2E_CAS_IMAGE:-\(databastion-dev\/cas:[^}]*\)}.*/\1/p' "$HERE/docker-compose.cas.yml")"
-[ -n "$dev_cas" ] && [ "$dev_cas" = "$e2e_cas" ] \
-  || fail "the CAS image of docker-compose.cas.yml must be the one of dev/docker-compose.yml"
+if [ -z "$dev_cas" ] || [ "$dev_cas" != "$e2e_cas" ]; then
+  fail "the CAS image of docker-compose.cas.yml must be the one of dev/docker-compose.yml"
+fi
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
   unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_CAS_IMAGE
 fi
@@ -113,7 +114,7 @@ NP="$E2E_WORK_DIR/name-patterns"
 mkdir -p "$P" "$TP" "$NP"
 register_secret() {
   local name="$1" value="$2"
-  [ -n "$value" ] && [ "$value" != null ] || return 0
+  if [ -z "$value" ] || [ "$value" = null ]; then return 0; fi
   printf '%s\n' "$value" >"$P/$name"
   if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$value"; fi
 }
@@ -151,7 +152,7 @@ BEGIN { if ((getline s < ENVIRON["SECRET_FILE"]) <= 0 || s == "") exit 2; rep = 
 redact_dir() {
   local dir="$1" pdir="$2" f name file tmp="$E2E_WORK_DIR/redact.tmp"
   local -a hits
-  [ -d "$dir" ] && [ -d "$pdir" ] || return 0
+  if [ ! -d "$dir" ] || [ ! -d "$pdir" ]; then return 0; fi
   for f in "$pdir"/*; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
@@ -311,13 +312,19 @@ api() {
 status_of() { head -n1 <<<"$1"; }
 body_of() { tail -n +2 <<<"$1"; }
 api_json() { printf '%s' "$3" >"$E2E_WORK_DIR/req.json"; api "$1" "$2" "$E2E_WORK_DIR/req.json"; }
+# console_sql SQL: the harness only reads the console database (read-only transactions).
 console_sql() {
-  timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T db \
+  timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" db \
     psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
 }
-# casdb_sql SQL: as the superuser of cas-db (database cas).
+# casdb_sql SQL: as the superuser of cas-db (database cas), for the grants and the guard fixtures;
+# casdb_ro SQL: the same in read-only transactions, for every query that only reads.
 casdb_sql() {
   timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T cas-db \
+    psql -XAt -v ON_ERROR_STOP=1 -U postgres -d cas -c "$1"
+}
+casdb_ro() {
+  timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" cas-db \
     psql -XAt -v ON_ERROR_STOP=1 -U postgres -d cas -c "$1"
 }
 files_root() {
@@ -398,7 +405,7 @@ done
 # CAS creates cas_tickets lazily (its ticket cleaner's first run, about 30 s after the start): no
 # login before the agent's Audit stream runs, so the trail starts with this run's actions.
 deadline=$(( $(date +%s) + TABLE_TIMEOUT_S ))
-until [ "$(casdb_sql "SELECT to_regclass('public.cas_tickets') IS NOT NULL")" = t ]; do
+until [ "$(casdb_ro "SELECT to_regclass('public.cas_tickets') IS NOT NULL")" = t ]; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "no table cas_tickets in cas-db within ${TABLE_TIMEOUT_S} s"
   sleep 2
 done
@@ -406,7 +413,7 @@ done
 casdb_sql "REVOKE ALL ON public.cas_tickets FROM PUBLIC, databastion_agent;
   GRANT SELECT (type, creation_time, expiration_time) ON public.cas_tickets TO databastion_agent" >/dev/null \
   || fail "cannot set the agent's column grants on cas_tickets"
-grants="$(casdb_sql "SELECT concat_ws(',', has_table_privilege('databastion_agent', 'public.cas_tickets', 'SELECT'),
+grants="$(casdb_ro "SELECT concat_ws(',', has_table_privilege('databastion_agent', 'public.cas_tickets', 'SELECT'),
     has_column_privilege('databastion_agent', 'public.cas_tickets', 'type', 'SELECT'),
     (SELECT count(*) FROM pg_attribute a WHERE a.attrelid = 'public.cas_tickets'::regclass AND a.attnum > 0
        AND NOT a.attisdropped AND a.attname NOT IN ('type', 'creation_time', 'expiration_time')
@@ -416,6 +423,22 @@ grants="$(casdb_sql "SELECT concat_ws(',', has_table_privilege('databastion_agen
   || fail "cannot read the grants on cas_tickets"
 [ "$grants" = "f,t,0,body+id+parent_id+principal_id+type" ] \
   || fail "unexpected cas_tickets shape or grants ($grants): the JPA mapping changed?"
+# The agent's role on cas-db: the ADR-0012 minimal variant (as run.sh checks it on target-pg),
+# CONNECT on `cas`, exactly pg_read_all_stats, the four role defaults.
+role="$(casdb_ro "SELECT concat_ws(',', rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication,
+    rolbypassrls, rolconnlimit, pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER'),
+    pg_has_role(r.oid, 'pg_monitor', 'MEMBER'), pg_has_role(r.oid, 'pg_read_all_stats', 'MEMBER'),
+    has_database_privilege(r.oid, 'cas', 'CONNECT'),
+    (SELECT string_agg(b.rolname, '+' ORDER BY b.rolname) FROM pg_auth_members m
+       JOIN pg_roles b ON b.oid = m.roleid WHERE m.member = r.oid),
+    (SELECT string_agg(c, '+' ORDER BY c COLLATE \"C\") FROM pg_db_role_setting s,
+       unnest(s.setconfig) AS c WHERE s.setrole = r.oid))
+  FROM pg_roles r WHERE rolname = 'databastion_agent'")" || fail "cannot inspect databastion_agent on cas-db"
+expected_role="t,f,f,f,f,f,5,f,f,t,t,pg_read_all_stats"
+expected_role+=",default_transaction_read_only=on+idle_in_transaction_session_timeout=60s"
+expected_role+="+lock_timeout=2s+statement_timeout=30s"
+[ "$role" = "$expected_role" ] || fail "databastion_agent on cas-db has unexpected attributes: $role"
+unset role expected_role
 # The registry and the audit log as staged (ADR-0041 decision 6): owner the CAS user (10041), group
 # the agent's (10001); directories 0750 (the log directory setgid), files 0640 with one link.
 # shellcheck disable=SC2016 # expanded by the container shell, on purpose
@@ -479,6 +502,22 @@ log "target ${CAS_TARGET}: $(jq -c '{engine, reachable, auditLevel, auditSource,
 jq -e '.auditLevel == "none"' <<<"$t" >/dev/null || fail "${CAS_TARGET}: audit level $(jq -r .auditLevel <<<"$t") before any audit record, expected none"
 [[ " $(notes_of "$t") " == *" audit.limited_pending_first_record "* ]] \
   || fail "${CAS_TARGET}: no audit.limited_pending_first_record before any audit record"
+# The agent cannot reach CAS (ADR-0041 decision 9: it never contacts CAS): CAS has no endpoint on
+# agent-net, and from the agent container's network namespace the name `cas` does not resolve and
+# CAS's address on its backend network does not answer (positive control: the same probe resolves and
+# reaches cas-db, the agent's PostgreSQL target).
+cas_cid="$(compose ps -q cas)"
+docker inspect "$cas_cid" --format '{{json .NetworkSettings.Networks}}' \
+  | jq -e --arg n "${PROJECT}_agent-net" 'has($n) | not' >/dev/null || fail "CAS has an endpoint on agent-net"
+cas_ip="$(docker inspect "$cas_cid" --format '{{json .NetworkSettings.Networks}}' | jq -r --arg n "${PROJECT}_cas-backend" '.[$n].IPAddress')"
+[[ "$cas_ip" =~ ^[0-9.]+$ ]] || fail "no address of CAS on cas-backend"
+reach="$(timeout 60 docker run --rm --network "container:$(compose ps -q agent)" --cap-drop ALL \
+  busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e sh -c \
+  "nslookup cas-db >/dev/null 2>&1 && nc -w 3 cas-db 5432 </dev/null >/dev/null 2>&1 || echo control-failed
+   if nslookup cas >/dev/null 2>&1; then echo resolves; fi; if nc -w 3 $cas_ip 8080 </dev/null >/dev/null 2>&1; then echo connects; fi; echo probed")" \
+  || fail "cannot run the reachability probe in the agent's network namespace"
+[ "$reach" = probed ] || fail "from the agent's network namespace, CAS $(tr '\n' ' ' <<<"$reach")"
+log "the agent cannot resolve nor reach CAS (no agent-net endpoint, ${cas_ip}:8080 unreachable from its namespace)"
 log "target ${DB_TARGET}: $(target_json "$DB_TARGET" | jq -c '{engine, reachable, auditLevel, notes: [.notes[]?.code]}')"
 phase_done enroll
 
@@ -595,7 +634,7 @@ scan() {
     case "$spool" in
       t,0,0,0,*) break ;;
       t,*,*,*,*) IFS=, read -r _ _ db di _ <<<"$spool"
-        [ "$db" = 0 ] && [ "$di" = 0 ] || fail "the agent dropped results ($spool)" ;;
+        if [ "$db" != 0 ] || [ "$di" != 0 ]; then fail "the agent dropped results ($spool)"; fi ;;
     esac
     [ "$(date +%s)" -lt "$deadline" ] || fail "no heartbeat with an empty spool within ${SPOOL_TIMEOUT_S} s after the scans ('$spool')"
     sleep 2
@@ -693,8 +732,10 @@ while :; do
 done
 log "Audit: connect ${n_conn} (fingerprinted) + ${n_clear} (${CLEAR_PRINCIPAL}), reads of ${SERVICE_NAME} ${n_read}, auth_failure ${n_fail} own + ${n_star} in '*', incidents: reads ${n_inc_r}, stuffing ${n_inc_s} ($(( $(date +%s) - T_TRAFFIC )) s after the traffic)"
 # Exact counts once everything is in: nothing lost, nothing counted twice.
-[ "$n_conn" = "$N_LOGINS" ] && [ "$n_clear" = 1 ] && [ "$n_read" = "$N_ST" ] \
-  && [ $(( n_fail + n_star )) = "$FAILURES" ] || fail "Audit: event counts differ from the traffic ($st)"
+if ! { [ "$n_conn" = "$N_LOGINS" ] && [ "$n_clear" = 1 ] && [ "$n_read" = "$N_ST" ] \
+    && [ $(( n_fail + n_star )) = "$FAILURES" ]; }; then
+  fail "Audit: event counts differ from the traffic ($st)"
+fi
 # The 16th distinct name carries the signal; the aggregate's principal is `*` (ADR-0041 decision 7).
 [ "$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${CAS_TARGET}'
     AND action = 'auth_failure' AND db_user_fingerprint IS NOT NULL AND signals ? 'volume.failed_logins_many_accounts'")" -ge 1 ] \
@@ -750,10 +791,11 @@ phase_done audit
 # Real JPA table, tickets encrypted (CAS 8.0 default), column grants only.
 guard_notes() { notes_of "$(target_json "$DB_TARGET")"; }
 log "CAS store guard (${DB_TARGET}): the JPA table cas_tickets, tickets encrypted, column grants only"
-rows="$(casdb_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE type ILIKE '%encoded%') FROM public.cas_tickets")"
+rows="$(casdb_ro "SELECT count(*) || ',' || count(*) FILTER (WHERE type ILIKE '%encoded%') FROM public.cas_tickets")"
 IFS=, read -r n_rows n_encoded <<<"$rows"
-[ "$n_rows" -gt 0 ] && [ "$n_rows" = "$n_encoded" ] \
-  || fail "cas_tickets: $n_rows row(s), $n_encoded encoded: expected encoded tickets only (crypto on)"
+if ! { [ "$n_rows" -gt 0 ] && [ "$n_rows" = "$n_encoded" ]; }; then
+  fail "cas_tickets: $n_rows row(s), $n_encoded encoded: expected encoded tickets only (crypto on)"
+fi
 line="$(timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color agent 2>/dev/null \
   | grep -F 'CAS ticket registry: metadata only' | grep -F "\"target_id\":\"${DB_TARGET}\"" | tail -n 1)"
 [ -n "$line" ] || fail "${DB_TARGET}: no 'CAS ticket registry: metadata only' line in the agent log"
@@ -814,11 +856,10 @@ out="$(scenario logins --password-file "$S/cas_user_password" "${user_args[@]}" 
 timeout 30 docker compose "${COMPOSE_ARGS[@]}" exec -T cas-db psql -XAq -v ON_ERROR_STOP=1 -U postgres -d cas \
   <"$E2E_WORK_DIR/guard.sql" >/dev/null || fail "cannot create the renamed copy and the tripwire table"
 rm -f -- "$E2E_WORK_DIR/guard.sql"
-rows="$(casdb_sql "SELECT count(*) || ',' || count(*) FILTER (WHERE type ILIKE '%encoded%') || ',' ||
+rows="$(casdb_ro "SELECT count(*) || ',' || count(*) FILTER (WHERE type ILIKE '%encoded%') || ',' ||
     count(*) FILTER (WHERE id LIKE 'TGT-%') || ',' || count(*) FILTER (WHERE id LIKE 'ST-%') FROM public.sso_archive")"
 IFS=, read -r n_rows n_encoded n_tgt n_st <<<"$rows"
-[ "$n_encoded" = 0 ] && [ "$n_tgt" -ge "${#USERS[@]}" ] && [ "$n_st" -ge "${#USERS[@]}" ] \
-  || fail "the copy of cas_tickets: $n_rows row(s), $n_encoded encoded, $n_tgt TGT, $n_st ST: expected clear tickets of every login"
+if ! { [ "$n_encoded" = 0 ] && [ "$n_tgt" -ge "${#USERS[@]}" ] && [ "$n_st" -ge "${#USERS[@]}" ]; }; then fail "the copy of cas_tickets: $n_rows row(s), $n_encoded encoded, $n_tgt TGT, $n_st ST: expected clear tickets of every login"; fi
 # The run's ticket-granting tickets (in clear in the table now): ticket ids of the run too, searched
 # with the service tickets (never printed).
 i=0
@@ -828,14 +869,14 @@ while IFS= read -r id; do
   printf '%s' "$id" | sha256sum | cut -d' ' -f1 >"$TP/tgt_${i}_sha256"
   printf '%s' "$id" | sha512sum | cut -d' ' -f1 >"$TP/tgt_${i}_sha512"
   i=$((i + 1))
-done < <(casdb_sql "SELECT id FROM public.sso_archive WHERE id LIKE 'TGT-%'")
+done < <(casdb_ro "SELECT id FROM public.sso_archive WHERE id LIKE 'TGT-%'")
 mask_dir "$TP"
 # Positive control of the ticket scans: the copy holds service tickets of the run.
-casdb_sql "COPY (SELECT id FROM public.sso_archive) TO STDOUT" >"$E2E_WORK_DIR/tickets-control.txt"
+casdb_ro "COPY (SELECT id FROM public.sso_archive) TO STDOUT" >"$E2E_WORK_DIR/tickets-control.txt"
 grep -c . "$E2E_WORK_DIR/tickets-control.txt" >/dev/null || fail "empty ticket copy"
 leak_scan "$E2E_WORK_DIR/tickets-control.txt" "$TP" >/dev/null \
   && fail "ticket scan positive control: no ticket of the run found in the copy of cas_tickets"
-rm -f -- "$E2E_WORK_DIR/tickets-control.txt"
+# (kept: the positive control of the ticket-shape scan, below)
 scan "$DB_TARGET"
 deadline=$(( $(date +%s) + 90 ))
 while :; do
@@ -888,6 +929,11 @@ fetch_page events /events
 fetch_page incidents "/incidents?status=all"
 fetch_page agent "/agents/${AGENT_ID}"
 fetch_page api-agents /api/agents
+# Positive controls of the page scans: the pages show what the run did.
+for page in events incidents; do
+  grep -qF "$CLEAR_PRINCIPAL" "$D/pages/$page.html" || fail "the $page page does not list ${CLEAR_PRINCIPAL} (page scan control)"
+done
+grep -qF "$CAS_TARGET" "$D/pages/findings.html" || fail "the findings page does not name ${CAS_TARGET} (page scan control)"
 # The agent's state volume (spool, audit cursors and settings, identity), read as the agent.
 files_agent 'tar -C /state -cf - .' >"$D/state.tar" || fail "cannot read the agent's state"
 tar -C "$D/state" -xf "$D/state.tar" && rm -f "$D/state.tar"
@@ -962,7 +1008,43 @@ if ! leaked="$(leak_scan "$E2E_LOG_DIR" "$P")"; then
   while IFS= read -r l; do log "LEAK (CAS-side logs): $l"; done <<<"$leaked"
   leaks=1
 fi
+# Ticket ids by shape (as oidc.sh scans for JWTs): any ticket of the run, including those never
+# seen on the wire (the ticket-granting tickets of the encrypted phase), in the console database, the
+# exports, the pages, the agent's state and the non-CAS logs. Positive control: the ids of the copy
+# of the ticket table (clear tickets of the run).
+TICKET_SHAPE='\b(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)-[0-9]+-[A-Za-z0-9._-]{8,}'
+LC_ALL=C grep -qE "$TICKET_SHAPE" "$E2E_WORK_DIR/tickets-control.txt" \
+  || fail "ticket-shape scan positive control: no ticket shape in the copy of cas_tickets"
+shaped="$(LC_ALL=C grep -rlE "$TICKET_SHAPE" -- "$D" "$E2E_WORK_DIR/scan-logs" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ' || true)"
+if [ -n "$shaped" ]; then
+  log "LEAK: ticket-shaped value(s) in: $shaped"
+  leaks=1
+fi
+rm -f -- "$E2E_WORK_DIR/tickets-control.txt"
 rm -rf -- "$E2E_WORK_DIR/scan-logs"
+# The CAS audit trail (and its rotations) as it stands at the end: every ticket-shaped token in it is
+# a ticket of the run, registered and searched like the others (the trail masks ticket ids, so none
+# is expected: CAS's audit appender writes masked ids, the reason the exact ticket scans above take
+# their values from the scenario and from the ticket table's copy instead). Positive control of the
+# typed-name scans: every typed name is in the trail.
+cas_files 0:0 'cat /state/logs/cas/cas_audit*.log' >"$E2E_WORK_DIR/cas-audit.log" || fail "cannot read the CAS audit log"
+i=0
+while IFS= read -r id; do
+  printf '%s\n' "$id" >"$TP/trail_$i"
+  i=$((i + 1))
+done < <(LC_ALL=C grep -ohE "$TICKET_SHAPE" "$E2E_WORK_DIR/cas-audit.log" | sort -u)
+mask_dir "$TP"
+if [ "$i" -gt 0 ]; then
+  for pdir in "$D" "$E2E_LOG_DIR"; do
+    leaked="$(leak_scan "$pdir" "$TP" | grep '^trail_' | grep -vE ': (cas|cas-encrypted-tickets|cas-db|cas-files)\.log $' || true)"
+    if [ -n "$leaked" ]; then log "LEAK: $leaked"; leaks=1; fi
+  done
+fi
+n_trail_tp="$(for f in "$TP"/st_* "$TP"/tgt_*; do case "$f" in *_sha*) ;; *) LC_ALL=C grep -qFf "$f" "$E2E_WORK_DIR/cas-audit.log" && echo x ;; esac; done | wc -l)"
+for f in "$NP"/*; do
+  LC_ALL=C grep -qFf "$f" "$E2E_WORK_DIR/cas-audit.log" || fail "typed-name scan positive control: $(basename "$f") not in the CAS audit trail"
+done
+log "I2: CAS audit trail: every typed name present (scan control), ${i} ticket-shaped token(s), ${n_trail_tp} ticket(s) of the run in clear"
 log "I2: $(find "$TP" -type f | wc -l) ticket value(s), $(find "$NP" -type f | wc -l) typed name(s), $(find "$P" -type f | wc -l) secret(s) searched"
 rm -rf -- "$D" "$E2E_WORK_DIR/cas-audit.log"
 [ "$i2_failed" = 0 ] || fail "invariant I2: ground-truth value(s) of the cas engine in clear text (ids above)"

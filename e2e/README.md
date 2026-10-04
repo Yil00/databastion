@@ -456,8 +456,8 @@ minutes and an external dependency to the required `e2e` job.
 
 | Service | Image | Role |
 |---------|-------|------|
-| `cas` | [`dev/cas`](../dev/cas/Dockerfile) (CAS 8.0.2 overlay: JSON service registry, OIDC, JPA ticket registry) | The dev service's image and configuration ([`cas.properties`](../dev/cas/config/cas.properties), [`log4j2.xml`](../dev/cas/config/log4j2.xml), mounted read-only): static users, the JSON audit trail to `/var/log/cas/cas_audit.log`, tickets encrypted by default. Plain HTTP published on `127.0.0.1:${E2E_CAS_PORT:-8281}` only (the agent never contacts CAS, ADR-0041 decision 9). The users' and database passwords are Docker secrets that a wrapper exports for the CAS process only (`cas.sh` checks that no password is in the container's environment). On `agent-net` (its database) and `cas-net` (the published port) |
-| `cas-db` | PostgreSQL 17 (pinned) | The JPA ticket registry's database `cas` (owner `cas`, network alias `postgres` as in the dev JDBC URL), and the agent's PostgreSQL target `casdb-e2e`: [`target-initdb/01-agent-role.sh`](target-initdb/01-agent-role.sh) (the ADR-0012 minimal role) and [`40-cas.sh`](target-initdb/40-cas.sh) (the role `cas`, `USAGE` on `public` for the agent, no `PUBLIC` access); once CAS created `cas_tickets`, `cas.sh` grants the agent `SELECT (type, creation_time, expiration_time)` only (ADR-0041 decision 6) and checks the table's shape and grants |
+| `cas` | [`dev/cas`](../dev/cas/Dockerfile) (CAS 8.0.2 overlay: JSON service registry, OIDC, JPA ticket registry) | The dev service's image and configuration ([`cas.properties`](../dev/cas/config/cas.properties), [`log4j2.xml`](../dev/cas/config/log4j2.xml), mounted read-only): static users, the JSON audit trail to `/var/log/cas/cas_audit.log`, tickets encrypted by default. Plain HTTP published on `127.0.0.1:${E2E_CAS_PORT:-8281}` only (the agent never contacts CAS, ADR-0041 decision 9). The users' and database passwords are Docker secrets that a wrapper exports for the CAS process only (`cas.sh` checks that no password is in the container's environment). On `cas-backend` (internal, its database only) and `cas-net` (the published port), never on `agent-net`: `cas.sh` checks that CAS has no `agent-net` endpoint and that, from the agent container's network namespace, `cas` does not resolve and CAS's address does not answer |
+| `cas-db` | PostgreSQL 17 (pinned) | The JPA ticket registry's database `cas` (owner `cas`, network alias `postgres` on `cas-backend` as in the dev JDBC URL), and the agent's PostgreSQL target `casdb-e2e` (`cas-db` on `agent-net`): the agent's role is checked against the ADR-0012 attributes and role settings as in `run.sh`; [`target-initdb/01-agent-role.sh`](target-initdb/01-agent-role.sh) (the ADR-0012 minimal role) and [`40-cas.sh`](target-initdb/40-cas.sh) (the role `cas`, `USAGE` on `public` for the agent, no `PUBLIC` access); once CAS created `cas_tickets`, `cas.sh` grants the agent `SELECT (type, creation_time, expiration_time)` only (ADR-0041 decision 6) and checks the table's shape and grants |
 | `cas-files` | busybox (pinned) | One-shot, no network: [`dev/cas/files-init.sh`](../dev/cas/files-init.sh) on the volumes `cas-registry` (the definitions of [`dev/cas/services`](../dev/cas/services), directory `0750`, files `0640`) and `cas-log` (directory `2750`, the log `0640`), owner the CAS user (10041), group the agent's (10001). CAS mounts them without the image's copy-up (`nocopy`), the agent read-only at `/srv/cas/services` and `/var/log/cas`: nothing it could write, no symlink (ADR-0041 decision 3, [ADR-0043](../docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)); `cas.sh` checks every mode, owner and link count |
 | `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Targets `cas-e2e` (`engine: cas`, `json_dir`, `audit_log`, `clear_principals: [svc-monitoring]`, client addresses `truncated` by default) and `casdb-e2e` (`databases: [cas]`, the CAS store guard on by default) |
 
@@ -510,8 +510,18 @@ uses a fresh cookie jar (no SSO reuse).
    `cas-db` (the target side). No service ticket, ticket-granting ticket, ticket-granting cookie,
    nor SHA-256 / SHA-512 of a ticket, no typed name of a failed login, no password (typed or
    generated) in the same places (positive control: the copy of the ticket table holds tickets of the
-   run); no generated secret in any log, CAS's included. CAS logs the typed names itself: they are
-   redacted from the kept logs like the secrets.
+   run); no generated secret in any log, CAS's included. Also by shape, as `oidc.sh` scans for JWTs:
+   no `(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)-<digits>-<8+ characters>` value in the same places,
+   which covers the tickets never seen on the wire (the ticket-granting tickets of the encrypted
+   phase); positive control: the ids of the ticket table's copy. The pages' scans have their own
+   controls (the events and incidents pages list `svc-monitoring`, the findings page names
+   `cas-e2e`). At the end the CAS audit trail (rotations included) is read again: every typed name
+   must be in it (the control of the typed-name scans), and every ticket-shaped token in it is
+   registered and searched like the run's tickets. CAS's audit appender masks ticket ids (dev's
+   `make dev-cas-smoke` checks it), so the exact ticket values come from the scenario's redirects
+   and the table's copy; their absence is proven by those exact scans and the shape scan. CAS logs
+   the typed names itself: they are redacted from the kept logs like the secrets. The harness reads
+   the console database and, but for its fixtures, the CAS database in read-only transactions.
 
 ```sh
 e2e/cas.sh                         # builds the console, agent and CAS images first

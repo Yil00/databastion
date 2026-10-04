@@ -12,7 +12,8 @@
 #              the CAS process only (never in the container's environment, so never in
 #              `docker inspect`).
 #   cas-db     the JPA ticket registry's PostgreSQL (database `cas`, owner `cas`), network alias
-#              `postgres` (the JDBC URL of dev's cas.properties). Also the agent's PostgreSQL target
+#              `postgres` on the internal cas-backend network shared with CAS only (the JDBC URL of
+#              dev's cas.properties). Also the agent's PostgreSQL target
 #              `casdb-e2e` for the CAS store guard (ADR-0041 decisions 5 and 6): the agent's role
 #              (target-initdb/01-agent-role.sh) gets the column grants on `cas_tickets` from cas.sh
 #              once CAS created the table.
@@ -42,8 +43,10 @@ services:
     # pg_stat_statements: the agent role's own statements (not asserted here; the PostgreSQL
     # connector's check() reads it when present).
     command: [postgres, -c, shared_preload_libraries=pg_stat_statements]
+    # agent-net: the agent's PostgreSQL target (`cas-db`); cas-backend: CAS's JDBC URL (`postgres`).
     networks:
-      agent-net:
+      agent-net: {}
+      cas-backend:
         aliases: [postgres]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d cas"]
@@ -101,9 +104,10 @@ services:
       - {type: volume, source: cas-log, target: /var/log/cas, volume: {nocopy: true}}
     ports:
       - "127.0.0.1:${E2E_CAS_PORT:-8281}:8080"
-    # agent-net: the ticket registry's database (cas-db); cas-net: the published port (an internal
-    # network cannot publish one).
-    networks: [agent-net, cas-net]
+    # cas-backend (internal): the ticket registry's database only; cas-net: the published port (an
+    # internal network cannot publish one). Never on agent-net: the agent cannot reach CAS
+    # (cas.sh checks it from the agent's network namespace).
+    networks: [cas-backend, cas-net]
     depends_on:
       cas-db:
         condition: service_healthy
@@ -147,6 +151,8 @@ services:
       - agent-secrets:/secrets
 
 networks:
+  cas-backend:
+    internal: true
   cas-net: {}
 
 volumes:

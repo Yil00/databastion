@@ -109,7 +109,8 @@ jobs:
           echo "CPUs: $(nproc)"; free -m | head -n 2
           stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
       - name: Run e2e/load/cas.sh
-        run: e2e/load/cas.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 3300 e2e/load/cas.sh
       # Counters, timings and latencies only (run.sh's format): no ticket, no secret (cas.sh redacts
       # every generated secret from its outputs on exit, whatever the result).
       - name: Upload results
