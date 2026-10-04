@@ -14,6 +14,8 @@ export interface FakeCode {
   /** PKCE verifier the token request must present (checked as S256 by the test via `seen`). */
   refreshToken?: string;
   noIdToken?: boolean;
+  /** Userinfo claims served for the access token of this answer (default: `claims`). */
+  userinfo?: Record<string, unknown>;
   /** Overrides of the signed `id_token` (header / signing key). */
   sign?: (claims: Record<string, unknown>) => Promise<string>;
 }
@@ -34,6 +36,8 @@ export interface FakeProvider {
   hits: Record<string, number>;
   tokenRequests: { form: URLSearchParams; authorization: string | undefined }[];
   revoked: string[];
+  /** Userinfo claims per issued access token. */
+  userinfo: Map<string, Record<string, unknown>>;
   signIdToken(claims: Record<string, unknown>, header?: Record<string, unknown>, key?: CryptoKey): Promise<string>;
   close(): Promise<void>;
 }
@@ -80,6 +84,7 @@ export async function startFakeProvider(opts: { clientId?: string; clientSecret?
     hits: {},
     tokenRequests: [],
     revoked: [],
+    userinfo: new Map(),
     async signIdToken(claims, header = {}, key = privateKey) {
       return new SignJWT(claims).setProtectedHeader({ alg: "RS256", kid: rsKid, ...header } as { alg: string }).sign(key);
     },
@@ -91,7 +96,9 @@ export async function startFakeProvider(opts: { clientId?: string; clientSecret?
   };
   const tokenAnswer = async (c: FakeCode) => {
     const idToken = c.noIdToken ? undefined : c.sign ? await c.sign(c.claims) : await fp.signIdToken(c.claims);
-    return { token_type: "Bearer", access_token: `at-${Math.random()}`, expires_in: 300, ...(idToken ? { id_token: idToken } : {}), ...(c.refreshToken ? { refresh_token: c.refreshToken } : {}) };
+    const accessToken = `at-${Math.random()}`;
+    fp.userinfo.set(accessToken, c.userinfo ?? c.claims);
+    return { token_type: "Bearer", access_token: accessToken, expires_in: 300, ...(idToken ? { id_token: idToken } : {}), ...(c.refreshToken ? { refresh_token: c.refreshToken } : {}) };
   };
   server.on("request", (req, res) => {
     void (async () => {
@@ -117,6 +124,10 @@ export async function startFakeProvider(opts: { clientId?: string; clientSecret?
           return send(res, 200, await tokenAnswer(c));
         }
         return send(res, 400, { error: "unsupported_grant_type" });
+      }
+      if (path === "/userinfo") {
+        const info = fp.userinfo.get((req.headers.authorization ?? "").replace(/^Bearer /, ""));
+        return info ? send(res, 200, info) : send(res, 401, { error: "invalid_token" });
       }
       if (path === "/revoke" && req.method === "POST") {
         const form = new URLSearchParams(await body(req));

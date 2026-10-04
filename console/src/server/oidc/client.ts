@@ -109,6 +109,16 @@ export async function checkIdToken(p: OidcProvider, md: ProviderMetadata, idToke
  */
 export async function withUserinfo(p: OidcProvider, md: ProviderMetadata, claims: IdTokenClaims, accessToken: string | null): Promise<Record<string, unknown>> {
   if (!p.config.useUserinfo) return claims;
+  const info = await fetchUserinfo(p, md, accessToken);
+  if (info.sub !== claims.sub) throw new OidcFlowError("id_token");
+  return { ...info, ...claims };
+}
+
+/**
+ * Userinfo claims (same fetcher as every provider call: no redirect, 5 s, 64 KiB cap, TLS rules).
+ * The caller binds them to a subject: their `sub` is not checked here.
+ */
+export async function fetchUserinfo(p: OidcProvider, md: ProviderMetadata, accessToken: string | null): Promise<Record<string, unknown>> {
   if (md.userinfoEndpoint === null || accessToken === null) throw new OidcFlowError("token");
   let json: unknown;
   try {
@@ -117,9 +127,7 @@ export async function withUserinfo(p: OidcProvider, md: ProviderMetadata, claims
     throw new OidcFlowError("token");
   }
   if (json === null || typeof json !== "object" || Array.isArray(json)) throw new OidcFlowError("token");
-  const info = json as Record<string, unknown>;
-  if (info.sub !== claims.sub) throw new OidcFlowError("id_token");
-  return { ...info, ...claims };
+  return json as Record<string, unknown>;
 }
 
 /** Refresh grant. A refreshed `id_token`, when returned, is validated (no nonce, same `sub`). */

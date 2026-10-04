@@ -171,7 +171,8 @@ Order: phase 8, then phases 9 and 10 (engines), phase 11 (platform) and phase 12
 - [ ] `connector-cas`: YAML service registries (`yaml_dir`, refused today), with a pre-scanner that refuses anchors and aliases before parsing (`agent-engineer`)
 - [ ] CAS Audit: map the OIDC / OAuth token issuance actions after verifying their names against CAS 8.0; until then an OIDC / OAuth-only CAS deployment stays Limited ([08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas)) (`agent-engineer`)
 - [ ] CAS store guard: verify against CAS 8.0 the MongoDB built-in collection names and the `PGTIOU`, `CT` and `TST` ticket prefixes (`agent-engineer`)
-- [ ] CI: add the `e2e-oidc` job to the required `CI result` check once it has run green on `dev` (`agent-engineer`)
+- [ ] CI: add the `e2e-oidc` and `e2e-cas` jobs to the required `CI result` check once each has run green on `dev` (`agent-engineer`)
+- [ ] **0.4.0 release gate** (maintainer decision): acceptance of [ADR-0039](adr/0039-engine-scope-expansion.md) decision 8 (new engines as capability tokens, `ConnectorList.maxItems` widened under negotiation), which phase 8 already applies to `cas` (P8-C, #137) while the ADR is still Proposed (maintainer)
 - [ ] Protocol: register `privilege.not_evaluated` for `postgres` in `target-notes.json`; the PostgreSQL store guard reports an incomplete evaluation as `check.stage_failed` (label `stage_check`) meanwhile (`agent-engineer`, `security-reviewer` review)
 - [x] [05-security.md](05-security.md#apereo-cas-connector): recommended CAS file permissions and CAS table column grants (docs/p8-f-phase8-docs)
 

@@ -31,6 +31,15 @@ export function oidcProvider(): OidcProvider | null {
   return state.provider;
 }
 
+/**
+ * Role sync is on when OIDC maps roles (a role expression is set) and `SKIP_ROLE_SYNC` is off
+ * (ADR-0038 decision 9; `skipRoleSync` is already true without a role expression).
+ */
+export function oidcRoleSyncOn(): boolean {
+  const p = oidcProvider();
+  return p !== null && !p.config.skipRoleSync;
+}
+
 /** Test hook: replaces (or resets with `undefined`) the process-wide provider. */
 export function setOidcProviderForTests(p: OidcProvider | null | undefined): void {
   state.built = p !== undefined;

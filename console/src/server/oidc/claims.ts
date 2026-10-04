@@ -47,6 +47,7 @@ export interface CompiledExpression {
 
 interface JmesPathModule {
   compile(expression: string): unknown;
+  tokenize(expression: string): { type: string; value: unknown }[];
   search(data: unknown, expression: string): unknown;
 }
 const jp = jmespath as unknown as JmesPathModule;
@@ -132,6 +133,84 @@ function oneLine(v: string, max: number): string | null {
   return clean === "" || clean.length > max ? null : clean;
 }
 
+/**
+ * The groups claim validated for authorization: an array of strings (non-string entries dropped),
+ * at most {@link MAX_GROUPS} entries of at most {@link MAX_GROUP_LENGTH} characters (`"too_large"`
+ * otherwise); an absent claim is an empty list. Any other value, a string in particular, is
+ * `null`: it is never used for authorization (JMESPath `contains()` on a string is a substring
+ * test, so `"x-databastion-admins-y"` would match `databastion-admins`).
+ */
+function validateGroups(g: unknown): string[] | null | "too_large" {
+  if (g === undefined || g === null) return [];
+  if (!Array.isArray(g)) return null;
+  const strings = g.filter((x): x is string => typeof x === "string");
+  if (strings.length > MAX_GROUPS || strings.some((x) => x.length > MAX_GROUP_LENGTH)) return "too_large";
+  return strings;
+}
+
+/** A plain field path (`groups`, `realm_access.roles`, `resource_access."my-client".roles`), optionally ending in `[*]` or `[]`. */
+export function plainPath(source: string): string[] | null {
+  const trimmed = source.trim().replace(/\[\*?\]$/, "");
+  const segments: string[] = [];
+  let rest = trimmed;
+  while (rest.length > 0) {
+    const m = /^(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\\]*")/.exec(rest);
+    if (!m) return null;
+    segments.push(m[0].startsWith('"') ? m[0].slice(1, -1) : m[0]);
+    rest = rest.slice(m[0].length);
+    if (rest.length === 0) break;
+    if (!rest.startsWith(".")) return null;
+    rest = rest.slice(1);
+    if (rest.length === 0) return null;
+  }
+  return segments.length > 0 ? segments : null;
+}
+
+/**
+ * Whether `expr` reads a field named `groups` that is not reached through a dot (the top-level
+ * name the role expression sees as the validated groups list). Used for a startup warning only.
+ */
+export function readsTopLevelGroups(expr: CompiledExpression): boolean {
+  let tokens: { type: string; value: unknown }[];
+  try {
+    tokens = jp.tokenize(expr.source);
+  } catch {
+    return false;
+  }
+  return tokens.some((t, i) => (t.type === "UnquotedIdentifier" || t.type === "QuotedIdentifier") && t.value === "groups" && tokens[i - 1]?.type !== "Dot");
+}
+
+/** Whether `GROUPS_ATTRIBUTE_PATH` is the top-level `groups` claim itself (`groups`, `groups[*]`). */
+export function groupsPathIsGroups(groupsPath: CompiledExpression): boolean {
+  const p = plainPath(groupsPath.source);
+  return p !== null && p.length === 1 && p[0] === "groups";
+}
+
+function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * Document the role expression runs on (end-of-phase-8 review L5): the claims, with the groups
+ * replaced by their validated value (`null` when invalid) under the top-level name `groups` and,
+ * when `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH` is a plain field path, at that path too. A string
+ * groups claim can therefore never reach `contains()` as a substring test.
+ */
+function roleDocument(claims: unknown, groupsPath: CompiledExpression | null, roleGroups: string[] | null): unknown {
+  const doc = plain(claims) as Record<string, unknown>;
+  const value = () => plain(roleGroups);
+  setOwn(doc, "groups", value());
+  const path = groupsPath === null ? null : plainPath(groupsPath.source);
+  if (path !== null) {
+    let obj: unknown = doc;
+    for (const seg of path.slice(0, -1)) {
+      obj = obj !== null && typeof obj === "object" && !Array.isArray(obj) && ownKey.call(obj, seg) ? (obj as Record<string, unknown>)[seg] : undefined;
+    }
+    if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) setOwn(obj as Record<string, unknown>, path[path.length - 1] as string, value());
+  }
+  return doc;
+}
+
 /** `admin` or `analyst` exactly (case-sensitive); anything else, including errors, is no role. */
 export function toRole(v: unknown): Role | null {
   return v === "admin" || v === "analyst" ? v : null;
@@ -169,15 +248,24 @@ export function mapClaims(rawClaims: Record<string, unknown>, cfg: ClaimMappingC
 
   let groups: string[] = [];
   let groupsTooLarge = false;
+  // Groups as the role expression sees them (end-of-phase-8 review L5): the validated list, or
+  // `null` when the groups claim is not an array of strings within bounds.
+  let roleGroups: string[] | null;
   if (cfg.groupsPath !== null) {
-    const g = evaluate(cfg.groupsPath, claims);
-    if (Array.isArray(g)) {
-      const strings = g.filter((x): x is string => typeof x === "string");
-      if (strings.length > MAX_GROUPS || strings.some((x) => x.length > MAX_GROUP_LENGTH)) groupsTooLarge = true;
-      else groups = strings;
+    const g = validateGroups(evaluate(cfg.groupsPath, claims));
+    if (g === "too_large") {
+      groupsTooLarge = true;
+      roleGroups = null;
+    } else {
+      groups = g ?? [];
+      roleGroups = g;
     }
+  } else {
+    // No groups expression: the raw `groups` claim, under the same rules.
+    const g = validateGroups((claims as Record<string, unknown>).groups);
+    roleGroups = g === "too_large" ? null : g;
   }
-  const role = cfg.rolePath === null ? null : toRole(evaluate(cfg.rolePath, claims));
+  const role = cfg.rolePath === null ? null : toRole(evaluate(cfg.rolePath, roleDocument(claims, cfg.groupsPath, roleGroups)));
   const identity: MappedIdentity = {
     login: login !== null && USERNAME.test(login) ? login : null,
     email,

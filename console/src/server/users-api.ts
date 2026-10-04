@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client";
 import { readJsonBody } from "@/server/request";
-import { oidcProvider } from "@/server/oidc/runtime";
+import { oidcRoleSyncOn as roleSyncOn } from "@/server/oidc/runtime";
 import { guardedUser, requireUser } from "@/server/user-api";
 import {
   approvePendingLogin,
@@ -46,11 +46,6 @@ async function body(req: Request): Promise<Record<string, unknown> | null> {
   return b.ok && isPlainObject(b.value) ? b.value : null;
 }
 
-/** Role sync is on when OIDC maps roles and SKIP_ROLE_SYNC is off (ADR-0038 decision 9). */
-function roleSyncOn(): boolean {
-  const p = oidcProvider();
-  return p !== null && !p.config.skipRoleSync;
-}
 
 export function handleListUsers(req: Request): Promise<Response> {
   return guardedUser("user.list", async () => {
@@ -91,7 +86,7 @@ export function handleListPendingLogins(req: Request): Promise<Response> {
   return guardedUser("oidc_pending_login.list", async () => {
     const g = await requireUser(req, { admin: true, route: "oidc_pending_login.list" });
     if (!g.ok) return g.response;
-    return json(await listPendingLogins(getDb()));
+    return json(await listPendingLogins(getDb(), roleSyncOn()));
   });
 }
 
@@ -102,7 +97,7 @@ export function handleApprovePendingLogin(req: Request, id: string): Promise<Res
     if (!UUID.test(id)) return error(404, "not_found");
     const v = await body(req);
     if (!v || !onlyKeys(v, ["role"]) || !isRole(v.role)) return error(400, "invalid_request");
-    return result(await approvePendingLogin(getDb(), id, v.role, { userId: g.session.user.id, ip: g.ip }), 201);
+    return result(await approvePendingLogin(getDb(), id, v.role, { userId: g.session.user.id, ip: g.ip }, roleSyncOn()), 201);
   });
 }
 

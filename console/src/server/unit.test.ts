@@ -139,6 +139,43 @@ describe("startupWarnings", () => {
     expect(startupWarnings(env({ NODE_ENV: "production", DATABASTION_TRUST_PROXY: "1" }))).toHaveLength(0);
     expect(startupWarnings(env({ NODE_ENV: "development" }))).toHaveLength(0);
   });
+
+  it("warns when the local login stays enabled for every local user while OIDC is on (end-of-phase-8 review L4)", () => {
+    const oidc = { NODE_ENV: "development", DATABASTION_OIDC_ENABLED: "1" };
+    const warned = (e: Record<string, string>) => startupWarnings(env(e)).some((w) => w.startsWith("DATABASTION_LOCAL_LOGIN=enabled while OIDC is enabled"));
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "enabled" })).toBe(true);
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "admins" })).toBe(false);
+    expect(warned(oidc)).toBe(false);
+    expect(warned({ NODE_ENV: "development", DATABASTION_LOCAL_LOGIN: "enabled" })).toBe(false);
+    expect(warned({ ...oidc, DATABASTION_LOCAL_LOGIN: "bogus" })).toBe(false);
+  });
+
+  it("warns about OIDC settings with surprising effects (review of #147)", () => {
+    const base = {
+      NODE_ENV: "development",
+      DATABASTION_OIDC_ENABLED: "1",
+      DATABASTION_OIDC_ISSUER_URL: "https://sso.example.com/realms/acme",
+      DATABASTION_OIDC_CLIENT_ID: "databastion",
+      DATABASTION_OIDC_CLIENT_SECRET: "s3cret-s3cret-s3cret",
+      DATABASTION_PUBLIC_URL: "https://console.example.com",
+      DATABASTION_ENCRYPTION_KEY: "k".repeat(48),
+      DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(groups, 'databastion-admins') && 'admin' || 'analyst'",
+    };
+    const has = (e: Record<string, string>, needle: string) => startupWarnings(env(e)).some((w) => w.includes(needle));
+    const GROUPS = "GROUPS_ATTRIBUTE_PATH is another path";
+    expect(has({ ...base, DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: "realm_access.roles" }, GROUPS)).toBe(true);
+    expect(has({ ...base, DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: "groups" }, GROUPS)).toBe(false);
+    expect(has({ ...base, DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: "groups[*]" }, GROUPS)).toBe(false);
+    expect(has(base, GROUPS)).toBe(false);
+    expect(has({ ...base, DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: "realm_access.roles", DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "contains(realm_access.groups, 'a') && 'admin'" }, GROUPS)).toBe(false);
+    const REFRESH = "USE_REFRESH_TOKEN=1 with role sync on";
+    expect(has({ ...base, DATABASTION_OIDC_USE_REFRESH_TOKEN: "1" }, REFRESH)).toBe(true);
+    expect(has({ ...base, DATABASTION_OIDC_USE_REFRESH_TOKEN: "1", DATABASTION_OIDC_USE_USERINFO: "1" }, REFRESH)).toBe(false);
+    expect(has({ ...base, DATABASTION_OIDC_USE_REFRESH_TOKEN: "1", DATABASTION_OIDC_SKIP_ROLE_SYNC: "1" }, REFRESH)).toBe(false);
+    expect(has({ ...base, DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH: "", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1" }, REFRESH)).toBe(false);
+    // No configuration value in any warning.
+    expect(startupWarnings(env({ ...base, DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH: "realm_access.roles", DATABASTION_OIDC_USE_REFRESH_TOKEN: "1" })).join()).not.toMatch(/s3cret|sso\.example|realm_access/);
+  });
 });
 
 describe("startupErrors (P1-D N3)", () => {
