@@ -1,6 +1,6 @@
 # ADR-0039: Engine scope expansion and supported-version policy
 
-- **Status**: Proposed (decision 1, the end-of-life version policy, was decided by the maintainer on 2026-10-04)
+- **Status**: Proposed (decision 1, the end-of-life version policy, was decided by the maintainer on 2026-10-04; decision 8, new engines as capability tokens, was accepted by the maintainer on 2026-10-04 as implemented for `cas` in #137 and refined by [ADR-0042](0042-hold-items-of-unlisted-engines.md); the other decisions stay Proposed until their phase)
 - **Date**: 2026-10-04
 - **Context references**: ROADMAP phases 9 and 10; security review of this ADR (M1, M2, L1 to L4); [08-engine-capabilities.md](../08-engine-capabilities.md); [ADR-0002](0002-single-agent-connectors.md), [ADR-0003](0003-data-minimization-at-source.md), [ADR-0006](0006-target-discovery.md), [ADR-0009](0009-name-normalization-and-item-sanitization.md), [ADR-0022](0022-protocol-capability-negotiation.md), [ADR-0035](0035-discovery-pacing.md); `agent/deny.toml`
 
