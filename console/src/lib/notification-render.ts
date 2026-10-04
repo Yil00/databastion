@@ -141,6 +141,20 @@ export interface AgentAuditStreamStoppedPayload {
   security_event_id: string;
 }
 
+/**
+ * P8-A (ADR-0038 decision 11): a local administrator logged in with a password while OIDC is
+ * enabled (break-glass path), so its use is visible. Console data only.
+ */
+export interface UserLocalLoginPayload {
+  event: "user.local_login";
+  occurred_at: string;
+  url: string | null;
+  user_id: string;
+  username: string;
+  /** Client IP when known (trusted reverse proxy), else `null`. */
+  source_ip: string | null;
+}
+
 export interface ChannelTestPayload {
   event: "channel.test";
   occurred_at: string;
@@ -190,6 +204,7 @@ export type NotificationPayload =
   | AgentIntegrityPayload
   | AgentBatchesDroppedPayload
   | AgentAuditStreamStoppedPayload
+  | UserLocalLoginPayload
   | ChannelTestPayload;
 
 /** Webhook body: the payload plus the format version and the delivery id. */
@@ -213,6 +228,7 @@ const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
   "agent.integrity": "Agent-integrity events",
   "agent.batches_dropped": "Dropped batches",
   "agent.audit_stream_stopped": "Audit streams stopped",
+  "user.local_login": "Local administrator logins",
 };
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
@@ -339,6 +355,17 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
         ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }
+    case "user.local_login": {
+      const p = payload;
+      const name = one(p.username, 64);
+      return {
+        subject: `[DataBastion] Local administrator login: ${name}`,
+        text: [
+          `The local administrator ${name} (id ${p.user_id}) logged in with a password at ${p.occurred_at}${p.source_ip ? ` from ${one(p.source_ip, 64)}` : ""}, while single sign-on is enabled.`,
+          "Local administrator logins are the break-glass path (DATABASTION_LOCAL_LOGIN). If nobody expected this login, check the console audit log and change that account's password.",
+        ].join("\n") + `\n${link(p.url)}${FOOTER}`,
+      };
+    }
     case "system_alerts.suppressed": {
       const p = payload;
       const s = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -352,7 +379,7 @@ export function renderEmail(payload: NotificationPayload): { subject: string; te
           "",
           ...lines,
           "",
-          "Every one of them is recorded in the console: silences, integrity events, dropped batches and stopped Audit streams as security events on the agent, recoveries in the audit log.",
+          "Every one of them is recorded in the console: silences, integrity events, dropped batches and stopped Audit streams as security events on the agent, recoveries and local administrator logins in the audit log.",
         ].join("\n") + `\n${link(p.url)}${FOOTER}`,
       };
     }

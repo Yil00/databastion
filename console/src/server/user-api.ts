@@ -58,6 +58,14 @@ import {
 import { argon2MedianMs, loginArgon2Gate, sha256Hex } from "@/server/crypto";
 import { RateLimiter } from "@/server/rate-limit";
 import { clientIp, ipBucket, readJsonBody } from "@/server/request";
+import { currentLocalLoginMode, oidcProvider } from "@/server/oidc/runtime";
+import { handleOidcLinkStart } from "@/server/oidc/routes";
+import { endSessionUrl, revokeRefreshToken } from "@/server/oidc/client";
+import { decryptRefreshToken } from "@/server/oidc/tokens";
+import { consoleUrl } from "@/server/alerting-config";
+import { enqueueSystemAlert } from "@/server/notifications";
+import { sessions, userIdentities } from "@/db/schema";
+import { eq } from "drizzle-orm";
 
 /**
  * User (UI) API: login / logout / session, enrollment tokens, agents. Every state-changing route
@@ -76,7 +84,7 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 const error = (status: number, code: string, headers: Record<string, string> = {}) =>
   json({ error: code }, status, headers);
 
-async function guardedUser(route: string, fn: () => Promise<Response>): Promise<Response> {
+export async function guardedUser(route: string, fn: () => Promise<Response>): Promise<Response> {
   try {
     return await fn();
   } catch (err) {
@@ -87,7 +95,7 @@ async function guardedUser(route: string, fn: () => Promise<Response>): Promise<
 
 type Guard = { ok: true; session: Session; ip: string | null } | { ok: false; response: Response };
 
-async function requireUser(
+export async function requireUser(
   req: Request,
   opts: { admin?: boolean; stateChanging?: boolean; route: string },
 ): Promise<Guard> {
@@ -192,6 +200,8 @@ const noop = () => undefined;
 
 export function handleLogin(req: Request): Promise<Response> {
   return guardedUser("login", async () => {
+    // ADR-0038 decision 11: `disabled` hides the local login entirely.
+    if (currentLocalLoginMode() === "disabled") return error(404, "not_found");
     if (!isSameOrigin(req)) return error(403, "forbidden");
     const body = await readJsonBody(req, MAX_USER_BODY);
     if (!body.ok) return error(body.reason === "too_large" ? 413 : 400, "invalid_request");
@@ -332,17 +342,51 @@ async function verifyLogin(
     });
     return error(401, "invalid_credentials");
   }
+  // ADR-0038 decision 11: with `admins`, only local administrators may log in locally. Checked after
+  // the password, with the same answer as a wrong one (no role oracle); counted as a failure.
+  if (currentLocalLoginMode() === "admins" && result.user.role !== "admin") {
+    await writeAudit(db, {
+      actorType: "user",
+      actorId: result.user.id,
+      action: "user.login",
+      outcome: "failure",
+      sourceIp: ip,
+      details: { method: "local", reason: "local_login_admins_only" },
+    });
+    return error(401, "invalid_credentials");
+  }
   refundAll();
   // L4: drop the session this browser already had, and expired / idle sessions.
   const previous = readSessionToken(req);
   if (previous) await deleteSession(db, sha256Hex(previous));
   await purgeStaleSessions(db);
   const session = await createSession(db, result.user.id);
-  await writeAudit(db, {
-    actorType: "user",
-    actorId: result.user.id,
-    action: "user.login",
-    sourceIp: ip,
+  const breakGlass = result.user.role === "admin" && oidcProvider() !== null;
+  await db.transaction(async (tx) => {
+    await writeAudit(tx, {
+      actorType: "user",
+      actorId: result.user.id,
+      action: "user.login",
+      sourceIp: ip,
+      ...(breakGlass ? { details: { method: "local", break_glass: true } } : {}),
+    });
+    // ADR-0038 decision 11: a local administrator login while OIDC is enabled is the break-glass
+    // path: a system alert (budgeted like the others, ADR-0033) makes its use visible.
+    if (breakGlass) {
+      await enqueueSystemAlert(tx, {
+        subjectKey: `user:${result.user.id}|local_login:${session.expiresAt.toISOString()}|${sha256Hex(session.token).slice(0, 16)}`,
+        agentId: null,
+        securityEventId: null,
+        payload: {
+          event: "user.local_login",
+          occurred_at: new Date().toISOString(),
+          url: consoleUrl("/users"),
+          user_id: result.user.id,
+          username: result.user.username,
+          source_ip: ip,
+        },
+      });
+    }
   });
   const headers = new Headers(NO_STORE);
   headers.append("Set-Cookie", sessionCookie(session.token, Math.floor(SESSION_TTL_MS / 1000)));
@@ -352,21 +396,57 @@ async function verifyLogin(
   return Response.json({ user: result.user, csrf_token: session.csrfToken }, { status: 200, headers });
 }
 
+/**
+ * Logout (`POST` + CSRF). For an OIDC session (ADR-0038 decision 14): the session is deleted, the
+ * refresh token held (if any) is revoked at the provider when it advertises a
+ * `revocation_endpoint` (RFC 7009), then the answer carries the RP-initiated logout URL
+ * (`200 {redirect_url}`) when the provider advertises an `end_session_endpoint` or
+ * `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` is set. Otherwise `204`.
+ */
 export function handleLogout(req: Request): Promise<Response> {
   return guardedUser("logout", async () => {
     const g = await requireUser(req, { stateChanging: true, route: "logout" });
     if (!g.ok) return g.response;
-    await deleteSession(getDb(), g.session.tokenHash);
-    await writeAudit(getDb(), {
+    const db = getDb();
+    let refreshToken: string | null = null;
+    let subject: string | null = null;
+    if (g.session.method === "oidc") {
+      const [row] = await db
+        .select({ enc: sessions.refreshTokenEnc, subject: userIdentities.subject })
+        .from(sessions)
+        .leftJoin(userIdentities, eq(userIdentities.id, sessions.identityId))
+        .where(eq(sessions.tokenHash, g.session.tokenHash));
+      subject = row?.subject ?? null;
+      refreshToken = row?.enc ? decryptRefreshToken(row.enc, g.session.tokenHash) : null;
+    }
+    await deleteSession(db, g.session.tokenHash);
+    let redirectUrl: string | null = null;
+    let revoked: boolean | null = null;
+    const provider = g.session.method === "oidc" ? oidcProvider() : null;
+    if (provider !== null) {
+      const md = await provider.getMetadata().catch(() => null);
+      if (md !== null && refreshToken !== null && md.revocationEndpoint !== null) revoked = await revokeRefreshToken(provider, md, refreshToken);
+      redirectUrl = endSessionUrl(provider, md, subject);
+    }
+    await writeAudit(db, {
       actorType: "user",
       actorId: g.session.user.id,
       action: "user.logout",
       sourceIp: g.ip,
+      details: { method: g.session.method, ...(revoked === null ? {} : { refresh_revoked: revoked }) },
     });
-    return new Response(null, {
-      status: 204,
-      headers: { ...NO_STORE, "Set-Cookie": clearSessionCookie() },
-    });
+    const headers = { ...NO_STORE, "Set-Cookie": clearSessionCookie() };
+    if (redirectUrl !== null) return json({ redirect_url: redirectUrl }, 200, headers);
+    return new Response(null, { status: 204, headers });
+  });
+}
+
+/** `POST /api/auth/oidc/link`: self-service "Link single sign-on" from a local session (ADR-0038 decision 6). */
+export function handleOidcLink(req: Request): Promise<Response> {
+  return guardedUser("oidc.link", async () => {
+    const g = await requireUser(req, { stateChanging: true, route: "oidc.link" });
+    if (!g.ok) return g.response;
+    return handleOidcLinkStart(req, { userId: g.session.user.id, tokenHash: g.session.tokenHash, method: g.session.method });
   });
 }
 

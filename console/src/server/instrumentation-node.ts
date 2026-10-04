@@ -26,6 +26,17 @@ export async function registerNode(): Promise<void> {
   } catch (err) {
     logger.warn({ error: errorSummary(err) }, "database role check skipped");
   }
+  // ADR-0038: provider discovery (hosts logged, retried while down) and the break-glass check.
+  try {
+    const { currentLocalLoginMode, warmUpOidcProvider } = await import("@/server/oidc/runtime");
+    const { localLoginStartupError } = await import("@/server/oidc/startup");
+    const { getDb } = await import("@/db/client");
+    warmUpOidcProvider();
+    const message = await localLoginStartupError(getDb(), currentLocalLoginMode());
+    if (message !== null) logger.error(message);
+  } catch (err) {
+    logger.warn({ error: errorSummary(err) }, "local login check skipped");
+  }
 }
 
 const STARTED = Symbol.for("databastion.metricsListener");
