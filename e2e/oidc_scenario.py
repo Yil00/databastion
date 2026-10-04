@@ -5,8 +5,10 @@ Driven by e2e/oidc.sh, which starts the console (production build) and Keycloak 
 from the run's throwaway CA) and runs this script twice, once per console configuration:
 
 - ``signup-off``: sign-up off (the default), ``ALLOWED_GROUPS`` and ``ALLOWED_DOMAINS`` set, strict
-  role mapping. Refused group, unverified e-mail, pending logins approved as new users, role mapped
-  from the group at every login (promotion and demotion), the attribute-editing user ``mallory``
+  role mapping. Refused group, unverified e-mail, pending logins approved as new users only with
+  the role mapped from their group (role sync on: another role is ``409 role_mismatch``), role mapped
+  from the group at every login (promotion and demotion after a group change at the provider), the
+  attribute-editing user ``mallory``
   (Alice's e-mail and name, then her username changed at runtime to the local administrator's),
   self-service linking from a local session, logout (RP-initiated, Keycloak session ended).
 - ``signup-on``: sign-up on, no group or domain filter, strict role mapping. The user without a
@@ -392,6 +394,21 @@ class KeycloakAdmin:
         if r.status != 204:
             raise ScenarioError(f"Keycloak user update: HTTP {r.status}")
 
+    def group_id(self, name: str) -> str:
+        r = self.call("GET", "/groups?" + urllib.parse.urlencode({"search": name, "exact": "true"}))
+        if r.status != 200:
+            raise ScenarioError(f"Keycloak group {name}: HTTP {r.status}")
+        rows = [g for g in r.json() if g.get("name") == name]
+        if len(rows) != 1:
+            raise ScenarioError(f"Keycloak group {name}: {len(rows)} matches")
+        return rows[0]["id"]
+
+    def set_member(self, user_id: str, group: str, member: bool) -> None:
+        """Adds `user_id` to (or removes it from) the top-level group `group`."""
+        r = self.call("PUT" if member else "DELETE", f"/users/{user_id}/groups/{self.group_id(group)}")
+        if r.status != 204:
+            raise ScenarioError(f"Keycloak group membership update: HTTP {r.status}")
+
     def sessions(self, user_id: str) -> list[Any]:
         r = self.call("GET", f"/users/{user_id}/sessions")
         if r.status != 200:
@@ -567,6 +584,35 @@ def approve(env: Env, admin: Browser, pending_id: str, role: str, who: str) -> s
     return user_id
 
 
+def refuse_mismatch(env: Env, admin: Browser, pending_id: str, role: str, mapped: str, subject: str, who: str) -> None:
+    """Role sync on: an approval with another role than the mapped one is refused (end-of-phase-8 review L1)."""
+    mark = db_mark(env)
+    r = admin.api("POST", f"/api/oidc/pending-logins/{pending_id}", {"role": role})
+    check(r.status == 409 and r.json().get("error") == "role_mismatch", f"{who}: approval as {role} refused, 409 role_mismatch (mapped role {mapped}, role sync on)")
+    a = audit_since(env, mark, "user.pending_login_approve")
+    check(
+        len(a) == 1 and a[0]["outcome"] == "failure" and a[0]["target_id"] == pending_id
+        and a[0]["details"].get("reason") == "role_mismatch" and a[0]["details"].get("role") == role
+        and a[0]["details"].get("mapped_role") == mapped and a[0]["details"].get("subject") == subject,
+        f"{who}: audit user.pending_login_approve failure, reason role_mismatch, mapped_role {mapped}",
+    )
+    check(pending_for(admin, subject) is not None, f"{who}: pending login kept after the refused approval")
+
+
+def expect_first_login(env: Env, username: str, user_id: str, role: str) -> tuple[Browser, Outcome]:
+    """First login after approval with the mapped role: no role change."""
+    mark = db_mark(env)
+    b, out = oidc_login(env, username)
+    check(out.signed_in, f"{username}: signed in, landing on /agents")
+    s = b.session()
+    check(s is not None and s["id"] == user_id and s["username"] == username and s["role"] == role, f"{username}: session as {username}, role {role} from the group")
+    entries = audit_since(env, mark)
+    check(not any(e["action"] == "user.role_change" for e in entries), f"{username}: no role change at the first login (approved with the mapped role)")
+    logins = [e for e in entries if e["action"] == "user.login"]
+    check(len(logins) == 1 and logins[0]["actor_id"] == user_id and logins[0]["details"] == {"method": "oidc"}, f"{username}: audit user.login, method oidc")
+    return b, out
+
+
 def expect_role_sync(env: Env, username: str, user_id: str, before: str, after: str) -> tuple[Browser, Outcome]:
     mark = db_mark(env)
     b, out = oidc_login(env, username)
@@ -631,15 +677,24 @@ def phase_signup_off(env: Env) -> None:
     expect_denied(env, "nogroup.erin", "group")
     check(pending_count(env) == n, "refused logins leave no pending login")
 
-    print("# Pending login, approval, role from the group (promotion)")
+    print("# Pending login approved only with the role mapped from the group (role sync on)")
     p = expect_pending(env, admin, "admin.alice", subjects["admin.alice"], "admin.alice", "admin", "databastion-admins")
     check(p["emailVerified"] is True, "admin.alice: pending login shows email_verified true")
-    alice_id = approve(env, admin, p["id"], "analyst", "admin.alice")
-    alice, alice_login = expect_role_sync(env, "admin.alice", alice_id, "analyst", "admin")
+    check(p.get("syncedRole") == "admin", "admin.alice: pending login shows the role it will get (admin)")
+    refuse_mismatch(env, admin, p["id"], "analyst", "admin", subjects["admin.alice"], "admin.alice")
+    alice_id = approve(env, admin, p["id"], "admin", "admin.alice")
+    alice, alice_login = expect_first_login(env, "admin.alice", alice_id, "admin")
 
-    print("# Pending login, approval, role from the group (demotion)")
     p = expect_pending(env, admin, "analyst.bob", subjects["analyst.bob"], "analyst.bob", "analyst", "databastion-analysts")
-    bob_id = approve(env, admin, p["id"], "admin", "analyst.bob")
+    check(p.get("syncedRole") == "analyst", "analyst.bob: pending login shows the role it will get (analyst)")
+    refuse_mismatch(env, admin, p["id"], "admin", "analyst", subjects["analyst.bob"], "analyst.bob")
+    bob_id = approve(env, admin, p["id"], "analyst", "analyst.bob")
+    expect_first_login(env, "analyst.bob", bob_id, "analyst")
+
+    print("# Role from the group at every login: promotion, then demotion, after group changes at the provider")
+    kc.set_member(subjects["analyst.bob"], "databastion-admins", True)
+    expect_role_sync(env, "analyst.bob", bob_id, "analyst", "admin")
+    kc.set_member(subjects["analyst.bob"], "databastion-admins", False)
     expect_role_sync(env, "analyst.bob", bob_id, "admin", "analyst")
 
     print("# Attribute-editing user: Alice's e-mail and name, then the local administrator's username")
@@ -791,8 +846,8 @@ def phase_signup_on(env: Env) -> None:
     check([r["username"] for r in admins] == ["admin.alice", LOCAL_ADMIN, LOCAL_LINKER], "administrators: admin.alice (group), e2e-admin and e2e-linker (local) only")
     check(
         sql_json(env, "SELECT 1 FROM audit_log WHERE action = 'user.role_change' AND details->>'to' = 'admin' AND target_id <> "
-                 f"'{need_uuid(env.state.get('alice_id'), 'alice id')}'") == [],
-        "no role change to admin but admin.alice's",
+                 f"'{need_uuid(env.state.get('bob_id'), 'bob id')}'") == [],
+        "no role change to admin but analyst.bob's (databastion-admins granted at the provider, then removed)",
     )
 
 
