@@ -80,6 +80,8 @@ mod tests {
             br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "serviceId": "(", "name": "x"}"#,
             br#"{"action": "AUTHENTICATION_FAILED", "who": "a", "when": 1791115200000, "clientIpAddress": "::1"}"#,
             br#"{"action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": "https://[::1]:1/"}"#,
+            br#"{"action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": {"service": "https://app.example.org/login", "ticketId": "ST-1-****-cas01"}}"#,
+            br#"{"action": "SERVICE_TICKET_CREATED", "when": 1791115200000, "what": {"service": "https://a.example.org/", "service": "x"}}"#,
         ] {
             registry(input);
             audit_log(input);

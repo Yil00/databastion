@@ -651,6 +651,35 @@ mod tests {
     }
 
     #[test]
+    fn object_form_service_tickets_name_the_service_only() {
+        // CAS 8.0.2 shape: `what` is an object; a clear ticket id, a
+        // principal and a credential next to `service` never reach events.
+        let def = parse_definition(
+            br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "name": "Intranet",
+                "serviceId": "^https://intranet\\.example\\.org/.*"}"#,
+        )
+        .unwrap();
+        let mut b = builder(ClientAddrMode::Truncated);
+        b.set_services(Some(Arc::new(ServiceIndex::new([&def]))));
+        let r = parse_record(
+            br#"{"who": "jdoe", "what": {"service": "https://intranet.example.org/login",
+                 "ticketId": "ST-1-FAKEclearTICKET-cas01", "principal": "MRKprincipal",
+                 "credential": {"password": "MRKpassword"}},
+                 "action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z",
+                 "clientIpAddress": "192.0.2.77"}"#,
+            UtcOffset(0),
+        )
+        .unwrap();
+        let out = run(&mut b, std::slice::from_ref(&r), at(10));
+        let o = out[0].object.as_ref().unwrap();
+        assert_eq!(o.object().as_str(), "Intranet");
+        let dbg = format!("{out:?} {r:?} {b:?}");
+        for leak in ["ST-1", "FAKE", "cas01", "MRK", "intranet.example", "jdoe"] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
+    }
+
+    #[test]
     fn registry_changes_are_dcl_and_others_counted() {
         let mut b = builder(ClientAddrMode::Omitted);
         let out = run(
