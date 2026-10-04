@@ -14,6 +14,9 @@ pub struct RegistryFacts {
     pub skipped: u64,
     /// Services whose `clientSecret` is stored in clear.
     pub clear_secrets: u64,
+    /// Files refused because the agent could write them (counted in
+    /// `skipped` too).
+    pub writable: u64,
 }
 
 #[derive(Debug, Default)]

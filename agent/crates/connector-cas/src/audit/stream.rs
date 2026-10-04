@@ -159,10 +159,13 @@ impl AuditRunner {
             return Err(Refusal::ResolvedChanged);
         }
         fsread::check_log(self.settings.path.path(), self.policy)?;
-        let polled = self.tailer.poll().map_err(|e| match e {
-            TailError::Unreadable(std::io::ErrorKind::PermissionDenied) => Refusal::Writable,
-            TailError::Unreadable(_) => Refusal::NotReadable,
-        })?;
+        // `check_log` above already refused a log the agent could write;
+        // a permission error of the tailer is an `EACCES` on open (review
+        // of #138 I3): not readable.
+        let polled = self
+            .tailer
+            .poll()
+            .map_err(|TailError::Unreadable(_)| Refusal::NotReadable)?;
         let lines: Vec<Zeroizing<Vec<u8>>> = polled.records;
         let batch = parse_lines(&lines, self.settings.offset, now);
         drop(lines);

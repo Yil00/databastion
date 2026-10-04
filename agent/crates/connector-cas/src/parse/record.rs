@@ -115,6 +115,9 @@ pub struct AuditRecord {
     /// `clientIpAddress` when it is one IP literal.
     pub client: Option<IpAddr>,
     /// First product token of `userAgent` (e.g. `python-requests/2.32`).
+    /// TODO(P8-C): it goes through the contract `Principal.application`
+    /// sanitization (`EventPrincipal::with_application`) when the event
+    /// becomes a `MaskedEvent`.
     pub user_agent: Option<String>,
     /// Scheme and host of the service, for service-ticket issuance.
     pub service: Option<ServiceHost>,
@@ -410,7 +413,8 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
     let client = raw
         .client
         .flatten()
-        .and_then(|c| c.trim().parse::<IpAddr>().ok());
+        .and_then(|c| c.trim().parse::<IpAddr>().ok())
+        .map(crate::audit::events::canonical);
     let user_agent = raw.agent.flatten().and_then(|ua| first_token(&ua));
     Ok(AuditRecord {
         action,

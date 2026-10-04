@@ -7,7 +7,9 @@
 //!   (`privilege.registry_writable`) or when it holds CAS configuration
 //!   files (`privilege.config_readable`); a directory that cannot be
 //!   listed, or no longer resolves where it did at load, is a failed stage
-//!   (`check.stage_failed`). The last Discovery scan's counts give
+//!   (`check.stage_failed`). Registry files refused because the agent
+//!   could write them in the last scan also give
+//!   `privilege.registry_writable`. The last Discovery scan's counts give
 //!   `coverage.registry_files_skipped` and
 //!   `security.client_secrets_in_clear`.
 //! - Audit log: at most [`CHECK_TAIL_BYTES`] of its end are parsed;
@@ -105,6 +107,9 @@ pub(crate) fn check_blocking(
                         CasNoteCode::CoverageRegistryFilesSkipped,
                         skipped,
                     ));
+                }
+                if facts.writable > 0 {
+                    notes.push(CasNote::flag(CasNoteCode::PrivilegeRegistryWritable));
                 }
                 if facts.clear_secrets > 0 {
                     notes.push(CasNote::counted(
@@ -262,6 +267,7 @@ mod tests {
             RegistryFacts {
                 skipped: 2,
                 clear_secrets: 1,
+                writable: 1,
             },
             None,
         );
@@ -274,6 +280,7 @@ mod tests {
                 CasNoteCode::CoverageRegistryFilesSkipped,
                 CasNoteCode::SecurityClientSecretsInClear,
                 CasNoteCode::SecurityAuditHeadersLogged,
+                CasNoteCode::PrivilegeRegistryWritable,
             ]
         );
         assert!(h.notes.contains(&CasNote::counted(

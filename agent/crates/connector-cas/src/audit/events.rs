@@ -105,8 +105,26 @@ impl CasEvent {
     }
 }
 
-/// The address a failure counts for, in the aggregates.
-type AggKey = (Option<IpAddr>, u64);
+/// The address a failure counts for, in the windows and the aggregates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum AddrKey {
+    /// A parsed client address (canonical, before reduction).
+    Known(IpAddr),
+    /// No parseable client address: one shared key (review of #138 L4),
+    /// so failures without an address still reach the many-accounts
+    /// signal.
+    Unknown,
+}
+
+/// The aggregate a failure is merged into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AggAddr {
+    Addr(AddrKey),
+    /// A window was full.
+    Overflow,
+}
+
+type AggKey = (AggAddr, u64);
 
 /// Per-address window: distinct principals and when each last failed.
 #[derive(Default)]
@@ -137,15 +155,46 @@ pub fn is_unidentified(who: &str) -> bool {
     })
 }
 
-/// Reduces a client address per `mode`.
+/// The canonical form of a logged address (review of #138 L3): an
+/// IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`, not `::`
+/// nor `::1`) IPv6 address is its IPv4 address, so the windows and the
+/// reduction see one address per client.
+#[must_use]
+pub fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let bits = u128::from(v6);
+            if bits >> 32 == 0 && bits > 1 {
+                return IpAddr::V4(std::net::Ipv4Addr::from(u32::try_from(bits).unwrap_or(0)));
+            }
+            ip
+        }
+    }
+}
+
+/// Reduces a client address per `mode`. `truncated`: IPv4 to its /24,
+/// IPv6 to its /56, except 6to4 (`2002::/16`), whose embedded IPv4 address
+/// is cut to its /24 (the /40 prefix is kept, the rest zeroed); Teredo
+/// (`2001::/32`) keeps its prefix and part of the server address, its
+/// obfuscated client address and port are zeroed by the /56. Mapped and
+/// compatible addresses are IPv4 first ([`canonical`]).
 #[must_use]
 pub fn reduce(ip: IpAddr, mode: ClientAddrMode) -> Option<ClientAddr> {
+    let ip = canonical(ip);
     match mode {
         ClientAddrMode::Omitted => None,
         ClientAddrMode::Clear => Some(ClientAddr::Ip(ip)),
         ClientAddrMode::Truncated => Some(ClientAddr::Ip(match ip {
             IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_ff00).into()),
-            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !((1u128 << 72) - 1)).into()),
+            IpAddr::V6(v6) => {
+                let bits = u128::from(v6);
+                let keep = if bits >> 112 == 0x2002 { 40 } else { 56 };
+                IpAddr::V6((bits & !(u128::MAX >> keep)).into())
+            }
         })),
     }
 }
@@ -157,7 +206,7 @@ pub struct Builder {
     mode: ClientAddrMode,
     services: Option<Arc<ServiceIndex>>,
     registry_db: NormalizedName,
-    addrs: HashMap<IpAddr, AddrWindow>,
+    addrs: HashMap<AddrKey, AddrWindow>,
     principals: HashMap<[u8; 16], VecDeque<SystemTime>>,
     aggregates: BTreeMap<AggKey, CasEvent>,
     /// Failures aggregated because a window was full (heartbeat metric
@@ -332,7 +381,7 @@ impl Builder {
     /// Notes a failure of `tag` from `ip`: `Some(Own(many))` for an event of
     /// its own (`many`: this principal is the [`MANY_ACCOUNTS`]th),
     /// `Some(Flood)` to aggregate, `None` when the window is full.
-    fn note_addr(&mut self, ip: IpAddr, tag: [u8; 16], ts: SystemTime) -> Option<AddrOutcome> {
+    fn note_addr(&mut self, ip: AddrKey, tag: [u8; 16], ts: SystemTime) -> Option<AddrOutcome> {
         if !self.addrs.contains_key(&ip) && self.addrs.len() >= MAX_WINDOW_ENTRIES {
             self.prune(ts);
             if self.addrs.len() >= MAX_WINDOW_ENTRIES {
@@ -354,10 +403,12 @@ impl Builder {
     fn failure(&mut self, r: &AuditRecord, ts: SystemTime, who: &str, out: &mut Vec<CasEvent>) {
         let tag = self.tag(who);
         let one = self.note_principal(tag, ts);
-        let addr = match (one, r.client) {
-            (None, _) => None,
-            (Some(_), None) => Some(AddrOutcome::Own(false)),
-            (Some(_), Some(ip)) => self.note_addr(ip, tag, ts),
+        let key = r
+            .client
+            .map_or(AddrKey::Unknown, |ip| AddrKey::Known(canonical(ip)));
+        let addr = match one {
+            None => None,
+            Some(_) => self.note_addr(key, tag, ts),
         };
         let one = one == Some(true);
         match addr {
@@ -371,19 +422,22 @@ impl Builder {
                 }
                 out.push(e);
             }
-            Some(AddrOutcome::Flood) => self.aggregate(r.client, ts, one),
+            Some(AddrOutcome::Flood) => self.aggregate(AggAddr::Addr(key), ts, one),
             None => {
                 self.overflow = self.overflow.saturating_add(1);
-                self.aggregate(None, ts, one);
+                self.aggregate(AggAddr::Overflow, ts, one);
             }
         }
     }
 
-    fn aggregate(&mut self, ip: Option<IpAddr>, ts: SystemTime, one: bool) {
-        let client = ip.and_then(|ip| reduce(ip, self.mode));
+    fn aggregate(&mut self, addr: AggAddr, ts: SystemTime, one: bool) {
+        let client = match addr {
+            AggAddr::Addr(AddrKey::Known(ip)) => reduce(ip, self.mode),
+            AggAddr::Addr(AddrKey::Unknown) | AggAddr::Overflow => None,
+        };
         let e = self
             .aggregates
-            .entry((ip, minute(ts)))
+            .entry((addr, minute(ts)))
             .or_insert_with(|| CasEvent {
                 ts,
                 ts_last: None,
@@ -653,6 +707,54 @@ mod tests {
     }
 
     #[test]
+    fn failures_without_an_address_share_one_window() {
+        let mut b = builder(ClientAddrMode::Truncated);
+        let now = at(10_000);
+        let recs: Vec<AuditRecord> = (0..20u64)
+            .map(|i| {
+                rec(
+                    "AUTHENTICATION_FAILED",
+                    &format!("user{i}"),
+                    "not-an-address",
+                    i,
+                )
+            })
+            .collect();
+        let mut out = run(&mut b, &recs, now);
+        assert_eq!(out.len(), MANY_ACCOUNTS);
+        assert_eq!(
+            out[MANY_ACCOUNTS - 1].signals,
+            [CasSignal::FailedLoginsManyAccounts]
+        );
+        b.flush(now, true, &mut out);
+        let agg = out.last().unwrap();
+        assert_eq!(agg.principal, CasPrincipal::ManyAccounts);
+        assert_eq!((agg.count, agg.client), (4, None));
+        assert_eq!(b.overflow, 0);
+    }
+
+    #[test]
+    fn mapped_addresses_share_the_ipv4_window() {
+        let mut b = builder(ClientAddrMode::Clear);
+        let recs: Vec<AuditRecord> = (0..16u64)
+            .map(|i| {
+                let ip = if i % 2 == 0 {
+                    "192.0.2.9"
+                } else {
+                    "::ffff:192.0.2.9"
+                };
+                rec("AUTHENTICATION_FAILED", &format!("user{i}"), ip, i)
+            })
+            .collect();
+        let out = run(&mut b, &recs, at(10_000));
+        assert_eq!(out[15].signals, [CasSignal::FailedLoginsManyAccounts]);
+        assert!(
+            out.iter()
+                .all(|e| e.client == ClientAddr::parse("192.0.2.9"))
+        );
+    }
+
+    #[test]
     fn guessing_one_account_is_signalled_from_any_address() {
         let mut b = builder(ClientAddrMode::Clear);
         let recs: Vec<AuditRecord> = (0..21u64)
@@ -732,6 +834,25 @@ mod tests {
         assert_eq!(
             reduce(v6, ClientAddrMode::Truncated),
             ClientAddr::parse("2001:db8:1234:5600::")
+        );
+        let r = |s: &str| reduce(s.parse().unwrap(), ClientAddrMode::Truncated);
+        // Mapped and compatible: IPv4 /24.
+        assert_eq!(r("::ffff:192.0.2.77"), ClientAddr::parse("192.0.2.0"));
+        assert_eq!(r("::192.0.2.77"), ClientAddr::parse("192.0.2.0"));
+        assert_eq!(
+            reduce("::ffff:192.0.2.77".parse().unwrap(), ClientAddrMode::Clear),
+            ClientAddr::parse("192.0.2.77")
+        );
+        assert_eq!(r("::1"), ClientAddr::parse("::"));
+        // 6to4: the embedded IPv4 cut to its /24.
+        assert_eq!(
+            r("2002:c000:024d:1234::1"),
+            ClientAddr::parse("2002:c000:200::")
+        );
+        // Teredo: the obfuscated client address and port are zeroed.
+        assert_eq!(
+            r("2001:0:4136:e378:8000:63bf:3fff:fdd2"),
+            ClientAddr::parse("2001:0:4136:e300::")
         );
     }
 

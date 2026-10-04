@@ -131,21 +131,56 @@ proptest! {
     fn url_credentials_are_always_stripped(
         user in marker(),
         pass in marker(),
+        special in proptest::collection::vec(prop::sample::select(vec!["/", "?", "#", "@", ":", "%", "%40", "%3A"]), 0..4),
         query in marker(),
         frag in marker(),
+        relative in any::<bool>(),
         host in "[a-z]{1,10}(\\.[a-z]{2,6}){0,2}",
         path in "(/[a-z0-9]{0,6}){0,3}",
         before in "[ -~]{0,10}",
     ) {
-        let text = format!("{before} https://{user}:{pass}@{host}{path}?q={query}#{frag} tail");
+        // A password holding URL delimiters (review of #138 M1).
+        let pass = format!("{pass}{}{pass}", special.concat());
+        let scheme = if relative { "" } else { "https:" };
+        let text = format!("{before} {scheme}//{user}:{pass}@{host}{path}?q={query}#{frag} tail");
         let out = strip_credentials(&text);
         for m in [&user, &pass, &query, &frag] {
-            prop_assert!(!out.contains(m.as_str()), "{} in {}", m, out);
+            prop_assert!(!out.contains(m.as_str()), "{} in {:?}", m, out);
         }
-        prop_assert!(out.contains(&host));
-        if !before.to_ascii_lowercase().contains("http") {
+        prop_assert!(out.contains(&format!("//{host}{path}")), "{:?}", out);
+        if !relative && !before.to_ascii_lowercase().contains("http") {
             let h = service_of(&text).unwrap();
             prop_assert_eq!(h.as_url(), format!("https://{host}/"));
+        }
+    }
+
+    /// Mapped, compatible, 6to4 and Teredo addresses never keep more of
+    /// the client than its IPv4 /24 (review of #138 L3).
+    #[test]
+    fn embedded_ipv4_addresses_are_reduced(v4 in any::<u32>(), low in any::<u64>(), mid in any::<u16>()) {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use databastion_classifiers::masking::ClientAddr;
+        use crate::audit::events::reduce;
+        let t = ClientAddrMode::Truncated;
+        let ip4 = IpAddr::V4(Ipv4Addr::from(v4));
+        let want = reduce(ip4, t);
+        prop_assert_eq!(want, Some(ClientAddr::Ip(IpAddr::V4(Ipv4Addr::from(v4 & 0xffff_ff00)))));
+        let mapped = IpAddr::V6(Ipv4Addr::from(v4).to_ipv6_mapped());
+        prop_assert_eq!(reduce(mapped, t), want);
+        if v4 > 1 {
+            let compatible = IpAddr::V6(Ipv6Addr::from(u128::from(v4)));
+            prop_assert_eq!(reduce(compatible, t), want);
+        }
+        let six_to_four = (0x2002u128 << 112) | (u128::from(v4) << 80) | (u128::from(mid) << 64) | u128::from(low);
+        let expect = (0x2002u128 << 112) | (u128::from(v4 & 0xffff_ff00) << 80);
+        prop_assert_eq!(
+            reduce(IpAddr::V6(Ipv6Addr::from(six_to_four)), t),
+            Some(ClientAddr::Ip(IpAddr::V6(Ipv6Addr::from(expect))))
+        );
+        let teredo = (0x2001_0000u128 << 96) | (u128::from(v4) << 64) | u128::from(low);
+        match reduce(IpAddr::V6(Ipv6Addr::from(teredo)), t) {
+            Some(ClientAddr::Ip(IpAddr::V6(r))) => prop_assert_eq!(u128::from(r) & ((1u128 << 72) - 1), 0),
+            other => prop_assert!(false, "{:?}", other),
         }
     }
 

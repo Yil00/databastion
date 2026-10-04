@@ -42,6 +42,15 @@ const CONFIG_FILE_NAMES: [&str; 4] = [
     "application.yml",
     "application.properties",
 ];
+/// Configuration name stems (`<stem>.<ext>` and `<stem>-<profile>.<ext>`)
+/// and their extensions (review of #138 I1).
+const CONFIG_STEMS: [(&str, &[&str]); 3] = [
+    ("application", &["yml", "yaml", "properties"]),
+    ("bootstrap", &["yml", "yaml", "properties"]),
+    ("cas", &["yml", "yaml", "properties"]),
+];
+/// Extensions of key material: their presence refuses the directory.
+const KEY_EXTENSIONS: [&str; 5] = ["jwks", "jks", "p12", "pem", "key"];
 
 /// Why a declared source is not read (kinds only, never a path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +178,9 @@ fn ancestor_writable(path: &Path, me: &Me) -> bool {
 /// An opened registry directory and the service definition files it lists.
 pub(crate) struct Listing {
     dir: OwnedFd,
+    /// Device of the directory: an entry on another device (a mount point
+    /// in the directory) is skipped (review of #138 I2).
+    dev: u64,
     /// Names of the `.json` entries, in directory order, at most
     /// [`MAX_REGISTRY_FILES`].
     pub(crate) files: Vec<CString>,
@@ -186,10 +198,34 @@ impl std::fmt::Debug for Listing {
     }
 }
 
+/// Whether an entry name is CAS configuration or key material (compared
+/// case-insensitively): `cas.properties`, `cas.yml`, `application.yml`,
+/// `application.properties`, `application[-*].{yml,yaml,properties}`,
+/// `cas[-*].{yml,yaml,properties}`, `bootstrap[-*].{yml,yaml,properties}`,
+/// `*.jwks`, `*.jks`, `*.p12`, `*.pem`, `*.key`.
 fn is_config_name(name: &[u8]) -> bool {
-    CONFIG_FILE_NAMES
+    if CONFIG_FILE_NAMES
         .iter()
         .any(|c| c.as_bytes().eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    let Some(dot) = lower.iter().rposition(|b| *b == b'.') else {
+        return false;
+    };
+    let (base, ext) = lower.split_at(dot);
+    let ext = ext.get(1..).unwrap_or(&[]);
+    if KEY_EXTENSIONS.iter().any(|k| k.as_bytes() == ext) {
+        return true;
+    }
+    CONFIG_STEMS.iter().any(|(stem, exts)| {
+        exts.iter().any(|e| e.as_bytes() == ext)
+            && (base == stem.as_bytes()
+                || base
+                    .strip_prefix(stem.as_bytes())
+                    .is_some_and(|r| r.first() == Some(&b'-')))
+    })
 }
 
 fn has_json_extension(name: &[u8]) -> bool {
@@ -255,6 +291,7 @@ pub(crate) fn list_registry(path: &Path, policy: Policy) -> Result<Listing, Refu
     }
     Ok(Listing {
         dir: fd,
+        dev: meta.dev(),
         files,
         over_cap,
     })
@@ -274,6 +311,9 @@ impl Listing {
         let file = File::from(fd);
         let meta = file.metadata().map_err(|_| FileSkip::NotReadable)?;
         if !meta.file_type().is_file() {
+            return Err(FileSkip::NotReadable);
+        }
+        if meta.dev() != self.dev {
             return Err(FileSkip::NotReadable);
         }
         if meta.nlink() != 1 {
@@ -480,6 +520,20 @@ pub(crate) mod tests {
                 Refusal::ConfigFiles,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn other_names_are_not_configuration() {
+        for name in [
+            "application.json",
+            "casino.yml",
+            "cas_audit.log",
+            "App-1.json",
+            "key",
+            "applications.yml",
+        ] {
+            assert!(!is_config_name(name.as_bytes()), "{name}");
         }
     }
 

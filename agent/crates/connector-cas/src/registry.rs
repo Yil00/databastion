@@ -22,8 +22,13 @@ use regex::{Regex, RegexBuilder};
 use crate::parse::definition::{Definition, Seg, ServiceType};
 use crate::parse::url::ServiceHost;
 
-/// Compiled size limit of one `serviceId` pattern, in bytes.
-const PATTERN_SIZE_LIMIT: usize = 256 * 1024;
+/// Compiled size limit of one `serviceId` pattern, and of its lazy DFA
+/// cache, in bytes.
+const PATTERN_SIZE_LIMIT: usize = 64 * 1024;
+/// Total budget of compiled patterns per index (review of #138 L6), charged
+/// at the worst case of each pattern (both limits): at most 512 patterns
+/// are compiled; services beyond are indexed without one (never matched).
+pub const PATTERN_BUDGET: usize = 64 * 1024 * 1024;
 /// Most services indexed.
 pub const MAX_SERVICES: usize = 4096;
 
@@ -88,6 +93,8 @@ struct Entry {
 #[derive(Default)]
 pub struct ServiceIndex {
     entries: Vec<Entry>,
+    /// Pattern budget charged so far.
+    charged: usize,
 }
 
 impl std::fmt::Debug for ServiceIndex {
@@ -104,28 +111,39 @@ impl ServiceIndex {
     pub fn new<'a>(defs: impl IntoIterator<Item = &'a Definition>) -> Self {
         let mut idx = Self::default();
         for d in defs {
-            idx.add(d);
+            let _ = idx.add(d);
         }
         idx.finish();
         idx
     }
 
-    /// Adds one service (ignored beyond [`MAX_SERVICES`]); call
-    /// [`Self::finish`] once every service is added.
-    pub fn add(&mut self, d: &Definition) {
+    /// Adds one service; call [`Self::finish`] once every service is
+    /// added. `false` when it is beyond [`MAX_SERVICES`] or its pattern is
+    /// beyond [`PATTERN_BUDGET`] (not indexed, or indexed without a
+    /// pattern).
+    pub fn add(&mut self, d: &Definition) -> bool {
         if self.entries.len() >= MAX_SERVICES {
-            return;
+            return false;
         }
+        let cost = 2 * PATTERN_SIZE_LIMIT;
+        let within = self.charged.saturating_add(cost) <= PATTERN_BUDGET;
+        let pattern = if within {
+            self.charged += cost;
+            RegexBuilder::new(&d.service_id)
+                .size_limit(PATTERN_SIZE_LIMIT)
+                .dfa_size_limit(PATTERN_SIZE_LIMIT)
+                .build()
+                .ok()
+        } else {
+            None
+        };
         self.entries.push(Entry {
             order: d.evaluation_order.unwrap_or(i64::MAX),
             service_type: d.service_type,
             object: object_name(d),
-            pattern: RegexBuilder::new(&d.service_id)
-                .size_limit(PATTERN_SIZE_LIMIT)
-                .dfa_size_limit(PATTERN_SIZE_LIMIT)
-                .build()
-                .ok(),
+            pattern,
         });
+        within
     }
 
     /// Sorts the services in evaluation order (stable: file order for
@@ -233,6 +251,11 @@ mod tests {
         ];
         let idx = ServiceIndex::new(&defs);
         assert_eq!(idx.len(), 3);
+        let mut big = ServiceIndex::default();
+        let budget = PATTERN_BUDGET / (2 * PATTERN_SIZE_LIMIT);
+        for i in 0..=budget {
+            assert_eq!(big.add(&defs[1]), i < budget, "{i}");
+        }
         let host = |u: &str| service_of(u).unwrap();
         let (t, o) = idx.lookup(&host("https://hr.example.org/x")).unwrap();
         assert_eq!((t, o.as_str()), (ServiceType::Cas, "HR"));

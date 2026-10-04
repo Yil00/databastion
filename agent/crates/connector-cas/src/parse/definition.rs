@@ -46,19 +46,31 @@ pub const MAX_STRING_BYTES: usize = 4096;
 /// Longest key kept in a path, in bytes (longer: `*`).
 const MAX_KEY_BYTES: usize = 256;
 
-/// Substrings that make a key a credential (security review M2): compared
-/// case-insensitively on the raw key. Over-exclusion (`keyAlias`,
-/// `tokenExpiration`) is accepted.
-pub const CREDENTIAL_WORDS: [&str; 9] = [
+/// Substrings that make a key a credential (security review M2, review of
+/// #138 M2): compared case-insensitively on the raw key. `header` skips
+/// every HTTP header map or list (`headers`, `httpHeaders`: `Authorization`,
+/// `Cookie` values) whatever its shape. Over-exclusion (`keyAlias`,
+/// `tokenExpiration`, `authenticationPolicy`, `bypass…`) is accepted.
+pub const CREDENTIAL_WORDS: [&str; 19] = [
     "secret",
     "password",
     "passwd",
+    "pass",
+    "pwd",
     "key",
     "token",
     "credential",
     "jwk",
     "private",
     "keystore",
+    "authorization",
+    "auth",
+    "cookie",
+    "bearer",
+    "salt",
+    "cipher",
+    "signing",
+    "header",
 ];
 
 /// Keys whose children are data (names chosen by the operator), collapsed
@@ -158,7 +170,7 @@ pub enum SecretForm {
     Absent,
     /// A reference resolved at run time (`${…}`, `#{…}`).
     Reference,
-    /// The output of a cipher executor (a compact JWS / JWE, or a
+    /// The output of a cipher executor (a five-segment compact JWE, or a
     /// `{cipher}` value; the exact CAS 8.0 shape is to verify).
     Encrypted,
     /// Anything else: a secret in clear.
@@ -179,8 +191,10 @@ impl SecretForm {
         if t.starts_with("{cipher}") {
             return Self::Encrypted;
         }
+        // A compact JWE (five segments) only: a three-segment JWS is
+        // signed, not encrypted (even `alg: none`), so it counts as clear.
         let compact = t.starts_with("eyJ")
-            && matches!(t.split('.').count(), 3 | 5)
+            && t.split('.').count() == 5
             && t.split('.').all(|p| {
                 p.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -358,6 +372,7 @@ impl Ctx {
         }
         let stripped = strip_credentials(s);
         let value = bounded_owned(&stripped, MAX_STRING_BYTES);
+        drop(stripped);
         if value.trim().is_empty() {
             return;
         }
@@ -872,6 +887,17 @@ mod tests {
             "privateKey",
             "KeyStoreLocation",
             "monkey",
+            "Authorization",
+            "basicAuthUsername",
+            "Cookie",
+            "bearerValue",
+            "clientPwd",
+            "passphrase",
+            "hashSalt",
+            "cipherExecutor",
+            "signingAlgorithm",
+            "httpHeaders",
+            "headers",
         ] {
             assert!(is_credential_key(k), "{k}");
         }
@@ -887,6 +913,60 @@ mod tests {
         }
     }
 
+    /// HTTP-based policies carry credentials in headers, basic
+    /// authentication fields and URLs (review of #138 M2).
+    #[test]
+    fn http_policies_keep_no_credential() {
+        let doc = r#"{
+          "@class": "org.apereo.cas.services.CasRegisteredService",
+          "serviceId": "^https://app.example.org/.*", "name": "App",
+          "attributeReleasePolicy": {
+            "@class": "org.apereo.cas.services.ReturnRestfulAttributeReleasePolicy",
+            "endpoint": "https://svc:fake-pa/ss@attrs.example.org/release?apikey=FAKE-QUERY",
+            "headers": {"@class": "java.util.LinkedHashMap",
+                        "Authorization": "Basic RkFLRS1IRUFERVI=", "X-Trace": "FAKE-TRACE"}
+          },
+          "accessStrategy": {
+            "@class": "org.apereo.cas.services.RemoteEndpointServiceAccessStrategy",
+            "endpointUrl": "//fake-user:fake-pwd@authz.example.org/check",
+            "acceptableResponseCodes": "200,202",
+            "httpHeaders": [{"name": "Cookie", "value": "FAKE-COOKIE"}],
+            "basicAuthUsername": "FAKE-USER", "basicAuthPassword": "FAKE-BASIC"
+          },
+          "proxyPolicy": {
+            "@class": "org.apereo.cas.services.RestfulRegisteredServiceProxyPolicy",
+            "endpoint": "https://proxy.example.org/p#FAKE-FRAGMENT",
+            "headers": {"Cookie": "TGC=FAKE-TGC"}
+          },
+          "ticketGrantingTicketExpirationPolicy": {
+            "@class": "org.apereo.cas.services.DefaultRegisteredServiceTicketGrantingTicketExpirationPolicy",
+            "requestHeaders": {"Authorization": "Bearer FAKE-BEARER"}
+          }
+        }"#;
+        let d = parse_definition(doc.as_bytes()).unwrap();
+        let p = paths(&d);
+        for (_, v) in &p {
+            for bad in [
+                "FAKE-",
+                "fake-pa",
+                "ss@",
+                "fake-user",
+                "fake-pwd",
+                "RkFLRS",
+                "apikey",
+            ] {
+                assert!(!v.contains(bad), "{bad} in {v}");
+            }
+        }
+        let kept: Vec<&str> = p.iter().map(|(_, v)| v.as_str()).collect();
+        assert!(
+            kept.contains(&"https://attrs.example.org/release"),
+            "{kept:?}"
+        );
+        assert!(kept.contains(&"//authz.example.org/check"), "{kept:?}");
+        assert!(kept.contains(&"https://proxy.example.org/p"), "{kept:?}");
+    }
+
     #[test]
     fn secret_forms() {
         assert_eq!(SecretForm::of(""), SecretForm::Absent);
@@ -897,8 +977,17 @@ mod tests {
         );
         assert_eq!(SecretForm::of("{cipher}AbCd"), SecretForm::Encrypted);
         assert_eq!(
-            SecretForm::of("eyJhbGciOiJIUzUxMiJ9.ZmFrZQ.c2ln"),
+            SecretForm::of("eyJhbGciOiJSU0EtT0FFUCJ9.a2V5.aXY.Y2lwaGVy.dGFn"),
             SecretForm::Encrypted
+        );
+        // A JWS (here `alg: none`) is readable: clear.
+        assert_eq!(
+            SecretForm::of("eyJhbGciOiJub25lIn0.ZmFrZQ."),
+            SecretForm::Clear
+        );
+        assert_eq!(
+            SecretForm::of("eyJhbGciOiJIUzUxMiJ9.ZmFrZQ.c2ln"),
+            SecretForm::Clear
         );
         assert_eq!(SecretForm::of("eyJ.a.b.c"), SecretForm::Clear);
         assert_eq!(SecretForm::of("fake-secret"), SecretForm::Clear);

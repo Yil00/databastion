@@ -9,7 +9,9 @@
 //!   service type, `object` = the service's normalized name when every
 //!   value of the pool comes from services of that one name, else `*`,
 //!   `field` = the normalized path. `sampled` counts values,
-//!   `estimated_rows` the services. Credential fields are never sampled;
+//!   `estimated_rows` the services. At most [`MAX_POOLED_BYTES`] of values
+//!   and the compiled-pattern budget of [`crate::registry`] per scan.
+//!   Credential fields are never sampled;
 //!   `clientSecret` only gives the count of services holding one in clear
 //!   ([`RegistryFacts::clear_secrets`]).
 //! - **Audit log**: the `who` of `AUTHENTICATION_SUCCESS` records in the
@@ -47,6 +49,9 @@ use crate::state::{CasState, RegistryFacts};
 pub const AUDIT_TAIL_BYTES: u64 = 1024 * 1024;
 /// Most (service type, field) pools kept per scan.
 pub const MAX_POOLS: usize = 4096;
+/// Most bytes of values pooled per scan (review of #138 L6): values beyond
+/// it are not kept, and their file counts as skipped for a limit.
+pub const MAX_POOLED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Why a scan stopped (never a value, a path or a file name).
 #[derive(Debug, thiserror::Error)]
@@ -168,7 +173,7 @@ async fn scan_registry(
     };
     let mut facts = RegistryFacts {
         skipped: listing.over_cap,
-        clear_secrets: 0,
+        ..RegistryFacts::default()
     };
     cover(sink, |c| c.limit = listing.over_cap);
     let mut names = listing.files.clone();
@@ -176,19 +181,22 @@ async fn scan_registry(
     let mut index = ServiceIndex::default();
     let mut pools: HashMap<(ServiceType, String), Pool> = HashMap::new();
     let max_values = usize::try_from(job.sample_rows()).unwrap_or(usize::MAX);
+    let mut pooled_bytes = 0usize;
     for (i, name) in names.iter().enumerate() {
         let l = Arc::clone(&listing);
         let name = name.clone();
         let paced = job
             .paced(tokio::task::spawn_blocking(move || {
-                match l.read(&name, policy) {
+                // Reading and parsing one file are isolated together: a
+                // panic costs that file only (review of #138 I6).
+                databastion_core::isolate(|| match l.read(&name, policy) {
                     Err(skip) => FileOutcome::Skipped(skip),
-                    Ok(bytes) => match databastion_core::isolate(|| parse_definition(&bytes)) {
-                        None => FileOutcome::Panicked,
-                        Some(Err(e)) => FileOutcome::Refused(e),
-                        Some(Ok(d)) => FileOutcome::Parsed(d),
+                    Ok(bytes) => match parse_definition(&bytes) {
+                        Err(e) => FileOutcome::Refused(e),
+                        Ok(d) => FileOutcome::Parsed(d),
                     },
-                }
+                })
+                .unwrap_or(FileOutcome::Panicked)
             }))
             .await?;
         let outcome = match paced {
@@ -206,6 +214,9 @@ async fn scan_registry(
             FileOutcome::Parsed(d) => d,
             other => {
                 facts.skipped = facts.skipped.saturating_add(1);
+                if matches!(other, FileOutcome::Skipped(FileSkip::Writable)) {
+                    facts.writable = facts.writable.saturating_add(1);
+                }
                 cover(sink, |c| match other {
                     FileOutcome::Skipped(FileSkip::TooLarge)
                     | FileOutcome::Refused(DefinitionError::Bounds) => c.limit = 1,
@@ -216,11 +227,12 @@ async fn scan_registry(
                 continue;
             }
         };
-        cover(sink, |c| c.sampled = 1);
         if def.client_secret == SecretForm::Clear {
             facts.clear_secrets = facts.clear_secrets.saturating_add(1);
         }
-        index.add(&def);
+        // A service beyond the compiled-pattern budget is indexed without
+        // its pattern (it never matches) and counted as a limit.
+        let mut limited = !index.add(&def);
         let object = object_name(&def);
         let service_type = def.service_type;
         for s in def.values {
@@ -244,9 +256,24 @@ async fn scan_registry(
                 }
             }
             if pool.values.len() < max_values {
-                pool.values.push(s.value);
+                let len = s.value.len();
+                if pooled_bytes.saturating_add(len) > MAX_POOLED_BYTES {
+                    limited = true;
+                } else {
+                    pooled_bytes += len;
+                    pool.values.push(s.value);
+                }
             }
         }
+        // A file whose values did not all fit the scan's budgets counts as
+        // skipped for a limit, otherwise as sampled.
+        cover(sink, |c| {
+            if limited {
+                c.limit = 1;
+            } else {
+                c.sampled = 1;
+            }
+        });
     }
     index.finish();
     state.note_registry(facts, Some(Arc::new(index)));
@@ -460,7 +487,8 @@ mod tests {
             snap.registry,
             Some(RegistryFacts {
                 skipped: 2,
-                clear_secrets: 1
+                clear_secrets: 1,
+                writable: 0,
             })
         );
         assert_eq!(state.services().unwrap().len(), 2);
