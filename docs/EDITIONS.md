@@ -8,10 +8,10 @@ DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-ope
 │               (this repository, public)                  │
 │  • Console: agents, targets, findings, incidents         │
 │  • Agent + PostgreSQL, MySQL/MariaDB, MongoDB,           │
-│    OpenLDAP connectors (CAS and more engines planned)    │
+│    OpenLDAP, Apereo CAS connectors (more planned)        │
 │  • Discovery + Audit, standard classifiers               │
 │  • Simple policies, email / webhook alerting             │
-│  • Local auth + OIDC                                     │
+│  • Local auth + OIDC single sign-on (ADR-0038)           │
 │  • Console audit log                                     │
 │  • Prometheus metrics, Docker Compose                    │
 └──────────────────────────────────────────────────────────┘
@@ -36,7 +36,7 @@ DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-ope
 2. **Enterprise adds scale, governance and integration**, not baseline security.
 3. A Community feature is never removed to be moved into Enterprise.
 
-> Difference from the initial table: **OIDC** and the baseline **audit log** stay in Community. What moves to Enterprise is SAML/SCIM and the *advanced* audit log (export, retention, tamper-proofing).
+> Difference from the initial table: **OIDC** and the baseline **audit log** stay in Community. OIDC login is implemented in this repository ([ADR-0038](adr/0038-console-oidc-login.md), on `dev`, in the next release), with group-to-role mapping onto the two Community roles (`admin`, `analyst`); per-target or per-team roles remain Enterprise (fine-grained RBAC). What moves to Enterprise is SAML/SCIM and the *advanced* audit log (export, retention, tamper-proofing).
 
 Prevention: the Community edition offers recommended actions and response hooks, never in the data path; the blocking proxy, session kill and grant revocation are Enterprise ([ADR-0040](adr/0040-prevention-mode-scope.md)).
 
