@@ -549,7 +549,9 @@ jobs:
           export DATABASTION_TEST_LDAPS_URL="ldaps://localhost:${LDAPS_PORT}"
           export DATABASTION_TEST_LDAP_CA_FILE="$RUNNER_TEMP/ldap-ca.pem"
           export DATABASTION_TEST_LDAP_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapsearch -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}' -b dc=example,dc=org -E pr=20/noprompt '(objectClass=*)'"
-          export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls
+          # CAS store guard (ADR-0041 decision 14): the test writes its fixture entries as the admin.
+          export DATABASTION_TEST_LDAP_MODIFY_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapmodify -c -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}'"
+          export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls,ldap-modify
           (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
       # Phase 7: SASL EXTERNAL over ldapi:// against the real slapd. The socket directory is published
       # to the runner (compose override) and olcAuthzRegexp maps the runner's uid to the service DN.
