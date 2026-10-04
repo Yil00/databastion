@@ -5,7 +5,7 @@ import { and, eq, gt, lte, ne, or, sql } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { sessions, users } from "@/db/schema";
 import { randomToken, safeEqual, sha256Hex } from "@/server/crypto";
-import { revokeRefreshTokensInBackground } from "@/server/oidc/revoke";
+import { revokeRefreshTokensInBackground, type EndedSessionRow } from "@/server/oidc/revoke";
 import { encryptRefreshToken } from "@/server/oidc/tokens";
 
 /**
@@ -179,22 +179,31 @@ export async function purgeStaleSessions(db: Database): Promise<number> {
 }
 
 /** Ends every session of a user except `keepTokenHash` (a demotion at login or refresh, ADR-0038 decision 9). */
-export async function revokeOtherSessions(db: Pick<Database, "delete">, userId: string, keepTokenHash: string | null): Promise<number> {
+/**
+ * Revocation of the refresh tokens of deleted rows: into `deferred` when the caller runs in a
+ * transaction (it schedules them after the commit, so a rollback revokes nothing), else now.
+ */
+function ended(rows: EndedSessionRow[], deferred: EndedSessionRow[] | undefined): void {
+  if (deferred) deferred.push(...rows);
+  else revokeRefreshTokensInBackground(rows);
+}
+
+export async function revokeOtherSessions(db: Pick<Database, "delete">, userId: string, keepTokenHash: string | null, deferred?: EndedSessionRow[]): Promise<number> {
   const where = keepTokenHash === null ? eq(sessions.userId, userId) : and(eq(sessions.userId, userId), ne(sessions.tokenHash, keepTokenHash));
   const rows = await db.delete(sessions).where(where).returning(ENDED);
-  revokeRefreshTokensInBackground(rows);
+  ended(rows, deferred);
   return rows.length;
 }
 
 /** Ends every session of a user (password change, account disabled, suspected compromise). */
-export async function revokeAllSessions(db: Pick<Database, "delete">, userId: string): Promise<number> {
-  return revokeOtherSessions(db, userId, null);
+export async function revokeAllSessions(db: Pick<Database, "delete">, userId: string, deferred?: EndedSessionRow[]): Promise<number> {
+  return revokeOtherSessions(db, userId, null, deferred);
 }
 
 /** Ends the sessions opened with one OIDC identity (before unlinking it). */
-export async function revokeIdentitySessions(db: Pick<Database, "delete">, identityId: string): Promise<number> {
+export async function revokeIdentitySessions(db: Pick<Database, "delete">, identityId: string, deferred?: EndedSessionRow[]): Promise<number> {
   const rows = await db.delete(sessions).where(eq(sessions.identityId, identityId)).returning(ENDED);
-  revokeRefreshTokensInBackground(rows);
+  ended(rows, deferred);
   return rows.length;
 }
 

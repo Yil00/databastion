@@ -450,11 +450,35 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     expect((await oidcFailedCallbacks.checkShared("global")).limited).toBe(false);
     const ok = await oidcLogin("sub-after-flood", { preferred_username: "after.flood", groups: [] });
     expect(ok.res.status).toBe(200);
-    // A failed code exchange after a valid state is charged to the global budget.
+    // An id_token refused after a successful exchange (a provider-issued code) is charged.
     const before = await oidcFailedCallbacks.countShared("global");
     const s = await start();
-    expect((await callback(s, { code: "unknown-code" })).status).toBe(400);
+    fp.codes.set("bad-nonce", { claims: idClaims(fp, "sub-x", "w".repeat(43), { preferred_username: "x" }) });
+    expect((await callback(s, { code: "bad-nonce" })).status).toBe(400);
     expect(await oidcFailedCallbacks.countShared("global")).toBe(before + 1);
+  });
+
+  it("own state + garbage code, repeated from many IPs or with no trusted proxy, never locks out SSO (re-review M1-residual)", async () => {
+    configure({ DATABASTION_OIDC_ALLOW_SIGN_UP: "1" });
+    oidcFailedCallbacks.clear();
+    delete process.env.DATABASTION_TRUSTED_PROXY_HOPS;
+    for (let i = 0; i < 310; i++) {
+      const s = await start();
+      expect((await callback(s, { code: `garbage-${i}` })).status).toBe(400);
+    }
+    process.env.DATABASTION_TRUSTED_PROXY_HOPS = "1";
+    for (let ip = 0; ip < 40; ip++) {
+      const h = { "X-Forwarded-For": `198.51.100.${ip + 10}` };
+      for (let i = 0; i < 8; i++) {
+        const s = await start(h);
+        await callback(s, { code: `garbage-${ip}-${i}` }, h);
+      }
+    }
+    expect(await oidcFailedCallbacks.countShared("global")).toBe(0);
+    expect(await denials("token")).toBeGreaterThanOrEqual(310);
+    const ok = await oidcLogin("sub-after-garbage", { preferred_username: "after.garbage", groups: [] });
+    expect(ok.res.status).toBe(200);
+    delete process.env.DATABASTION_TRUSTED_PROXY_HOPS;
   });
 
   it("role sync never demotes the last enabled admin, and alerts on a break-glass demotion (review L3)", async () => {
@@ -514,5 +538,23 @@ describe.skipIf(!hasDb)("OIDC login flow (PostgreSQL, fake provider)", () => {
     // The unlinked identity is now unknown: no login into Carol's account.
     configure();
     expect((await oidcLogin("sub-carol", { preferred_username: "carol.sso", groups: [] })).res.status).toBe(400);
+  });
+
+  it("refuses to unlink a local user's last identity when the local login is unavailable to them (re-review L-b)", async () => {
+    configure();
+    process.env.DATABASTION_LOCAL_LOGIN = "enabled";
+    const admin = await localLogin("root");
+    const [mia] = await getDb().insert(users).values({ username: "mia", passwordHash: await argon2Hash(PASSWORD), role: "analyst" }).returning({ id: users.id });
+    const [ident] = await getDb().insert(userIdentities).values({ userId: mia?.id ?? "", issuer: fp.issuer, subject: "sub-mia" }).returning({ id: userIdentities.id });
+    const unlink = () => handleUnlinkIdentity(userReq("POST", `/api/users/${mia?.id}/identities/${ident?.id}/unlink`, { cookie: admin.cookie, csrf: admin.csrf }), mia?.id ?? "", ident?.id ?? "");
+    process.env.DATABASTION_LOCAL_LOGIN = "disabled";
+    let res = await unlink();
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "no_other_login_method" });
+    process.env.DATABASTION_LOCAL_LOGIN = "admins"; // mia is an analyst
+    expect((await unlink()).status).toBe(409);
+    process.env.DATABASTION_LOCAL_LOGIN = "enabled";
+    res = await unlink();
+    expect(res.status).toBe(200);
   });
 });

@@ -4,6 +4,7 @@ import type { Database } from "@/db/client";
 import { meta, oidcPendingLogins, userIdentities, users } from "@/db/schema";
 import { writeAudit } from "@/server/audit";
 import { createSession, revokeOtherSessions } from "@/server/auth/session";
+import { revokeRefreshTokensInBackground, type EndedSessionRow } from "./revoke";
 import { consoleUrl } from "@/server/alerting-config";
 import { enqueueSystemAlert } from "@/server/notifications";
 
@@ -89,14 +90,24 @@ async function roleSyncAlert(tx: Tx, userId: string, username: string, kind: "la
  * role is kept, the refusal audited and alerted), and demoting an account that holds a local
  * password (a break-glass account) raises a system alert. A demotion ends the user's other sessions.
  */
-export async function syncRole(tx: Tx, userId: string, from: Role, to: Role, ctx: { ip: string | null; keepTokenHash: string | null }): Promise<Role> {
+export async function syncRole(
+  tx: Tx,
+  userId: string,
+  mappedFrom: Role,
+  to: Role,
+  ctx: { ip: string | null; keepTokenHash: string | null; ended: EndedSessionRow[] },
+): Promise<Role> {
+  if (mappedFrom === to) return mappedFrom;
+  // Lock order everywhere (re-review L-a): the user row first, then the admin-set lock, as in
+  // users-admin.ts. The row lock is free when the login path already holds it.
+  const [u] = await tx.select({ username: users.username, passwordHash: users.passwordHash, role: users.role }).from(users).where(eq(users.id, userId)).for("update");
+  if (!u) return mappedFrom;
+  const from = u.role;
   if (from === to) return from;
   const demotion = from === "admin";
   if (demotion) {
     await tx.execute(sql`select pg_advisory_xact_lock(${ADMIN_SET_LOCK})`);
   }
-  const [u] = await tx.select({ username: users.username, passwordHash: users.passwordHash }).from(users).where(eq(users.id, userId));
-  if (!u) return from;
   if (demotion && !(await otherEnabledAdmin(tx, userId))) {
     await writeAudit(tx, {
       actorType: "system",
@@ -120,7 +131,7 @@ export async function syncRole(tx: Tx, userId: string, from: Role, to: Role, ctx
     details: { source: "oidc", from, to },
   });
   if (demotion) {
-    await revokeOtherSessions(tx, userId, ctx.keepTokenHash);
+    await revokeOtherSessions(tx, userId, ctx.keepTokenHash, ctx.ended);
     if (u.passwordHash !== null) await roleSyncAlert(tx, userId, u.username, "local_admin_demoted");
   }
   return to;
@@ -144,6 +155,8 @@ export async function completeOidcLogin(
   refreshToken: string | null,
   actor: Actor,
 ): Promise<LoginOutcome> {
+  // Sessions ended by a demotion: their refresh tokens are revoked only after the commit.
+  const ended: EndedSessionRow[] = [];
   const outcome = await db.transaction(async (tx): Promise<LoginOutcome | { pending: true }> => {
     const [found] = await tx
       .select({ identityId: userIdentities.id, userId: users.id, role: users.role, disabledAt: users.disabledAt })
@@ -160,7 +173,7 @@ export async function completeOidcLogin(
       identityId = found.identityId;
       if (!cfg.skipRoleSync && found.role !== id.effectiveRole) {
         // A demotion ends every existing session of the user (the new one carries the new role).
-        await syncRole(tx, userId, found.role, id.effectiveRole, { ip: actor.ip, keepTokenHash: null });
+        await syncRole(tx, userId, found.role, id.effectiveRole, { ip: actor.ip, keepTokenHash: null, ended });
       }
       await bumpIdentity(tx, identityId, id.mapped);
     } else {
@@ -208,6 +221,7 @@ export async function completeOidcLogin(
     });
     return { ok: true, userId, session };
   });
+  revokeRefreshTokensInBackground(ended);
   if ("pending" in outcome) return { ok: false, reason: "sign_up", userId: null };
   return outcome;
 }

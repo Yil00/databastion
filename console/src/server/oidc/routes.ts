@@ -32,10 +32,10 @@ import {
  * - per client IP (when known), only unfinished or failed flows count: a `/start` (or link start)
  *   is given back when its callback succeeds, and a callback reservation is refunded on success,
  *   so many users behind one NAT address are not throttled by their successful logins;
- * - globally, only failures AFTER a valid, unconsumed state cookie that come from the code
- *   exchange or the `id_token` validation are charged, and the global budget is checked only once
- *   the state cookie is valid: cookie-less or garbage callbacks cost their sender's per-IP budget
- *   only and cannot block single sign-on for everyone.
+ * - globally, only `id_token` refusals after a successful code exchange (a code the provider
+ *   issued) are charged, and the budget is checked only once the state cookie is valid: cookie-less
+ *   or forged callbacks, codes the token endpoint rejects and transport errors cost their sender's
+ *   per-IP budget only and cannot block single sign-on for everyone.
  */
 export const OIDC_IPV6_PREFIX = 56;
 export const oidcStartPerIp = RateLimiter.shared("oidc.start_per_ip", 60, 5 * 60_000, "closed");
@@ -146,9 +146,14 @@ export async function handleOidcCallback(req: Request): Promise<Response> {
     await auditDenied(db, reason, { ip, userId: userId ?? linkUserId, purpose });
     return failurePage(reason === "rate_limited" ? 429 : 400);
   };
-  /** A code exchange or `id_token` failure after a valid state: charged to the global budget. */
+  /**
+   * Charged to the global budget only for failures that need a code the provider actually issued
+   * (re-review M1-residual): an `id_token` refused after a successful exchange (`id_token`,
+   * `nonce`, `iss`, stale `auth_time`). A code the token endpoint rejects (`token`), or a transport
+   * error (`provider_error`), costs the sender's per-IP budget only: anyone can forge those.
+   */
   const denyCharged = async (reason: LoginDeniedReason): Promise<Response> => {
-    if (stateConsumed) await oidcFailedCallbacks.hitShared("global");
+    if (stateConsumed && (reason === "id_token" || reason === "nonce" || reason === "iss")) await oidcFailedCallbacks.hitShared("global");
     return deny(reason);
   };
   try {
@@ -230,7 +235,7 @@ export async function handleOidcCallback(req: Request): Promise<Response> {
     if (err instanceof OidcFlowError) return denyCharged(err.reason);
     logger.warn({ component: "oidc", error: errorSummary(err) }, "OIDC callback failed");
     try {
-      return await denyCharged("provider_error");
+      return await deny("provider_error");
     } catch {
       return failurePage(500);
     }

@@ -11,6 +11,8 @@ import { decryptRefreshToken } from "./tokens";
  * call, two attempts each. Tokens are never logged.
  */
 export const MAX_REVOCATIONS_PER_CALL = 100;
+/** Background revocation jobs per process; beyond, new ones are skipped (logged), never queued. */
+export const MAX_CONCURRENT_REVOCATION_JOBS = 8;
 
 const pending = processGlobal("oidc.pendingRevocations", () => new Set<Promise<void>>());
 
@@ -27,6 +29,10 @@ export function revokeRefreshTokensInBackground(rows: readonly EndedSessionRow[]
     .map((r) => decryptRefreshToken(r.enc, r.h))
     .filter((t): t is string => t !== null);
   if (tokens.length === 0) return;
+  if (pending.size >= MAX_CONCURRENT_REVOCATION_JOBS) {
+    logger.warn({ component: "oidc", skipped: tokens.length }, "OIDC refresh token revocation skipped: too many revocations in progress (best effort)");
+    return;
+  }
   const job = (async () => {
     try {
       // Imported lazily: auth/session.ts imports this module (no static import cycle).

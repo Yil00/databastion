@@ -257,8 +257,10 @@ session** (Account page, "Link single sign-on"). The link flow asks the provider
 authentication (`prompt=login`, `max_age=0`) and refuses an `id_token` whose `auth_time` is older
 than the start of the link (60 s of skew); the Account page then shows the linked issuer and
 subject. Administrators cannot link an identity to someone else's account, but can **unlink** one
-(Users page, `user.identity_unlink`; its sessions end), except the only identity of a single sign-on
-user. They approve pending logins only as **new** users, choosing the role. Pending
+(Users page, `user.identity_unlink`; its sessions end), unless it would leave the user without a
+login method: the only identity of a single sign-on user (`409 last_identity`), or the only identity
+of a local user who cannot use the local login in the current `DATABASTION_LOCAL_LOGIN` mode
+(`disabled`, or `admins` for a non-administrator: `409 no_other_login_method`). They approve pending logins only as **new** users, choosing the role. Pending
 logins show the issuer and subject first and flag `email_verified: false`; they expire after 7 days
 and are capped at 1000 (the least recent attempt is evicted; evictions are counted and shown).
 
@@ -292,8 +294,9 @@ the provider advertises an `end_session_endpoint` or `DATABASTION_OIDC_SIGNOUT_R
 **Residual risk**: without refresh, a user disabled at the provider keeps their console session up
 to `DATABASTION_OIDC_SESSION_MAX_AGE`. Refresh tokens of sessions that end otherwise (user disabled,
 demotion, unlinked identity, expired or idle sessions purged, failed refresh) are revoked at the
-provider in the background, best effort (two attempts, at most 100 per action): the local action
-never waits for the provider. After a logout the browser lands on `/login?logged_out=1`, where
+provider in the background, best effort (two attempts, at most 100 per action, at most 8 such jobs
+at a time per process, beyond which they are skipped and logged), scheduled only after the change
+is committed: the local action never waits for the provider. After a logout the browser lands on `/login?logged_out=1`, where
 auto-login does not apply (it would sign the user straight back in).
 
 **Role sync guards** (security review L3): role sync never demotes the **last enabled
@@ -310,10 +313,12 @@ refreshed as described above.
 only unfinished or failed flows count, so many users behind one NAT address are not throttled
 (security review M1). Per client IP (when known), per 5 minutes: 60 starts (`/api/auth/oidc/start`
 and the link start; a start is given back when its callback succeeds) and 30 callbacks (refunded on
-success). Globally: 300 failed callbacks per 5 minutes, counting only failures of the code exchange
-or of the `id_token` validation after a valid, unconsumed state cookie, and checked only once the
-state cookie is valid: cookie-less or forged callbacks cost their sender's per-IP budget only, so
-they cannot block single sign-on for everyone.
+success). Globally: 300 failed callbacks per 5 minutes, counting only `id_token` refusals after a
+successful code exchange (`id_token`, `nonce`, `iss`, a stale `auth_time` on a link), which need a
+code the provider issued, and checked only once the state cookie is valid. Cookie-less or forged
+callbacks, codes the token endpoint rejects (anyone can start a flow and send a garbage code) and
+transport errors cost their sender's per-IP budget only, so they cannot block single sign-on for
+everyone (security review M1).
 
 **Audit log**: `user.login` (`details.method = oidc`), `user.login_denied` with a reason from a
 closed list (`state`, `nonce`, `iss`, `token`, `id_token`, `provider_error`, `rate_limited` (at most
@@ -353,7 +358,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `GET /api/auth/oidc/callback` | OIDC only: the provider's redirect (`query` mode); answers a same-origin page navigating to `/agents` (or a generic failure page) |
 | `POST /api/auth/oidc/link` | "Link single sign-on" (CSRF, local session only, `409 local_session_required` otherwise): `200 {redirect_url}` |
 | `GET` / `POST /api/users` | List users / create a local user `{username, password, role}` (admin, CSRF); `201 {userId}`, `409 username_taken`. Audited `user.create` |
-| `POST /api/users/{id}/identities/{identity_id}/unlink` | Unlink an OIDC identity (admin, CSRF): its sessions end; `409 last_identity` for the only identity of a single sign-on user. Audited `user.identity_unlink` |
+| `POST /api/users/{id}/identities/{identity_id}/unlink` | Unlink an OIDC identity (admin, CSRF): its sessions end; `409 last_identity` for the only identity of a single sign-on user, `409 no_other_login_method` for the only identity of a local user the current `DATABASTION_LOCAL_LOGIN` mode keeps out. Audited `user.identity_unlink` |
 | `PATCH /api/users/{id}` | `{role}` or `{disabled}` (admin, CSRF). `409 self`, `409 last_admin` (the console keeps one enabled administrator), `409 role_managed_by_provider` (an SSO-bound user while role sync is on). Disabling ends the user's sessions. Audited `user.role_change` (source `user`) / `user.disable` / `user.enable` |
 | `GET /api/oidc/pending-logins` | Pending OIDC logins and the eviction count (admin) |
 | `POST` / `DELETE /api/oidc/pending-logins/{id}` | Approve as a NEW user `{role}` (`201 {userId}`; `409 username_taken`, `identity_bound`, `invalid_login`) / discard (admin, CSRF). Audited |

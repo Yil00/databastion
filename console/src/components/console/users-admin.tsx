@@ -49,6 +49,7 @@ const ERRORS: Record<string, string> = {
   invalid_password: "The password must be 12 to 1024 characters long.",
   not_found: "Not found (already handled or expired).",
   last_identity: "This single sign-on user has no other login method: disable the user instead.",
+  no_other_login_method: "The local login is not available to this user (DATABASTION_LOCAL_LOGIN): unlinking would leave no login method. Disable the user instead.",
 };
 
 async function errorOf(res: Response | null): Promise<string> {

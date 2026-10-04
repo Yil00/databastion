@@ -98,8 +98,8 @@ export async function checkIdToken(p: OidcProvider, md: ProviderMetadata, idToke
       if (err.failure === "iss") throw new OidcFlowError("iss");
       throw new OidcFlowError("id_token");
     }
-    // JWKS unavailable.
-    throw new OidcFlowError("id_token");
+    // JWKS unavailable (transport): not an id_token refusal, not charged to the global budget.
+    throw new OidcFlowError("provider_error");
   }
 }
 

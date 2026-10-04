@@ -4,6 +4,9 @@ import type { Database } from "@/db/client";
 import { oidcPendingLogins, userIdentities, users } from "@/db/schema";
 import { writeAudit } from "@/server/audit";
 import { revokeAllSessions, revokeIdentitySessions } from "@/server/auth/session";
+import type { LocalLoginMode } from "@/server/oidc/config";
+import { revokeRefreshTokensInBackground, type EndedSessionRow } from "@/server/oidc/revoke";
+import { currentLocalLoginMode } from "@/server/oidc/runtime";
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, USERNAME } from "@/server/auth/users";
 import { argon2Hash } from "@/server/crypto";
 import { ADMIN_SET_LOCK, pendingEvictions } from "@/server/oidc/service";
@@ -179,7 +182,8 @@ async function otherEnabledAdmin(tx: Pick<Database, "select">, userId: string): 
  */
 export async function setUserRole(db: Database, id: string, role: Role, actor: AdminActor, roleSyncOn: boolean): Promise<AdminResult> {
   if (id === actor.userId) return fail(409, "self");
-  return db.transaction(async (tx) => {
+  const ended: EndedSessionRow[] = [];
+  const r = await db.transaction(async (tx): Promise<AdminResult> => {
     // Lock order everywhere: the user row, then the admin-set lock (as OIDC role sync does).
     const [u] = await tx.select({ role: users.role }).from(users).where(eq(users.id, id)).for("update");
     if (!u) return fail(404, "not_found");
@@ -191,7 +195,7 @@ export async function setUserRole(db: Database, id: string, role: Role, actor: A
     }
     if (u.role === "admin" && !(await otherEnabledAdmin(tx, id))) return fail(409, "last_admin");
     await tx.update(users).set({ role }).where(eq(users.id, id));
-    if (u.role === "admin") await revokeAllSessions(tx as unknown as Database, id);
+    if (u.role === "admin") await revokeAllSessions(tx, id, ended);
     await writeAudit(tx, {
       actorType: "user",
       actorId: actor.userId,
@@ -203,19 +207,23 @@ export async function setUserRole(db: Database, id: string, role: Role, actor: A
     });
     return { ok: true as const };
   });
+  // Refresh tokens of the ended sessions: revoked only once the change is committed.
+  revokeRefreshTokensInBackground(ended);
+  return r;
 }
 
 /** Disables (ends every session; no login by any method, decision 8) or re-enables a user. */
 export async function setUserDisabled(db: Database, id: string, disabled: boolean, actor: AdminActor): Promise<AdminResult> {
   if (id === actor.userId) return fail(409, "self");
-  return db.transaction(async (tx) => {
+  const ended: EndedSessionRow[] = [];
+  const r = await db.transaction(async (tx): Promise<AdminResult> => {
     const [u] = await tx.select({ role: users.role, disabledAt: users.disabledAt }).from(users).where(eq(users.id, id)).for("update");
     if (!u) return fail(404, "not_found");
     await tx.execute(sql`select pg_advisory_xact_lock(${ADMIN_SET_LOCK})`);
     if ((u.disabledAt !== null) === disabled) return { ok: true as const };
     if (disabled && u.role === "admin" && !(await otherEnabledAdmin(tx, id))) return fail(409, "last_admin");
     await tx.update(users).set({ disabledAt: disabled ? sql`now()` : null }).where(eq(users.id, id));
-    if (disabled) await revokeAllSessions(tx as unknown as Database, id);
+    if (disabled) await revokeAllSessions(tx, id, ended);
     await writeAudit(tx, {
       actorType: "user",
       actorId: actor.userId,
@@ -226,6 +234,8 @@ export async function setUserDisabled(db: Database, id: string, disabled: boolea
     });
     return { ok: true as const };
   });
+  revokeRefreshTokensInBackground(ended);
+  return r;
 }
 
 /** The current user's own account view (`/account`). */
@@ -235,7 +245,9 @@ export async function accountView(db: Database, userId: string): Promise<UserVie
   const idents = await db
     .select({ id: userIdentities.id, issuer: userIdentities.issuer, subject: userIdentities.subject, email: userIdentities.email })
     .from(userIdentities)
-    .where(eq(userIdentities.userId, userId));
+    .where(eq(userIdentities.userId, userId))
+    // Most recently linked first (re-review L-c: the success message names the new link).
+    .orderBy(desc(userIdentities.createdAt));
   return {
     id: u.id,
     username: u.username,
@@ -251,18 +263,26 @@ export async function accountView(db: Database, userId: string): Promise<UserVie
 
 /**
  * Unlinks an OIDC identity from a user (security review L1: undo a wrong self-service link). The
- * sessions opened with that identity end (their refresh tokens are revoked in the background).
- * Refused for the only identity of a single sign-on user (it would have no login method left).
+ * sessions opened with that identity end (their refresh tokens are revoked after the commit).
+ * Refused when it would leave the user without any login method (re-review L-b):
+ * - `409 last_identity`: the only identity of a single sign-on user (no local password);
+ * - `409 no_other_login_method`: the only identity of a local user who cannot use the local login
+ *   in the current `DATABASTION_LOCAL_LOGIN` mode (`disabled`, or `admins` for a non-administrator).
  */
-export async function unlinkIdentity(db: Database, userId: string, identityId: string, actor: AdminActor): Promise<AdminResult> {
-  return db.transaction(async (tx) => {
-    const [u] = await tx.select({ ssoOnly: users.ssoOnly }).from(users).where(eq(users.id, userId)).for("update");
+export async function unlinkIdentity(db: Database, userId: string, identityId: string, actor: AdminActor, mode: LocalLoginMode = currentLocalLoginMode()): Promise<AdminResult> {
+  const ended: EndedSessionRow[] = [];
+  const r = await db.transaction(async (tx): Promise<AdminResult> => {
+    const [u] = await tx.select({ ssoOnly: users.ssoOnly, role: users.role, passwordHash: users.passwordHash }).from(users).where(eq(users.id, userId)).for("update");
     if (!u) return fail(404, "not_found");
     const idents = await tx.select({ id: userIdentities.id, issuer: userIdentities.issuer, subject: userIdentities.subject }).from(userIdentities).where(eq(userIdentities.userId, userId));
     const ident = idents.find((i) => i.id === identityId);
     if (!ident) return fail(404, "not_found");
-    if (u.ssoOnly && idents.length === 1) return fail(409, "last_identity");
-    await revokeIdentitySessions(tx, identityId);
+    if (idents.length === 1) {
+      if (u.ssoOnly || u.passwordHash === null) return fail(409, "last_identity");
+      const localUsable = mode === "enabled" || (mode === "admins" && u.role === "admin");
+      if (!localUsable) return fail(409, "no_other_login_method");
+    }
+    await revokeIdentitySessions(tx, identityId, ended);
     await tx.delete(userIdentities).where(eq(userIdentities.id, identityId));
     await writeAudit(tx, {
       actorType: "user",
@@ -275,4 +295,6 @@ export async function unlinkIdentity(db: Database, userId: string, identityId: s
     });
     return { ok: true as const };
   });
+  revokeRefreshTokensInBackground(ended);
+  return r;
 }

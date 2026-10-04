@@ -8,6 +8,7 @@ import { deleteSession, OIDC_REFRESH_INTERVAL_MS, type Session } from "@/server/
 
 import { mapClaims } from "./claims";
 import { refreshTokens, withUserinfo } from "./client";
+import { revokeRefreshTokensInBackground, type EndedSessionRow } from "./revoke";
 import { syncRole } from "./service";
 import { oidcProvider } from "./runtime";
 import { decryptRefreshToken, encryptRefreshToken } from "./tokens";
@@ -63,7 +64,9 @@ export async function refreshOidcSession(db: Database, session: Session): Promis
       if (!mapping.ok) return end(`refresh_${mapping.reason}`);
       if (!provider.config.skipRoleSync && mapping.effectiveRole !== role) {
         const from = role;
-        role = await db.transaction((tx) => syncRole(tx, session.user.id, from, mapping.effectiveRole, { ip: null, keepTokenHash: session.tokenHash }));
+        const ended: EndedSessionRow[] = [];
+        role = await db.transaction((tx) => syncRole(tx, session.user.id, from, mapping.effectiveRole, { ip: null, keepTokenHash: session.tokenHash, ended }));
+        revokeRefreshTokensInBackground(ended);
       }
     }
     if (tokens.refreshToken !== null && tokens.refreshToken !== refreshToken) {
