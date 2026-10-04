@@ -39,7 +39,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_EVENT_INCIDENTS_PER_POLICY_HOUR` | Worker: new incidents an `access_event` policy may open per clock hour, 1 to 10000, default 50; beyond, the matches go to one overflow incident of the policy. See "Audit correlation" |
 | `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
-| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches, stopped Audit streams) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
+| `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches, stopped Audit streams, break-glass local administrator logins) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -48,6 +48,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_METRICS_HOST` | Bind address (IP literal) of that listener: `127.0.0.1` by default; `0.0.0.0` inside a container whose metrics port is not published. Invalid port / host: `/metrics` is disabled everywhere and an error is logged |
 | `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY=1` | Let the web and worker processes start in production without a usable `DATABASTION_ENCRYPTION_KEY(_FILE)` (see below; not recommended) |
 | `DATABASTION_INSECURE_COOKIES=1` | Drop `Secure` / `__Host-` from the session cookie in production (plain-HTTP test setups only; warned at startup) |
+| `DATABASTION_OIDC_*`, `DATABASTION_LOCAL_LOGIN` | Single sign-on with OpenID Connect and the local login mode: see "Single sign-on (OIDC)" |
 | `DATABASTION_BOOTSTRAP_ADMIN_USERNAME` | `pnpm admin:bootstrap` only: login of the first administrator |
 | `DATABASTION_BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | `pnpm admin:bootstrap` only: its password (12 to 1024 characters) |
 | `TEST_DATABASE_URL`, `PG_BIN` | Tests only: an existing admin URL, or the PostgreSQL binaries used to start a throwaway cluster (default `/usr/lib/postgresql/16/bin`) |
@@ -57,7 +58,8 @@ database (also used as the job queue: no Redis). See
 [deploy/docker-compose.example.yml](../deploy/docker-compose.example.yml) (at least 32 characters,
 e.g. `openssl rand -base64 32`) is the console server key of the web and worker processes. It keys the agent "known good" fingerprints (HKDF-SHA256
 subkey, domain `agent-known-good.v1`, see "Data at rest") and the login device cookies (domain
-`login-device.v1`, see "Brute-force protection") and encrypts masked samples at rest (domain
+`login-device.v1`, see "Brute-force protection"), encrypts the OIDC state cookie (`oidc-state.v1`)
+and refresh tokens (`oidc-tokens.v1`, see "Single sign-on (OIDC)") and encrypts masked samples at rest (domain
 `masked-samples.v1`, see "Data at rest") and the notification channel secrets (domain
 `notification-channels.v1`, see "Alerting"). **Set it in production: the shared-IP protection
 of agents (P1-D M1) and the device-cookie protection of logins (N1) require it.** Unset, too short
@@ -201,6 +203,116 @@ pnpm admin:bootstrap
 ```
 
 The command refuses to run once a user exists, and writes `user.bootstrap` to the audit log.
+Further local users are created by an administrator on the **Users** page (`/users`).
+
+## Single sign-on (OIDC)
+Decisions: [ADR-0038](../docs/adr/0038-console-oidc-login.md). OpenID Connect Authorization Code
+flow with PKCE (S256), confidential client, `query` response mode only; one provider per console.
+Libraries: [`jose`](https://github.com/panva/jose) (MIT, no dependencies) for the JWS signature
+check of the `id_token`, [`jmespath`](https://github.com/jmespath/jmespath.js) (Apache-2.0, no
+dependencies) for the claim expressions. Code: `src/server/oidc/`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASTION_OIDC_ENABLED` | unset | `1` turns OIDC on. Then the issuer, client id, client secret, `DATABASTION_PUBLIC_URL` and a usable `DATABASTION_ENCRYPTION_KEY(_FILE)` are required, or the web and worker processes **refuse to start** (any environment; `DATABASTION_ALLOW_MISSING_ENCRYPTION_KEY` does not apply) |
+| `DATABASTION_OIDC_ISSUER_URL` | | Exact issuer, e.g. `https://sso.example.com/realms/acme`. The console reads `<issuer>/.well-known/openid-configuration` and requires its `issuer` to be **exactly** this value. `https://` only (`http://` on a loopback address outside production) |
+| `DATABASTION_OIDC_CLIENT_ID` | | Client id of the confidential client |
+| `DATABASTION_OIDC_CLIENT_SECRET` / `_FILE` | | Client secret (never both). Never logged nor written in an error |
+| `DATABASTION_OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | or `client_secret_post` (weaker: the secret travels in the request body, where proxies and provider logs are more likely to record it) |
+| `DATABASTION_OIDC_SCOPES` | `openid profile email` | Space- or comma-separated; `openid` is always added. Add the scope that releases your groups claim if needed |
+| `DATABASTION_OIDC_DISPLAY_NAME` | `Single sign-on` | Label of the "Sign in with ..." button |
+| `DATABASTION_OIDC_ID_TOKEN_ALGS` | `RS256,PS256,ES256` | Allowed `id_token` algorithms, intersected with the provider's `id_token_signing_alg_values_supported`. Allowed values: `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`; `none` and `HS*` are refused at startup |
+| `DATABASTION_OIDC_CA_FILE` | unset | Extra CA (PEM) for the provider's endpoints, added to the system roots. There is no "skip verify" option |
+| `DATABASTION_OIDC_USE_USERINFO` | unset | `1`: call the userinfo endpoint; its `sub` must equal the `id_token`'s, and its claims are merged **under** those of the `id_token` |
+| `DATABASTION_OIDC_LOGIN_ATTRIBUTE_PATH` | `preferred_username` | JMESPath expression of the console username (display attribute). Lower-cased; must match `^[a-z0-9][a-z0-9._-]{0,63}$`, else the login is refused (`username`) |
+| `DATABASTION_OIDC_EMAIL_ATTRIBUTE_PATH` | `email` | Display attribute. `email_verified` is always read from the standard claim |
+| `DATABASTION_OIDC_NAME_ATTRIBUTE_PATH` | `name` | Display attribute |
+| `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH` | unset | Expression yielding an array of strings (at most 256, each at most 256 characters, else the login is refused) |
+| `DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH` | unset | Expression that must yield exactly `admin` or `analyst`, e.g. `contains(groups[*], 'databastion-admins') && 'admin' \|\| 'analyst'`. Anything else (another string, another case, a non-string, an evaluation error) is **no role**. Unset: roles are managed in the console (no role sync) |
+| `DATABASTION_OIDC_ROLE_ATTRIBUTE_STRICT` | `1` | A login whose role expression yields no role is refused (`role`). `0`: such a login gets `analyst`, never `admin` |
+| `DATABASTION_OIDC_ALLOWED_GROUPS` | unset | Comma-separated; when set, at least one mapped group must match (needs `GROUPS_ATTRIBUTE_PATH`) |
+| `DATABASTION_OIDC_ALLOWED_DOMAINS` | unset | Comma-separated domains; when set, `email_verified` must be `true` and the domain after the **last** `@` must equal one of them exactly (case-insensitive). Never a suffix match: `example.com` admits neither `evil-example.com` nor `sub.example.com` |
+| `DATABASTION_OIDC_ALLOW_SIGN_UP` | `0` | `1`: an unknown identity that passes the filters becomes a console user. The console refuses to start unless `ALLOWED_GROUPS` is set, or `ROLE_ATTRIBUTE_PATH` with strict mode. `0`: the attempt is refused and recorded as a **pending login** (Users page) |
+| `DATABASTION_OIDC_SKIP_ROLE_SYNC` | unset | `1`: roles are managed in the console; a user created by sign-up starts with the mapped role under strict mode, else `analyst` |
+| `DATABASTION_OIDC_AUTO_LOGIN` | unset | `1`: `/login` redirects straight to the provider; `/login?local=1` still shows the local form (unless the local login is `disabled`), and so does a failed attempt (no redirect loop) |
+| `DATABASTION_OIDC_USE_REFRESH_TOKEN` | unset | `1`: the refresh token is kept, encrypted (HKDF subkey `oidc-tokens.v1`), and refreshed at most every 5 minutes on user activity; the role is synced again when the provider returns claims; a failed refresh (also a provider outage) ends the session |
+| `DATABASTION_OIDC_SESSION_MAX_AGE` | `12h` | Absolute lifetime of an OIDC session, `5m` to `12h` (`8h`, `90m`, `3600s`). The 2 h idle timeout applies too |
+| `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` | unset | Where the browser goes after logout, instead of the provider's `end_session_endpoint` |
+| `DATABASTION_LOCAL_LOGIN` | `enabled` with OIDC off, `admins` with OIDC on | `enabled`: every local user; `admins`: local administrators only (break-glass path; others get the same `401` as a wrong password); `disabled` (only when set explicitly): `/api/auth/login` answers `404` and the form is hidden, recovery needs host access |
+
+Register at the provider: redirect URI `<DATABASTION_PUBLIC_URL>/api/auth/oidc/callback`, post-logout
+redirect URI `<DATABASTION_PUBLIC_URL>/login`, a confidential client with the standard flow (and
+PKCE S256 if the provider enforces a method).
+
+**Authorization reads provider-controlled claims only.** The role, groups and allow-list
+expressions must read claims that only the provider's administrators set (groups, roles, client
+roles). Never base them on `email`, `preferred_username`, `name` or any attribute a user can edit at
+the provider: a user changing their own e-mail or username to `databastion-admins` must not become
+an administrator.
+
+**Identity key.** A login finds its user by (`iss`, `sub`) only (`user_identities`), never by
+e-mail or username: there is no automatic linking. A login claim equal to an existing username is
+refused (`username`), not merged. A local user links single sign-on **from their own local
+session** (Account page, "Link single sign-on"); administrators cannot link an identity to someone
+else's account, and approve pending logins only as **new** users, choosing the role. Pending
+logins show the issuer and subject first and flag `email_verified: false`; they expire after 7 days
+and are capped at 1000 (the least recent attempt is evicted; evictions are counted and shown).
+
+**Flow details.** `GET /api/auth/oidc/start` creates a 256-bit `state`, a 256-bit `nonce` and the
+PKCE verifier, kept in a cookie encrypted with AES-256-GCM under the HKDF subkey `oidc-state.v1`
+(`__Host-databastion_oidc` in production, `HttpOnly`, `SameSite=Lax`, 10 minutes). The callback
+records the SHA-256 of the consumed state (`oidc_consumed_states`, until the cookie's expiry) and
+refuses a state already recorded. It checks the RFC 9207 `iss` when the provider advertises it (and
+whenever present), exchanges the code (an `id_token` is required) and validates the `id_token`: the
+algorithm, the JWK selected by `kid` (matching `kty` / curve, `alg` when present, `use` absent or
+`sig`; without a `kid`, only a JWKS with a single matching key), `iss`, `aud`, `azp` (when `aud` has
+several values or `azp` is present), `exp`, `nbf`, `iat` (not in the future, at most 10 minutes
+old), with 60 s of clock skew, and the `nonce`. The callback answers with a same-origin page that
+navigates to `/agents` (no `return_to`); a provider `error` shows a generic page and its
+`error_description` is never echoed. Every call to the provider follows no redirect, times out
+after 5 s and has a size cap checked before parsing (discovery 64 KiB, JWKS 256 KiB, token and
+userinfo 64 KiB). The JWKS is refetched at least every hour (sooner when its `Cache-Control:
+max-age` is shorter, at least 1 minute; a failed refetch keeps keys within their `max-age`, at most
+24 h) and at most once a minute on an unknown `kid`. Discovery runs at startup (the provider hosts
+are logged) and is retried with backoff while the provider is down: the console starts and the
+local login keeps working.
+
+**Sessions and logout.** An OIDC login creates the usual console session (`SameSite=Strict`,
+2 h idle), tagged `oidc` with the provider's `sid`. The mapped role is applied at each login (and
+refresh) unless role sync is off; a demotion ends the user's other sessions; each change is audited
+`user.role_change` with its source (`oidc` or `user`). A user disabled in the console cannot log in
+by any method. Logout stays a `POST` with the CSRF token: it deletes the session, revokes a held
+refresh token at the provider's `revocation_endpoint` (RFC 7009), and answers `200 {redirect_url}`
+for RP-initiated logout (`client_id`, `logout_hint` = the subject, `post_logout_redirect_uri`) when
+the provider advertises an `end_session_endpoint` or `DATABASTION_OIDC_SIGNOUT_REDIRECT_URL` is set.
+**Residual risk**: without refresh, a user disabled at the provider keeps their console session up
+to `DATABASTION_OIDC_SESSION_MAX_AGE`.
+
+**Rate limits** (shared by every console process, failing closed, see "Shared rate limits"):
+`/api/auth/oidc/start` (and the link start) 30 per client IP (when known) per 5 minutes; the
+callback 30 per client IP per 5 minutes; failed callbacks 300 per 5 minutes globally (beyond, every
+callback answers `429` until the window ends).
+
+**Audit log**: `user.login` (`details.method = oidc`), `user.login_denied` with a reason from a
+closed list (`state`, `nonce`, `iss`, `token`, `id_token`, `provider_error`, `rate_limited` (at most
+one entry a minute per process), `group`, `domain`, `email_unverified`, `role`, `sign_up`,
+`disabled`, `username`), `user.signup`, `user.pending_login_approve` / `_discard`,
+`user.identity_link` (with the session method and the issuer and subject; failures with a reason),
+`user.role_change`, `user.create`, `user.disable`, `user.enable`. Entries reference the user id.
+Tokens, codes, the state, the nonce and raw claims are never logged nor stored (only the encrypted
+refresh token).
+
+**Break-glass.** While OIDC is enabled, every successful local administrator login raises the
+system alert `user.local_login` (channels flagged "system alerts", within the hourly budget of
+system alerts) and its `user.login` entry carries `break_glass: true`. With `admins`, the web
+process logs an **error** at startup when no enabled local administrator with a password exists.
+
+**End-to-end setup** (Keycloak dev realm, P8-D): the e2e scenario sets `DATABASTION_OIDC_ENABLED=1`,
+`DATABASTION_OIDC_ISSUER_URL` (the realm URL), `DATABASTION_OIDC_CLIENT_ID`,
+`DATABASTION_OIDC_CLIENT_SECRET_FILE`, `DATABASTION_OIDC_CA_FILE` (the dev CA, for an `https://`
+Keycloak), `DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH=groups`,
+`DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH` (on the admin group), `DATABASTION_OIDC_ALLOWED_GROUPS`, and
+`DATABASTION_PUBLIC_URL`; `DATABASTION_OIDC_ALLOW_SIGN_UP` stays `0` to exercise pending logins.
 
 The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 `pnpm build` with Node 24.
@@ -213,7 +325,14 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `/api/agent/v1/*` | Agent API (see [its README](src/app/api/agent/v1/README.md)) |
 | `GET /metrics` | Prometheus text format, bearer token (see "Metrics"); on the dedicated listener when `DATABASTION_METRICS_PORT` is set; internal network only |
 | `POST /api/auth/login` | `{username, password}` → session cookie + `{user, csrf_token}`; failed logins rate limited per IP, per username + IP, and per username (slow-down, never a lock-out; see "Brute-force protection") |
-| `POST /api/auth/logout` | Ends the session |
+| `POST /api/auth/logout` | Ends the session (CSRF). OIDC sessions: refresh token revoked at the provider when held, then `200 {redirect_url}` for RP-initiated logout when available; otherwise `204` |
+| `GET /api/auth/oidc/start` | OIDC only: `302` to the provider with the encrypted state cookie; rate limited per IP |
+| `GET /api/auth/oidc/callback` | OIDC only: the provider's redirect (`query` mode); answers a same-origin page navigating to `/agents` (or a generic failure page) |
+| `POST /api/auth/oidc/link` | "Link single sign-on" (CSRF, local session only, `409 local_session_required` otherwise): `200 {redirect_url}` |
+| `GET` / `POST /api/users` | List users / create a local user `{username, password, role}` (admin, CSRF); `201 {userId}`, `409 username_taken`. Audited `user.create` |
+| `PATCH /api/users/{id}` | `{role}` or `{disabled}` (admin, CSRF). `409 self`, `409 last_admin` (the console keeps one enabled administrator), `409 role_managed_by_provider` (an SSO-bound user while role sync is on). Disabling ends the user's sessions. Audited `user.role_change` (source `user`) / `user.disable` / `user.enable` |
+| `GET /api/oidc/pending-logins` | Pending OIDC logins and the eviction count (admin) |
+| `POST` / `DELETE /api/oidc/pending-logins/{id}` | Approve as a NEW user `{role}` (`201 {userId}`; `409 username_taken`, `identity_bound`, `invalid_login`) / discard (admin, CSRF). Audited |
 | `GET /api/auth/session` | Current user + CSRF token |
 | `GET` / `POST /api/enrollment-tokens` | List / create (admin). The `dbe_…` token is returned once, only its SHA-256 is stored; valid 24 h |
 | `DELETE /api/enrollment-tokens/{id}` | Revoke an unused token (admin) |
@@ -238,7 +357,9 @@ browser): `/login`, `/agents` (name, hostname, version, status online / silent (
 90 s) / revoked / locked, last seen, targets with audit level and their number of notes),
 `/agents/{id}` (targets with their notes, see "Target notes"; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
-`dbe_…` token is shown once with a copy button; list; revoke), `/findings` (counts per target and
+`dbe_…` token is shown once with a copy button; list; revoke), `/users` (admin: local users,
+roles, disable / enable, pending single sign-on logins), `/account` (own account, linked single
+sign-on identities, "Link single sign-on"), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
 `?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
 row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
@@ -530,6 +651,10 @@ least N x 16 + 20 connections, plus PostgreSQL's reserved and administration con
 | Audit settings (`audit_configs`) | per target: the settings last sent, the manual sensitive objects (normalized names and classifier ids), the `sensitive_objects` list last sent, the last job, and the warning of the last change (`disabled` / `emptied` / `shrunk` with the number of objects removed) |
 | Incidents (`incidents`) | plain columns: policy snapshot (id, name, revision), severity, status and who / when of each transition, finding id, agent, target, classifier, `matched` and `classifiers_version` snapshots, `dedup_key`; no sampled value (the samples stay encrypted on the finding). Never deleted by the runtime role, which may only update the lifecycle and re-match columns (migrations `0015`, `0016`) |
 | Enrollment tokens, session tokens | SHA-256 only (256-bit random values) |
+| Sessions (`sessions`) | token SHA-256, user, times, method (`local` / `oidc`), OIDC identity and provider `sid`; the OIDC refresh token (`DATABASTION_OIDC_USE_REFRESH_TOKEN=1` only) AES-256-GCM under the HKDF subkey `oidc-tokens.v1`, AAD = `"databastion.oidc-tokens.v1" ‖ 0x01 ‖ session token hash`. Access and ID tokens are never stored |
+| OIDC identities (`user_identities`) | (issuer, subject) of each bound identity, unique, and its display attributes (e-mail, `email_verified`, name), refreshed at each login |
+| Pending OIDC logins (`oidc_pending_logins`) | issuer, subject, mapped login, e-mail, `email_verified`, name, groups (at most 64), mapped role, attempts and times; never raw claims or tokens. At most 1000 rows, 7-day expiry; evictions counted in `meta` (`oidc.pending_logins_evicted`) |
+| Consumed OIDC states (`oidc_consumed_states`) | SHA-256 of each consumed `state`, until its cookie's expiry (insert and delete only for the runtime role, migration `0038`) |
 | Database credentials, connection strings | never received nor stored (invariant I3) |
 | Agent-reported metadata (hostname, versions, target ids, audit levels, metrics) | plain columns, bounded by the protocol schema, escaped on display |
 | Notification channels (`notification_channels`) | slug, type, flags and the non-secret settings in plain columns (SMTP host, port, TLS mode, sender, recipients, user; webhook URL **origin** only). `secret`: AES-256-GCM, key = HKDF-SHA256 subkey `notification-channels.v1`, random 96-bit nonce, AAD = `"databastion.notification-channels.v1" ‖ 0x01 ‖ channel id ‖ 0x00 ‖ type`, plaintext = JSON `{"password"}` (SMTP AUTH) or `{"url", "signing_secret"}` (webhook: the full URL is treated as a secret, many embed a token). Never returned by the API, never logged, never in the audit log |
@@ -858,8 +983,9 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   names; the API accepts them (policies may be written before their channels).
 - **Events and payload**: `incident.opened` (a new incident, `incident.reopened_from` set when it
   follows a resolved one for the same policy and finding), `agent.silent`, `agent.recovered`,
-  `agent.integrity`, `agent.batches_dropped`, `agent.audit_stream_stopped`, `channel.test`,
-  `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
+  `agent.integrity`, `agent.batches_dropped`, `agent.audit_stream_stopped`, `user.local_login`
+  (P8-A: a local administrator logged in while OIDC is enabled; payload `user_id`, `username`,
+  `source_ip`), `channel.test`, `notifications.suppressed`, `system_alerts.suppressed`. Payload: event, time, console URL, incident id, severity, status,
   policy id / name / revision, agent and target ids, classifier and classifier set, normalized
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
@@ -946,7 +1072,7 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   episode, one integrity alert per agent, kind and hour, one dropped-batches alert per agent and
   hour) do not bound a fleet: N misbehaving agents would send N alerts an hour to each channel.
   So all system alerts (`agent.silent`, `agent.recovered`, `agent.integrity`,
-  `agent.batches_dropped`, `agent.audit_stream_stopped`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
+  `agent.batches_dropped`, `agent.audit_stream_stopped`, `user.local_login`) also share a budget of `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` (default
   20) per channel and UTC clock hour, whatever the agent. It is a hard limit, shared by every
   console process: the count lives in `system_alert_budgets`, one row per (channel, hour), charged
   by a conditional upsert (`insert ... on conflict do update set sent = sent + 1 where sent <

@@ -154,3 +154,19 @@ describe("notification contents", () => {
     expect(integrity.text).toContain("locked: true");
   });
 });
+
+describe("user.local_login system alert (ADR-0038 decision 11)", () => {
+  it("names the administrator on one line and says it is the break-glass path", () => {
+    const m = renderEmail({
+      event: "user.local_login",
+      occurred_at: "2026-10-04T12:00:00.000Z",
+      url: "https://console.example.com/users",
+      user_id: "01890a5d-ac96-774b-bcce-b302099a8057",
+      username: "root\nadmin",
+      source_ip: "203.0.113.7",
+    });
+    expect(m.subject).toBe("[DataBastion] Local administrator login: root admin");
+    expect(m.text).toContain("from 203.0.113.7");
+    expect(m.text).toContain("break-glass");
+  });
+});
