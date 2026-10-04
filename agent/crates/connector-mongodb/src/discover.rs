@@ -151,9 +151,25 @@ pub(crate) fn read_command_for(
 /// Most `type` values read from a ticket registry collection.
 const MAX_TICKET_TYPES: i64 = 256;
 
+/// The ticket type field of a ticket registry: `type` in any ASCII case
+/// among the keys probed (PR #141 review L5), else `type`. Only letters,
+/// so the `$` path built from it is a plain field path.
+pub(crate) fn ticket_type_field(keys: &[String]) -> &str {
+    keys.iter()
+        .map(String::as_str)
+        .find(|k| *k == "type")
+        .or_else(|| {
+            keys.iter()
+                .map(String::as_str)
+                .find(|k| k.eq_ignore_ascii_case("type"))
+        })
+        .unwrap_or("type")
+}
+
 /// The CAS store guard's only read of a ticket registry collection
-/// (ADR-0041 decision 5): `$group` on `type` with a count, nothing else.
-pub(crate) fn ticket_types_command(collection: &str) -> DocBuf {
+/// (ADR-0041 decision 5): `$group` on the type field (`type`, any case)
+/// with a count, nothing else.
+pub(crate) fn ticket_types_command(collection: &str, type_field: &str) -> DocBuf {
     DocBuf::new()
         .str("aggregate", collection)
         .array(
@@ -162,7 +178,7 @@ pub(crate) fn ticket_types_command(collection: &str) -> DocBuf {
                 DocBuf::new().doc(
                     "$group",
                     DocBuf::new()
-                        .str("_id", "$type")
+                        .str("_id", &format!("${type_field}"))
                         .doc("n", DocBuf::new().i32("$sum", 1)),
                 ),
                 DocBuf::new().i64("$limit", MAX_TICKET_TYPES),
@@ -181,12 +197,13 @@ pub(crate) async fn ticket_metadata<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session<S>,
     db: &str,
     collection: &str,
+    type_field: &str,
 ) -> Result<TicketCounts, MgError> {
     let reply = session
         .command(
             Stage::Sample,
             db,
-            ticket_types_command(collection),
+            ticket_types_command(collection, type_field),
             Kind::Read,
         )
         .await?;
@@ -221,6 +238,87 @@ pub(crate) async fn ticket_metadata<S: AsyncRead + AsyncWrite + Unpin>(
         session.kill_cursor(db, collection, cursor_id).await;
     }
     counts
+}
+
+/// The CAS store guard's key probe of a collection (PR #141 review L4):
+/// the top-level field **names** of one random document, never a value
+/// (`$objectToArray` mapped to its keys), read before any document so a
+/// renamed ticket registry or audit trail is recognized by its shape
+/// first.
+pub(crate) fn key_probe_command(collection: &str) -> DocBuf {
+    DocBuf::new()
+        .str("aggregate", collection)
+        .array(
+            "pipeline",
+            vec![
+                DocBuf::new().doc("$sample", DocBuf::new().i64("size", 1)),
+                DocBuf::new().doc(
+                    "$project",
+                    DocBuf::new().i32("_id", 0).doc(
+                        "k",
+                        DocBuf::new().doc(
+                            "$map",
+                            DocBuf::new()
+                                .doc("input", DocBuf::new().str("$objectToArray", "$$ROOT"))
+                                .str("as", "f")
+                                .str("in", "$$f.k"),
+                        ),
+                    ),
+                ),
+            ],
+        )
+        .doc("cursor", DocBuf::new().i64("batchSize", 2))
+        .bool("allowDiskUse", false)
+}
+
+/// Runs [`key_probe_command`]: at most [`MAX_TOP_KEYS`] field names. An
+/// open cursor in the reply is killed.
+pub(crate) async fn probe_keys<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    db: &str,
+    collection: &str,
+) -> Result<Vec<String>, MgError> {
+    let reply = session
+        .command(Stage::Sample, db, key_probe_command(collection), Kind::Read)
+        .await?;
+    let bad = |_| non_fatal(FailureCode::Internal);
+    let (cursor_id, keys) = {
+        let doc = reply.doc();
+        let cursor = doc.doc("cursor").ok().flatten();
+        let cursor_id = cursor.and_then(|c| c.int("id").ok().flatten()).unwrap_or(0);
+        let keys = (|| {
+            let batch = cursor
+                .ok_or(non_fatal(FailureCode::Internal))?
+                .array("firstBatch")
+                .map_err(bad)?
+                .ok_or(non_fatal(FailureCode::Internal))?;
+            let mut keys: Vec<String> = Vec::new();
+            for element in batch.iter() {
+                let (_, Value::Doc(d)) = element.map_err(bad)? else {
+                    return Err(non_fatal(FailureCode::Internal));
+                };
+                let Some(list) = d.array("k").map_err(bad)? else {
+                    continue;
+                };
+                for k in list.iter() {
+                    if let (_, Value::Str(k)) = k.map_err(bad)?
+                        && keys.len() < MAX_TOP_KEYS
+                        && let Ok(k) = std::str::from_utf8(k)
+                        && !keys.iter().any(|t| t == k)
+                    {
+                        keys.push(k.to_owned());
+                    }
+                }
+            }
+            Ok(keys)
+        })();
+        (cursor_id, keys)
+    };
+    drop(reply);
+    if cursor_id != 0 {
+        session.kill_cursor(db, collection, cursor_id).await;
+    }
+    keys
 }
 
 /// A sampled collection: the values by normalized path, the estimate.
@@ -488,6 +586,7 @@ where
             job.skip_out_of_time(sink, selected.len() - di);
             break;
         }
+        job.begin_database(db);
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
             match job.paced(catalog::list_collections(s, db)).await? {
@@ -567,11 +666,52 @@ where
                 break;
             }
             // CAS store guard (ADR-0041 decision 5): a ticket registry
-            // known by name is never sampled.
+            // known by name is never sampled. Otherwise the field names of
+            // one document are probed first (PR #141 review L4): a renamed
+            // ticket registry or audit trail is recognized by its shape
+            // before any document is read. A probe that fails leaves the
+            // shape check on the documents read.
             let named = cas_guard::recognize_name(stores, [unit.name.as_str()]);
+            let probed = if named == Some(StoreKind::ServiceRegistry) {
+                Vec::new()
+            } else {
+                let s = ensure(&mut slot, target, &mut connect).await?;
+                match job.paced(probe_keys(s, db, &unit.name)).await? {
+                    Paced::Done(Ok(keys)) => keys,
+                    // The session is broken: the collection is skipped, as
+                    // a failed read would be.
+                    Paced::Done(Err(e)) if e.fatal => {
+                        sink.add_coverage(ScanCoverage {
+                            error: 1,
+                            ..ScanCoverage::default()
+                        });
+                        totals.skipped += 1;
+                        tracing::warn!(
+                            target_id = %target.id,
+                            database = db_name.as_str(),
+                            object = object.as_str(),
+                            stage = e.stage.as_str(),
+                            server_code = e.server_code,
+                            code = %e.code,
+                            reason = "key probe failed",
+                            "object not covered"
+                        );
+                        continue;
+                    }
+                    Paced::Done(Err(_)) => Vec::new(),
+                    Paced::OutOfTime => {
+                        job.skip_out_of_time(sink, units.len() - i);
+                        out_of_time = true;
+                        break;
+                    }
+                }
+            };
+            let named =
+                named.or_else(|| cas_guard::recognize_shape(probed.iter().map(String::as_str)));
             if named == Some(StoreKind::TicketRegistry) {
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                match job.paced(ticket_metadata(s, db, &unit.name)).await? {
+                let field = ticket_type_field(&probed);
+                match job.paced(ticket_metadata(s, db, &unit.name, field)).await? {
                     Paced::Done(r) => {
                         ticket_registry(job, sink, target, &db_name, &object, r);
                         cas_stores.push((db.clone(), unit.name.clone(), StoreKind::TicketRegistry));
@@ -647,9 +787,13 @@ where
             if kind == Some(StoreKind::TicketRegistry) {
                 // Recognized by its document shape: the documents read are
                 // dropped (zeroized) unclassified; its metadata only.
+                let field = ticket_type_field(&sampled.top_keys).to_owned();
                 drop(sampled);
                 let s = ensure(&mut slot, target, &mut connect).await?;
-                match job.paced(ticket_metadata(s, db, &unit.name)).await? {
+                match job
+                    .paced(ticket_metadata(s, db, &unit.name, &field))
+                    .await?
+                {
                     Paced::Done(r) => ticket_registry(job, sink, target, &db_name, &object, r),
                     Paced::OutOfTime => {
                         job.skip_out_of_time(sink, units.len() - i);

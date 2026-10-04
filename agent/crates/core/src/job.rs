@@ -297,6 +297,16 @@ impl ScanJob {
         key: Arc<HmacKey>,
     ) -> Self {
         let max_duration = limits.clamp_scan_duration(u64::from(params.max_duration_s));
+        let scope = if params.schemas.is_some()
+            || params.include_objects.is_some()
+            || !params.exclude_objects.is_empty()
+        {
+            crate::cas_guard::ScanScope::Partial
+        } else if params.databases.is_some() {
+            crate::cas_guard::ScanScope::Databases
+        } else {
+            crate::cas_guard::ScanScope::Whole
+        };
         Self {
             target: Some(target.clone()),
             sample_rows: limits.clamp_sample_rows(u64::from(params.sample_rows)),
@@ -310,7 +320,7 @@ impl ScanJob {
             pacer: Pacer::new(limits.discovery_duty_cycle_percent)
                 .with_deadline(Instant::now() + max_duration),
             rotation: 0,
-            guard: Arc::default(),
+            guard: Arc::new(crate::cas_guard::ScanGuard::new(scope)),
         }
     }
 
@@ -508,29 +518,44 @@ impl ScanJob {
     /// [`Self::sample_rows`] values are examined.
     ///
     /// The CAS store guard's ticket-id tripwire runs first (ADR-0041
-    /// decision 5): when one of the values has the shape of a CAS ticket
-    /// id (`databastion_classifiers::cas::is_ticket_id`), nothing of the
-    /// column is classified (no finding, no masked sample, no
-    /// fingerprint), the column counts in `coverage.cas_guard_tripped`, and
-    /// the connector must drop its values without reading the column again
-    /// in this scan. Connectors classify each column once per scan.
+    /// decision 5, PR #141 review M4,
+    /// `databastion_classifiers::cas::screen`):
+    ///
+    /// - a value starting with a named CAS ticket prefix (`TGT-1-…`): nothing
+    ///   of the column is classified (no finding, no masked sample, no
+    ///   fingerprint), the column counts in `coverage.cas_guard_tripped`, and
+    ///   the connector must drop its values without reading the column again
+    ///   in this scan;
+    /// - a value with only the generic ticket shape (`[A-Z]{2,8}-<digits>-`)
+    ///   or holding a named ticket id inside it: that value alone is dropped
+    ///   (never classified, masked nor fingerprinted) and counted; the other
+    ///   values are classified as usual.
+    ///
+    /// Connectors classify each column once per scan.
     #[must_use]
     pub fn classify(&self, column_name: &str, values: &[RawSample<'_>]) -> Vec<ColumnFinding> {
         let n = values.len().min(self.sample_rows as usize);
-        let values = &values[..n];
-        if values
-            .iter()
-            .any(databastion_classifiers::cas::is_ticket_id)
-        {
+        let screened = databastion_classifiers::cas::screen(&values[..n]);
+        let target_id = self.target.as_ref().map_or("", |t| t.id.as_str());
+        if screened.column_dropped {
             self.guard.trip();
             tracing::warn!(
-                target_id = self.target.as_ref().map_or("", |t| t.id.as_str()),
-                "CAS store guard: a column or field held a ticket-id-shaped value; its values \
-                 were dropped before classification and it is not read further in this scan"
+                target_id,
+                "CAS store guard: a column or field held a CAS ticket id; its values were \
+                 dropped before classification and it is not read further in this scan"
             );
             return Vec::new();
         }
-        self.column_classifier().classify(column_name, values)
+        if screened.values_dropped > 0 {
+            self.guard.drop_values(screened.values_dropped as u64);
+            tracing::debug!(
+                target_id,
+                dropped = screened.values_dropped,
+                "CAS store guard: ticket-id-shaped values dropped before classification"
+            );
+        }
+        self.column_classifier()
+            .classify(column_name, &screened.kept)
     }
 
     /// [`Self::classify`] under a CAS store guard rule
@@ -594,6 +619,13 @@ impl ScanJob {
             other = counts.clear_of(TicketKind::Other),
             "CAS ticket registry: metadata only (ticket counts by kind)"
         );
+    }
+
+    /// The connector now reads `database` (a PostgreSQL database, a MySQL /
+    /// MariaDB schema, a MongoDB database, an LDAP naming context): the
+    /// CAS store guard's tally is kept per database (PR #141 review L6).
+    pub fn begin_database(&self, database: &str) {
+        self.guard.begin_database(database);
     }
 
     /// What the CAS store guard saw in this scan so far.

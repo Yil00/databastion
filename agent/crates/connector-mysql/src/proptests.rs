@@ -270,6 +270,45 @@ proptest! {
         let selects = crate::grants::select_grants(&line);
         if crate::grants::parse_line(&line).is_none() {
             prop_assert_eq!(selects, None);
+        } else {
+            // A line `parse_line` reads always has its `SELECT` grants read
+            // (else the CAS store guard reports not evaluated).
+            prop_assert!(selects.is_some());
+        }
+    }
+
+    /// Grant lines of every form the servers print: whenever `parse_line`
+    /// reads privileges, `select_grants` reads them too (PR #141 review M1).
+    #[test]
+    fn privilege_lines_always_have_select_grants_read(
+        privs in proptest::collection::vec(prop_oneof![
+            Just("SELECT".to_owned()),
+            Just("INSERT".to_owned()),
+            Just("ALL PRIVILEGES".to_owned()),
+            Just("SHOW VIEW".to_owned()),
+            Just("PROXY".to_owned()),
+            "\\PC{1,12}".prop_map(|c| format!("SELECT ({})", quoted(&c))),
+            "\\PC{1,12}".prop_map(|c| format!("UPDATE ({}, `x`)", quoted(&c))),
+        ], 1..4),
+        target in prop_oneof![
+            Just("*.*".to_owned()),
+            Just("*".to_owned()),
+            Just("''@''".to_owned()),
+            Just("`app`@`%`".to_owned()),
+            "\\PC{1,12}".prop_map(|d| format!("{}.*", quoted(&d))),
+            ("\\PC{1,12}", "\\PC{1,12}").prop_map(|(d, t)| format!("{}.{}", quoted(&d), quoted(&t))),
+            ("(TABLE|PROCEDURE|FUNCTION|PACKAGE|PACKAGE BODY)", "\\PC{1,12}")
+                .prop_map(|(k, t)| format!("{k} `db`.{}", quoted(&t))),
+            "\\PC{1,12}".prop_map(|t| quoted(&t)),
+        ],
+        option in prop_oneof![Just(""), Just(" WITH GRANT OPTION")],
+    ) {
+        let line = format!("GRANT {} ON {target} TO `u`@`%`{option}", privs.join(", "));
+        if matches!(
+            crate::grants::parse_line(&line),
+            Some(crate::grants::Line::Privileges { .. })
+        ) {
+            prop_assert!(crate::grants::select_grants(&line).is_some(), "{}", line);
         }
     }
 

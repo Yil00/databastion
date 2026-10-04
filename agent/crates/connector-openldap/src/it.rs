@@ -60,6 +60,8 @@ use crate::conn::{Auth, Session, Timeouts};
 use crate::error::Stage;
 use crate::proto::{Entry, Filter, Scope, Search};
 
+mod cas_guard_it;
+
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const SERVICE_DN: &str = "cn=databastion,ou=services,dc=example,dc=org";

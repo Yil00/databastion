@@ -380,6 +380,44 @@ fn ticket_id_tripwire_drops_the_column() {
     assert_eq!(notes[0].count(), Some(2));
 }
 
+/// PR #141 review M4 / L1: a value with only the generic ticket shape, or
+/// a named ticket id inside it, is dropped alone (never classified,
+/// masked nor fingerprinted) and counted; the rest of the column is
+/// classified; the column is not tripped.
+#[test]
+fn generic_or_embedded_ticket_ids_drop_the_value_only() {
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &target(),
+        &limits(200, 30_000, 3_600),
+        key(),
+    );
+    let raw = [
+        "jane.doe@example.org",
+        "INV-2026-jane.doe@example.org",
+        "john.smith@example.org",
+        "https://app.example.org/?ticket=ST-7-FAKEsecret-cas01",
+        "anna.berg@example.org",
+    ];
+    let values: Vec<RawSample<'_>> = raw.iter().map(|v| RawSample::new(v)).collect();
+    let mut found = Vec::new();
+    let logs = logs_of(|| found = job.classify("email", &values));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].sampled(), 3);
+    assert_eq!(found[0].matched(), 3);
+    for m in found[0].masked_samples() {
+        let m = format!("{m:?}");
+        assert!(!m.contains("INV") && !m.contains("ST-7"), "{m}");
+    }
+    assert!(
+        !logs.contains("FAKEsecret") && !logs.contains("INV-2026"),
+        "{logs}"
+    );
+    assert_eq!(job.cas_guard().tripped(), 0);
+    assert_eq!(job.cas_guard().values_dropped(), 2);
+    assert!(job.cas_guard().notes().is_empty());
+}
+
 /// ADR-0041 decision 5: the audit trail principal and the service registry
 /// body keep no masked sample; the body keeps no `secret.*` fingerprint;
 /// never-read columns give nothing.
@@ -447,7 +485,7 @@ mod guard_props {
         #[test]
         fn a_ticket_id_never_reaches_a_finding_or_a_log(
             others in proptest::collection::vec("[a-z]{3,8}\\.[a-z]{3,8}@example\\.(org|com)", 1..20),
-            prefix in "(TGT|ST|PT|PGT|OC|AT|RT)",
+            prefix in "(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)",
             n in 1u32..100_000,
             tail in "[A-Za-z0-9]{8,24}",
             pos in any::<prop::sample::Index>(),

@@ -249,6 +249,16 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         .await;
         exec(&mut a, &format!("GRANT `{CAS_ROLE}` TO '{CAS_USER}'@'%'")).await;
         if !mysql {
+            // PR #141 review M1: on MariaDB a role that is not the default
+            // one cannot be evaluated: the guard reports not evaluated,
+            // never least privilege.
+            let notes = guard_check(&t).await;
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated),
+                "{name}: {notes:?}"
+            );
             exec(
                 &mut a,
                 &format!("SET DEFAULT ROLE `{CAS_ROLE}` FOR '{CAS_USER}'@'%'"),

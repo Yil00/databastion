@@ -149,6 +149,7 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                     .map_err(|e| fail(target, e))?
             }
         };
+        job.begin_database(&unit.schema);
         let db = normalize(&unit.schema);
         let object = normalize(&unit.name);
         let sampled = match job

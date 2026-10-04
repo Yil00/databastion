@@ -808,21 +808,27 @@ server over an in-memory stream (`src/fake.rs`); property tests in `src/proptest
 The PostgreSQL, MySQL / MariaDB, MongoDB and OpenLDAP connectors guard Apereo CAS stores
 ([ADR-0041](../docs/adr/0041-cas-connector.md) decisions 5 and 6), on by default:
 `databastion_core::cas_guard` recognizes them by name (built-in names, case-insensitive on
-letters and digits, schema-agnostic), by the target's `cas_stores` lists
+ASCII letters and digits, schema-agnostic), by the target's `cas_stores` lists
 (`targets[].<engine>.cas_stores.{ticket_registry,service_registry,audit_trail}`, at most 64 names
-each) and by column shape, and gives each column a rule (`ColumnRule`): a ticket registry is
-never sampled (one `type, count(*)` aggregate, `TicketCounts`), the audit trail's ticket-id,
-header and extra-info columns are never selected, `AUD_USER` keeps no masked sample, a service
-registry body keeps no masked sample nor `secret.*` fingerprint (`ScanJob::classify_guarded`).
-The ticket-id tripwire runs in `ScanJob::classify` for every connector
-(`databastion_classifiers::cas::is_ticket_id`): one ticket-id-shaped value drops the whole column
-before classification. The core keeps each target's latest scan tally (`ScanGuard`) and adds
-`coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted` to its notes; each
-connector's `check()` evaluates `privilege.ticket_credentials_readable` at every heartbeat
-(PostgreSQL `has_column_privilege`; MySQL / MariaDB `information_schema.COLUMNS` and the roles'
-`SHOW GRANTS`; MongoDB `connectionStatus`). Integration tests: `connector-postgres`
-`src/it_cas_guard.rs`, `connector-mysql` `src/it/cas_guard_it.rs` (fixtures created by the
-tests in their own database), and scripted-server tests in `connector-mongodb` and
+each) and by column shape (MongoDB: a key-names-only probe before any document is read), and
+gives each column a rule (`ColumnRule`): a ticket registry is never sampled (one `type, count(*)`
+aggregate, `TicketCounts`), the audit trail's ticket-id, header and extra-info columns are never
+selected, `AUD_USER` keeps no masked sample, a service registry body keeps no masked sample nor
+`secret.*` fingerprint (`ScanJob::classify_guarded`). The ticket-id tripwire runs in
+`ScanJob::classify` for every connector (`databastion_classifiers::cas::screen`): a value starting
+with a named ticket prefix (`TGT-1-…`) drops the whole column before classification; a value with
+only the generic `[A-Z]{2,8}-<digits>-` shape, or holding a named ticket id inside it, is dropped
+on its own. The name normalizers mask ticket ids in names. The core keeps, per target and
+database, the tallies of the latest completed scans (`TargetTally`; connectors call
+`ScanJob::begin_database`) and adds `coverage.cas_guard_tripped` and
+`security.ticket_registry_unencrypted` to its notes; each connector's `check()` evaluates
+`privilege.ticket_credentials_readable` at every heartbeat (PostgreSQL `has_column_privilege`;
+MySQL / MariaDB `information_schema.COLUMNS` and the roles' `SHOW GRANTS`; MongoDB
+`connectionStatus`), and reports an incomplete evaluation as not evaluated. Integration tests:
+`connector-postgres` `src/it_cas_guard.rs`, `connector-mysql` `src/it/cas_guard_it.rs`,
+`connector-mongodb` `src/it/cas_guard_it.rs` and `connector-openldap` `src/it/cas_guard_it.rs`
+(fixtures created by the tests: their own database, or entries under `ou=cas-it` written by
+`DATABASTION_TEST_LDAP_MODIFY_CMD`), and scripted-server tests in `connector-mongodb` and
 `connector-openldap` `src/fake.rs`. Behaviour per engine:
 [docs/08](../docs/08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap).
 

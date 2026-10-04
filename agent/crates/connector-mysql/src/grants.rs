@@ -286,8 +286,15 @@ pub(crate) struct SelectGrant {
 /// The `SELECT` grants of one `SHOW GRANTS` line (empty for a line that
 /// grants no `SELECT`); `None` when the line is not understood.
 pub(crate) fn select_grants(line: &str) -> Option<Vec<SelectGrant>> {
-    if !matches!(parse_line(line)?, Line::Privileges { .. }) {
-        return Some(Vec::new());
+    match parse_line(line)? {
+        // `PROXY ON user@host` grants no `SELECT`.
+        Line::Privileges {
+            scope: Scope::Proxy,
+            ..
+        }
+        | Line::Roles { .. }
+        | Line::Ignored => return Some(Vec::new()),
+        Line::Privileges { .. } => {}
     }
     let toks = tokens(line)?;
     let mut depth = 0usize;

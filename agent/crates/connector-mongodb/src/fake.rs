@@ -170,6 +170,17 @@ fn group_stage(body: &Doc<'_>) -> bool {
         .is_some()
 }
 
+/// The CAS store guard's key probe: `$sample` then a `$project` of `k`.
+fn key_probe(body: &Doc<'_>) -> bool {
+    body.array("pipeline")
+        .unwrap()
+        .and_then(|p| match p.iter().nth(1) {
+            Some(Ok((_, Value::Doc(stage)))) => stage.doc("$project").unwrap(),
+            _ => None,
+        })
+        .is_some_and(|proj| proj.doc("k").unwrap().is_some())
+}
+
 fn keys_have(body: &Doc<'_>, key: &str) -> bool {
     body.get(key).unwrap().is_some()
 }
@@ -352,7 +363,9 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                 None => error_reply(26),
             },
             "find" | "aggregate" => {
-                if script.oversized_find {
+                // The key probe is answered normally: the oversized reply
+                // is the documents' read.
+                if script.oversized_find && !key_probe(&body) {
                     let mut h = Vec::new();
                     h.extend_from_slice(&i32::MAX.to_le_bytes());
                     h.extend_from_slice(&7i32.to_le_bytes());
@@ -380,6 +393,24 @@ pub(crate) async fn serve(mut stream: DuplexStream, script: Script, log: Log) {
                         )
                         .i32("ok", 1)
                         .finish(),
+                    // The key probe: the first document's top-level keys.
+                    Some(c) if name == "aggregate" && key_probe(&body) => {
+                        let docs: Vec<Vec<u8>> = c
+                            .docs
+                            .first()
+                            .map(|d| {
+                                let keys: Vec<String> = Doc::new(d)
+                                    .unwrap()
+                                    .iter()
+                                    .map(|e| String::from_utf8(e.unwrap().0.to_vec()).unwrap())
+                                    .collect();
+                                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                                DocBuf::new().array_str("k", &keys).finish()
+                            })
+                            .into_iter()
+                            .collect();
+                        cursor_reply(&db, &c.name, &docs, 0)
+                    }
                     // The CAS store guard's `$group` on `type`.
                     Some(c) if name == "aggregate" && group_stage(&body) => {
                         let mut groups: Vec<(String, i64)> = Vec::new();
@@ -1472,16 +1503,19 @@ async fn cas_store_guard_over_the_wire() {
             .cloned()
             .collect()
     };
-    // Built-in name: one `$group` aggregate, no `find` nor `count`.
+    // Built-in name: the key probe (field names only, to find the type
+    // field), then one `$group` aggregate; no `find` nor `count`.
     let built_in = reads("serviceTicketsCollection");
-    assert_eq!(built_in.len(), 1, "{built_in:?}");
-    assert_eq!(built_in[0].name, "aggregate");
-    // Renamed: read once (shape recognized), then its `$group`.
-    assert!(
-        reads("sso_sessions_v2")
-            .iter()
-            .any(|c| c.name == "aggregate" && c.size.is_none())
-    );
+    assert_eq!(built_in.len(), 2, "{built_in:?}");
+    assert!(built_in.iter().all(|c| c.name == "aggregate"));
+    assert_eq!(built_in[0].size, Some(1));
+    assert_eq!(built_in[1].size, None);
+    // Renamed (PR #141 review L4): recognized by the key probe before any
+    // document is read; then its `$group`, and no `find` nor `count`.
+    let renamed = reads("sso_sessions_v2");
+    assert_eq!(renamed.len(), 2, "{renamed:?}");
+    assert!(renamed.iter().all(|c| c.name == "aggregate"));
+    assert_eq!(renamed[1].size, None);
     // The audit trail is read without its ticket ids and headers.
     let audit_find = reads("MongoDbCasAuditRepository");
     assert!(
@@ -1589,4 +1623,48 @@ fn find_scopes_of_connection_status() {
             FindScope::Any,
         ]
     );
+}
+
+/// PR #141 review L5: the ticket type field is found whatever its ASCII
+/// case; L4: the key probe projects field names only.
+#[test]
+fn ticket_type_field_and_key_probe() {
+    let k = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(discover::ticket_type_field(&k(&["_id", "Type"])), "Type");
+    assert_eq!(discover::ticket_type_field(&k(&["TYPE", "type"])), "type");
+    assert_eq!(discover::ticket_type_field(&k(&["_type", "kind"])), "type");
+    let group = discover::ticket_types_command("t", "TYPE").finish();
+    let group = Doc::new(&group).unwrap();
+    let stage = group.array("pipeline").unwrap().unwrap();
+    let Some(Ok((_, Value::Doc(first)))) = stage.iter().next() else {
+        panic!("no $group");
+    };
+    assert_eq!(
+        first.doc("$group").unwrap().unwrap().str("_id").unwrap(),
+        Some("$TYPE")
+    );
+    let probe = discover::key_probe_command("t").finish();
+    let probe = Doc::new(&probe).unwrap();
+    assert!(key_probe(&probe));
+    let stages: Vec<_> = probe
+        .array("pipeline")
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|e| match e.unwrap().1 {
+            Value::Doc(d) => d,
+            _ => panic!("stage"),
+        })
+        .collect();
+    assert_eq!(stages.len(), 2);
+    let sample = stages[0].doc("$sample").unwrap().unwrap();
+    assert_eq!(sample.int("size").unwrap(), Some(1));
+    // `_id` excluded, only `k` (the keys) projected.
+    let project = stages[1].doc("$project").unwrap().unwrap();
+    let projected: Vec<String> = project
+        .iter()
+        .map(|e| String::from_utf8(e.unwrap().0.to_vec()).unwrap())
+        .collect();
+    assert_eq!(projected, ["_id", "k"]);
+    assert_eq!(project.int("_id").unwrap(), Some(0));
 }

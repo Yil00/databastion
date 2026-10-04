@@ -20,19 +20,20 @@
 //!   samples (and without `secret.*` fingerprints for the body);
 //! - the **ticket registry metadata** ([`TicketCounts`]): counts per kind
 //!   and whether the tickets are encrypted, from `type` only;
-//! - the per-scan tally ([`ScanGuard`]) behind the target notes
+//! - the per-scan tally ([`ScanGuard`], per database) and the per-target
+//!   tally of completed scans ([`TargetTally`]) behind the target notes
 //!   `coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted`
 //!   (added by the core to the target's `check()` notes).
 //!
 //! The third recognition rule, the ticket-id **value tripwire**, runs in
 //! the shared sampling path (`ScanJob::classify`, with
-//! `databastion_classifiers::cas::is_ticket_id`): a column or field holding
-//! one ticket-id-shaped value is dropped whole, before classification.
+//! `databastion_classifiers::cas::screen`): a value starting with a named
+//! ticket prefix drops its whole column or field before classification; a
+//! value with only the generic ticket shape, or holding a named ticket id,
+//! is dropped on its own (PR #141 review M4, L1).
 //!
 //! Nothing here logs or returns a sampled value; object and column names
 //! are only compared.
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 
@@ -123,8 +124,8 @@ impl CasStores {
             }) {
                 return Err((
                     key,
-                    "names must be 1 to 128 characters with a letter or digit and no control \
-                     character",
+                    "names must be 1 to 128 characters with an ASCII letter or digit and no \
+                     control character",
                 ));
             }
         }
@@ -146,15 +147,17 @@ impl CasStores {
 }
 
 /// The comparison key of a table, collection, object class or column
-/// name: its letters and digits, lower-cased; the part after the last `.`
-/// only (schema-agnostic: `cas.CasTickets` and `CAS_TICKETS` are the same
-/// table).
+/// name: its ASCII letters and digits, lower-cased; the part after the
+/// last `.` only (schema-agnostic: `cas.CasTickets` and `CAS_TICKETS` are
+/// the same table). The connectors' catalog queries compute the same key
+/// in SQL (PR #141 review L7): the part after the last `.`, every
+/// character but `[A-Za-z0-9]` removed, then lower-cased.
 #[must_use]
 pub fn name_key(name: &str) -> String {
     let last = name.rsplit('.').next().unwrap_or(name);
     last.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
         .collect()
 }
 
@@ -247,13 +250,23 @@ pub fn recognize_name<'a>(
 /// The store kind of an object by its column (or top-level field) shape,
 /// whatever its name: `id`, `type`, `body` (MongoDB: or `json`),
 /// `principal_id` (or `principalId`, MongoDB `principal`) and either
-/// `parent_id` or an expiration column is a ticket registry; `AUD_RESOURCE`
-/// with `AUD_ACTION` is an audit trail.
+/// `parent_id` or an expiration column is a ticket registry. An audit
+/// trail is (PR #141 review M2):
+/// - `AUD_RESOURCE` with `AUD_ACTION` (the JDBC table);
+/// - `AUD_USER` with `AUD_ACTION` and `AUD_CLIENT_IP` or `AUD_DATE` (the
+///   same table as MySQL shows it to an account without a privilege on
+///   `AUD_RESOURCE`: only the columns it holds a privilege on are listed);
+/// - `resourceOperatedUpon` or `actionPerformed` with `principal` or
+///   `clientInfo` (the MongoDB / Inspektr document).
 #[must_use]
 pub fn recognize_shape<'a>(columns: impl IntoIterator<Item = &'a str>) -> Option<StoreKind> {
     let keys: Vec<String> = columns.into_iter().map(name_key).collect();
     let has = |k: &str| keys.iter().any(|c| c == k);
-    if has("audresource") && has("audaction") {
+    let jdbc = has("audaction")
+        && (has("audresource") || (has("auduser") && (has("audclientip") || has("auddate"))));
+    let inspektr = (has("resourceoperatedupon") || has("actionperformed"))
+        && (has("principal") || has("clientinfo"));
+    if jdbc || inspektr {
         return Some(StoreKind::AuditTrail);
     }
     let ticket = has("id")
@@ -318,6 +331,7 @@ const AUDIT_NEVER_READ: &[&str] = &[
     "audextrainfo",
     "resourceoperatedupon",
     "resource",
+    "what",
     "headers",
     "extrainfo",
 ];
@@ -559,64 +573,233 @@ impl TicketCounts {
     }
 }
 
-/// What the guard saw during one Discovery scan of a target: shared by the
-/// clones of its `ScanJob`, read by the core for the target's notes.
+/// The result of a connector's `check()` of the CAS store guard (ADR-0041
+/// decision 6): how many ticket registries or audit trails have a
+/// credential column the agent's account can read, and whether every
+/// privilege that applies was evaluated (PR #141 review M1, L2, L3). An
+/// incomplete check is reported as not evaluated, never as least
+/// privilege.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadableCheck {
+    /// Stores with a readable credential column (among those evaluated).
+    pub readable: u64,
+    /// Every applicable privilege was read and understood, and no list
+    /// was cut at its limit.
+    pub complete: bool,
+}
+
+/// What the guard saw in one database (or LDAP naming context) of a
+/// target, during one scan.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Tally {
+    /// Columns or fields dropped whole by the tripwire.
+    pub tripped: u64,
+    /// Values dropped one by one by the tripwire.
+    pub values_dropped: u64,
+    /// Tickets stored in clear.
+    pub unencrypted: u64,
+    /// Tickets stored encrypted.
+    pub encrypted: u64,
+    /// Ticket registries whose metadata was read.
+    pub registries: u64,
+}
+
+impl Tally {
+    fn add(&mut self, o: &Self) {
+        self.tripped = self.tripped.saturating_add(o.tripped);
+        self.values_dropped = self.values_dropped.saturating_add(o.values_dropped);
+        self.unencrypted = self.unencrypted.saturating_add(o.unencrypted);
+        self.encrypted = self.encrypted.saturating_add(o.encrypted);
+        self.registries = self.registries.saturating_add(o.registries);
+    }
+
+    /// The target notes of a tally (counts only).
+    #[must_use]
+    pub fn notes(&self) -> Vec<crate::TargetNote> {
+        use crate::{NoteCode, TargetNote};
+        let mut out = Vec::new();
+        if self.tripped > 0 {
+            out.push(TargetNote::new(NoteCode::CoverageCasGuardTripped).with_count(self.tripped));
+        }
+        if self.unencrypted > 0 {
+            out.push(
+                TargetNote::new(NoteCode::SecurityTicketRegistryUnencrypted)
+                    .with_count(self.unencrypted),
+            );
+        }
+        out
+    }
+}
+
+/// Per database, the guard tallies of a target's latest **completed**
+/// Discovery scans (PR #141 review L6): once a scan succeeds, it replaces
+/// the tallies of the databases it covered (a scan without any filter
+/// replaces them all; a scan filtered by schema or object only raises
+/// them, as it saw part of each database); a running or failed scan
+/// changes nothing, so the notes do not flap during a scan.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TargetTally(std::collections::BTreeMap<String, Tally>);
+
+impl TargetTally {
+    /// Takes in the tallies of a completed scan; `cut`: it stopped before
+    /// sampling every object (out of time), so it only raises the tallies.
+    pub fn merge_scan(&mut self, scan: &ScanGuard, cut: bool) {
+        let (scope, per_db) = scan.snapshot();
+        let scope = if cut { ScanScope::Partial } else { scope };
+        match scope {
+            ScanScope::Whole => self.0 = per_db,
+            ScanScope::Databases => self.0.extend(per_db),
+            ScanScope::Partial => {
+                for (db, t) in per_db {
+                    let e = self.0.entry(db).or_default();
+                    e.tripped = e.tripped.max(t.tripped);
+                    e.values_dropped = e.values_dropped.max(t.values_dropped);
+                    e.unencrypted = e.unencrypted.max(t.unencrypted);
+                    e.encrypted = e.encrypted.max(t.encrypted);
+                    e.registries = e.registries.max(t.registries);
+                }
+            }
+        }
+    }
+
+    /// The sum over the databases.
+    #[must_use]
+    pub fn total(&self) -> Tally {
+        let mut t = Tally::default();
+        for v in self.0.values() {
+            t.add(v);
+        }
+        t
+    }
+}
+
+/// What the guard saw during one Discovery scan of a target, per database
+/// (the connectors call `ScanJob::begin_database`): shared by the clones
+/// of its `ScanJob`, taken in by the core when the scan completes.
 #[derive(Debug, Default)]
 pub struct ScanGuard {
-    tripped: AtomicU64,
-    unencrypted: AtomicU64,
-    encrypted: AtomicU64,
-    registries: AtomicU64,
+    scope: ScanScope,
+    state: std::sync::Mutex<GuardState>,
+}
+
+/// What a scan covers, for [`TargetTally::merge_scan`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ScanScope {
+    /// Every database and object of the target (no filter).
+    #[default]
+    Whole,
+    /// Whole databases, some of them (a database filter only).
+    Databases,
+    /// Part of some databases (a schema or object filter).
+    Partial,
+}
+
+#[derive(Debug, Default)]
+struct GuardState {
+    current: String,
+    per_db: std::collections::BTreeMap<String, Tally>,
 }
 
 impl ScanGuard {
+    /// A guard for a scan covering `scope`.
+    #[must_use]
+    pub fn new(scope: ScanScope) -> Self {
+        Self {
+            scope,
+            state: std::sync::Mutex::default(),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut Tally) -> R) -> R {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let GuardState { current, per_db } = &mut *st;
+        f(per_db.entry(current.clone()).or_default())
+    }
+
+    /// The scan now reads `database` (its tally starts at zero, and
+    /// replaces the previous scan's once this scan completes).
+    pub(crate) fn begin_database(&self, database: &str) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        database.clone_into(&mut st.current);
+        st.per_db.entry(database.to_owned()).or_default();
+    }
+
     /// One more column or field dropped by the ticket-id tripwire.
     pub(crate) fn trip(&self) {
-        self.tripped.fetch_add(1, Ordering::Relaxed);
+        self.with(|t| t.tripped = t.tripped.saturating_add(1));
+    }
+
+    /// Values dropped one by one by the tripwire (generic ticket shape, or
+    /// a ticket id inside the value).
+    pub(crate) fn drop_values(&self, n: u64) {
+        self.with(|t| t.values_dropped = t.values_dropped.saturating_add(n));
     }
 
     /// A ticket registry's metadata.
     pub(crate) fn add_registry(&self, counts: &TicketCounts) {
-        self.registries.fetch_add(1, Ordering::Relaxed);
-        self.unencrypted
-            .fetch_add(counts.unencrypted(), Ordering::Relaxed);
-        self.encrypted
-            .fetch_add(counts.encrypted(), Ordering::Relaxed);
+        self.with(|t| {
+            t.registries = t.registries.saturating_add(1);
+            t.unencrypted = t.unencrypted.saturating_add(counts.unencrypted());
+            t.encrypted = t.encrypted.saturating_add(counts.encrypted());
+        });
+    }
+
+    /// What the scan covers, and its tallies per database.
+    #[must_use]
+    pub fn snapshot(&self) -> (ScanScope, std::collections::BTreeMap<String, Tally>) {
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.scope, st.per_db.clone())
+    }
+
+    /// This scan's totals so far.
+    #[must_use]
+    pub fn total(&self) -> Tally {
+        let mut t = Tally::default();
+        for v in self.snapshot().1.values() {
+            t.add(v);
+        }
+        t
     }
 
     /// Columns or fields dropped by the tripwire so far.
     #[must_use]
     pub fn tripped(&self) -> u64 {
-        self.tripped.load(Ordering::Relaxed)
+        self.total().tripped
+    }
+
+    /// Values dropped one by one so far (logged, not a target note: the
+    /// `coverage.cas_guard_tripped` description counts columns not read
+    /// further).
+    #[must_use]
+    pub fn values_dropped(&self) -> u64 {
+        self.total().values_dropped
     }
 
     /// Tickets stored in clear, over the registries read so far.
     #[must_use]
     pub fn unencrypted(&self) -> u64 {
-        self.unencrypted.load(Ordering::Relaxed)
+        self.total().unencrypted
     }
 
     /// Ticket registries whose metadata was read.
     #[must_use]
     pub fn registries(&self) -> u64 {
-        self.registries.load(Ordering::Relaxed)
+        self.total().registries
     }
 
     /// The target notes of this scan's guard (counts only).
     #[must_use]
     pub fn notes(&self) -> Vec<crate::TargetNote> {
-        use crate::{NoteCode, TargetNote};
-        let mut out = Vec::new();
-        if self.tripped() > 0 {
-            out.push(TargetNote::new(NoteCode::CoverageCasGuardTripped).with_count(self.tripped()));
-        }
-        if self.unencrypted() > 0 {
-            out.push(
-                TargetNote::new(NoteCode::SecurityTicketRegistryUnencrypted)
-                    .with_count(self.unencrypted()),
-            );
-        }
-        out
+        self.total().notes()
     }
 }
 
@@ -768,6 +951,64 @@ mod tests {
             Some(StoreKind::AuditTrail)
         );
         assert_eq!(recognize_shape(["AUD_RESOURCE"]), None);
+        // PR #141 review M2: the JDBC table as MySQL lists it to an account
+        // without a privilege on `AUD_RESOURCE`.
+        for cols in [
+            &["AUD_USER", "AUD_ACTION", "AUD_CLIENT_IP"][..],
+            &["aud_user", "aud_action", "aud_date"][..],
+            &[
+                "AUD_USER",
+                "AUD_CLIENT_IP",
+                "AUD_SERVER_IP",
+                "AUD_ACTION",
+                "APPLIC_CD",
+                "AUD_DATE",
+            ][..],
+        ] {
+            assert_eq!(
+                recognize_shape(cols.iter().copied()),
+                Some(StoreKind::AuditTrail),
+                "{cols:?}"
+            );
+        }
+        assert_eq!(recognize_shape(["AUD_USER", "AUD_ACTION"]), None);
+        assert_eq!(recognize_shape(["AUD_USER", "AUD_DATE"]), None);
+        // The MongoDB / Inspektr document.
+        for cols in [
+            &[
+                "_id",
+                "principal",
+                "resourceOperatedUpon",
+                "actionPerformed",
+            ][..],
+            &["_id", "actionPerformed", "clientInfo"][..],
+            &[
+                "_id",
+                "resourceOperatedUpon",
+                "clientInfo",
+                "whenActionWasPerformed",
+            ][..],
+        ] {
+            assert_eq!(
+                recognize_shape(cols.iter().copied()),
+                Some(StoreKind::AuditTrail),
+                "{cols:?}"
+            );
+        }
+        assert_eq!(recognize_shape(["_id", "actionPerformed"]), None);
+        assert_eq!(recognize_shape(["_id", "principal", "clientInfo"]), None);
+        let a = Some(StoreKind::AuditTrail);
+        // `clientInfo.headers` (cookies) is never read, nor `what`.
+        assert_eq!(column_rule(a, "clientInfo.headers"), ColumnRule::NeverRead);
+        assert_eq!(
+            column_rule(a, "clientInfo.headers.Cookie"),
+            ColumnRule::NeverRead
+        );
+        assert_eq!(column_rule(a, "what"), ColumnRule::NeverRead);
+        assert_eq!(
+            column_rule(a, "clientInfo.clientIpAddress"),
+            ColumnRule::Sampled
+        );
     }
 
     #[test]
@@ -905,5 +1146,50 @@ mod tests {
         assert_eq!(notes[1].count(), Some(4));
         assert!(notes.iter().all(|n| n.labels().is_empty()));
         assert_eq!(g.registries(), 1);
+    }
+
+    /// PR #141 review L6: a completed scan replaces the tallies of the
+    /// databases it covered; a whole-target scan replaces them all.
+    #[test]
+    fn target_tally_keeps_the_last_completed_scan_per_database() {
+        let mut t = TargetTally::default();
+        let full = ScanGuard::new(ScanScope::Whole);
+        full.begin_database("a");
+        full.trip();
+        full.begin_database("b");
+        full.trip();
+        full.trip();
+        t.merge_scan(&full, false);
+        assert_eq!(t.total().tripped, 3);
+        // A scan of `a` only, clean: `b` keeps its tally.
+        let only_a = ScanGuard::new(ScanScope::Databases);
+        only_a.begin_database("a");
+        t.merge_scan(&only_a, false);
+        assert_eq!(t.total().tripped, 2);
+        // A scan in progress does not touch the stored tally.
+        let running = ScanGuard::new(ScanScope::Whole);
+        running.begin_database("b");
+        assert_eq!(t.total().tripped, 2);
+        // A whole-target scan that no longer sees `b` drops it.
+        running.begin_database("a");
+        t.merge_scan(&running, false);
+        assert_eq!(t.total(), Tally::default());
+        assert!(t.total().notes().is_empty());
+        // An object-filtered scan only raises a database's tally.
+        let full = ScanGuard::new(ScanScope::Whole);
+        full.begin_database("a");
+        full.trip();
+        full.trip();
+        t.merge_scan(&full, false);
+        let part = ScanGuard::new(ScanScope::Partial);
+        part.begin_database("a");
+        part.trip();
+        t.merge_scan(&part, false);
+        assert_eq!(t.total().tripped, 2);
+        // So does a whole-target scan stopped out of time.
+        let cut = ScanGuard::new(ScanScope::Whole);
+        cut.begin_database("a");
+        t.merge_scan(&cut, true);
+        assert_eq!(t.total().tripped, 2);
     }
 }

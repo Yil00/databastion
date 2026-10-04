@@ -497,6 +497,10 @@ fn value_spans(s: &str) -> Vec<Range<usize>> {
     spans.extend(split_digit_runs(s));
     spans.extend(hash_spans(s));
     spans.extend(split_aws_key_ids(s));
+    // A CAS ticket id (PR #141 review M3): masked to the end of the name.
+    if let Some(start) = crate::cas::ticket_start_in_name(s) {
+        spans.push(start..s.len());
+    }
     spans
 }
 
@@ -841,6 +845,11 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
 /// Normalizes an LDAP attribute type (lowercased).
 #[must_use]
 pub fn normalize_ldap_attribute(raw: &str) -> NormalizedName {
+    // A ticket id is looked for before lower-casing (the pattern is upper
+    // case).
+    if fold(raw).is_some_and(|f| crate::cas::ticket_start_in_name(&f).is_some()) {
+        return NormalizedName::wildcard();
+    }
     normalize_path(&raw.to_ascii_lowercase())
 }
 

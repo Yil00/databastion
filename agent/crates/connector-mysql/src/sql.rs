@@ -318,13 +318,32 @@ pub(crate) fn ticket_type_counts(
     })
 }
 
-/// `check()` of the CAS store guard, at every heartbeat (ADR-0041
-/// decision 6): the columns the account can see (`information_schema`
-/// lists those it holds a privilege on, directly, through its enabled
-/// roles or `PUBLIC`) of the tables that may be CAS stores: a name key in
-/// `keys` (letters and digits, lower-cased), or a `body` / `json` /
-/// `AUD_RESOURCE` column. Columns: schema, table, column, privileges.
-/// `None` when a key cannot be quoted.
+/// Normalized name key of a catalog name in SQL, as
+/// `databastion_core::cas_guard::name_key` (PR #141 review L7): the part
+/// after the last `.`, every character but an ASCII letter or digit
+/// removed (binary collation and an explicit list: no case folding beyond
+/// ASCII), then lower-cased.
+macro_rules! name_key {
+    ($col:literal) => {
+        concat!(
+            "LOWER(REGEXP_REPLACE(SUBSTRING_INDEX(CONVERT(",
+            $col,
+            " USING utf8mb4) COLLATE utf8mb4_bin, '.', -1), \
+             '[^ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]', ''))"
+        )
+    };
+}
+
+/// Most rows of [`cas_guard_columns`]; one more is read to tell a cut list
+/// (then reported as not evaluated, PR #141 review L2).
+pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
+
+/// `check()` of the CAS store guard (ADR-0041 decision 6): the columns of
+/// the tables that may be CAS stores (a name key in `keys`, or a `body` /
+/// `json` / `AUD_RESOURCE` / `AUD_USER` column) the account can see, with
+/// its privileges on each. Tables matched by name come first (PR #141
+/// review L2); at most [`CAS_GUARD_MAX_ROWS`] + 1 rows. `None` when a key
+/// cannot be quoted. Columns: schema, table, column, privileges.
 #[must_use]
 pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
     let mut list = Vec::with_capacity(keys.len());
@@ -334,18 +353,20 @@ pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
     if list.is_empty() {
         list.push("''".to_owned());
     }
+    let list = list.join(", ");
     Some(format!(
         "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.PRIVILEGES \
          FROM information_schema.COLUMNS c \
          WHERE LOWER(c.TABLE_SCHEMA) NOT IN \
            ('mysql', 'sys', 'information_schema', 'performance_schema') \
-           AND (REGEXP_REPLACE(LOWER(c.TABLE_NAME), '[^a-z0-9]', '') IN ({}) \
+           AND ({key} IN ({list}) \
              OR (c.TABLE_SCHEMA, c.TABLE_NAME) IN ( \
                SELECT x.TABLE_SCHEMA, x.TABLE_NAME FROM information_schema.COLUMNS x \
-               WHERE LOWER(x.COLUMN_NAME) IN ('body', 'json', 'aud_resource', 'audresource'))) \
-         ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION \
-         LIMIT 20000",
-        list.join(", ")
+               WHERE {xkey} IN ('body', 'json', 'audresource', 'auduser'))) \
+         ORDER BY ({key} IN ({list})) DESC, c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION \
+         LIMIT 20001",
+        key = name_key!("c.TABLE_NAME"),
+        xkey = name_key!("x.COLUMN_NAME"),
     ))
 }
 

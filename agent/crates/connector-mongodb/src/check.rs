@@ -448,12 +448,16 @@ const MAX_GUARD_LISTINGS: usize = 16;
 /// collections named like CAS stores (built-in names and `cas_stores`),
 /// those the last scan recognized by their document shape, and, for a
 /// database-wide `find`, the collections of that database named like CAS
-/// stores.
+/// stores. A `find` on any database lists the databases first.
+///
+/// Fail closed (PR #141 review L3): the check is not complete when more
+/// than [`MAX_GUARD_LISTINGS`] databases would have to be listed, when a
+/// database or collection list is cut or cannot be read.
 pub(crate) async fn cas_guard_readable<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session<S>,
     target: &TargetConfig,
     state: &CheckState,
-) -> Result<u64, MgError> {
+) -> Result<databastion_core::cas_guard::ReadableCheck, MgError> {
     use databastion_core::cas_guard::{self, StoreKind};
     let stores = target.cas_stores();
     let guarded_name = |c: &str| {
@@ -480,7 +484,9 @@ pub(crate) async fn cas_guard_readable<S: AsyncRead + AsyncWrite + Unpin>(
         .filter(|(_, _, k)| *k != StoreKind::ServiceRegistry)
         .collect();
     let mut readable: std::collections::BTreeSet<(String, String)> = Default::default();
-    let mut listed = 0usize;
+    let mut to_list: std::collections::BTreeSet<String> = Default::default();
+    let mut any = false;
+    let mut complete = true;
     for scope in scopes {
         match scope {
             crate::privileges::FindScope::Collection(db, c) => {
@@ -494,25 +500,48 @@ pub(crate) async fn cas_guard_readable<S: AsyncRead + AsyncWrite + Unpin>(
                         readable.insert((d.clone(), c.clone()));
                     }
                 }
-                if listed < MAX_GUARD_LISTINGS && !catalog::is_system_database(&db) {
-                    listed += 1;
-                    if let Ok((collections, _)) = catalog::list_collections(session, &db).await {
-                        for c in collections {
-                            if guarded_name(&c.name) {
-                                readable.insert((db.clone(), c.name));
-                            }
-                        }
-                    }
-                }
+                to_list.insert(db);
             }
             crate::privileges::FindScope::Any => {
                 for (d, c, _) in &known {
                     readable.insert((d.clone(), c.clone()));
                 }
+                any = true;
             }
         }
     }
-    Ok(readable.len() as u64)
+    if any {
+        match catalog::list_databases(session).await {
+            Ok((databases, truncated)) => {
+                complete &= !truncated;
+                to_list.extend(databases);
+            }
+            Err(e) if !e.fatal => complete = false,
+            Err(e) => return Err(e),
+        }
+    }
+    to_list.retain(|db| !catalog::is_system_database(db));
+    if to_list.len() > MAX_GUARD_LISTINGS {
+        complete = false;
+    }
+    for db in to_list.into_iter().take(MAX_GUARD_LISTINGS) {
+        match catalog::list_collections(session, &db).await {
+            Ok((collections, truncated)) => {
+                complete &= !truncated;
+                for c in collections {
+                    if guarded_name(&c.name) {
+                        readable.insert((db.clone(), c.name));
+                    }
+                }
+            }
+            Err(e) if !e.fatal => complete = false,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(cas_guard::ReadableCheck {
+        readable: readable.len() as u64,
+        complete,
+    })
 }
 
 /// Privileges and coverage.
@@ -667,16 +696,26 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
     // CAS store guard (ADR-0041 decision 6): at every heartbeat.
     if !session.is_broken() {
         match cas_guard_readable(&mut session, target, state).await {
-            Ok(0) => {}
-            Ok(n) => {
-                detail.push(format!(
-                    "the account can find in {n} CAS ticket registry or audit trail \
-                     collection(s): their credentials are readable (grant find on a view \
-                     projecting the metadata only)"
-                ));
-                codes.add(
-                    TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(n),
-                );
+            Ok(r) => {
+                if !r.complete {
+                    detail.push(
+                        "CAS store guard privileges not fully evaluated (too many databases to \
+                         list, or a list cut or not readable)"
+                            .to_owned(),
+                    );
+                    codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+                }
+                let n = r.readable;
+                if n > 0 {
+                    detail.push(format!(
+                        "the account can find in {n} CAS ticket registry or audit trail \
+                         collection(s): their credentials are readable (grant find on a view \
+                         projecting the metadata only)"
+                    ));
+                    codes.add(
+                        TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(n),
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(

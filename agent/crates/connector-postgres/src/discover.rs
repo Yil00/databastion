@@ -102,6 +102,7 @@ async fn scan_database(
         job.skip_out_of_time(sink, 1);
         return Ok(());
     }
+    job.begin_database(database);
     let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;

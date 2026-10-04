@@ -237,6 +237,7 @@ where
             job.skip_out_of_time(sink, 1);
             continue;
         }
+        job.begin_database(suffix);
         let listed = {
             let s = ensure(&mut slot, target, &mut connect).await?;
             match job.paced(catalog::containers(s, suffix)).await? {
@@ -458,6 +459,9 @@ async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
         filter: Filter::Present("objectClass"),
         attributes,
     };
+    // Ticket entries skipped, per object class (logged once per container,
+    // PR #141 review L8).
+    let mut skipped: std::collections::BTreeMap<String, u64> = Default::default();
     let mut on_entry = |e: Entry| {
         let class = schema.structural_class(
             e.first_str("structuralObjectClass"),
@@ -476,10 +480,7 @@ async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
         // CAS store guard (ADR-0041 decision 5, security review M5).
         match cas_entry(job.cas_stores(), &e) {
             Some(StoreKind::TicketRegistry) => {
-                tracing::info!(
-                    object = object.as_str(),
-                    "CAS ticket entry not read (CAS store guard)"
-                );
+                *skipped.entry(object.as_str().to_owned()).or_default() += 1;
             }
             kind => {
                 let group = groups.entry(object).or_default();
@@ -488,7 +489,15 @@ async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
-    let outcome = s.search(Stage::Sample, &search, &mut on_entry).await?;
+    let outcome = s.search(Stage::Sample, &search, &mut on_entry).await;
+    for (object, entries) in &skipped {
+        tracing::info!(
+            object = object.as_str(),
+            entries = *entries,
+            "CAS ticket entries not read (CAS store guard)"
+        );
+    }
+    let outcome = outcome?;
     if let Some(e) = outcome.error(Stage::Sample) {
         return Err(e);
     }

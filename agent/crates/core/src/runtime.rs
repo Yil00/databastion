@@ -644,10 +644,11 @@ struct Runtime {
     /// Targets whose audit stream was stopped after [`AUDIT_MAX_PANICS`]
     /// panics in a row, with that count (reported as a target note).
     audit_parked: Mutex<std::collections::HashMap<String, u32>>,
-    /// Per target, the CAS store guard tally of its latest Discovery scan
-    /// (ADR-0041 decision 5): `coverage.cas_guard_tripped` and
-    /// `security.ticket_registry_unencrypted` in the target's notes.
-    cas_guards: Mutex<std::collections::HashMap<String, Arc<crate::cas_guard::ScanGuard>>>,
+    /// Per target and database, the CAS store guard tallies of its latest
+    /// completed Discovery scans (ADR-0041 decision 5, PR #141 review L6):
+    /// `coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted`
+    /// in the target's notes.
+    cas_guards: Mutex<std::collections::HashMap<String, crate::cas_guard::TargetTally>>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
     /// Longest wait for a scan's findings to be acknowledged before its
@@ -1147,7 +1148,7 @@ impl Runtime {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&target.id)
             {
-                notes.extend(g.notes());
+                notes.extend(g.total().notes());
             }
             notes
         };
@@ -2859,11 +2860,6 @@ impl Runtime {
         // security review): derived from the job id.
         let seed = id.get().as_u64_pair().1;
         let scan = scan.with_cancel(token).with_rotation(seed);
-        // The guard tally of this scan replaces the previous scan's.
-        self.cas_guards
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(target_id.as_str().to_owned(), Arc::clone(scan.cas_guard()));
         let (sink, mut rx) = FindingSink::channel(FINDINGS_CHANNEL);
         let coverage = sink.coverage_cell();
         let chunk: Mutex<Vec<MaskedFinding>> = Mutex::new(Vec::new());
@@ -3046,6 +3042,17 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         outcome.out_of_time = scan.pacer().out_of_time();
+        // The guard tally of a completed scan replaces the previous scans'
+        // for the databases it covered; a running or failed scan leaves the
+        // notes as they were.
+        if outcome.error.is_none() {
+            self.cas_guards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.as_str().to_owned())
+                .or_default()
+                .merge_scan(scan.cas_guard(), outcome.out_of_time);
+        }
         outcome
     }
 

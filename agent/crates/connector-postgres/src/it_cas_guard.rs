@@ -278,3 +278,66 @@ async fn cas_store_guard_on_postgres() {
     assert_eq!(readable, Some(2));
     assert_eq!(with_audit, Some(3));
 }
+
+/// PR #141 review M5: a CAS upgrade drops and recreates its ticket tables;
+/// the agent's column grants are gone, but the schema's default privileges
+/// give it a table grant on the new tables: the next check reports them
+/// (built-in name and shape). Review L2: more candidate relations than the
+/// check reads (tables matched by name first) is reported as not
+/// evaluated, never as least privilege.
+#[tokio::test]
+async fn recreated_ticket_tables_and_cut_candidate_lists() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    setup(&adm, &u.user).await;
+    let (_dir, t) = target(&u, &u.user, &u.password, GUARD_DB, false);
+    let c = PostgresConnector::new();
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(ticket_note(&h.notes), None, "{h:?}");
+    let not_evaluated = |h: &databastion_core::TargetHealth| {
+        h.notes
+            .iter()
+            .any(|n| n.code() == NoteCode::CheckStageFailed)
+    };
+    assert!(!not_evaluated(&h), "{h:?}");
+
+    let g = admin(&adm, GUARD_DB).await;
+    g.batch_execute(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA cas GRANT SELECT ON TABLES TO \"{agent}\"; \
+         DROP TABLE cas.\"CasTickets\"; \
+         CREATE TABLE cas.\"CasTickets\" (id text, body text, type text, principal_id text); \
+         DROP TABLE cas.sso_sessions_v2; \
+         CREATE TABLE cas.sso_sessions_v2 (id text PRIMARY KEY, parent_id text, body text, \
+           type text, principal_id text, expiration_time timestamptz);",
+        agent = u.user
+    ))
+    .await
+    .unwrap();
+    let h = c.check(&t).await;
+    assert_eq!(ticket_note(&h.notes), Some(2), "{h:?}");
+    assert!(!not_evaluated(&h), "{h:?}");
+
+    // 300 more candidates (a `body` column each): the list is cut, the
+    // tables named like CAS stores are still evaluated.
+    g.batch_execute(
+        "DO $$ BEGIN FOR i IN 1..300 LOOP \
+           EXECUTE format('CREATE TABLE cas.filler_%s (body text)', i); \
+         END LOOP; END $$;",
+    )
+    .await
+    .unwrap();
+    let h = c.check(&t).await;
+    let readable = ticket_note(&h.notes);
+    let cut = not_evaluated(&h);
+    drop(g);
+    admin(&adm, "postgres")
+        .await
+        .batch_execute(&format!("DROP DATABASE {GUARD_DB} WITH (FORCE)"))
+        .await
+        .unwrap();
+    assert!(cut, "{h:?}");
+    assert!(readable >= Some(1), "{h:?}");
+}
