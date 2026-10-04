@@ -11,8 +11,10 @@
 //! - [`ServiceIndex`]: `serviceId` patterns compiled with the `regex`
 //!   crate under a size limit, in evaluation order. A pattern that does
 //!   not compile (Java-only syntax: look-arounds, possessive quantifiers)
-//!   never matches. A lookup gives only the entry's type and normalized
-//!   name: the host it was given never leaves the agent.
+//!   cannot be evaluated: a lookup that reaches it stops with no service
+//!   (`*`), since CAS might have matched it (review of #138). A lookup
+//!   gives only the entry's type and normalized name: the host it was
+//!   given never leaves the agent.
 
 use databastion_classifiers::names::{
     NormalizedName, PathPart, normalize_field_path, normalize_path,
@@ -84,7 +86,8 @@ pub fn object_name(def: &Definition) -> NormalizedName {
 /// The `serviceId` pattern of an indexed service.
 enum Pattern {
     Compiled(Regex),
-    /// Does not compile (Java-only syntax): never matches.
+    /// Does not compile (Java-only syntax): whether it matches is unknown,
+    /// so a lookup that reaches it stops with no service.
     Invalid,
     /// Beyond [`PATTERN_BUDGET`]: whether it matches is unknown, so a
     /// lookup that reaches it stops with no service (review of #138: a
@@ -177,8 +180,9 @@ impl ServiceIndex {
 
     /// The first service (in evaluation order) whose pattern matches
     /// `scheme://host/`: its type and normalized name. `None` when none
-    /// matches, or when a service whose pattern was not compiled for the
-    /// budget comes first (it might match).
+    /// matches, or when a service whose pattern could not be compiled
+    /// (Java-only syntax, or beyond the budget) comes first (it might
+    /// match).
     #[must_use]
     pub fn lookup(&self, host: &ServiceHost) -> Option<(ServiceType, &NormalizedName)> {
         let url = host.as_url();
@@ -187,8 +191,8 @@ impl ServiceIndex {
                 Pattern::Compiled(p) if p.is_match(&url) => {
                     return Some((e.service_type, &e.object));
                 }
-                Pattern::Compiled(_) | Pattern::Invalid => {}
-                Pattern::Unknown => return None,
+                Pattern::Compiled(_) => {}
+                Pattern::Invalid | Pattern::Unknown => return None,
             }
         }
         None
@@ -266,10 +270,19 @@ mod tests {
         let defs = [
             mk("Catch-All", "^https://.*", 100),
             mk("HR", "^https://hr\\\\.example\\\\.org/.*", 1),
-            mk("Java-Only", "^https://(?=x).*", 0),
+            mk("Java-Only", "^https://(?=x).*", 200),
         ];
         let idx = ServiceIndex::new(&defs);
         assert_eq!(idx.len(), 3);
+        // A pattern that does not compile, first in evaluation order,
+        // stops the lookup: CAS may have matched it.
+        let first = mk("Java-First", "^https://(?=x).*", 0);
+        let invalid_first = ServiceIndex::new([&first, &defs[0], &defs[1]]);
+        assert!(
+            invalid_first
+                .lookup(&service_of("https://hr.example.org/x").unwrap())
+                .is_none()
+        );
         let mut big = ServiceIndex::default();
         let budget = PATTERN_BUDGET / (2 * PATTERN_SIZE_LIMIT);
         for i in 0..budget {

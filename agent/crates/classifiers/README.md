@@ -251,6 +251,8 @@ this agent emits only the closed set below (`masking::Signal::ALL`):
 | `signature.mongodump` | MongoDB: a read of a collection (`find`, `aggregate`, `getMore`) by a client whose `appName` is `mongodump` (P5-B / P5-C, ADR-0027) |
 | `signature.mongoexport` | MongoDB: the same with `mongoexport` |
 | `shape.bulk_search` | OpenLDAP: a search with scope one-level, subtree or children whose filter selects no entry by value (presence tests and `objectClass` equality assertions only, under `&` / `\|`): an LDIF export or a bulk `ldapsearch` (phase 6, ADR-0029) |
+| `volume.failed_logins_many_accounts` | CAS: one client address (before the `client_addr` reduction) with failed authentications for at least 16 distinct principals within 10 minutes; its further failures are aggregated per address and minute under the principal `*` (`EventPrincipal::many_accounts`, the only principal sent as `*`; phase 8, ADR-0041) |
+| `volume.failed_logins_one_account` | CAS: one principal with at least 20 failed authentications within 10 minutes, whatever the addresses (phase 8, ADR-0041) |
 
 The thresholds sit above the agent's own maximum sample (10 000 rows), so
 its Discovery never raises them. `shape.*` and `signature.*` are heuristics

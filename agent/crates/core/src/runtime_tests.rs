@@ -1384,6 +1384,17 @@ async fn audit_cursor_resets_are_a_heartbeat_metric() {
 }
 
 #[tokio::test]
+async fn failed_login_window_overflows_are_a_heartbeat_metric() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let key = MetricsMapKey::try_from("audit_window_overflow_total").unwrap();
+    let before = rt.metrics().0[&key];
+    crate::audit::count_window_overflow(4);
+    assert!(rt.metrics().0[&key] >= before + 4.0);
+}
+
+#[tokio::test]
 async fn batch_conflict_is_dropped_never_resent() {
     let server = MockServer::start().await;
     let (_env, rt) = spooled_runtime(&server, vec![Step::Conflict], 3).await;

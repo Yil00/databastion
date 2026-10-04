@@ -1,13 +1,16 @@
 //! Closed target notes and signals of a `cas` target (ADR-0041 decisions 8
-//! and 11), as crate-internal types.
+//! and 11).
 //!
-//! TODO(P8-C): wired to the protocol types in P8-C. The `cas` engine, the
-//! new notes (`target-notes.json`) and the two signals (`signals.json`) are
-//! added to the contract on another branch; until it merges, this crate
-//! keeps its own closed enums with the contract spellings, and nothing here
-//! reaches the uplink (the crate is not wired into the agent core yet).
+//! The crate keeps its own closed enums (the subset a `cas` target can
+//! report), mapped exhaustively to the core's [`NoteCode`] (registered in
+//! `target-notes.json` with engine `cas` by P8-C) and to
+//! `databastion_classifiers::masking::Signal` (registered in
+//! `signals.json`): a code added here does not compile until it is mapped.
 
 use std::fmt;
+
+use databastion_classifiers::masking::Signal;
+use databastion_core::{NoteCode, TargetNote};
 
 /// Closed note codes a `cas` target reports (ADR-0041 decision 11). Counts
 /// only: a note never carries a path, a file name or a value.
@@ -93,6 +96,30 @@ impl CasNoteCode {
     }
 }
 
+impl CasNoteCode {
+    /// The core's note code (same contract spelling).
+    #[must_use]
+    pub const fn code(self) -> NoteCode {
+        match self {
+            Self::AuditLogNotReadable => NoteCode::AuditLogNotReadable,
+            Self::AuditLogFormatUnsupported => NoteCode::AuditLogFormatUnsupported,
+            Self::AuditLimitedPendingFirstRecord => NoteCode::AuditLimitedPendingFirstRecord,
+            Self::AuditAuthRecordsNotSeen => NoteCode::AuditAuthRecordsNotSeen,
+            Self::AuditAuthFailuresNotSeen => NoteCode::AuditAuthFailuresNotSeen,
+            Self::AuditServiceTicketRecordsNotSeen => NoteCode::AuditServiceTicketRecordsNotSeen,
+            Self::AuditRecordsDropped => NoteCode::AuditRecordsDropped,
+            Self::AuditStreamStopped => NoteCode::AuditStreamStopped,
+            Self::CoverageRegistryFilesSkipped => NoteCode::CoverageRegistryFilesSkipped,
+            Self::SecurityClientSecretsInClear => NoteCode::SecurityClientSecretsInClear,
+            Self::SecurityAuditHeadersLogged => NoteCode::SecurityAuditHeadersLogged,
+            Self::PrivilegeRegistryWritable => NoteCode::PrivilegeRegistryWritable,
+            Self::PrivilegeConfigReadable => NoteCode::PrivilegeConfigReadable,
+            Self::CheckStageFailed => NoteCode::CheckStageFailed,
+            Self::CheckTimedOut => NoteCode::CheckTimedOut,
+        }
+    }
+}
+
 impl fmt::Display for CasNoteCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -109,6 +136,16 @@ pub struct CasNote {
 }
 
 impl CasNote {
+    /// The core's note (closed code and count only).
+    #[must_use]
+    pub fn to_target_note(self) -> TargetNote {
+        let note = TargetNote::new(self.code.code());
+        match self.count {
+            Some(n) => note.with_count(n),
+            None => note,
+        }
+    }
+
     /// A note without a count.
     #[must_use]
     pub const fn flag(code: CasNoteCode) -> Self {
@@ -125,11 +162,8 @@ impl CasNote {
     }
 }
 
-/// Signals of a `cas` target (ADR-0041 decision 8; heuristics).
-///
-/// TODO(P8-C): wired to the protocol types in P8-C (appended to
-/// `signals.json` with engine `cas`, then to
-/// `databastion_classifiers::masking::Signal`).
+/// Signals of a `cas` target (ADR-0041 decision 8; heuristics), mapped
+/// to `databastion_classifiers::masking::Signal` ([`Self::signal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CasSignal {
     /// One client address, failed authentications for at least
@@ -148,6 +182,15 @@ impl CasSignal {
         match self {
             Self::FailedLoginsManyAccounts => "volume.failed_logins_many_accounts",
             Self::FailedLoginsOneAccount => "volume.failed_logins_one_account",
+        }
+    }
+
+    /// The agent's signal (same contract spelling).
+    #[must_use]
+    pub const fn signal(self) -> Signal {
+        match self {
+            Self::FailedLoginsManyAccounts => Signal::FailedLoginsManyAccounts,
+            Self::FailedLoginsOneAccount => Signal::FailedLoginsOneAccount,
         }
     }
 }
@@ -177,6 +220,18 @@ mod tests {
             CasSignal::FailedLoginsOneAccount,
         ] {
             assert!(s.as_str().starts_with("volume."));
+            assert_eq!(s.signal().as_str(), s.as_str());
         }
+    }
+
+    #[test]
+    fn codes_map_to_the_core_codes_of_the_same_spelling() {
+        for c in CasNoteCode::ALL {
+            assert_eq!(c.code().as_str(), c.as_str(), "{c}");
+        }
+        let n = CasNote::counted(CasNoteCode::SecurityClientSecretsInClear, 3).to_target_note();
+        assert_eq!(n.code(), NoteCode::SecurityClientSecretsInClear);
+        assert_eq!(n.count(), Some(3));
+        assert!(n.labels().is_empty());
     }
 }

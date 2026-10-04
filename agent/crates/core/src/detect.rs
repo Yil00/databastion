@@ -102,6 +102,7 @@ fn target_family(engine: TargetEngine) -> u8 {
         TargetEngine::Mysql | TargetEngine::Mariadb => 1,
         TargetEngine::Mongodb => 2,
         TargetEngine::Openldap => 3,
+        TargetEngine::Cas => 4,
     }
 }
 
@@ -120,6 +121,8 @@ fn default_port(engine: TargetEngine) -> u16 {
         TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
         TargetEngine::Mongodb => 27017,
         TargetEngine::Openldap => 389,
+        // Never detected (no port of its own here; ADR-0041 decision 3).
+        TargetEngine::Cas => 0,
     }
 }
 

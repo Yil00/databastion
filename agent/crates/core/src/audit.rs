@@ -76,6 +76,36 @@ pub(crate) fn cursor_resets() -> u64 {
     CURSOR_RESETS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Failed logins aggregated anonymously because a connector's bounded
+/// failed-login window was full (CAS, ADR-0041 decision 7, security review
+/// M7): heartbeat metric `audit_window_overflow_total`.
+static WINDOW_OVERFLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts `n` failed logins a connector aggregated without principal nor
+/// address because its bounded window was full: heartbeat metric
+/// `audit_window_overflow_total`.
+pub fn count_window_overflow(n: u64) {
+    WINDOW_OVERFLOW.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_window_overflow`].
+pub(crate) fn window_overflows() -> u64 {
+    WINDOW_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A tag key for in-memory state only (failed-login windows keyed by a
+/// tag of the principal, never by the name): a fresh random key, so the
+/// tags mean nothing outside this process and are never persisted nor
+/// sent. `None` when the system random source fails.
+#[must_use]
+pub fn ephemeral_tag_key(purpose: &str) -> Option<LocalTagKey> {
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::fill(bytes.as_mut()).ok()?;
+    databastion_classifiers::masking::HmacKey::new(bytes.as_ref())
+        .ok()?
+        .local_tag_key(purpose)
+}
+
 /// Subdirectory of `state_dir` holding audit cursors and settings.
 pub(crate) const AUDIT_DIR: &str = "audit";
 

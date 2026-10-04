@@ -15,6 +15,7 @@ publish.workspace = true
 [dependencies]
 databastion-core.workspace = true
 databastion-classifiers.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "sync"] }
 tracing.workspace = true
@@ -25,8 +26,6 @@ regex.workspace = true
 # (never a generic `serde_json::Value`, ADR-0041 decisions 4 and 7).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-# `cas:` block of a target in agent.yaml.
-serde_yaml_ng = "0.10"
 # openat / fstat / faccessat without `unsafe` (ADR-0041 decision 3), as the
 # core's state files.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
@@ -35,6 +34,10 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
 # cargo-fuzz): never enabled by the agent binary.
 fuzzing = []
+# Test helpers for other crates' tests (enabled from their
+# `[dev-dependencies]` only, never by the agent binary): accepting files the
+# test's own user could write.
+test-support = []
 
 [dev-dependencies]
 # Test helpers of the core (tailing log files the test's own user owns).

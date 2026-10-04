@@ -30,8 +30,9 @@
 //!   in a full window is aggregated into one event per minute without a
 //!   client address, principal `*`, and counted ([`Builder::overflow`]).
 //!
-//! TODO(P8-C): wired to the protocol types in P8-C: [`CasEvent`] becomes a
-//! `MaskedEvent` with the `cas_audit_log` source and the `cas` signals.
+//! [`CasEvent::into_masked`] gives the `MaskedEvent` the core accepts
+//! (source `cas_audit_log`, the signals as `masking::Signal`, the `*`
+//! aggregate as `EventPrincipal::many_accounts`).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -39,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use databastion_classifiers::masking::{
-    ClientAddr, EventAction, EventObject, EventPrincipal, LocalTagKey,
+    ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, LocalTagKey, MaskedEvent,
 };
 use databastion_classifiers::names::{NormalizedName, normalize_path};
 
@@ -102,6 +103,36 @@ impl CasEvent {
         if let Err(i) = self.signals.binary_search(&s) {
             self.signals.insert(i, s);
         }
+    }
+
+    /// The masked event the core accepts: source `cas_audit_log`, the
+    /// principal with its (already reduced) client address and the
+    /// application through the contract `Principal.application`
+    /// sanitization, the object, rows and signals, and the aggregate count
+    /// and last time when records were merged.
+    #[must_use]
+    pub fn into_masked(self) -> MaskedEvent {
+        let principal = match self.principal {
+            CasPrincipal::Account(p) => p,
+            CasPrincipal::ManyAccounts => EventPrincipal::many_accounts(),
+        }
+        .with_client(self.client);
+        let principal = match self.application.as_deref() {
+            Some(app) => principal.with_application(app),
+            None => principal,
+        };
+        let mut e = MaskedEvent::new(EventSource::CasAuditLog, self.action, principal, self.ts)
+            .with_rows(self.rows);
+        if let Some(o) = self.object {
+            e = e.with_object(o);
+        }
+        for s in self.signals {
+            e = e.with_signal(s.signal());
+        }
+        if self.count > 1 || self.ts_last.is_some() {
+            e = e.with_aggregate(self.count, self.ts_last.unwrap_or(self.ts));
+        }
+        e
     }
 }
 
@@ -858,6 +889,118 @@ mod tests {
             r("2001:0:4136:e378:8000:63bf:3fff:fdd2"),
             ClientAddr::parse("2001:0:4136:e300::")
         );
+    }
+
+    /// The bodies the console would receive for `events` (the core's own
+    /// masked -> contract conversion), parsed.
+    fn contract(events: Vec<CasEvent>) -> Vec<serde_json::Value> {
+        let masked: Vec<MaskedEvent> = events.into_iter().map(CasEvent::into_masked).collect();
+        let key = databastion_classifiers::masking::HmacKey::new(&[9u8; 32]).unwrap();
+        let json = databastion_core::test_support::contract_events_json(&masked, &key);
+        json.lines()
+            .flat_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["events"].as_array().unwrap().clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn client_addresses_are_reduced_end_to_end() {
+        let cases = [
+            ("198.51.100.77", "198.51.100.0"),
+            ("::ffff:192.0.2.77", "192.0.2.0"),
+            ("::192.0.2.77", "192.0.2.0"),
+            ("2002:c000:024d:1234::1", "2002:c000:200::"),
+            ("2001:db8:1234:5678:9abc::1", "2001:db8:1234:5600::"),
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:0:4136:e300::"),
+            ("::", "::"),
+            ("::1", "::1"),
+        ];
+        let mut b = builder(ClientAddrMode::Truncated);
+        let recs: Vec<AuditRecord> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (ip, _))| {
+                rec(
+                    "AUTHENTICATION_SUCCESS",
+                    "jane.doe@example.org",
+                    ip,
+                    i as u64,
+                )
+            })
+            .collect();
+        let sent = contract(run(&mut b, &recs, at(1000)));
+        assert_eq!(sent.len(), cases.len());
+        for (e, (ip, want)) in sent.iter().zip(cases) {
+            assert_eq!(e["source"], "cas_audit_log");
+            assert_eq!(e["action"], "connect");
+            assert_eq!(e["principal"]["client_addr"], want, "{ip}");
+            assert!(e["principal"]["db_user_fingerprint"].is_string());
+            assert_eq!(e["principal"]["application"], "curl/8.5.0");
+        }
+        // `clear` keeps the address (mapped ones as IPv4), `omitted` drops it.
+        let mut clear = builder(ClientAddrMode::Clear);
+        let sent = contract(run(
+            &mut clear,
+            &[
+                rec(
+                    "AUTHENTICATION_SUCCESS",
+                    "svc-monitoring",
+                    "::ffff:192.0.2.77",
+                    1,
+                ),
+                rec("AUTHENTICATION_SUCCESS", "svc-monitoring", "2001:db8::1", 2),
+            ],
+            at(1000),
+        ));
+        assert_eq!(sent[0]["principal"]["client_addr"], "192.0.2.77");
+        assert_eq!(sent[1]["principal"]["client_addr"], "2001:db8::1");
+        assert_eq!(sent[0]["principal"]["db_user"], "svc-monitoring");
+        let mut omitted = builder(ClientAddrMode::Omitted);
+        let sent = contract(run(
+            &mut omitted,
+            &[rec("AUTHENTICATION_SUCCESS", "x", "192.0.2.1", 1)],
+            at(1000),
+        ));
+        assert!(sent[0]["principal"].get("client_addr").is_none());
+    }
+
+    #[test]
+    fn a_flood_reaches_the_contract_as_the_star_aggregate() {
+        let mut b = builder(ClientAddrMode::Truncated);
+        let now = at(10_000);
+        let recs: Vec<AuditRecord> = (0..40u64)
+            .map(|i| {
+                rec(
+                    "AUTHENTICATION_FAILED",
+                    &format!("user{i}@example.org"),
+                    "203.0.113.9",
+                    i,
+                )
+            })
+            .collect();
+        let mut out = run(&mut b, &recs, now);
+        b.flush(now, true, &mut out);
+        let sent = contract(out);
+        assert_eq!(sent.len(), MANY_ACCOUNTS + 1);
+        let agg = sent.last().unwrap();
+        assert_eq!(agg["action"], "auth_failure");
+        assert_eq!(agg["principal"]["db_user"], "*");
+        assert_eq!(agg["principal"]["client_addr"], "203.0.113.0");
+        assert_eq!(agg["aggregated_count"], 24);
+        assert_eq!(
+            agg["signals"],
+            serde_json::json!(["volume.failed_logins_many_accounts"])
+        );
+        // Every other failure is a fingerprint, never a name.
+        for e in &sent[..MANY_ACCOUNTS] {
+            assert!(e["principal"].get("db_user").is_none(), "{e}");
+        }
+        let all = serde_json::to_string(&sent).unwrap();
+        for leak in ["user1", "example.org", "ST-1", "hr.example", "203.0.113.9"] {
+            assert!(!all.contains(leak), "{leak} in {all}");
+        }
     }
 
     #[test]

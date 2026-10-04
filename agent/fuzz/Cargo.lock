@@ -190,13 +190,13 @@ dependencies = [
 name = "databastion-connector-cas"
 version = "0.3.1"
 dependencies = [
+ "async-trait",
  "databastion-classifiers",
  "databastion-core",
  "regex",
  "rustix",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",

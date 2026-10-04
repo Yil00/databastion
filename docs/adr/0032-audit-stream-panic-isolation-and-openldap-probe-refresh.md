@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-09-30
 - **Refines**: [ADR-0031](0031-openldap-principals-dedup-and-stream-alerts.md) decision 6 (skip a record that always panics), [ADR-0029](0029-openldap-connector.md) decisions 1 (panic guard bullet), 4 (recommended `olcAccess`), 7 (persisted cursor) and 10 (failed-operation proof), [ADR-0027](0027-mongodb-audit.md) decisions 3 and 4 (profiler entries whose command is truncated or not an object). All stay Accepted.
+- **Refined by**: [ADR-0043](0043-audit-logs-opened-without-following-a-final-symlink.md) (decision 8: audit log files opened with `O_NOFOLLOW`, a final symlink refused, per-source open check)
 - **Context references**: PR #83 (`fix/p7-agent-followups`, commit f546844) and its re-reviews; PR #82 (`dev/openldap/config.ldif`); `agent/crates/core/src/panics.rs` (`isolate`, `resume_panic`), `agent/crates/core/src/runtime.rs` (`PanicTracker`, `audit_restart_delay`), `agent/crates/core/src/audit.rs` (`CursorStore::isolate`, `CursorStore::skip_records`, `PositionRegistry`), `agent/crates/core/src/audit/tail.rs` (`writable_by_agent`), `agent/crates/connector-openldap/src/audit/mod.rs` (`Position`), `agent/crates/connector-openldap/src/check.rs` (`prove`, `search_record`, `probe_record`), `agent/crates/connector-mongodb/src/audit/profiler.rs`; `agent/README.md` ("Audit streams that panic", "Audit log files")
 
 ## Context

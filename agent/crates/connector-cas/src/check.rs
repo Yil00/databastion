@@ -19,13 +19,13 @@
 //!   `headers`. The level follows [`crate::audit::level`], from the
 //!   records parsed here and by the stream; never Full.
 //!
-//! TODO(P8-C): wired to the protocol types in P8-C ([`CasHealth`] becomes
-//! the core's `TargetHealth` with `TargetNote`s).
+//! [`CasHealth::into_target_health`] gives the core's `TargetHealth`, its
+//! notes as `TargetNote`s (closed codes and counts only).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use databastion_core::AuditLevel;
+use databastion_core::{AuditLevel, FailureCode, TargetHealth};
 
 use crate::audit::level::Evidence;
 use crate::audit::stream::parse_lines;
@@ -48,11 +48,55 @@ pub struct CasHealth {
     pub audit_level: AuditLevel,
     /// Closed notes, sorted, without duplicates.
     pub notes: Vec<CasNote>,
+    /// A source was refused because the agent's account could write it (a
+    /// privilege problem, not an unreachable file).
+    pub refused_writable: bool,
+}
+
+impl CasHealth {
+    /// The core's health: the notes as `TargetNote`s, and, when no source
+    /// is readable, a closed failure code (`timeout` when the check ran out
+    /// of time, `permission_denied` when a source is refused for the
+    /// agent's privileges, else `target_unreachable`).
+    #[must_use]
+    pub fn into_target_health(self) -> TargetHealth {
+        let has = |c: CasNoteCode| self.notes.iter().any(|n| n.code == c);
+        let failure = if self.reachable {
+            None
+        } else if has(CasNoteCode::CheckTimedOut) {
+            Some(FailureCode::Timeout)
+        } else if self.refused_writable
+            || has(CasNoteCode::PrivilegeRegistryWritable)
+            || has(CasNoteCode::PrivilegeConfigReadable)
+        {
+            Some(FailureCode::PermissionDenied)
+        } else {
+            Some(FailureCode::TargetUnreachable)
+        };
+        let detail = (!self.notes.is_empty()).then(|| {
+            self.notes
+                .iter()
+                .map(|n| n.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        TargetHealth {
+            reachable: self.reachable,
+            audit_level: self.audit_level,
+            failure,
+            detail,
+            notes: self
+                .notes
+                .into_iter()
+                .map(CasNote::to_target_note)
+                .collect(),
+        }
+    }
 }
 
 /// Checks a `cas` target within [`CHECK_BUDGET`].
 pub async fn check(settings: &CasSettings, state: &Arc<CasState>) -> CasHealth {
-    check_with(settings, state, Policy::STRICT).await
+    check_with(settings, state, Policy::agent()).await
 }
 
 pub(crate) async fn check_with(
@@ -79,6 +123,7 @@ fn failed(code: CasNoteCode) -> CasHealth {
         reachable: false,
         audit_level: AuditLevel::None,
         notes: vec![CasNote::flag(code)],
+        refused_writable: false,
     }
 }
 
@@ -90,6 +135,7 @@ pub(crate) fn check_blocking(
 ) -> CasHealth {
     let mut notes = Vec::new();
     let mut reachable = false;
+    let mut refused_writable = false;
     let snap = state.snapshot();
     if let Some(dir) = &settings.registry_dir {
         let listed = if dir.still_resolves() {
@@ -119,7 +165,8 @@ pub(crate) fn check_blocking(
                 }
             }
             Err(Refusal::Writable) => {
-                notes.push(CasNote::flag(CasNoteCode::PrivilegeRegistryWritable))
+                refused_writable = true;
+                notes.push(CasNote::flag(CasNoteCode::PrivilegeRegistryWritable));
             }
             Err(Refusal::ConfigFiles) => {
                 notes.push(CasNote::flag(CasNoteCode::PrivilegeConfigReadable))
@@ -137,7 +184,14 @@ pub(crate) fn check_blocking(
             Err(Refusal::ResolvedChanged)
         };
         match tail {
-            Err(_) => notes.push(CasNote::flag(CasNoteCode::AuditLogNotReadable)),
+            Err(refusal) => {
+                // A log the agent could write keeps the closed note
+                // `audit.log_not_readable` (no privilege code covers the
+                // log), but the failure is `permission_denied` (security
+                // review of #140 L2).
+                refused_writable |= refusal == Refusal::Writable;
+                notes.push(CasNote::flag(CasNoteCode::AuditLogNotReadable));
+            }
             Ok(tail) => {
                 reachable = true;
                 let batch = parse_lines(tail.bytes.split(|b| *b == b'\n'), log.offset, now);
@@ -174,6 +228,7 @@ pub(crate) fn check_blocking(
         reachable,
         audit_level: level,
         notes,
+        refused_writable,
     }
 }
 
@@ -229,6 +284,34 @@ mod tests {
                 CasNoteCode::AuditLogNotReadable,
                 CasNoteCode::PrivilegeRegistryWritable
             ]
+        );
+        assert!(h.refused_writable);
+        assert_eq!(
+            h.clone().into_target_health().failure,
+            Some(FailureCode::PermissionDenied)
+        );
+        // An audit log alone, refused because the agent could write it:
+        // `audit.log_not_readable`, failure `permission_denied` (#140 L2).
+        let log_only = CasSettings::from_yaml(
+            &format!(
+                "{{audit_log: {{path: {}/cas_audit.log}}}}",
+                dir.path().display()
+            ),
+            &[],
+        )
+        .unwrap();
+        let h = check_with(&log_only, &state, Policy::STRICT).await;
+        assert_eq!(codes(&h), [CasNoteCode::AuditLogNotReadable]);
+        assert_eq!(
+            h.into_target_health().failure,
+            Some(FailureCode::PermissionDenied)
+        );
+        // Not there at all: unreachable.
+        std::fs::remove_file(dir.path().join("cas_audit.log")).unwrap();
+        let h = check_with(&log_only, &state, Policy::STRICT).await;
+        assert_eq!(
+            h.into_target_health().failure,
+            Some(FailureCode::TargetUnreachable)
         );
     }
 
@@ -291,6 +374,42 @@ mod tests {
         let h = check_blocking(&s, &state, Policy::TESTS, now);
         assert_eq!(h.audit_level, AuditLevel::None);
         assert!(codes(&h).contains(&CasNoteCode::AuditStreamStopped));
+    }
+
+    #[test]
+    fn health_maps_to_the_core_with_closed_failures() {
+        let h = |reachable, notes: Vec<CasNote>| {
+            CasHealth {
+                reachable,
+                audit_level: AuditLevel::None,
+                notes,
+                refused_writable: false,
+            }
+            .into_target_health()
+        };
+        assert_eq!(h(true, vec![]).failure, None);
+        assert_eq!(
+            h(false, vec![CasNote::flag(CasNoteCode::CheckTimedOut)]).failure,
+            Some(FailureCode::Timeout)
+        );
+        assert_eq!(
+            h(
+                false,
+                vec![CasNote::flag(CasNoteCode::PrivilegeRegistryWritable)]
+            )
+            .failure,
+            Some(FailureCode::PermissionDenied)
+        );
+        let t = h(
+            false,
+            vec![
+                CasNote::flag(CasNoteCode::AuditLogNotReadable),
+                CasNote::counted(CasNoteCode::CoverageRegistryFilesSkipped, 2),
+            ],
+        );
+        assert_eq!(t.failure, Some(FailureCode::TargetUnreachable));
+        assert_eq!(t.notes.len(), 2);
+        assert_eq!(t.notes[1].count(), Some(2));
     }
 
     #[test]

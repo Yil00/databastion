@@ -104,6 +104,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Mysql => ProtoConnector::Mysql,
         Engine::Mongodb => ProtoConnector::Mongodb,
         Engine::Openldap => ProtoConnector::Openldap,
+        Engine::Cas => ProtoConnector::Cas,
     }
 }
 
@@ -1232,6 +1233,12 @@ impl Runtime {
         if let Ok(key) = MetricsMapKey::try_from("audit_pending_evicted_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::pending_evicted() as f64);
+        }
+        // Failed logins aggregated without principal nor address because a
+        // bounded failed-login window was full (CAS, ADR-0041 decision 7).
+        if let Ok(key) = MetricsMapKey::try_from("audit_window_overflow_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::window_overflows() as f64);
         }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
@@ -3282,6 +3289,7 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Mariadb => databastion_protocol::Engine::Mariadb,
         TargetEngine::Mongodb => databastion_protocol::Engine::Mongodb,
         TargetEngine::Openldap => databastion_protocol::Engine::Openldap,
+        TargetEngine::Cas => databastion_protocol::Engine::Cas,
     }
 }
 

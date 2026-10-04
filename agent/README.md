@@ -22,7 +22,7 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-connector-mysql` | `crates/connector-mysql` | MySQL / MariaDB connector: Discovery and `check()` (P2-C), Audit (P4-B, [README](crates/connector-mysql/README.md)) |
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector: Discovery, `check()` and Audit through `cn=accesslog` (phase 6, [ADR-0029](../docs/adr/0029-openldap-connector.md), [README](crates/connector-openldap/README.md)) |
-| `databastion-connector-cas` | `crates/connector-cas` | Apereo CAS connector, local files only: JSON service registry Discovery, JSON audit log Audit, `check()` (phase 8, [ADR-0041](../docs/adr/0041-cas-connector.md), [README](crates/connector-cas/README.md)); not wired into the core until the `cas` protocol values land (P8-C) |
+| `databastion-connector-cas` | `crates/connector-cas` | Apereo CAS connector, local files only: JSON service registry Discovery, JSON audit log Audit, `check()` (phase 8, [ADR-0041](../docs/adr/0041-cas-connector.md), [README](crates/connector-cas/README.md)); its targets, findings and events are sent once the console lists `engine.cas` ([ADR-0042](../docs/adr/0042-hold-items-of-unlisted-engines.md)) |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
 
@@ -30,8 +30,8 @@ Dependency direction: `classifiers` ← `core` ← `connector-*` ← `agent`;
 `protocol` ← `core` (uplink only, not re-exported).
 
 ### Cargo features (binary)
-`postgres`, `mysql`, `mongodb`, `openldap`: all enabled by default. A minimal
-binary: `cargo build --no-default-features --features postgres`.
+`postgres`, `mysql`, `mongodb`, `openldap`, `cas`: all enabled by default. A
+minimal binary: `cargo build --no-default-features --features postgres`.
 
 ## Security boundaries
 
@@ -447,7 +447,21 @@ opened without blocking, it must be a regular file, and it must **not be
 writable by the agent's own account**: not owned by the agent's effective uid,
 not world-writable, and not group-writable when its group is one of the
 agent's (effective or supplementary groups). This is checked on the opened
-handle, so after following symlinks (end-of-phase-4 review L4). An audit log is
+handle (end-of-phase-4 review L4). Since P8-B the path is opened with
+`O_NOFOLLOW`, at the first open and at every reopen after a rotation: a
+configured path whose last component is a symlink is refused
+(`audit.log_not_readable`; point `audit_log.path` at the file itself; symlinked
+directories above it still work), so a symlink swapped in at rotation time
+cannot redirect the tailer (security review of #138 L2). A CAS
+`cas.audit_log.path` is the exception at load only: it is resolved once when
+`agent.yaml` is loaded (symlinks followed then), the tailer opens the resolved
+path, and a later change of where the declared path resolves is refused until
+the next reload ([ADR-0043](../docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)
+decision 2). A file with more than one hard link is refused too, at every open
+and reopen (`audit.log_not_readable`; security review of #140 L1): a hard link
+put at the path at rotation could be any other file the agent can read. A source can add its
+own checks of every opened file (`Tailer::with_open_check`, used by the CAS
+connector). An audit log is
 the database server's evidence: a file the agent's account could write could
 have been forged or rewritten by it. Such a file is refused like an unreadable
 one: `check()` reports `audit.log_not_readable`, the Audit stream re-evaluates
@@ -789,6 +803,59 @@ over-privilege and Audit tests, `DATABASTION_TEST_LDAP_EXPORT_CMD` for a real pa
 `DATABASTION_TEST_LDAPS_URL` / `DATABASTION_TEST_LDAP_CA_FILE` for TLS), and are skipped otherwise;
 the handshake, StartTLS injection, hostile responses and a scan also run against a scripted
 server over an in-memory stream (`src/fake.rs`); property tests in `src/proptests.rs`.
+
+### CAS connector
+Apereo CAS targets ([ADR-0041](../docs/adr/0041-cas-connector.md), reference: the
+[connector README](crates/connector-cas/README.md)): **local files only**, no network
+connection of any kind (no HTTP, database or LDAP client; checked by
+`tests/architecture.rs`), no credential. A `cas` target is declared with a `cas:` block
+(`agent.example.yaml`) and never detected locally (I5: recognizing CAS would mean reading
+`java` command lines):
+
+```yaml
+targets:
+  - id: cas-prod
+    engine: cas
+    cas:
+      service_registry:
+        json_dir: /etc/cas/services        # JSON definitions (yaml_dir is refused for now)
+      audit_log:
+        path: /var/log/cas/cas_audit.log   # audit-format JSON, one record per line
+        timezone: UTC                      # or ±HH:MM, for `when` without an offset
+      clear_principals: [svc-monitoring]   # at most 64; `*` and `unidentified` refused
+      client_addr: truncated               # clear | truncated (default) | omitted
+```
+
+- `host`, `port`, `socket`, `account`, `secret` and the other engines' blocks are refused for
+  `engine: cas` (`account` and `secret` are required for every other engine). The block is
+  validated by the core (`config::cas`) and its absolute paths resolved when `agent.yaml` is
+  loaded or reloaded (symlinks followed once); paths under `/proc`, `/sys`, `/dev` or the
+  agent's `state_dir` are refused, and a source whose path later resolves elsewhere is refused
+  until the next reload.
+- Files the agent's account could write (owner, group or world write bit, `faccessat(W_OK)`
+  with ACLs, any writable ancestor directory) are refused, as are a registry directory holding
+  CAS configuration or key material, symlinked or hard-linked files, and files on another
+  device than the registry directory. The audit log is opened by the core tailer with
+  `O_NOFOLLOW` and this connector's checks run on the tailer's handle after every (re)open
+  (`Tailer::with_open_check`), so a symlink or a hard link swapped in at rotation is never
+  read.
+- Discovery: the service registry (credential fields never sampled, `clientSecret` only
+  counted when in clear, URLs stripped of userinfo, query, fragment and `;` parameters before
+  classification) and the `who` of successful authentications in the audit log's last MiB.
+- Audit: the JSON audit log (`audit_source` `cas_audit_log`): `connect`, `auth_failure`,
+  `read` of the matching service for a service ticket, `dcl` on the registry; principals
+  fingerprinted except `clear_principals`; client addresses reduced per `client_addr` (signals
+  on the full address); `volume.failed_logins_many_accounts` (the `*` "several accounts"
+  aggregate per address and minute beyond 16 principals in 10 minutes) and
+  `volume.failed_logins_one_account`. The failed-login windows hold at most 4096 entries each,
+  keyed by tags of a random per-stream key (never persisted nor sent); failures that find a
+  full window are aggregated without address and counted in the heartbeat metric
+  `audit_window_overflow_total`. Level never Full (docs/08).
+- Engine capability: until a heartbeat response lists `engine.cas`, heartbeats leave the `cas`
+  target out and its findings and events wait in the spool (ADR-0042). The uplink sends
+  `db_user` `*` only for the CAS failed-login aggregate (a `cas_audit_log` `auth_failure` with
+  `volume.failed_logins_many_accounts`); an account named `*` on any engine is sent as its
+  fingerprint.
 
 ### Future database drivers
 Add them with `default-features = false` and rustls-only TLS features, and
