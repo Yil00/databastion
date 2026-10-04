@@ -149,7 +149,7 @@ pub(crate) fn read_command_for(
 }
 
 /// Most `type` values read from a ticket registry collection.
-const MAX_TICKET_TYPES: i64 = 256;
+pub(crate) const MAX_TICKET_TYPES: i64 = 256;
 
 /// The ticket type field of a ticket registry: `type` in any ASCII case
 /// among the keys probed (PR #141 review L5), else `type`. Only letters,
@@ -248,27 +248,30 @@ pub(crate) async fn ticket_metadata<S: AsyncRead + AsyncWrite + Unpin>(
 pub(crate) fn key_probe_command(collection: &str) -> DocBuf {
     DocBuf::new()
         .str("aggregate", collection)
-        .array(
-            "pipeline",
-            vec![
-                DocBuf::new().doc("$sample", DocBuf::new().i64("size", 1)),
-                DocBuf::new().doc(
-                    "$project",
-                    DocBuf::new().i32("_id", 0).doc(
-                        "k",
-                        DocBuf::new().doc(
-                            "$map",
-                            DocBuf::new()
-                                .doc("input", DocBuf::new().str("$objectToArray", "$$ROOT"))
-                                .str("as", "f")
-                                .str("in", "$$f.k"),
-                        ),
-                    ),
-                ),
-            ],
-        )
+        .array("pipeline", key_probe_pipeline())
         .doc("cursor", DocBuf::new().i64("batchSize", 2))
         .bool("allowDiskUse", false)
+}
+
+/// The key probe's pipeline (also matched exactly by the Audit sources:
+/// the agent's own probe returns no value of a document).
+pub(crate) fn key_probe_pipeline() -> Vec<DocBuf> {
+    vec![
+        DocBuf::new().doc("$sample", DocBuf::new().i64("size", 1)),
+        DocBuf::new().doc(
+            "$project",
+            DocBuf::new().i32("_id", 0).doc(
+                "k",
+                DocBuf::new().doc(
+                    "$map",
+                    DocBuf::new()
+                        .doc("input", DocBuf::new().str("$objectToArray", "$$ROOT"))
+                        .str("as", "f")
+                        .str("in", "$$f.k"),
+                ),
+            ),
+        ),
+    ]
 }
 
 /// Runs [`key_probe_command`]: at most [`MAX_TOP_KEYS`] field names. An

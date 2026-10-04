@@ -175,6 +175,10 @@ pub(crate) struct EventBuilder {
     pub(crate) panicked: u64,
 }
 
+/// The `$limit` of the CAS store guard's ticket type count
+/// (`discover::ticket_types_command`).
+const OWN_TYPE_COUNT_LIMIT: u64 = 256;
+
 /// Unused poll credits kept per database: polls whose own entry is never
 /// seen (not profiled, overwritten) do not add up.
 pub(crate) const MAX_POLL_CREDITS: u32 = 64;
@@ -420,18 +424,35 @@ impl EventBuilder {
             && own_profiler_poll(cmd, r)
             && self.own.routine_unbudgeted(user, app, client, &e)
             && self.take_poll_credit(r);
+        // The CAS store guard's key probe (exact shape): one document's
+        // top-level key names, no value; like `count`, nothing charged.
+        let own_key_probe = cmd == Cmd::Aggregate
+            && r.shape
+                .pipeline
+                .is_some_and(|p| p.own_key_probe && !p.writes);
         let routine = if own_poll {
             true
-        } else if cmd == Cmd::Count && r.shape.filter.is_empty() {
+        } else if (cmd == Cmd::Count && r.shape.filter.is_empty()) || own_key_probe {
             self.own.routine_unbudgeted(user, app, client, &e)
         } else if r.rows.is_some() {
             self.own.routine(user, app, client, &e, Instant::now())
         } else {
             // No count (auditLog): only a `find` with a limit within the
             // budget, charged that limit; anything else is reported.
+            // The CAS store guard's ticket type count (exact shape): at
+            // most its `$limit` of groups, charged that limit.
+            let type_count = cmd == Cmd::Aggregate
+                && r.shape
+                    .pipeline
+                    .is_some_and(|p| p.own_type_count && !p.writes);
             match (cmd, r.shape.limit) {
                 (Cmd::Find, Some(l)) if l > 0 && l.unsigned_abs() <= self.budget => {
                     let charged = e.clone().with_rows(Some(l.unsigned_abs()));
+                    self.own
+                        .routine(user, app, client, &charged, Instant::now())
+                }
+                _ if type_count && OWN_TYPE_COUNT_LIMIT <= self.budget => {
+                    let charged = e.clone().with_rows(Some(OWN_TYPE_COUNT_LIMIT));
                     self.own
                         .routine(user, app, client, &charged, Instant::now())
                 }
@@ -895,6 +916,157 @@ mod tests {
 
     /// Security review L1: without counts (`auditLog`), only a `find` with
     /// a limit within the budget is left out, charged that limit.
+    /// PR #141 E2E follow-up: the CAS store guard's key probe (one
+    /// document's key names) is the agent's own read and charges nothing,
+    /// so it never pushes a fully sampled collection over the budget; only
+    /// with the agent's identity and exact shape.
+    #[test]
+    fn own_guard_key_probe_charges_nothing() {
+        use super::super::records::{Pipeline, StageKind};
+        let app = Some("databastion-agent");
+        let probe = |user: &str, app: Option<&str>| {
+            let mut r = own_record(Cmd::Aggregate, "customers", Some(1), app);
+            r.user = Some(Zeroizing::new(user.to_owned()));
+            r.shape.limit = None;
+            r.shape.pipeline = Some(Pipeline::from_stages([
+                StageKind::SampleOne,
+                StageKind::KeyProject,
+            ]));
+            r
+        };
+        for source in [
+            EventSource::MongodbLog,
+            EventSource::MongodbProfiler,
+            EventSource::MongodbAuditLog,
+        ] {
+            let mut b = builder();
+            // The whole budget taken by the sample, then the probe: left out.
+            let ev = b.convert(
+                vec![
+                    own_record(Cmd::Find, "customers", Some(200), app),
+                    probe("databastion@admin", app),
+                    probe("databastion@admin", app),
+                ],
+                source,
+                SystemTime::now(),
+            );
+            assert!(ev.is_empty(), "{source:?}: {ev:?}");
+            // Another account, or another application: reported.
+            let ev = b.convert(
+                vec![
+                    probe("alice@admin", app),
+                    probe("databastion@admin", Some("mongosh")),
+                ],
+                source,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 2, "{source:?}");
+            // Another `$sample` aggregate past the budget: reported.
+            let mut other = probe("databastion@admin", app);
+            other.shape.pipeline = Some(Pipeline::from_stages([
+                StageKind::SampleOne,
+                StageKind::PassThrough,
+            ]));
+            assert_eq!(
+                b.convert(vec![other], source, SystemTime::now()).len(),
+                1,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// The same through the server log as the E2E run writes it (no
+    /// profiler, `slowms` 0): the agent's connection, its sample of a
+    /// collection up to the budget, then its key probe.
+    #[test]
+    fn own_guard_key_probe_in_the_server_log() {
+        let mut b = builder();
+        let probe = r#"{"aggregate":"customers","pipeline":[{"$sample":{"size":1}},{"$project":{"_id":0,"k":{"$map":{"input":{"$objectToArray":"$$ROOT"},"as":"f","in":"$$f.k"}}}}],"cursor":{"batchSize":2},"$db":"app"}"#;
+        let records = log(&[
+            accepted(3, AGENT),
+            meta(3, "databastion-agent"),
+            auth(3, "databastion", true).replace("10.0.0.9", AGENT),
+            slow(
+                3,
+                r#"{"find":"customers","filter":{},"limit":200,"singleBatch":true,"$db":"app"}"#,
+                200,
+            ),
+            slow(3, probe, 1),
+        ]);
+        let ev = b.convert(records, EventSource::MongodbLog, SystemTime::now());
+        assert!(
+            ev.iter().all(|e| e.action() == EventAction::Connect),
+            "{ev:?}"
+        );
+        // The same probe from another account is reported.
+        let records = log(&[
+            accepted(4, AGENT),
+            meta(4, "databastion-agent"),
+            auth(4, "alice", true).replace("10.0.0.9", AGENT),
+            slow(4, probe, 1),
+        ]);
+        let ev = b.convert(records, EventSource::MongodbLog, SystemTime::now());
+        assert!(ev.iter().any(|e| e.action() == EventAction::Read), "{ev:?}");
+    }
+
+    /// The CAS store guard's ticket type count: charged its rows, or its
+    /// `$limit` of groups when the source logs no count (auditLog), never
+    /// reported while within the budget; any other aggregate without a
+    /// count is reported.
+    #[test]
+    fn own_guard_type_count_is_charged_its_limit() {
+        use super::super::records::{Pipeline, StageKind};
+        let app = Some("databastion-agent");
+        let mut b = EventBuilder::new(
+            OwnAccount::new(
+                "databastion@admin",
+                Some("databastion-agent"),
+                ClientAddr::parse(AGENT),
+                1000,
+                SharedOwnUsage::default(),
+            ),
+            "databastion@admin".to_owned(),
+            1000,
+        );
+        let count = || {
+            let mut r = own_record(Cmd::Aggregate, "CasTickets", None, app);
+            r.shape.limit = None;
+            r.shape.pipeline = Some(Pipeline::from_stages([
+                StageKind::TypeGroup,
+                StageKind::Limit256,
+            ]));
+            r
+        };
+        // 3 x 256 within 1000: left out; a 4th goes over: reported.
+        let ev = b.convert(
+            vec![count(), count(), count()],
+            EventSource::MongodbAuditLog,
+            SystemTime::now(),
+        );
+        assert!(ev.is_empty(), "{ev:?}");
+        assert_eq!(
+            b.convert(
+                vec![count()],
+                EventSource::MongodbAuditLog,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+        // With a count (server log): charged that count.
+        let mut logged = count();
+        logged.ns = Some(("app".to_owned(), Some("other".to_owned())));
+        logged.rows = Some(4);
+        assert!(
+            b.convert(vec![logged], EventSource::MongodbLog, SystemTime::now())
+                .is_empty()
+        );
+        assert_eq!(
+            OWN_TYPE_COUNT_LIMIT,
+            u64::try_from(crate::discover::MAX_TICKET_TYPES).unwrap()
+        );
+    }
+
     #[test]
     fn own_reads_without_counts_need_a_bounded_find() {
         let app = Some("databastion-agent");
@@ -1035,6 +1207,8 @@ mod tests {
             pipeline: Some(Pipeline {
                 pass_through: true,
                 writes: false,
+                own_key_probe: false,
+                own_type_count: false,
             }),
             ..Shape::default()
         };
