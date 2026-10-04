@@ -41,10 +41,11 @@ export const AUDIT_SOURCES = exhaustive<AuditSource>()([
   "mongodb_profiler",
   "mongodb_log",
   "openldap_accesslog",
+  "cas_audit_log",
 ]);
 
 /** Every contract `Engine`, in contract order. */
-export const ENGINES = exhaustive<Engine>()(["postgres", "mysql", "mariadb", "mongodb", "openldap"]);
+export const ENGINES = exhaustive<Engine>()(["postgres", "mysql", "mariadb", "mongodb", "openldap", "cas"]);
 
 /** Every contract `AccessEvent.action`, in contract order. */
 export const EVENT_ACTIONS = exhaustive<EventAction>()(["connect", "auth_failure", "read", "write", "ddl", "dcl"]);

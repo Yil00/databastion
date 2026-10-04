@@ -118,6 +118,10 @@ pub enum NoteCode {
     AuditAuditLogPluginNotRead,
     /// `audit.auditlog_on_community`.
     AuditAuditlogOnCommunity,
+    /// `audit.auth_failures_not_seen`.
+    AuditAuthFailuresNotSeen,
+    /// `audit.auth_records_not_seen`.
+    AuditAuthRecordsNotSeen,
     /// `audit.authcheck_success_pending`.
     AuditAuthcheckSuccessPending,
     /// `audit.failed_operations_not_logged`.
@@ -132,6 +136,8 @@ pub enum NoteCode {
     AuditHistoryNotReadable,
     /// `audit.limited_pending_first_record`.
     AuditLimitedPendingFirstRecord,
+    /// `audit.log_format_unsupported`.
+    AuditLogFormatUnsupported,
     /// `audit.log_not_readable`.
     AuditLogNotReadable,
     /// `audit.log_plugin_mismatch`.
@@ -156,6 +162,8 @@ pub enum NoteCode {
     AuditRecordsDroppedSeverity,
     /// `audit.server_audit_not_read`.
     AuditServerAuditNotRead,
+    /// `audit.service_ticket_records_not_seen`.
+    AuditServiceTicketRecordsNotSeen,
     /// `audit.slow_operations_only`.
     AuditSlowOperationsOnly,
     /// `audit.source_not_configured`.
@@ -174,8 +182,12 @@ pub enum NoteCode {
     CheckStageFailed,
     /// `check.timed_out`.
     CheckTimedOut,
+    /// `coverage.cas_guard_tripped`.
+    CoverageCasGuardTripped,
     /// `coverage.other_engine_tables`.
     CoverageOtherEngineTables,
+    /// `coverage.registry_files_skipped`.
+    CoverageRegistryFilesSkipped,
     /// `coverage.relations_rls_skipped`.
     CoverageRelationsRlsSkipped,
     /// `coverage.relations_without_select`.
@@ -222,6 +234,8 @@ pub enum NoteCode {
     PrivilegePredefinedRoles,
     /// `privilege.read_beyond_discovery`.
     PrivilegeReadBeyondDiscovery,
+    /// `privilege.registry_writable`.
+    PrivilegeRegistryWritable,
     /// `privilege.role_attributes`.
     PrivilegeRoleAttributes,
     /// `privilege.roles_not_evaluated`.
@@ -230,16 +244,24 @@ pub enum NoteCode {
     PrivilegeSystemCollections,
     /// `privilege.system_database_select`.
     PrivilegeSystemDatabaseSelect,
+    /// `privilege.ticket_credentials_readable`.
+    PrivilegeTicketCredentialsReadable,
     /// `privilege.write_actions`.
     PrivilegeWriteActions,
     /// `privilege.write_not_evaluated`.
     PrivilegeWriteNotEvaluated,
     /// `privilege.write_on_relations`.
     PrivilegeWriteOnRelations,
+    /// `security.audit_headers_logged`.
+    SecurityAuditHeadersLogged,
+    /// `security.client_secrets_in_clear`.
+    SecurityClientSecretsInClear,
     /// `security.init_connect`.
     SecurityInitConnect,
     /// `security.login_event_trigger`.
     SecurityLoginEventTrigger,
+    /// `security.ticket_registry_unencrypted`.
+    SecurityTicketRegistryUnencrypted,
     /// `security.tls_disabled`.
     SecurityTlsDisabled,
 }
@@ -251,6 +273,8 @@ impl NoteCode {
         Self::AuditAuditLogFilterNotRead,
         Self::AuditAuditLogPluginNotRead,
         Self::AuditAuditlogOnCommunity,
+        Self::AuditAuthFailuresNotSeen,
+        Self::AuditAuthRecordsNotSeen,
         Self::AuditAuthcheckSuccessPending,
         Self::AuditFailedOperationsNotLogged,
         Self::AuditFullPendingFirstRecord,
@@ -258,6 +282,7 @@ impl NoteCode {
         Self::AuditHistoryLongConsumerDisabled,
         Self::AuditHistoryNotReadable,
         Self::AuditLimitedPendingFirstRecord,
+        Self::AuditLogFormatUnsupported,
         Self::AuditLogNotReadable,
         Self::AuditLogPluginMismatch,
         Self::AuditLogWithoutRowCounts,
@@ -270,6 +295,7 @@ impl NoteCode {
         Self::AuditRecordsDropped,
         Self::AuditRecordsDroppedSeverity,
         Self::AuditServerAuditNotRead,
+        Self::AuditServiceTicketRecordsNotSeen,
         Self::AuditSlowOperationsOnly,
         Self::AuditSourceNotConfigured,
         Self::AuditStatementConsumersDisabled,
@@ -279,7 +305,9 @@ impl NoteCode {
         Self::CheckServerIsMysql,
         Self::CheckStageFailed,
         Self::CheckTimedOut,
+        Self::CoverageCasGuardTripped,
         Self::CoverageOtherEngineTables,
+        Self::CoverageRegistryFilesSkipped,
         Self::CoverageRelationsRlsSkipped,
         Self::CoverageRelationsWithoutSelect,
         Self::CoverageRemoteEngineTables,
@@ -303,15 +331,20 @@ impl NoteCode {
         Self::PrivilegePerformanceSchemaWithoutAudit,
         Self::PrivilegePredefinedRoles,
         Self::PrivilegeReadBeyondDiscovery,
+        Self::PrivilegeRegistryWritable,
         Self::PrivilegeRoleAttributes,
         Self::PrivilegeRolesNotEvaluated,
         Self::PrivilegeSystemCollections,
         Self::PrivilegeSystemDatabaseSelect,
+        Self::PrivilegeTicketCredentialsReadable,
         Self::PrivilegeWriteActions,
         Self::PrivilegeWriteNotEvaluated,
         Self::PrivilegeWriteOnRelations,
+        Self::SecurityAuditHeadersLogged,
+        Self::SecurityClientSecretsInClear,
         Self::SecurityInitConnect,
         Self::SecurityLoginEventTrigger,
+        Self::SecurityTicketRegistryUnencrypted,
         Self::SecurityTlsDisabled,
     ];
 
@@ -323,6 +356,8 @@ impl NoteCode {
             Self::AuditAuditLogFilterNotRead => "audit.audit_log_filter_not_read",
             Self::AuditAuditLogPluginNotRead => "audit.audit_log_plugin_not_read",
             Self::AuditAuditlogOnCommunity => "audit.auditlog_on_community",
+            Self::AuditAuthFailuresNotSeen => "audit.auth_failures_not_seen",
+            Self::AuditAuthRecordsNotSeen => "audit.auth_records_not_seen",
             Self::AuditAuthcheckSuccessPending => "audit.authcheck_success_pending",
             Self::AuditFailedOperationsNotLogged => "audit.failed_operations_not_logged",
             Self::AuditFullPendingFirstRecord => "audit.full_pending_first_record",
@@ -330,6 +365,7 @@ impl NoteCode {
             Self::AuditHistoryLongConsumerDisabled => "audit.history_long_consumer_disabled",
             Self::AuditHistoryNotReadable => "audit.history_not_readable",
             Self::AuditLimitedPendingFirstRecord => "audit.limited_pending_first_record",
+            Self::AuditLogFormatUnsupported => "audit.log_format_unsupported",
             Self::AuditLogNotReadable => "audit.log_not_readable",
             Self::AuditLogPluginMismatch => "audit.log_plugin_mismatch",
             Self::AuditLogWithoutRowCounts => "audit.log_without_row_counts",
@@ -342,6 +378,7 @@ impl NoteCode {
             Self::AuditRecordsDropped => "audit.records_dropped",
             Self::AuditRecordsDroppedSeverity => "audit.records_dropped_severity",
             Self::AuditServerAuditNotRead => "audit.server_audit_not_read",
+            Self::AuditServiceTicketRecordsNotSeen => "audit.service_ticket_records_not_seen",
             Self::AuditSlowOperationsOnly => "audit.slow_operations_only",
             Self::AuditSourceNotConfigured => "audit.source_not_configured",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
@@ -351,7 +388,9 @@ impl NoteCode {
             Self::CheckServerIsMysql => "check.server_is_mysql",
             Self::CheckStageFailed => "check.stage_failed",
             Self::CheckTimedOut => "check.timed_out",
+            Self::CoverageCasGuardTripped => "coverage.cas_guard_tripped",
             Self::CoverageOtherEngineTables => "coverage.other_engine_tables",
+            Self::CoverageRegistryFilesSkipped => "coverage.registry_files_skipped",
             Self::CoverageRelationsRlsSkipped => "coverage.relations_rls_skipped",
             Self::CoverageRelationsWithoutSelect => "coverage.relations_without_select",
             Self::CoverageRemoteEngineTables => "coverage.remote_engine_tables",
@@ -377,15 +416,20 @@ impl NoteCode {
             }
             Self::PrivilegePredefinedRoles => "privilege.predefined_roles",
             Self::PrivilegeReadBeyondDiscovery => "privilege.read_beyond_discovery",
+            Self::PrivilegeRegistryWritable => "privilege.registry_writable",
             Self::PrivilegeRoleAttributes => "privilege.role_attributes",
             Self::PrivilegeRolesNotEvaluated => "privilege.roles_not_evaluated",
             Self::PrivilegeSystemCollections => "privilege.system_collections",
             Self::PrivilegeSystemDatabaseSelect => "privilege.system_database_select",
+            Self::PrivilegeTicketCredentialsReadable => "privilege.ticket_credentials_readable",
             Self::PrivilegeWriteActions => "privilege.write_actions",
             Self::PrivilegeWriteNotEvaluated => "privilege.write_not_evaluated",
             Self::PrivilegeWriteOnRelations => "privilege.write_on_relations",
+            Self::SecurityAuditHeadersLogged => "security.audit_headers_logged",
+            Self::SecurityClientSecretsInClear => "security.client_secrets_in_clear",
             Self::SecurityInitConnect => "security.init_connect",
             Self::SecurityLoginEventTrigger => "security.login_event_trigger",
+            Self::SecurityTicketRegistryUnencrypted => "security.ticket_registry_unencrypted",
             Self::SecurityTlsDisabled => "security.tls_disabled",
         }
     }

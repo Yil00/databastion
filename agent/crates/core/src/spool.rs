@@ -449,9 +449,24 @@ impl Spool {
     /// FIFO. Corrupt files are quarantined and skipped; a transient read
     /// error (EMFILE, ENOMEM…) leaves the queue untouched and returns `None`
     /// (retried later).
+    #[cfg(test)]
     pub(crate) fn front_where(
         &mut self,
+        endpoint: impl FnMut(bool) -> bool,
+    ) -> Option<(Key, ResultBatch)> {
+        self.front_sendable(endpoint, |_| true)
+    }
+
+    /// As [`front_where`](Self::front_where), also skipping (and keeping)
+    /// the batches `sendable` refuses: those carrying a value of an engine
+    /// the console has not accepted (ADR-0039 decision 8) are held until it
+    /// does. Holding needs the batch read; it only happens to batches of
+    /// such engines, which are rare (the console only gives jobs for the
+    /// targets it was told about).
+    pub(crate) fn front_sendable(
+        &mut self,
         mut endpoint: impl FnMut(bool) -> bool,
+        mut sendable: impl FnMut(&ResultBatch) -> bool,
     ) -> Option<(Key, ResultBatch)> {
         let mut index = 0;
         loop {
@@ -461,6 +476,7 @@ impl Spool {
                 continue;
             }
             match self.read(&entry.key, entry.findings) {
+                Ok(batch) if !sendable(&batch) => index += 1,
                 Ok(batch) => return Some((entry.key, batch)),
                 Err(ReadError::Transient(e)) => {
                     tracing::warn!(kind = %e.kind(), "spool read failed; will retry");

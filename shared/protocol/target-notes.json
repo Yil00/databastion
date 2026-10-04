@@ -23,6 +23,18 @@
       "mongodb"
     ]
   },
+  "audit.auth_failures_not_seen": {
+    "description": "No failed authentication (AUTHENTICATION_FAILED) read from the CAS audit log in the last 7 days: check that the CAS audit configuration does not exclude it. The level stays Partial.",
+    "engines": [
+      "cas"
+    ]
+  },
+  "audit.auth_records_not_seen": {
+    "description": "Limited: CAS audit records were read in the last 24 h, but no successful authentication (AUTHENTICATION_SUCCESS): authentication actions may be excluded from the CAS audit trail.",
+    "engines": [
+      "cas"
+    ]
+  },
   "audit.authcheck_success_pending": {
     "description": "Partial once the Audit stream has read a successful authCheck record of the auditLog (auditAuthorizationSuccess enabled; none in the last 24 h): reported Limited until then.",
     "engines": [
@@ -63,18 +75,26 @@
     ]
   },
   "audit.limited_pending_first_record": {
-    "description": "Limited once the Audit stream has read a record of its source (server log or profiler; none in the last 24 h): reported None until then.",
+    "description": "Limited once the Audit stream has read a record of its source (MongoDB server log or profiler, CAS audit log; none in the last 24 h): reported None until then.",
     "engines": [
-      "mongodb"
+      "mongodb",
+      "cas"
+    ]
+  },
+  "audit.log_format_unsupported": {
+    "description": "The CAS audit log holds records but none in the JSON audit format (cas.audit.engine.audit-format: JSON, one record per line): the DEFAULT format is not read, so there is no Audit source.",
+    "engines": [
+      "cas"
     ]
   },
   "audit.log_not_readable": {
-    "description": "The audit log file configured in agent.yaml is not readable by the agent.",
+    "description": "The audit log file configured in agent.yaml is not readable by the agent (on CAS, also when it is refused because the agent could write it or one of its parent directories).",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "cas"
     ]
   },
   "audit.log_plugin_mismatch": {
@@ -138,7 +158,8 @@
       "mysql",
       "mariadb",
       "mongodb",
-      "openldap"
+      "openldap",
+      "cas"
     ]
   },
   "audit.records_dropped_severity": {
@@ -152,6 +173,12 @@
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "audit.service_ticket_records_not_seen": {
+    "description": "Limited: successful authentications were read from the CAS audit log in the last 24 h, but no service ticket or token issuance record: which application received a ticket is not known.",
+    "engines": [
+      "cas"
     ]
   },
   "audit.slow_operations_only": {
@@ -186,7 +213,8 @@
       "mysql",
       "mariadb",
       "mongodb",
-      "openldap"
+      "openldap",
+      "cas"
     ]
   },
   "check.server_is_mariadb": {
@@ -208,11 +236,23 @@
       "mysql",
       "mariadb",
       "mongodb",
-      "openldap"
+      "openldap",
+      "cas"
     ]
   },
   "check.timed_out": {
     "description": "check() did not finish within its time bound.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb",
+      "mongodb",
+      "openldap",
+      "cas"
+    ]
+  },
+  "coverage.cas_guard_tripped": {
+    "description": "{count} column(s) or field(s) held CAS ticket-id-shaped values: those values were dropped before classification and the columns or fields were not read further (CAS store guard).",
     "engines": [
       "postgres",
       "mysql",
@@ -226,6 +266,12 @@
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "coverage.registry_files_skipped": {
+    "description": "{count} CAS service registry file(s) skipped: not readable, refused (symbolic or hard link, writable by the agent), too large, not a service definition or not parsable. None of their values is classified.",
+    "engines": [
+      "cas"
     ]
   },
   "coverage.relations_rls_skipped": {
@@ -293,9 +339,10 @@
     ]
   },
   "privilege.config_readable": {
-    "description": "cn=config is readable by the agent's service DN: the access control rules, the root password hashes and every server setting are visible.",
+    "description": "The engine's configuration is readable by the agent's account. OpenLDAP: cn=config is readable by the agent's service DN (access control rules, root password hashes, every server setting). CAS: CAS configuration files (cas.properties, cas.yml, application.yml or .properties) sit in the declared service registry directory and hold every CAS secret: the registry source is refused and those files are never opened.",
     "engines": [
-      "openldap"
+      "openldap",
+      "cas"
     ]
   },
   "privilege.extended_variant": {
@@ -379,6 +426,12 @@
       "mongodb"
     ]
   },
+  "privilege.registry_writable": {
+    "description": "{count} CAS service registry file(s) or directories writable by the agent's account (directly, through its groups or an ACL, or through a parent directory), so the registry is not read from them: the agent must only read service definitions, since an account that can write them could change what CAS releases to whom.",
+    "engines": [
+      "cas"
+    ]
+  },
   "privilege.role_attributes": {
     "description": "Role attributes beyond the minimal grants: {labels}.",
     "engines": [
@@ -405,6 +458,15 @@
       "mariadb"
     ]
   },
+  "privilege.ticket_credentials_readable": {
+    "description": "The agent's account can read credential columns of a CAS ticket registry or audit trail (ticket ids, bodies, principals, attributes, AUD_RESOURCE, AUD_HEADERS), directly, through a role or PUBLIC, or through a schema- or database-wide grant: grant SELECT on the metadata columns only. The agent never reads them.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb",
+      "mongodb"
+    ]
+  },
   "privilege.write_actions": {
     "description": "{count} write or administration action(s) (for example insert, update, remove, drop, index, user or role management).",
     "engines": [
@@ -423,6 +485,18 @@
       "postgres"
     ]
   },
+  "security.audit_headers_logged": {
+    "description": "CAS audit records carry request headers (cas.audit.engine.http-request-headers), so the audit log holds cookies, including the ticket-granting cookie: remove headers from the audited fields. The agent skips them.",
+    "engines": [
+      "cas"
+    ]
+  },
+  "security.client_secrets_in_clear": {
+    "description": "{count} CAS service definition(s) with an OAuth or OIDC client secret in clear: encrypt them. The agent never samples, masks nor fingerprints a client secret.",
+    "engines": [
+      "cas"
+    ]
+  },
   "security.init_connect": {
     "description": "init_connect is set: SQL runs at every login of the agent's account.",
     "engines": [
@@ -434,6 +508,15 @@
     "description": "An enabled login event trigger runs user code at every connection of the agent.",
     "engines": [
       "postgres"
+    ]
+  },
+  "security.ticket_registry_unencrypted": {
+    "description": "{count} CAS ticket(s) stored without ticket registry encryption (crypto.enabled false): ticket ids and principals are in clear in the table or collection. The agent read only the ticket types and counts.",
+    "engines": [
+      "postgres",
+      "mysql",
+      "mariadb",
+      "mongodb"
     ]
   },
   "security.tls_disabled": {

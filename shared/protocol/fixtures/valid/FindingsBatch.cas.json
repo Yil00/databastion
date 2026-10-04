@@ -1,0 +1,59 @@
+{
+  "batch_id": "01925a1c-3b40-7d2e-9a11-4c5d6e7f8091",
+  "job_id": "01925a1b-7f00-7a3c-8b22-1d2e3f4a5b6c",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "cas-prod",
+      "location": {
+        "engine": "cas",
+        "database": "service_registry",
+        "schema": "oidc",
+        "object": "HR_Portal",
+        "field": "contacts[].email"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 12,
+      "matched": 12,
+      "estimated_rows": 40,
+      "masked_samples": [
+        "j*******@e******.com"
+      ]
+    },
+    {
+      "target_id": "cas-prod",
+      "location": {
+        "engine": "cas",
+        "database": "service_registry",
+        "schema": "cas",
+        "object": "*",
+        "field": "contacts[].phone"
+      },
+      "classifier": "pii.phone",
+      "confidence": 0.9,
+      "sampled": 8,
+      "matched": 7,
+      "estimated_rows": 40,
+      "masked_samples": [
+        "+33 * ** ** ** 12"
+      ]
+    },
+    {
+      "target_id": "cas-prod",
+      "location": {
+        "engine": "cas",
+        "database": "audit_trail",
+        "object": "audit_log",
+        "field": "who"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.95,
+      "sampled": 200,
+      "matched": 180,
+      "fingerprints": [
+        "hmac-sha256:7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+      ]
+    }
+  ]
+}

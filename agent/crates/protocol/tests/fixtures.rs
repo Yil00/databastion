@@ -49,6 +49,7 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "HeartbeatRequest.detected-target-without-endpoint.json",
         "minProperties",
     ),
+    ("HeartbeatRequest.duplicate-connectors.json", "uniqueItems"),
     ("HeartbeatRequest.duplicate-note-labels.json", "uniqueItems"),
     (
         "HeartbeatRequest.note-negative-count.json",

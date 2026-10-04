@@ -143,7 +143,7 @@
       "pattern": "^/(run|var/run|tmp|var/lib/mysql)(/\\.?[A-Za-z0-9_-][A-Za-z0-9._-]*)+$"
     },
     "ClientAddress": {
-      "description": "IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket\nconnection. Never a host name.\n",
+      "description": "IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket\nconnection. Never a host name.\n\nA per-target agent option `client_addr: clear | truncated | omitted` may reduce it before the\nuplink (ADR-0041 open question 8, refining ADR-0007; default `truncated` on `cas` targets, whose\naudit trail holds every end user's address, `clear` elsewhere): `truncated` keeps the network\npart only, IPv4 `/24` and IPv6 `/56`, with the host bits set to zero (`198.51.100.77` ->\n`198.51.100.0`, `2001:db8:1:2a3::1` -> `2001:db8:1:200::`); `omitted` leaves `client_addr`\nout. A truncated address is still an address literal of this schema: the console cannot tell\nit from a full one, and counts or matches it as given. Signals that depend on the address\n(`volume.failed_logins_many_accounts`) are computed by the agent on the full address before the\nreduction.\n",
       "type": "string",
       "minLength": 2,
       "maxLength": 45,
@@ -163,30 +163,32 @@
       ]
     },
     "Engine": {
-      "description": "Database or directory engine.",
+      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0039 decision 8, ADR-0022). Every later engine value follows the\nsame rule with its own `engine.<value>` token.\n",
       "type": "string",
       "enum": [
         "postgres",
         "mysql",
         "mariadb",
         "mongodb",
-        "openldap"
+        "openldap",
+        "cas"
       ]
     },
     "Connector": {
-      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB.",
+      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB. `cas` is sent only when the\nconsole listed `engine.cas` (see `Engine`).\n",
       "type": "string",
       "enum": [
         "postgres",
         "mysql",
         "mongodb",
-        "openldap"
+        "openldap",
+        "cas"
       ]
     },
     "ConnectorList": {
-      "description": "Connectors compiled in and enabled in this agent.",
+      "description": "Connectors compiled in and enabled in this agent. A connector of an engine added after\nprotocol 0.1.0 is listed only once the console's latest heartbeat response lists its\n`engine.<value>` token, and never in `/enroll` (no heartbeat response yet): a console that\ndoes not list the token only ever receives the four 0.1.0 connectors.\n",
       "type": "array",
-      "maxItems": 4,
+      "maxItems": 16,
       "uniqueItems": true,
       "items": {
         "$ref": "#/$defs/Connector"
@@ -203,7 +205,7 @@
       ]
     },
     "AuditSource": {
-      "description": "Native source used for Audit on a target.",
+      "description": "Native source used for Audit on a target. `cas_audit_log` (the CAS JSON audit log file,\nADR-0041 decision 7) is sent only when the console listed `engine.cas` (see `Engine`).\n",
       "type": "string",
       "enum": [
         "pgaudit",
@@ -215,7 +217,8 @@
         "mongodb_audit_log",
         "mongodb_profiler",
         "mongodb_log",
-        "openldap_accesslog"
+        "openldap_accesslog",
+        "cas_audit_log"
       ]
     },
     "Edition": {
@@ -804,7 +807,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }
@@ -1380,7 +1383,7 @@
       }
     },
     "Location": {
-      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\n",
+      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1527,12 +1530,12 @@
       }
     },
     "Principal": {
-      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so\nthe agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN\nand the DNs listed in its `openldap.clear_principals`. The console escapes `db_user` and\n`application` on display.\n",
+      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so\nthe agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN\nand the DNs listed in its `openldap.clear_principals`. On CAS (ADR-0041 decision 7), principals\nare end users: every principal is sent as `db_user_fingerprint` except the names listed in the\ntarget's `cas.clear_principals`, and the name of a failed authentication is always\nfingerprinted.\n\n**The `*` aggregate (CAS only).** `db_user` equal to `*` means \"several accounts\", never an\naccount named `*` nor a wildcard: it appears only on `cas` targets, only on `auth_failure`\nevents carrying the signal `volume.failed_logins_many_accounts`, when the agent aggregates the\nfailed authentications of one client address (beyond 16 distinct principals in 10 minutes, or\nwhen its bounded window is full, then without `client_addr`) into one event per address and\nminute; `aggregated_count` is the number of failures merged. No other event carries `db_user`\n`*`. The console escapes `db_user` and `application` on display.\n",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "db_user": {
-          "description": "Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of\n`openldap.clear_principals`) as logged by the engine.\n",
+          "description": "Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of\n`openldap.clear_principals`; on CAS, a name of `cas.clear_principals`, or the `*`\naggregate above) as logged by the engine.\n",
           "type": "string",
           "minLength": 1,
           "maxLength": 256,

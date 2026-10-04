@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-28
+- **Refined by**: [ADR-0041](0041-cas-connector.md) open question 8 (per-target reduction of client addresses, see "Refinement" below)
 
 ## Context
 [ADR-0003](0003-data-minimization-at-source.md) states that no raw sensitive value leaves the agent, and details what a Discovery finding may carry. Audit access events ([09-agent-protocol.md](../09-agent-protocol.md#access-event-agent--console)) come from other sources: database audit logs (pgaudit, `server_audit`, MongoDB `auditLog`), `pg_stat_statements`, the OpenLDAP `cn=accesslog`. These sources contain query text with literals (`WHERE email = 'jane.doe@example.com'`), MongoDB filter documents, LDAP search filters and entry DNs (`uid=jdoe,ou=people,dc=example,dc=com`). Forwarding them as-is would move sensitive values to the console, which ADR-0003 forbids but does not spell out for events.
@@ -18,6 +19,9 @@ Audit access events follow the same rule as findings: they are built from masked
 - **LDAP entry DNs** are reduced to their parent container (`uid=jdoe,ou=people,dc=example,dc=com` → `ou=people,dc=example,dc=com`). A bind DN used as the principal is kept, since it identifies who reads, not what is read.
 - **Names are normalized** before the uplink: bounded length, control characters removed, identifiers that match a classifier (e.g. a column or collection named after a person or containing an email) are masked like a value.
 - **Enforcement in the agent**: the uplink and the connector sinks only accept `MaskedEvent`, which can only be constructed in `classifiers::masking` (private fields, no constructor from a string, no `Deserialize`). Connectors hand raw event data to `classifiers::masking`; they never build the protocol type themselves.
+
+### Refinement: per-target client address reduction (ADR-0041, 2026-10-04)
+Client IP addresses stay metadata that may leave the agent, but an agent-side per-target option `client_addr: clear | truncated | omitted` may reduce them before the uplink, as confirmed by the maintainer for [ADR-0041](0041-cas-connector.md) open question 8. `truncated` keeps IPv4 `/24` and IPv6 `/56` with the host bits zeroed; `omitted` leaves the address out. The default is `truncated` on `cas` targets, whose audit trail holds the address of every end user, and `clear` on the other engines. Signals that depend on the address are computed on the full address before the reduction. A truncated address is still an address literal of the contract `ClientAddress` (text clarification, no schema change).
 
 ## Consequences
 - The console cannot show the exact query or the exact entries read, only their shape, their targets and their volume. An investigator goes to the database's own audit log, with their own permissions.

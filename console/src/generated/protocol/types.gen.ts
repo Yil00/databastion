@@ -395,19 +395,38 @@ export interface components {
         /**
          * @description IPv4 or IPv6 literal of the database client as logged by the engine, or `local` for a Unix socket
          *     connection. Never a host name.
+         *
+         *     A per-target agent option `client_addr: clear | truncated | omitted` may reduce it before the
+         *     uplink (ADR-0041 open question 8, refining ADR-0007; default `truncated` on `cas` targets, whose
+         *     audit trail holds every end user's address, `clear` elsewhere): `truncated` keeps the network
+         *     part only, IPv4 `/24` and IPv6 `/56`, with the host bits set to zero (`198.51.100.77` ->
+         *     `198.51.100.0`, `2001:db8:1:2a3::1` -> `2001:db8:1:200::`); `omitted` leaves `client_addr`
+         *     out. A truncated address is still an address literal of this schema: the console cannot tell
+         *     it from a full one, and counts or matches it as given. Signals that depend on the address
+         *     (`volume.failed_logins_many_accounts`) are computed by the agent on the full address before the
+         *     reduction.
          */
         ClientAddress: string | "local";
         /**
-         * @description Database or directory engine.
+         * @description Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after
+         *     protocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the
+         *     capability `engine.cas` (ADR-0039 decision 8, ADR-0022). Every later engine value follows the
+         *     same rule with its own `engine.<value>` token.
          * @enum {string}
          */
-        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap";
+        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap" | "cas";
         /**
-         * @description Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB.
+         * @description Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB. `cas` is sent only when the
+         *     console listed `engine.cas` (see `Engine`).
          * @enum {string}
          */
-        Connector: "postgres" | "mysql" | "mongodb" | "openldap";
-        /** @description Connectors compiled in and enabled in this agent. */
+        Connector: "postgres" | "mysql" | "mongodb" | "openldap" | "cas";
+        /**
+         * @description Connectors compiled in and enabled in this agent. A connector of an engine added after
+         *     protocol 0.1.0 is listed only once the console's latest heartbeat response lists its
+         *     `engine.<value>` token, and never in `/enroll` (no heartbeat response yet): a console that
+         *     does not list the token only ever receives the four 0.1.0 connectors.
+         */
         ConnectorList: components["schemas"]["Connector"][];
         /**
          * @description Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
@@ -417,10 +436,11 @@ export interface components {
          */
         AuditLevel: "full" | "partial" | "limited" | "none";
         /**
-         * @description Native source used for Audit on a target.
+         * @description Native source used for Audit on a target. `cas_audit_log` (the CAS JSON audit log file,
+         *     ADR-0041 decision 7) is sent only when the console listed `engine.cas` (see `Engine`).
          * @enum {string}
          */
-        AuditSource: "pgaudit" | "pg_stat_statements" | "pg_stat_activity" | "mariadb_server_audit" | "mysql_audit_log" | "performance_schema" | "mongodb_audit_log" | "mongodb_profiler" | "mongodb_log" | "openldap_accesslog";
+        AuditSource: "pgaudit" | "pg_stat_statements" | "pg_stat_activity" | "mariadb_server_audit" | "mysql_audit_log" | "performance_schema" | "mongodb_audit_log" | "mongodb_profiler" | "mongodb_log" | "openldap_accesslog" | "cas_audit_log";
         /**
          * @description Engine edition or distribution, when the agent can tell.
          * @enum {string}
@@ -677,7 +697,8 @@ export interface components {
             server_time: components["schemas"]["Timestamp"];
             /**
              * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
-             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`. The agent keeps
+             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines
+             *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
              *     heartbeat response, and when the list is absent, it sends none of them. The console
@@ -958,6 +979,14 @@ export interface components {
          *     MongoDB: database, collection, normalized field path. OpenLDAP: naming context (as
          *     `database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,
          *     never an entry DN), structural objectClass (as `object`), attribute (ADR-0029).
+         *     CAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,
+         *     `schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),
+         *     `object` = the normalized service name (`*` when masked, then the numeric service id), `field`
+         *     = the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,
+         *     e.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =
+         *     `audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential
+         *     field (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another
+         *     engine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.
          */
         Location: {
             engine: components["schemas"]["Engine"];
@@ -1013,13 +1042,24 @@ export interface components {
          *     for any account name that does not match the `db_user` pattern, the agent sends
          *     `db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so
          *     the agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN
-         *     and the DNs listed in its `openldap.clear_principals`. The console escapes `db_user` and
-         *     `application` on display.
+         *     and the DNs listed in its `openldap.clear_principals`. On CAS (ADR-0041 decision 7), principals
+         *     are end users: every principal is sent as `db_user_fingerprint` except the names listed in the
+         *     target's `cas.clear_principals`, and the name of a failed authentication is always
+         *     fingerprinted.
+         *
+         *     **The `*` aggregate (CAS only).** `db_user` equal to `*` means "several accounts", never an
+         *     account named `*` nor a wildcard: it appears only on `cas` targets, only on `auth_failure`
+         *     events carrying the signal `volume.failed_logins_many_accounts`, when the agent aggregates the
+         *     failed authentications of one client address (beyond 16 distinct principals in 10 minutes, or
+         *     when its bounded window is full, then without `client_addr`) into one event per address and
+         *     minute; `aggregated_count` is the number of failures merged. No other event carries `db_user`
+         *     `*`. The console escapes `db_user` and `application` on display.
          */
         Principal: {
             /**
              * @description Database account (or, on OpenLDAP, `anonymous`, the agent's own DN or a DN of
-             *     `openldap.clear_principals`) as logged by the engine.
+             *     `openldap.clear_principals`; on CAS, a name of `cas.clear_principals`, or the `*`
+             *     aggregate above) as logged by the engine.
              */
             db_user?: string;
             db_user_fingerprint?: components["schemas"]["Fingerprint"];

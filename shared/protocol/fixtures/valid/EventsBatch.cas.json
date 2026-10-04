@@ -1,0 +1,86 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1b",
+  "events": [
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:01:00Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c",
+        "client_addr": "198.51.100.0",
+        "application": "Mozilla/5.0"
+      },
+      "action": "connect",
+      "objects": [],
+      "source": "cas_audit_log",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:01:02Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c",
+        "client_addr": "198.51.100.0"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "service_registry",
+          "schema": "oidc",
+          "object": "HR_Portal"
+        }
+      ],
+      "rows": 1,
+      "source": "cas_audit_log",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:02:00Z",
+      "ts_last": "2026-10-04T09:02:59Z",
+      "principal": {
+        "db_user": "*",
+        "client_addr": "203.0.113.0",
+        "application": "python-requests/2.32"
+      },
+      "action": "auth_failure",
+      "objects": [],
+      "signals": [
+        "volume.failed_logins_many_accounts"
+      ],
+      "source": "cas_audit_log",
+      "aggregated_count": 340
+    },
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:03:00Z",
+      "ts_last": "2026-10-04T09:09:00Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e",
+        "client_addr": "2001:db8:1:200::"
+      },
+      "action": "auth_failure",
+      "objects": [],
+      "signals": [
+        "volume.failed_logins_one_account"
+      ],
+      "source": "cas_audit_log",
+      "aggregated_count": 21
+    },
+    {
+      "target_id": "cas-prod",
+      "ts": "2026-10-04T09:04:00Z",
+      "principal": {
+        "db_user": "cas-admin"
+      },
+      "action": "dcl",
+      "objects": [
+        {
+          "database": "service_registry",
+          "object": "service_registry"
+        }
+      ],
+      "source": "cas_audit_log",
+      "aggregated_count": 1
+    }
+  ]
+}
