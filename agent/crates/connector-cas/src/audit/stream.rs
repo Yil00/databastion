@@ -372,14 +372,23 @@ mod tests {
             .with_open_check(Arc::clone(&check));
         assert!(t.poll().is_ok());
         assert_eq!(*last.lock().unwrap(), None);
-        // Rotation to a hard-linked file: refused on the tailer's handle,
-        // without any check of this crate before the poll.
+        // Rotation to a hard-linked file: refused on the tailer's handle by
+        // the core itself (one link, #140 L1), before this crate's check.
         std::fs::rename(log.path(), dir.path().join("cas_audit.log.1")).unwrap();
         let other = dir.path().join("other.log");
         std::fs::write(&other, b"{}\n").unwrap();
         std::fs::hard_link(&other, log.path()).unwrap();
         assert!(t.poll().is_err());
-        assert_eq!(*last.lock().unwrap(), Some(Refusal::NotReadable));
+        // Rotation to a file the agent could write (the test's own, under
+        // the strict policy): refused by this crate's check, run on the
+        // tailer's handle without any check before the poll.
+        std::fs::remove_file(log.path()).unwrap();
+        append(&dir, "");
+        let strict = fsread::log_open_check(log.clone(), Policy::STRICT, Arc::clone(&last));
+        let mut t =
+            Tailer::new(log.path().to_path_buf(), Framing::Lines, None).with_open_check(strict);
+        assert!(t.poll().is_err());
+        assert_eq!(*last.lock().unwrap(), Some(Refusal::Writable));
     }
 
     #[test]

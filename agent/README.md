@@ -452,7 +452,14 @@ handle (end-of-phase-4 review L4). Since P8-B the path is opened with
 configured path whose last component is a symlink is refused
 (`audit.log_not_readable`; point `audit_log.path` at the file itself; symlinked
 directories above it still work), so a symlink swapped in at rotation time
-cannot redirect the tailer (security review of #138 L2). A source can add its
+cannot redirect the tailer (security review of #138 L2). A CAS
+`cas.audit_log.path` is the exception at load only: it is resolved once when
+`agent.yaml` is loaded (symlinks followed then), the tailer opens the resolved
+path, and a later change of where the declared path resolves is refused until
+the next reload ([ADR-0043](../docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)
+decision 2). A file with more than one hard link is refused too, at every open
+and reopen (`audit.log_not_readable`; security review of #140 L1): a hard link
+put at the path at rotation could be any other file the agent can read. A source can add its
 own checks of every opened file (`Tailer::with_open_check`, used by the CAS
 connector). An audit log is
 the database server's evidence: a file the agent's account could write could

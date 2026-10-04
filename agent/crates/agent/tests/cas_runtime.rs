@@ -20,7 +20,7 @@ const TOKEN: &str = "dbe_TOKENTOKENTOKENTOKENTOKENTOKENTOKENTOKEN012";
 const SCAN_ID: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f91";
 const AUDIT_ID: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f92";
 /// Raw values of the fixtures: none may reach the console.
-const RAW: [&str; 7] = [
+const RAW: [&str; 11] = [
     "jane.doe@example.org",
     "john.roe@example.org",
     "max.moe@example.org",
@@ -28,6 +28,14 @@ const RAW: [&str; 7] = [
     "alice.user",
     "ST-1-FAKEfakeFAKE",
     "192.0.2.77",
+    // The service host of the ticket record and the registry's hosts: only
+    // the matching service's normalized name (`Hr`) may leave.
+    "hr.example.org",
+    "wiki.example.org",
+    // The query string of `what` (it held the ticket id).
+    "ticket=",
+    // A contact name of the registry (classified, never sent raw).
+    "Contact",
 ];
 
 struct TempDir(PathBuf);

@@ -61,6 +61,9 @@
 //!   agent's account could write would not be evidence of what the server
 //!   did. Such a file is refused like an unreadable one
 //!   (`PermissionDenied`: `audit.log_not_readable` in `check()`).
+//! - The file must have **one hard link** (`st_nlink` = 1, on the handle,
+//!   at every open and reopen): a hard link put at the path could be any
+//!   other file the agent can read (security review of #140 L1).
 //! - The path is opened with `O_NOFOLLOW` (security review of #138 L2): a
 //!   symlink as its last component is refused (directories above it are
 //!   still resolved), at the first open and at every reopen after a
@@ -567,6 +570,16 @@ fn open_regular(
         .metadata()
         .map_err(|e| TailError::Unreadable(e.kind()))?;
     if !meta.file_type().is_file() {
+        return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
+    }
+    // A hard link put at the path (whoever can write the log directory,
+    // with `fs.protected_hardlinks=0`) could be any other file the agent
+    // can read: refused like a final symlink (security review of #140 L1).
+    if meta.nlink() != 1 {
+        tracing::warn!(
+            "audit log refused: the file has several hard links; it must be the log the \
+             server writes, with one link"
+        );
         return Err(TailError::Unreadable(std::io::ErrorKind::InvalidInput));
     }
     if writable_by_agent(&meta) {
@@ -1567,6 +1580,33 @@ mod tests {
         append(&log, "b\n");
         let got = lines(t.poll().unwrap());
         assert_eq!(got, ["b"]);
+    }
+
+    #[test]
+    fn a_hard_linked_log_is_refused_at_open_and_at_rotation() {
+        let d = Dir::new("hardlink");
+        let other = d.0.join("other.log");
+        append(&other, "secret history\n");
+        let linked = d.0.join("linked.log");
+        std::fs::hard_link(&other, &linked).unwrap();
+        let mut t = Tailer::new(linked.clone(), Framing::Lines, None);
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        assert!(!readable(&linked));
+        // Swapped in at rotation.
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(lines(t.poll().unwrap()).is_empty());
+        std::fs::rename(&log, d.0.join("audit.log.1")).unwrap();
+        std::fs::remove_file(&linked).unwrap();
+        std::fs::hard_link(&other, &log).unwrap();
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        // A regular single-link file again: followed.
+        std::fs::remove_file(&log).unwrap();
+        append(&log, "");
+        assert!(lines(t.poll().unwrap()).is_empty());
+        append(&log, "b\n");
+        assert_eq!(lines(t.poll().unwrap()), ["b"]);
     }
 
     #[test]

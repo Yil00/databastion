@@ -48,6 +48,9 @@ pub struct CasHealth {
     pub audit_level: AuditLevel,
     /// Closed notes, sorted, without duplicates.
     pub notes: Vec<CasNote>,
+    /// A source was refused because the agent's account could write it (a
+    /// privilege problem, not an unreachable file).
+    pub refused_writable: bool,
 }
 
 impl CasHealth {
@@ -62,7 +65,8 @@ impl CasHealth {
             None
         } else if has(CasNoteCode::CheckTimedOut) {
             Some(FailureCode::Timeout)
-        } else if has(CasNoteCode::PrivilegeRegistryWritable)
+        } else if self.refused_writable
+            || has(CasNoteCode::PrivilegeRegistryWritable)
             || has(CasNoteCode::PrivilegeConfigReadable)
         {
             Some(FailureCode::PermissionDenied)
@@ -119,6 +123,7 @@ fn failed(code: CasNoteCode) -> CasHealth {
         reachable: false,
         audit_level: AuditLevel::None,
         notes: vec![CasNote::flag(code)],
+        refused_writable: false,
     }
 }
 
@@ -130,6 +135,7 @@ pub(crate) fn check_blocking(
 ) -> CasHealth {
     let mut notes = Vec::new();
     let mut reachable = false;
+    let mut refused_writable = false;
     let snap = state.snapshot();
     if let Some(dir) = &settings.registry_dir {
         let listed = if dir.still_resolves() {
@@ -159,7 +165,8 @@ pub(crate) fn check_blocking(
                 }
             }
             Err(Refusal::Writable) => {
-                notes.push(CasNote::flag(CasNoteCode::PrivilegeRegistryWritable))
+                refused_writable = true;
+                notes.push(CasNote::flag(CasNoteCode::PrivilegeRegistryWritable));
             }
             Err(Refusal::ConfigFiles) => {
                 notes.push(CasNote::flag(CasNoteCode::PrivilegeConfigReadable))
@@ -177,7 +184,14 @@ pub(crate) fn check_blocking(
             Err(Refusal::ResolvedChanged)
         };
         match tail {
-            Err(_) => notes.push(CasNote::flag(CasNoteCode::AuditLogNotReadable)),
+            Err(refusal) => {
+                // A log the agent could write keeps the closed note
+                // `audit.log_not_readable` (no privilege code covers the
+                // log), but the failure is `permission_denied` (security
+                // review of #140 L2).
+                refused_writable |= refusal == Refusal::Writable;
+                notes.push(CasNote::flag(CasNoteCode::AuditLogNotReadable));
+            }
             Ok(tail) => {
                 reachable = true;
                 let batch = parse_lines(tail.bytes.split(|b| *b == b'\n'), log.offset, now);
@@ -214,6 +228,7 @@ pub(crate) fn check_blocking(
         reachable,
         audit_level: level,
         notes,
+        refused_writable,
     }
 }
 
@@ -269,6 +284,34 @@ mod tests {
                 CasNoteCode::AuditLogNotReadable,
                 CasNoteCode::PrivilegeRegistryWritable
             ]
+        );
+        assert!(h.refused_writable);
+        assert_eq!(
+            h.clone().into_target_health().failure,
+            Some(FailureCode::PermissionDenied)
+        );
+        // An audit log alone, refused because the agent could write it:
+        // `audit.log_not_readable`, failure `permission_denied` (#140 L2).
+        let log_only = CasSettings::from_yaml(
+            &format!(
+                "{{audit_log: {{path: {}/cas_audit.log}}}}",
+                dir.path().display()
+            ),
+            &[],
+        )
+        .unwrap();
+        let h = check_with(&log_only, &state, Policy::STRICT).await;
+        assert_eq!(codes(&h), [CasNoteCode::AuditLogNotReadable]);
+        assert_eq!(
+            h.into_target_health().failure,
+            Some(FailureCode::PermissionDenied)
+        );
+        // Not there at all: unreachable.
+        std::fs::remove_file(dir.path().join("cas_audit.log")).unwrap();
+        let h = check_with(&log_only, &state, Policy::STRICT).await;
+        assert_eq!(
+            h.into_target_health().failure,
+            Some(FailureCode::TargetUnreachable)
         );
     }
 
@@ -340,6 +383,7 @@ mod tests {
                 reachable,
                 audit_level: AuditLevel::None,
                 notes,
+                refused_writable: false,
             }
             .into_target_health()
         };
