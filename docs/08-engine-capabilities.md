@@ -56,20 +56,34 @@ Sampling is bounded per object (rows, bytes, statement timeout), and since #93 t
 
 ## Load and database impact, measured
 
-The load / database impact harness of #92 ([e2e/load/README.md](../e2e/load/README.md): method, formulas and every check) measures Discovery's CPU impact on the target servers, the Audit path under a fixed-rate workload, and the agent's own resources. Figures of the final CI load run on the head of #93 (`d04bbf6`), with pgaudit on PostgreSQL, the `server_audit` log on MariaDB and every target limited to 2 CPUs:
+The load / database impact harness of #92 ([e2e/load/README.md](../e2e/load/README.md): method, formulas and every check) measures Discovery's CPU impact on the target servers, the Audit path under a fixed-rate workload, and the agent's own resources. Database figures of the CI load run on the head of #146 (`e2e3ee1`, job 111539820644, every check passed), with pgaudit on PostgreSQL, the `server_audit` log on MariaDB, every target limited to 2 CPUs, and the [CAS store guard](#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap) active in every database connector (it is not optional). This run replaces the final run on the head of #93 (`d04bbf6`): the database load job had been failing since the distroless console image of #86 (no healthcheck tool in the image), until #146.
 
 | Measurement | Result | Criterion |
 |-------------|--------|-----------|
-| Discovery impact on the database while a scan runs (share of a 2-CPU server) | MariaDB 0.322 %, MongoDB 0.267 %, PostgreSQL 0.045 % | < 2 % per scan ([04-mvp-scope.md](04-mvp-scope.md#mvp-success-criteria)) |
+| Discovery impact on the database while a scan runs (share of a 2-CPU server) | MariaDB 0.324 %, MongoDB 0.219 %, PostgreSQL 0 (no CPU attributable to the scan above the idle-agent baseline; the #93 run measured 0.045 %) | < 2 % per scan ([04-mvp-scope.md](04-mvp-scope.md#mvp-success-criteria)) |
 | Scaled seed | 400 tables and 10^6 rows on PostgreSQL and MariaDB; 200 collections and 5 × 10^5 documents on MongoDB | |
-| Audit under load, 300 statements/s for 600 s: events stored / statements issued | exactly equal (MariaDB 180 551, PostgreSQL 180 115) | 0.99 to 1.01 |
-| Latency the workload gains with Audit on (p95) | none: added p95 ≤ 0 | ≤ 3 × p95 without Audit + 5 ms |
-| Drain: end of the workload to the last of its events stored | about 11 s | ≤ 240 s |
-| Agent CPU with Audit on | 0.024 core | ≤ 1 core |
-| Agent peak RSS | 40.7 MiB, no RSS or CPU growth over the run | ≤ 256 MiB, no monotonic growth |
-| Spool | 0 batches dropped, spool not used | nothing dropped |
+| Audit under load, 300 statements/s for 600 s: events stored / statements issued | exactly equal (MariaDB 179 676, PostgreSQL 180 128) | 0.99 to 1.01 |
+| Latency the workload gains with Audit on (p95) | MariaDB −0.01 ms, PostgreSQL +0.004 ms (0.25 / 0.24 ms and 0.338 / 0.342 ms without / with Audit) | ≤ 3 × p95 without Audit + 5 ms |
+| Drain: end of the workload to the last of its events stored | about 13 s (MariaDB 12.8 s, PostgreSQL 12.9 s) | ≤ 240 s |
+| Agent CPU with Audit on | 0.024 core (0.0004 core with Audit off) | ≤ 1 core |
+| Agent peak RSS | 40.5 MiB | ≤ 256 MiB, no monotonic growth |
+| Spool | no batch dropped (check passed) | nothing dropped |
 
-Scope of these figures: a single CI run on shared runners, one agent, 2-CPU targets. MongoDB Audit under load and the OpenLDAP audit proof searches are not measured yet (ROADMAP phase 7 follow-ups). The harness's growth check only catches a fast leak: the 72 h stability test of the MVP criteria is run separately by the maintainer and is not reported here.
+The Apereo CAS target has its own run (`e2e/load/cas.sh`, CI job `load-cas`, [e2e/load/README.md](../e2e/load/README.md)): CAS 8.0.2 (dev overlay) with its JPA ticket registry in PostgreSQL, both limited to 2 CPUs. Figures of run 37235163505 (job 111532739008) on `dev` at `684966d` (#145):
+
+| Measurement | Result | Criterion |
+|-------------|--------|-----------|
+| Audit under load, 4 logins/s and 1 failed login/s for 600 s: events stored / audit records that give an event | exactly equal: 5 400 (2 400 `connect`, 2 400 `read`, 600 `auth_failure`) | 0.99 to 1.01 |
+| Drain: end of the workload to the last of its events stored | 65.2 s (event lag p95 65.4 s) | ≤ 240 s (drain) |
+| CAS login latency (p95 of the `POST`) | 66.3 ms without Audit, 67.1 ms with Audit (+0.8 ms) | ≤ 3 × p95 without Audit + 5 ms |
+| CAS host CPU | 0.75 core without Audit, 0.73 with Audit | |
+| Agent CPU | 0.0002 core with Audit off, 0.0007 core with Audit on | ≤ 1 core |
+| Agent peak RSS | 17.9 MiB, no growth (slope 0.15 MiB/h) | ≤ 256 MiB, no monotonic growth |
+| Discovery of the CAS ticket table (PostgreSQL target `casdb-load`, 3 240 tickets, read by the store guard as a count aggregate, never sampled) | 0.803 % of the 2-CPU database server, 0 findings | < 2 % per scan |
+
+The CAS connector reads local files only, so there is no CAS database impact to measure for its own sources.
+
+Scope of these figures: one CI run per harness on shared runners, one agent, 2-CPU targets. MongoDB Audit under load and the OpenLDAP audit proof searches are not measured yet (ROADMAP phase 7 follow-ups). The harness's growth check only catches a fast leak: the 72 h stability test of the MVP criteria is run separately by the maintainer and is not reported here.
 
 ## Audit log files and failing streams (every engine)
 
@@ -490,7 +504,7 @@ The core adds `coverage.cas_guard_tripped` and `security.ticket_registry_unencry
 
 ## Apereo CAS
 
-What the CAS connector does, as implemented in phase 8 ([ADR-0041](adr/0041-cas-connector.md), P8-B; on `dev`, in the next release). Its tests so far are unit, property, fuzz and runtime tests on files; the end-to-end run against the CAS 8.0.2 dev service and the load run are in progress (ROADMAP P8-D), and CAS is not in the engine matrix yet. The reference is [the connector README](../agent/crates/connector-cas/README.md); the target settings are in [10-user-guide.md](10-user-guide.md#6-declare-targets). Maintained CAS lines only (8.0.x; 7.3.x is not supported); the agent cannot read the CAS version, so it is not checked at run time.
+What the CAS connector does, as implemented in phase 8 ([ADR-0041](adr/0041-cas-connector.md), P8-B; on `dev`, in the next release). Besides unit, property, fuzz and runtime tests on files, it is tested end to end against the CAS 8.0.2 dev service (CI job `e2e-cas`, #145, part of the required `CI result` check) and under load (job `load-cas`, [figures](#load-and-database-impact-measured)); CAS is not in the engine matrix. The reference is [the connector README](../agent/crates/connector-cas/README.md); the target settings are in [10-user-guide.md](10-user-guide.md#6-declare-targets). Maintained CAS lines only (8.0.x; 7.3.x is not supported); the agent cannot read the CAS version, so it is not checked at run time.
 
 ### Sources
 - **Local files only**, declared in `agent.yaml`: the JSON service registry directory (`cas.service_registry.json_dir`) and the JSON audit log (`cas.audit_log.path`). No network connection of any kind (no HTTP, database or LDAP client), no credential, no actuator endpoint; never detected locally (I5). The CAS configuration (`cas.properties`, `cas.yml`) is never read.
