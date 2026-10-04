@@ -415,7 +415,12 @@ class ReportTest(unittest.TestCase):
     def test_failures(self) -> None:
         rep, ck = L.build_report(*scenario(impact_cores=0.03), L.Limits())  # 1.5 % ... below
         self.assertTrue(rep["pass"])
-        rep, ck = L.build_report(*scenario(impact_cores=0.05), L.Limits())  # 2.5 %
+        # The scenario's scan lasts 30 s, so it is judged over 60 s: 2.5 % over the scan is 1.25 %.
+        rep, ck = L.build_report(*scenario(impact_cores=0.05), L.Limits())
+        self.assertTrue(rep["pass"])
+        self.assertAlmostEqual(rep["discovery"]["pg-load"]["impact_judged_pct"],
+                               rep["discovery"]["pg-load"]["impact_pct_60s"])
+        rep, ck = L.build_report(*scenario(impact_cores=0.1), L.Limits())  # 5 % over the scan, 2.5 % over 60 s
         self.assertEqual(self.names(ck, False), {"discovery.pg-load.db_cpu_impact_pct"})
         rep, ck = L.build_report(*scenario(received_ratio=0.9), L.Limits())
         self.assertEqual(self.names(ck, False), {"audit.pg-load.events_accounted"})

@@ -145,6 +145,12 @@ Per target:
 impact % = 100 x (C_db[scan] - r_idle x d_measured) / (d_scan x capacity)
 ```
 
+A scan shorter than 60 s is asserted on `max(d_scan, 60 s)` instead of `d_scan` (the "Over 60 s"
+column): below the 0.5 s CPU sampling and a session's fixed cost, a sub-second average measures noise
+(the CAS ticket aggregate, a 0.6 s scan using 0.04 s of CPU, read 3.6 % over the scan and 0.03 % over
+a minute). Scans of a minute or more, the paced Discovery scans of `run.sh`, are judged on their own
+duration as before. The per-scan figure stays in the report.
+
 - `C_db[scan]`: CPU time of the target's container (cgroup) from the last sample at or before the
   job's delivery to the agent to the first sample at or after the console recorded its end
   (`d_measured`, which contains the scan window).
