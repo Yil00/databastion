@@ -32,7 +32,7 @@ rustls-native-certs.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 stringprep = "0.1"
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.4", default-features = false }
 # Audit (P5-B, P5-C): auditLog and server log JSON records, read with serde
 # visitors that skip command values (no protocol types).
