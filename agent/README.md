@@ -3,11 +3,12 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: released (v0.1.0; latest v0.3.1).** `agent.yaml`
+> **Status: released (v0.1.0; latest v0.4.0).** `agent.yaml`
 > configuration, enrollment, `0600` identity storage, HTTPS uplink,
 > heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
 > detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
-> MariaDB, MongoDB and OpenLDAP. `check()` reports the audit level each
+> MariaDB, MongoDB, OpenLDAP and, since 0.4.0, Apereo CAS (local files).
+> `check()` reports the audit level each
 > target actually reaches
 > ([08-engine-capabilities.md](../docs/08-engine-capabilities.md)).
 
