@@ -35,7 +35,7 @@ DataBastion sits **as close to the data as possible**:
 | MongoDB Community | ✅ | Limited (slow operations only) | Server log, profiler | 6.0, 7.0, 8.0 (**8.0.32** on every change) | Requires MongoDB 5.0+ (enforced; 4.x, end of life, is not supported), SCRAM-SHA-256, one declared host |
 | MongoDB Enterprise / Percona Server for MongoDB | ✅ | Partial, never Full | `auditLog` JSON file | Percona Server for MongoDB 8.0 (8.0.32-14) | MongoDB Enterprise: recorded log samples only |
 | OpenLDAP | ✅ | Full when reads and failed operations are proven logged for every naming context; Partial / Limited otherwise | `slapo-accesslog` (`cn=accesslog`) | Debian bookworm `slapd` (OpenLDAP 2.5) | |
-| Apereo CAS (on `dev`, next release) | ✅ JSON service registry and audit log files | Partial at best (authentications and service tickets logged), never Full | JSON audit log file | 8.0.2 (dev service, in the end-to-end and load tests; not in the engine matrix) | Local files only, no network connection to CAS. Ticket ids never sampled. CAS stores kept in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP are read by those targets under the CAS store guard (ticket registries: counts only) |
+| Apereo CAS (since 0.4.0) | ✅ JSON service registry and audit log files | Partial at best (authentications and service tickets logged), never Full | JSON audit log file | 8.0.2 (dev service, in the end-to-end and load tests; not in the engine matrix) | Local files only, no network connection to CAS. Ticket ids never sampled. CAS stores kept in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP are read by those targets under the CAS store guard (ticket registries: counts only) |
 
 *Planned, not supported yet*: Microsoft SQL Server, Redis and Valkey (phase 9), SQLite and Firebird (phase 10). Their expected audit levels are lower than the engines above for some (Redis and Valkey Limited at best, SQLite Discovery only): see the [roadmap](docs/ROADMAP.md#after-the-mvp) and [ADR-0039](docs/adr/0039-engine-scope-expansion.md), proposed. End-of-life engine versions are not supported.
 
@@ -79,7 +79,7 @@ Details: [architecture](docs/02-architecture.md) · [security](docs/05-security.
 | License | Apache 2.0 | Commercial |
 | Discovery + Audit, all connectors | ✅ | ✅ |
 | Policies, incidents, email / webhook alerting | ✅ | ✅ |
-| Local auth and OpenID Connect single sign-on (OIDC on `dev`, next release, [ADR-0038](docs/adr/0038-console-oidc-login.md)), console audit log | ✅ | ✅ |
+| Local auth and OpenID Connect single sign-on (OIDC since 0.4.0, [ADR-0038](docs/adr/0038-console-oidc-login.md)), console audit log | ✅ | ✅ |
 | Multi-tenancy, fine-grained RBAC, SAML / SCIM | | ✅ |
 | Advanced Prevention mode, SIEM export, compliance reports | | ✅ |
 | Support & SLA | | ✅ |

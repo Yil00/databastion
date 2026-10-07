@@ -3,8 +3,9 @@
 ## Supported versions
 | Version | Supported |
 |---------|-----------|
-| 0.1.x | Yes: security fixes are released as `0.1.Z` patch versions |
-| Pre-releases (`0.1.0-alpha.N`, `-beta.N`, `-rc.N`) | No: upgrade to the latest `0.1.x` release |
+| 0.4.x | Yes: security fixes are released as `0.4.Z` patch versions |
+| 0.1.x, 0.2.x, 0.3.x | No: upgrade to the latest `0.4.x` release |
+| Pre-releases (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) | No: upgrade to the latest `0.4.x` release |
 | Unreleased commits of `main` / `dev` | No |
 
 The console and the agent share one version number and are released together ([RELEASE.md](RELEASE.md#2-versions)). A fix may require upgrading both: the console first, then the agents.
@@ -21,8 +22,8 @@ Please include: the affected version or commit, the component (agent, connector,
 
 ## Scope
 In scope, in this repository:
-- **Agent** (`agent/`): the `databastion-agent` binary, its connectors (PostgreSQL, MySQL / MariaDB, MongoDB, OpenLDAP), the classifiers and masking, the local state files, and the image built from `agent/Dockerfile`.
-- **Console** (`console/`): the web and worker processes, the user API and UI, the agent API (`/api/agent/v1`), the internal database migrations and roles, alerting, and the image built from `console/Dockerfile`.
+- **Agent** (`agent/`): the `databastion-agent` binary, its connectors (PostgreSQL, MySQL / MariaDB, MongoDB, OpenLDAP, Apereo CAS), the classifiers and masking, the local state files, and the image built from `agent/Dockerfile`.
+- **Console** (`console/`): the web and worker processes, the user API and UI, local and OpenID Connect login, the agent API (`/api/agent/v1`), the internal database migrations and roles, alerting, and the image built from `console/Dockerfile`.
 - **Protocol** (`shared/protocol/`): the agent ↔ console contract (`openapi.yaml`, schemas, registries) and how each side enforces it.
 - The [deployment example](deploy/docker-compose.example.yml) and the release workflows, where they make a deployment or a published artifact insecure.
 
@@ -46,7 +47,7 @@ Also particularly sensitive: bypassing agent or console authentication, tamperin
 ## Known limitations and residual risks
 These are known and documented; reporting them again is not needed, but a way to go beyond what is described is a vulnerability. Details are in [docs/05-security.md](docs/05-security.md), [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) and the linked ADRs; the release notes list them under "Known limitations" ([CHANGELOG.md](CHANGELOG.md)).
 
-- **Audit coverage depends on the engine**: each target reports Full, Partial, Limited or None; MySQL / MariaDB and MongoDB are never Full ([docs/08, matrix](docs/08-engine-capabilities.md#matrix)).
+- **Audit coverage depends on the engine**: each target reports Full, Partial, Limited or None; MySQL / MariaDB, MongoDB and Apereo CAS are never Full ([docs/08, matrix](docs/08-engine-capabilities.md#matrix)).
 - **Records lost while the agent is stopped**: the rest of a log rotated by rename, MySQL / MariaDB statements held in a rotated file, and `performance_schema` history that wrapped ([docs/08](docs/08-engine-capabilities.md#audit-log-files-and-failing-streams-every-engine)). A log truncated in place while the agent was stopped is fixed by #97.
 - **Paced Discovery**: at the defaults (1 % duty cycle, 3600 s budget) a scan covers about 36 s of query time; large targets show "partial coverage" ([ADR-0035](docs/adr/0035-discovery-pacing.md)). Since #98 the console delivers one scan per agent at a time, so a pass over N targets of one agent takes about N × the scan budget ([ADR-0036](docs/adr/0036-console-discovery-scan-scheduling.md)).
 - **PostgreSQL statement text on the agent host**: `pg_read_all_stats` exposes other users' raw statement text, including passwords typed as literals, and `pg_stat_statements` keeps DCL passwords in clear; protect the agent's credentials and host accordingly ([docs/05](docs/05-security.md#recommended-database-accounts-read-only)). Holders of those credentials can run the agent's allow-listed table-less statements on `pg_stat_statements` unreported ([docs/08](docs/08-engine-capabilities.md#the-agents-own-account)).
@@ -54,7 +55,10 @@ These are known and documented; reporting them again is not needed, but a way to
 - **Failed-login flood**: junk names can keep root out of the named groups at about 100 times root's volume, and an events flood can evict findings down to a quarter of the spool ([agent/README.md](agent/README.md#failed-login-flood)).
 - **Per-record isolation**: dropped statements reach the counters and the `agent.audit_stream_stopped` alert, not the policies ([ADR-0032](docs/adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md)).
 - **Carried forward**: name-normalization gaps ([ADR-0009](docs/adr/0009-name-normalization-and-item-sanitization.md)); OpenLDAP `check()` does not probe `userPKCS12`; e-mail notifications are plain text only; the system-alert budget needs the same setting on every console process ([ADR-0033](docs/adr/0033-system-alert-budget.md)); webhook and e-mail consumers must escape principals ([docs/05](docs/05-security.md#alerting)).
-- **Upgrades**: upgrade the console and the agents together for 0.1.0; agents built before #60 cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md)).
+- **OpenID Connect login** (since 0.4.0): without refresh tokens, a user disabled at the provider keeps their console session until its maximum age (12 h by default); with OIDC on, `DATABASTION_LOCAL_LOGIN=enabled` lets local users bypass the provider's policies; the role, group and domain expressions are written by the operator and must not read user-editable claims ([docs/05](docs/05-security.md#console-login-with-openid-connect)).
+- **Apereo CAS** (since 0.4.0): client addresses come from `X-Forwarded-For` unless a proxy overwrites it; CAS stores that match no CAS store guard rule are sampled like any table until the first ticket id is read ([docs/05](docs/05-security.md#apereo-cas-connector)).
+- **Audit log paths**: since 0.4.0 a final symlink and a file with more than one hard link are refused, but symlinks in parent directories are still followed; outside CAS targets, the directory permissions must keep others from replacing a parent directory ([ADR-0043](docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)).
+- **Upgrades**: upgrade the console first, then the agents; a 0.4.0 agent holds its `cas` targets, findings and events until the console lists `engine.cas` ([ADR-0042](docs/adr/0042-hold-items-of-unlisted-engines.md)). Agents built before #60 (before 0.1.0) cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md)).
 - **Release trust**: a single maintainer approves releases ([RELEASE.md](RELEASE.md#repository-configuration-one-time)).
 
 ## Verifying release artifacts
@@ -62,7 +66,7 @@ The console and agent images are published to GHCR by [publish.yml](.github/work
 
 1. Resolve the digest of the tag (a tag can be moved in a registry; a digest cannot):
    ```bash
-   VERSION=0.1.0
+   VERSION=0.4.0
    IMAGE=ghcr.io/yil00/databastion-agent
    docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest
    # or: crane digest "$IMAGE:$VERSION"
@@ -76,4 +80,4 @@ The console and agent images are published to GHCR by [publish.yml](.github/work
    ```
 3. Deploy exactly that digest (`$IMAGE:$VERSION@sha256:<digest>`), never the bare tag.
 
-Same steps for `ghcr.io/yil00/databastion-console`. The full verification steps, including the agent `.deb` packages and the signed `SHA256SUMS`, are in [RELEASE.md § 4](RELEASE.md#4-published-artifacts) and [deploy/README.md](deploy/README.md#verify-the-artifacts). No release has been published yet; the first pre-release is `0.1.0-rc.1`.
+Same steps for `ghcr.io/yil00/databastion-console`. The full verification steps, including the agent `.deb` packages and the signed `SHA256SUMS`, are in [RELEASE.md § 4](RELEASE.md#4-published-artifacts) and [deploy/README.md](deploy/README.md#verify-the-artifacts).
