@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
+
 ### ⚠️ Upgrade notes
 From 0.3.x: upgrade the console first, then the agents, as for every release (a console `X.Y` accepts agents `X.Y` and `X.(Y-1)`, [RELEASE.md](RELEASE.md#compatibility)). Check these points before upgrading:
 - **Audit log paths (every engine)**: every log-file Audit source (pgaudit server log, MariaDB `server_audit`, the MySQL / Percona JSON logs, the MongoDB `auditLog` and server log, the CAS audit log) now refuses an `audit_log.path` whose last component is a symlink, and a log file with more than one hard link, at the first open and at every reopen after a rotation. The target then reports `audit.log_not_readable` and its Audit stream reads nothing from that path. **Point the agent at the real file**; symlinked parent directories still work ([ADR-0043](docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)). A CAS `audit_log.path` is resolved once, when `agent.yaml` is loaded: a later change of where it resolves is refused until the next reload
