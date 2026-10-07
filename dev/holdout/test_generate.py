@@ -76,10 +76,18 @@ class Corpus(unittest.TestCase):
         self.assertGreaterEqual(negatives, positive_columns)
 
     def test_misleading_negatives_present(self):
-        fields = {(x["field"].split(".")[-1].lower(), bool(x["expected_classifiers"]))
-                  for x in self.labels["locations"]}
-        self.assertIn(("email_opt_in", False), fields)
-        self.assertIn(("phone_country", False), fields)
+        # The name style (snake, camel, upper, pascal, flat) is drawn from the seed, so names are
+        # compared without case or separators, and the column kind comes from the generator's tags.
+        def bare(field):
+            return field.split(".")[-1].lower().replace("_", "")
+
+        found = {(bare(x["field"]), tag)
+                 for x in self.labels["locations"]
+                 if not x["expected_classifiers"] and not x["ambiguous"]
+                 and "naming:misleading" in x["tags"]
+                 for tag in x["tags"] if tag.startswith("negative:")}
+        self.assertIn(("emailoptin", "negative:boolean_optin"), found)
+        self.assertIn(("phonecountry", "negative:country_code"), found)
 
 
 if __name__ == "__main__":
