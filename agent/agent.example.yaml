@@ -73,6 +73,13 @@ targets:
       # ADR-0012 extended grant variant (pg_read_all_data): check() then reports
       # the membership as an expected warning instead of over-privilege.
       extended_grants: false
+      # CAS store guard (always on, ADR-0041): CAS stores under custom names,
+      # in addition to the built-in names, column shapes and the ticket-id
+      # tripwire. Ticket registries are never sampled (ticket counts only).
+      # cas_stores:
+      #   ticket_registry: [sso_tickets]
+      #   service_registry: [cas_services]
+      #   audit_trail: [cas_audit]
       # pgaudit server log file (P4-A), read by the agent on this host (never
       # through SQL); a fixed log_filename, rotation by rename or truncation
       # is followed. Readable by the agent user, never writable by it:
@@ -159,6 +166,28 @@ targets:
       # administrator accounts, at most 64) and the agent's own DN; every other DN
       # usually names a person and is sent as a keyed fingerprint (ADR-0029).
       # clear_principals: ["cn=admin,dc=example,dc=com"]
+  # Apereo CAS (ADR-0041): local files on this host only. No host, port,
+  # socket, account or secret (refused); never detected locally. The agent's
+  # user needs read access without write access (e.g. 0640, group databastion;
+  # the registry directory 0750) and must NOT be able to read the CAS
+  # configuration (cas.properties, cas.yml): a registry directory holding it
+  # is refused. Results reach a console that lists engine.cas only.
+  - id: cas-prod
+    engine: cas
+    cas:
+      service_registry:
+        # JSON service definitions, listed non-recursively (yaml_dir: not yet)
+        json_dir: /etc/cas/services
+      audit_log:
+        # cas.audit.engine.audit-format: JSON, one record per line (%m%n)
+        path: /var/log/cas/cas_audit.log
+        # Zone of `when` values without an offset: UTC (default) or ±HH:MM
+        timezone: UTC
+      # Principals sent by name (service and administrator accounts, at most
+      # 64; `*` and `unidentified` are reserved); end users are fingerprinted.
+      # clear_principals: [svc-monitoring]
+      # Client addresses: truncated (default: IPv4 /24, IPv6 /56), clear, omitted
+      client_addr: truncated
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting

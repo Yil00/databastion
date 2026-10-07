@@ -300,6 +300,22 @@ impl ColumnFinding {
         &self.fingerprints
     }
 
+    /// The same result without masked samples (counts and fingerprints
+    /// only): a column whose values may hold credentials next to a
+    /// classified value (CAS store guard, ADR-0041 decision 5).
+    #[must_use]
+    pub fn without_masked_samples(mut self) -> Self {
+        self.masked_samples.clear();
+        self
+    }
+
+    /// The same result without fingerprints.
+    #[must_use]
+    pub fn without_fingerprints(mut self) -> Self {
+        self.fingerprints.clear();
+        self
+    }
+
     /// Turns the result into an uplink-ready finding at `location`.
     #[must_use]
     pub fn into_finding(self, location: FindingLocation) -> MaskedFinding {

@@ -4,7 +4,16 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { eventsHref, principalHref } from "@/lib/events-filter";
-import { fingerprintNoun, fingerprintTitle, isLdapEngine, locationPartLabels, shortFingerprint } from "@/lib/location-labels";
+import {
+  AGGREGATE_PRINCIPAL_TITLE,
+  fingerprintNoun,
+  fingerprintTitle,
+  isAggregatePrincipal,
+  isCasEngine,
+  isLdapEngine,
+  locationPartLabels,
+  shortFingerprint,
+} from "@/lib/location-labels";
 import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
 
@@ -18,6 +27,8 @@ import type { EventView, PrincipalView } from "@/server/events";
  * The objects of an event. OpenLDAP (ADR-0029 decision 6): `object class <class> in container
  * <container DN>` (the naming context when no container is known), separated by `;` since DNs hold
  * commas; `*` is an object class the log does not tell (no sensitive object reachable).
+ * CAS (ADR-0041 decision 7): `service <name> (<type>)` for a ticket issued to an application (`*`:
+ * no registry entry recognized), `service registry` for a change of the registry itself.
  */
 export function objectsLabel(objects: EventView["objects"], max = 3, engine: string | null = null): string {
   const ldap = isLdapEngine(engine);
@@ -25,10 +36,17 @@ export function objectsLabel(objects: EventView["objects"], max = 3, engine: str
   const names = objects.map((o) =>
     ldap
       ? `${l.object} ${o.object} in ${o.schema !== undefined ? `${l.schema} ${o.schema}` : `${l.database} ${o.database}`}`
-      : [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."),
+      : isCasEngine(engine)
+        ? casObjectLabel(o)
+        : [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."),
   );
   const sep = ldap ? "; " : ", ";
   return names.length > max ? `${names.slice(0, max).join(sep)} and ${names.length - max} more` : names.join(sep);
+}
+
+function casObjectLabel(o: EventView["objects"][number]): string {
+  if (o.object === o.database) return o.object === "service_registry" ? "service registry" : `store ${o.object}`;
+  return `service ${o.object}${o.schema !== undefined ? ` (${o.schema})` : ""}`;
 }
 
 export function formatCount(n: number | null): string {
@@ -76,9 +94,17 @@ export function SignalBadge({ signal }: { signal: string }) {
 /**
  * A principal: the account name (or, OpenLDAP, the DN sent in clear), or a fingerprint. A
  * fingerprint is never shown as if it were a name: labelled, shortened in a monospace font, with
- * what it is and its full value in the tooltip.
+ * what it is and its full value in the tooltip. The CAS `*` aggregate is shown as "several
+ * accounts", never as an account named `*`.
  */
 export function PrincipalLabel({ principal, fingerprinted, engine = null }: { principal: string; fingerprinted: boolean; engine?: string | null }) {
+  if (!fingerprinted && isAggregatePrincipal(principal, engine)) {
+    return (
+      <span title={AGGREGATE_PRINCIPAL_TITLE} data-aggregate-principal="">
+        <span className="text-muted-foreground">several accounts</span> <code className="font-mono text-xs">*</code>
+      </span>
+    );
+  }
   if (!fingerprinted) return <span className="break-all">{principal}</span>;
   return (
     <span title={fingerprintTitle(principal, engine)} data-fingerprint="">

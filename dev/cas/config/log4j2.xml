@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Apereo CAS dev service logging (dev/README.md "Apereo CAS"). Mounted read-only at
+  /etc/cas/config/log4j2.xml in place of the image's file.
+  - The audit trail (logger org.apereo.inspektr) goes to /var/log/cas/cas_audit.log only, with the
+    message alone (%m%n): one JSON record per line, as connector-cas reads it (ADR-0041 decision 7).
+    Files are created 0640; the directory (dev/.state/logs/cas, prepared by dev/cas/files-init.sh)
+    is setgid with the agent's group, so the agent can read them and not write them (decision 6).
+  - Every other logger goes to the console only (`docker compose logs cas`).
+-->
+<Configuration monitorInterval="0" packages="org.apereo.cas.logging">
+    <Properties>
+        <Property name="auditDir">/var/log/cas</Property>
+    </Properties>
+    <Appenders>
+        <Console name="console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d %p [%c] - &lt;%m&gt;%n" alwaysWriteExceptions="true"/>
+        </Console>
+        <RollingFile name="auditlogfile" fileName="${auditDir}/cas_audit.log" append="true"
+                     filePattern="${auditDir}/cas_audit-%d{yyyy-MM-dd}-%i.log"
+                     filePermissions="rw-r-----" immediateFlush="true">
+            <PatternLayout pattern="%m%n"/>
+            <Policies>
+                <SizeBasedTriggeringPolicy size="10 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="3"/>
+        </RollingFile>
+        <CasAppender name="casAudit">
+            <AppenderRef ref="auditlogfile"/>
+        </CasAppender>
+        <CasAppender name="casConsole">
+            <AppenderRef ref="console"/>
+        </CasAppender>
+    </Appenders>
+    <Loggers>
+        <Logger name="org.apereo.inspektr" additivity="false" level="info">
+            <AppenderRef ref="casAudit"/>
+        </Logger>
+        <Logger name="org.apereo.cas" level="info"/>
+        <Logger name="org.springframework" level="warn"/>
+        <Logger name="org.hibernate" level="warn"/>
+        <Logger name="com.zaxxer.hikari" level="warn"/>
+        <Root level="warn">
+            <AppenderRef ref="casConsole"/>
+        </Root>
+    </Loggers>
+</Configuration>

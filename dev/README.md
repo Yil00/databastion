@@ -12,6 +12,10 @@ make dev-logs     # last 200 log lines of every service (TAIL=n to change)
 make seed         # regenerates dev/seed/out/* and dev/ground-truth.json
 make test-dev     # unit tests of the seed generator
 make agent-it     # connector integration tests against this environment (ENGINE=postgres|mysql|mongodb|openldap)
+make dev-keycloak        # opt-in: Keycloak with the OIDC test realm (below), waits until healthy
+make dev-keycloak-smoke  # checks its discovery document, JWKS and seeded realm
+make dev-cas             # opt-in: Apereo CAS with a seeded registry and audit trail (below)
+make dev-cas-smoke       # logs a fake user in, then checks the audit log, permissions and grants
 ```
 `make help` lists every target by section (setup with `make install` / `make doctor`, console, agent, protocol, `make check`, end-to-end, release). The CI workflow `.github/workflows/dev-env.yml` runs the same steps as `make dev` / `make dev-smoke`; `make agent-it` ([agent-it.sh](agent-it.sh)) runs the "dev image" step of the CI connector jobs, with the variables shown below.
 
@@ -28,6 +32,8 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | Percona Server for MongoDB 8.0 (`psmdb`, opt-in: profile `psmdb`) | 27019 | `app` (the MongoDB seed) | `auditLog` JSON file (`auditAuthorizationSuccess`) in `dev/.state/logs/psmdb/auditLog.json` | Partial ([ADR-0027](../docs/adr/0027-mongodb-audit.md): once a successful `authCheck` was read) |
 | OpenLDAP (Debian slapd) (`openldap`) | 1389 (LDAPS 1636) | `dc=example,dc=org` | `slapo-accesslog` in `cn=accesslog` (`reads writes session`) | Full ([ADR-0029](../docs/adr/0029-openldap-connector.md): once each naming context shows a search record) |
 | Mailpit (`mailpit`) | SMTP 1025, UI 8025 | | | |
+| Keycloak 26.8 (`keycloak`, opt-in: profile `keycloak`) | 8180 | realm `databastion` ([below](#keycloak-oidc-test-realm)) | | |
+| Apereo CAS 8.0.2 (`cas`, opt-in: profile `cas`) | 8280 | JSON service registry `cas/services` ([below](#apereo-cas)) | JSON audit log `dev/.state/logs/cas/cas_audit.log` | Partial ([ADR-0041](../docs/adr/0041-cas-connector.md): never Full) |
 | Prometheus (`prometheus`) | 9090 | | | |
 | Grafana (`grafana`) | 3001 | | | |
 
@@ -105,6 +111,96 @@ make agent-it ENGINE=postgres
 ```
 
 The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
+
+## Keycloak (OIDC test realm)
+An OpenID Connect provider for the console's OIDC login ([ADR-0038](../docs/adr/0038-console-oidc-login.md), ROADMAP P8-A and P8-D), used by the console integration tests and by the end-to-end login scenario ([e2e/README.md](../e2e/README.md#oidc-login-scenario), which generates its realm from this one with HTTPS redirect URIs and its own secrets). It is **opt-in** (Compose profile `keycloak`), like `psmdb`: Keycloak needs about half a GiB of memory and 30 to 60 s to start, which only the OIDC work needs, so `make dev` stays as fast as before.
+
+```sh
+make dev-keycloak        # docker compose -f dev/docker-compose.yml --profile keycloak up -d --wait keycloak
+make dev-keycloak-smoke  # dev/keycloak/smoke.sh: discovery, JWKS, client, mapper, groups, users, user profile
+make dev-down            # also stops it (dev-down and dev-reset include the opt-in profiles)
+```
+
+- Image `keycloak/keycloak:26.8.0`, pinned by tag and index digest. It is the Keycloak project's own Docker Hub repository, which carries the same releases as `quay.io/keycloak/keycloak`; `DATABASTION_DEV_KEYCLOAK_IMAGE` overrides it (e.g. `quay.io/keycloak/keycloak:<version>@sha256:…`).
+- `start-dev --import-realm`: dev mode (embedded H2 database, HTTP), realm imported from [keycloak/databastion-realm.json](keycloak/databastion-realm.json). There is no volume: every new container imports the realm again, so `make dev-down` (or `docker compose … rm -sf keycloak`) discards whatever was changed in it, such as the edits of the attribute-editing user below.
+- Published on `127.0.0.1:8180` only (`KEYCLOAK_PORT`); the management interface (port 9000, `/health/ready`, used by the healthcheck) is not published. Admin console: <http://127.0.0.1:8180/admin/> (user `admin`, password `KEYCLOAK_ADMIN_PASSWORD`, a temporary bootstrap administrator of the `master` realm).
+- **Issuer**: `http://127.0.0.1:8180/realms/databastion`, fixed by `KC_HOSTNAME` whatever host name a request uses. ADR-0038 decision 2 requires `https://` for the issuer and every endpoint, except that "a plain-HTTP issuer is accepted only on a loopback address and outside production": this service relies on that exception, so the console must run in development mode (`pnpm dev`), not as a production build. The issuer uses `127.0.0.1` and the console `localhost`, two different sites: the provider's redirect to the callback is then a cross-site navigation, as in production, which is what the `SameSite=Lax` state cookie of decision 5 is for. Open the console at <http://localhost:3000>, not `127.0.0.1:3000`, or the redirect URI will not match.
+- Credentials: `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_CONSOLE_CLIENT_SECRET` and `KEYCLOAK_DEV_USER_PASSWORD` in [.env.example](.env.example), **dev-only** values. The realm file holds no secret: Keycloak resolves its `${KEYCLOAK_CONSOLE_CLIENT_SECRET}` and `${KEYCLOAK_DEV_USER_PASSWORD}` placeholders from the container environment at import time. Unlike the other services, the Compose file falls back to the `.env.example` values when they are missing from `dev/.env`, since Compose interpolates the services of inactive profiles too: an older `dev/.env` keeps `make dev` working.
+
+### Realm `databastion`
+- Client `databastion-console`: confidential (`client-secret`), standard flow (authorization code) only: no implicit flow, no direct access (password) grant, no service account, no device or CIBA grant. PKCE with `S256` required. Redirect URI `http://localhost:3000/api/auth/oidc/callback` (`<DATABASTION_PUBLIC_URL>/api/auth/oidc/callback`, decision 16), post-logout redirect URI `http://localhost:3000/login`, front-channel logout off, back-channel logout URL empty (back-channel logout is a planned addition, decision 13). The `iss` parameter is sent in authorization responses (RFC 9207).
+- Mapper `groups` (group membership): claim `groups`, group names without their path (`databastion-admins`, not `/databastion-admins`), in the ID token and the userinfo response, not in the access token.
+- Groups `databastion-admins`, `databastion-analysts`, and `contractors` (not an allowed group).
+- Users can edit their username (`editUsernameAllowed`), e-mail and first and last names (the default user profile gives `edit` to `user` on those attributes; the smoke test checks it), and duplicate e-mails are allowed. No self-registration, no password reset, no e-mail verification flow.
+
+Users (password `KEYCLOAK_DEV_USER_PASSWORD` for all, `dev-only-keycloak-user` by default; every e-mail is under the reserved `.test` domain):
+
+| Username | E-mail (`email_verified`) | Groups | Tests |
+|----------|---------------------------|--------|-------|
+| `admin.alice` | `admin.alice@databastion.test` (true) | `databastion-admins` | Role `admin` mapped from the group; pending login then approval when sign-up is off (the default); self-service linking to a local user |
+| `analyst.bob` | `analyst.bob@databastion.test` (true) | `databastion-analysts` | Role `analyst` mapped from the group |
+| `outsider.carol` | `outsider.carol@databastion.test` (true) | `contractors` | Refused by `DATABASTION_OIDC_ALLOWED_GROUPS` (`user.login_denied`, reason `group`), or by strict role mode without it (reason `role`) |
+| `unverified.dave` | `unverified.dave@databastion.test` (**false**) | `databastion-analysts` | Refused by `DATABASTION_OIDC_ALLOWED_DOMAINS=databastion.test` (reason `email_unverified`); without the domain filter, an `analyst` whose pending login is flagged `email_verified: false` |
+| `mallory` | `admin.alice@databastion.test` (true) | `databastion-analysts` | Attribute-editing user (decision 7, decision 17): seeded with Alice's e-mail and name (`Alice Admin`), and can change her username, e-mail and name in the account console (<http://127.0.0.1:8180/realms/databastion/account>), e.g. the username to the name of an existing console user such as `admin`. Expected: never `admin` (her role comes from her group only), never linked to Alice's account (identities are keyed by (`iss`, `sub`)), and refused (reason `username`) when her login claim equals an existing console username |
+| `nogroup.erin` | `nogroup.erin@databastion.test` (true) | none | No `groups` claim at all: with strict role mapping (`ROLE_ATTRIBUTE_STRICT=1`) the role expression fails, which counts as no role, so the login is refused (or pending, never a default role) |
+
+Mallory's e-mail is seeded as verified to stand for the worst case, a provider that keeps a user-edited e-mail verified (Keycloak normally marks an e-mail changed by its user as unverified).
+
+### Running the console against it
+From `console/`, in development mode (`pnpm dev`), with the console's usual development variables (database, `DATABASTION_ENCRYPTION_KEY`, which OIDC requires) and:
+
+```sh
+export DATABASTION_PUBLIC_URL=http://localhost:3000
+export DATABASTION_OIDC_ENABLED=1
+export DATABASTION_OIDC_ISSUER_URL=http://127.0.0.1:8180/realms/databastion
+export DATABASTION_OIDC_CLIENT_ID=databastion-console
+export DATABASTION_OIDC_CLIENT_SECRET=dev-only-keycloak-console-client-secret   # KEYCLOAK_CONSOLE_CLIENT_SECRET
+export DATABASTION_OIDC_DISPLAY_NAME="Keycloak (dev)"
+export DATABASTION_OIDC_GROUPS_ATTRIBUTE_PATH=groups
+export DATABASTION_OIDC_ROLE_ATTRIBUTE_PATH="contains(groups, 'databastion-admins') && 'admin' || contains(groups, 'databastion-analysts') && 'analyst'"
+export DATABASTION_OIDC_ROLE_ATTRIBUTE_STRICT=1
+export DATABASTION_OIDC_ALLOWED_GROUPS=databastion-admins,databastion-analysts
+# Optional: refuse unverified e-mails (unverified.dave) and other domains.
+export DATABASTION_OIDC_ALLOWED_DOMAINS=databastion.test
+```
+
+- The role expression reads the `groups` claim only, which only the realm's administrators set; it must never read `email`, `preferred_username` or `name` (decision 7), which `mallory` controls. A user in neither group gets `false`, a non-string, so no role; a token without a `groups` claim (`nogroup.erin`) makes `contains` fail, which also counts as no role. The fixture uses short group names (`full.path` off); a real realm should either keep allowed group names unique or use full paths (`/databastion-admins`) in the expressions, since a subgroup with the same short name would otherwise match.
+- The defaults do the rest: login claim `preferred_username`, e-mail `email`, name `name`, scopes `openid profile email`, `RS256` signatures (the realm's only signing key), `client_secret_basic`, no sign-up (`DATABASTION_OIDC_ALLOW_SIGN_UP=0`: first logins become pending logins), local login `admins` while OIDC is on.
+- `DATABASTION_OIDC_CA_FILE` is not needed: the issuer is plain HTTP on a loopback address. A production build of the console (`pnpm build && pnpm start`) refuses it.
+- Logout ends the Keycloak session through RP-initiated logout (`end_session_endpoint`, `post_logout_redirect_uri` `http://localhost:3000/login`); with `DATABASTION_OIDC_USE_REFRESH_TOKEN=1`, the refresh token is revoked first (`revocation_endpoint`).
+
+## Apereo CAS
+The target of the CAS connector ([ADR-0041](../docs/adr/0041-cas-connector.md) decision 14, ROADMAP P8-D): a CAS 8.0 server with a seeded JSON service registry, static fake users, the JSON audit trail and a JPA ticket registry in the `postgres` service. Opt-in (Compose profile `cas`), like Keycloak: CAS needs about 1 GiB of memory and one to two minutes to start.
+
+```sh
+make dev-cas         # builds the image (first time: a few minutes), starts postgres and CAS, sets the grants
+make dev-cas-smoke   # dev/cas/smoke.sh (below)
+make dev-down        # also stops it; make dev-reset also removes its files (see "Files")
+```
+
+- **Image** ([cas/Dockerfile](cas/Dockerfile)): the published `apereo/cas:8.0.2` image (pinned by tag and index digest) is the CAS overlay with the core modules only, without the JSON service registry, OIDC or the JPA ticket registry, and CAS reads no module from mounted files. As ADR-0041 open question 7 allows, the build adds those modules to its war: [cas/overlay/build.gradle](cas/overlay/build.gradle) resolves them from Maven Central against the CAS and Spring Boot BOMs of the war, every version locked ([gradle.lockfile](cas/overlay/gradle.lockfile)) and every file checked against [verification-metadata.xml](cas/overlay/gradle/verification-metadata.xml) (SHA-256, `--dependency-verification strict`). The checksums are trust on first use: they pin what Maven Central served when the file was generated (signatures are not verified), so a later change is caught, a file already bad at generation is not; [cas/overlay/merge.py](cas/overlay/merge.py) adds the jars the war lacks and fails on any version conflict with it (the war's SBOM gives its versions). The image runs as an unprivileged `cas` user (uid / gid 10041). It is dev-only, carries no secret, and is never a release asset. Not included: the SAML2 IdP module, which needs OpenSAML, published only in the Shibboleth repository: the SAML definition below is a Discovery fixture that CAS itself logs as not loadable. A new CAS version: change `CAS_IMAGE`, `CAS_VERSION` and `SPRING_BOOT_VERSION` together in the Dockerfile (the war's `Spring-Boot-Version`), then regenerate the lock and the metadata as the first comment of `build.gradle` says.
+- **Configuration** ([cas/config/cas.properties](cas/config/cas.properties), [cas/config/log4j2.xml](cas/config/log4j2.xml)), mounted read-only: plain HTTP published on `127.0.0.1:8280` only (`CAS_PORT`), as Keycloak; the agent never contacts CAS (ADR-0041 decision 9) and no actuator endpoint is exposed (the healthcheck reads a static resource, since every request to `/cas/login` writes an audit record). CAS generates its cookie, webflow and ticket keys at each start and prints them in its own log: dev only.
+- **Users** (password `CAS_DEV_USER_PASSWORD`, `dev-only-cas-user` by default): `camille.martin@example.org`, `hugo.durand@example.net`, `olivia.smith@example.com` (e-mail-shaped logins, listed in `ground-truth.json` as the audit trail's `who`), and the service account `svc-monitoring` (a candidate for `clear_principals`).
+- **Service registry** ([cas/services](cas/services), generated by `make seed` from [seed/generate.py](seed/generate.py), never edited by hand): `Intranet-1001` (CAS protocol, used by the smoke test: `https://intranet.example.org/…`), `Badge-Sync-1005` (CAS protocol, an e-mail allow-list in `requiredAttributes`, a RESTful attribute release policy with a fake `Authorization` header), `Payroll-SP-1002` (SAML), `HR-Portal-1003` (OIDC, dev-only client secret in clear, static release values: phone numbers), `Expenses-1004` (OIDC, client secret in the `{cipher}` form). Contacts follow the fake-data conventions below. CAS loads four of them (not the SAML one).
+- **Audit trail**: `cas.audit.engine.audit-format=JSON`, single-line, written by the `org.apereo.inspektr` logger with the message alone (`%m%n`) to `dev/.state/logs/cas/cas_audit.log` (rolled at 10 MB, three files kept). Auditable fields `who`, `what`, `when`, `action`, client and server addresses and user agent; no request headers, no validation assertion. CAS 8.0.2 writes `what` as a JSON object (for example `{"service": …, "ticketId": "ST-1-****…"}`, ticket ids partly masked by CAS's log appender) and `when` without a UTC offset (the container's zone is UTC).
+- **Ticket registry**: JPA in the database `cas` of the `postgres` service (role `cas`, password `CAS_DB_PASSWORD`; [cas/db-init.sh](cas/db-init.sh), not audited by pgaudit). CAS 8.0.2 creates the table `cas_tickets` (`id`, `type`, `body`, `parent_id`, `principal_id`, `service`, `attributes`, `creation_time`, `expiration_time`, `last_used_time`). Tickets are encrypted (the CAS default: `type` is then `org.apereo.cas.ticket.registry.DefaultEncodedTicket`); `DATABASTION_DEV_CAS_TICKET_CRYPTO=false make dev-cas` stores them in clear (`type` is then the ticket class, such as `org.apereo.cas.ticket.TicketGrantingTicketImpl`, and `body` holds the ticket). Each start empties the table (the keys of the previous start are gone). The agent's account `databastion` gets `CONNECT` on `cas`, `USAGE` on `public` and, once CAS has created the table, `SELECT (type, creation_time, expiration_time)` on `cas_tickets` only (decision 6, one-shot `cas-db-grants`): the guard's `SELECT type, count(*) … GROUP BY type` works, `id`, `body`, `principal_id`, `service` and `attributes` stay unreadable. No distributed locking (one node; it would need a lock table the JPA registry does not create). As every role, `cas` keeps PostgreSQL's default `PUBLIC` privileges (`CONNECT`, `TEMPORARY`) on the other dev databases (`shop`, `postgres`), without any table privilege there; the dev grants are not restructured for it.
+- **Files** (decision 6 permissions, one-shot `cas-files-init`, [cas/files-init.sh](cas/files-init.sh)): the registry is copied to `dev/.state/cas/services` (directory `0750`, files `0640`) and mounted read-only into CAS; the log directory `dev/.state/logs/cas` is `2750` (setgid) and CAS creates its logs `0640`. Owner: the CAS user (10041); group: the agent's (10001, the uid / gid of the agent image and of the e2e agent; `DATABASTION_DEV_AGENT_GID` changes it). So an agent running as uid 10001 reads them and can write none of them, nor their directories; the host user cannot read them either. Read the log as the agent would: `docker compose -f dev/docker-compose.yml run --rm --no-deps -T -u 10001:10001 --entrypoint cat cas-files-init /state/logs/cas/cas_audit.log`. `make dev-reset` removes them through the same one-shot container. An agent running on the host as your own user **refuses** these sources, by design: the checkout's directories are its own, and connector-cas refuses a file with an ancestor directory the agent can write (`privilege.registry_writable`, `audit.log_not_readable`); run the agent as another user or in a container (the e2e harness).
+
+A `cas` target for an agent that sees these files at `/etc/cas/services` and `/var/log/cas` (container mounts):
+
+```yaml
+targets:
+  - id: dev-cas
+    engine: cas
+    cas:
+      service_registry:
+        json_dir: /etc/cas/services
+      audit_log:
+        path: /var/log/cas/cas_audit.log
+      clear_principals: [svc-monitoring]
+```
+
+`make dev-cas-smoke` ([cas/smoke.sh](cas/smoke.sh)) checks, from the host: a registered service is accepted and an unknown one refused, the OIDC discovery document; a fake user's login through `/cas/login` and its service ticket validated (`/cas/p3/serviceValidate`), a failed login; then, reading as uid 10001, that the audit log holds one JSON object per line with the `AUTHENTICATION_SUCCESS`, `SERVICE_TICKET_CREATED` (for that service), `SERVICE_TICKET_VALIDATE_SUCCESS` and `AUTHENTICATION_FAILED` records, no `headers` key, neither the password nor the wrong one typed, and not the service ticket in clear; that no actuator endpoint (`health`, `env`) is served; the modes, owner and group above, that uid 10001 can read and not write (even through a read-write mount) and that another uid can read nothing; and the ticket table grants. Nothing secret is printed.
 
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
@@ -232,12 +328,13 @@ export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-comp
 Audit keys of `DATABASTION_TEST_REQUIRE` for MongoDB: `mongo-log`, `mongodump`, `psmdb-audit`.
 
 ## Seed data and ground truth
-[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
+[seed/generate.py](seed/generate.py) (Python standard library, fixed seed) writes the per-engine seed files in [seed/out/](seed/out/), the CAS service registry in [cas/services/](cas/services/) and [ground-truth.json](ground-truth.json). The MySQL and MariaDB files start with `SET NAMES utf8mb4`: the MySQL image loads them with a client whose default character set follows the container locale (latin1), which double-encoded every non-ASCII value before (fixed in P2-C; run `make dev-reset dev` to reload). They are committed (about 0.4 MB) and a test fails if they drift from the generator. The containers load them only on an empty volume: after `make seed`, run `make dev-reset dev`.
 
-All values are fake: `example.com/.org/.net` e-mails, French phone numbers in the ARCEP ranges reserved for fiction, UK 07700 900xxx, US 555-01xx, IBANs with valid mod-97 on fictitious bank codes, NIRs with a valid key, Luhn-valid card numbers from the 411111 / 555555 test ranges, AWS-shaped keys containing `EXAMPLE`.
+All values are fake: `example.com/.org/.net` e-mails, CAS client secrets and `Authorization` header starting with `dev-only` (or a `{cipher}` value of random characters), French phone numbers in the ARCEP ranges reserved for fiction, UK 07700 900xxx, US 555-01xx, IBANs with valid mod-97 on fictitious bank codes, NIRs with a valid key, Luhn-valid card numbers from the 411111 / 555555 test ranges, AWS-shaped keys containing `EXAMPLE`.
 
-`ground-truth.json` lists every seeded location (engine, database, container, object, field) with the expected classifiers and the seeded values, plus:
+`ground-truth.json` lists every seeded location (engine, database, container, object, field) with the expected classifiers and the seeded values (CAS: the registry and audit-trail locations as connector-cas reports them, [above](#apereo-cas)), plus:
 - **negative controls** (`negative_control: true`): look-alike columns (`email_opt_in`, Luhn-invalid 16-digit references, year-named columns…) that must produce no finding;
+- **credentials never sampled** (`never_sampled: true`, CAS): the client secrets and the `Authorization` header of the registry. No classifier is expected there; their `values` must never reach the console, the agent's logs or the spool (ADR-0041 decision 14);
 - **value-bearing names** (`name_contains_value: true`, [ADR-0009](../docs/adr/0009-name-normalization-and-item-sanitization.md), security review M2): MongoDB dynamic keys that are e-mail addresses or digit-only phone numbers, an LDAP `ou=` named after a person, SQL tables whose names embed a phone number, a person name or an e-mail address. Their `name_values` must never reach the console (invariant I2 test, P2-E).
 
 Classifier ids in the ground truth are provisional until the classifier set is frozen (P2-A).

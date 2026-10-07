@@ -250,6 +250,8 @@ pub struct ScanJob {
     pacer: Pacer,
     /// Where the object order starts (see [`ScanJob::rotate`]).
     rotation: u64,
+    /// What the CAS store guard saw in this scan (shared by the clones).
+    guard: Arc<crate::cas_guard::ScanGuard>,
 }
 
 impl Default for ScanJob {
@@ -266,6 +268,7 @@ impl Default for ScanJob {
             key: None,
             pacer: Pacer::new(limits.discovery_duty_cycle_percent),
             rotation: 0,
+            guard: Arc::default(),
         }
     }
 }
@@ -294,6 +297,16 @@ impl ScanJob {
         key: Arc<HmacKey>,
     ) -> Self {
         let max_duration = limits.clamp_scan_duration(u64::from(params.max_duration_s));
+        let scope = if params.schemas.is_some()
+            || params.include_objects.is_some()
+            || !params.exclude_objects.is_empty()
+        {
+            crate::cas_guard::ScanScope::Partial
+        } else if params.databases.is_some() {
+            crate::cas_guard::ScanScope::Databases
+        } else {
+            crate::cas_guard::ScanScope::Whole
+        };
         Self {
             target: Some(target.clone()),
             sample_rows: limits.clamp_sample_rows(u64::from(params.sample_rows)),
@@ -307,6 +320,7 @@ impl ScanJob {
             pacer: Pacer::new(limits.discovery_duty_cycle_percent)
                 .with_deadline(Instant::now() + max_duration),
             rotation: 0,
+            guard: Arc::new(crate::cas_guard::ScanGuard::new(scope)),
         }
     }
 
@@ -502,10 +516,122 @@ impl ScanJob {
 
     /// Classifies one column (name + sampled values). At most
     /// [`Self::sample_rows`] values are examined.
+    ///
+    /// The CAS store guard's ticket-id tripwire runs first (ADR-0041
+    /// decision 5, PR #141 review M4,
+    /// `databastion_classifiers::cas::screen`):
+    ///
+    /// - a value starting with a named CAS ticket prefix (`TGT-1-…`): nothing
+    ///   of the column is classified (no finding, no masked sample, no
+    ///   fingerprint), the column counts in `coverage.cas_guard_tripped`, and
+    ///   the connector must drop its values without reading the column again
+    ///   in this scan;
+    /// - a value with only the generic ticket shape (`[A-Z]{2,8}-<digits>-`)
+    ///   or holding a named ticket id inside it: that value alone is dropped
+    ///   (never classified, masked nor fingerprinted) and counted; the other
+    ///   values are classified as usual.
+    ///
+    /// Connectors classify each column once per scan.
     #[must_use]
     pub fn classify(&self, column_name: &str, values: &[RawSample<'_>]) -> Vec<ColumnFinding> {
         let n = values.len().min(self.sample_rows as usize);
-        self.column_classifier().classify(column_name, &values[..n])
+        let screened = databastion_classifiers::cas::screen(&values[..n]);
+        let target_id = self.target.as_ref().map_or("", |t| t.id.as_str());
+        if screened.column_dropped {
+            self.guard.trip();
+            tracing::warn!(
+                target_id,
+                "CAS store guard: a column or field held a CAS ticket id; its values were \
+                 dropped before classification and it is not read further in this scan"
+            );
+            return Vec::new();
+        }
+        if screened.values_dropped > 0 {
+            self.guard.drop_values(screened.values_dropped as u64);
+            tracing::debug!(
+                target_id,
+                dropped = screened.values_dropped,
+                "CAS store guard: ticket-id-shaped values dropped before classification"
+            );
+        }
+        self.column_classifier()
+            .classify(column_name, &screened.kept)
+    }
+
+    /// [`Self::classify`] under a CAS store guard rule
+    /// ([`crate::cas_guard::column_rule`]): nothing for
+    /// [`ColumnRule::NeverRead`](crate::cas_guard::ColumnRule::NeverRead)
+    /// (the connector should not have read it), findings without masked
+    /// samples, and without the fingerprints of `secret.*` classifiers, as
+    /// the rule says.
+    #[must_use]
+    pub fn classify_guarded(
+        &self,
+        column_name: &str,
+        values: &[RawSample<'_>],
+        rule: crate::cas_guard::ColumnRule,
+    ) -> Vec<ColumnFinding> {
+        use crate::cas_guard::ColumnRule;
+        if rule == ColumnRule::NeverRead {
+            return Vec::new();
+        }
+        let found = self.classify(column_name, values);
+        match rule {
+            ColumnRule::Sampled | ColumnRule::NeverRead => found,
+            ColumnRule::NoMaskedSamples => found
+                .into_iter()
+                .map(ColumnFinding::without_masked_samples)
+                .collect(),
+            ColumnRule::NoSamplesNoSecretFingerprints => found
+                .into_iter()
+                .map(|f| {
+                    let secret = f.classifier().is_secret();
+                    let f = f.without_masked_samples();
+                    if secret { f.without_fingerprints() } else { f }
+                })
+                .collect(),
+        }
+    }
+
+    /// The target's `cas_stores` lists (`agent.yaml`), if any.
+    #[must_use]
+    pub fn cas_stores(&self) -> Option<&crate::cas_guard::CasStores> {
+        self.target.as_ref().and_then(TargetConfig::cas_stores)
+    }
+
+    /// Records the metadata of a ticket registry read by the guard's
+    /// aggregate (counts only), logged per kind and kept for the target's
+    /// `security.ticket_registry_unencrypted` note.
+    pub fn record_ticket_registry(&self, counts: &crate::cas_guard::TicketCounts) {
+        use crate::cas_guard::TicketKind;
+        self.guard.add_registry(counts);
+        tracing::info!(
+            target_id = self.target.as_ref().map_or("", |t| t.id.as_str()),
+            encrypted = counts.encrypted(),
+            unencrypted = counts.unencrypted(),
+            tgt = counts.clear_of(TicketKind::Tgt),
+            st = counts.clear_of(TicketKind::St),
+            pt = counts.clear_of(TicketKind::Pt),
+            pgt = counts.clear_of(TicketKind::Pgt),
+            oauth_code = counts.clear_of(TicketKind::OauthCode),
+            oauth_access_token = counts.clear_of(TicketKind::OauthAccessToken),
+            oauth_refresh_token = counts.clear_of(TicketKind::OauthRefreshToken),
+            other = counts.clear_of(TicketKind::Other),
+            "CAS ticket registry: metadata only (ticket counts by kind)"
+        );
+    }
+
+    /// The connector now reads `database` (a PostgreSQL database, a MySQL /
+    /// MariaDB schema, a MongoDB database, an LDAP naming context): the
+    /// CAS store guard's tally is kept per database (PR #141 review L6).
+    pub fn begin_database(&self, database: &str) {
+        self.guard.begin_database(database);
+    }
+
+    /// What the CAS store guard saw in this scan so far.
+    #[must_use]
+    pub fn cas_guard(&self) -> &Arc<crate::cas_guard::ScanGuard> {
+        &self.guard
     }
 }
 

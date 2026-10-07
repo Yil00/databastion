@@ -56,6 +56,12 @@ struct Entry {
     bytes: u64,
     items: u64,
     created: SystemTime,
+    /// Capability tokens of the engine values its items carry (ADR-0042):
+    /// whether it is held is decided from here, without reading the file.
+    gates: Vec<&'static str>,
+    /// Its gated-engine items were already kept once after a `400` `enum`
+    /// (ADR-0042 decision 4). In memory only: an agent restart forgets it.
+    kept_once: bool,
 }
 
 /// What a batch is, for the eviction priority.
@@ -206,6 +212,8 @@ impl Spool {
                         bytes: to_u64(batch.bytes().len()),
                         items: to_u64(batch.len()),
                         created,
+                        gates: batch.gates().to_vec(),
+                        kept_once: false,
                     });
                 }
                 Err(ReadError::Corrupt) => spool.quarantine(&os_name),
@@ -416,6 +424,8 @@ impl Spool {
             bytes: len,
             items,
             created: SystemTime::now(),
+            gates: batch.gates().to_vec(),
+            kept_once: batch.kept_once(),
         }))
     }
 
@@ -449,19 +459,43 @@ impl Spool {
     /// FIFO. Corrupt files are quarantined and skipped; a transient read
     /// error (EMFILE, ENOMEM…) leaves the queue untouched and returns `None`
     /// (retried later).
+    #[cfg(test)]
     pub(crate) fn front_where(
         &mut self,
+        endpoint: impl FnMut(bool) -> bool,
+    ) -> Option<(Key, ResultBatch)> {
+        self.front_sendable(endpoint, |_| false)
+    }
+
+    /// Number of spooled batches whose engine tokens `held` refuses
+    /// (ADR-0042), from the entries only (no file read).
+    pub(crate) fn held_batches(&self, mut held: impl FnMut(&[&'static str]) -> bool) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| !e.gates.is_empty() && held(&e.gates))
+            .count()
+    }
+
+    /// As [`front_where`](Self::front_where), also skipping (and keeping)
+    /// the batches whose engine tokens `held` refuses: those carrying a
+    /// value of an engine the console has not listed (ADR-0042) wait until
+    /// it does. Decided from the entry's tokens (recorded when the batch
+    /// was written or loaded), so a held batch is never read here.
+    pub(crate) fn front_sendable(
+        &mut self,
         mut endpoint: impl FnMut(bool) -> bool,
+        mut held: impl FnMut(&[&'static str]) -> bool,
     ) -> Option<(Key, ResultBatch)> {
         let mut index = 0;
         loop {
-            let entry = self.entries.get(index)?.clone();
-            if !endpoint(entry.findings) {
+            let entry = self.entries.get(index)?;
+            if !endpoint(entry.findings) || (!entry.gates.is_empty() && held(&entry.gates)) {
                 index += 1;
                 continue;
             }
+            let entry = entry.clone();
             match self.read(&entry.key, entry.findings) {
-                Ok(batch) => return Some((entry.key, batch)),
+                Ok(batch) => return Some((entry.key, batch.with_kept_once(entry.kept_once))),
                 Err(ReadError::Transient(e)) => {
                     tracing::warn!(kind = %e.kind(), "spool read failed; will retry");
                     return None;

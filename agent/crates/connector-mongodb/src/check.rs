@@ -121,6 +121,10 @@ struct Cached {
     report: Report,
 }
 
+/// A CAS store recognized by a scan: raw database and collection names
+/// (only compared, never logged), and its kind.
+pub(crate) type CasStore = (String, String, databastion_core::cas_guard::StoreKind);
+
 /// Per-target state of `check()`: the last detailed report, what the
 /// Audit stream observed (the last successful `authCheck`, dropped
 /// records, its source) and the agent's own reads (shared by every stream
@@ -131,6 +135,9 @@ pub(crate) struct CheckState {
     /// Per target: time-series collections the server refused to the
     /// account (`Unauthorized`) in the last scan, and when.
     timeseries_refused: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Per target: the CAS ticket registries and audit trails the last
+    /// scan recognized (by name or document shape).
+    cas_stores: Mutex<HashMap<String, Vec<CasStore>>>,
     /// Source of the level last reported by `check()`.
     sources: Mutex<HashMap<String, EventSource>>,
     /// When the stream last parsed a successful `authCheck` record.
@@ -275,6 +282,23 @@ impl CheckState {
 
     /// Records what the last scan of `target_id` observed: how many
     /// time-series collections the server refused to the account.
+    /// Records the CAS stores the last scan recognized.
+    pub(crate) fn record_cas_stores(&self, target_id: &str, stores: Vec<CasStore>) {
+        self.cas_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target_id.to_owned(), stores);
+    }
+
+    fn cas_stores(&self, target_id: &str) -> Vec<CasStore> {
+        self.cas_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn record_scan(&self, target_id: &str, timeseries_refused: u64) {
         self.timeseries_refused
             .lock()
@@ -413,6 +437,111 @@ pub(crate) async fn build_info<S: AsyncRead + AsyncWrite + Unpin>(
         "community"
     };
     Ok(Build { version, edition })
+}
+
+/// Most databases listed by the CAS store guard's privilege check.
+const MAX_GUARD_LISTINGS: usize = 16;
+
+/// How many CAS ticket registry or audit trail collections the account
+/// can `find` in (ADR-0041 decision 6): from the resolved privileges of
+/// `connectionStatus` (every role, inherited ones included), against the
+/// collections named like CAS stores (built-in names and `cas_stores`),
+/// those the last scan recognized by their document shape, and, for a
+/// database-wide `find`, the collections of that database named like CAS
+/// stores. A `find` on any database lists the databases first.
+///
+/// Fail closed (PR #141 review L3): the check is not complete when more
+/// than [`MAX_GUARD_LISTINGS`] databases would have to be listed, when a
+/// database or collection list is cut or cannot be read.
+pub(crate) async fn cas_guard_readable<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    target: &TargetConfig,
+    state: &CheckState,
+) -> Result<databastion_core::cas_guard::ReadableCheck, MgError> {
+    use databastion_core::cas_guard::{self, StoreKind};
+    let stores = target.cas_stores();
+    let guarded_name = |c: &str| {
+        cas_guard::recognize_name(stores, [c]).is_some_and(|k| k != StoreKind::ServiceRegistry)
+    };
+    let reply = session
+        .command(
+            Stage::Check,
+            "admin",
+            DocBuf::new()
+                .i32("connectionStatus", 1)
+                .bool("showPrivileges", true),
+            Kind::Read,
+        )
+        .await?;
+    let scopes = crate::privileges::find_scopes(reply.doc()).map_err(|_| MgError {
+        fatal: false,
+        ..MgError::new(FailureCode::Internal, Stage::Check)
+    })?;
+    drop(reply);
+    let known: Vec<CasStore> = state
+        .cas_stores(&target.id)
+        .into_iter()
+        .filter(|(_, _, k)| *k != StoreKind::ServiceRegistry)
+        .collect();
+    let mut readable: std::collections::BTreeSet<(String, String)> = Default::default();
+    let mut to_list: std::collections::BTreeSet<String> = Default::default();
+    let mut any = false;
+    let mut complete = true;
+    for scope in scopes {
+        match scope {
+            crate::privileges::FindScope::Collection(db, c) => {
+                if guarded_name(&c) || known.iter().any(|(d, k, _)| *d == db && *k == c) {
+                    readable.insert((db, c));
+                }
+            }
+            crate::privileges::FindScope::Database(db) => {
+                for (d, c, _) in &known {
+                    if *d == db {
+                        readable.insert((d.clone(), c.clone()));
+                    }
+                }
+                to_list.insert(db);
+            }
+            crate::privileges::FindScope::Any => {
+                for (d, c, _) in &known {
+                    readable.insert((d.clone(), c.clone()));
+                }
+                any = true;
+            }
+        }
+    }
+    if any {
+        match catalog::list_databases(session).await {
+            Ok((databases, truncated)) => {
+                complete &= !truncated;
+                to_list.extend(databases);
+            }
+            Err(e) if !e.fatal => complete = false,
+            Err(e) => return Err(e),
+        }
+    }
+    to_list.retain(|db| !catalog::is_system_database(db));
+    if to_list.len() > MAX_GUARD_LISTINGS {
+        complete = false;
+    }
+    for db in to_list.into_iter().take(MAX_GUARD_LISTINGS) {
+        match catalog::list_collections(session, &db).await {
+            Ok((collections, truncated)) => {
+                complete &= !truncated;
+                for c in collections {
+                    if guarded_name(&c.name) {
+                        readable.insert((db.clone(), c.name));
+                    }
+                }
+            }
+            Err(e) if !e.fatal => complete = false,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(cas_guard::ReadableCheck {
+        readable: readable.len() as u64,
+        complete,
+    })
 }
 
 /// Privileges and coverage.
@@ -562,6 +691,40 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
         None => {
             detail.push("privileges not evaluated".to_owned());
             codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+        }
+    }
+    // CAS store guard (ADR-0041 decision 6): at every heartbeat.
+    if !session.is_broken() {
+        match cas_guard_readable(&mut session, target, state).await {
+            Ok(r) => {
+                if !r.complete {
+                    detail.push(
+                        "CAS store guard privileges not fully evaluated (too many databases to \
+                         list, or a list cut or not readable)"
+                            .to_owned(),
+                    );
+                    codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+                }
+                let n = r.readable;
+                if n > 0 {
+                    detail.push(format!(
+                        "the account can find in {n} CAS ticket registry or audit trail \
+                         collection(s): their credentials are readable (grant find on a view \
+                         projecting the metadata only)"
+                    ));
+                    codes.add(
+                        TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(n),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    server_code = e.server_code,
+                    "CAS store guard privilege check failed"
+                );
+                codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+            }
         }
     }
     // Observed, not predicted: what the server refused in the last scan.

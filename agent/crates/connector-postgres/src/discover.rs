@@ -18,6 +18,7 @@
 
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
+use databastion_core::cas_guard::{self, CasStores, StoreKind, TicketCounts};
 use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FindingSink, Paced, ScanCoverage, ScanJob};
 use futures_util::StreamExt;
@@ -101,6 +102,7 @@ async fn scan_database(
         job.skip_out_of_time(sink, 1);
         return Ok(());
     }
+    job.begin_database(database);
     let first = Session::connect(target, database, timeouts)
         .await
         .map_err(|e| fail(target, &db_name, e))?;
@@ -156,7 +158,13 @@ async fn scan_database(
         let schema = normalize(&unit.schema);
         let object = normalize(&unit.name);
         let sampled = match job
-            .paced(sample_unit(&current, unit, job.sample_rows(), timeouts))
+            .paced(sample_unit(
+                &current,
+                unit,
+                job.sample_rows(),
+                timeouts,
+                job.cas_stores(),
+            ))
             .await?
         {
             Paced::Done(s) => s,
@@ -194,6 +202,43 @@ async fn scan_database(
             }
             Err(e) => return Err(fail(target, &db_name, e)),
         };
+        if sample.kind == Some(StoreKind::TicketRegistry) {
+            // CAS store guard (ADR-0041 decision 5): metadata only, never
+            // sampled: a kind of object the connector does not sample.
+            sink.add_coverage(ScanCoverage {
+                unsupported: 1,
+                ..ScanCoverage::default()
+            });
+            match &sample.tickets {
+                Some(counts) => job.record_ticket_registry(counts),
+                None => tracing::info!(
+                    target_id = %target.id,
+                    database = db_name.as_str(),
+                    schema = schema.as_str(),
+                    object = object.as_str(),
+                    "CAS ticket registry without a readable type column: encryption not \
+                     evaluated"
+                ),
+            }
+            tracing::info!(
+                target_id = %target.id,
+                database = db_name.as_str(),
+                schema = schema.as_str(),
+                object = object.as_str(),
+                "CAS ticket registry: not sampled (CAS store guard, metadata only)"
+            );
+            continue;
+        }
+        if let Some(kind) = sample.kind {
+            tracing::info!(
+                target_id = %target.id,
+                database = db_name.as_str(),
+                schema = schema.as_str(),
+                object = object.as_str(),
+                store = kind.as_str(),
+                "CAS store guard applied"
+            );
+        }
         sink.add_coverage(ScanCoverage {
             sampled: 1,
             ..ScanCoverage::default()
@@ -211,7 +256,8 @@ async fn scan_database(
         // No transaction is open from here on.
         for (column, values) in &sample.columns {
             let samples: Vec<RawSample<'_>> = values.iter().map(RawValue::as_sample).collect();
-            for finding in job.classify(column, &samples) {
+            let rule = cas_guard::column_rule(sample.kind, column);
+            for finding in job.classify_guarded(column, &samples, rule) {
                 let mut finding = finding.into_finding(FindingLocation {
                     database: db_name.clone(),
                     schema: Some(schema.clone()),
@@ -287,6 +333,11 @@ fn log_coverage(target: &TargetConfig, db: &NormalizedName, c: &Coverage) {
 pub(crate) struct UnitSample {
     pub(crate) columns: Vec<(String, Vec<RawValue>)>,
     pub(crate) estimated_rows: Option<u64>,
+    /// The CAS store the object is (CAS store guard), if any.
+    pub(crate) kind: Option<StoreKind>,
+    /// A ticket registry's metadata (`None`: not a ticket registry, or its
+    /// `type` column is not readable).
+    pub(crate) tickets: Option<TicketCounts>,
 }
 
 impl std::fmt::Debug for UnitSample {
@@ -294,17 +345,137 @@ impl std::fmt::Debug for UnitSample {
         f.debug_struct("UnitSample")
             .field("columns", &self.columns.len())
             .field("estimated_rows", &self.estimated_rows)
-            .finish()
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
     }
 }
 
-/// Samples the members of a unit within a budget of `sample_rows` rows.
+/// Every column of one relation with whether the role can read it (the
+/// CAS store guard's shape recognition; never logged). Names that are not
+/// UTF-8 are left out.
+async fn all_columns(
+    session: &Session,
+    oid: u32,
+    timeouts: Timeouts,
+) -> Result<Vec<(String, bool)>, PgError> {
+    let tx = session.begin(timeouts).await?;
+    match tx
+        .query(Stage::Columns, sql::ALL_COLUMNS, &[(&oid, Type::OID)])
+        .await
+    {
+        Ok(rows) => {
+            tx.commit().await?;
+            let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Columns);
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                if let Some(name) = crate::wire::catalog_text(row, 0).map_err(get)? {
+                    out.push((name, row.try_get(1).map_err(get)?));
+                }
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+/// The CAS store a unit is (ADR-0041 decision 5): by its name or a
+/// partition's (built-in names and the target's `cas_stores`), else by
+/// the column shape of its first member.
+async fn guard_kind(
+    session: &Session,
+    unit: &Unit,
+    stores: Option<&CasStores>,
+    timeouts: Timeouts,
+) -> Result<Option<StoreKind>, PgError> {
+    let names =
+        std::iter::once(unit.name.as_str()).chain(unit.members.iter().map(|m| m.name.as_str()));
+    if let Some(kind) = cas_guard::recognize_name(stores, names) {
+        return Ok(Some(kind));
+    }
+    let Some(first) = unit.members.first() else {
+        return Ok(None);
+    };
+    let columns = all_columns(session, first.oid, timeouts).await?;
+    Ok(cas_guard::recognize_shape(
+        columns.iter().map(|(n, _)| n.as_str()),
+    ))
+}
+
+/// Most `type` values read per ticket registry relation.
+const MAX_TICKET_TYPES: i64 = 256;
+
+/// The only read of a ticket registry (ADR-0041 decision 5): per member,
+/// `SELECT type, count(*) … GROUP BY type`, when the role can read `type`.
+/// `None` when no member's `type` column is readable.
+async fn ticket_metadata(
+    session: &Session,
+    unit: &Unit,
+    timeouts: Timeouts,
+) -> Result<Option<TicketCounts>, PgError> {
+    let mut counts = TicketCounts::default();
+    let mut evaluated = false;
+    for member in &unit.members {
+        let columns = all_columns(session, member.oid, timeouts).await?;
+        let Some(column) = cas_guard::ticket_type_column(
+            columns.iter().filter(|(_, r)| *r).map(|(n, _)| n.as_str()),
+        )
+        .map(str::to_owned) else {
+            continue;
+        };
+        let Some(statement) = sql::ticket_type_counts(&member.schema, &member.name, &column) else {
+            continue;
+        };
+        let tx = session.begin(timeouts).await?;
+        match tx
+            .query(
+                Stage::Sample,
+                &statement,
+                &[(&MAX_TICKET_TYPES, Type::INT8)],
+            )
+            .await
+        {
+            Ok(rows) => {
+                tx.commit().await?;
+                let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Sample);
+                for row in &rows {
+                    let kind: Option<String> = row.try_get(0).map_err(get)?;
+                    let n: i64 = row.try_get(1).map_err(get)?;
+                    counts.add(kind.as_deref().unwrap_or(""), u64::try_from(n).unwrap_or(0));
+                }
+                evaluated = true;
+            }
+            Err(e) => {
+                tx.rollback().await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(evaluated.then_some(counts))
+}
+
+/// Samples the members of a unit within a budget of `sample_rows` rows,
+/// under the CAS store guard: a ticket registry is never sampled (its
+/// metadata only), and the columns an audit trail must never give are not
+/// selected.
 async fn sample_unit(
     session: &Session,
     unit: &Unit,
     sample_rows: u32,
     timeouts: Timeouts,
+    stores: Option<&CasStores>,
 ) -> Result<UnitSample, PgError> {
+    let kind = guard_kind(session, unit, stores, timeouts).await?;
+    if kind == Some(StoreKind::TicketRegistry) {
+        return Ok(UnitSample {
+            columns: Vec::new(),
+            estimated_rows: unit.estimated_rows(),
+            kind,
+            tickets: ticket_metadata(session, unit, timeouts).await?,
+        });
+    }
     let mut columns: Vec<(String, Vec<RawValue>)> = Vec::new();
     let mut remaining = sample_rows;
     let n = unit.members.len();
@@ -316,7 +487,7 @@ async fn sample_unit(
         }
         let left = u32::try_from(n - i).unwrap_or(u32::MAX);
         let quota = remaining.div_ceil(left);
-        match sample_member(session, member, quota, timeouts, &mut columns).await {
+        match sample_member(session, member, quota, timeouts, kind, &mut columns).await {
             Ok(rows) => {
                 sampled_any = true;
                 remaining = remaining.saturating_sub(rows);
@@ -341,6 +512,8 @@ async fn sample_unit(
     Ok(UnitSample {
         columns,
         estimated_rows: unit.estimated_rows(),
+        kind,
+        tickets: None,
     })
 }
 
@@ -365,10 +538,11 @@ async fn sample_member(
     member: &Member,
     limit: u32,
     timeouts: Timeouts,
+    kind: Option<StoreKind>,
     columns: &mut Vec<(String, Vec<RawValue>)>,
 ) -> Result<u32, PgError> {
     let tx = session.begin(timeouts).await?;
-    let result = read_member(&tx, member, limit).await;
+    let result = read_member(&tx, member, limit, kind).await;
     match result {
         Ok((names, values, rows)) => {
             tx.commit().await?;
@@ -393,6 +567,7 @@ async fn read_member(
     tx: &ReadTx<'_>,
     member: &Member,
     limit: u32,
+    kind: Option<StoreKind>,
 ) -> Result<MemberSample, PgError> {
     let rows = tx
         .query(
@@ -413,7 +588,11 @@ async fn read_member(
         );
         if let Some(d) = decoder {
             // A column name that is not UTF-8 (L1): not sampled.
-            if let Some(name) = crate::wire::catalog_text(&row, 1).map_err(get)? {
+            if let Some(name) = crate::wire::catalog_text(&row, 1).map_err(get)?
+                // CAS store guard: a column that must never be read is not
+                // selected (ADR-0041 decision 5).
+                && cas_guard::column_rule(kind, &name) != cas_guard::ColumnRule::NeverRead
+            {
                 cols.push((name, d));
             }
         }

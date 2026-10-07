@@ -11,6 +11,8 @@ UP_TIMEOUT ?= 900
 WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb percona psmdb
+# Opt-in dev services (Compose profiles), stopped by dev-down / dev-reset too.
+DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas
 # pnpm at the version pinned by console/package.json (`packageManager`), through corepack.
 PNPM ?= corepack pnpm
 export COREPACK_ENABLE_DOWNLOAD_PROMPT ?= 0
@@ -29,14 +31,15 @@ AGENT_CONFIG ?=
 
 .PHONY: help \
 	install doctor \
-	dev-dirs dev-metrics-token dev dev-smoke dev-down dev-reset dev-logs dev-ps seed seed-check test-dev \
+	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-down \
+	dev-reset dev-logs dev-ps seed seed-check test-dev \
 	console-dev console-worker console-migrate console-lint console-typecheck console-test console-build \
 	console-licenses \
 	agent-build agent-build-minimal agent-fmt agent-lint agent-test agent-holdout agent-deny agent-it \
 	agent-fuzz agent-run \
 	protocol-lint protocol-append-only protocol-test protocol-drift protocol-check \
 	docs-check shell-lint test-scripts test-e2e test-load fmt lint test check ci \
-	e2e load-test \
+	e2e e2e-oidc load-test \
 	release-dry bump
 
 ##@ Help
@@ -98,7 +101,7 @@ dev/.env:
 	cp dev/.env.example dev/.env
 
 dev-dirs: ## Create the engine log directories (world-writable: engines run as non-root users)
-	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS))
+	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS)) dev/.state/cas
 	chmod 0777 $(addprefix dev/.state/logs/,$(LOG_DIRS))
 
 dev-metrics-token: ## Create dev/.state/metrics_token (48 random chars, 0600) if missing; never committed
@@ -117,11 +120,27 @@ dev: dev/.env dev-dirs dev-metrics-token ## Start the dev environment (databases
 dev-smoke: dev/.env ## Smoke-test a running dev environment (accounts, audit logs, UIs)
 	timeout 300 dev/smoke-test.sh
 
+dev-keycloak: dev/.env ## Start the opt-in Keycloak service (OIDC test realm, ADR-0038) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile keycloak up -d --wait --wait-timeout $(WAIT_TIMEOUT) keycloak
+
+dev-keycloak-smoke: dev/.env ## Smoke-test the running Keycloak service (discovery, JWKS, seeded realm)
+	timeout 180 dev/keycloak/smoke.sh
+
+dev-cas: dev/.env dev-dirs ## Start the opt-in Apereo CAS service (ADR-0041 target; builds its overlay image) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile cas up -d --build --wait --wait-timeout $(WAIT_TIMEOUT) cas cas-db-grants
+
+dev-cas-smoke: dev/.env ## Smoke-test the running CAS service (registry, login, service ticket, audit log, permissions)
+	timeout 300 dev/cas/smoke.sh
+
 dev-down: ## Stop the dev environment (keeps data volumes)
-	timeout 180 $(COMPOSE) down --remove-orphans
+	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down --remove-orphans
 
 dev-reset: ## Stop and delete volumes and dev/.state (reloads the seed on next `make dev`)
-	timeout 180 $(COMPOSE) down -v --remove-orphans
+	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down -v --remove-orphans
+	@# The CAS files belong to the CAS user and the agent's group (dev/cas/files-init.sh): removed
+	@# by the same one-shot container, as the host user cannot.
+	if [ -e dev/.state/cas/services ] || [ -e dev/.state/logs/cas ]; then \
+	  timeout 120 $(COMPOSE) run --rm --no-deps -T cas-files-init sh /usr/local/bin/files-init.sh clean; fi
 	rm -rf dev/.state
 
 dev-logs: ## Show the last TAIL (200) log lines of every service (not followed)
@@ -234,14 +253,15 @@ protocol-check: protocol-lint protocol-append-only protocol-test protocol-drift 
 docs-check: ## Internal Markdown links (CI)
 	timeout 120 python3 scripts/check-md-links.py
 
-shell-lint: ## shellcheck of the load harness (CI) and dev/agent-it.sh
-	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh dev/agent-it.sh
+shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and the Keycloak and CAS dev scripts
+	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
+	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'
 	timeout 60 .github/scripts/test_check_release_settings.sh
 
-test-e2e: ## Unit tests of the e2e I2 leak scanner (CI)
+test-e2e: ## Unit tests of the e2e I2 leak scanner and the OIDC scenario driver (CI)
 	timeout 120 python3 -m unittest discover -s e2e -p 'test_*.py' -v
 
 test-load: ## Unit tests of the load harness (CI)
@@ -261,6 +281,9 @@ ci: check console-licenses console-build agent-holdout agent-build-minimal agent
 
 e2e: test-e2e ## LONG: end-to-end harness in containers (e2e/run.sh, at most E2E_TIMEOUT s)
 	timeout $(E2E_TIMEOUT) e2e/run.sh
+
+e2e-oidc: test-e2e ## End-to-end OIDC login scenario against Keycloak (e2e/oidc.sh, a few minutes)
+	timeout 1320 e2e/oidc.sh
 
 load-test: test-load ## LONG (about 1 h): load / database impact test (e2e/load/run.sh, at most LOAD_TIMEOUT s)
 	timeout $(LOAD_TIMEOUT) e2e/load/run.sh

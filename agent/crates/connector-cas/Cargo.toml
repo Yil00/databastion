@@ -1,0 +1,50 @@
+[package]
+name = "databastion-connector-cas"
+description = "DataBastion agent: Apereo CAS connector (local files only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rule: a connector depends on `databastion-core` (sinks, tailer)
+# and `databastion-classifiers` (masking) only. This one opens no network
+# connection of any kind (ADR-0041 decisions 2 and 13): no network client, no
+# TLS crate, only crates already in the agent's dependency graph.
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+tracing.workspace = true
+zeroize.workspace = true
+# serviceId patterns, compiled under a size limit (ADR-0041 decision 7).
+regex.workspace = true
+# Service definitions and audit records, read through closed serde visitors
+# (never a generic `serde_json::Value`, ADR-0041 decisions 4 and 7).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# openat / fstat / faccessat without `unsafe` (ADR-0041 decision 3), as the
+# core's state files.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+# Test helpers for other crates' tests (enabled from their
+# `[dev-dependencies]` only, never by the agent binary): accepting files the
+# test's own user could write.
+test-support = []
+
+[dev-dependencies]
+# Test helpers of the core (tailing log files the test's own user owns).
+databastion-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# Property tests of every parser (src/proptests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

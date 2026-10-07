@@ -1,0 +1,11 @@
+{
+  "console_min_protocol": 1,
+  "heartbeat_interval_s": 30,
+  "server_time": "2026-10-04T09:00:00.120Z",
+  "accepts": [
+    "access_event.bytes",
+    "engine.cas",
+    "job_progress.coverage",
+    "target_status.notes"
+  ]
+}

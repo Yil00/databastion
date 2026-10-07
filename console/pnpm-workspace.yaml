@@ -13,3 +13,6 @@ ignoredOptionalDependencies:
 # esbuild < 0.25 has a dev-server advisory (GHSA-67mh-4wv8-2f99). Force a fixed version there.
 overrides:
   '@esbuild-kit/core-utils>esbuild': ^0.25.0
+# postcss (through next) pulls source-map-js < 1.2.2, which has an event-loop denial-of-service
+# advisory on crafted indexed source maps (GHSA-68fv-2mgg-jv7q). Force a fixed version.
+  'source-map-js': ^1.2.2

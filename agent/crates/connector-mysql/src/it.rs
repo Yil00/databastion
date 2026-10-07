@@ -32,6 +32,7 @@
 #![allow(clippy::print_stderr)]
 
 mod audit_it;
+mod cas_guard_it;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;

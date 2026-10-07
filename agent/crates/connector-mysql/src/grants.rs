@@ -270,9 +270,152 @@ fn scope(target: &[Tok]) -> Option<Scope> {
     }
 }
 
+/// A `SELECT` (or `ALL [PRIVILEGES]`) grant of a `SHOW GRANTS` line, with
+/// what it covers, for the CAS store guard's credential column check
+/// (ADR-0041 decision 6). Names are only compared, never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectGrant {
+    /// `None`: every database (`*.*`); `Some("")`: the default database.
+    pub(crate) db: Option<String>,
+    /// `None`: every table of the database.
+    pub(crate) table: Option<String>,
+    /// `None`: every column of the table.
+    pub(crate) columns: Option<Vec<String>>,
+}
+
+/// The `SELECT` grants of one `SHOW GRANTS` line (empty for a line that
+/// grants no `SELECT`); `None` when the line is not understood.
+pub(crate) fn select_grants(line: &str) -> Option<Vec<SelectGrant>> {
+    match parse_line(line)? {
+        // `PROXY ON user@host` grants no `SELECT`.
+        Line::Privileges {
+            scope: Scope::Proxy,
+            ..
+        }
+        | Line::Roles { .. }
+        | Line::Ignored => return Some(Vec::new()),
+        Line::Privileges { .. } => {}
+    }
+    let toks = tokens(line)?;
+    let mut depth = 0usize;
+    let (mut on, mut to) = (None, None);
+    for (i, t) in toks.iter().enumerate().skip(1) {
+        match t {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth = depth.checked_sub(1)?,
+            _ if depth == 0 && on.is_none() && t.is_word("ON") => on = Some(i),
+            _ if depth == 0 && t.is_word("TO") => {
+                to = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (on, to) = (on?, to?);
+    let mut target = toks.get(on + 1..to)?;
+    if target.first().is_some_and(|x| x.is_word("TABLE")) {
+        target = target.get(1..)?;
+    } else if target
+        .first()
+        .is_some_and(|x| x.is_word("PROCEDURE") || x.is_word("FUNCTION") || x.is_word("PACKAGE"))
+    {
+        return Some(Vec::new());
+    }
+    let (db, table) = match target {
+        [Tok::Punct('*'), Tok::Punct('.'), Tok::Punct('*')] => (None, None),
+        [Tok::Punct('*')] => (Some(String::new()), None),
+        [d, Tok::Punct('.'), Tok::Punct('*')] => (Some(d.name()?.to_owned()), None),
+        [d, Tok::Punct('.'), t] => (Some(d.name()?.to_owned()), Some(t.name()?.to_owned())),
+        [t] => (Some(String::new()), Some(t.name()?.to_owned())),
+        _ => return None,
+    };
+    // Privileges with their column lists.
+    let mut out = Vec::new();
+    let list = toks.get(1..on)?;
+    let mut i = 0;
+    while i < list.len() {
+        let mut words: Vec<&str> = Vec::new();
+        let mut columns: Option<Vec<String>> = None;
+        while let Some(t) = list.get(i) {
+            match t {
+                Tok::Word(w) => words.push(w),
+                Tok::Punct('(') => {
+                    let mut cols = Vec::new();
+                    i += 1;
+                    loop {
+                        cols.push(list.get(i)?.name()?.to_owned());
+                        i += 1;
+                        match list.get(i)? {
+                            Tok::Punct(',') => i += 1,
+                            Tok::Punct(')') => break,
+                            _ => return None,
+                        }
+                    }
+                    columns = Some(cols);
+                }
+                Tok::Punct(',') => break,
+                _ => return None,
+            }
+            i += 1;
+        }
+        i += 1;
+        let p = words.join(" ").to_ascii_uppercase();
+        if p == "SELECT" || p == "ALL" || p == "ALL PRIVILEGES" {
+            out.push(SelectGrant {
+                db: db.clone(),
+                table: table.clone(),
+                columns,
+            });
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_grants_keep_tables_and_columns() {
+        let g = |db: Option<&str>, t: Option<&str>, c: Option<&[&str]>| SelectGrant {
+            db: db.map(str::to_owned),
+            table: t.map(str::to_owned),
+            columns: c.map(|c| c.iter().map(|x| (*x).to_owned()).collect()),
+        };
+        assert_eq!(
+            select_grants("GRANT SELECT ON *.* TO `r`@`%`"),
+            Some(vec![g(None, None, None)])
+        );
+        assert_eq!(
+            select_grants("GRANT SELECT, INSERT ON `cas`.* TO `r`@`%`"),
+            Some(vec![g(Some("cas"), None, None)])
+        );
+        assert_eq!(
+            select_grants(
+                "GRANT SELECT (`type`, `creation_time`), INSERT (`id`) ON `cas`.`cas_tickets` \
+                 TO `u`@`%`"
+            ),
+            Some(vec![g(
+                Some("cas"),
+                Some("cas_tickets"),
+                Some(&["type", "creation_time"])
+            )])
+        );
+        assert_eq!(
+            select_grants("GRANT ALL PRIVILEGES ON TABLE `cas`.`t` TO `r`"),
+            Some(vec![g(Some("cas"), Some("t"), None)])
+        );
+        assert_eq!(
+            select_grants("GRANT INSERT ON `cas`.* TO `r`"),
+            Some(vec![])
+        );
+        assert_eq!(
+            select_grants("GRANT EXECUTE ON PROCEDURE `cas`.`p` TO `r`"),
+            Some(vec![])
+        );
+        assert_eq!(select_grants("GRANT `role1` TO `u`@`%`"), Some(vec![]));
+        assert_eq!(select_grants("GRANT SELECT ON `a`.`b`.`c` TO `u`"), None);
+    }
 
     fn privs(line: &str) -> (Vec<String>, Scope, bool) {
         match parse_line(line) {

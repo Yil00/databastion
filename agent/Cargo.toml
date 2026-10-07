@@ -8,6 +8,7 @@ members = [
     "crates/connector-mysql",
     "crates/connector-mongodb",
     "crates/connector-openldap",
+    "crates/connector-cas",
     "crates/protocol",
     "crates/protocol-codegen",
 ]
@@ -32,6 +33,7 @@ databastion-connector-postgres = { path = "crates/connector-postgres" }
 databastion-connector-mysql = { path = "crates/connector-mysql" }
 databastion-connector-mongodb = { path = "crates/connector-mongodb" }
 databastion-connector-openldap = { path = "crates/connector-openldap" }
+databastion-connector-cas = { path = "crates/connector-cas" }
 databastion-protocol = { path = "crates/protocol" }
 databastion-protocol-codegen = { path = "crates/protocol-codegen" }
 

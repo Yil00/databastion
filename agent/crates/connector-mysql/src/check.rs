@@ -340,6 +340,12 @@ pub(crate) struct Grants {
     /// A grant with `WITH GRANT OPTION` / `WITH ADMIN OPTION` that is not
     /// in the lists above (a role, or `USAGE`).
     pub(crate) other_grantable: bool,
+    /// The `SELECT` grants of the `SHOW GRANTS` lines read (roles and
+    /// `PUBLIC`), with their tables and columns (CAS store guard).
+    pub(crate) selects: Vec<grant_lines::SelectGrant>,
+    /// A privilege line whose `SELECT` grants were not understood (CAS
+    /// store guard: not evaluated, PR #141 review M1).
+    pub(crate) selects_unknown: bool,
 }
 
 /// A privilege name as a closed label: `[A-Z ]{1,40}` (server constants,
@@ -837,6 +843,42 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
              damaged)"
         ));
         codes.add(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(dropped));
+    }
+    // CAS store guard (ADR-0041 decision 6): at every heartbeat, so a
+    // ticket table recreated with a table grant is reported at once.
+    if !session.is_poisoned() {
+        match cas_guard_readable(&mut session, target.cas_stores()).await {
+            Ok(r) => {
+                if !r.complete {
+                    notes.push(
+                        "CAS store guard privileges not fully evaluated (a role or PUBLIC not \
+                         evaluated, a grant line not understood, or too many candidate columns)"
+                            .to_owned(),
+                    );
+                    codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+                }
+                let n = r.readable;
+                if n > 0 {
+                    notes.push(format!(
+                        "the account can read credential columns of {n} CAS ticket registry \
+                         or audit trail table(s) (grant SELECT on the metadata columns only)"
+                    ));
+                    codes.add(
+                        TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(n),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    stage = e.stage.as_str(),
+                    errno = e.errno,
+                    sqlstate = e.sqlstate(),
+                    "CAS store guard privilege check failed"
+                );
+                codes.add(TargetNote::new(NoteCode::PrivilegeNotEvaluated));
+            }
+        }
     }
     if state.due(&target.id) && !session.is_poisoned() {
         match report(
@@ -1362,6 +1404,10 @@ fn merge_grant_lines(rows: &Rows, grants: &mut Grants) -> bool {
                 scope,
                 grantable,
             }) => {
+                match line.and_then(grant_lines::select_grants) {
+                    Some(selects) => grants.selects.extend(selects),
+                    None => grants.selects_unknown = true,
+                }
                 for p in privileges {
                     match &scope {
                         Scope::Global => grants.global.push((p, grantable)),
@@ -1374,6 +1420,108 @@ fn merge_grant_lines(rows: &Rows, grants: &mut Grants) -> bool {
         }
     }
     understood
+}
+
+/// How many CAS ticket registry or audit trail tables have a credential
+/// column the account can read (ADR-0041 decision 6): visible with
+/// `SELECT` in `information_schema.COLUMNS` (direct grants, enabled roles,
+/// `PUBLIC`), or covered by a `SELECT` grant of a role or of `PUBLIC` read
+/// through `SHOW GRANTS` (roles the account can enable included, as in
+/// ADR-0025): a table grant without a column list or with a credential
+/// column, a grant on its database or on `*.*`. Tables recognized by name
+/// (built-in and `cas_stores`) and by column shape.
+///
+/// Fail closed (PR #141 review M1, L2): the check is not complete when the
+/// column list is cut at its limit (tables matched by name come first),
+/// when the roles or `PUBLIC` could not all be evaluated (as in
+/// [`role_privileges`]), or when a privilege line's `SELECT` grants were
+/// not understood; the caller reports it as not evaluated.
+pub(crate) async fn cas_guard_readable(
+    session: &mut Session,
+    stores: Option<&databastion_core::cas_guard::CasStores>,
+) -> Result<databastion_core::cas_guard::ReadableCheck, MyError> {
+    use databastion_core::cas_guard::{self, StoreKind};
+    let keys = cas_guard::known_name_keys(stores);
+    let statement =
+        sql::cas_guard_columns(&keys).ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
+    let (rows, skipped) = session.query_counted(Stage::Check, &statement).await?;
+    let mut complete = skipped == 0 && rows.len() <= sql::CAS_GUARD_MAX_ROWS;
+    // Per table: (column, readable).
+    type Columns = Vec<(String, bool)>;
+    let mut tables: Vec<((String, String), Columns)> = Vec::new();
+    for row in rows.iter().take(sql::CAS_GUARD_MAX_ROWS) {
+        let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let key = (v(0), v(1));
+        let readable = v(3)
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case("select"));
+        match tables.last_mut() {
+            Some((k, cols)) if *k == key => cols.push((v(2), readable)),
+            _ => tables.push((key, vec![(v(2), readable)])),
+        }
+    }
+    let mut guarded: Vec<(&(String, String), StoreKind)> = Vec::new();
+    let mut readable: BTreeSet<(String, String)> = BTreeSet::new();
+    for (key, columns) in &tables {
+        let Some(kind) = cas_guard::recognize(
+            stores,
+            [key.1.as_str()],
+            columns.iter().map(|(c, _)| c.as_str()),
+        ) else {
+            continue;
+        };
+        if kind == StoreKind::ServiceRegistry {
+            continue;
+        }
+        guarded.push((key, kind));
+        if columns
+            .iter()
+            .any(|(c, r)| *r && cas_guard::is_credential_column(kind, c))
+        {
+            readable.insert(key.clone());
+        }
+    }
+    // Roles and `PUBLIC` (`SHOW GRANTS`), enabled or not.
+    let mut grants = Grants::default();
+    let evaluated = role_privileges(session, &mut grants).await?;
+    complete &= evaluated && grants.roles_unevaluated == 0 && !grants.selects_unknown;
+    let db_of = |g: &grant_lines::SelectGrant, schema: &str| {
+        g.db.as_deref()
+            .is_none_or(|d| d.is_empty() || db_matches(d, schema))
+    };
+    for g in &grants.selects {
+        match &g.table {
+            Some(table) => {
+                let kind = cas_guard::recognize_name(stores, [table.as_str()]).or_else(|| {
+                    guarded
+                        .iter()
+                        .find(|((s, t), _)| t == table && db_of(g, s))
+                        .map(|(_, k)| *k)
+                });
+                let Some(kind) = kind.filter(|k| *k != StoreKind::ServiceRegistry) else {
+                    continue;
+                };
+                let credential = g.columns.as_ref().is_none_or(|cols| {
+                    cols.iter()
+                        .any(|c| cas_guard::is_credential_column(kind, c))
+                });
+                if credential {
+                    readable.insert((g.db.clone().unwrap_or_default(), table.clone()));
+                }
+            }
+            None => {
+                for ((s, t), _) in &guarded {
+                    if db_of(g, s) {
+                        readable.insert((s.clone(), t.clone()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(cas_guard::ReadableCheck {
+        readable: readable.len() as u64,
+        complete,
+    })
 }
 
 async fn report(
@@ -1584,6 +1732,8 @@ mod tests {
             roles: 3,
             roles_unevaluated: 2,
             other_grantable: false,
+            selects: Vec::new(),
+            selects_unknown: false,
         };
         let (over, _, notes) = evaluate_privileges(&grants, true, true, false);
         assert_registered(&notes);
@@ -1613,6 +1763,25 @@ mod tests {
 
     fn rows(lines: &[&str]) -> Rows {
         lines.iter().map(|l| vec![Some((*l).to_owned())]).collect()
+    }
+
+    /// PR #141 review M1: a privilege line whose `SELECT` grants are not
+    /// understood leaves the CAS store guard check not evaluated; `PROXY`
+    /// lines grant no `SELECT` (the property tests check that every line
+    /// `parse_line` reads as privileges has its `SELECT` grants read).
+    #[test]
+    fn select_grants_are_read_from_every_privilege_line() {
+        let mut grants = Grants::default();
+        assert!(merge_grant_lines(
+            &rows(&[
+                "GRANT PROXY ON ''@'' TO `u`@`%` WITH GRANT OPTION",
+                "GRANT SELECT (`a`) ON `hr`.`t` TO `u`@`%`",
+                "GRANT EXECUTE ON PROCEDURE `hr`.`p` TO `u`@`%`",
+            ]),
+            &mut grants
+        ));
+        assert!(!grants.selects_unknown);
+        assert_eq!(grants.selects.len(), 1);
     }
 
     /// End-of-phase-4 review L2: without `APPLICABLE_ROLES`, the role

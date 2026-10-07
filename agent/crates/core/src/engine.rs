@@ -15,6 +15,8 @@ pub enum Engine {
     Mongodb,
     /// OpenLDAP.
     Openldap,
+    /// Apereo CAS (local files only, ADR-0041).
+    Cas,
 }
 
 impl Engine {
@@ -26,6 +28,7 @@ impl Engine {
             Self::Mysql => "mysql",
             Self::Mongodb => "mongodb",
             Self::Openldap => "openldap",
+            Self::Cas => "cas",
         }
     }
 }

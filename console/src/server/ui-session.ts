@@ -12,6 +12,8 @@ import { csrfTokenFor, loadSession, sessionCookieName, type SessionUser } from "
 export interface PageSession {
   user: SessionUser;
   csrfToken: string;
+  /** How the session was opened (ADR-0038): "Link single sign-on" needs a local session. */
+  method: "local" | "oidc";
 }
 
 export async function pageSession(): Promise<PageSession | null> {
@@ -21,7 +23,7 @@ export async function pageSession(): Promise<PageSession | null> {
     headers: { cookie: `${sessionCookieName()}=${value}` },
   });
   const session = await loadSession(getDb(), req);
-  return session ? { user: session.user, csrfToken: csrfTokenFor(session.token) } : null;
+  return session ? { user: session.user, csrfToken: csrfTokenFor(session.token), method: session.method } : null;
 }
 
 export async function requirePageSession(): Promise<PageSession> {

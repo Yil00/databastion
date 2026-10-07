@@ -1,0 +1,42 @@
+{
+  "@class": "org.apereo.cas.services.OidcRegisteredService",
+  "id": 1004,
+  "name": "Expenses",
+  "evaluationOrder": 40,
+  "serviceId": "^https://expenses\\.example\\.org/oidc/callback$",
+  "clientId": "expenses",
+  "clientSecret": "{cipher}eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..wgLCSVAg1TL8InTm.yZwrx7KMSarlNG6VMNLFhuLO6ALkLSkjKYsLJhLOdvz1Jsg2.BNmhb0fxIjAsjt0fivofX7",
+  "supportedGrantTypes": [
+    "java.util.HashSet",
+    [
+      "authorization_code"
+    ]
+  ],
+  "supportedResponseTypes": [
+    "java.util.HashSet",
+    [
+      "code"
+    ]
+  ],
+  "scopes": [
+    "java.util.HashSet",
+    [
+      "openid",
+      "email"
+    ]
+  ],
+  "description": "Expense reports (FAKE data; its client secret is in the {cipher} form)",
+  "contacts": [
+    "java.util.ArrayList",
+    [
+      {
+        "@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+        "name": "Camille Richard",
+        "email": "camille.richard@example.org",
+        "phone": "02 61 91 52 05",
+        "department": "Finance",
+        "type": "TECHNICAL"
+      }
+    ]
+  ]
+}

@@ -104,6 +104,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Mysql => ProtoConnector::Mysql,
         Engine::Mongodb => ProtoConnector::Mongodb,
         Engine::Openldap => ProtoConnector::Openldap,
+        Engine::Cas => ProtoConnector::Cas,
     }
 }
 
@@ -197,7 +198,9 @@ pub async fn enroll(
     let request = EnrollRequest {
         agent_version: agent_version()?,
         arch: EnrollRequestArch::try_from(std::env::consts::ARCH).ok(),
-        connectors: connector_list(engines),
+        // No heartbeat response yet: connectors of engines added after
+        // protocol 0.1.0 wait for their token (ADR-0039 decision 8).
+        connectors: crate::capabilities::enroll_connectors(connector_list(engines)),
         hostname: hostname(),
         os: Some(EnrollRequestOs::Linux),
         token,
@@ -623,6 +626,9 @@ struct Runtime {
     unauthorized_heartbeats: std::sync::atomic::AtomicU32,
     /// Optional request fields the console accepts (ADR-0022).
     console_caps: crate::capabilities::ConsoleCapabilities,
+    /// Targets left out of the latest heartbeat because the console does
+    /// not list their engine's token (logged when it changes).
+    engines_withheld: AtomicU64,
     /// Last local detection result and when it was computed.
     detection: Mutex<Option<(Instant, Vec<DetectedTarget>)>>,
     /// Result endpoints parked after a `501`.
@@ -638,6 +644,11 @@ struct Runtime {
     /// Targets whose audit stream was stopped after [`AUDIT_MAX_PANICS`]
     /// panics in a row, with that count (reported as a target note).
     audit_parked: Mutex<std::collections::HashMap<String, u32>>,
+    /// Per target and database, the CAS store guard tallies of its latest
+    /// completed Discovery scans (ADR-0041 decision 5, PR #141 review L6):
+    /// `coverage.cas_guard_tripped` and `security.ticket_registry_unencrypted`
+    /// in the target's notes.
+    cas_guards: Mutex<std::collections::HashMap<String, crate::cas_guard::TargetTally>>,
     /// Wakes the audit worker when `audits` changes.
     audit_changed: tokio::sync::Notify,
     /// Longest wait for a scan's findings to be acknowledged before its
@@ -817,11 +828,13 @@ impl Runtime {
             detection: Mutex::new(None),
             unauthorized_heartbeats: std::sync::atomic::AtomicU32::new(0),
             console_caps: crate::capabilities::ConsoleCapabilities::default(),
+            engines_withheld: AtomicU64::new(0),
             parked: Mutex::new(Parked::default()),
             findings_cap: MAX_FINDINGS_PER_JOB,
             check_timeout: CHECK_TIMEOUT,
             audits: Mutex::new(AuditTable::default()),
             audit_parked: Mutex::new(std::collections::HashMap::new()),
+            cas_guards: Mutex::new(std::collections::HashMap::new()),
             audit_changed: tokio::sync::Notify::new(),
             status_flush_wait: STATUS_FLUSH_WAIT,
             turns: Mutex::new(crate::checks::TurnState::default()),
@@ -1124,6 +1137,21 @@ impl Runtime {
             }
             None => (level, notes),
         };
+        // The CAS store guard's findings of the latest scan (counts only;
+        // not on `cas` targets, whose notes do not list these codes).
+        let notes = {
+            let mut notes = notes;
+            if target.engine != crate::config::TargetEngine::Cas
+                && let Some(g) = self
+                    .cas_guards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&target.id)
+            {
+                notes.extend(g.total().notes());
+            }
+            notes
+        };
         let audit_source = match connector {
             Some(c) if level != AuditLevel::None => c.audit_source(target).and_then(|s| {
                 serde_json::from_value::<databastion_protocol::AuditSource>(
@@ -1227,16 +1255,32 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::pending_evicted() as f64);
         }
+        // Failed logins aggregated without principal nor address because a
+        // bounded failed-login window was full (CAS, ADR-0041 decision 7).
+        if let Ok(key) = MetricsMapKey::try_from("audit_window_overflow_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::window_overflows() as f64);
+        }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
         if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::cursor_resets() as f64);
         }
-        let spool = self.lock_spool().counters;
+        let (spool, held) = {
+            let spool = self.lock_spool();
+            // Batches waiting for an engine token the console has not listed
+            // (ADR-0042; a gauge, from the spool entries only).
+            let held = spool.held_batches(|gates| uplink::held_back(gates, &self.console_caps));
+            (spool.counters, held)
+        };
         for (name, value) in [
             ("spool_quarantined_total", spool.quarantined),
             ("spool_rejected_batches_total", spool.rejected_batches),
+            (
+                "spool_held_batches",
+                u64::try_from(held).unwrap_or(u64::MAX),
+            ),
         ] {
             if let Ok(key) = MetricsMapKey::try_from(name) {
                 #[allow(clippy::cast_precision_loss, reason = "metric counters")]
@@ -1286,7 +1330,7 @@ impl Runtime {
         let engines: Vec<Engine> = self.connectors.iter().map(|c| c.engine()).collect();
         let spool = self.lock_spool().status();
         let detected_targets = self.detected_targets(&config).await;
-        Ok(HeartbeatRequest {
+        let mut heartbeat = HeartbeatRequest {
             // No console -> agent field needs negotiating yet (ADR-0022).
             accepts: None,
             agent_version: agent_version()?,
@@ -1299,7 +1343,25 @@ impl Runtime {
             targets: self.target_statuses(&config).await,
             ts: now(),
             uptime_s: crate::sanitize::clamped_count(self.started.elapsed().as_secs()),
-        })
+        };
+        // Engines added after protocol 0.1.0 are reported only once the
+        // console lists their token (ADR-0039 decision 8): an older console
+        // rejects the whole heartbeat for an unknown `Engine` value.
+        let withheld =
+            crate::capabilities::withhold_unaccepted_engines(&mut heartbeat, &self.console_caps);
+        let count = withheld.len();
+        let previous = self
+            .engines_withheld
+            .swap(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if count > 0 && previous != u64::try_from(count).unwrap_or(u64::MAX) {
+            let ids: Vec<&str> = withheld.iter().map(|t| t.as_str()).collect();
+            tracing::warn!(
+                targets = ?ids,
+                "targets not reported: the console does not list their engine's capability \
+                 (e.g. engine.cas); the console is too old for them, upgrade it"
+            );
+        }
+        Ok(heartbeat)
     }
 
     /// Serialized heartbeat, used as the probe request before re-sending a
@@ -1343,7 +1405,11 @@ impl Runtime {
                 return Err(e);
             }
         };
-        self.console_caps.record(response.accepts.as_ref());
+        if self.console_caps.record(response.accepts.as_ref()) {
+            // Batches held for a token the console did not list may be
+            // sendable now.
+            self.spool_pushed.notify_one();
+        }
         let value = response.heartbeat_interval_s.0;
         let clamped = backoff::clamp_heartbeat_interval(value);
         if clamped.is_none() {
@@ -1609,8 +1675,12 @@ impl Runtime {
         let front = {
             let now = Instant::now();
             let mut parked = self.lock_parked();
-            self.lock_spool()
-                .front_where(|findings| !parked.is_parked(findings, now))
+            // A batch carrying an engine value the console has not listed
+            // (ADR-0039 decision 8) waits, spooled; the others still go.
+            self.lock_spool().front_sendable(
+                |findings| !parked.is_parked(findings, now),
+                |gates| uplink::held_back(gates, &self.console_caps),
+            )
         };
         let Some((key, batch)) = front else {
             return Ok(Flush::Idle);
@@ -1686,26 +1756,59 @@ impl Runtime {
             // is more likely an older console than bad items. Any other
             // keyword (`formatMinimum`, retention…) keeps the ordinary rules
             // and the capabilities.
+            //
+            // Likewise an unknown enum value (`enum`) pointed at items of an
+            // engine added after protocol 0.1.0 (ADR-0039 decision 8): those
+            // items are kept and held until a heartbeat response lists the
+            // engine's token again (a rolled-back console, or a replica that
+            // does not accept it yet, ADR-0022 decision 8). Only once
+            // (ADR-0042 decision 4): a batch already kept once takes the
+            // ordinary path below, without clearing the capabilities again.
             Err(CallError::Uplink(UplinkError::ItemsRejected {
                 status: 400,
                 items,
                 unknown_field,
-            })) if !unknown_field.is_empty() && batch.carries_gated() => {
-                Ok(self.resend_stripped(&key, &batch, &items, &unknown_field, failures))
+                unknown_value,
+            })) if (!unknown_field.is_empty() && batch.carries_gated())
+                || (!unknown_value.is_empty()
+                    && batch.carries_gated_engine()
+                    && !batch.kept_once()) =>
+            {
+                Ok(self.resend_stripped(
+                    &key,
+                    &batch,
+                    &items,
+                    &unknown_field,
+                    &unknown_value,
+                    failures,
+                ))
             }
             Err(CallError::Uplink(UplinkError::Rejected {
                 status: 400,
                 code: Some(_),
                 unknown_field: true,
             })) if batch.carries_gated() => {
-                Ok(self.resend_stripped(&key, &batch, &[], &[], failures))
+                Ok(self.resend_stripped(&key, &batch, &[], &[], &[], failures))
             }
-            Err(CallError::Uplink(UplinkError::ItemsRejected { items, .. })) => {
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                items,
+                unknown_value,
+                ..
+            })) => {
                 let dropped = u64::try_from(items.len()).unwrap_or(u64::MAX);
-                tracing::warn!(
-                    items = dropped,
-                    "console rejected batch items; resending the rest"
-                );
+                if batch.kept_once() && !unknown_value.is_empty() {
+                    tracing::warn!(
+                        items = dropped,
+                        "console refused the engine value again after one resend while \
+                         listing its token: items dropped after one resend (ADR-0042); \
+                         resending the rest"
+                    );
+                } else {
+                    tracing::warn!(
+                        items = dropped,
+                        "console rejected batch items; resending the rest"
+                    );
+                }
                 let rest: Vec<ResultBatch> = match batch.without(&items) {
                     Ok(rest) => rest.into_iter().collect(),
                     Err(uplink::Unserializable) => {
@@ -1792,17 +1895,23 @@ impl Runtime {
     /// (`unknown`) that carried a gated field are kept; the others were
     /// rejected for another reason and are left out. The replacement
     /// carries no gated field: it is never stripped again.
+    ///
+    /// Items of an engine added after protocol 0.1.0 rejected as an unknown
+    /// value (`enum`, `unknown_value`) are kept too: with the capabilities
+    /// cleared, the replacement is held (`ResultBatch::held_back`) until a
+    /// heartbeat response lists the engine's token again.
     fn resend_stripped(
         &self,
         key: &[u64],
         batch: &ResultBatch,
         rejected: &[usize],
         unknown: &[usize],
+        unknown_value: &[usize],
         failures: u32,
     ) -> Flush {
         self.console_caps.clear();
         bump(&self.counters.gated_fields_stripped, 1);
-        let (again, left_out) = match batch.stripped(rejected, unknown) {
+        let (again, left_out) = match batch.stripped(rejected, unknown, unknown_value) {
             Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
             Err(uplink::Unserializable) => {
                 self.count_unserializable(1);
@@ -2933,6 +3042,17 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         outcome.out_of_time = scan.pacer().out_of_time();
+        // The guard tally of a completed scan replaces the previous scans'
+        // for the databases it covered; a running or failed scan leaves the
+        // notes as they were.
+        if outcome.error.is_none() {
+            self.cas_guards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.as_str().to_owned())
+                .or_default()
+                .merge_scan(scan.cas_guard(), outcome.out_of_time);
+        }
         outcome
     }
 
@@ -3201,6 +3321,7 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Mariadb => databastion_protocol::Engine::Mariadb,
         TargetEngine::Mongodb => databastion_protocol::Engine::Mongodb,
         TargetEngine::Openldap => databastion_protocol::Engine::Openldap,
+        TargetEngine::Cas => databastion_protocol::Engine::Cas,
     }
 }
 

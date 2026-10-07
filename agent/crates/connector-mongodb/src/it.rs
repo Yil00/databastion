@@ -44,6 +44,8 @@ use crate::bson::{Doc, DocBuf, Value};
 use crate::conn::{Kind, Session, Timeouts};
 use crate::error::Stage;
 
+mod cas_guard_it;
+
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const PROBE_DB: &str = "databastion_probe";

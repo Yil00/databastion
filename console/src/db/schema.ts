@@ -37,6 +37,13 @@ import {
 
 const tsz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 
+/** Raw bytes (`bytea`): used for AES-256-GCM ciphertexts only. */
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return "bytea";
+  },
+});
+
 /**
  * `meta` is a small key/value table for console-level metadata
  * (e.g. installation id, schema bootstrap markers). It must never hold
@@ -58,8 +65,13 @@ export const users = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     /** Lowercased login name. */
     username: text("username").notNull(),
-    /** argon2id PHC string. */
-    passwordHash: text("password_hash").notNull(),
+    /**
+     * argon2id PHC string. NULL only for single sign-on users (`sso_only`, ADR-0038): a local user
+     * always keeps one (`users_password_hash_local`).
+     */
+    passwordHash: text("password_hash"),
+    /** Created by an OIDC sign-up or a pending-login approval: no local password, no local login. */
+    ssoOnly: boolean("sso_only").notNull().default(false),
     role: userRole("role").notNull().default("analyst"),
     createdAt: tsz("created_at").notNull().defaultNow(),
     disabledAt: tsz("disabled_at"),
@@ -68,8 +80,41 @@ export const users = pgTable(
   (t) => [
     uniqueIndex("users_username_key").on(t.username),
     check("users_username_len", sql`char_length(${t.username}) between 1 and 64`),
+    // A small table (console users): validated in the migration itself (no ADR-0028 deferral).
+    check("users_password_hash_local", sql`${t.passwordHash} is not null or ${t.ssoOnly}`),
   ],
 );
+
+/**
+ * OIDC identities bound to console users (ADR-0038 decision 6): the identity key is (`issuer`,
+ * `subject`), never the e-mail. The display attributes are refreshed at each login. One identity
+ * per user and issuer.
+ */
+export const userIdentities = pgTable(
+  "user_identities",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    issuer: text("issuer").notNull(),
+    subject: text("subject").notNull(),
+    email: text("email"),
+    emailVerified: boolean("email_verified"),
+    displayName: text("display_name"),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    lastLoginAt: tsz("last_login_at"),
+  },
+  (t) => [
+    uniqueIndex("user_identities_issuer_subject_key").on(t.issuer, t.subject),
+    uniqueIndex("user_identities_user_issuer_key").on(t.userId, t.issuer),
+    check("user_identities_issuer_len", sql`char_length(${t.issuer}) between 1 and 2048`),
+    check("user_identities_subject_len", sql`char_length(${t.subject}) between 1 and 255`),
+  ],
+);
+
+/** How a console session was opened (ADR-0038 decision 13). */
+export const sessionMethod = pgEnum("session_method", ["local", "oidc"]);
 
 export const sessions = pgTable(
   "sessions",
@@ -82,8 +127,67 @@ export const sessions = pgTable(
     createdAt: tsz("created_at").notNull().defaultNow(),
     lastSeenAt: tsz("last_seen_at").notNull().defaultNow(),
     expiresAt: tsz("expires_at").notNull(),
+    method: sessionMethod("method").notNull().default("local"),
+    /** OIDC identity of an `oidc` session (logout hint, role sync on refresh). */
+    identityId: uuid("identity_id").references(() => userIdentities.id, { onDelete: "cascade" }),
+    /** The provider's `sid` claim, when present (planned back-channel logout). */
+    providerSid: text("provider_sid"),
+    /**
+     * Refresh token (`DATABASTION_OIDC_USE_REFRESH_TOKEN=1` only): AES-256-GCM under the HKDF subkey
+     * `oidc-tokens.v1`, AAD bound to the session token hash. Access and ID tokens are never kept.
+     */
+    refreshTokenEnc: bytea("refresh_token_enc"),
+    /** Last token refresh (or the login): refreshed at most every 5 minutes on user activity. */
+    refreshedAt: tsz("refreshed_at"),
   },
-  (t) => [index("sessions_user_id_idx").on(t.userId)],
+  (t) => [
+    index("sessions_user_id_idx").on(t.userId),
+    check("sessions_provider_sid_len", sql`${t.providerSid} is null or char_length(${t.providerSid}) between 1 and 255`),
+    check("sessions_oidc_identity", sql`(${t.method} = 'oidc') = (${t.identityId} is not null)`),
+  ],
+);
+
+/**
+ * Refused OIDC logins of unknown identities while sign-up is off (ADR-0038 decision 8): an
+ * administrator approves one as a NEW user, or discards it. At most 1000 rows (least recent attempt
+ * evicted, evictions counted in `meta`), 7-day expiry. Mapped attributes only, never raw claims.
+ */
+export const oidcPendingLogins = pgTable(
+  "oidc_pending_logins",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    issuer: text("issuer").notNull(),
+    subject: text("subject").notNull(),
+    login: text("login"),
+    email: text("email"),
+    emailVerified: boolean("email_verified").notNull().default(false),
+    displayName: text("display_name"),
+    groups: jsonb("groups").$type<string[]>().notNull().default([]),
+    /** Role mapped at the attempt (`null`: no role): a hint for the approving administrator. */
+    mappedRole: userRole("mapped_role"),
+    attempts: integer("attempts").notNull().default(1),
+    createdAt: tsz("created_at").notNull().defaultNow(),
+    lastAttemptAt: tsz("last_attempt_at").notNull().defaultNow(),
+    expiresAt: tsz("expires_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("oidc_pending_logins_issuer_subject_key").on(t.issuer, t.subject),
+    index("oidc_pending_logins_last_attempt_idx").on(t.lastAttemptAt),
+    check("oidc_pending_logins_attempts", sql`${t.attempts} >= 1`),
+  ],
+);
+
+/**
+ * Consumed OIDC `state` values (SHA-256 hex), kept until the state cookie's expiry: a callback
+ * replaying a consumed state is refused (ADR-0038 decision 5).
+ */
+export const oidcConsumedStates = pgTable(
+  "oidc_consumed_states",
+  {
+    stateHash: text("state_hash").primaryKey(),
+    expiresAt: tsz("expires_at").notNull(),
+  },
+  (t) => [index("oidc_consumed_states_expires_idx").on(t.expiresAt)],
 );
 
 // --------------------------------------------------------------------------- agents
@@ -325,13 +429,6 @@ export const securityEvents = pgTable(
 );
 
 // ------------------------------------------------------------------------- findings
-
-/** Raw bytes (`bytea`): used for AES-256-GCM ciphertexts only. */
-const bytea = customType<{ data: Buffer; driverData: Buffer }>({
-  dataType() {
-    return "bytea";
-  },
-});
 
 /**
  * Findings batches received from agents (`POST /findings`), for idempotency on

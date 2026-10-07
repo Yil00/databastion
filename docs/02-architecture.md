@@ -70,7 +70,7 @@ An agent can monitor several targets, of different engines, on the same host.
 ## Agent operating modes
 1. **Discovery**: periodic traversal of schemas / collections / entries, sampling, classification. Produces *findings* ("column `clients.email` contains email addresses, confidence 0.97").
 2. **Audit**: reading native logs, normalizing them into *access events*, pre-aggregation. The available level depends on the engine and its edition: [08-engine-capabilities.md](08-engine-capabilities.md).
-3. **Prevention** (phase 2): proxy or hooks to block certain operations.
+3. **Response** (planned, ROADMAP phase 12): recommended actions on incidents and signed webhook hooks for external tooling; DataBastion never blocks nor writes to a target in the Community edition. Blocking (proxy) is Enterprise ([ADR-0040](adr/0040-prevention-mode-scope.md)).
 
 **Discovery feeds Audit**: locations classified as sensitive by Discovery are used to weight the accesses observed by Audit. A large volume read from a table with no sensitive data does not carry the same weight as a large volume read from `clients`.
 
@@ -90,7 +90,7 @@ Detailed specification: [09-agent-protocol.md](09-agent-protocol.md).
 
 - **Transport**: HTTPS (TLS 1.3), versioned JSON; the OpenAPI contract [`shared/protocol/openapi.yaml`](../shared/protocol/openapi.yaml) is the source of truth
 - **Responsiveness**: *long-poll* on `GET /jobs` (request held for up to 25 s), which gives near-real-time responsiveness without WebSocket or gRPC
-- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable (the agent generates the new secret, [ADR-0008](adr/0008-agent-generated-secret-rotation.md)). mTLS as an option (phase 2).
+- **Authentication**: single-use enrollment token → agent ID + long secret, stored hashed on the console side, rotatable (the agent generates the new secret, [ADR-0008](adr/0008-agent-generated-secret-rotation.md)). mTLS as an option is planned (ROADMAP phase 11, ADR first).
 - **Resilience**: if the console is unreachable, the agent queues to disk (bounded spool) and resends on reconnection.
 
 ## Agent deployment modes

@@ -1,5 +1,6 @@
 import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
+import { localLoginMode, oidcConfigWarnings, oidcEnabled, oidcStartupFatal } from "./oidc/config";
 import { trustedProxyHops } from "./request";
 
 /**
@@ -25,7 +26,29 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
     );
   }
   warnings.push(...alertingWarnings(env));
+  const localLogin = localLoginWarning(env);
+  if (localLogin !== null) warnings.push(localLogin);
+  warnings.push(...oidcConfigWarnings(env));
   return warnings;
+}
+
+/**
+ * End-of-phase-8 review L4: `DATABASTION_LOCAL_LOGIN=enabled` while OIDC is on keeps the password
+ * form open to every local user, so the provider's policies (MFA, disabling) do not cover them.
+ * Meant only as a temporary migration window (console/README.md, "Single sign-on (OIDC)").
+ */
+export function localLoginWarning(env: NodeJS.ProcessEnv = process.env): string | null {
+  let enabled: boolean;
+  try {
+    enabled = oidcEnabled(env) && localLoginMode(env) === "enabled";
+  } catch {
+    return null; // a configuration error is reported by startupFatal
+  }
+  if (!enabled) return null;
+  return (
+    "DATABASTION_LOCAL_LOGIN=enabled while OIDC is enabled: every local user can still sign in with a password, outside the identity provider's policies. " +
+    "Use it only as a temporary window to migrate local users to single sign-on, then remove it (the default with OIDC is admins)."
+  );
 }
 
 /** Escape hatch for {@link startupFatal}: start anyway without a usable server key (not recommended). */
@@ -42,6 +65,10 @@ function serverKeyUsable(env: NodeJS.ProcessEnv): boolean {
  * disabled protections and the process starts). `null`: start. Never contains configuration values.
  */
 export function startupFatal(env: NodeJS.ProcessEnv = process.env): string | null {
+  // ADR-0038: an OIDC or local-login configuration error is fatal in every environment (OIDC is an
+  // explicit opt-in, and it needs the server key even where the override below applies).
+  const oidc = oidcStartupFatal(env);
+  if (oidc !== null) return oidc;
   if (env.NODE_ENV !== "production") return null;
   // L5 (P3-C): the alerting dev flag needs a second explicit opt-in in production.
   const alerting = alertingFatal(env);

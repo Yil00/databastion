@@ -68,6 +68,18 @@ export const SIGNAL_REGISTRY = {
       "postgres"
     ]
   },
+  "volume.failed_logins_many_accounts": {
+    "description": "One client address with failed authentications for at least 16 distinct principals within 10 minutes (credential stuffing or password spraying, indistinguishable without the passwords, which are never seen). On CAS, the further failures of that address are aggregated per minute under the principal * (several accounts). Heuristic: the address comes from X-Forwarded-For by default, so evadable by design.",
+    "engines": [
+      "cas"
+    ]
+  },
+  "volume.failed_logins_one_account": {
+    "description": "One principal (fingerprint) with at least 20 failed authentications within 10 minutes, whatever the client addresses (online guessing against one account, including from many addresses). Heuristic: evadable by design.",
+    "engines": [
+      "cas"
+    ]
+  },
   "volume.large_result": {
     "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it).",
     "engines": [

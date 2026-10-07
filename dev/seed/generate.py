@@ -9,6 +9,7 @@ byte-identical files. Outputs:
 - ``dev/seed/out/mariadb.sql``   MariaDB database ``support``
 - ``dev/seed/out/mongo.json``    MongoDB database ``app`` (loaded by ``dev/mongo/initdb/10-seed.js``)
 - ``dev/seed/out/openldap.ldif`` OpenLDAP suffix ``dc=example,dc=org``
+- ``dev/cas/services/*.json``    Apereo CAS JSON service registry (opt-in service ``cas``)
 - ``dev/ground-truth.json``      every seeded location and the classifiers expected on it
 
 All values are fictitious by construction:
@@ -18,12 +19,14 @@ All values are fictitious by construction:
 - IBANs use bank codes starting with ``99`` (FR) / ``999`` (DE) and have valid mod-97 check digits;
 - NIRs have a valid key but random components;
 - card numbers use the well-known test prefixes 411111 (Visa) and 555555 (Mastercard), Luhn-valid;
-- AWS-shaped keys always contain ``EXAMPLE``.
+- AWS-shaped keys always contain ``EXAMPLE``;
+- CAS client secrets and the REST Authorization header start with ``dev-only``.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import random
@@ -233,7 +236,8 @@ class Truth:
     def add(self, engine: str, database: str, container: str | None, obj: str, field: str | None,
             classifiers: list[str], values: list[str] | None = None, *, negative_control: bool = False,
             name_values: list[str] | None = None, name_value_classifiers: list[str] | None = None,
-            normalized: str | None = None, note: str | None = None) -> None:
+            normalized: str | None = None, note: str | None = None,
+            never_sampled: bool = False) -> None:
         loc: dict = {
             "engine": engine, "database": database, "container": container, "object": obj,
             "field": field, "expected_classifiers": sorted(classifiers),
@@ -246,7 +250,9 @@ class Truth:
             loc["expected_normalized_name"] = normalized
         if note:
             loc["note"] = note
-        if values is not None and classifiers:
+        if never_sampled:
+            loc["never_sampled"] = True
+        if values is not None and (classifiers or never_sampled):
             loc["values"] = sorted({v for v in values if v})
         self.locations.append(loc)
 
@@ -705,6 +711,173 @@ def gen_openldap(f: Fake, t: Truth) -> str:
 
 
 # --------------------------------------------------------------------------------------------------
+# Apereo CAS: JSON service registry (dev/cas/services, opt-in service `cas`, ADR-0041)
+# --------------------------------------------------------------------------------------------------
+# Accepted users of the CAS dev service (dev/cas/config/cas.properties, `cas.authn.accept.users`;
+# password CAS_DEV_USER_PASSWORD). E-mail-shaped logins, as many deployments use: their `who` in
+# the audit log is classified (ADR-0041 decision 4) and always fingerprinted in events (decision 7).
+CAS_USERS = ("camille.martin@example.org", "hugo.durand@example.net", "olivia.smith@example.com")
+# A service account login (not personal data): the e2e can list it in `cas.clear_principals`.
+CAS_SERVICE_USER = "svc-monitoring"
+CAS_SERVICES = "cas/services"
+CAS_CLASS = {
+    "cas": "org.apereo.cas.services.CasRegisteredService",
+    "saml": "org.apereo.cas.support.saml.services.SamlRegisteredService",
+    "oidc": "org.apereo.cas.services.OidcRegisteredService",
+}
+
+
+def cas_object(name: str) -> str:
+    """The Discovery object of a service name, as connector-cas reports it: ADR-0009 normalization
+    keeps these names as they are (`HR-Portal`), checked against the connector's own parser."""
+    return name
+
+
+def cas_contacts(f: Fake, n: int, department: str) -> tuple[list, list[dict]]:
+    """`contacts` in the CAS JSON form ([class, [items]]) and the people drawn."""
+    people = [f.person() for _ in range(n)]
+    items = [{"@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+              "name": f"{p['first']} {p['last']}", "email": p["email"], "phone": p["phone"],
+              "department": department, "type": "TECHNICAL" if i == 0 else "ADMINISTRATIVE"}
+             for i, p in enumerate(people)]
+    return ["java.util.ArrayList", items], people
+
+
+def gen_cas(f: Fake, t: Truth) -> dict[str, str]:
+    """Service definitions (one file per service, `<name>-<id>.json` as CAS names them) and their
+    ground-truth locations, as connector-cas reports them: database `service_registry`, schema the
+    service type, object the normalized service name when every value of the location comes from
+    services of that name, else `*` (values are pooled per service type and field path, ADR-0041
+    decision 4), field the normalized path."""
+    E, DB = "cas", "service_registry"
+    services: list[dict] = []
+    contacts: dict[str, list[dict]] = {}
+
+    def add(kind: str, definition: dict, people: list[dict]) -> None:
+        services.append(definition)
+        contacts.setdefault(kind, []).extend(people)
+
+    c, people = cas_contacts(f, 2, "IT")
+    add("cas", {
+        "@class": CAS_CLASS["cas"], "id": 1001, "name": "Intranet", "evaluationOrder": 10,
+        "serviceId": "^https://intranet\\.example\\.org(/.*)?$",
+        "description": "Staff intranet (DataBastion dev fixture, FAKE data)",
+        "informationUrl": "https://intranet.example.org/about",
+        "logoutType": "BACK_CHANNEL",
+        "contacts": c,
+        "attributeReleasePolicy": {
+            "@class": "org.apereo.cas.services.ReturnAllowedAttributeReleasePolicy",
+            "allowedAttributes": ["java.util.ArrayList", ["mail", "cn", "telephoneNumber"]]},
+        "properties": {"@class": "java.util.HashMap", "costCenter": {
+            "@class": "org.apereo.cas.services.DefaultRegisteredServiceProperty",
+            "values": ["java.util.HashSet", ["CC-1042"]]}},
+    }, people)
+
+    # Required-attribute values: an allow-list of e-mail addresses (a small application).
+    c, people = cas_contacts(f, 2, "Facilities")
+    allowed = [f.email(p["first"], p["last"]) for p in (f.person() for _ in range(4))]
+    # RESTful attribute release with an Authorization header: never sampled (header maps are
+    # skipped whole), listed below as a value that must never reach the console.
+    rest_auth = "Basic " + base64.b64encode(
+        f"dev-only-badge-sync:{f.chars(B64_CHARSET, 24)}".encode()).decode()
+    add("cas", {
+        "@class": CAS_CLASS["cas"], "id": 1005, "name": "Badge-Sync", "evaluationOrder": 50,
+        "serviceId": "^https://badges\\.example\\.org/.*",
+        "description": "Badge printing; attributes released through a REST endpoint (FAKE data)",
+        "contacts": c,
+        "accessStrategy": {
+            "@class": "org.apereo.cas.services.DefaultRegisteredServiceAccessStrategy",
+            "requiredAttributes": {"@class": "java.util.HashMap",
+                                   "mail": ["java.util.HashSet", allowed]}},
+        "attributeReleasePolicy": {
+            "@class": "org.apereo.cas.services.ReturnRestfulAttributeReleasePolicy",
+            "endpoint": "https://badges.example.org/api/cas/release", "method": "POST",
+            "headers": {"@class": "java.util.LinkedHashMap", "Authorization": rest_auth}},
+    }, people)
+
+    c, people = cas_contacts(f, 2, "Payroll")
+    add("saml", {
+        "@class": CAS_CLASS["saml"], "id": 1002, "name": "Payroll-SP", "evaluationOrder": 20,
+        "serviceId": "https://payroll.example.net/shibboleth",
+        "description": "Payroll service provider (FAKE data; the dev image has no SAML2 IdP module)",
+        "metadataLocation": "https://payroll.example.net/Shibboleth.sso/Metadata",
+        "contacts": c,
+    }, people)
+
+    # OIDC: one client secret in clear (counted as `security.client_secrets_in_clear`, never read),
+    # one in the cipher executor's `{cipher}` form. Static release values: hotline numbers.
+    c, people = cas_contacts(f, 2, "Human Resources")
+    clear_secret = "dev-only-cas-oidc-client-secret-" + f.chars(B64_CHARSET, 24)
+    hotlines = [f.fr_phone() for _ in range(3)]
+    add("oidc", {
+        "@class": CAS_CLASS["oidc"], "id": 1003, "name": "HR-Portal", "evaluationOrder": 30,
+        "serviceId": "^https://hr\\.example\\.com/oidc/callback$",
+        "clientId": "hr-portal", "clientSecret": clear_secret,
+        "supportedGrantTypes": ["java.util.HashSet", ["authorization_code"]],
+        "supportedResponseTypes": ["java.util.HashSet", ["code"]],
+        "scopes": ["java.util.HashSet", ["openid", "profile", "email"]],
+        "description": "HR portal (FAKE data; its client secret is a dev-only value in clear)",
+        "contacts": c,
+        "attributeReleasePolicy": {
+            "@class": "org.apereo.cas.services.ReturnStaticAttributeReleasePolicy",
+            "allowedAttributes": {"@class": "java.util.LinkedHashMap",
+                                  "hotline": ["java.util.ArrayList", hotlines]}},
+    }, people)
+    c, people = cas_contacts(f, 1, "Finance")
+    jwe = ".".join(["eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0", ""] +
+                   [f.chars(B64_CHARSET, n) for n in (16, 48, 22)])
+    encrypted_secret = "{cipher}" + jwe
+    add("oidc", {
+        "@class": CAS_CLASS["oidc"], "id": 1004, "name": "Expenses", "evaluationOrder": 40,
+        "serviceId": "^https://expenses\\.example\\.org/oidc/callback$",
+        "clientId": "expenses", "clientSecret": encrypted_secret,
+        "supportedGrantTypes": ["java.util.HashSet", ["authorization_code"]],
+        "supportedResponseTypes": ["java.util.HashSet", ["code"]],
+        "scopes": ["java.util.HashSet", ["openid", "email"]],
+        "description": "Expense reports (FAKE data; its client secret is in the {cipher} form)",
+        "contacts": c,
+    }, people)
+
+    files = {f"{CAS_SERVICES}/{s['name']}-{s['id']}.json":
+             json.dumps(s, ensure_ascii=False, indent=2) + "\n" for s in services}
+
+    for kind, people in sorted(contacts.items()):
+        names = {s["name"] for s in services if s["@class"] == CAS_CLASS[kind]}
+        obj = cas_object(next(iter(names))) if len(names) == 1 else "*"
+        note = None if obj != "*" else "values of every service of the type, pooled (ADR-0041 decision 4)"
+        t.add(E, DB, kind, obj, "contacts[].name", ["pii.person_name"],
+              [f"{p['first']} {p['last']}" for p in people], note=note)
+        t.add(E, DB, kind, obj, "contacts[].email", ["pii.email"], [p["email"] for p in people],
+              note=note)
+        t.add(E, DB, kind, obj, "contacts[].phone", ["pii.phone"], [p["phone"] for p in people],
+              note=note)
+        t.add(E, DB, kind, obj, "contacts[].department", [], negative_control=True, note=note)
+    t.add(E, DB, "cas", cas_object("Badge-Sync"), "access_strategy.required_attributes.*[]",
+          ["pii.email"], allowed, note="required-attribute values (an e-mail allow-list)")
+    t.add(E, DB, "oidc", cas_object("HR-Portal"), "attribute_release_policy.allowed_attributes.*[]",
+          ["pii.phone"], hotlines, note="static attribute release values")
+    t.add(E, DB, "cas", cas_object("Intranet"), "attribute_release_policy.allowed_attributes[]", [],
+          negative_control=True, note="attribute names, not values")
+    t.add(E, DB, "cas", cas_object("Intranet"), "properties.*.values[]", [], negative_control=True,
+          note="cost center code")
+    # Credentials: never sampled, masked nor fingerprinted (ADR-0041 decision 4); listed so that
+    # the I2 checks search for them (none may reach the console, the agent logs or the spool).
+    t.add(E, DB, "oidc", cas_object("HR-Portal"), "client_secret", [], [clear_secret],
+          never_sampled=True, note="OIDC client secret in clear: never sampled; counted as "
+          "security.client_secrets_in_clear")
+    t.add(E, DB, "oidc", cas_object("Expenses"), "client_secret", [], [encrypted_secret],
+          never_sampled=True, note="OIDC client secret in the {cipher} form: never sampled")
+    t.add(E, DB, "cas", cas_object("Badge-Sync"), "attribute_release_policy.headers.authorization",
+          [], [rest_auth], never_sampled=True,
+          note="Authorization header of the RESTful release policy: never sampled")
+    # The audit log (decision 4): the `who` of successful authentications. Records exist once a
+    # user logged in (dev/cas/smoke.sh, the e2e scenario); the service account is not personal.
+    t.add(E, "audit_trail", None, "audit_log", "who", ["pii.email"], list(CAS_USERS),
+          note="logins of the accepted users (cas.authn.accept.users); present once they logged in")
+    return files
+
+
+# --------------------------------------------------------------------------------------------------
 def build(seed: int = SEED) -> dict[str, str]:
     f = Fake(seed)
     t = Truth()
@@ -715,6 +888,8 @@ def build(seed: int = SEED) -> dict[str, str]:
         "seed/out/mongo.json": gen_mongo(f, t),
         "seed/out/openldap.ldif": gen_openldap(f, t),
     }
+    # Own random stream: the outputs above stay byte-identical.
+    files.update(gen_cas(Fake(seed + 41), t))
     truth = {
         "version": 1,
         "generator": "dev/seed/generate.py",
@@ -731,6 +906,11 @@ def build(seed: int = SEED) -> dict[str, str]:
             "console database (P2-E).",
             "MySQL / MariaDB: Discovery excludes the system schemas mysql, information_schema, "
             "performance_schema and sys (docs/05-security.md).",
+            "never_sampled: a credential (CAS client secret, Authorization header) the connector "
+            "never samples, masks nor fingerprints; expects no classifier, and its values must "
+            "never reach the console, the agent logs or the spool (ADR-0041 decision 14).",
+            "cas: locations as connector-cas reports them (ADR-0041 decision 4); the registry is "
+            "dev/cas/services, the audit log dev/.state/logs/cas/cas_audit.log.",
         ],
         "targets": {
             "postgresql": {"service": "postgres", "databases": ["shop"]},
@@ -738,6 +918,7 @@ def build(seed: int = SEED) -> dict[str, str]:
             "mariadb": {"service": "mariadb", "databases": ["support"]},
             "mongodb": {"service": "mongo", "databases": ["app"]},
             "openldap": {"service": "openldap", "databases": ["dc=example,dc=org"]},
+            "cas": {"service": "cas", "databases": ["service_registry", "audit_trail"]},
         },
         "locations": t.locations,
     }

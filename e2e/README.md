@@ -12,7 +12,9 @@ real `mongodump`) and the OpenLDAP target (`cn=accesslog`,
 [ADR-0029](../docs/adr/0029-openldap-connector.md): a bulk `ldapsearch`), the two **v0.1.0 release
 gates** of phase 7; and a password-bearing DCL statement on the Audit path (PostgreSQL `CREATE USER`
 / `ALTER ROLE … PASSWORD`, MariaDB `CREATE USER` / `ALTER USER … IDENTIFIED BY`, phase 7); see also
-[Adding an Audit target](#adding-an-audit-target).
+[Adding an Audit target](#adding-an-audit-target). The console's OIDC login against Keycloak (P8-D)
+is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario), and so
+is the Apereo CAS target (P8-D): [CAS target](#cas-target).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
 It runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/`, `dev/seed/out/`,
@@ -352,7 +354,188 @@ recognized by its `COPY … TO STDOUT` of several whole tables), and the pgaudit
 source, literal positive control in the target's log) are replaced or skipped, as printed. It is not
 a substitute for the CI run.
 
+## OIDC login scenario
+ROADMAP P8-D: the console's single sign-on ([ADR-0038](../docs/adr/0038-console-oidc-login.md))
+against Keycloak with the [dev test realm](../dev/README.md#keycloak-oidc-test-realm).
+[`oidc.sh`](oidc.sh) merges [`docker-compose.oidc.yml`](docker-compose.oidc.yml) over this stack
+(Compose project `databastion-e2e-oidc`) and starts only `db`, `migrate`, `web`, `proxy`,
+`bootstrap-admin` and `keycloak`: no agent, no target, no worker. [`run.sh`](run.sh) never reads the
+override. The CI job is `e2e-oidc` in [`ci.yml`](../.github/workflows/ci.yml) (25 min budget,
+`oidc.sh` at most 1320 s with the console image build at most 900 s, about 2 minutes of scenario); it runs when `console/`, `e2e/`,
+`deploy/initdb/`, `dev/keycloak/`, `dev/docker-compose.yml` or `ci.yml` change, and is not part of
+the required `CI result` check yet.
+
+**TLS.** Inside the containers the issuer is not a loopback address, so decision 2 requires
+`https://` for it and every endpoint, and the console runs the production image (`NODE_ENV=production`,
+checked; no plain-HTTP exception, no development build). `oidc.sh` generates a throwaway CA and two
+certificates at run time: the proxy's (`console.e2e.internal`) and Keycloak's
+(`keycloak.e2e.internal`); the CA key is deleted once they are issued. Keycloak runs in production
+mode (`start`), HTTPS only (TLS 1.3 and 1.2; `oidc.sh` checks that its port refuses plain HTTP),
+with the embedded `dev-file` database and local caches in the container. The console trusts the CA
+for the provider only, through `DATABASTION_OIDC_CA_FILE` (decision 3). Keycloak listens on the
+same port inside and on `127.0.0.1` (`E2E_KEYCLOAK_PORT`, default 8444), so that the issuer
+`https://keycloak.e2e.internal:8444/realms/databastion` is the same for the console (network alias
+on `console-net`) and for the scenario's browser on the host.
+
+**Realm and secrets.** The realm is generated at run time from
+[`dev/keycloak/databastion-realm.json`](../dev/keycloak/databastion-realm.json) with `jq`: redirect
+URI `https://console.e2e.internal:8443/api/auth/oidc/callback`, post-logout redirect URI
+`…/login`, `sslRequired: all`, and one more user, `link.grace` (like `admin.alice`), for the
+self-service link. The client secret and the users' password stay `${…}` placeholders, resolved by
+Keycloak at import. Keycloak's master administrator password, the client secret, the users'
+password and the two local administrators' passwords are random, generated for the run, given to
+Keycloak as Docker secrets that a wrapper exports for its process only (never in the container's
+environment) and to the console as `DATABASTION_OIDC_CLIENT_SECRET_FILE`. The Keycloak image is the
+one [`dev/docker-compose.yml`](../dev/docker-compose.yml) pins (tag and index digest, whose
+provenance against quay.io the dev environment workflow checks); `oidc.sh` refuses a different pin.
+
+**Console configuration.** `GROUPS_ATTRIBUTE_PATH=groups`, a role expression on the `groups` claim
+only, `ROLE_ATTRIBUTE_STRICT=1`, local login `admins` (the default with OIDC on). The scenario
+([`oidc_scenario.py`](oidc_scenario.py), Python standard library) runs twice, the web container
+being recreated in between:
+
+| Phase | Console settings | Cases |
+|-------|------------------|-------|
+| `signup-off` | `ALLOW_SIGN_UP=0`, `ALLOWED_GROUPS=databastion-admins,databastion-analysts`, `ALLOWED_DOMAINS=databastion.test` | Break-glass login of the local administrator `e2e-admin` (`user.login` with `break_glass`); with an e-mail channel flagged "system alerts" (never contacted: no worker runs), a second one queues the `user.local_login` delivery row (`pending`, user id and name). A local analyst `e2e-analyst` is refused (`401`, no session, `user.login` failures only) since `DATABASTION_LOCAL_LOGIN` is `admins`. `outsider.carol` refused (`group`), `unverified.dave` (`email_unverified`), `nogroup.erin` (`group`), no pending login for them. `admin.alice`: pending login (`sign_up`) listed with issuer, subject, login, mapped role `admin` (`syncedRole`) and groups; since role sync is on, approval as `analyst` is refused (`409 role_mismatch`, a failed `user.pending_login_approve` with `reason` and `mapped_role`, the pending login kept), approval as `admin` succeeds and her first login keeps `admin` with no `user.role_change`. `analyst.bob`: the same pattern (as `admin` refused, as `analyst` approved, no role change at login). Role sync at every login: `analyst.bob` is added to `databastion-admins` through the Keycloak admin API and his next login promotes him to `admin`, then removed from it and his next login demotes him to `analyst` (`user.role_change`, source `oidc`, both ways). `mallory` (Alice's e-mail and name): pending, never signed in to Alice's account; her username is then changed at runtime to `e2e-admin` through the Keycloak admin API (the realm lets her make the same edit in the account console; either way the next `id_token` carries the same claims): the same pending login (keyed by issuer and subject), mapped role `analyst`, approval refused `409 username_taken`, discarded, bound to no user. Self-service link: refused from an OIDC session (`409 local_session_required`); from the local session of a new local administrator `e2e-linker` whose browser already holds a Keycloak SSO session as `link.grace` (signed in to Keycloak's account console, proven by a form-less authorization), `prompt=login` / `max_age=0` make Keycloak show its login form again, nothing is recorded before the credentials are posted, then `user.identity_link` is audited with the session method, issuer and subject; `link.grace` then signs in to `e2e-linker`'s account. Logout of Alice's OIDC session: `200 {redirect_url}` with `client_id`, `logout_hint` (her subject) and `post_logout_redirect_uri`, no `id_token_hint`; console session gone, `user.logout` audited, Keycloak's confirmation submitted, the browser's Keycloak session ended, a new sign-in asks for credentials |
+| `signup-on` | `ALLOW_SIGN_UP=1`, no group or domain filter, `USE_REFRESH_TOKEN=1` | `nogroup.erin` (no `groups` claim) and `outsider.carol` refused under strict mapping (`role`), no pending login. `mallory`, still named `e2e-admin`: refused (`username`), no user created, no identity bound, `e2e-admin` unchanged (role, local password, no identity, its session still valid). Positive control: `unverified.dave` signs up as `analyst`; his refresh token is stored as an AES-256-GCM blob (format byte 1, no JWT bytes) and his logout revokes it at Keycloak (`user.logout` with `refresh_revoked: true`) and deletes the session row. Never admin: the administrators are `admin.alice` (group), `e2e-admin` and `e2e-linker` (local) only, and no role change to `admin` but Bob's (the group granted at runtime, then removed) |
+
+Every login goes through the real flow: `/api/auth/oidc/start` (checked: code flow, PKCE `S256`,
+`state`, `nonce`, `query` response mode, exact redirect URI), Keycloak's login form, the callback
+(RFC 9207 `iss` checked), the console's same-origin page (`/agents`, or the generic
+`/login?sso_error=1` page) and a `__Host-` session cookie. Each refusal is checked in the console's
+audit log (`user.login_denied` with exactly `{method: oidc, reason}`, and no login, sign-up, role
+change or link). The browser is a headless HTTP client (urllib, no JavaScript) that follows each
+redirect itself and resolves the two host names to `127.0.0.1`, with TLS verified against the run's
+CA only and no proxy; the audit log and tables are read with `psql` in the `db` container, in
+read-only transactions (`PGOPTIONS=-c default_transaction_read_only=on`, checked). The Keycloak admin
+token is fetched again when the admin API answers `401`. The link's freshness is shown only on the
+provider side (Keycloak re-prompts despite the SSO session); the console's own `auth_time` refusal
+of a stale link is covered by the console's unit tests, not here.
+
+**Secret hygiene.** Every generated secret is registered as in `run.sh`. The scenario records every
+one-time value it sees: session tokens, CSRF tokens, Keycloak's admin token, the URL-borne
+authorization codes, states and nonces, and Keycloak's session ids. After both phases, `oidc.sh` fails if any secret or
+recorded value is found in the logs of `db`, `migrate`, `web`, `keycloak` and `bootstrap-admin` or
+in a `pg_dump` of the console database, or if any secret, session or CSRF token is found in the
+proxy's access log. That log records the callback URLs, and so the codes and states, by design: the
+scan must find them there, as its positive control. Keycloak's session ids (`session_state`, the
+provider `sid` the console keeps with the session, decision 13) are looked for in every log but the
+proxy's, not in the dump. The tokens the scenario never sees (`id_token`, access and refresh tokens,
+all JWTs at Keycloak) are looked for by shape (`eyJ….eyJ….`) in the web and Keycloak logs and the
+dump, the scenario's Keycloak admin tokens excepted (their recognition is the positive control), and
+the dump must hold no `"id_token"`, `"access_token"` or `"refresh_token"` field. `oidc.sh` also checks that
+the first web process logged the provider discovery and the break-glass error of decision 11 (no
+local administrator yet), and that the second one did not log that error. Logs are redacted in
+place on exit, whatever the result.
+
+```sh
+e2e/oidc.sh                          # or: make e2e-oidc
+E2E_KEYCLOAK_PORT=9444 e2e/oidc.sh   # if 8444 is taken on 127.0.0.1
+```
+
+The `E2E_OIDC_*` variables of the two configurations are set by `oidc.sh` itself (reset at start).
+Logs go to `e2e/.logs-oidc/` (`E2E_LOG_DIR`, ignored by git). `E2E_SKIP_BUILD=1` reuses the console
+image as for `run.sh` (`E2E_CONSOLE_IMAGE`), and
+`E2E_KEYCLOAK_IMAGE` (local runs only, ignored under GitHub Actions) names a registry mirror of the
+pinned image, which must carry the same digest (e.g.
+`mirror.gcr.io/keycloak/keycloak@sha256:…`).
+
+## CAS target
+ROADMAP P8-D, [ADR-0041](../docs/adr/0041-cas-connector.md) decision 14: a `cas` target with
+Discovery, Audit and the I2 check, and the CAS store guard against a real JPA ticket table.
+[`cas.sh`](cas.sh) merges [`docker-compose.cas.yml`](docker-compose.cas.yml) over this stack (Compose
+project `databastion-e2e-cas`, Compose v2.24 or later for `!override`) and starts only `db`,
+`migrate`, `web`, `worker`, `proxy`, `cas-db`, `cas` and `agent`; [`run.sh`](run.sh) never reads the
+override. The CI job is `e2e-cas` in [`ci.yml`](../.github/workflows/ci.yml) (45 min budget, `cas.sh`
+at most 2400 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`, `dev/cas/`,
+`dev/ground-truth.json`, `dev/docker-compose.yml` or `ci.yml` change, and is not part of the
+required `CI result` check until it has run green on `dev`. It is a job of its own rather than a
+part of `run.sh`: building the CAS overlay (its modules come from Maven Central, locked and
+SHA-256 verified, [dev/README.md](../dev/README.md#apereo-cas)) and starting CAS add about five
+minutes and an external dependency to the required `e2e` job.
+
+| Service | Image | Role |
+|---------|-------|------|
+| `cas` | [`dev/cas`](../dev/cas/Dockerfile) (CAS 8.0.2 overlay: JSON service registry, OIDC, JPA ticket registry) | The dev service's image and configuration ([`cas.properties`](../dev/cas/config/cas.properties), [`log4j2.xml`](../dev/cas/config/log4j2.xml), mounted read-only): static users, the JSON audit trail to `/var/log/cas/cas_audit.log`, tickets encrypted by default. Plain HTTP published on `127.0.0.1:${E2E_CAS_PORT:-8281}` only (the agent never contacts CAS, ADR-0041 decision 9). The users' and database passwords are Docker secrets that a wrapper exports for the CAS process only (`cas.sh` checks that no password is in the container's environment). On `cas-backend` (internal, its database only) and `cas-net` (the published port), never on `agent-net`: `cas.sh` checks that CAS has no `agent-net` endpoint and that, from the agent container's network namespace, `cas` does not resolve and CAS's address does not answer |
+| `cas-db` | PostgreSQL 17 (pinned) | The JPA ticket registry's database `cas` (owner `cas`, network alias `postgres` on `cas-backend` as in the dev JDBC URL), and the agent's PostgreSQL target `casdb-e2e` (`cas-db` on `agent-net`): the agent's role is checked against the ADR-0012 attributes and role settings as in `run.sh`; [`target-initdb/01-agent-role.sh`](target-initdb/01-agent-role.sh) (the ADR-0012 minimal role) and [`40-cas.sh`](target-initdb/40-cas.sh) (the role `cas`, `USAGE` on `public` for the agent, no `PUBLIC` access); once CAS created `cas_tickets`, `cas.sh` grants the agent `SELECT (type, creation_time, expiration_time)` only (ADR-0041 decision 6) and checks the table's shape and grants |
+| `cas-files` | busybox (pinned) | One-shot, no network: [`dev/cas/files-init.sh`](../dev/cas/files-init.sh) on the volumes `cas-registry` (the definitions of [`dev/cas/services`](../dev/cas/services), directory `0750`, files `0640`) and `cas-log` (directory `2750`, the log `0640`), owner the CAS user (10041), group the agent's (10001). CAS mounts them without the image's copy-up (`nocopy`), the agent read-only at `/srv/cas/services` and `/var/log/cas`: nothing it could write, no symlink (ADR-0041 decision 3, [ADR-0043](../docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)); `cas.sh` checks every mode, owner and link count |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Targets `cas-e2e` (`engine: cas`, `json_dir`, `audit_log`, `clear_principals: [svc-monitoring]`, client addresses `truncated` by default) and `casdb-e2e` (`databases: [cas]`, the CAS store guard on by default) |
+
+**Scenario.** The CAS traffic comes from [`cas_scenario.py`](cas_scenario.py) (Python standard
+library, unit tests in [`test_cas_scenario.py`](test_cas_scenario.py)) on the host, as a browser:
+the login form, the credentials, the service ticket from the redirect, its validation. Every login
+uses a fresh cookie jar (no SSO reuse).
+1. The agent is online with both targets; the console lists `engine.cas` (ADR-0042), so the `cas`
+   target is reported: reachable, audit level **None** with `audit.limited_pending_first_record`
+   before any record.
+2. Two `access_event` policies on `cas-e2e` (every `read`; `volume.failed_logins_many_accounts`),
+   Audit enabled on `cas-e2e`.
+3. Two logins of each of the three e-mail users and one of `svc-monitoring`, each with a validated
+   service ticket for `https://intranet.example.org/login` (`Intranet`); then 20 failed logins from
+   the host, each with a distinct typed name (one of them a random password-like string) and a random
+   password: a credential-stuffing burst from one client address.
+4. Discovery of both targets. `cas-e2e`: [`i2_check.py findings`](i2_check.py) with every expected
+   classifier and no negative control, and every `cas` location of the ground truth with an expected
+   classifier found (contacts, the static release value, the required-attribute value, the audit
+   trail's `who`), none on a credential field (`never_sampled`).
+5. Audit: the heartbeat level becomes **Partial** (`cas_audit_log`), with
+   `security.client_secrets_in_clear` (count 1: HR-Portal) and none of the "not seen", unreadable,
+   unsupported-format, dropped, headers, writable or skipped notes. Events, exactly: 6 `connect`
+   fingerprinted plus 1 of `svc-monitoring` in clear, 7 `read` of `service_registry` / `Intranet`
+   (the object-form `what` of CAS 8.0, #143), 16 `auth_failure` with their own fingerprinted
+   principal (the 16th with the signal) and the 4 others in the `*` aggregate with
+   `volume.failed_logins_many_accounts`; every client address truncated to its /24, none stored as CAS
+   logged it; no principal in clear but `svc-monitoring` and `*`; incidents of both policies (failed
+   logins share one incident per client network, ADR-0031 decision 1: the stuffing incident links
+   the `*` aggregate).
+6. CAS store guard, real table: `cas_tickets` holds encoded tickets only; the agent logged
+   `CAS ticket registry: metadata only` with `encrypted` > 0 and `unencrypted` 0 and did not sample
+   it; the next heartbeat reports neither `security.ticket_registry_unencrypted`,
+   `privilege.ticket_credentials_readable` nor `coverage.cas_guard_tripped`; no finding on it.
+7. CAS store guard, clear tickets: the table emptied, CAS restarted with
+   `cas.ticket.registry.jpa.crypto.enabled=false`, one more login per e-mail user with the service
+   tickets left unvalidated (they stay in the table, ids in clear); then, as the superuser, a copy
+   `sso_archive` of the table (clear ids, bodies and principals) and a plain table `app_sessions`
+   holding every service ticket of the run next to contact e-mails, both readable in full by the
+   agent. The run's ticket-granting ticket ids are read from the copy and searched like the service
+   tickets. After a new scan: `security.ticket_registry_unencrypted`,
+   `privilege.ticket_credentials_readable` (count 1: the copy, recognized by its column shape; the
+   real table keeps its column grants) and `coverage.cas_guard_tripped`; no finding on either
+   ticket table nor on `app_sessions.session_ref`, and `app_sessions.contact` found (positive
+   control).
+8. I2 and secret hygiene: no `cas` value of the ground truth (the `never_sampled` client secrets
+   and header included; positive control: a canary file holding one) in a `pg_dump` of the console
+   database, the exports of its Audit tables, the findings, events, incidents and agent pages, the
+   agent's state volume (spool, cursors, settings) or the logs of every container but CAS and
+   `cas-db` (the target side). No service ticket, ticket-granting ticket, ticket-granting cookie,
+   nor SHA-256 / SHA-512 of a ticket, no typed name of a failed login, no password (typed or
+   generated) in the same places (positive control: the copy of the ticket table holds tickets of the
+   run); no generated secret in any log, CAS's included. Also by shape, as `oidc.sh` scans for JWTs:
+   no `(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)-<digits>-<8+ characters>` value in the same places,
+   which covers the tickets never seen on the wire (the ticket-granting tickets of the encrypted
+   phase); positive control: the ids of the ticket table's copy. The pages' scans have their own
+   controls (the events and incidents pages list `svc-monitoring`, the findings page names
+   `cas-e2e`). At the end the CAS audit trail (rotations included) is read again: every typed name
+   must be in it (the control of the typed-name scans), and every ticket-shaped token in it is
+   registered and searched like the run's tickets. CAS's audit appender masks ticket ids (dev's
+   `make dev-cas-smoke` checks it), so the exact ticket values come from the scenario's redirects
+   and the table's copy; their absence is proven by those exact scans and the shape scan. CAS logs
+   the typed names itself: they are redacted from the kept logs like the secrets. The harness reads
+   the console database and, but for its fixtures, the CAS database in read-only transactions.
+
+```sh
+e2e/cas.sh                         # builds the console, agent and CAS images first
+E2E_SKIP_BUILD=1 e2e/cas.sh        # reuse them (E2E_CONSOLE_IMAGE, E2E_AGENT_IMAGE, E2E_CAS_IMAGE)
+E2E_CAS_PORT=9281 e2e/cas.sh       # if 8281 is taken on 127.0.0.1
+```
+
+Logs go to `e2e/.logs-cas/` (`E2E_LOG_DIR`, ignored by git). Behind a TLS-intercepting proxy the CAS
+overlay cannot be built as is (Gradle must trust the proxy's CA): build it beforehand with a local
+Gradle base image that trusts it (`docker build --build-arg GRADLE_IMAGE=<that image> -t
+databastion-dev/cas:8.0.2-overlay dev/cas`, never committed), then run with `E2E_SKIP_BUILD=1`.
+
 ## Load / database impact
 The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to
 measure the database CPU impact of Discovery, the Audit path under a sustained workload and the
-agent's resource use. It runs in its own workflow, outside the required `CI result` check.
+agent's resource use, and, with [`load/cas.sh`](load/README.md#cas-target), the CAS target under a
+login workload. It runs in its own workflow, outside the required `CI result` check.

@@ -20,6 +20,8 @@ use serde::Deserialize;
 
 use crate::engine::Engine;
 
+pub mod cas;
+
 /// Hard upper bound on the rows sampled per object (contract `sample_rows`
 /// range is `1..=10000`).
 pub const SAMPLE_ROWS_RANGE: (u32, u32) = (1, 10_000);
@@ -257,6 +259,8 @@ pub enum TargetEngine {
     Mongodb,
     /// OpenLDAP.
     Openldap,
+    /// Apereo CAS: local files only (`cas:` block; ADR-0041).
+    Cas,
 }
 
 impl TargetEngine {
@@ -268,6 +272,7 @@ impl TargetEngine {
             Self::Mysql | Self::Mariadb => Engine::Mysql,
             Self::Mongodb => Engine::Mongodb,
             Self::Openldap => Engine::Openldap,
+            Self::Cas => Engine::Cas,
         }
     }
 }
@@ -290,11 +295,15 @@ pub struct TargetConfig {
     /// Unix socket path (exclusive with `host`).
     #[serde(default)]
     pub socket: Option<PathBuf>,
-    /// Least-privilege read-only account (I4).
+    /// Least-privilege read-only account (I4). Required for every engine
+    /// except `cas`, where it is refused (a `cas` target reads local files
+    /// only, ADR-0041 decision 3).
+    #[serde(default)]
     pub account: String,
     /// Where the account secret is read from. Never the secret itself (I3).
     /// Required for every target except an OpenLDAP target that binds with
-    /// SASL `EXTERNAL` (`openldap.bind: sasl_external`), where it is refused.
+    /// SASL `EXTERNAL` (`openldap.bind: sasl_external`) and a `cas` target,
+    /// where it is refused.
     #[serde(default)]
     pub secret: SecretRef,
     /// Region of national phone numbers without `+` in this target (`fr`),
@@ -314,6 +323,14 @@ pub struct TargetConfig {
     /// OpenLDAP settings (`engine: openldap` only).
     #[serde(default)]
     pub openldap: Option<OpenldapTargetConfig>,
+    /// Apereo CAS settings (`engine: cas` only, required there): local
+    /// paths only.
+    #[serde(default)]
+    pub cas: Option<cas::RawCasSettings>,
+    /// The `cas` block validated and its paths resolved when the
+    /// configuration was loaded ([`AgentConfig::parse`]).
+    #[serde(skip)]
+    cas_resolved: Option<cas::CasSettings>,
 }
 
 /// Maximum number of databases declared for one PostgreSQL target.
@@ -346,6 +363,12 @@ pub struct PostgresTargetConfig {
     /// Without it, Audit uses `pg_stat_statements` (Limited).
     #[serde(default)]
     pub audit_log: Option<PgAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a PostgreSQL server log file.
@@ -383,6 +406,7 @@ impl Default for PostgresTargetConfig {
             ca_file: None,
             extended_grants: false,
             audit_log: None,
+            cas_stores: None,
         }
     }
 }
@@ -438,6 +462,12 @@ pub struct MysqlTargetConfig {
     /// (Partial or Limited).
     #[serde(default)]
     pub audit_log: Option<MysqlAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a MySQL / MariaDB audit log file.
@@ -520,6 +550,12 @@ pub struct MongodbTargetConfig {
     /// uses the profiler when the account can read `system.profile`.
     #[serde(default)]
     pub audit_log: Option<MongodbAuditLogConfig>,
+    /// CAS stores under custom names (ADR-0041 decision 5): tables or
+    /// collections the CAS store guard treats as a ticket registry, a
+    /// service registry or an audit trail, in addition to the built-in
+    /// names, column shapes and the ticket-id tripwire (always on).
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 /// Format of a MongoDB log file read by the Audit connector.
@@ -556,6 +592,7 @@ impl Default for MongodbTargetConfig {
             ca_file: None,
             auth_source: default_mongodb_auth_source(),
             audit_log: None,
+            cas_stores: None,
         }
     }
 }
@@ -632,6 +669,13 @@ pub struct OpenldapTargetConfig {
     /// agent's own DN is always sent by name.
     #[serde(default)]
     pub clear_principals: Vec<String>,
+    /// CAS stores under custom names (ADR-0041 decision 5): LDAP object
+    /// classes of service registry entries (`service_registry`; their
+    /// entries are classified without masked samples nor `secret.*`
+    /// fingerprints) and of ticket entries (`ticket_registry`; never
+    /// read). `audit_trail` is not used on OpenLDAP.
+    #[serde(default)]
+    pub cas_stores: Option<crate::cas_guard::CasStores>,
 }
 
 fn default_accesslog_base() -> String {
@@ -646,6 +690,7 @@ impl Default for OpenldapTargetConfig {
             bind: OpenldapBind::default(),
             accesslog_base: default_accesslog_base(),
             clear_principals: Vec::new(),
+            cas_stores: None,
         }
     }
 }
@@ -692,6 +737,28 @@ pub enum OpenldapBind {
 }
 
 impl TargetConfig {
+    /// The `cas_stores` lists of the target's engine block (PostgreSQL,
+    /// MySQL / MariaDB, MongoDB, OpenLDAP), if any.
+    #[must_use]
+    pub fn cas_stores(&self) -> Option<&crate::cas_guard::CasStores> {
+        match self.engine {
+            TargetEngine::Postgres => self.postgres.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Mysql | TargetEngine::Mariadb => self.mysql.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Mongodb => self.mongodb.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Cas => None,
+        }
+    }
+
+    /// The validated `cas` block of an `engine: cas` target, its paths
+    /// resolved when the configuration was loaded. `None` for other
+    /// engines (and for a target that did not come from
+    /// [`AgentConfig::parse`]).
+    #[must_use]
+    pub fn cas_settings(&self) -> Option<&cas::CasSettings> {
+        self.cas_resolved.as_ref()
+    }
+
     /// OpenLDAP settings, defaults when absent.
     #[must_use]
     pub fn openldap_settings(&self) -> OpenldapTargetConfig {
@@ -706,6 +773,8 @@ impl TargetConfig {
     pub fn effective_port(&self) -> Option<u16> {
         self.host.as_ref()?;
         Some(self.port.unwrap_or(match self.engine {
+            // A `cas` target has no host (refused by the validation).
+            TargetEngine::Cas => return None,
             TargetEngine::Postgres => 5432,
             TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
             TargetEngine::Mongodb => 27017,
@@ -898,6 +967,15 @@ const KNOWN_KEYS: &[&str] = &[
     "sasl_external",
     "accesslog_base",
     "clear_principals",
+    "cas",
+    "service_registry",
+    "json_dir",
+    "yaml_dir",
+    "timezone",
+    "client_addr",
+    "clear",
+    "truncated",
+    "omitted",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -995,7 +1073,33 @@ impl AgentConfig {
             }
         })?;
         config.validate()?;
+        let mut config = config;
+        config.resolve_cas()?;
         Ok(config)
+    }
+
+    /// Validates the `cas:` blocks and resolves their paths (blocking I/O:
+    /// `canonicalize`), refusing paths under the agent's own state
+    /// directory (ADR-0041 decision 3).
+    fn resolve_cas(&mut self) -> Result<(), ConfigError> {
+        let state_dir = self.state_dir.clone();
+        for (i, target) in self.targets.iter_mut().enumerate() {
+            if let Some(raw) = target.cas.clone() {
+                let settings =
+                    cas::CasSettings::validate(raw, &[state_dir.as_path()]).map_err(|e| {
+                        ConfigError::Invalid {
+                            field: if e.key.is_empty() {
+                                format!("targets[{i}].cas")
+                            } else {
+                                format!("targets[{i}].cas.{}", e.key)
+                            },
+                            reason: e.reason,
+                        }
+                    })?;
+                target.cas_resolved = Some(settings);
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1147,6 +1251,12 @@ impl TargetConfig {
                 "must be a slug matching ^[a-z0-9][a-z0-9_.-]{0,62}$",
             ));
         }
+        if self.cas.is_some() && self.engine != TargetEngine::Cas {
+            return Err(invalid(f("cas"), "only for engine cas"));
+        }
+        if self.engine == TargetEngine::Cas {
+            return self.validate_cas(i);
+        }
         match (&self.host, &self.socket) {
             (Some(host), None) => {
                 if host.is_empty() || host.len() > 253 || host.chars().any(char::is_control) {
@@ -1179,6 +1289,28 @@ impl TargetConfig {
                 f("account"),
                 "must be 1 to 128 characters without control characters",
             ));
+        }
+        for (block, stores) in [
+            (
+                "postgres",
+                self.postgres.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "mysql",
+                self.mysql.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "mongodb",
+                self.mongodb.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+            (
+                "openldap",
+                self.openldap.as_ref().and_then(|c| c.cas_stores.as_ref()),
+            ),
+        ] {
+            if let Some(Err((key, reason))) = stores.map(crate::cas_guard::CasStores::validate) {
+                return Err(invalid(f(&format!("{block}.cas_stores.{key}")), reason));
+            }
         }
         if let Some(pg) = &self.postgres {
             self.validate_postgres(pg, i)?;
@@ -1244,6 +1376,35 @@ impl TargetConfig {
                 "exactly one of env or file is required",
             )),
         }
+    }
+
+    /// A `cas` target is a set of local paths (ADR-0041 decision 3, I3,
+    /// I5): no host, port, socket, account, secret nor engine block of
+    /// another engine. The `cas` block itself is validated and resolved by
+    /// [`AgentConfig::resolve_cas`].
+    fn validate_cas(&self, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].{name}");
+        let refused = [
+            ("host", self.host.is_some()),
+            ("port", self.port.is_some()),
+            ("socket", self.socket.is_some()),
+            ("account", !self.account.is_empty()),
+            ("secret", self.secret != SecretRef::default()),
+            ("postgres", self.postgres.is_some()),
+            ("mysql", self.mysql.is_some()),
+            ("mongodb", self.mongodb.is_some()),
+            ("openldap", self.openldap.is_some()),
+        ];
+        if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
+            return Err(invalid(
+                f(name),
+                "not used by a cas target, which reads local files only (remove it)",
+            ));
+        }
+        if self.cas.is_none() {
+            return Err(invalid(f("cas"), "required for engine cas"));
+        }
+        Ok(())
     }
 
     fn validate_postgres_tls(&self, i: usize) -> Result<(), ConfigError> {
@@ -1455,6 +1616,102 @@ targets:
         parse(text).unwrap_err().to_string()
     }
 
+    const CAS: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: cas-prod
+    engine: cas
+    cas:
+      service_registry:
+        json_dir: /etc/cas/services
+      audit_log:
+        path: /var/log/cas/cas_audit.log
+        timezone: \"+02:00\"
+      clear_principals: [svc-monitoring]
+";
+
+    #[test]
+    fn cas_targets_are_local_paths_only() {
+        let cfg = parse(CAS).unwrap();
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Cas);
+        assert_eq!(t.engine.connector(), Engine::Cas);
+        assert_eq!(t.effective_port(), None);
+        let s = t.cas_settings().unwrap();
+        assert!(s.registry_dir.is_some());
+        let log = s.audit_log.as_ref().unwrap();
+        assert_eq!(log.offset, cas::UtcOffset(7200));
+        assert_eq!(s.client_addr, cas::ClientAddrMode::Truncated);
+        assert_eq!(s.clear_principals, ["svc-monitoring"]);
+        // No host, port, socket, account, secret nor another engine's block.
+        for (extra, key) in [
+            ("    host: cas.example.org\n", "targets[0].host"),
+            ("    port: 8443\n", "targets[0].port"),
+            ("    socket: /run/cas.sock\n", "targets[0].socket"),
+            ("    account: databastion\n", "targets[0].account"),
+            (
+                "    secret:\n      env: DATABASTION_CAS\n",
+                "targets[0].secret",
+            ),
+            ("    openldap: {tls: start_tls}\n", "targets[0].openldap"),
+        ] {
+            let text = CAS.replace("    engine: cas\n", &format!("    engine: cas\n{extra}"));
+            assert!(err(&text).contains(key), "{extra}: {}", err(&text));
+        }
+        // The block is required, and only for engine cas.
+        let bare = "console:\n  url: https://c.example\nstate_dir: /s\ntargets:\n  - id: c\n    engine: cas\n";
+        assert!(err(bare).contains("targets[0].cas"));
+        let misplaced = BASE.replace(
+            "    port: 5432\n",
+            "    port: 5432\n    cas: {audit_log: {path: /var/log/cas/a.log}}\n",
+        );
+        assert!(err(&misplaced).contains("targets[0].cas"));
+        // The block's own rules, named by key, never by value.
+        for (from, to, key) in [
+            (
+                "        path: /var/log/cas/cas_audit.log",
+                "        path: var/log/hunter2-SECRET.log",
+                "targets[0].cas.audit_log.path",
+            ),
+            (
+                "      clear_principals: [svc-monitoring]",
+                "      clear_principals: [\"*\"]",
+                "targets[0].cas.clear_principals",
+            ),
+            (
+                "        json_dir: /etc/cas/services",
+                "        json_dir: /var/lib/databastion/services",
+                "targets[0].cas.service_registry.json_dir",
+            ),
+            (
+                "        json_dir: /etc/cas/services",
+                "        yaml_dir: /etc/cas/services",
+                "targets[0].cas.service_registry.yaml_dir",
+            ),
+            (
+                "        timezone: \"+02:00\"",
+                "        timezone: Europe/Paris",
+                "targets[0].cas.audit_log.timezone",
+            ),
+        ] {
+            let message = err(&CAS.replace(from, to));
+            assert!(message.contains(key), "{to}: {message}");
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+        assert!(
+            err(&CAS.replace(
+                "      clear_principals",
+                "      password: x\n      clear_principals"
+            ))
+            .contains("unknown field")
+        );
+        // Other engines still need an account.
+        let no_account = BASE.replacen("    account: databastion\n", "", 1);
+        assert!(err(&no_account).contains("account"), "{}", err(&no_account));
+    }
+
     #[test]
     fn example_file_is_valid() {
         let text = include_str!("../../../agent.example.yaml");
@@ -1511,6 +1768,38 @@ targets:
         let message = err(&text);
         assert!(message.contains("secret.env"), "{message}");
         assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    /// ADR-0041 decision 5: `targets[].<engine>.cas_stores`, bounded.
+    #[test]
+    fn cas_stores_are_per_engine_block_and_bounded() {
+        let yaml = |block: &str| {
+            format!(
+                "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - {{id: t, \
+                 engine: postgres, host: db, account: a, secret: {{env: PW}}, postgres: {{{block}}}}}\n"
+            )
+        };
+        let c = AgentConfig::parse(&yaml(
+            "cas_stores: {ticket_registry: [sso_tix], service_registry: [Apps], audit_trail: [Trail]}",
+        ))
+        .unwrap();
+        let stores = c.targets[0].cas_stores().unwrap();
+        assert_eq!(stores.ticket_registry, ["sso_tix"]);
+        assert_eq!(stores.audit_trail, ["Trail"]);
+        assert!(
+            AgentConfig::parse(&yaml("databases: [shop]"))
+                .unwrap()
+                .targets[0]
+                .cas_stores()
+                .is_none()
+        );
+        let e = AgentConfig::parse(&yaml("cas_stores: {ticket_registry: [\"\"]}")).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("postgres.cas_stores.ticket_registry"),
+            "{e}"
+        );
+        assert!(AgentConfig::parse(&yaml("cas_stores: {tickets: [x]}")).is_err());
     }
 
     #[test]

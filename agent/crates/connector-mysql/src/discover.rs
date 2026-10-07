@@ -17,6 +17,7 @@
 
 use databastion_classifiers::masking::{FindingLocation, RawSample, RawValue};
 use databastion_classifiers::names::{NormalizedName, PathPart, normalize_field_path};
+use databastion_core::cas_guard::{self, CasStores, StoreKind, TicketCounts};
 use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 
@@ -148,10 +149,16 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                     .map_err(|e| fail(target, e))?
             }
         };
+        job.begin_database(&unit.schema);
         let db = normalize(&unit.schema);
         let object = normalize(&unit.name);
         let sampled = match job
-            .paced(sample_table(&mut current, unit, job.sample_rows()))
+            .paced(sample_table(
+                &mut current,
+                unit,
+                job.sample_rows(),
+                job.cas_stores(),
+            ))
             .await?
         {
             Paced::Done(s) => s,
@@ -228,6 +235,40 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                 "virtual generated columns not sampled (computed on read)"
             );
         }
+        if sample.kind == Some(StoreKind::TicketRegistry) {
+            // CAS store guard (ADR-0041 decision 5): metadata only, never
+            // sampled: a kind of object the connector does not sample.
+            sink.add_coverage(ScanCoverage {
+                unsupported: 1,
+                ..ScanCoverage::default()
+            });
+            match &sample.tickets {
+                Some(counts) => job.record_ticket_registry(counts),
+                None => tracing::info!(
+                    target_id = %target.id,
+                    database = db.as_str(),
+                    object = object.as_str(),
+                    "CAS ticket registry without a readable type column: encryption not \
+                     evaluated"
+                ),
+            }
+            tracing::info!(
+                target_id = %target.id,
+                database = db.as_str(),
+                object = object.as_str(),
+                "CAS ticket registry: not sampled (CAS store guard, metadata only)"
+            );
+            continue;
+        }
+        if let Some(kind) = sample.kind {
+            tracing::info!(
+                target_id = %target.id,
+                database = db.as_str(),
+                object = object.as_str(),
+                store = kind.as_str(),
+                "CAS store guard applied"
+            );
+        }
         sink.add_coverage(ScanCoverage {
             sampled: 1,
             ..ScanCoverage::default()
@@ -235,7 +276,8 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         // No transaction is open from here on.
         for (column, values) in &sample.columns {
             let samples: Vec<RawSample<'_>> = values.iter().map(RawValue::as_sample).collect();
-            for finding in job.classify(column, &samples) {
+            let rule = cas_guard::column_rule(sample.kind, column);
+            for finding in job.classify_guarded(column, &samples, rule) {
                 let mut finding = finding.into_finding(FindingLocation {
                     database: db.clone(),
                     schema: None,
@@ -337,6 +379,11 @@ pub(crate) struct TableSample {
     pub(crate) rows: u32,
     /// `TABLE_ROWS` (an estimate for InnoDB).
     pub(crate) estimated_rows: Option<u64>,
+    /// The CAS store the table is (CAS store guard), if any.
+    pub(crate) kind: Option<StoreKind>,
+    /// A ticket registry's metadata (`None`: not a ticket registry, or its
+    /// `type` column is not readable).
+    pub(crate) tickets: Option<TicketCounts>,
 }
 
 impl std::fmt::Debug for TableSample {
@@ -405,9 +452,10 @@ pub(crate) async fn sample_table(
     session: &mut Session,
     table: &Table,
     limit: u32,
+    stores: Option<&CasStores>,
 ) -> Result<TableSample, MyError> {
     let mut tx = session.begin().await?;
-    match read_table(&mut tx, table, limit).await {
+    match read_table(&mut tx, table, limit, stores).await {
         Ok(sample) => {
             tx.commit().await?;
             Ok(sample)
@@ -423,6 +471,7 @@ async fn read_table(
     tx: &mut ReadTx<'_>,
     table: &Table,
     limit: u32,
+    stores: Option<&CasStores>,
 ) -> Result<TableSample, MyError> {
     let mut sample = TableSample {
         columns: Vec::new(),
@@ -430,6 +479,8 @@ async fn read_table(
         virtual_columns: 0,
         rows: 0,
         estimated_rows: None,
+        kind: None,
+        tickets: None,
     };
     // The engine is checked again in this transaction (a table altered to
     // a remote engine since the introspection is not read). The engine is
@@ -467,6 +518,50 @@ async fn read_table(
     let statement = sql::columns(&table.schema, &table.name)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Columns))?;
     let rows = tx.query(Stage::Columns, &statement).await?;
+    // CAS store guard (ADR-0041 decision 5): by name, else by the shape of
+    // the columns the account can see.
+    sample.kind = cas_guard::recognize(
+        stores,
+        [table.name.as_str()],
+        rows.iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_deref())),
+    );
+    if sample.kind == Some(StoreKind::TicketRegistry) {
+        let type_column = rows
+            .iter()
+            .filter(|r| {
+                r.get(3)
+                    .and_then(|v| v.as_deref())
+                    .is_some_and(|p| p.split(',').any(|p| p.trim() == "select"))
+            })
+            .filter_map(|r| r.first().and_then(|v| v.as_deref()))
+            .find(|c| cas_guard::name_key(c) == "type")
+            .map(str::to_owned);
+        sample.readable = true;
+        if let Some(column) = type_column {
+            let statement = sql::ticket_type_counts(
+                tx.flavor(),
+                tx.timeouts().statement_ms(),
+                &table.schema,
+                &table.name,
+                &column,
+            )
+            .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
+            let mut counts = TicketCounts::default();
+            for row in tx.query(Stage::Sample, &statement).await? {
+                let kind = row.first().cloned().flatten().unwrap_or_default();
+                let n = row
+                    .get(1)
+                    .cloned()
+                    .flatten()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                counts.add(&kind, n);
+            }
+            sample.tickets = Some(counts);
+        }
+        return Ok(sample);
+    }
     let mut cols: Vec<(String, Sampled)> = Vec::new();
     let mut readable = false;
     let mut virtual_columns = 0usize;
@@ -484,7 +579,9 @@ async fn read_table(
             virtual_columns += 1;
             continue;
         }
-        if name.is_empty() {
+        if name.is_empty()
+            || cas_guard::column_rule(sample.kind, &name) == cas_guard::ColumnRule::NeverRead
+        {
             continue;
         }
         if let Some(kind) = sampled_kind(&data_type) {
