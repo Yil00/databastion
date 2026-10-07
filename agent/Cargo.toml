@@ -16,7 +16,7 @@ members = [
 # `version` is rewritten by scripts/bump-version.mjs: keep it the first
 # `version` key of this section.
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 # The real minimum (let-chains in the classifiers, and `regress` 0.12 through the protocol crate,
 # need 1.88), checked by the "Agent MSRV" CI job; release.yml pins the same toolchain.
