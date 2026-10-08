@@ -134,6 +134,12 @@ owner has no `CREATEROLE`); with the example compose file,
 [deploy/initdb/10-databastion-roles.sh](../deploy/initdb/10-databastion-roles.sh) does it at the
 first database initialization, reading the passwords from the Docker secret files inside psql
 (never on a command line). The worker runs pg-boss with `schema: 'pgboss'`, `createSchema: false`.
+pg-boss schema upgrades are not console migrations: the worker applies them at startup as the
+runtime role (e.g. pg-boss 12.36's schema 44 and its `pgboss.instance` table), which owns every
+pg-boss table, so they need no new grant. `pgboss.instance` holds one row per pg-boss instance
+(worker, web sender): host name, pid, versions, pool and process figures, queue names and an
+allow-list of pg-boss options; no connection string, password or job data
+(`registerInstance: true`, see `pgBossOptions` in `src/worker/queues.ts`).
 
 At startup, the web and worker processes log a warning if their database role is a superuser or
 owns `audit_log`, if it can delete incidents or rewrite their snapshot columns, or if it can
