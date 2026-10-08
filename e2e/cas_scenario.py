@@ -57,7 +57,7 @@ MAX_BODY = 4 * 1024 * 1024
 CAS_NS = {"cas": "http://www.yale.edu/tp/cas"}
 _EXECUTION = re.compile(r'name="execution"\s+value="([^"]+)"')
 # Ticket ids of CAS (ADR-0041 decision 5, the tripwire's shape): a prefix, a counter, then more.
-TICKET_RE = re.compile(r"^(TGT|ST|PT|PGT|OC|AT|RT|[A-Z]{2,4})-\d+-[A-Za-z0-9._-]+$")
+TICKET_RE = re.compile(r"^(TGT|ST|PT|PGT|OC|AT|RT|[A-Z]{2,8})-\d+-[A-Za-z0-9._-]+$")
 
 
 class ScenarioError(Exception):

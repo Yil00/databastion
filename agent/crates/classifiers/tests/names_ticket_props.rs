@@ -12,7 +12,7 @@ use proptest::prelude::*;
 fn ticket() -> impl Strategy<Value = (String, String)> {
     (
         prop_oneof![
-            "(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)",
+            "(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR|SART|SATQ|STS)",
             // The generic shape.
             "[A-Z]{2,8}",
         ],

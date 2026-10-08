@@ -8,7 +8,8 @@
 //!   action filters live in the CAS configuration the agent must not read,
 //!   and `what` is dropped.
 //! - **Partial**: an `AUTHENTICATION_SUCCESS` record **and** a
-//!   service-ticket issuance record in the last 24 h; with
+//!   service-ticket or token issuance record (`SERVICE_TICKET_CREATED`,
+//!   `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`) in the last 24 h; with
 //!   `audit.auth_failures_not_seen` when no `AUTHENTICATION_FAILED` was
 //!   parsed in the last 7 days.
 //! - **Limited**: a valid record in the last 24 h, but not both kinds
@@ -180,6 +181,28 @@ mod tests {
                 CasNoteCode::AuditServiceTicketRecordsNotSeen
             ]
         );
+    }
+
+    /// ADR-0041 decision 10: an OAuth / OIDC token issuance counts like a
+    /// service ticket (an OAuth-only deployment, e.g. `client_credentials`
+    /// and `refresh_token` grants, writes no `SERVICE_TICKET_CREATED`).
+    #[test]
+    fn token_issuance_proves_issuance() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let ago = |h: u64| now - Duration::from_secs(h * H);
+        let mut e = Evidence::default();
+        e.note(&rec("AUTHENTICATION_SUCCESS", ago(2)), now);
+        for other in [
+            "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+            "OIDC_ID_TOKEN_CREATED",
+            "OAUTH2_AUTHORIZATION_RESPONSE_CREATED",
+            "OAUTH2_USER_PROFILE_CREATED",
+        ] {
+            e.note(&rec(other, ago(1)), now);
+            assert_eq!(e.level(now).0, AuditLevel::Limited, "{other}");
+        }
+        e.note(&rec("OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED", ago(3)), now);
+        assert_eq!(e.level(now).0, AuditLevel::Partial);
     }
 
     #[test]

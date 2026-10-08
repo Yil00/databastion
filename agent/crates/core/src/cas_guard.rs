@@ -162,8 +162,25 @@ pub fn name_key(name: &str) -> String {
 }
 
 /// Built-in ticket registry names: the JPA table (`CasTickets` /
-/// `cas_tickets`, verified) and the MongoDB ticket collections (CAS 8.0
-/// defaults, to verify).
+/// `cas_tickets`, verified on the CAS 8.0.2 dev service) and the MongoDB
+/// ticket collections of CAS 8.0.2, verified against its jars (`javap`):
+/// the five collections of the MongoDB ticket registry's
+/// `MongoDbTicketCatalogConfigurationValuesProvider`, and the default
+/// storage names of the OAuth 2.0 / OIDC tickets (`OAuthCodeProperties`,
+/// `OAuthAccessTokenProperties`, `OAuthRefreshTokenProperties`,
+/// `OAuthDeviceTokenProperties`, `OAuthDeviceUserCodeProperties`,
+/// `OidcCibaProperties`, `OidcPushedAuthorizationProperties`) and of the
+/// SAML2 IdP tickets (`SamlIdPTicketProperties` defaults, read from the
+/// CAS 8.0.2 configuration model jar; the SAML2 IdP catalog configurer
+/// that applies them was not checked) and of the WS-Federation security
+/// token tickets (`wsSecurityTokenTicketsCache`, set by
+/// `CasWsSecurityTokenTicketCatalogConfiguration` in
+/// `cas-server-support-ws-sts` 8.0.2), which the MongoDB ticket
+/// registry uses as collection names (`TicketDefinitionProperties`
+/// `storageName`). The last names are **legacy aliases**, kept fail closed:
+/// the names assumed before the CAS 8.0.2 check (`oauth*Collection`,
+/// `casTicketsCollection`), which an operator may also have set as storage
+/// names; recognizing them costs nothing but a guarded collection.
 const TICKET_REGISTRY_NAMES: &[&str] = &[
     "castickets",
     "ticketgrantingticketscollection",
@@ -171,6 +188,17 @@ const TICKET_REGISTRY_NAMES: &[&str] = &[
     "proxyticketscollection",
     "proxygrantingticketscollection",
     "transientsessionticketscollection",
+    "oauthcodescache",
+    "oauthaccesstokenscache",
+    "oauthrefreshtokenscache",
+    "oauthdevicetokenscache",
+    "oauthdeviceusercodescache",
+    "oidccibarequestscache",
+    "oidcpushedauthzrequestscache",
+    "samlartifactscache",
+    "samlattributequerycache",
+    "wssecuritytokenticketscache",
+    // Legacy aliases (not CAS 8.0.2 defaults; see above).
     "oauthcodescollection",
     "oauthaccesstokenscollection",
     "oauthrefreshtokenscollection",
@@ -180,8 +208,10 @@ const TICKET_REGISTRY_NAMES: &[&str] = &[
 ];
 
 /// Built-in service registry names: the JPA table (`RegisteredServices`,
-/// verified), the MongoDB collection and the LDAP object class (CAS
-/// defaults, to verify).
+/// verified), the MongoDB collection (`cas-service-registry`, the CAS 8.0.2
+/// default of `MongoDbServiceRegistryProperties`) and the LDAP object class
+/// (`casRegisteredService`, the CAS 8.0.2 default of
+/// `LdapServiceRegistryProperties`).
 const SERVICE_REGISTRY_NAMES: &[&str] = &[
     "registeredservices",
     "casserviceregistry",
@@ -189,7 +219,8 @@ const SERVICE_REGISTRY_NAMES: &[&str] = &[
 ];
 
 /// Built-in audit trail names: the JDBC table (`COM_AUDIT_TRAIL`,
-/// verified) and the MongoDB collection (CAS default, to verify).
+/// verified) and the MongoDB collection (`MongoDbCasAuditRepository`, the
+/// CAS 8.0.2 default of `AuditMongoDbProperties`).
 const AUDIT_TRAIL_NAMES: &[&str] = &["comaudittrail", "mongodbcasauditrepository"];
 
 fn builtin_kind(key: &str) -> Option<StoreKind> {
@@ -825,6 +856,24 @@ mod tests {
             "public.CasTickets",
             "cas.cas_tickets",
             "ticketGrantingTicketsCollection",
+            "serviceTicketsCollection",
+            "proxyTicketsCollection",
+            "proxyGrantingTicketsCollection",
+            "transientSessionTicketsCollection",
+            "oauthCodesCache",
+            "oauthAccessTokensCache",
+            "oauthRefreshTokensCache",
+            "oauthDeviceTokensCache",
+            "oauthDeviceUserCodesCache",
+            "oidcCibaRequestsCache",
+            "oidcPushedAuthzRequestsCache",
+            "samlArtifactsCache",
+            "samlAttributeQueryCache",
+            "wsSecurityTokenTicketsCache",
+            // Legacy aliases, kept fail closed.
+            "oauthAccessTokensCollection",
+            "oauthCodesCollection",
+            "casTicketsCollection",
         ] {
             assert_eq!(
                 recognize_name(None, [n]),
@@ -836,6 +885,7 @@ mod tests {
             "RegisteredServices",
             "registered_services",
             "cas-service-registry",
+            "casRegisteredService",
         ] {
             assert_eq!(
                 recognize_name(None, [n]),
@@ -843,7 +893,12 @@ mod tests {
                 "{n}"
             );
         }
-        for n in ["COM_AUDIT_TRAIL", "com_audit_trail", "ComAuditTrail"] {
+        for n in [
+            "COM_AUDIT_TRAIL",
+            "com_audit_trail",
+            "ComAuditTrail",
+            "MongoDbCasAuditRepository",
+        ] {
             assert_eq!(
                 recognize_name(None, [n]),
                 Some(StoreKind::AuditTrail),

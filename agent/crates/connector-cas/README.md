@@ -130,14 +130,33 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 
 - `AUTHENTICATION_SUCCESS` → `connect`, `AUTHENTICATION_FAILED` →
   `auth_failure`, `SERVICE_TICKET_CREATED` → `read` of the matching service,
-  `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`; other actions are
-  counted only.
+  `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED` (OAuth 2.0 / OIDC tokens issued by
+  the token endpoint, any grant) → `read` of `*` (CAS 8.0.2 writes no service
+  in that record), `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`;
+  other actions are counted only.
+- OAuth 2.0 / OIDC action names and `what` shapes were taken from the CAS
+  8.0.2 dev service (authorization code, implicit, `refresh_token`,
+  `client_credentials`, `password`): real records, token values redacted, in
+  [fixtures/cas-8.0.2-oauth-oidc-audit.jsonl](fixtures/cas-8.0.2-oauth-oidc-audit.jsonl)
+  (the client `scratch-m2m` and `https://m2m.example.org/cb` come from a
+  local-only service definition with every grant enabled, not from the dev
+  registry). An authorization code login writes `SERVICE_TICKET_CREATED`
+  (`service` = the redirect URI) and then the token response: two `read`
+  events. `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` (`who` `audit:unknown`),
+  `OIDC_ID_TOKEN_CREATED` (its `what` holds the ID token and the token
+  request's `Authorization` header, client secret included),
+  `OAUTH2_AUTHORIZATION_RESPONSE_CREATED` and `OAUTH2_USER_PROFILE_CREATED`
+  are counted only; their `what` is never read.
 - `what` (which can hold a ticket id, a live SSO bearer credential) is a
   string or, as CAS 8.0 writes it, an object such as
   `{"service": "https://…", "ticketId": "ST-1-…"}`: from an object only the
   string `service` is read, every other key (`ticketId`, `principal`,
   `credential`…) and nested value is skipped without being copied, and a
-  duplicate `service` drops the record. It is reduced
+  duplicate `service` drops the record. Kept keys and values are borrowed
+  from the line (held by the tailer in a zeroizing buffer) as raw JSON and
+  unescaped by the crate (`parse/jtext.rs`) into zeroizing buffers sized once,
+  so `serde_json`'s private scratch buffer, which is never wiped, receives no
+  string of the record. It is reduced
   to the service URL's scheme and host at parse time, used only to pick a
   registry entry, then dropped. Ticket ids are never kept, logged,
   fingerprinted nor reported. Only a literal `@` ends a userinfo there; an
@@ -170,11 +189,10 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   `EventPrincipal::many_accounts`: the core sends `db_user` `*` only for it,
   on a `cas_audit_log` `auth_failure` with the many-accounts signal.
 - Level: never Full; Partial with a successful authentication and a service
-  ticket in the last 24 h; Limited with one of them; None before any record.
+  ticket or token issuance (`OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`) in the
+  last 24 h; Limited with one of them; None before any record.
 
 ## Not done yet
 
-YAML registries, the OIDC / OAuth token issuance actions (names to verify
-against CAS 8.0), the CAS store guard in the other connectors (ticket
-registry metadata, `security.ticket_registry_unencrypted`), the CAS dev
-service and the end-to-end, I2 and load tests (P8-D).
+YAML registries (ROADMAP phase 8 follow-ups), and the records of the OAuth 2.0
+device authorization grant (not exercised against CAS 8.0.2).
