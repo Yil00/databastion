@@ -639,7 +639,7 @@ mod tests {
     use std::time::SystemTime;
 
     use databastion_classifiers::masking::{EventObject, EventPrincipal, EventSource, Signal};
-    use databastion_classifiers::names::normalize_path;
+    use databastion_classifiers::names::{NormalizedName, normalize_path};
 
     use super::*;
     use crate::config::{Limits, TargetConfig};
@@ -757,6 +757,21 @@ mod tests {
         assert_eq!(out[0].aggregated_count(), 3);
         assert!(out[0].always_report());
         assert!(reportable(&c, &out[0]));
+        // A read of `*` (code out of sight, unreadable text) marked by its
+        // connector: never matches `sensitive_objects`, still reported.
+        let star = MaskedEvent::new(
+            EventSource::MariadbServerAudit,
+            EventAction::Read,
+            EventPrincipal::account("u"),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        )
+        .with_object(EventObject::new(
+            normalize_path("shop"),
+            None,
+            NormalizedName::wildcard(),
+        ));
+        assert!(!reportable(&c, &star));
+        assert!(reportable(&c, &star.with_always_report()));
     }
 
     #[test]

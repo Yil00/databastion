@@ -47,9 +47,12 @@
 //! schema-qualified function call) adds `*`. A text with several
 //! statements takes the action of its most reportable one. A statement
 //! that writes or changes something, runs code out of sight or cannot be
-//! read is never left out as the agent's own (I4); changes that touch a
-//! system schema, configuration DDL and unreadable changes are marked
-//! always reported (never dropped by `min_rows`). A read or write whose objects cannot be told
+//! read is never left out as the agent's own (I4), unless table records
+//! that all read decide for an unreadable text. Changes that touch a
+//! system schema, configuration DDL (audit log administration functions
+//! included), code out of sight and unreadable texts are marked always
+//! reported (never dropped by `min_rows`). Read signals are computed per
+//! read statement, whatever the event's action. A read or write whose objects cannot be told
 //! (text that does not lex, `CALL`) is reported against `*`. Statements
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
@@ -830,10 +833,17 @@ impl EventBuilder {
         // sight, a text that cannot be read): the agent only reads (I4)
         // and never sends these, so such a statement with its identity is
         // never left out as its own.
+        //
+        // An unreadable text with table records that all read (a name
+        // ending in a non-ASCII character before a backtick trips the
+        // multibyte rule) is decided by its records: they name what it
+        // read.
+        let blind =
+            unparsed && (a.tables.is_empty() || a.tables.iter().any(|t| t.2 != TableOp::Read));
         let changes = is_change_kind(kind)
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
-            || unparsed
+            || blind
             || a.tables
                 .iter()
                 .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
@@ -933,16 +943,24 @@ impl EventBuilder {
                             .any(|r| system(r.schema.as_deref().unwrap_or(a.database)))
                     })));
         let configuration = parts.iter().any(|p| {
-            p.kind == StatementKind::Ddl
-                && matches!(
-                    p.lead.first().map(String::as_str),
-                    Some("set" | "install" | "uninstall")
-                )
+            p.audit_function
+                || p.kind == StatementKind::Ddl
+                    && matches!(
+                        p.lead.first().map(String::as_str),
+                        Some("set" | "install" | "uninstall")
+                    )
         });
-        if touches_system || configuration || (unparsed && action != EventAction::Read) {
+        // Also reads of `*`: code that runs out of sight or a text that
+        // cannot be read never matches `sensitive_objects` and has no
+        // useful row count, so `min_rows` would drop it.
+        if touches_system || configuration || call || blind {
             e = e.with_always_report();
         }
-        if action == EventAction::Read {
+        // Read signals per read statement, whatever the event's action (a
+        // multi-statement text whose most reportable statement is a
+        // write keeps the signals of its reads; the contract allows any
+        // registered signal on any action).
+        {
             let session = self.sessions.get(&a.session);
             let dumper = a
                 .application
@@ -2584,7 +2602,7 @@ mod tests {
             "/*M! SELECT * FROM hr.customers */",
             "/*!80000 SELECT * FROM hr.customers */",
         ] {
-            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
         }
     }
 
@@ -2628,15 +2646,15 @@ mod tests {
             "SET @x = hr.f()",
             "CALL hr.p()",
         ] {
-            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
         }
         // A named read that also calls a stored function: both.
         expect_everywhere(
             "SELECT email, hr.f(id) FROM hr.customers WHERE id = 1",
             // Objects are sorted: `*` first.
             |s| match star(s) {
-                "*.*" => "read [\"*.*\", \"hr.customers\"]".to_owned(),
-                st => format!("read [\"hr.customers\", {st:?}]"),
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
             },
         );
         // An ordinary small write is not marked: `min_rows` applies.
@@ -2665,6 +2683,102 @@ mod tests {
         for (source, ev) in on_every_source("databastion", "SELECT a FROM hr.t LIMIT 1") {
             assert!(ev.is_none(), "{source:?}");
         }
+    }
+
+    /// Re-review of #168, N1: a multi-statement text whose most
+    /// reportable statement is a write keeps the signals of its reads.
+    #[test]
+    fn read_signals_survive_a_write_in_the_same_text() {
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'; UPDATE shop.t SET a = a WHERE 0",
+            ) {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert_eq!(e.action(), EventAction::Write, "{source:?}");
+                assert!(e.signals().contains(&Signal::IntoOutfile), "{source:?}");
+                assert!(e.signals().contains(&Signal::FullTableRead), "{source:?}");
+            }
+            for (source, ev) in on_every_source(
+                user,
+                "SELECT SQL_NO_CACHE * FROM hr.customers; INSERT INTO shop.t VALUES (1)",
+            ) {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert_eq!(e.action(), EventAction::Write, "{source:?}");
+                assert_eq!(
+                    e.signals(),
+                    [Signal::FullTableRead, Signal::Mysqldump],
+                    "{source:?}"
+                );
+            }
+        }
+    }
+
+    /// Re-review of #168, N2: audit log administration functions are
+    /// configuration DDL, always reported, qualified or not.
+    #[test]
+    fn audit_functions_are_reported() {
+        for text in [
+            "SELECT audit_log_filter_set_user('%', 'log_none')",
+            "SELECT audit_log_filter_set_filter('log_none', '{\"filter\": {\"log\": false}}')",
+            "SELECT audit_log_filter_remove_user('%')",
+            "SELECT audit_log_filter_remove_filter('log_all')",
+            "SELECT audit_log_filter_flush()",
+            "SELECT audit_log_read()",
+            "SELECT audit_log_read_bookmark()",
+            "SELECT audit_log_rotate()",
+            "SELECT audit_log_encryption_password_set('x')",
+            "SELECT mysql.audit_log_filter_set_user('%', 'log_none')",
+            "DO audit_log_filter_remove_user('%')",
+            "SET @x = audit_log_filter_remove_user('%')",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+    }
+
+    /// Re-review of #168, N3: a qualified call after `ON` in a read is a
+    /// call: reported against `*`, never the agent's own.
+    #[test]
+    fn calls_after_on_in_a_read_are_calls() {
+        expect_everywhere(
+            "SELECT a FROM hr.t JOIN hr.u ON hr.disable_consumers() LIMIT 1",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.t\", \"hr.u\"] always".to_owned(),
+                st => format!("read [\"hr.t\", \"hr.u\", {st:?}] always"),
+            },
+        );
+    }
+
+    /// Re-review of #168, N5: a text that trips the multibyte rule (a name
+    /// ending in a non-ASCII character, before its closing backtick) is decided by
+    /// its table records when they all read; without records it is
+    /// reported.
+    #[test]
+    fn unreadable_own_samples_with_read_records_stay_own() {
+        let text = "SELECT LEFT(`c`, 4096) FROM `hr`.`caf\u{e9}` LIMIT 10";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        let records = |q: u64| {
+            vec![
+                format!("20260929 09:40:35,h,databastion,172.18.0.1,30,{q},READ,hr,caf\u{e9},"),
+                sa_line("databastion", "172.18.0.1", q, text),
+            ]
+        };
+        let mut b = EventBuilder::new(own());
+        // Within the budget (unknown rows: the whole budget): left out,
+        // then reported, as any own read of a table.
+        assert_eq!(file(&mut b, sa_at(&records(1), 4096)), Vec::<String>::new());
+        assert_eq!(file(&mut b, sa_at(&records(2), 4096)).len(), 1);
+        // Without table records: never the agent's own.
+        let mut b = EventBuilder::new(own());
+        let out = b.convert_file(
+            sa_at(&[sa_line("databastion", "172.18.0.1", 1, text)], 4096),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            out.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"shop.*\"] always"]
+        );
     }
 
     #[test]

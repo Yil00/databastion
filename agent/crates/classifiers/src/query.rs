@@ -887,6 +887,10 @@ pub struct StatementInfo {
     /// calls (`f(…)`) cannot be told from built-in functions and are not
     /// flagged.
     pub routine_call: bool,
+    /// MySQL: the statement calls an audit log administration function
+    /// (`audit_log_filter_set_user(…)`, `audit_log_rotate()`…), which
+    /// changes or reads the audit configuration or log; its kind is DDL.
+    pub audit_function: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1287,32 +1291,61 @@ fn my_kind_all(tokens: &[Tok]) -> StatementKind {
 }
 
 /// A schema-qualified function call, `db.f(` (names plain or quoted),
-/// that is not a table with a column list (`INSERT [INTO] db.t (a)`,
-/// `CREATE TABLE db.t (`, `ON db.t (`, `REFERENCES db.t (`).
-fn has_qualified_call(s: &[Tok]) -> bool {
+/// that is not a table with a column list: in a write, after `INTO`,
+/// `INSERT` / `REPLACE` and their modifiers, or `TABLE` (`LOAD DATA …
+/// INTO TABLE db.t (a)`); in DDL or DCL, after `TABLE`, `EXISTS`, `ON`,
+/// `VIEW` or `REFERENCES`. Nowhere else (`JOIN db.t ON db.f()` is a call).
+fn has_qualified_call(s: &[Tok], kind: StatementKind) -> bool {
     let name = |t: &Tok| matches!(t, Tok::Word(_) | Tok::Quoted(_));
+    let write = matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+    );
+    let schema_change = matches!(kind, StatementKind::Ddl | StatementKind::Dcl);
     s.windows(4).enumerate().any(|(i, w)| {
+        let table_before = match i.checked_sub(1).and_then(|j| word(s.get(j))) {
+            Some(
+                "into" | "insert" | "replace" | "ignore" | "low_priority" | "delayed"
+                | "high_priority",
+            ) => write,
+            Some("table") => write || schema_change,
+            Some("exists" | "on" | "view" | "references") => schema_change,
+            _ => false,
+        };
         name(&w[0])
             && is_punct(Some(&w[1]), ".")
             && name(&w[2])
             && is_punct(Some(&w[3]), "(")
-            && !matches!(
-                i.checked_sub(1).and_then(|j| word(s.get(j))),
-                Some(
-                    "into"
-                        | "insert"
-                        | "replace"
-                        | "ignore"
-                        | "low_priority"
-                        | "delayed"
-                        | "high_priority"
-                        | "table"
-                        | "exists"
-                        | "on"
-                        | "references"
-                        | "view"
-                )
-            )
+            && !table_before
+    })
+}
+
+/// Whether a function name is one of the audit log administration
+/// functions of MySQL Enterprise Audit and the Percona `audit_log_filter`
+/// component (same names): `audit_log_filter_*`, `audit_log_encryption_*`,
+/// `audit_log_read`, `audit_log_read_bookmark`, `audit_log_rotate`.
+/// MariaDB `server_audit` and the Percona `audit_log` plugin have no
+/// functions (system variables only).
+fn is_audit_function(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("audit_log_filter_")
+        || n.starts_with("audit_log_encryption_")
+        || matches!(
+            n.as_str(),
+            "audit_log_read" | "audit_log_read_bookmark" | "audit_log_rotate"
+        )
+}
+
+/// A call of an audit log administration function ([`is_audit_function`]),
+/// qualified or not: its name (plain or quoted) followed by `(`. Code
+/// tokens only: never in a literal or a comment.
+fn has_audit_function(s: &[Tok]) -> bool {
+    s.windows(2).any(|w| {
+        matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n))
+            && is_punct(Some(&w[1]), "(")
     })
 }
 
@@ -1353,8 +1386,9 @@ fn my_sets_global(s: &[Tok]) -> bool {
 /// the kind of its statement.
 fn my_kind(s: &[Tok]) -> StatementKind {
     let s = my_set_statement_body(s).unwrap_or(s);
-    if set_statement_level(s).is_some() {
-        // A `SET STATEMENT` nested deeper than MAX_SET_STATEMENT_DEPTH.
+    if set_statement_level(s).is_some() || has_audit_function(s) {
+        // A `SET STATEMENT` nested deeper than MAX_SET_STATEMENT_DEPTH, or
+        // a call of an audit log administration function.
         return StatementKind::Ddl;
     }
     let Some(i) = main_start(s) else {
@@ -1544,7 +1578,8 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         nested,
         outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
         lead: lead_words(s),
-        routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s),
+        routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
+        audit_function: opts.dialect == Dialect::Mysql && has_audit_function(s),
     }
 }
 
@@ -3132,6 +3167,69 @@ mod tests {
         ] {
             assert!(!call(q), "{q}");
         }
+    }
+
+    /// Re-review of #168, N2 / N3: audit administration functions are DDL,
+    /// qualified or not, in any statement, never from a literal or a
+    /// comment; table column lists are excluded from qualified calls only
+    /// in the statements that have them.
+    #[test]
+    fn mysql_audit_functions_and_call_contexts() {
+        for q in [
+            "SELECT audit_log_filter_set_filter('log_none', '{\"filter\": {\"log\": false}}')",
+            "SELECT audit_log_filter_set_user('%', 'log_none')",
+            "SELECT AUDIT_LOG_FILTER_REMOVE_USER('%')",
+            "SELECT audit_log_filter_remove_filter('log_all')",
+            "SELECT audit_log_filter_flush()",
+            "SELECT audit_log_read()",
+            "SELECT audit_log_read(audit_log_read_bookmark())",
+            "SELECT audit_log_read_bookmark()",
+            "SELECT audit_log_rotate()",
+            "SELECT audit_log_encryption_password_set('x')",
+            "SELECT audit_log_encryption_password_get()",
+            "SELECT mysql.audit_log_filter_set_user('%', 'log_none')",
+            "SELECT `audit_log_filter_set_user`('%', 'log_none')",
+            "DO audit_log_filter_remove_user('%')",
+            "SET @x = audit_log_filter_remove_user('%')",
+            "SELECT a FROM t WHERE audit_log_rotate() IS NOT NULL",
+            "SELECT 1; SELECT audit_log_rotate()",
+        ] {
+            let a = my(q);
+            let most = a
+                .parts()
+                .iter()
+                .fold(StatementKind::Other, |k, p| most_reportable(k, p.kind));
+            assert_eq!(most, StatementKind::Ddl, "{q}");
+            assert!(a.parts().iter().any(|p| p.audit_function), "{q}");
+        }
+        // Prefix path (text that does not lex): still DDL.
+        assert_eq!(
+            analyze_raw(
+                "SELECT audit_log_filter_set_user('\u{e9}\\', 'x')".as_bytes(),
+                AnalyzeOptions::mysql()
+            )
+            .kind(),
+            StatementKind::Ddl
+        );
+        for q in [
+            "SELECT 'audit_log_rotate()'",
+            "SELECT 1 /* audit_log_rotate() */",
+            "SELECT audit_log_rotate FROM t",
+            "SELECT audit_log_session_filter_id()",
+        ] {
+            assert_ne!(my(q).kind(), StatementKind::Ddl, "{q}");
+        }
+        let call = |q: &str| my(q).parts().iter().any(|p| p.routine_call);
+        assert!(call(
+            "SELECT a FROM hr.t JOIN hr.u ON hr.disable_consumers() LIMIT 1"
+        ));
+        assert!(call("SELECT a FROM hr.t WHERE EXISTS hr.f(1)"));
+        assert!(call("SELECT * FROM hr.t INTO @x; SELECT hr.f()"));
+        assert!(!call("CREATE INDEX i ON db.t (a)"));
+        assert!(!call("INSERT INTO db.t (a) VALUES (1)"));
+        assert!(!call(
+            "ALTER TABLE db.t ADD FOREIGN KEY (a) REFERENCES db.u (a)"
+        ));
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege
