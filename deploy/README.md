@@ -46,7 +46,7 @@ exact certificate identity is known for each version: check it exactly, not with
 bundles use the Sigstore bundle format), then:
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION"
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
     --certificate-github-workflow-trigger push)
@@ -74,7 +74,7 @@ docker buildx imagetools inspect "$agent_ref" --format '{{json .Provenance}}'
 
 A tag can be moved in a registry; a digest cannot. **Pinning the digest is required**: `.env` takes
 the console line of the verified `image-digests.txt`
-(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.4.0@sha256:<digest>`), and Compose
+(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.5.0@sha256:<digest>`), and Compose
 then pulls exactly that image.
 
 ## Install
@@ -91,7 +91,7 @@ On the console host, in an empty directory (as a user allowed to run `docker`), 
 `SHA256SUMS` verified [above](#verify-the-artifacts):
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-deploy-$VERSION.tar.gz"
 sha256sum --check --ignore-missing SHA256SUMS            # must print "databastion-deploy-...: OK"
 tar -xzf "databastion-deploy-$VERSION.tar.gz" --strip-components=2 "databastion-deploy-$VERSION/deploy"
@@ -149,7 +149,7 @@ for one agent.
 On the database host. Verify the download first ([above](#verify-the-artifacts)).
 
 ```bash
-VERSION=0.4.0
+VERSION=0.5.0
 ARCH="$(dpkg --print-architecture)"      # amd64 or arm64
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-agent_${VERSION}_${ARCH}.deb"
 sha256sum --check --ignore-missing SHA256SUMS          # the list verified with cosign
