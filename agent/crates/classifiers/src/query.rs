@@ -97,6 +97,13 @@ enum Tok {
     Int(u64),
     /// Bound parameter `$n`.
     Param,
+    /// MySQL `"…"`: a string literal, or an identifier under
+    /// `ANSI_QUOTES` (the session mode is unknown). A literal everywhere a
+    /// literal is expected; its content (raw, at most
+    /// [`MAX_DQUOTED_CHARS`] characters, ASCII-lowercased) is kept only to
+    /// recognize a name position (`FROM "t"`, `"db"."t"`, `"f"(`). Never
+    /// written to the normalized text.
+    DQuoted(String),
     /// Operator or punctuation.
     Punct(String),
 }
@@ -157,6 +164,10 @@ fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
             .and_then(|d| d.parse::<u32>().ok())
             .is_some_and(|v| v < 50_700)
 }
+
+/// Characters of a `"…"` token kept ([`Tok::DQuoted`]): enough for any
+/// audit function name.
+const MAX_DQUOTED_CHARS: usize = 64;
 
 /// Longest version number of an executable comment (`/*!NNNNNN`).
 const MAX_COMMENT_VERSION_DIGITS: usize = 6;
@@ -264,10 +275,18 @@ fn lex_mysql_range(
                 out.push(Tok::Literal);
             }
             b'"' => {
-                // A string, or an identifier under ANSI_QUOTES: opaque in
-                // both readings (never a name).
+                // A string, or an identifier under ANSI_QUOTES: never
+                // resolved to a name, but kept apart from other literals
+                // so that a name position can be told (fail closed).
+                let from = i + 1;
                 i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
-                out.push(Tok::Literal);
+                let content: String = text
+                    .get(from..i.saturating_sub(1))
+                    .unwrap_or("")
+                    .chars()
+                    .take(MAX_DQUOTED_CHARS)
+                    .collect();
+                out.push(Tok::DQuoted(content.to_ascii_lowercase()));
             }
             b'`' => {
                 let mut j = i + 1;
@@ -891,6 +910,9 @@ pub struct StatementInfo {
     /// (`audit_log_filter_set_user(…)`, `audit_log_rotate()`…), which
     /// changes or reads the audit configuration or log; its kind is DDL.
     pub audit_function: bool,
+    /// MySQL: a `"…"` token in a name position (an identifier under
+    /// `ANSI_QUOTES`, never resolved): the objects cannot be told.
+    pub dquoted_name: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -907,6 +929,7 @@ pub struct QueryAnalysis {
     statements: usize,
     parts: Vec<StatementInfo>,
     lexed: bool,
+    audit_function: bool,
 }
 
 impl QueryAnalysis {
@@ -920,7 +943,16 @@ impl QueryAnalysis {
             statements: 0,
             parts: Vec::new(),
             lexed: false,
+            audit_function: false,
         }
+    }
+
+    /// MySQL: the text calls an audit log administration function: in a
+    /// statement of a lexed text, or found by a raw scan of a text that
+    /// did not lex (fail closed: also inside a literal or a comment).
+    #[must_use]
+    pub fn audit_function(&self) -> bool {
+        self.audit_function || self.parts.iter().any(|p| p.audit_function)
     }
 
     /// Whether the text lexed unambiguously: `false` when only the kind
@@ -1129,6 +1161,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         statements: statements.len(),
         parts,
         lexed: true,
+        audit_function: false,
     }
 }
 
@@ -1142,16 +1175,36 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
         Err(e) => {
             // The valid prefix only, for the kind.
             let prefix = std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or("");
-            analyze(prefix, opts.opaque(true))
+            let mut a = analyze(prefix, opts.opaque(true));
+            // MySQL: an audit function call anywhere in the bytes.
+            if opts.dialect == Dialect::Mysql
+                && !a.audit_function
+                && raw_audit_function(&String::from_utf8_lossy(raw))
+            {
+                a.kind = most_reportable(a.kind, StatementKind::Ddl);
+                a.audit_function = true;
+            }
+            a
         }
     }
+}
+
+/// A MySQL text that did not lex: `kind`, made DDL when a raw scan finds
+/// an audit log administration function call ([`raw_audit_function`]).
+fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
+    let mut a = QueryAnalysis::unparsed(kind);
+    if raw_audit_function(text) {
+        a.kind = most_reportable(kind, StatementKind::Ddl);
+        a.audit_function = true;
+    }
+    a
 }
 
 /// [`analyze`] for MySQL / MariaDB text: every `sql_mode` reading must
 /// give the same tokens.
 fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     if opts.opaque || (!opts.transcoded && multibyte_hazard(text.as_bytes())) {
-        return QueryAnalysis::unparsed(my_kind_prefix(text));
+        return my_unparsed(text, my_kind_prefix(text));
     }
     let readings: Vec<Result<Vec<Tok>, LexError>> = my_modes(text)
         .into_iter()
@@ -1173,7 +1226,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                     },
                 )
             });
-            return QueryAnalysis::unparsed(kind);
+            return my_unparsed(text, kind);
         }
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
@@ -1214,6 +1267,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         statements: statements.len(),
         parts,
         lexed: true,
+        audit_function: false,
     }
 }
 
@@ -1344,9 +1398,98 @@ fn is_audit_function(name: &str) -> bool {
 /// tokens only: never in a literal or a comment.
 fn has_audit_function(s: &[Tok]) -> bool {
     s.windows(2).any(|w| {
-        matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n))
+        matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) | Tok::DQuoted(n) if is_audit_function(n))
             && is_punct(Some(&w[1]), "(")
     })
+}
+
+/// Raw-text scan for a call of an audit log administration function, for
+/// a text that did not lex (fail closed: a name inside a literal or a
+/// comment counts too): a function name ([`is_audit_function`],
+/// ASCII case-insensitive, not preceded by an identifier character),
+/// optionally followed by a closing quote or backtick, then whitespace and
+/// comments, then `(`.
+fn raw_audit_function(text: &str) -> bool {
+    let b = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut from = 0;
+    while let Some(k) = find(&lb[from..], b"audit_log_") {
+        let start = from + k;
+        from = start + 1;
+        if start > 0 && is_my_ident_cont(b[start - 1]) {
+            continue;
+        }
+        let mut j = start;
+        while j < lb.len() && is_my_ident_cont(lb[j]) {
+            j += 1;
+        }
+        if !lower.get(start..j).is_some_and(is_audit_function) {
+            continue;
+        }
+        if matches!(lb.get(j), Some(b'"' | b'`')) {
+            j += 1;
+        }
+        loop {
+            match lb.get(j) {
+                Some(c) if c.is_ascii_whitespace() => j += 1,
+                Some(b'/') if lb.get(j + 1) == Some(&b'*') => match find(&lb[j + 2..], b"*/") {
+                    Some(e) => j += e + 4,
+                    None => break,
+                },
+                Some(b'#') => {
+                    while j < lb.len() && lb[j] != b'\n' {
+                        j += 1;
+                    }
+                }
+                Some(b'-') if my_dash_comment(lb, j, lb.len()) => {
+                    while j < lb.len() && lb[j] != b'\n' {
+                        j += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if lb.get(j) == Some(&b'(') {
+            return true;
+        }
+    }
+    false
+}
+
+/// A `"…"` token ([`Tok::DQuoted`]) in a name position, where it can only
+/// be an identifier under `ANSI_QUOTES` (as a string it would be a syntax
+/// error): after `FROM`, `JOIN`, `UPDATE`, `INTO`, `TABLE`, after a comma
+/// in a `FROM` list, next to a `.`, or right before `(`.
+fn has_dquoted_name(s: &[Tok]) -> bool {
+    let mut in_from = false;
+    for (i, t) in s.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| s.get(j));
+        match t {
+            Tok::DQuoted(_) => {
+                let after_keyword = matches!(
+                    word(prev),
+                    Some("from" | "join" | "update" | "into" | "table")
+                );
+                let in_list = in_from && is_punct(prev, ",");
+                let dotted = is_punct(prev, ".") || is_punct(s.get(i + 1), ".");
+                let called = is_punct(s.get(i + 1), "(");
+                if after_keyword || in_list || dotted || called {
+                    return true;
+                }
+            }
+            Tok::Word(w) => match w.as_str() {
+                "from" | "join" | "update" | "into" | "table" => in_from = true,
+                "where" | "group" | "having" | "order" | "limit" | "union" | "set" | "values"
+                | "value" | "select" | "on" | "using" | "for" | "window" | "lock" | "procedure"
+                | "partition" | "as" => in_from = false,
+                _ => {}
+            },
+            Tok::Punct(p) if p == "(" || p == ")" || p == ";" => in_from = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A MySQL `SET` that assigns a global or persisted system variable in
@@ -1535,7 +1678,7 @@ fn has_outfile(s: &[Tok]) -> bool {
     s.windows(3).any(|w| {
         matches!(&w[0], Tok::Word(i) if i == "into")
             && matches!(&w[1], Tok::Word(f) if f == "outfile" || f == "dumpfile")
-            && matches!(w[2], Tok::Literal | Tok::Param)
+            && matches!(w[2], Tok::Literal | Tok::DQuoted(_) | Tok::Param)
     })
 }
 
@@ -1580,6 +1723,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         lead: lead_words(s),
         routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
         audit_function: opts.dialect == Dialect::Mysql && has_audit_function(s),
+        dquoted_name: opts.dialect == Dialect::Mysql && has_dquoted_name(s),
     }
 }
 
@@ -2155,7 +2299,10 @@ fn read_relation(
     }
     // MySQL `INTO OUTFILE '…'` / `INTO DUMPFILE '…'`: a file, not a relation.
     if matches!(word(s.get(i)), Some("outfile" | "dumpfile"))
-        && matches!(s.get(i + 1), Some(Tok::Literal | Tok::Param))
+        && matches!(
+            s.get(i + 1),
+            Some(Tok::Literal | Tok::DQuoted(_) | Tok::Param)
+        )
     {
         return i + 2;
     }
@@ -2398,7 +2545,7 @@ fn normalize_tokens(tokens: &[Tok]) -> NormalizedQuery {
                 }
             }
             Tok::Quoted(q) => format!("\"{}\"", names::normalize_path(q).as_str()),
-            Tok::Literal | Tok::Int(_) | Tok::Param => "?".to_owned(),
+            Tok::Literal | Tok::DQuoted(_) | Tok::Int(_) | Tok::Param => "?".to_owned(),
             Tok::Punct(p) => p.clone(),
         };
         let len = piece.chars().count() + usize::from(!out.is_empty());
@@ -3230,6 +3377,80 @@ mod tests {
         assert!(!call(
             "ALTER TABLE db.t ADD FOREIGN KEY (a) REFERENCES db.u (a)"
         ));
+    }
+
+    /// Re-review of d162baa, P1 / P2: `"…"` in a name position, and the
+    /// raw audit-function scan of texts that do not lex.
+    #[test]
+    fn mysql_dquoted_names_and_raw_audit_scan() {
+        let dq = |q: &str| my(q).parts().iter().any(|p| p.dquoted_name);
+        for q in [
+            "SELECT * FROM \"hr\".\"customers\"",
+            "SELECT * FROM \"t\"",
+            "SELECT * FROM hr.a, \"b\"",
+            "SELECT * FROM a JOIN \"b\" ON 1",
+            "UPDATE \"t\" SET a = 1",
+            "INSERT INTO \"t\" VALUES (1)",
+            "DELETE FROM \"t\"",
+            "TRUNCATE TABLE \"t\"",
+            "SELECT \"t\".a FROM t",
+            "SELECT \"f\"(1)",
+        ] {
+            assert!(dq(q), "{q}");
+        }
+        for q in [
+            "SELECT a FROM t WHERE a = \"x\"",
+            "SELECT \"x\", CONCAT(\"a\", \"b\")",
+            "INSERT INTO t VALUES (\"x\", \"y\")",
+            "INSERT INTO t (a, b) VALUES (\"x\", \"y\")",
+            "UPDATE t SET a = \"x\", b = \"y\" WHERE c IN (\"p\", \"q\")",
+            "SELECT a FROM t AS \"alias\" WHERE b = \"x\" LIMIT 1",
+            "SELECT * FROM t INTO OUTFILE \"/tmp/x\"",
+        ] {
+            assert!(!dq(q), "{q}");
+        }
+        assert!(my_norm("SELECT a FROM t WHERE a = \"x\"").is_some_and(|n| !n.contains('x')));
+        assert!(has_outfile(
+            &lex_mysql(
+                "SELECT * FROM t INTO OUTFILE \"/x\"",
+                MyMode {
+                    backslash: true,
+                    ansi_quotes: false,
+                    version_as_comment: false
+                }
+            )
+            .unwrap()
+        ));
+        assert_eq!(
+            my("SELECT \"audit_log_rotate\"()").kind(),
+            StatementKind::Ddl
+        );
+        for t in [
+            "x = 'a\\' AND audit_log_filter_remove_user('%')",
+            "x AUDIT_LOG_ROTATE /* c */ ()",
+            "x `audit_log_read` -- c\n (1)",
+            "x \"audit_log_filter_set_user\" # c\n ('%')",
+        ] {
+            assert!(raw_audit_function(t), "{t}");
+        }
+        for t in [
+            "my_audit_log_rotate()",
+            "audit_log_rotate",
+            "audit_log_rotated()",
+            "audit_log_session_filter_id()",
+        ] {
+            assert!(!raw_audit_function(t), "{t}");
+        }
+        let a = analyze_raw(
+            "SELECT a FROM t WHERE x = '\u{e9}\\' AND audit_log_filter_remove_user('%')".as_bytes(),
+            AnalyzeOptions::mysql(),
+        );
+        assert!(!a.lexed() && a.audit_function());
+        assert_eq!(a.kind(), StatementKind::Ddl);
+        let mut raw = b"SELECT a FROM t WHERE x = '\xff' AND audit_log_rotate()".to_vec();
+        raw.push(b' ');
+        let a = analyze_raw(&raw, AnalyzeOptions::mysql());
+        assert!(a.audit_function() && a.kind() == StatementKind::Ddl);
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege

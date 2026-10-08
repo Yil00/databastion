@@ -141,6 +141,17 @@ fn is_system_relation(r: &RelationName, database: &str) -> bool {
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
 }
 
+/// The tables behind the audit log administration functions (MySQL
+/// Enterprise Audit and the Percona `audit_log_filter` component):
+/// `mysql.audit_log_filter` and `mysql.audit_log_user`. Writing them
+/// changes what the audit log records.
+fn is_audit_table(db: &str, table: &str) -> bool {
+    db.eq_ignore_ascii_case("mysql")
+        && ["audit_log_filter", "audit_log_user"]
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(table))
+}
+
 /// A statement kind that changes something: rows, schema or privileges.
 fn is_change_kind(k: StatementKind) -> bool {
     is_write_kind(k) || matches!(k, StatementKind::Ddl | StatementKind::Dcl)
@@ -820,8 +831,10 @@ impl EventBuilder {
         // Code that runs out of sight: a procedure, a prepared statement,
         // a stored function (schema-qualified calls only: `f()` cannot be
         // told from a built-in function).
+        // A `"…"` name (`ANSI_QUOTES`) hides the objects the same way.
         let call = parts.iter().any(|p| {
             p.routine_call
+                || p.dquoted_name
                 || matches!(
                     p.lead.first().map(String::as_str),
                     Some("call" | "execute" | "prepare")
@@ -838,8 +851,14 @@ impl EventBuilder {
         // ending in a non-ASCII character before a backtick trips the
         // multibyte rule) is decided by its records: they name what it
         // read.
-        let blind =
-            unparsed && (a.tables.is_empty() || a.tables.iter().any(|t| t.2 != TableOp::Read));
+        // A raw scan of an unreadable text that finds an audit log
+        // administration function makes it blind whatever its records
+        // (fail closed).
+        let audit_function = analysis.as_ref().is_some_and(QueryAnalysis::audit_function);
+        let blind = unparsed
+            && (a.tables.is_empty()
+                || a.tables.iter().any(|t| t.2 != TableOp::Read)
+                || audit_function);
         let changes = is_change_kind(kind)
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
@@ -932,24 +951,28 @@ impl EventBuilder {
         // configuration changes (`SET GLOBAL`, `INSTALL` / `UNINSTALL`),
         // and changes whose text cannot be read.
         let system = |db: &str| is_system_schema(db);
-        let touches_system =
-            a.tables.iter().any(|(db, _, op)| {
-                system(db) && (*op != TableOp::Read || action != EventAction::Read)
-            }) || (action != EventAction::Read
-                && (objects.iter().any(|(db, _)| system(db))
-                    || parts.iter().any(|p| {
-                        p.relations
-                            .iter()
-                            .any(|r| system(r.schema.as_deref().unwrap_or(a.database)))
-                    })));
-        let configuration = parts.iter().any(|p| {
-            p.audit_function
-                || p.kind == StatementKind::Ddl
-                    && matches!(
-                        p.lead.first().map(String::as_str),
-                        Some("set" | "install" | "uninstall")
-                    )
-        });
+        let touches_system = a.tables.iter().any(|(db, table, op)| {
+            (system(db) || is_audit_table(db, table))
+                && (*op != TableOp::Read || action != EventAction::Read)
+        }) || (action != EventAction::Read
+            && (objects
+                .iter()
+                .any(|(db, table)| system(db) || is_audit_table(db, table))
+                || parts.iter().any(|p| {
+                    p.relations.iter().any(|r| {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        system(db) || is_audit_table(db, &r.name)
+                    })
+                })));
+        let configuration = audit_function
+            || parts.iter().any(|p| {
+                p.audit_function
+                    || p.kind == StatementKind::Ddl
+                        && matches!(
+                            p.lead.first().map(String::as_str),
+                            Some("set" | "install" | "uninstall")
+                        )
+            });
         // Also reads of `*`: code that runs out of sight or a text that
         // cannot be read never matches `sensitive_objects` and has no
         // useful row count, so `min_rows` would drop it.
@@ -2779,6 +2802,128 @@ mod tests {
             out.iter().map(shown).collect::<Vec<_>>(),
             ["read [\"shop.*\"] always"]
         );
+    }
+
+    /// Re-review of d162baa, P1: double-quoted names (`ANSI_QUOTES`, set
+    /// by any session without an event) hide the objects: reported against
+    /// `*`, always reported, never the agent's own.
+    #[test]
+    fn double_quoted_names_are_reported() {
+        let star = |s: EventSource, action: &str| format!("{action} [{:?}] always", star(s));
+        for text in [
+            "SELECT * FROM \"hr\".\"customers\"",
+            "SELECT * FROM \"customers\"",
+            "SELECT a FROM hr.t JOIN \"customers\" c ON c.id = t.id",
+            "SELECT \"hr\".\"f\"(1)",
+        ] {
+            expect_everywhere(text, |s| match text {
+                t if t.contains("JOIN") => match super::tests::star(s) {
+                    "*.*" => "read [\"*.*\", \"hr.t\"] always".to_owned(),
+                    st => format!("read [\"hr.t\", {st:?}] always"),
+                },
+                _ => star(s, "read"),
+            });
+        }
+        expect_everywhere("SELECT * FROM hr.a, \"b\"", |s| {
+            match super::tests::star(s) {
+                "*.*" => "read [\"*.*\", \"hr.a\"] always".to_owned(),
+                st => format!("read [\"hr.a\", {st:?}] always"),
+            }
+        });
+        expect_everywhere(
+            "UPDATE \"performance_schema\".\"setup_consumers\" SET \"ENABLED\" = 'NO'",
+            |s| star(s, "write"),
+        );
+        expect_everywhere("DELETE FROM \"hr\".\"customers\"", |s| star(s, "write"));
+        for text in [
+            "SELECT \"audit_log_filter_remove_user\"('%')",
+            "SELECT \"AUDIT_LOG_ROTATE\" ()",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+        // Double-quoted strings in value positions: as before (from
+        // another account; the agent's own reads are left out).
+        for (text, want) in [
+            ("SELECT a FROM hr.t WHERE a = \"x\"", "read [\"hr.t\"]"),
+            ("INSERT INTO hr.t VALUES (\"x\", \"y\")", "write [\"hr.t\"]"),
+            (
+                "UPDATE hr.t SET a = \"x\", b = \"y\" WHERE id = 1",
+                "write [\"hr.t\"]",
+            ),
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(want),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        for (source, ev) in on_every_source("app", "SELECT \"x\", CONCAT(\"a\", \"b\")") {
+            assert!(ev.is_none(), "{source:?}");
+        }
+        // The agent's own read with a double-quoted value: still its own.
+        for (source, ev) in
+            on_every_source("databastion", "SELECT a FROM hr.t WHERE a = \"x\" LIMIT 1")
+        {
+            assert!(ev.is_none(), "{source:?}");
+        }
+    }
+
+    /// Re-review of d162baa, P2: an audit function after an unreadable
+    /// literal is found by a raw scan: DDL, always reported, never the
+    /// agent's own, also with table records that all read.
+    #[test]
+    fn audit_functions_after_unreadable_literals_are_reported() {
+        let text = "SELECT a FROM hr.t WHERE x = 'x\u{e9}\\' AND audit_log_filter_remove_user /* c */ ('%') IS NOT NULL";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,t,"),
+                        sa_line(user, "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["ddl [\"hr.t\"] always"],
+                "{user}"
+            );
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                vec![json_query(user, "172.18.0.1", 1, text)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["ddl [] always"],
+                "{user}"
+            );
+        }
+    }
+
+    /// Writes to the tables behind the audit functions are always
+    /// reported.
+    #[test]
+    fn writes_to_audit_filter_tables_are_always_reported() {
+        expect_everywhere(
+            "UPDATE mysql.audit_log_user SET FILTERNAME = 'log_none' WHERE USER = '%'",
+            |_| "write [\"mysql.audit_log_user\"] always".to_owned(),
+        );
+        expect_everywhere(
+            "INSERT INTO mysql.audit_log_filter (NAME, FILTER) VALUES ('n', '{}')",
+            |_| "write [\"mysql.audit_log_filter\"] always".to_owned(),
+        );
+        expect_everywhere("UPDATE mysql.user SET a = 1 WHERE b = 2", |_| {
+            "write [\"mysql.user\"]".to_owned()
+        });
     }
 
     #[test]
