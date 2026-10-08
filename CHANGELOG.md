@@ -7,6 +7,12 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 👷 CI
+- Release PRs (to `main`): the "Release version" check now also fails while the holdout seed (`SEED` in `dev/holdout/generate.py`) is the one of the previous final release, or brings back an earlier release's seed; it was not rotated for 0.2.0, 0.3.0 and 0.3.1. `[skip-release]` PRs are not checked; `[skip-holdout]` in the title keeps the seed only when no classifier code changed since the previous release ([RELEASE.md § 8](RELEASE.md#8-holdout-seed-rotation)). The PR template has a release checklist line
+
+### 📝 Documentation
+- [dev/holdout/README.md](dev/holdout/README.md): 39 hard-negative columns have opaque names, not 44 (the 44 also counted the 5 ambiguous opaque-named columns, which are excluded from scoring); its CI section now describes the blocking holdout gate in `ci.yml`. The corpus and its seed are unchanged
+
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
 ### ⚠️ Upgrade notes
