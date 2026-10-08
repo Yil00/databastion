@@ -240,7 +240,9 @@ As for PostgreSQL, an event of the agent's account is left out only when **all**
 - it carries no signal;
 - the agent's reads of each object stay within `limits.max_sample_rows` rows over a rolling 24 h. The audit-log sources have no row count, so each statement is charged the whole budget: a second read of a table within 24 h is reported.
 
-Behind a proxy every client has the proxy's address, and another process on the agent host shares the agent's address. Someone holding the agent's credentials on the agent host, spoofing its `program_name` and reading at most the budget per table and day with filtered queries stays unreported. Writes, DDL and DCL with the agent's identity are always reported.
+Not charged to the budget (same identity rules, and no table record outside `information_schema`): the CAS store guard's column query that `check()` sends at every heartbeat ([ADR-0041](adr/0041-cas-connector.md) decision 6), recognized by its exact text, or, when the source marks the text as cut (`server_audit_query_log_limit`, 1024 bytes by default; `performance_schema`'s text limit), by a cut text of at least 256 bytes that is a prefix of it. A cut text of that statement can end inside a string literal and does not parse, so it would otherwise read as a read of `*` with unknown rows.
+
+Behind a proxy every client has the proxy's address, and another process on the agent host shares the agent's address. Someone holding the agent's credentials on the agent host, spoofing its `program_name` and reading at most the budget per table and day with filtered queries stays unreported. The same person can also send a statement whose first `server_audit_query_log_limit` bytes are the guard statement's and hide anything after the cut: the server logs only that prefix (no table record unless `server_audit` logs `TABLE` events, which then reveal the tables read). Writes, DDL and DCL with the agent's identity are always reported.
 
 ### Known limits
 

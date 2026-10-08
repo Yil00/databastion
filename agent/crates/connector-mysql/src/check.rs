@@ -1441,9 +1441,8 @@ pub(crate) async fn cas_guard_readable(
     stores: Option<&databastion_core::cas_guard::CasStores>,
 ) -> Result<databastion_core::cas_guard::ReadableCheck, MyError> {
     use databastion_core::cas_guard::{self, StoreKind};
-    let keys = cas_guard::known_name_keys(stores);
-    let statement =
-        sql::cas_guard_columns(&keys).ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
+    let statement = sql::cas_guard_statement(stores)
+        .ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
     let (rows, skipped) = session.query_counted(Stage::Check, &statement).await?;
     let mut complete = skipped == 0 && rows.len() <= sql::CAS_GUARD_MAX_ROWS;
     // Per table: (column, readable).

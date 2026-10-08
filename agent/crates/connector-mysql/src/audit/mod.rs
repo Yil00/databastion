@@ -173,6 +173,28 @@ fn own_account(
     .persisted(cfg)
 }
 
+/// The event builder of a target's stream, with the connector's own
+/// statements of that target (the CAS store guard's column query, built
+/// from the same `cas_stores` as `check()`).
+fn builder(
+    cfg: &AuditConfig,
+    target: &TargetConfig,
+    pre: &Prerequisites,
+    state: &CheckState,
+) -> EventBuilder {
+    EventBuilder::new(own_account(cfg, target, pre, state))
+        .with_own_statements(own_statements(target))
+}
+
+/// Exact texts of the statements `check()` sends that read
+/// `information_schema` only (see `EventBuilder::own_statement`).
+pub(crate) fn own_statements(target: &TargetConfig) -> Vec<Vec<u8>> {
+    sql::cas_guard_statement(target.cas_stores())
+        .map(String::into_bytes)
+        .into_iter()
+        .collect()
+}
+
 struct FileStream {
     format: MysqlLogFormat,
     tailer: Option<Tailer>,
@@ -364,7 +386,7 @@ pub(crate) async fn audit_stream(
                         file.insert(FileStream::new(
                             format,
                             Tailer::new(log.path, framing, cfg.cursor(cursor_name(format))),
-                            EventBuilder::new(own_account(cfg, target, &pre, state)),
+                            builder(cfg, target, &pre, state),
                         ))
                     }
                 };
@@ -393,7 +415,7 @@ pub(crate) async fn audit_stream(
                             .await
                             .map_err(MyError::into_connector_error)?,
                     };
-                    let builder = EventBuilder::new(own_account(cfg, target, &pre, state));
+                    let builder = builder(cfg, target, &pre, state);
                     let poller =
                         PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR))
                             .await

@@ -370,6 +370,16 @@ pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
     ))
 }
 
+/// The CAS store guard statement of a target: [`cas_guard_columns`] of
+/// the built-in and `cas_stores` name keys. One builder for `check()` and
+/// for the Audit stream, which recognizes it by its exact text.
+#[must_use]
+pub(crate) fn cas_guard_statement(
+    stores: Option<&databastion_core::cas_guard::CasStores>,
+) -> Option<String> {
+    cas_guard_columns(&databastion_core::cas_guard::known_name_keys(stores))
+}
+
 // ------------------------------------------------------------------ check()
 
 /// The current account as it appears in the `GRANTEE` column of the

@@ -264,6 +264,13 @@ async fn audit_log_scenario(
     // when the agent's address is known.
     let (r, _) = scan(&agent_target(server).1).await;
     r.unwrap();
+    // check() at every heartbeat sends the CAS store guard statement, longer
+    // than the default `server_audit_query_log_limit` (cut inside a string
+    // literal there): never reported as the agent's read (mariadb-e2e I2).
+    for _ in 0..3 {
+        let health = connector.check(&t).await;
+        assert!(health.reachable, "{label}: {health:?}");
+    }
     let real = real_dump(label);
     let mut events: Events = Vec::new();
     collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
