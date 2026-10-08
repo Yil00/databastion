@@ -25,6 +25,7 @@ The project follows [semantic versioning](https://semver.org/).
 
 ### 📝 Documentation
 - [dev/holdout/README.md](dev/holdout/README.md): 39 hard-negative columns have opaque names, not 44 (the 44 also counted the 5 ambiguous opaque-named columns, which are excluded from scoring); its CI section now describes the blocking holdout gate in `ci.yml`. The corpus and its seed are unchanged
+- [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md#mysql--mariadb-audit), MySQL / MariaDB Audit: a new known limit. Reads (and writes) that touch only `information_schema`, `performance_schema` or `sys` produce no access event, for every account. Some of these tables hold other sessions' statement texts with their literal values (`events_statements_*`, `threads`, `PROCESSLIST`, the `sys` views), so an account with `SELECT` on `performance_schema`, the agent's included when it is its Audit source, reads them unreported. Grant `performance_schema` and `PROCESS` sparingly
 
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
