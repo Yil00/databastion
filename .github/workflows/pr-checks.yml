@@ -106,7 +106,9 @@ jobs:
             exit 1
           fi
           expected="release: $version"
-          if [ "$TITLE" != "$expected" ]; then
+          # A trailing " [skip-holdout]" (RELEASE.md section 8) is checked by the next step.
+          title="${TITLE% \[skip-holdout\]}"
+          if [ "$title" != "$expected" ]; then
             echo "::error::Merging this PR releases $version: title it \"$expected\", or add [skip-release] to the title to merge without a release (RELEASE.md, section 5)."
             exit 1
           fi
@@ -114,7 +116,7 @@ jobs:
       # RELEASE.md sections 7 and 8: the holdout seed is rotated once per release (it was not for
       # 0.2.0, 0.3.0 and 0.3.1). Fails unless SEED in dev/holdout/generate.py at the merge commit
       # differs from SEED at the previous final release tag (the latest X.Y.Z tag reachable from the
-      # PR base) and from every earlier final release. `[skip-release]` in the title: no release, no
+      # PR base commit on main) and from every earlier final release. `[skip-release]` in the title: no release, no
       # check. `[skip-holdout]`: the release keeps the seed, accepted only when nothing under
       # agent/crates/classifiers changed since that tag (RELEASE.md section 8). A reminder, not a
       # control: the PR's own code runs here and can edit this step.
@@ -147,6 +149,10 @@ jobs:
             exit 0
           fi
           prev="$(seed_at "$prev_tag")"
+          if [[ ! "$prev" =~ ^[0-9]+$ ]]; then
+            echo "::error::Cannot read the holdout SEED of $prev_tag from dev/holdout/generate.py: check the seed by hand (RELEASE.md, section 8)."
+            exit 1
+          fi
           if [ "$new" != "$prev" ]; then
             # A rotation must not bring back the seed of an earlier release.
             reused=""
