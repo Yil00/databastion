@@ -126,8 +126,11 @@ dev-keycloak: dev/.env ## Start the opt-in Keycloak service (OIDC test realm, AD
 dev-keycloak-smoke: dev/.env ## Smoke-test the running Keycloak service (discovery, JWKS, seeded realm)
 	timeout 180 dev/keycloak/smoke.sh
 
+# cas-db-grants is a one-shot: `up --wait` may report its normal exit (0) as a failure, so it runs
+# on its own once CAS is healthy and fails the target only on a non-zero exit.
 dev-cas: dev/.env dev-dirs ## Start the opt-in Apereo CAS service (ADR-0041 target; builds its overlay image) and wait until healthy
-	timeout $(UP_TIMEOUT) $(COMPOSE) --profile cas up -d --build --wait --wait-timeout $(WAIT_TIMEOUT) cas cas-db-grants
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile cas up -d --build --wait --wait-timeout $(WAIT_TIMEOUT) cas
+	timeout 300 $(COMPOSE) --profile cas run --rm --no-deps -T cas-db-grants
 
 dev-cas-smoke: dev/.env ## Smoke-test the running CAS service (registry, login, service ticket, audit log, permissions)
 	timeout 300 dev/cas/smoke.sh

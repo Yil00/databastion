@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🐛 Bug Fixes
+- Dev environment: `make dev-cas` no longer fails at random after CAS is healthy. `docker compose up --wait` could report the normal exit (0) of the one-shot `cas-db-grants` as a failure; it now runs on its own with `docker compose run --rm` once CAS is healthy.
+
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
 ### ⚠️ Upgrade notes
