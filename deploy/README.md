@@ -223,7 +223,8 @@ refuse every bind on its own (a bind to port 0 went through it in CI); the
 `@system-service` system-call set without `@privileged`, `MemoryDenyWriteExecute`,
 `RestrictNamespaces`, `LockPersonality`, and the kernel protections (`ProtectKernel*`,
 `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`). `systemd-analyze security
-databastion-agent` rates it about 1.5 ("OK"). `/proc` stays visible: local engine detection reads
+databastion-agent` rates it about 1.5 ("OK"). `LimitCORE=0`: no core dump of a process that
+holds database credentials and, while parsing, unwiped copies of sampled values. `/proc` stays visible: local engine detection reads
 process names (never command lines) and `/proc/net/tcp` ([ADR-0006](../docs/adr/0006-target-discovery.md)).
 `Restart=on-failure` (10 s apart, at most 5 starts in 10 minutes).
 

@@ -31,6 +31,8 @@ use std::path::Path;
 use rustix::fs::{Access, AtFlags, CWD, Mode, OFlags};
 use zeroize::Zeroizing;
 
+use crate::config::RegistryFormat;
+
 /// Most registry files read per scan.
 pub const MAX_REGISTRY_FILES: usize = 4096;
 /// Largest registry file read, in bytes.
@@ -210,10 +212,10 @@ pub(crate) struct Listing {
     /// Device of the directory: an entry on another device (a mount point
     /// in the directory) is skipped (review of #138 I2).
     dev: u64,
-    /// Names of the `.json` entries, in directory order, at most
-    /// [`MAX_REGISTRY_FILES`].
+    /// Names of the definition entries (`.json`, or `.yml` / `.yaml`), in
+    /// directory order, at most [`MAX_REGISTRY_FILES`].
     pub(crate) files: Vec<CString>,
-    /// `.json` entries beyond [`MAX_REGISTRY_FILES`].
+    /// Definition entries beyond [`MAX_REGISTRY_FILES`].
     pub(crate) over_cap: u64,
 }
 
@@ -258,17 +260,31 @@ fn is_config_name(name: &[u8]) -> bool {
     })
 }
 
-fn has_json_extension(name: &[u8]) -> bool {
-    name.len() > 5
-        && name
-            .rsplit(|b| *b == b'.')
-            .next()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case(b"json"))
+/// Whether `name` is `<stem>.<ext>` with a non-empty stem and one of `exts`
+/// (compared case-insensitively).
+fn has_extension(name: &[u8], exts: &[&str]) -> bool {
+    let Some(dot) = name.iter().rposition(|b| *b == b'.') else {
+        return false;
+    };
+    let ext = name.get(dot + 1..).unwrap_or(&[]);
+    dot > 0 && exts.iter().any(|e| ext.eq_ignore_ascii_case(e.as_bytes()))
 }
 
-/// Opens and lists the registry directory at `path` (see the module
-/// documentation).
-pub(crate) fn list_registry(path: &Path, policy: Policy) -> Result<Listing, Refusal> {
+/// Whether `name` is a definition file of a registry in `format`.
+fn is_definition_name(name: &[u8], format: RegistryFormat) -> bool {
+    match format {
+        RegistryFormat::Json => has_extension(name, &["json"]),
+        RegistryFormat::Yaml => has_extension(name, &["yml", "yaml"]),
+    }
+}
+
+/// Opens and lists the registry directory at `path`, keeping the entries
+/// of `format` (see the module documentation).
+pub(crate) fn list_registry(
+    path: &Path,
+    format: RegistryFormat,
+    policy: Policy,
+) -> Result<Listing, Refusal> {
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -307,7 +323,7 @@ pub(crate) fn list_registry(path: &Path, policy: Policy) -> Result<Listing, Refu
             // Keep listing: nothing of the directory is read anyway.
             continue;
         }
-        if !has_json_extension(name) {
+        if !is_definition_name(name, format) {
             continue;
         }
         if files.len() < MAX_REGISTRY_FILES {
@@ -562,7 +578,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&reg).unwrap();
         std::fs::write(reg.join("App-1.json"), b"{}").unwrap();
         assert_eq!(
-            list_registry(&reg, Policy::STRICT).unwrap_err(),
+            list_registry(&reg, RegistryFormat::Json, Policy::STRICT).unwrap_err(),
             Refusal::Writable
         );
         let log = dir.path().join("cas_audit.log");
@@ -580,7 +596,7 @@ pub(crate) mod tests {
         std::fs::write(reg.join(".json"), b"x").unwrap();
         std::fs::create_dir(reg.join("nested.json")).unwrap();
         std::fs::write(reg.join("nested.json/Inner-3.json"), b"{}").unwrap();
-        let l = list_registry(reg, Policy::TESTS).unwrap();
+        let l = list_registry(reg, RegistryFormat::Json, Policy::TESTS).unwrap();
         let mut names: Vec<_> = l
             .files
             .iter()
@@ -595,6 +611,35 @@ pub(crate) mod tests {
             FileSkip::NotReadable
         );
         assert_eq!(&*l.read(c"App-1.json", Policy::TESTS).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn a_yaml_listing_keeps_yml_and_yaml_only() {
+        let dir = TempDir::new("list-yaml");
+        let reg = dir.path();
+        for n in [
+            "App-1.yml",
+            "Other-2.YAML",
+            "Json-3.json",
+            ".yml",
+            "README.md",
+        ] {
+            std::fs::write(reg.join(n), b"x").unwrap();
+        }
+        let l = list_registry(reg, RegistryFormat::Yaml, Policy::TESTS).unwrap();
+        let mut names: Vec<_> = l
+            .files
+            .iter()
+            .map(|n| n.to_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["App-1.yml", "Other-2.YAML"]);
+        // CAS configuration next to YAML definitions refuses the directory.
+        std::fs::write(reg.join("application-prod.yml"), b"x").unwrap();
+        assert_eq!(
+            list_registry(reg, RegistryFormat::Yaml, Policy::TESTS).unwrap_err(),
+            Refusal::ConfigFiles
+        );
     }
 
     #[test]
@@ -613,7 +658,7 @@ pub(crate) mod tests {
             std::fs::write(dir.path().join("App-1.json"), b"{}").unwrap();
             std::fs::write(dir.path().join(name), b"cas.secret=hunter2-SECRET").unwrap();
             assert_eq!(
-                list_registry(dir.path(), Policy::TESTS).unwrap_err(),
+                list_registry(dir.path(), RegistryFormat::Json, Policy::TESTS).unwrap_err(),
                 Refusal::ConfigFiles,
                 "{name}"
             );
@@ -668,7 +713,7 @@ pub(crate) mod tests {
         std::fs::hard_link(&secret, reg.join("Hard-2.json")).unwrap();
         let big = vec![b' '; usize::try_from(MAX_REGISTRY_FILE_BYTES).unwrap() + 1];
         std::fs::write(reg.join("Big-3.json"), big).unwrap();
-        let l = list_registry(reg, Policy::TESTS).unwrap();
+        let l = list_registry(reg, RegistryFormat::Json, Policy::TESTS).unwrap();
         assert_eq!(
             l.read(c"Sym-1.json", Policy::TESTS).unwrap_err(),
             FileSkip::NotReadable
@@ -685,7 +730,7 @@ pub(crate) mod tests {
         let link = outside.path().join("link");
         std::os::unix::fs::symlink(reg, &link).unwrap();
         assert_eq!(
-            list_registry(&link, Policy::TESTS).unwrap_err(),
+            list_registry(&link, RegistryFormat::Json, Policy::TESTS).unwrap_err(),
             Refusal::NotReadable
         );
         // A FIFO never blocks the open and is not read.
@@ -706,7 +751,7 @@ pub(crate) mod tests {
         for i in 0..(MAX_REGISTRY_FILES + 3) {
             std::fs::write(dir.path().join(format!("S-{i}.json")), b"{}").unwrap();
         }
-        let l = list_registry(dir.path(), Policy::TESTS).unwrap();
+        let l = list_registry(dir.path(), RegistryFormat::Json, Policy::TESTS).unwrap();
         assert_eq!(l.files.len(), MAX_REGISTRY_FILES);
         assert_eq!(l.over_cap, 3);
     }

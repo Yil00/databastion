@@ -1,0 +1,12 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://wiki\\.example\\.org/.*"
+name: "Wiki"
+id: 10000004
+description: "Team wiki, owner max.moe@example.org"
+logoutUrl: https://wiki.example.org/logout?ticket=FAKE-TICKET
+attributeReleasePolicy: !<org.apereo.cas.services.ReturnAllAttributeReleasePolicy> {}
+accessStrategy: !<org.apereo.cas.services.DefaultRegisteredServiceAccessStrategy>
+  enabled: true
+  ssoEnabled: true
+  requiredAttributes: !<java.util.HashMap>
+    uid: !<java.util.HashSet> [max.moe, "jane.doe"]

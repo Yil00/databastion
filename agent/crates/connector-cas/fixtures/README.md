@@ -13,3 +13,10 @@
   secret there in clear) by `Basic REDACTED-FAKE`, the `TGC` and `JSESSIONID` cookies (the
   encrypted ticket-granting cookie and the session id, logged in clear) by `REDACTED`, and `txn` by a fixed UUID. The user is a fake dev
   user. Used by `audit::events` tests.
+- `registry/`: fake service definitions in pairs, each in JSON and in the YAML form CAS 8.0.2
+  writes (`--- !<class>`, Jackson class hints as verbatim tags; the sample of the CAS 8.0.2 YAML
+  service registry documentation, extended): an OIDC relying party with a clear `clientSecret`,
+  credential-named keys and a URL with credentials (`HR-Portal-10000003`), a CAS service with flow
+  collections (`Wiki-10000004.yaml`) and a SAML service provider with a block scalar
+  (`SP-10000005`). Every value is fake. Used by the `parse::definition` and `discover` tests that
+  check a YAML definition gives the same findings as its JSON equivalent.
