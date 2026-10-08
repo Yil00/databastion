@@ -23,8 +23,9 @@
 //! or where a token starts; wherever its model could differ from libyaml's
 //! it refuses. A file is refused ([`Refusal`]) when:
 //!
-//! - it does not start with `--- !<class>` at byte 0 ([`Refusal::NotCas`]:
-//!   CAS would not load it either);
+//! - it does not start with `--- !<class>` ([`Refusal::NotCas`]: CAS would
+//!   not load it either); CAS trims the content first, so blank lines
+//!   (spaces only) may come before `---`, which must be at column 0;
 //! - it is not UTF-8, or holds a control character, a byte order mark, a
 //!   lone carriage return or a Unicode line break (`U+0085`, `U+2028`,
 //!   `U+2029`, which libyaml counts as line breaks)
@@ -38,7 +39,10 @@
 //!   ([`Refusal::Tag`]): `!foo`, `!!str`, `!!python/…`, `!<tag:…>` are
 //!   refused;
 //! - a scalar starts with `<<` (the merge key, quoted or not)
-//!   ([`Refusal::MergeKey`]);
+//!   ([`Refusal::MergeKey`]); a key spelled with an escape (`"\x3c<"`)
+//!   passes, harmlessly: `serde_yaml_ng` applies merge keys only in
+//!   `Value::apply_merge`, which the agent never calls, so `<<` is an
+//!   ordinary key to the visitor whatever its spelling;
 //! - a directive (`%YAML`, `%TAG`), a second `---` or a `...` appears
 //!   ([`Refusal::Directive`], [`Refusal::Documents`]);
 //! - an explicit key (`?`), an empty key, or a flow collection or a
@@ -47,8 +51,12 @@
 //!   outside quoted scalars, comments and block scalar content
 //!   ([`Refusal::Syntax`]);
 //! - flow collections nest deeper than [`MAX_FLOW_DEPTH`], block and flow
-//!   collections deeper than [`MAX_NESTING`], or the file has more than
-//!   [`MAX_LINES`] lines ([`Refusal::Bounds`]);
+//!   collections deeper than [`MAX_NESTING`], the file has more than
+//!   [`MAX_LINES`] lines, or more than [`MAX_TOKENS`] scalars, flow
+//!   collection starts, block entries and values ([`Refusal::Bounds`]):
+//!   `serde_yaml_ng` loads every event of the document before the
+//!   visitor's node bounds apply, so the token count is what bounds its
+//!   memory;
 //! - anything else the scanner does not follow (an unterminated quote or
 //!   flow collection, an indentation indicator on a block scalar, `:`
 //!   followed by a flow indicator or a non-blank inside a flow collection)
@@ -62,9 +70,19 @@ use zeroize::Zeroizing;
 pub const MAX_LINES: usize = 32_768;
 /// Deepest nesting of flow collections (`[…]`, `{…}`).
 pub const MAX_FLOW_DEPTH: usize = 4;
-/// Deepest nesting of block and flow collections together (the parser's
-/// own bound is the same, `definition::MAX_DEPTH`).
+/// Deepest nesting of block and flow collections together, as counted by
+/// the scanner. A lower bound only: an indentless sequence (`key:` then
+/// `- a` at the key's column) adds a level without an indentation and is
+/// not counted. The backstops are the visitor's own depth bound
+/// (`definition::MAX_DEPTH`, 32) and `serde_yaml_ng`'s recursion limit
+/// (128).
 pub const MAX_NESTING: usize = 32;
+/// Most tokens per file: scalars (keys included), flow collection
+/// starts, block sequence entries and value indicators. Each node the
+/// visitor counts (at most `definition::MAX_NODES`) costs the scanner at
+/// most three tokens (a key, its `:` or a `-`, the node), so no document
+/// within the visitor's bounds is refused for it.
+pub const MAX_TOKENS: usize = 3 * super::definition::MAX_NODES;
 /// Longest class name in a tag, in bytes.
 pub const MAX_CLASS_BYTES: usize = 256;
 
@@ -217,6 +235,8 @@ struct Scanner<'a> {
     last: Last,
     /// Byte spans of the tags to blank.
     tags: Vec<(usize, usize)>,
+    /// Tokens seen (see [`MAX_TOKENS`]).
+    tokens: usize,
 }
 
 fn is_break(c: Option<u8>) -> bool {
@@ -256,7 +276,17 @@ impl<'a> Scanner<'a> {
             candidates: vec![None],
             last: Last::Start,
             tags: Vec::new(),
+            tokens: 0,
         }
+    }
+
+    /// Counts one token against [`MAX_TOKENS`].
+    fn token(&mut self) -> Result<(), Refusal> {
+        self.tokens += 1;
+        if self.tokens > MAX_TOKENS {
+            return Err(Refusal::Bounds);
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<u8> {
@@ -336,8 +366,25 @@ impl<'a> Scanner<'a> {
         self.candidates.last_mut().and_then(Option::take)
     }
 
-    /// `--- !<class>` at byte 0, followed by a blank or a line end.
+    /// `--- !<class>`, followed by a blank or a line end. CAS trims the
+    /// content before checking its start: blank lines (spaces only) may
+    /// come first, so that `---` is still at column 0; a tab, a comment or
+    /// spaces before `---` on its own line are refused.
     fn header(&mut self) -> Result<String, Refusal> {
+        loop {
+            let line_start = self.pos;
+            while self.peek() == Some(b' ') {
+                self.advance();
+            }
+            if is_break(self.peek()) {
+                self.eat_break();
+                continue;
+            }
+            if self.pos != line_start {
+                return Err(Refusal::NotCas);
+            }
+            break;
+        }
         if !self.starts_with(b"--- !<") {
             return Err(Refusal::NotCas);
         }
@@ -427,6 +474,10 @@ impl<'a> Scanner<'a> {
                 && is_blankz(self.at(3))
             {
                 return Err(Refusal::Documents);
+            }
+            // Closers, separators and tags (blanked) make no event.
+            if !matches!(c, b']' | b'}' | b',' | b'!') {
+                self.token()?;
             }
             match c {
                 b'[' | b'{' => {
@@ -909,5 +960,35 @@ mod tests {
         assert_eq!(refused(&deep), Refusal::Bounds);
         let seqs = format!("{}x\n", "- ".repeat(MAX_NESTING + 1));
         assert_eq!(refused(&seqs), Refusal::Bounds);
+    }
+
+    #[test]
+    fn tokens_are_bounded_before_parsing() {
+        // About 1 MiB of a flow sequence and of a flow mapping.
+        let seq = format!("a: [{}a]\n", "a,".repeat(512 * 1024));
+        assert_eq!(refused(&seq), Refusal::Bounds);
+        let map = format!("a: {{{}b: c}}\n", "b: c, ".repeat(170 * 1024));
+        assert_eq!(refused(&map), Refusal::Bounds);
+        // Within the visitor's node bound: accepted.
+        let entries: Vec<String> = (0..60_000).map(|i| format!("k{i}: 1")).collect();
+        ok(&format!("a: {{{}}}\n", entries.join(", ")));
+    }
+
+    #[test]
+    fn blank_lines_may_come_before_the_header() {
+        let p = prescan(format!("\n  \r\n\n{HEAD}a: 1\n").as_bytes()).unwrap();
+        assert_eq!(p.class, "org.apereo.cas.services.CasRegisteredService");
+        for doc in [
+            format!("\t\n{HEAD}"),
+            format!("# c\n{HEAD}"),
+            format!("\n  {HEAD}"),
+            "\n\n".to_owned(),
+        ] {
+            assert_eq!(
+                prescan(doc.as_bytes()).unwrap_err(),
+                Refusal::NotCas,
+                "{doc:?}"
+            );
+        }
     }
 }

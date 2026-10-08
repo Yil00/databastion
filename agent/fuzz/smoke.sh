@@ -5,7 +5,8 @@
 #
 # Builds the targets with libFuzzer's coverage instrumentation (the flags cargo-fuzz passes, without
 # a sanitizer: sanitizers need a nightly toolchain) plus debug assertions and overflow checks, then
-# runs each target for SECONDS from an empty corpus in a temporary directory. Exits non-zero on the
+# runs each target for SECONDS from a temporary corpus (empty, or seeded with the committed CAS
+# registry fixtures for cas_registry and cas_registry_yaml). Exits non-zero on the
 # first crash, panic, timeout or out-of-memory; the crashing input is kept under
 # $CARGO_TARGET_DIR/fuzz-artifacts/ (never commit it if it was built from real data).
 # For longer campaigns, use cargo-fuzz on nightly (README.md).
@@ -26,9 +27,19 @@ ART="$CARGO_TARGET_DIR/fuzz-artifacts"
 mkdir -p "$ART"
 CORPUS="$(mktemp -d)"
 trap 'rm -rf "$CORPUS"' EXIT
+# Synthetic seed inputs (committed fixtures, fake values only) for targets whose input must get
+# past a fixed header before the parser is reached.
+FIXTURES="$HERE/../crates/connector-cas/fixtures/registry"
+seed() {
+  case "$1" in
+    cas_registry) cp "$FIXTURES"/*.json "$2"/ ;;
+    cas_registry_yaml) cp "$FIXTURES"/*.yml "$FIXTURES"/*.yaml "$2"/ ;;
+  esac
+}
 for src in "$HERE"/fuzz_targets/*.rs; do
   t="$(basename "$src" .rs)"
   mkdir -p "$CORPUS/$t"
+  seed "$t" "$CORPUS/$t"
   echo "fuzz smoke: $t (${SECS}s)" >&2
   rc=0
   "$BIN/$t" "$CORPUS/$t" -max_total_time="$SECS" -max_len=4096 -timeout=10 -rss_limit_mb=1024 \

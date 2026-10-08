@@ -33,7 +33,12 @@
 //! any parsing), then the copy with its class hints blanked goes through
 //! the same visitor with `serde_yaml_ng`. The class is the root node's tag
 //! (`--- !<org.apereo.cas.…>`, what CAS 8.0.2 requires); a top-level
-//! `@class` key next to it refuses the document.
+//! `@class` key next to it refuses the document. YAML resolves unquoted
+//! digits to integers (`phone: 33612345678`, a card number): below the
+//! top level they are classified as their decimal text, which drops a
+//! leading `+`, a `0x` / `0o` prefix or `_` separators' meaning; a number
+//! with a leading zero stays a string. Floats are not classified. JSON
+//! numbers are never classified (unchanged).
 
 use std::fmt;
 
@@ -368,8 +373,13 @@ fn parse_with<'de, D: Deserializer<'de>>(
     de: D,
     root_class: Option<String>,
 ) -> Result<Definition, DefinitionError> {
-    let mut ctx = Ctx::default();
     let preset = root_class.is_some();
+    // YAML resolves unquoted digits to integers: on that path they are
+    // classified as their decimal text (JSON numbers stay unsampled).
+    let mut ctx = Ctx {
+        numbers_as_text: preset,
+        ..Ctx::default()
+    };
     let top = de.deserialize_any(TopVisitor {
         ctx: &mut ctx,
         preset_class: preset,
@@ -402,6 +412,8 @@ fn parse_with<'de, D: Deserializer<'de>>(
 
 #[derive(Default)]
 struct Ctx {
+    /// Integers are sampled as their decimal text (YAML only).
+    numbers_as_text: bool,
     path: Vec<Seg>,
     depth: usize,
     nodes: usize,
@@ -439,6 +451,14 @@ impl Ctx {
             return Err(self.fail(DefinitionError::Bounds));
         }
         Ok(())
+    }
+
+    /// An integer node: sampled as text on the YAML path.
+    fn number(&mut self, text: impl FnOnce() -> String) {
+        if self.numbers_as_text {
+            let t = Zeroizing::new(text());
+            self.sample(&t);
+        }
     }
 
     fn sample(&mut self, s: &str) {
@@ -596,6 +616,12 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<Top, E> {
         Ok(Top::Other)
     }
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<Top, E> {
+        Ok(Top::Other)
+    }
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<Top, E> {
+        Ok(Top::Other)
+    }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Top, E> {
         Ok(Top::Other)
     }
@@ -626,6 +652,12 @@ impl<'de> de::Deserialize<'de> for MaybeStr {
                 Ok(MaybeStr(None))
             }
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<MaybeStr, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_i128<E: de::Error>(self, _: i128) -> Result<MaybeStr, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_u128<E: de::Error>(self, _: u128) -> Result<MaybeStr, E> {
                 Ok(MaybeStr(None))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<MaybeStr, E> {
@@ -662,6 +694,12 @@ impl<'de> de::Deserialize<'de> for Number {
                 Ok(Number(Some(v)))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Number, E> {
+                Ok(Number(i64::try_from(v).ok()))
+            }
+            fn visit_i128<E: de::Error>(self, v: i128) -> Result<Number, E> {
+                Ok(Number(i64::try_from(v).ok()))
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<Number, E> {
                 Ok(Number(i64::try_from(v).ok()))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<Number, E> {
@@ -715,6 +753,12 @@ impl<'de> de::Deserialize<'de> for FormOf {
                 Ok(FormOf(SecretForm::Clear))
             }
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<FormOf, E> {
+                Ok(FormOf(SecretForm::Clear))
+            }
+            fn visit_i128<E: de::Error>(self, _: i128) -> Result<FormOf, E> {
+                Ok(FormOf(SecretForm::Clear))
+            }
+            fn visit_u128<E: de::Error>(self, _: u128) -> Result<FormOf, E> {
                 Ok(FormOf(SecretForm::Clear))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<FormOf, E> {
@@ -774,12 +818,26 @@ impl<'de> Visitor<'de> for Node<'_> {
         self.ctx.node()?;
         Ok(NodeKind::Other)
     }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<NodeKind, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<NodeKind, E> {
         self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
         Ok(NodeKind::Other)
     }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<NodeKind, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<NodeKind, E> {
         self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
+        Ok(NodeKind::Other)
+    }
+    // Integers beyond 64 bits (YAML: 20 digits or more; never from JSON
+    // without `arbitrary_precision`).
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<NodeKind, E> {
+        self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
+        Ok(NodeKind::Other)
+    }
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<NodeKind, E> {
+        self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
         Ok(NodeKind::Other)
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<NodeKind, E> {
@@ -1305,5 +1363,37 @@ mod tests {
             DefinitionError::Bounds
         );
         assert!(yaml("a: [1, 2]\nclientSecret: ${S}\n").is_ok());
+    }
+
+    #[test]
+    fn unquoted_yaml_numbers_are_classified_as_text() {
+        let json = r#"{"@class": "org.apereo.cas.services.CasRegisteredService",
+          "serviceId": "^https://app.example.org/.*", "name": "App",
+          "contacts": [{"name": "Jane Doe", "phone": "0612345678", "mobile": "33612345678"}],
+          "properties": {"card": {"values": ["4111111111111111"]},
+                         "iban": {"values": ["12345678901234567890123"]}}}"#;
+        let yaml = "--- !<org.apereo.cas.services.CasRegisteredService>\n\
+                    serviceId: \"^https://app.example.org/.*\"\nname: App\n\
+                    contacts:\n- name: Jane Doe\n  phone: 0612345678\n  mobile: 33612345678\n\
+                    properties:\n  card:\n    values: [4111111111111111]\n\
+                    \x20 iban:\n    values:\n    - 12345678901234567890123\n";
+        let j = parse_definition(json.as_bytes()).unwrap();
+        let y = parse_yaml_definition(yaml.as_bytes()).unwrap();
+        assert_eq!(paths(&j), paths(&y));
+        assert!(paths(&y).iter().any(|(_, v)| v == "4111111111111111"));
+        // JSON numbers are still not sampled; top-level `id` never is.
+        let j = parse_definition(
+            br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "serviceId": "x",
+                 "id": 4111111111111111, "phone": 33612345678}"#,
+        )
+        .unwrap();
+        assert_eq!(paths(&j), [("[serviceId]".to_owned(), "x".to_owned())]);
+        let y = parse_yaml_definition(
+            b"--- !<org.apereo.cas.services.CasRegisteredService>\nserviceId: x\n\
+              id: 4111111111111111\nevaluationOrder: 3\nratio: 1.5\n",
+        )
+        .unwrap();
+        assert_eq!(y.id, Some(4_111_111_111_111_111));
+        assert_eq!(paths(&y), [("[serviceId]".to_owned(), "x".to_owned())]);
     }
 }

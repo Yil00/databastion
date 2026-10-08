@@ -32,6 +32,11 @@ cargo-fuzz uses but without a sanitizer:
 agent/fuzz/smoke.sh 60     # seconds per target
 ```
 
+`smoke.sh` seeds `cas_registry` and `cas_registry_yaml` with the committed fake definitions of
+`crates/connector-cas/fixtures/registry/` (JSON and YAML respectively): from an empty corpus a
+YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. The other targets
+start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
+
 Longer campaigns with AddressSanitizer need a nightly toolchain and cargo-fuzz:
 
 ```sh

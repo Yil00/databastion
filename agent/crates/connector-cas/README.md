@@ -63,7 +63,8 @@ refused as a whole, and those files are never opened.
 - **YAML** (`yaml_dir`, `src/parse/yaml.rs`): CAS 8.0.2 loads a YAML file
   only when it starts with `--- !<class>` (`RegisteredServiceYamlSerializer`:
   Jackson writes class hints as verbatim tags) and reads one document. The
-  agent requires the same start at byte 0, takes the class from that root
+  agent requires the same start (after blank lines of spaces only, as CAS
+  trims the content; `---` at column 0), takes the class from that root
   tag (a top-level `@class` next to it refuses the file), and **pre-scans
   the raw bytes before any YAML parsing**, following libyaml's tokenizer:
   the file is refused (skipped, counted) on an anchor (`&a`) or an alias
@@ -76,12 +77,22 @@ refused as a whole, and those files are never opened.
   an indentation indicator on a block scalar; `:` followed by a non-blank
   inside a flow collection; invalid UTF-8, control characters, a BOM, a
   lone CR or a Unicode line break (`U+0085`, `U+2028`, `U+2029`); flow
-  collections nested deeper than 4, collections deeper than 32, or more than
-  32 768 lines. `&`, `*`, `!` and `#` inside quoted, plain and block
+  collections nested deeper than 4, collections deeper than 32 (a lower
+  bound: indentless sequences are not counted; the visitor's depth 32 and
+  `serde_yaml_ng`'s recursion limit 128 are the backstops), more than
+  32 768 lines, or more than 196 608 tokens (scalars, flow collection
+  starts, `-` entries and `:` values: three per node the visitor allows),
+  since `serde_yaml_ng` loads every event before the visitor's bounds apply
+  (a 1 MiB `[a,a,…]` is refused before parsing). `&`, `*`, `!` and `#` inside quoted, plain and block
   scalars and comments are text. The class hints are then blanked (replaced
   by spaces, positions unchanged) in a zeroizing copy, which goes through
   the same closed visitor and bounds as JSON with `serde_yaml_ng`: the YAML
   parser never sees an anchor, an alias, a merge key nor a tag.
+- **Unquoted numbers (YAML)**: YAML resolves `phone: 33612345678` or a card
+  number to an integer; below the top level the visitor classifies it as
+  its decimal text (a leading `+`, a `0x` / `0o` prefix and `_` are lost;
+  a number with a leading zero stays a string). Floats are not classified.
+  JSON numbers are not classified (unchanged).
 - **YAML parser choice**: `serde_yaml_ng` 0.10, the maintained fork of the
   deprecated `serde_yaml` (MIT / Apache-2.0), which the core already links
   to read `agent.yaml`: no new crate in the agent binary (ADR-0041 decisions
