@@ -54,6 +54,15 @@ updates:
       interval: weekly
     commit-message:
       prefix: chore(agent)
+    ignore:
+      # protocol-codegen: syn, prettyplease and schemars must match the versions typify uses;
+      # they move together with a typify upgrade, never on their own.
+      - dependency-name: syn
+        update-types: ["version-update:semver-major"]
+      - dependency-name: prettyplease
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: schemars
+        update-types: ["version-update:semver-major"]
     groups:
       agent:
         patterns: ["*"]
