@@ -1441,22 +1441,45 @@ pub(crate) async fn cas_guard_readable(
     stores: Option<&databastion_core::cas_guard::CasStores>,
 ) -> Result<databastion_core::cas_guard::ReadableCheck, MyError> {
     use databastion_core::cas_guard::{self, StoreKind};
-    let statement = sql::cas_guard_statement(stores)
+    // Several statements, each short enough never to be cut in the audit
+    // logs (`sql::CAS_GUARD_MAX_STATEMENT`): tables matched by name first,
+    // then by shape; at most `CAS_GUARD_MAX_ROWS` rows in all.
+    let statements = sql::cas_guard_statement_texts(stores)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
-    let (rows, skipped) = session.query_counted(Stage::Check, &statement).await?;
-    let mut complete = skipped == 0 && rows.len() <= sql::CAS_GUARD_MAX_ROWS;
+    let mut complete = true;
+    let mut taken = 0usize;
     // Per table: (column, readable).
     type Columns = Vec<(String, bool)>;
     let mut tables: Vec<((String, String), Columns)> = Vec::new();
-    for row in rows.iter().take(sql::CAS_GUARD_MAX_ROWS) {
-        let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
-        let key = (v(0), v(1));
-        let readable = v(3)
-            .split(',')
-            .any(|p| p.trim().eq_ignore_ascii_case("select"));
-        match tables.last_mut() {
-            Some((k, cols)) if *k == key => cols.push((v(2), readable)),
-            _ => tables.push((key, vec![(v(2), readable)])),
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for statement in &statements {
+        if taken > sql::CAS_GUARD_MAX_ROWS {
+            break;
+        }
+        let (rows, skipped) = session.query_counted(Stage::Check, statement).await?;
+        complete &= skipped == 0;
+        // Tables of the earlier statements (a table matched by name and by
+        // shape) are not listed twice.
+        let earlier = seen.clone();
+        for row in &rows {
+            let v = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+            let key = (v(0), v(1));
+            if earlier.contains(&key) {
+                continue;
+            }
+            taken += 1;
+            if taken > sql::CAS_GUARD_MAX_ROWS {
+                complete = false;
+                break;
+            }
+            let readable = v(3)
+                .split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("select"));
+            seen.insert(key.clone());
+            match tables.last_mut() {
+                Some((k, cols)) if *k == key => cols.push((v(2), readable)),
+                _ => tables.push((key, vec![(v(2), readable)])),
+            }
         }
     }
     let mut guarded: Vec<(&(String, String), StoreKind)> = Vec::new();

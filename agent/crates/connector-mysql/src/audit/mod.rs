@@ -145,6 +145,15 @@ pub(crate) async fn probe_prerequisites(
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_QUERY_LIMIT);
+        if limit < sql::CAS_GUARD_MAX_STATEMENT + 2 {
+            tracing::warn!(
+                target_id = %target.id,
+                limit,
+                "server_audit_query_log_limit below the agent's longest statement: its CAS \
+                 store guard statements are cut in the log and reported as its own reads; \
+                 keep it at 1024 or more"
+            );
+        }
         (offset.unwrap_or(0), limit)
     } else {
         (0, DEFAULT_QUERY_LIMIT)
@@ -189,9 +198,10 @@ fn builder(
 /// Exact texts of the statements `check()` sends that read
 /// `information_schema` only (see `EventBuilder::own_statement`).
 pub(crate) fn own_statements(target: &TargetConfig) -> Vec<Vec<u8>> {
-    sql::cas_guard_statement(target.cas_stores())
-        .map(String::into_bytes)
+    sql::cas_guard_statement_texts(target.cas_stores())
+        .unwrap_or_default()
         .into_iter()
+        .map(String::into_bytes)
         .collect()
 }
 

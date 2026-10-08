@@ -297,6 +297,14 @@ impl PsPoller {
                 .min(MAX_TEXT_BYTES)
         };
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
+        if text_limit < sql::CAS_GUARD_MAX_STATEMENT + 4 {
+            tracing::warn!(
+                limit = text_limit,
+                "performance_schema_max_sql_text_length below the agent's longest statement: \
+                 its CAS store guard statements are cut and reported as its own reads; keep \
+                 it at 1024 or more"
+            );
+        }
         let digest_limit = limit(scalar(session, sql::PS_DIGEST_LIMIT).await?);
         let boot = server_boot(session).await?;
         let mut saved = load(store.as_ref());

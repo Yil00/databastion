@@ -334,50 +334,101 @@ macro_rules! name_key {
     };
 }
 
-/// Most rows of [`cas_guard_columns`]; one more is read to tell a cut list
-/// (then reported as not evaluated, PR #141 review L2).
+/// Most rows of the CAS store guard statements together; one more is read
+/// to tell a cut list (then reported as not evaluated, PR #141 review L2).
 pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
 
-/// `check()` of the CAS store guard (ADR-0041 decision 6): the columns of
-/// the tables that may be CAS stores (a name key in `keys`, or a `body` /
-/// `json` / `AUD_RESOURCE` / `AUD_USER` column) the account can see, with
-/// its privileges on each. Tables matched by name come first (PR #141
-/// review L2); at most [`CAS_GUARD_MAX_ROWS`] + 1 rows. `None` when a key
-/// cannot be quoted. Columns: schema, table, column, privileges.
+/// Longest CAS store guard statement, in bytes as `server_audit` logs it
+/// (escaped): well under the 1024-byte defaults of
+/// `server_audit_query_log_limit` and `performance_schema_max_sql_text_length`,
+/// so that a guard statement is never cut at the default limits and its
+/// exact text can be recognized by the Audit stream.
+pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = 900;
+
+/// Length of `s` once escaped by MariaDB's `server_audit` (`'`, `\`,
+/// newline, carriage return, tab, backspace and form feed gain a `\`).
 #[must_use]
-pub(crate) fn cas_guard_columns(keys: &[String]) -> Option<String> {
-    let mut list = Vec::with_capacity(keys.len());
-    for k in keys {
-        list.push(quote_str(k)?);
-    }
-    if list.is_empty() {
-        list.push("''".to_owned());
-    }
-    let list = list.join(", ");
-    Some(format!(
-        "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.PRIVILEGES \
-         FROM information_schema.COLUMNS c \
-         WHERE LOWER(c.TABLE_SCHEMA) NOT IN \
-           ('mysql', 'sys', 'information_schema', 'performance_schema') \
-           AND ({key} IN ({list}) \
-             OR (c.TABLE_SCHEMA, c.TABLE_NAME) IN ( \
-               SELECT x.TABLE_SCHEMA, x.TABLE_NAME FROM information_schema.COLUMNS x \
-               WHERE {xkey} IN ('body', 'json', 'audresource', 'auduser'))) \
-         ORDER BY ({key} IN ({list})) DESC, c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION \
-         LIMIT 20001",
-        key = name_key!("c.TABLE_NAME"),
-        xkey = name_key!("x.COLUMN_NAME"),
-    ))
+pub(crate) fn server_audit_escaped_len(s: &str) -> usize {
+    s.len()
+        + s.bytes()
+            .filter(|b| matches!(b, b'\'' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c))
+            .count()
 }
 
-/// The CAS store guard statement of a target: [`cas_guard_columns`] of
-/// the built-in and `cas_stores` name keys. One builder for `check()` and
-/// for the Audit stream, which recognizes it by its exact text.
+/// The schemas the guard never looks at.
+const CAS_GUARD_SCHEMAS: &str =
+    "LOWER(TABLE_SCHEMA) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')";
+
+/// The CAS store guard statements of `check()` (ADR-0041 decision 6): the
+/// columns of the tables that may be CAS stores, with the account's
+/// privileges on each. Columns: schema, table, column, privileges; each
+/// statement ordered by schema, table and column position, at most
+/// [`CAS_GUARD_MAX_ROWS`] + 1 rows.
+///
+/// - First, tables whose name key is in `keys` (the built-in names and
+///   `cas_stores`), in as many statements as needed for each to stay within
+///   [`CAS_GUARD_MAX_STATEMENT`] (tables matched by name come first, PR
+///   #141 review L2);
+/// - last, the tables with a `body` / `json` / `AUD_RESOURCE` / `AUD_USER`
+///   column (recognition by shape).
+///
+/// `None` when a key cannot be quoted or does not fit one statement.
 #[must_use]
-pub(crate) fn cas_guard_statement(
+pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<Vec<String>> {
+    let head = format!(
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
+         FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} AND {} IN (",
+        name_key!("TABLE_NAME"),
+    );
+    let tail = ") ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001";
+    let mut out = Vec::new();
+    let mut list = String::new();
+    for k in keys {
+        let q = quote_str(k)?;
+        let candidate = if list.is_empty() {
+            q.clone()
+        } else {
+            format!("{list}, {q}")
+        };
+        let fits = |l: &str| {
+            server_audit_escaped_len(&head) + server_audit_escaped_len(l) + tail.len()
+                <= CAS_GUARD_MAX_STATEMENT
+        };
+        if fits(&candidate) {
+            list = candidate;
+        } else if list.is_empty() || !fits(&q) {
+            return None;
+        } else {
+            out.push(format!("{head}{list}{tail}"));
+            list = q;
+        }
+    }
+    if !list.is_empty() {
+        out.push(format!("{head}{list}{tail}"));
+    }
+    out.push(format!(
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
+         FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} \
+         AND (TABLE_SCHEMA, TABLE_NAME) IN (SELECT x.TABLE_SCHEMA, x.TABLE_NAME \
+         FROM information_schema.COLUMNS x WHERE {} IN ('body', 'json', 'audresource', 'auduser')) \
+         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001",
+        name_key!("x.COLUMN_NAME"),
+    ));
+    debug_assert!(
+        out.iter()
+            .all(|s| server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT)
+    );
+    Some(out)
+}
+
+/// The CAS store guard statements of a target: [`cas_guard_statements`]
+/// of the built-in and `cas_stores` name keys. One builder for `check()`
+/// and for the Audit stream, which recognizes them by their exact text.
+#[must_use]
+pub(crate) fn cas_guard_statement_texts(
     stores: Option<&databastion_core::cas_guard::CasStores>,
-) -> Option<String> {
-    cas_guard_columns(&databastion_core::cas_guard::known_name_keys(stores))
+) -> Option<Vec<String>> {
+    cas_guard_statements(&databastion_core::cas_guard::known_name_keys(stores))
 }
 
 // ------------------------------------------------------------------ check()
@@ -764,14 +815,56 @@ mod tests {
             PS_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
-            cas_guard_columns(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
         ];
+        v.extend(
+            cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
+        );
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
             v.push(sample_statement(flavor, 1000, "s", "t", &[("c", Sampled::Text)], 10).unwrap());
             v.push(ticket_type_counts(flavor, 1000, "s", "t", "type").unwrap());
         }
         v
+    }
+
+    /// The guard statements never reach the default 1024-byte log limits
+    /// (security review of f9bab99): every name key is in exactly one of
+    /// them, the shape statement comes last.
+    #[test]
+    fn cas_guard_statements_stay_short_and_cover_every_key() {
+        let names = |p: char| -> Vec<String> {
+            (0..64)
+                .map(|i| format!("{i:02}{}", p.to_string().repeat(126)))
+                .collect()
+        };
+        let full = databastion_core::cas_guard::CasStores {
+            ticket_registry: names('t'),
+            service_registry: names('s'),
+            audit_trail: names('a'),
+        };
+        for stores in [None, Some(&full)] {
+            let keys = databastion_core::cas_guard::known_name_keys(stores);
+            let all = cas_guard_statement_texts(stores).unwrap();
+            for s in &all {
+                assert!(
+                    server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT,
+                    "{}",
+                    s.len()
+                );
+                assert!(s.ends_with("LIMIT 20001"));
+            }
+            let (shape, by_name) = all.split_last().unwrap();
+            assert!(shape.contains("'audresource'"));
+            for k in &keys {
+                let q = format!("'{k}'");
+                assert_eq!(by_name.iter().filter(|s| s.contains(&q)).count(), 1, "{k}");
+            }
+            // Built-in names: two name statements and the shape one; 64
+            // names of 128 characters per list: 67.
+            assert_eq!(all.len(), if stores.is_none() { 3 } else { 67 });
+        }
+        // A key that cannot fit one statement: no statement at all.
+        assert!(cas_guard_statements(&["k".repeat(800)]).is_none());
     }
 
     #[test]

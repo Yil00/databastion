@@ -616,18 +616,14 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
     }
 }
 
-/// Shortest truncated text matched against the connector's own
-/// statements (a prefix): it covers the guard statement's fixed head and
-/// the start of its name list, so a short cut text is never left out.
-const MIN_OWN_PREFIX: usize = 256;
-
 /// Builds events for one target and source.
 pub(crate) struct EventBuilder {
     own: OwnAccount,
     /// Exact texts of the statements the connector itself sends that read
-    /// no relation but `information_schema` (the CAS store guard's column
-    /// query, ADR-0041 decision 6): recognized by text and left out
-    /// without a charge (see [`Self::own_statement`]).
+    /// no relation but `information_schema.COLUMNS` (the CAS store guard's
+    /// column queries, ADR-0041 decision 6, each short enough never to be
+    /// cut at the default log limits): recognized by their whole text and
+    /// left out without a charge (see [`Self::own_statement`]).
     own_statements: Vec<Vec<u8>>,
     sessions: Sessions,
     /// Table-access records waiting for their statement record.
@@ -661,19 +657,25 @@ impl EventBuilder {
 
     /// Whether a statement record is one of the connector's own statements
     /// (text only; the caller checks the account, the application, the
-    /// address and the tables): its text is equal to one of them, or the
-    /// record is marked truncated and its text, at least
-    /// [`MIN_OWN_PREFIX`] bytes long, is a prefix of one of them. The text
-    /// compared is the decoded one (`server_audit` escapes undone by
-    /// `records::parse_server_audit`, the JSON string of the `audit_log`
-    /// file, `performance_schema`'s `SQL_TEXT`); a `DIGEST_TEXT` never
-    /// matches (its literals are replaced), nor does an opaque text.
+    /// address and the tables): its decoded text (`server_audit` escapes
+    /// undone by `records::parse_server_audit`, the JSON string of the
+    /// `audit_log` file, `performance_schema`'s `SQL_TEXT`) is **equal** to
+    /// one of them, and the record is **not** marked truncated. A cut text
+    /// proves nothing about what followed the cut: it is never matched
+    /// (security review of f9bab99, H1). A `DIGEST_TEXT` never matches
+    /// (its literals are replaced), nor does an opaque text.
     fn own_statement(&self, text: &[u8], truncated: bool, opaque: bool) -> bool {
-        !opaque
-            && self.own_statements.iter().any(|g| {
-                text == g.as_slice()
-                    || (truncated && text.len() >= MIN_OWN_PREFIX && g.starts_with(text))
-            })
+        !truncated && !opaque && self.own_statements.iter().any(|g| text == g.as_slice())
+    }
+
+    /// The text and table conditions of an own guard statement (the
+    /// identity conditions are `OwnAccount::routine_unbudgeted`'s).
+    fn own_guard(&self, a: &Access<'_>) -> bool {
+        a.text
+            .is_some_and(|t| self.own_statement(t, a.truncated, a.opaque))
+            && a.tables
+                .iter()
+                .all(|(db, _, _)| db.eq_ignore_ascii_case("information_schema"))
     }
 
     /// The agent's address as the server sees it, refreshed at each
@@ -687,16 +689,13 @@ impl EventBuilder {
 
     /// The event of one statement, if any (see the module documentation).
     pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
-        // The connector's own guard statement: a truncated text of it does
-        // not lex (the cut can fall inside a string literal) and would read
-        // as a read of `*` with unknown rows, charged the whole budget. It
-        // reads `information_schema` only: left out without a charge when
-        // the account, application and address are the agent's, no table
-        // record names anything else, and no signal applies.
-        if let Some(t) = a.text
-            && self.own_statement(t, a.truncated, a.opaque)
-            && a.tables.iter().all(|(db, _, _)| is_system_schema(db))
-        {
+        // The connector's own guard statements, by their exact whole text:
+        // they read `information_schema.COLUMNS` only. Left out without a
+        // charge when the account, application and address are the agent's,
+        // every table record (if any) is in `information_schema` (not
+        // `performance_schema` nor `sys`: security review of f9bab99, M1),
+        // and no signal applies. Anything else takes the usual path.
+        if self.own_guard(&a) {
             let e = MaskedEvent::new(
                 a.source,
                 EventAction::Read,
@@ -1195,23 +1194,29 @@ mod tests {
             .collect()
     }
 
-    /// The CAS store guard statements `check()` sends: the built-in names,
-    /// and 64 names in each `cas_stores` list (the most allowed).
-    fn guard_statements() -> Vec<String> {
-        let names = |p: &str| -> Vec<String> {
+    /// The CAS store guard statements `check()` sends: for the built-in
+    /// names, and for 64 names of 128 characters in each `cas_stores` list
+    /// (the most allowed).
+    fn guard_sets() -> Vec<Vec<String>> {
+        let names = |p: char| -> Vec<String> {
             (0..64)
-                .map(|i| format!("{p}_custom_store_{i:02}"))
+                .map(|i| format!("{i:02}{}", p.to_string().repeat(126)))
                 .collect()
         };
         let full = databastion_core::cas_guard::CasStores {
-            ticket_registry: names("tickets"),
-            service_registry: names("services"),
-            audit_trail: names("audit"),
+            ticket_registry: names('t'),
+            service_registry: names('s'),
+            audit_trail: names('a'),
         };
         vec![
-            crate::sql::cas_guard_statement(None).unwrap(),
-            crate::sql::cas_guard_statement(Some(&full)).unwrap(),
+            crate::sql::cas_guard_statement_texts(None).unwrap(),
+            crate::sql::cas_guard_statement_texts(Some(&full)).unwrap(),
         ]
+    }
+
+    fn guard_builder(texts: &[String]) -> EventBuilder {
+        EventBuilder::new(own())
+            .with_own_statements(texts.iter().map(|t| t.clone().into_bytes()).collect())
     }
 
     /// A `server_audit` QUERY line for `text` as `user` from `host`, cut as
@@ -1245,118 +1250,167 @@ mod tests {
             .collect()
     }
 
-    /// E2E regression (mariadb-e2e I2): the guard statement, cut by
-    /// `server_audit_query_log_limit` inside a string literal, does not lex;
-    /// it must not surface as the agent's read of `*`, at any heartbeat.
+    fn pfs_access<'a>(
+        text: &'a [u8],
+        truncated: bool,
+        tables: Vec<(&'a str, &'a str, TableOp)>,
+    ) -> Access<'a> {
+        Access {
+            session: "t9".to_owned(),
+            user: "databastion",
+            principal: EventPrincipal::account("databastion"),
+            client: ClientSeen::NotVisible,
+            application: Some("databastion-agent"),
+            database: "",
+            text: Some(text),
+            opaque: false,
+            truncated,
+            tables,
+            rows: None,
+            status: 0,
+            ts: SystemTime::now(),
+            source: EventSource::PerformanceSchema,
+        }
+    }
+
+    /// E2E regression (mariadb-e2e I2): every guard statement stays under
+    /// the default 1024-byte log limits, is never cut, and is left out at
+    /// every heartbeat on each source.
     #[test]
     fn the_cas_guard_statement_is_left_out_whole_or_truncated() {
-        for g in guard_statements() {
-            assert!(g.len() > 1024, "{}", g.len());
-            for limit in [1024usize, 512, 300, 1 << 20] {
-                let cut = (limit < g.len()).then_some(limit);
-                let mut b =
-                    EventBuilder::new(own()).with_own_statements(vec![g.clone().into_bytes()]);
-                for q in 1..=3 {
-                    let line = sa_query("databastion", "172.18.0.1", q, &g, cut);
-                    let recs = sa_at(&[line], limit);
-                    assert_eq!(recs[0].truncated, cut.is_some(), "{limit}");
-                    assert_eq!(file(&mut b, recs), Vec::<String>::new(), "{limit}");
-                }
-            }
-            // The `audit_log` JSON file (whole text).
-            let mut b = EventBuilder::new(own()).with_own_statements(vec![g.clone().into_bytes()]);
-            for c in 1..=3u64 {
-                let rec = format!(
-                    r#"{{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":{c},"login":{{"user":"databastion","ip":"172.18.0.1"}},"general_data":{{"command":"Query","query":{},"status":0}}}}"#,
-                    serde_json::to_string(&g).unwrap()
-                );
-                let recs = vec![parse_json(rec.as_bytes()).unwrap()];
-                let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        for set in guard_sets() {
+            for g in &set {
                 assert!(
-                    ev.is_empty(),
-                    "{:?}",
-                    ev.iter().map(show).collect::<Vec<_>>()
+                    crate::sql::server_audit_escaped_len(g) <= 900,
+                    "{}",
+                    g.len()
                 );
-            }
-            // performance_schema `SQL_TEXT` cut at its limit.
-            let mut b = EventBuilder::new(own()).with_own_statements(vec![g.clone().into_bytes()]);
-            for _ in 0..3 {
-                let access = Access {
-                    session: "t9".to_owned(),
-                    user: "databastion",
-                    principal: EventPrincipal::account("databastion"),
-                    client: ClientSeen::NotVisible,
-                    application: Some("databastion-agent"),
-                    database: "",
-                    text: Some(&g.as_bytes()[..1020]),
-                    opaque: false,
-                    truncated: true,
-                    tables: Vec::new(),
-                    rows: None,
-                    status: 0,
-                    ts: SystemTime::now(),
-                    source: EventSource::PerformanceSchema,
-                };
-                assert!(b.statement(access, SystemTime::now()).is_none());
+                let mut b = guard_builder(&set);
+                for q in 1..=3 {
+                    let recs = sa_at(
+                        &[sa_query("databastion", "172.18.0.1", q, g, Some(1024))],
+                        1024,
+                    );
+                    assert!(!recs[0].truncated);
+                    assert_eq!(
+                        recs[0].text.as_deref().map(Vec::as_slice),
+                        Some(g.as_bytes())
+                    );
+                    assert_eq!(file(&mut b, recs), Vec::<String>::new());
+                }
+                // The `audit_log` JSON file.
+                let mut b = guard_builder(&set);
+                for c in 1..=3u64 {
+                    let rec = format!(
+                        r#"{{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":{c},"login":{{"user":"databastion","ip":"172.18.0.1"}},"general_data":{{"command":"Query","query":{},"status":0}}}}"#,
+                        serde_json::to_string(g).unwrap()
+                    );
+                    let recs = vec![parse_json(rec.as_bytes()).unwrap()];
+                    let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+                    assert!(
+                        ev.is_empty(),
+                        "{:?}",
+                        ev.iter().map(show).collect::<Vec<_>>()
+                    );
+                }
+                // performance_schema `SQL_TEXT`, not cut.
+                let mut b = guard_builder(&set);
+                for _ in 0..3 {
+                    let access = pfs_access(g.as_bytes(), false, Vec::new());
+                    assert!(b.own_guard(&access));
+                    assert!(b.statement(access, SystemTime::now()).is_none());
+                }
             }
         }
     }
 
-    /// Only the agent's account, address and text are left out: the same
-    /// cut text from another account or address, a text that is not a
-    /// prefix, a too short prefix, a whole text that differs, or a guard
-    /// text with a table record outside `information_schema` is reported.
+    /// Only the whole, uncut guard text with no table record outside
+    /// `information_schema` takes the uncharged path (security review of
+    /// f9bab99, H1, M1, L1).
     #[test]
     fn the_cas_guard_match_is_narrow() {
-        let g = guard_statements().remove(0);
-        let reported = |user: &str, host: &str, text: &str, limit: usize, tables: &[&str]| {
-            let mut b = EventBuilder::new(own()).with_own_statements(vec![g.clone().into_bytes()]);
-            let cut = (limit < text.len()).then_some(limit);
-            // Three heartbeats: an unknown read of the agent's account is
-            // charged the whole budget, so the first one may still be
-            // left out by the row budget; the next ones are reported.
+        let set = guard_sets().remove(0);
+        let g = &set[0];
+        // Three heartbeats: an unknown read of the agent's account is
+        // charged the whole budget, so the first may still be left out by
+        // the row budget; the next ones are reported.
+        let heartbeats = |text: &str, limit: usize| {
+            let mut b = guard_builder(&set);
             let mut out = Vec::new();
             for q in 1..=3u64 {
-                let mut lines = Vec::new();
-                for t in tables {
-                    lines.push(format!(
-                        "20260929 09:40:35,h,{user},{host},30,{q},READ,{t},cas_tickets,"
-                    ));
-                }
-                lines.push(sa_query(user, host, q, text, cut));
-                out.extend(file(&mut b, sa_at(&lines, limit)));
+                let cut = (limit < text.len()).then_some(limit);
+                out.extend(file(
+                    &mut b,
+                    sa_at(
+                        &[sa_query("databastion", "172.18.0.1", q, text, cut)],
+                        limit,
+                    ),
+                ));
             }
             out
         };
-        let own_host = "172.18.0.1";
-        assert!(reported("databastion", own_host, &g, 1024, &[]).is_empty());
-        assert!(!reported("app", own_host, &g, 1024, &[]).is_empty());
-        assert!(!reported("databastion", "10.9.9.9", &g, 1024, &[]).is_empty());
-        let mut forged = g.clone();
-        forged.replace_range(100..101, "X");
-        assert!(!reported("databastion", own_host, &forged, 1024, &[]).is_empty());
-        // A prefix under 256 bytes (a server limit set very low).
-        assert!(!reported("databastion", own_host, &g, 200, &[]).is_empty());
-        // Whole (not truncated) but only a prefix of the guard text.
-        let head = &g[..600];
-        assert!(!reported("databastion", own_host, head, 1 << 20, &[]).is_empty());
-        // A table record of a user table with the guard's text.
-        assert!(!reported("databastion", own_host, &g, 1024, &["cas"]).is_empty());
-        // Without the list (another builder), the cut text is reported:
-        // the regression this recognition fixes.
-        let mut b = EventBuilder::new(own());
-        let mut out = Vec::new();
-        for q in 1..=3 {
-            let recs = sa_at(
-                &[sa_query("databastion", own_host, q, &g, Some(1024))],
-                1024,
-            );
-            out.extend(file(&mut b, recs));
-        }
-        assert!(!out.is_empty());
+        // The guard text followed by another read, cut at the limit inside
+        // a literal (server_audit with QUERY events only: no table record).
+        let forged = format!(
+            "{g} UNION ALL SELECT name, email, phone, '{}' FROM shop.customers",
+            "x".repeat(400)
+        );
+        let out = heartbeats(&forged, 1024);
+        assert!(out.len() >= 2, "{out:?}");
         assert!(
-            out.iter().all(|e| e.starts_with("read [\"shop.*\"] None")),
+            out.iter().all(|e| e.starts_with("read [\"shop.*\"]")),
             "{out:?}"
+        );
+        // The same on performance_schema (`SQL_TEXT` cut, no table record).
+        let mut b = guard_builder(&set);
+        let mut reported = 0;
+        for _ in 0..3 {
+            let access = pfs_access(&forged.as_bytes()[..1020], true, Vec::new());
+            assert!(!b.own_guard(&access));
+            reported += usize::from(b.statement(access, SystemTime::now()).is_some());
+        }
+        assert!(reported >= 2);
+        // The exact guard text cut by a lowered limit (here inside its
+        // regular expression literal): no longer matched, reported as a
+        // read of `*` (documented: keep the limits at 1024).
+        let regex_at = g.find("[^ABC").unwrap();
+        let low = crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10;
+        let out = heartbeats(g, low);
+        assert!(out.len() >= 2, "{out:?}");
+        // The exact guard text with a table record outside
+        // `information_schema` never takes the uncharged path.
+        let b = guard_builder(&set);
+        for db in ["performance_schema", "sys", "shop"] {
+            let access = pfs_access(g.as_bytes(), false, vec![(db, "t", TableOp::Read)]);
+            assert!(!b.own_guard(&access), "{db}");
+        }
+        assert!(b.own_guard(&pfs_access(
+            g.as_bytes(),
+            false,
+            vec![("information_schema", "COLUMNS", TableOp::Read)]
+        )));
+        // A truncated record whose text equals the guard is not matched
+        // either, nor an opaque one.
+        assert!(!b.own_guard(&pfs_access(g.as_bytes(), true, Vec::new())));
+        let mut opaque = pfs_access(g.as_bytes(), false, Vec::new());
+        opaque.opaque = true;
+        assert!(!b.own_guard(&opaque));
+        // Exact text from another account or address: not the uncharged
+        // path (whatever the usual path then decides).
+        let mut b = guard_builder(&set);
+        let line = sa_query("app", "172.18.0.1", 1, g, None);
+        let _ = file(&mut b, sa_at(&[line], 1024));
+        let mut other = pfs_access(g.as_bytes(), false, Vec::new());
+        other.user = "app";
+        let e = MaskedEvent::new(
+            other.source,
+            EventAction::Read,
+            other.principal.clone(),
+            other.ts,
+        );
+        assert!(
+            !b.own
+                .routine_unbudgeted(other.user, other.application, other.client, &e)
         );
     }
 
