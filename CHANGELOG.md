@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🐛 Bug Fixes
+- Dev environment: `make dev-cas` no longer fails at random after CAS is healthy. `docker compose up --wait` could report the normal exit (0) of the one-shot `cas-db-grants` as a failure; it now runs on its own with `docker compose run --rm` once CAS is healthy.
+
 ### 👷 CI
 - Release PRs (to `main`): the "Release version" check now also fails while the holdout seed (`SEED` in `dev/holdout/generate.py`) is the one of the previous final release, or brings back an earlier release's seed; it was not rotated for 0.2.0, 0.3.0 and 0.3.1. `[skip-release]` PRs are not checked; `[skip-holdout]` in the title keeps the seed only when no classifier code changed since the previous release ([RELEASE.md § 8](RELEASE.md#8-holdout-seed-rotation)). The PR template has a release checklist line
 
