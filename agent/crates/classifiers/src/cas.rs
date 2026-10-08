@@ -29,18 +29,21 @@ use crate::masking::RawSample;
 
 /// Named CAS ticket prefixes: ADR-0041 decision 5 (`TGT`, `ST`, `PT`,
 /// `PGT`, `OC`, `AT`, `RT`) and the other ticket prefixes of CAS 8.0.2,
-/// verified against the constants of its jars (`javap -constants`; the
-/// core war, and the OAuth / OIDC modules of the dev overlay):
-/// `ProxyGrantingTicket.PROXY_GRANTING_TICKET_IOU_PREFIX` (`PGTIOU`),
-/// `TransientSessionTicket.PREFIX` (`TST`), `OAuth20DeviceToken.PREFIX`
-/// (`ODT`), `OAuth20DeviceUserCode.PREFIX` (`ODUC`),
-/// `OidcCibaRequest.PREFIX` (`CIBA`) and
-/// `OidcPushedAuthorizationRequest.PREFIX` (`OPAR`). CAS 8.0.2 has no `CT`
-/// prefix (formerly listed, to verify): a `CT-1-…` value only has the
-/// generic shape. Prefixes of modules outside the dev overlay (SAML2 IdP,
-/// WS-Federation) are not verified: they fall under the generic shape.
+/// verified against the constants of its jars (`javap -constants`): the
+/// core war (`ProxyGrantingTicket.PROXY_GRANTING_TICKET_IOU_PREFIX`
+/// `PGTIOU`, `TransientSessionTicket.PREFIX` `TST`), the OAuth / OIDC
+/// modules of the dev overlay (`OAuth20DeviceToken.PREFIX` `ODT`,
+/// `OAuth20DeviceUserCode.PREFIX` `ODUC`, `OidcCibaRequest.PREFIX` `CIBA`,
+/// `OidcPushedAuthorizationRequest.PREFIX` `OPAR`), and the SAML2 IdP and
+/// WS-Federation jars from Maven Central (`cas-server-support-saml-idp-ticket`:
+/// `SamlArtifactTicket.PREFIX` `SART`, `SamlAttributeQueryTicket.PREFIX`
+/// `SATQ`; `cas-server-support-ws-sts-api`: `SecurityTokenTicket.PREFIX`
+/// `STS`). CAS 8.0.2 has no `CT` prefix (formerly listed, to verify): a
+/// `CT-1-…` value only has the generic shape. Prefixes of other optional
+/// modules are not verified and fall under the generic shape.
 pub const TICKET_PREFIXES: &[&str] = &[
     "TGT", "ST", "PT", "PGT", "PGTIOU", "TST", "OC", "AT", "RT", "ODT", "ODUC", "CIBA", "OPAR",
+    "SART", "SATQ", "STS",
 ];
 
 /// Shortest and longest prefix of the generic shape.
@@ -232,6 +235,9 @@ mod tests {
             "ODUC-2-usercode",
             "CIBA-3-request",
             "OPAR-4-request",
+            "SART-5-artifact",
+            "SATQ-6-query",
+            "STS-7-token",
             "  TGT-9-padded",
             "\tST-1-",
         ] {

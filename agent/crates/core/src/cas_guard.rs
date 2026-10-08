@@ -170,9 +170,17 @@ pub fn name_key(name: &str) -> String {
 /// `OAuthAccessTokenProperties`, `OAuthRefreshTokenProperties`,
 /// `OAuthDeviceTokenProperties`, `OAuthDeviceUserCodeProperties`,
 /// `OidcCibaProperties`, `OidcPushedAuthorizationProperties`) and of the
-/// SAML2 IdP tickets (`SamlIdPTicketProperties`), which the MongoDB ticket
+/// SAML2 IdP tickets (`SamlIdPTicketProperties` defaults, read from the
+/// CAS 8.0.2 configuration model jar; the SAML2 IdP catalog configurer
+/// that applies them was not checked) and of the WS-Federation security
+/// token tickets (`wsSecurityTokenTicketsCache`, set by
+/// `CasWsSecurityTokenTicketCatalogConfiguration` in
+/// `cas-server-support-ws-sts` 8.0.2), which the MongoDB ticket
 /// registry uses as collection names (`TicketDefinitionProperties`
-/// `storageName`).
+/// `storageName`). The last names are **legacy aliases**, kept fail closed:
+/// the names assumed before the CAS 8.0.2 check (`oauth*Collection`,
+/// `casTicketsCollection`), which an operator may also have set as storage
+/// names; recognizing them costs nothing but a guarded collection.
 const TICKET_REGISTRY_NAMES: &[&str] = &[
     "castickets",
     "ticketgrantingticketscollection",
@@ -189,6 +197,14 @@ const TICKET_REGISTRY_NAMES: &[&str] = &[
     "oidcpushedauthzrequestscache",
     "samlartifactscache",
     "samlattributequerycache",
+    "wssecuritytokenticketscache",
+    // Legacy aliases (not CAS 8.0.2 defaults; see above).
+    "oauthcodescollection",
+    "oauthaccesstokenscollection",
+    "oauthrefreshtokenscollection",
+    "oauthdevicetokenscollection",
+    "oauthdeviceusercodescollection",
+    "casticketscollection",
 ];
 
 /// Built-in service registry names: the JPA table (`RegisteredServices`,
@@ -853,6 +869,11 @@ mod tests {
             "oidcPushedAuthzRequestsCache",
             "samlArtifactsCache",
             "samlAttributeQueryCache",
+            "wsSecurityTokenTicketsCache",
+            // Legacy aliases, kept fail closed.
+            "oauthAccessTokensCollection",
+            "oauthCodesCollection",
+            "casTicketsCollection",
         ] {
             assert_eq!(
                 recognize_name(None, [n]),
@@ -889,10 +910,6 @@ mod tests {
             "tickets",
             "cas_tickets_archive",
             "audit_trail",
-            // Names assumed before the CAS 8.0.2 check: not CAS defaults.
-            "oauthAccessTokensCollection",
-            "oauthCodesCollection",
-            "casTicketsCollection",
             "",
         ] {
             assert_eq!(recognize_name(None, [n]), None, "{n}");

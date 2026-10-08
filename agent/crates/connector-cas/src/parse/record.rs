@@ -9,7 +9,10 @@
 //! noted). **A record with a duplicate kept key is dropped.** A line that
 //! is not one JSON object, or lacks a valid `action` or `when`, is dropped.
 //!
-//! `what` can hold a ticket id (a live SSO bearer credential). It is a
+//! `what` can hold a ticket id (a live SSO bearer credential). It is only
+//! examined for an issuance action ([`Action::issues_for_service`]): for
+//! any other action its raw text is borrowed from the line and never
+//! decoded nor unescaped (a second `what` key still drops the record). It is a
 //! string (`ST-1-… for https://…`) or, as CAS 8.0 writes it, a JSON object
 //! (`{"service": "https://…", "ticketId": "ST-1-…"}`). From the object only
 //! the string value of the `service` key is read; every other key
@@ -285,9 +288,11 @@ enum When {
 }
 
 #[derive(Default)]
-struct Raw {
+struct Raw<'de> {
     who: Option<Option<Zeroizing<String>>>,
-    what: Option<What>,
+    /// Kept raw (borrowed, not examined): reduced by [`what_of`] only for
+    /// an issuance action, once the action is known.
+    what: Option<&'de RawValue>,
     action: Option<Option<Zeroizing<String>>>,
     when: Option<When>,
     client: Option<Option<Zeroizing<String>>>,
@@ -302,21 +307,21 @@ struct Raw {
 struct RecordVisitor;
 
 impl<'de> Visitor<'de> for RecordVisitor {
-    type Value = Raw;
+    type Value = Raw<'de>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("an audit record")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw<'de>, A::Error> {
         let mut r = Raw::default();
         while let Some(k) = map.next_key::<&'de RawValue>()? {
             let k = record_key::<A::Error>(k)?;
             let slot = match k {
                 K::Who => &mut r.who,
                 K::What => {
-                    let w = what_of::<A::Error>(map.next_value::<&'de RawValue>()?)?;
-                    if w.duplicate || r.what.replace(w).is_some() {
+                    let w = map.next_value::<&'de RawValue>()?;
+                    if r.what.replace(w).is_some() {
                         r.duplicate = true;
                     }
                     continue;
@@ -415,15 +420,18 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
         _ => None,
     }
     .ok_or(RecordError::Invalid)?;
-    // `what` is read only for service-ticket or token issuance, then dropped
-    // (zeroized) whatever the action.
-    let what = raw.what.and_then(|w| w.text);
-    let service = if action.issues_for_service() {
-        what.as_deref().and_then(|w| service_of(w))
-    } else {
-        None
+    // `what` is read only for service-ticket or token issuance (for any
+    // other action its raw text is never examined), then dropped (zeroized).
+    let service = match raw.what {
+        Some(w) if action.issues_for_service() => {
+            let w = what_of::<serde_json::Error>(w).map_err(|_| RecordError::NotJson)?;
+            if w.duplicate {
+                return Err(RecordError::Invalid);
+            }
+            w.text.as_deref().and_then(|t| service_of(t))
+        }
+        _ => None,
     };
-    drop(what);
     let client = raw
         .client
         .flatten()
@@ -726,6 +734,64 @@ mod tests {
             .unwrap();
             assert_eq!(r.action, Action::Other(base.to_owned()));
             assert!(r.service.is_none());
+        }
+    }
+
+    /// For a non-issuance action `what` is never decoded: an escape that
+    /// fails decoding (a lone surrogate) or a duplicate `service` inside it
+    /// changes nothing, where an issuance action drops the line.
+    #[test]
+    fn what_is_not_decoded_for_other_actions() {
+        let rec = |action: &str, what: &str| {
+            parse_record(
+                &line(&format!(
+                    r#""action": "{action}", "when": 1791115200000, "what": {what}"#
+                )),
+                UTC,
+            )
+            .map(|r| r.service.is_some())
+        };
+        for what in [
+            r#"{"service": "https:\/\/app.example.org\/\ud800"}"#,
+            r#""https:\/\/app.example.org\/\udc00""#,
+        ] {
+            assert_eq!(
+                rec("TICKET_GRANTING_TICKET_CREATED", what),
+                Ok(false),
+                "{what}"
+            );
+            assert_eq!(
+                rec("SERVICE_TICKET_VALIDATE_SUCCESS", what),
+                Ok(false),
+                "{what}"
+            );
+            assert_eq!(
+                rec("SERVICE_TICKET_CREATED", what),
+                Err(RecordError::NotJson),
+                "{what}"
+            );
+        }
+        let dup =
+            r#"{"service": "https://app.example.org/", "service": "https://evil.example.net/"}"#;
+        assert_eq!(rec("AUTHENTICATION_SUCCESS", dup), Ok(false));
+        assert_eq!(
+            rec("SERVICE_TICKET_CREATED", dup),
+            Err(RecordError::Invalid)
+        );
+        assert_eq!(
+            rec("OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED", dup),
+            Err(RecordError::Invalid)
+        );
+        // A second `what` key drops the record whatever the action.
+        for action in ["AUTHENTICATION_SUCCESS", "SERVICE_TICKET_CREATED"] {
+            assert_eq!(
+                rec(
+                    action,
+                    r#""x", "what": {"service": "https://app.example.org/"}"#
+                ),
+                Err(RecordError::Invalid),
+                "{action}"
+            );
         }
     }
 
