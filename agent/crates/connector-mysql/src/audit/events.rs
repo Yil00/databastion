@@ -41,8 +41,15 @@
 //! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
 //! access worth reporting). Server configuration changes (`SET GLOBAL` /
 //! `PERSIST`, `INSTALL` / `UNINSTALL`, `TRUNCATE`) are DDL events. A
-//! statement that writes or changes something is never left out as the
-//! agent's own (I4). A read or write whose objects cannot be told
+//! text that only kept its kind (opaque, ambiguous readings, not
+//! lexable) is reported against `*` with the most reportable kind of its
+//! readings; code that runs out of sight (`CALL`, `EXECUTE`, `PREPARE`, a
+//! schema-qualified function call) adds `*`. A text with several
+//! statements takes the action of its most reportable one. A statement
+//! that writes or changes something, runs code out of sight or cannot be
+//! read is never left out as the agent's own (I4); changes that touch a
+//! system schema, configuration DDL and unreadable changes are marked
+//! always reported (never dropped by `min_rows`). A read or write whose objects cannot be told
 //! (text that does not lex, `CALL`) is reported against `*`. Statements
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
@@ -56,6 +63,7 @@ use databastion_classifiers::masking::{
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
     AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze_raw,
+    most_reportable,
 };
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use databastion_core::audit::tail::RecordPos;
@@ -128,6 +136,11 @@ fn is_system_relation(r: &RelationName, database: &str) -> bool {
     is_system_schema(db)
         || is_internal_table(db, &r.name)
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
+}
+
+/// A statement kind that changes something: rows, schema or privileges.
+fn is_change_kind(k: StatementKind) -> bool {
+    is_write_kind(k) || matches!(k, StatementKind::Ddl | StatementKind::Dcl)
 }
 
 /// A statement kind that writes rows.
@@ -753,6 +766,11 @@ impl EventBuilder {
         });
         let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
         let parsed = !parts.is_empty();
+        // A text that only kept its kind (opaque, ambiguous under the
+        // possible `sql_mode` / version-comment readings, or not lexable):
+        // what it touched cannot be told (fail closed).
+        let unparsed =
+            opaque || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed);
         if let Some(app) = a.application {
             let s = self.sessions.entry(&a.session);
             if s.program.is_none() {
@@ -776,10 +794,6 @@ impl EventBuilder {
                 return None;
             }
         }
-        let lead0 = parts
-            .first()
-            .and_then(|p| p.lead.first())
-            .map(String::as_str);
         let table_action = if a.tables.iter().any(|t| t.2 == TableOp::Read) {
             Some(EventAction::Read)
         } else if a.tables.iter().any(|t| t.2 == TableOp::Write) {
@@ -789,10 +803,40 @@ impl EventBuilder {
         } else {
             None
         };
-        let kind = analysis
-            .as_ref()
-            .map_or(StatementKind::Other, QueryAnalysis::kind);
-        let call = lead0 == Some("call");
+        // The most reportable statement of a multi-statement text
+        // (`SET @a = 1; UPDATE performance_schema.setup_consumers …`).
+        let kind = if parsed {
+            parts
+                .iter()
+                .fold(StatementKind::Other, |k, p| most_reportable(k, p.kind))
+        } else {
+            analysis
+                .as_ref()
+                .map_or(StatementKind::Other, QueryAnalysis::kind)
+        };
+        // Code that runs out of sight: a procedure, a prepared statement,
+        // a stored function (schema-qualified calls only: `f()` cannot be
+        // told from a built-in function).
+        let call = parts.iter().any(|p| {
+            p.routine_call
+                || matches!(
+                    p.lead.first().map(String::as_str),
+                    Some("call" | "execute" | "prepare")
+                )
+        });
+        // The statement changed something, or may have, whatever its
+        // reported action (a `CALL` whose table records write, a write
+        // after a read in a multi-statement text, code that runs out of
+        // sight, a text that cannot be read): the agent only reads (I4)
+        // and never sends these, so such a statement with its identity is
+        // never left out as its own.
+        let changes = is_change_kind(kind)
+            || parts.iter().any(|p| is_change_kind(p.kind))
+            || call
+            || unparsed
+            || a.tables
+                .iter()
+                .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
         let action = match kind {
             StatementKind::Select
             | StatementKind::Table
@@ -805,7 +849,7 @@ impl EventBuilder {
             StatementKind::Ddl => EventAction::Ddl,
             StatementKind::Dcl => EventAction::Dcl,
             _ if call => EventAction::Read,
-            _ => match (table_action, opaque) {
+            _ => match (table_action, unparsed) {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
                 (None, true) => EventAction::Read,
@@ -814,16 +858,6 @@ impl EventBuilder {
         };
         let rw = matches!(action, EventAction::Read | EventAction::Write);
         let write = action == EventAction::Write;
-        // The statement changed something, whatever its reported action
-        // (a `CALL` whose table records write, a write after a read in a
-        // multi-statement text): the agent only reads (I4), so such a
-        // statement with its identity is never left out as its own.
-        let changes = parts.iter().any(|p| {
-            is_write_kind(p.kind) || matches!(p.kind, StatementKind::Ddl | StatementKind::Dcl)
-        }) || a
-            .tables
-            .iter()
-            .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
         let mut objects: Vec<(String, String)> = Vec::new();
         let mut unknown = false;
         if a.tables.is_empty() && rw {
@@ -849,7 +883,9 @@ impl EventBuilder {
                     }
                 }
             }
-            if !named_any && (!parsed || call) {
+            // Unknown objects: a text that cannot be read, code that runs
+            // out of sight, a write that names no table (or only `DUAL`).
+            if (!named_any && !parsed) || call || (write && objects.is_empty()) {
                 unknown = true;
             }
         } else {
@@ -879,6 +915,32 @@ impl EventBuilder {
         }
         if unknown {
             e = e.with_object(unknown_object(a.database));
+        }
+        // Never filtered by `min_rows` (ADR-0022 settings, agent side):
+        // changes that touch a system schema (they can turn the
+        // `performance_schema` source off or erase it), server
+        // configuration changes (`SET GLOBAL`, `INSTALL` / `UNINSTALL`),
+        // and changes whose text cannot be read.
+        let system = |db: &str| is_system_schema(db);
+        let touches_system =
+            a.tables.iter().any(|(db, _, op)| {
+                system(db) && (*op != TableOp::Read || action != EventAction::Read)
+            }) || (action != EventAction::Read
+                && (objects.iter().any(|(db, _)| system(db))
+                    || parts.iter().any(|p| {
+                        p.relations
+                            .iter()
+                            .any(|r| system(r.schema.as_deref().unwrap_or(a.database)))
+                    })));
+        let configuration = parts.iter().any(|p| {
+            p.kind == StatementKind::Ddl
+                && matches!(
+                    p.lead.first().map(String::as_str),
+                    Some("set" | "install" | "uninstall")
+                )
+        });
+        if touches_system || configuration || (unparsed && action != EventAction::Read) {
+            e = e.with_always_report();
         }
         if action == EventAction::Read {
             let session = self.sessions.get(&a.session);
@@ -2424,6 +2486,185 @@ mod tests {
             false,
             vec![("information_schema", "COLUMNS", TableOp::Write)]
         )));
+    }
+
+    /// The events of `text` sent by `user` from the agent's address, on
+    /// each source: `server_audit` (QUERY record only), the `audit_log`
+    /// JSON file and `performance_schema`; a fresh builder each time.
+    fn on_every_source(user: &str, text: &str) -> Vec<(EventSource, Option<MaskedEvent>)> {
+        let one = |ev: Vec<MaskedEvent>| {
+            assert!(ev.len() <= 1, "{text}");
+            ev.into_iter().next()
+        };
+        let mut out = Vec::new();
+        let mut b = EventBuilder::new(own());
+        let recs = sa_at(&[sa_line(user, "172.18.0.1", 1, text)], 4096);
+        out.push((
+            EventSource::MariadbServerAudit,
+            one(b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now())),
+        ));
+        let mut b = EventBuilder::new(own());
+        out.push((
+            EventSource::MysqlAuditLog,
+            one(b.convert_file(
+                vec![json_query(user, "172.18.0.1", 1, text)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            )),
+        ));
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+        access.user = user;
+        access.principal = EventPrincipal::account(user);
+        access.rows = Some(1);
+        out.push((
+            EventSource::PerformanceSchema,
+            b.statement(access, SystemTime::now()),
+        ));
+        out
+    }
+
+    /// `show` without the rows (they differ per source) and with the
+    /// always-reported mark.
+    fn shown(e: &MaskedEvent) -> String {
+        format!(
+            "{} {:?}{}",
+            e.action().as_str(),
+            e.objects()
+                .iter()
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect::<Vec<_>>(),
+            if e.always_report() { " always" } else { "" }
+        )
+    }
+
+    /// Checks `text` from `app` and from the agent's account on every
+    /// source: `want(source)` is the expected [`shown`] event.
+    fn expect_everywhere(text: &str, want: impl Fn(EventSource) -> String) {
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, text) {
+                let got = ev.as_ref().map(shown);
+                assert_eq!(
+                    got.as_deref(),
+                    Some(want(source).as_str()),
+                    "{user} {source:?}: {text}"
+                );
+            }
+        }
+    }
+
+    /// The database of an unknown object: the session's (`shop` in the
+    /// `server_audit` lines), none in the other records of these tests.
+    fn star(source: EventSource) -> &'static str {
+        if source == EventSource::MariadbServerAudit {
+            "shop.*"
+        } else {
+            "*.*"
+        }
+    }
+
+    /// Security review of #168, H1: texts whose readings differ (version
+    /// comments) or that do not lex keep their most reportable kind and
+    /// are reported (fail closed), never dropped.
+    #[test]
+    fn ambiguous_and_unlexable_texts_are_reported() {
+        for text in [
+            "SET /*M! GLOBAL */ server_audit_excl_users = 'mallory'",
+            "/*!80000 SET GLOBAL audit_log_exclude_accounts = 'mallory@%' */",
+            "SET /**/ GLOBAL server_audit_excl_users = 'x\u{e9}\\'",
+            "SET STATEMENT sql_mode='' FOR SET GLOBAL server_audit_excl_users = CONCAT('mallory', LEFT('\u{e9}\\',0))",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+        expect_everywhere(
+            "SET STATEMENT max_statement_time=1 /*M! FOR UPDATE performance_schema.setup_consumers SET enabled='NO' */",
+            |s| format!("write [{:?}] always", star(s)),
+        );
+        for text in [
+            "/*M! SELECT * FROM hr.customers */",
+            "/*!80000 SELECT * FROM hr.customers */",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+        }
+    }
+
+    /// Review of #168, M3, M1, L2: nested `SET STATEMENT`, code that runs
+    /// out of sight, `LOAD DATA`, `RENAME TABLE`, multi-statement texts.
+    #[test]
+    fn hidden_changes_are_reported() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        for text in [
+            "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR SET STATEMENT c=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET @a=1; UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "LOAD DATA INFILE '/tmp/x' INTO TABLE performance_schema.setup_consumers",
+        ] {
+            expect_everywhere(text, |_| consumers.to_owned());
+        }
+        // Deeper than 8 levels: DDL (fail closed).
+        let deep = format!(
+            "{}UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET STATEMENT a=1 FOR ".repeat(9)
+        );
+        expect_everywhere(&deep, |_| "ddl [] always".to_owned());
+        expect_everywhere(
+            "SET autocommit=1; SET GLOBAL server_audit_logging=OFF",
+            |_| "ddl [] always".to_owned(),
+        );
+        expect_everywhere(
+            "LOAD DATA LOCAL INFILE '/tmp/x' REPLACE INTO TABLE `hr`.`t` (a, b)",
+            |_| "write [\"hr.t\"]".to_owned(),
+        );
+        expect_everywhere("INSERT hr.t (a) VALUES (1)", |_| {
+            "write [\"hr.t\"]".to_owned()
+        });
+        expect_everywhere("RENAME TABLE hr.a TO hr.b", |_| "ddl []".to_owned());
+        for text in [
+            "EXECUTE s",
+            "EXECUTE IMMEDIATE @q",
+            "PREPARE s FROM @q",
+            "SELECT hr.f(1)",
+            "DO `hr`.`f`()",
+            "SET @x = hr.f()",
+            "CALL hr.p()",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+        }
+        // A named read that also calls a stored function: both.
+        expect_everywhere(
+            "SELECT email, hr.f(id) FROM hr.customers WHERE id = 1",
+            // Objects are sorted: `*` first.
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"]".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}]"),
+            },
+        );
+        // An ordinary small write is not marked: `min_rows` applies.
+        expect_everywhere("UPDATE hr.t SET a = 1 WHERE id = 2", |_| {
+            "write [\"hr.t\"]".to_owned()
+        });
+    }
+
+    /// Review of #168, L1: with the agent's identity, a `CALL`, an
+    /// `EXECUTE`, a stored function call and a text that cannot be read
+    /// are never its own, even within its row budget; its plain reads
+    /// still are.
+    #[test]
+    fn the_agents_hidden_code_is_never_its_own() {
+        for text in [
+            "CALL hr.p()",
+            "EXECUTE s",
+            "SELECT hr.f(1) FROM hr.t LIMIT 1",
+            "/*M! SELECT a FROM hr.t LIMIT 1 */",
+            "SELECT a FROM hr.t WHERE b = 'x\u{e9}\\' LIMIT 1",
+        ] {
+            for (source, ev) in on_every_source("databastion", text) {
+                assert!(ev.is_some(), "{source:?}: {text}");
+            }
+        }
+        for (source, ev) in on_every_source("databastion", "SELECT a FROM hr.t LIMIT 1") {
+            assert!(ev.is_none(), "{source:?}");
+        }
     }
 
     #[test]

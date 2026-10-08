@@ -958,6 +958,14 @@ mod tests {
             // stream reports these from any account, the agent's included.
             for w in [
                 "TRUNCATE",
+                "CALL ",
+                "PREPARE",
+                "EXECUTE",
+                "DO ",
+                "HANDLER",
+                "FLUSH",
+                "RESET",
+                "KILL",
                 "SET GLOBAL",
                 "SET PERSIST",
                 "SET @@",
@@ -968,6 +976,16 @@ mod tests {
                 "RENAME ",
                 "LOAD ",
             ] {
+                // The one exception: the server-side cancel of the
+                // agent's own statement on its other connection
+                // (`KILL QUERY <id>`, nothing else).
+                if w == "KILL"
+                    && upper
+                        .strip_prefix("KILL QUERY ")
+                        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    continue;
+                }
                 assert!(!upper.contains(w), "{w} in {s}");
             }
         }

@@ -21,7 +21,10 @@
 //! - `reportable` (crate-private): the `audit.configure` filter. An event
 //!   is reported when it carries a signal, touches an object listed in
 //!   `sensitive_objects`, is not a `read` / `write` (connections, DDL,
-//!   DCL), or when `min_rows` is absent or reached. It is applied after
+//!   DCL), is marked always reported by its connector
+//!   (`MaskedEvent::always_report`: writes to a database's own
+//!   instrumentation or audit settings), or when `min_rows` is absent or
+//!   reached. It is applied after
 //!   aggregation, so many small reads of one group add up.
 
 pub mod own;
@@ -575,7 +578,7 @@ impl Aggregator {
 
 /// The `audit.configure` reporting filter (see the module documentation).
 pub(crate) fn reportable(cfg: &AuditConfig, e: &MaskedEvent) -> bool {
-    if !e.signals().is_empty() {
+    if e.always_report() || !e.signals().is_empty() {
         return true;
     }
     if !matches!(e.action(), EventAction::Read | EventAction::Write) {
@@ -716,6 +719,44 @@ mod tests {
         // Empty list and no min_rows: everything.
         let c = cfg(serde_json::json!({"enabled": true, "sensitive_objects": []}));
         assert!(reportable(&c, &ev("u", "other", None)));
+    }
+
+    /// Events a connector marks always reported (writes to a database's
+    /// own instrumentation) pass `min_rows` whatever their rows, also after
+    /// aggregation with unmarked events of their group.
+    #[test]
+    fn always_reported_events_pass_min_rows() {
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100, "sensitive_objects": []
+        }));
+        let write = |rows| {
+            MaskedEvent::new(
+                EventSource::PerformanceSchema,
+                EventAction::Write,
+                EventPrincipal::account("u"),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            )
+            .with_object(EventObject::new(
+                normalize_path("performance_schema"),
+                None,
+                normalize_path("setup_consumers"),
+            ))
+            .with_rows(rows)
+        };
+        assert!(!reportable(&c, &write(Some(1))));
+        assert!(!reportable(&c, &write(None)));
+        assert!(reportable(&c, &write(Some(1)).with_always_report()));
+        assert!(reportable(&c, &write(None).with_always_report()));
+        let now = Instant::now();
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        a.push(write(Some(1)), now);
+        a.push(write(Some(1)).with_always_report(), now);
+        a.push(write(Some(1)), now);
+        let out = a.drain();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].aggregated_count(), 3);
+        assert!(out[0].always_report());
+        assert!(reportable(&c, &out[0]));
     }
 
     #[test]

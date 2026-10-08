@@ -882,6 +882,11 @@ pub struct StatementInfo {
     /// from a literal or a comment): the keywords of utility statements
     /// (`flush tables with read lock`, `show create table`). Never sent.
     pub lead: Vec<String>,
+    /// MySQL: the statement calls a schema-qualified function (`db.f(…)`),
+    /// a stored function that may read or write any table. Unqualified
+    /// calls (`f(…)`) cannot be told from built-in functions and are not
+    /// flagged.
+    pub routine_call: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -897,6 +902,7 @@ pub struct QueryAnalysis {
     copy: Option<CopyInfo>,
     statements: usize,
     parts: Vec<StatementInfo>,
+    lexed: bool,
 }
 
 impl QueryAnalysis {
@@ -909,7 +915,16 @@ impl QueryAnalysis {
             copy: None,
             statements: 0,
             parts: Vec::new(),
+            lexed: false,
         }
+    }
+
+    /// Whether the text lexed unambiguously: `false` when only the kind
+    /// was kept (opaque, ambiguous or unlexable text), so the parts and
+    /// relations say nothing about what the statement touched.
+    #[must_use]
+    pub fn lexed(&self) -> bool {
+        self.lexed
     }
 
     /// Every statement of the text, then the statements of a `DO` block
@@ -920,7 +935,9 @@ impl QueryAnalysis {
         &self.parts
     }
 
-    /// Kind of the first statement.
+    /// Kind of the first statement; for a MySQL text that did not lex
+    /// unambiguously ([`Self::lexed`] is `false`), the most reportable
+    /// kind of any reading ([`most_reportable`]).
     #[must_use]
     pub fn kind(&self) -> StatementKind {
         self.kind
@@ -1107,6 +1124,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         copy,
         statements: statements.len(),
         parts,
+        lexed: true,
     }
 }
 
@@ -1131,35 +1149,28 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     if opts.opaque || (!opts.transcoded && multibyte_hazard(text.as_bytes())) {
         return QueryAnalysis::unparsed(my_kind_prefix(text));
     }
-    let mut readings = my_modes(text).into_iter().map(|m| lex_mysql(text, m));
-    let first = readings.next().unwrap_or(Err(LexError::Unterminated));
-    let tokens = match first {
-        Ok(t) => {
-            let mut agree = true;
-            let mut kinds_agree = true;
-            for other in readings {
-                match other {
-                    Ok(o) if o == t => {}
-                    Ok(o) => {
-                        agree = false;
-                        kinds_agree &= my_kind(&o) == my_kind(&t);
-                    }
-                    Err(_) => {
-                        agree = false;
-                        kinds_agree = false;
-                    }
-                }
-            }
-            if !agree {
-                return QueryAnalysis::unparsed(if kinds_agree {
-                    my_kind(&t)
-                } else {
-                    StatementKind::Other
-                });
-            }
-            t
+    let readings: Vec<Result<Vec<Tok>, LexError>> = my_modes(text)
+        .into_iter()
+        .map(|m| lex_mysql(text, m))
+        .collect();
+    let tokens = match readings.first() {
+        Some(Ok(t)) if readings.iter().all(|r| r.as_ref().is_ok_and(|o| o == t)) => t.clone(),
+        _ => {
+            // Readings that differ, or a reading that does not lex: the
+            // most reportable kind of any reading (fail closed: a
+            // statement one reading runs is never dropped because
+            // another reading skips it).
+            let kind = readings.iter().fold(StatementKind::Other, |k, r| {
+                most_reportable(
+                    k,
+                    match r {
+                        Ok(t) => my_kind_all(t),
+                        Err(_) => my_kind_prefix(text),
+                    },
+                )
+            });
+            return QueryAnalysis::unparsed(kind);
         }
-        Err(_) => return QueryAnalysis::unparsed(my_kind_prefix(text)),
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
     // statement after `FOR` is what runs.
@@ -1183,7 +1194,12 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         Some(first) if !opts.possibly_truncated && kind.is_read() => main_shape(first),
         _ => None,
     };
-    let all_dml = !statements.is_empty() && statements.iter().all(|s| my_kind(s).is_dml());
+    // `LOAD DATA` is a write but not on the DML allow-list (its text
+    // names a server or client file).
+    let all_dml = !statements.is_empty()
+        && statements
+            .iter()
+            .all(|s| my_kind(s).is_dml() && word(s.first()) != Some("load"));
     let normalized = (all_dml && !opts.possibly_truncated).then(|| normalize_tokens(&tokens));
     QueryAnalysis {
         kind,
@@ -1193,13 +1209,17 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         copy: None,
         statements: statements.len(),
         parts,
+        lexed: true,
     }
 }
 
-/// The statement of a MariaDB `SET STATEMENT var = value[, …] FOR
-/// <statement>`: the tokens after the first top-level `FOR`. `None` for
-/// any other statement.
-fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
+/// Most nested `SET STATEMENT … FOR` levels unwrapped; a deeper nesting
+/// is DDL (fail closed).
+const MAX_SET_STATEMENT_DEPTH: usize = 8;
+
+/// One level of a MariaDB `SET STATEMENT var = value[, …] FOR
+/// <statement>`: the tokens after the first top-level `FOR`.
+fn set_statement_level(s: &[Tok]) -> Option<&[Tok]> {
     if word(s.first()) != Some("set") || word(s.get(1)) != Some("statement") {
         return None;
     }
@@ -1213,6 +1233,87 @@ fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
         }
     }
     None
+}
+
+/// The statement of a MariaDB `SET STATEMENT var = value[, …] FOR
+/// <statement>`, nested levels included. `None` for any other statement,
+/// and for a nesting deeper than [`MAX_SET_STATEMENT_DEPTH`] levels, which
+/// [`my_kind`] reads as DDL (fail closed).
+fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
+    let mut body = set_statement_level(s)?;
+    for _ in 1..MAX_SET_STATEMENT_DEPTH {
+        match set_statement_level(body) {
+            Some(inner) => body = inner,
+            None => return Some(body),
+        }
+    }
+    set_statement_level(body).is_none().then_some(body)
+}
+
+/// Rank of a kind for [`most_reportable`]: DCL, DDL, writes, reads,
+/// anything else.
+fn report_rank(k: StatementKind) -> u8 {
+    match k {
+        StatementKind::Dcl => 5,
+        StatementKind::Ddl => 4,
+        StatementKind::Insert
+        | StatementKind::Update
+        | StatementKind::Delete
+        | StatementKind::Merge
+        | StatementKind::Copy => 3,
+        StatementKind::Select
+        | StatementKind::Table
+        | StatementKind::Values
+        | StatementKind::Handler => 2,
+        StatementKind::Other => 0,
+    }
+}
+
+/// The more reportable of two kinds (DCL > DDL > write > read > other).
+#[must_use]
+pub fn most_reportable(a: StatementKind, b: StatementKind) -> StatementKind {
+    if report_rank(b) > report_rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// The most reportable kind of the statements of a MySQL token stream.
+fn my_kind_all(tokens: &[Tok]) -> StatementKind {
+    split_statements(tokens)
+        .into_iter()
+        .fold(StatementKind::Other, |k, s| most_reportable(k, my_kind(s)))
+}
+
+/// A schema-qualified function call, `db.f(` (names plain or quoted),
+/// that is not a table with a column list (`INSERT [INTO] db.t (a)`,
+/// `CREATE TABLE db.t (`, `ON db.t (`, `REFERENCES db.t (`).
+fn has_qualified_call(s: &[Tok]) -> bool {
+    let name = |t: &Tok| matches!(t, Tok::Word(_) | Tok::Quoted(_));
+    s.windows(4).enumerate().any(|(i, w)| {
+        name(&w[0])
+            && is_punct(Some(&w[1]), ".")
+            && name(&w[2])
+            && is_punct(Some(&w[3]), "(")
+            && !matches!(
+                i.checked_sub(1).and_then(|j| word(s.get(j))),
+                Some(
+                    "into"
+                        | "insert"
+                        | "replace"
+                        | "ignore"
+                        | "low_priority"
+                        | "delayed"
+                        | "high_priority"
+                        | "table"
+                        | "exists"
+                        | "on"
+                        | "references"
+                        | "view"
+                )
+            )
+    })
 }
 
 /// A MySQL `SET` that assigns a global or persisted system variable in
@@ -1252,12 +1353,18 @@ fn my_sets_global(s: &[Tok]) -> bool {
 /// the kind of its statement.
 fn my_kind(s: &[Tok]) -> StatementKind {
     let s = my_set_statement_body(s).unwrap_or(s);
+    if set_statement_level(s).is_some() {
+        // A `SET STATEMENT` nested deeper than MAX_SET_STATEMENT_DEPTH.
+        return StatementKind::Ddl;
+    }
     let Some(i) = main_start(s) else {
         return StatementKind::Other;
     };
     let second = word(s.get(i + 1));
     match word(s.get(i)) {
         Some("replace") => StatementKind::Insert,
+        // `LOAD DATA` / `LOAD XML … INTO TABLE t`: rows written to `t`.
+        Some("load") if matches!(second, Some("data" | "xml")) => StatementKind::Insert,
         Some("handler") => StatementKind::Handler,
         Some("install" | "uninstall") => StatementKind::Ddl,
         Some("set") if my_sets_global(&s[i..]) => StatementKind::Ddl,
@@ -1270,26 +1377,110 @@ fn my_kind(s: &[Tok]) -> StatementKind {
         Some("set") if matches!(second, Some("password" | "role" | "default")) => {
             StatementKind::Dcl
         }
+        // `RENAME TABLE` (account renames are DCL, above).
+        Some("rename") => StatementKind::Ddl,
         _ => first_kind(s),
     }
 }
 
-/// Kind from the first word of a MySQL text that did not lex: the prefix
-/// up to the first quote or comment is lexed alone (it holds no literal).
+/// Longest prefix [`my_kind_prefix`] reads.
+const MAX_KIND_PREFIX_BYTES: usize = 4096;
+
+/// The code of a MySQL text up to its first quote (a literal or a quoted
+/// name, whose end cannot be trusted in a text that did not lex), with
+/// comments removed. Executable comments (`/*!…*/`, `/*M!…*/`) are kept
+/// as code when `versioned_as_code`, removed otherwise. Also returns
+/// whether the text was cut before its end.
+fn my_prefix_code(text: &str, versioned_as_code: bool) -> (String, bool) {
+    let b = text.as_bytes();
+    let n = b.len().min(MAX_KIND_PREFIX_BYTES);
+    let mut out: Vec<u8> = Vec::new();
+    let mut in_versioned = false;
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        match c {
+            b'\'' | b'"' | b'`' => return (String::from_utf8_lossy(&out).into_owned(), true),
+            b'#' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(b' ');
+            }
+            b'-' if my_dash_comment(b, i, b.len()) => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(b' ');
+            }
+            b'*' if in_versioned && next == Some(b'/') => {
+                in_versioned = false;
+                i += 2;
+                out.push(b' ');
+            }
+            b'/' if next == Some(b'*') => {
+                let bang = match (b.get(i + 2), b.get(i + 3)) {
+                    (Some(b'!'), _) => Some(i + 3),
+                    (Some(b'M'), Some(b'!')) => Some(i + 4),
+                    _ => None,
+                };
+                match bang {
+                    Some(mut j) if versioned_as_code && !in_versioned => {
+                        let from = j;
+                        while j < n
+                            && b[j].is_ascii_digit()
+                            && j - from < MAX_COMMENT_VERSION_DIGITS
+                        {
+                            j += 1;
+                        }
+                        in_versioned = true;
+                        i = j;
+                    }
+                    _ => match find(&b[i + 2..n], b"*/") {
+                        Some(k) => i += k + 4,
+                        None => return (String::from_utf8_lossy(&out).into_owned(), true),
+                    },
+                }
+                out.push(b' ');
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&out).into_owned(), n < b.len())
+}
+
+/// Kind of a MySQL text that did not lex (or is opaque): its code up to
+/// the first quote, comments skipped, under both readings of executable
+/// comments, the most reportable. A `SET` (after `SET STATEMENT … FOR`)
+/// whose text is cut there is DDL: what it assigns cannot be told, and it
+/// may set a global variable (fail closed).
 fn my_kind_prefix(text: &str) -> StatementKind {
-    let end = text
-        .find(['\'', '"', '`', '#', '-', '/'])
-        .unwrap_or(text.len())
-        .min(256);
-    let Some(prefix) = text.get(..end) else {
-        return StatementKind::Other;
-    };
     let mode = MyMode {
         backslash: true,
         ansi_quotes: false,
         version_as_comment: true,
     };
-    lex_mysql(prefix, mode).map_or(StatementKind::Other, |t| my_kind(&t))
+    [true, false]
+        .into_iter()
+        .fold(StatementKind::Other, |k, versioned| {
+            let (code, cut) = my_prefix_code(text, versioned);
+            let Ok(tokens) = lex_mysql(&code, mode) else {
+                return k;
+            };
+            let mut kind = my_kind_all(&tokens);
+            if cut {
+                let last = split_statements(&tokens).last().copied().unwrap_or(&[]);
+                let body = my_set_statement_body(last).unwrap_or(last);
+                if word(body.first()) == Some("set") {
+                    kind = most_reportable(kind, StatementKind::Ddl);
+                }
+            }
+            most_reportable(k, kind)
+        })
 }
 
 /// The leading words of a statement (after leading parentheses).
@@ -1353,6 +1544,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         nested,
         outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
         lead: lead_words(s),
+        routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s),
     }
 }
 
@@ -1761,6 +1953,29 @@ fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<Relation
         }
         ["handler", ..] => {
             read_relation(s, start + 1, &none, false, out);
+        }
+        // `INSERT` / `REPLACE` without `INTO`: `INSERT [LOW_PRIORITY |
+        // DELAYED | HIGH_PRIORITY] [IGNORE] t …`.
+        ["insert" | "replace", ..] => {
+            let mut i = start + 1;
+            while matches!(
+                word(s.get(i)),
+                Some("low_priority" | "delayed" | "high_priority" | "ignore")
+            ) {
+                i += 1;
+            }
+            if word(s.get(i)) != Some("into") {
+                read_relation(s, i, &none, true, out);
+            }
+        }
+        // `LOAD DATA | XML … INTO TABLE t`.
+        ["load", "data" | "xml", ..] => {
+            if let Some(i) = s
+                .windows(2)
+                .position(|w| word(w.first()) == Some("into") && word(w.get(1)) == Some("table"))
+            {
+                read_relation(s, i + 2, &none, true, out);
+            }
         }
         ["lock", "tables" | "table", ..] => {
             // `LOCK TABLES t [[AS] a] READ [LOCAL] | [LOW_PRIORITY] WRITE, …`
@@ -2813,6 +3028,110 @@ mod tests {
         assert_eq!(a.kind(), StatementKind::Select);
         assert!(a.shape().is_some_and(|s| s.whole_relation(10_001)));
         assert_eq!(a.parts()[0].lead, ["select"]);
+    }
+
+    /// Security review of #168: texts whose readings differ or that do not
+    /// lex keep the most reportable kind of any reading; nested `SET
+    /// STATEMENT`, `LOAD DATA`, `RENAME TABLE`, `INSERT` without `INTO`,
+    /// schema-qualified function calls.
+    #[test]
+    fn mysql_fail_closed_kinds_and_hidden_changes() {
+        let raw = |q: &str| analyze_raw(q.as_bytes(), AnalyzeOptions::mysql());
+        for (q, k) in [
+            ("SET /*M! GLOBAL */ x = 'm'", StatementKind::Ddl),
+            ("/*!80000 SET GLOBAL x = 'm' */", StatementKind::Ddl),
+            ("SET /**/ GLOBAL x = 'x\u{e9}\\'", StatementKind::Ddl),
+            ("SET -- c\n GLOBAL x = 'x\u{e9}\\'", StatementKind::Ddl),
+            ("SET # c\n GLOBAL x = 'x\u{e9}\\'", StatementKind::Ddl),
+            (
+                "SET STATEMENT m='' FOR SET GLOBAL x = LEFT('\u{e9}\\', 0)",
+                StatementKind::Ddl,
+            ),
+            ("SET @x = 'x\u{e9}\\'", StatementKind::Ddl),
+            (
+                "SET STATEMENT m=1 /*M! FOR UPDATE t SET a = 'b' */",
+                StatementKind::Update,
+            ),
+            ("/*M! SELECT * FROM hr.c */", StatementKind::Select),
+            ("/*!80000 SELECT * FROM hr.c */", StatementKind::Select),
+            ("/*!80000 GRANT ALL ON *.* TO u */", StatementKind::Dcl),
+            ("SELECT 'x\u{e9}\\' FROM t", StatementKind::Select),
+        ] {
+            let a = raw(q);
+            assert_eq!(a.kind(), k, "{q}");
+            assert!(!a.lexed(), "{q}");
+        }
+        let lexed = my("SELECT a FROM t");
+        assert!(lexed.lexed());
+        assert_eq!(
+            most_reportable(StatementKind::Select, StatementKind::Dcl),
+            StatementKind::Dcl
+        );
+        assert_eq!(
+            most_reportable(StatementKind::Update, StatementKind::Other),
+            StatementKind::Update
+        );
+        let nested = |n: usize| {
+            format!(
+                "{}UPDATE performance_schema.setup_consumers SET enabled = 'NO'",
+                "SET STATEMENT a = 1 FOR ".repeat(n)
+            )
+        };
+        for n in 1..=MAX_SET_STATEMENT_DEPTH {
+            let a = my(&nested(n));
+            assert_eq!(a.kind(), StatementKind::Update, "{n}");
+            assert_eq!(
+                a.parts()[0].relations,
+                vec![RelationName {
+                    schema: Some("performance_schema".into()),
+                    name: "setup_consumers".into()
+                }],
+                "{n}"
+            );
+        }
+        assert_eq!(
+            my(&nested(MAX_SET_STATEMENT_DEPTH + 1)).kind(),
+            StatementKind::Ddl
+        );
+        assert_eq!(
+            my("LOAD DATA INFILE '/x' INTO TABLE hr.t").kind(),
+            StatementKind::Insert
+        );
+        assert!(my_norm("LOAD DATA INFILE '/x' INTO TABLE hr.t").is_none());
+        assert_eq!(
+            my_rels("LOAD XML LOCAL INFILE '/x' IGNORE INTO TABLE `hr`.`t` (a)"),
+            vec![r(Some("hr"), "t")]
+        );
+        assert_eq!(
+            my_rels("INSERT LOW_PRIORITY IGNORE hr.t (a) VALUES (1)"),
+            vec![r(Some("hr"), "t")]
+        );
+        assert_eq!(my_rels("REPLACE hr.t SET a = 1"), vec![r(Some("hr"), "t")]);
+        assert_eq!(my("RENAME TABLE a TO b").kind(), StatementKind::Ddl);
+        assert_eq!(my("RENAME USER a TO b").kind(), StatementKind::Dcl);
+        let call = |q: &str| my(q).parts().iter().any(|p| p.routine_call);
+        for q in [
+            "SELECT hr.f(1)",
+            "DO `hr`.`f`()",
+            "SET @x = hr . f ()",
+            "SELECT a FROM t WHERE b = hr.f(a)",
+            "INSERT INTO t VALUES (hr.f(1))",
+        ] {
+            assert!(call(q), "{q}");
+        }
+        for q in [
+            "INSERT INTO hr.t (a) VALUES (1)",
+            "INSERT hr.t (a) VALUES (1)",
+            "REPLACE INTO hr.t (a) VALUES (1)",
+            "INSERT IGNORE hr.t (a) VALUES (1)",
+            "CREATE TABLE hr.t (a int)",
+            "CREATE TABLE IF NOT EXISTS hr.t (a int)",
+            "CREATE INDEX i ON hr.t (a)",
+            "SELECT COUNT(*), t.a FROM hr.t",
+            "LOAD DATA INFILE '/x' INTO TABLE hr.t (a)",
+        ] {
+            assert!(!call(q), "{q}");
+        }
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege
