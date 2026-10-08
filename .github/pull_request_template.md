@@ -18,3 +18,4 @@
 - [ ] Lint and tests green for the affected component
 - [ ] Documentation and ROADMAP up to date
 - [ ] DCO-signed commits (`git commit -s`)
+- [ ] Release PR (`dev` → `main`, title `release: X.Y.Z`) only: [RELEASE.md § 7](../RELEASE.md#7-pre-release-checklist) checklist done, including the holdout seed rotated on `dev` since the previous release ([§ 8](../RELEASE.md#8-holdout-seed-rotation); the "Release version" check fails otherwise, unless `[skip-holdout]` is justified)
