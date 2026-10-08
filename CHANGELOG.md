@@ -9,6 +9,7 @@ The project follows [semantic versioning](https://semver.org/).
 
 ### 🐛 Bug Fixes
 - Agent and protocol: `privilege.not_evaluated` is registered for `postgres` in `shared/protocol/target-notes.json` (compatible change: an engine appended to an existing code), and the PostgreSQL CAS store guard now reports an incomplete privilege evaluation (candidate relation or column list cut at its limit, a name that is not UTF-8, or a failed check query) as `privilege.not_evaluated`, as MySQL / MariaDB and MongoDB do, instead of `check.stage_failed` with label `stage_check` ([docs/08-engine-capabilities.md](docs/08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap))
+- Dev environment: `make dev-cas` no longer fails at random after CAS is healthy. `docker compose up --wait` could report the normal exit (0) of the one-shot `cas-db-grants` as a failure; it now runs on its own with `docker compose run --rm` once CAS is healthy.
 
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
