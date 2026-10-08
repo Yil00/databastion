@@ -177,7 +177,7 @@ pub(crate) struct EventBuilder {
 
 /// The `$limit` of the CAS store guard's ticket type count
 /// (`discover::ticket_types_command`).
-const OWN_TYPE_COUNT_LIMIT: u64 = 256;
+pub(crate) const OWN_TYPE_COUNT_LIMIT: u64 = 256;
 
 /// Unused poll credits kept per database: polls whose own entry is never
 /// seen (not profiled, overwritten) do not add up.
