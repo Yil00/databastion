@@ -37,6 +37,12 @@ updates:
       # ESLint stays on 9: eslint-plugin-react (via eslint-config-next) does not support 10 yet.
       - dependency-name: eslint
         versions: [">=10"]
+      # TypeScript stays on 5.x: typescript-eslint (via eslint-config-next) does not support 7 yet.
+      - dependency-name: typescript
+        versions: [">=6"]
+      # @types/node follows the console's Node.js major (24, ci.yml and the console image).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       console:
         patterns: ["*"]

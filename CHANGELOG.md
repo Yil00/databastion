@@ -8,7 +8,15 @@ The project follows [semantic versioning](https://semver.org/).
 ## Unreleased
 
 ### 🐛 Bug Fixes
+- Console dependencies: `next` 16.3.8 (security fixes, among them GHSA-cjq9-62q9-8jv4, an SSRF in image optimization, which the console disables, and several cache-poisoning advisories), with `eslint-config-next` 16.3.8, `react` / `react-dom` 19.3.0, `pg` 8.23.1, `pg-boss` 12.35.1, `vitest` 5.0.3, `@types/node` 24.19.1 and the matching `@types/react*`. TypeScript stays on 5.x and `@types/node` on 24.x: typescript-eslint does not support TypeScript 7 yet, and the console runs on Node.js 24 (Dependabot now ignores TypeScript 6+ and `@types/node` majors; replaces #150).
+- Dev environment: `make dev-cas` no longer fails at random after CAS is healthy. `docker compose up --wait` could report the normal exit (0) of the one-shot `cas-db-grants` as a failure; it now runs on its own with `docker compose run --rm` once CAS is healthy.
 - Agent dependencies: `tokio` 1.53.2. The other updates of Dependabot #158 are left out: `syn` 3, `prettyplease` 0.3 and `schemars` 1 must move together with `typify` in `protocol-codegen` (Dependabot now ignores them on their own), and `base64` 0.23 changes its API (evaluated separately).
+
+### 👷 CI
+- Release PRs (to `main`): the "Release version" check now also fails while the holdout seed (`SEED` in `dev/holdout/generate.py`) is the one of the previous final release, or brings back an earlier release's seed; it was not rotated for 0.2.0, 0.3.0 and 0.3.1. `[skip-release]` PRs are not checked; `[skip-holdout]` in the title keeps the seed only when no classifier code changed since the previous release ([RELEASE.md § 8](RELEASE.md#8-holdout-seed-rotation)). The PR template has a release checklist line
+
+### 📝 Documentation
+- [dev/holdout/README.md](dev/holdout/README.md): 39 hard-negative columns have opaque names, not 44 (the 44 also counted the 5 ambiguous opaque-named columns, which are excluded from scoring); its CI section now describes the blocking holdout gate in `ci.yml`. The corpus and its seed are unchanged
 
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
