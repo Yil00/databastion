@@ -66,6 +66,16 @@ fn has(events: &[MaskedEvent], object: &str, signal: &str) -> bool {
     })
 }
 
+/// A write event naming `performance_schema.<table>`.
+fn has_write(events: &[MaskedEvent], table: &str) -> bool {
+    events.iter().any(|e| {
+        e.action() == EventAction::Write
+            && e.objects().iter().any(|o| {
+                o.database().as_str() == "performance_schema" && o.object().as_str() == table
+            })
+    })
+}
+
 /// Collects events until `done` holds or `timeout`.
 async fn collect_until(
     rx: &mut tokio::sync::mpsc::Receiver<MaskedEvent>,
@@ -530,9 +540,20 @@ async fn performance_schema_gives_events_with_rows() {
         )
         .await;
         exec(&mut a, "DROP USER 'databastion_it_pw'@'%'").await;
+        // A write to a performance_schema setup table (the admin account
+        // holds the privilege): reported with the table named. It sets
+        // the consumer to its own value, so it changes nothing and needs
+        // no restore.
+        exec(
+            &mut a,
+            "UPDATE performance_schema.setup_consumers SET ENABLED = ENABLED \
+             WHERE NAME = 'events_stages_current'",
+        )
+        .await;
         let mut events: Events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
-            has(ev, "big", "volume.large_result")
+            has_write(ev, "setup_consumers")
+                && has(ev, "big", "volume.large_result")
                 && has(ev, "d", "signature.mysqldump")
                 && has(ev, "d", "signature.into_outfile")
                 && ev.iter().any(|e| e.action() == EventAction::Dcl)
@@ -570,6 +591,11 @@ async fn performance_schema_gives_events_with_rows() {
         assert!(
             events.iter().any(|e| e.action() == EventAction::Dcl),
             "{}",
+            server.name
+        );
+        assert!(
+            has_write(&events, "setup_consumers"),
+            "{}: write to performance_schema.setup_consumers: {all:#?}",
             server.name
         );
         if real {

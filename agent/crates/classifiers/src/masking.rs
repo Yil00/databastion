@@ -1326,6 +1326,9 @@ pub struct MaskedEvent {
     signals: Vec<Signal>,
     source: EventSource,
     aggregated_count: u64,
+    /// Agent-internal, never sent: the `audit.configure` filter never
+    /// drops the event (see [`Self::always_report`]).
+    always_report: bool,
 }
 
 /// What pre-aggregation groups on: same principal, object set, action and
@@ -1357,7 +1360,26 @@ impl MaskedEvent {
             signals: Vec::new(),
             source,
             aggregated_count: 1,
+            always_report: false,
         }
+    }
+
+    /// Marks the event as always reported: the `audit.configure` filter
+    /// (`min_rows`, sensitive objects) never drops it. For changes that
+    /// can blind the Audit source (writes to a database's own
+    /// instrumentation or audit settings), whatever their row count.
+    /// Agent-internal: not part of the contract, never serialized (the
+    /// filter runs before events are converted and spooled).
+    #[must_use]
+    pub fn with_always_report(mut self) -> Self {
+        self.always_report = true;
+        self
+    }
+
+    /// Whether the event is always reported ([`Self::with_always_report`]).
+    #[must_use]
+    pub fn always_report(&self) -> bool {
+        self.always_report
     }
 
     /// Adds an object (duplicates and objects past [`MAX_EVENT_OBJECTS`]
@@ -1436,6 +1458,7 @@ impl MaskedEvent {
         for s in other.signals {
             self.add_signal(s);
         }
+        self.always_report |= other.always_report;
     }
 
     /// First occurrence.

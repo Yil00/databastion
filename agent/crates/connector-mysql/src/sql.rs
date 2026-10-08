@@ -941,10 +941,30 @@ mod tests {
         }
     }
 
+    /// Every statement the agent sends is a recognized read or on the
+    /// Audit stream's allow-list of statements of no known kind: the
+    /// fail-closed `Other` path never reports the agent's own traffic.
+    #[test]
+    fn own_statements_are_reads_or_allow_listed() {
+        use databastion_classifiers::query::{AnalyzeOptions, StatementKind, analyze};
+        for s in all_statements() {
+            let a = analyze(&s, AnalyzeOptions::mysql());
+            assert!(a.lexed(), "{s}");
+            for p in a.parts() {
+                let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
+                let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
+                assert!(read || quiet, "{s}");
+                assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+            }
+        }
+    }
+
     #[test]
     fn statements_are_single_and_never_read_write() {
         for s in all_statements() {
             assert!(!s.contains(';'), "multi-statement: {s}");
+            // The Audit stream's double-quote backstop relies on it.
+            assert!(!s.contains('"'), "double quote: {s}");
             let upper = s.to_uppercase();
             assert!(!upper.contains("READ WRITE"), "{s}");
             assert!(!upper.contains("CONSISTENT SNAPSHOT"), "{s}");
@@ -952,6 +972,40 @@ mod tests {
             for w in [
                 "INSERT ", "UPDATE ", "DELETE ", "REPLACE ", "CREATE ", "DROP ", "GRANT ",
             ] {
+                assert!(!upper.contains(w), "{w} in {s}");
+            }
+            // No server configuration change either (I4): the Audit
+            // stream reports these from any account, the agent's included.
+            for w in [
+                "TRUNCATE",
+                "CALL ",
+                "PREPARE",
+                "EXECUTE",
+                "DO ",
+                "HANDLER",
+                "FLUSH",
+                "RESET",
+                "KILL",
+                "SET GLOBAL",
+                "SET PERSIST",
+                "SET @@",
+                ", GLOBAL ",
+                ", PERSIST",
+                "INSTALL",
+                "ALTER ",
+                "RENAME ",
+                "LOAD ",
+            ] {
+                // The one exception: the server-side cancel of the
+                // agent's own statement on its other connection
+                // (`KILL QUERY <id>`, nothing else).
+                if w == "KILL"
+                    && upper
+                        .strip_prefix("KILL QUERY ")
+                        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    continue;
+                }
                 assert!(!upper.contains(w), "{w} in {s}");
             }
         }
