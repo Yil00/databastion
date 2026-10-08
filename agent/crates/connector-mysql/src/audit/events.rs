@@ -154,7 +154,8 @@ fn is_audit_table(db: &str, table: &str) -> bool {
 
 /// The closed allow-list of statements of no known kind that produce no
 /// event: they can neither read nor change data, and hold no subquery.
-/// Session `SET` without a function call or a table (`SET NAMES`,
+/// Session `SET` without a table or a schema-qualified function call
+/// (`SET NAMES`,
 /// `SET CHARACTER SET`, `SET TRANSACTION`, `SET autocommit = 1`…), `USE`,
 /// `BEGIN` (not `BEGIN NOT ATOMIC`), `START TRANSACTION`, `COMMIT`,
 /// `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SHOW`, `EXPLAIN` / `DESCRIBE` /
@@ -168,7 +169,11 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
     let lead: Vec<&str> = p.lead.iter().map(String::as_str).collect();
     let table_word = |w: Option<&&str>| matches!(w.copied(), Some("table" | "tables"));
     match lead.as_slice() {
-        ["set", ..] => !p.function_call && p.relations.is_empty(),
+        // Built-in calls are fine (`SET sql_mode = CONCAT(@@sql_mode, …)`,
+        // sent by Connector/J on every pooled connection); a
+        // schema-qualified (stored) function is not, nor an audit
+        // function (excluded above).
+        ["set", ..] => !p.routine_call && p.relations.is_empty(),
         ["begin"] | ["begin", "work"] => true,
         ["start", "transaction", ..]
         | [
@@ -3253,13 +3258,7 @@ mod tests {
             "SHOW TABLES WHERE (SELECT COUNT(*) FROM hr.customers) > 0",
             |_| "read [\"hr.customers\"]".to_owned(),
         );
-        for text in [
-            "DO 1",
-            "XA START 'x'",
-            "SET @x = NOW()",
-            "HELP 'select'",
-            "END",
-        ] {
+        for text in ["DO 1", "XA START 'x'", "HELP 'select'", "END"] {
             expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
         }
         // The allow-list: no event.
@@ -3269,6 +3268,9 @@ mod tests {
             "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
             "SET autocommit = 1",
             "SET @x = 1",
+            "SET @x = NOW()",
+            "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+            "FLUSH TABLES hr.customers FOR EXPORT",
             "USE hr",
             "BEGIN",
             "BEGIN WORK",
@@ -3301,6 +3303,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Re-review of c173fe8: `UPDATE` / `DELETE` / `REPLACE` modifiers,
+    /// `EXPLAIN … ANALYZE` anywhere before the statement, `(TABLE …)` /
+    /// `(VALUES …)` subqueries, and session `SET`s with function calls.
+    #[test]
+    fn modifiers_explain_forms_and_set_calls() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        for text in [
+            "UPDATE LOW_PRIORITY performance_schema.setup_consumers SET ENABLED = 'NO'",
+            "UPDATE IGNORE performance_schema.setup_consumers SET ENABLED = 'NO'",
+            "DELETE LOW_PRIORITY QUICK IGNORE FROM performance_schema.setup_consumers",
+            "REPLACE LOW_PRIORITY INTO performance_schema.setup_consumers VALUES ('x', 'NO')",
+            "REPLACE DELAYED performance_schema.setup_consumers VALUES ('x', 'NO')",
+        ] {
+            expect_everywhere(text, |_| consumers.to_owned());
+        }
+        expect_everywhere(
+            "UPDATE LOW_PRIORITY IGNORE performance_schema.setup_consumers, hr.a SET ENABLED = 'NO'",
+            |_| "write [\"hr.a\", \"performance_schema.setup_consumers\"] always".to_owned(),
+        );
+        let actors = "write [\"performance_schema.setup_actors\"] always";
+        for text in [
+            "EXPLAIN ANALYZE FORMAT=JSON INTO @x DELETE FROM performance_schema.setup_actors",
+            "EXPLAIN FORMAT=JSON INTO @x ANALYZE DELETE FROM performance_schema.setup_actors",
+        ] {
+            expect_everywhere(text, |_| actors.to_owned());
+        }
+        // `ANALYZE` without a statement found: never quiet (`*`).
+        expect_everywhere("EXPLAIN ANALYZE FOR CONNECTION 5", |s| {
+            format!("read [{:?}]", star(s))
+        });
+        for text in [
+            "SHOW TABLES WHERE 'a' IN (TABLE hr.customers)",
+            "SHOW TABLES WHERE ROW(1) IN (VALUES ROW(1)) AND 'a' IN (TABLE hr.customers)",
+        ] {
+            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+        }
+        // Session SETs: built-in calls are quiet; a stored or audit
+        // function is not.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+            ) {
+                assert!(ev.is_none(), "{user} {source:?}");
+            }
+        }
+        expect_everywhere("SET @x = hr.f()", |s| {
+            format!("read [{:?}] always", star(s))
+        });
+        expect_everywhere("SET @x = audit_log_rotate()", |_| {
+            "ddl [] always".to_owned()
+        });
     }
 
     #[test]

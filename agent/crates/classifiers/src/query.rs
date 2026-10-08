@@ -1255,7 +1255,8 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map(|(s, original)| {
             let mut info = statement_info(s, opts, false);
             let wrappers = my_wrappers(original);
-            info.analyze_wrapped = wrappers.contains(&Wrapper::Analyze);
+            info.analyze_wrapped =
+                wrappers.contains(&Wrapper::Analyze) || explain_analyze(original);
             info.compound = wrappers.contains(&Wrapper::Compound);
             info
         })
@@ -1303,6 +1304,25 @@ enum Wrapper {
     Compound,
 }
 
+/// Most tokens between `EXPLAIN` and the statement it explains.
+const MAX_EXPLAIN_PREFIX_TOKENS: usize = 32;
+
+/// Whether an `EXPLAIN` / `DESCRIBE` / `DESC` holds an `ANALYZE` word
+/// before its statement (or in its first [`MAX_EXPLAIN_PREFIX_TOKENS`]
+/// tokens when no statement is found there): it runs something, and is
+/// never quiet (fail closed).
+fn explain_analyze(s: &[Tok]) -> bool {
+    if !matches!(word(s.first()), Some("explain" | "describe" | "desc")) {
+        return false;
+    }
+    let end = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
+        .find(|&j| runs_statement_at(s, j, true))
+        .unwrap_or(s.len().min(MAX_EXPLAIN_PREFIX_TOKENS));
+    s[1..end]
+        .iter()
+        .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
+}
+
 /// Skips `FORMAT = name` at `i`.
 fn skip_format(s: &[Tok], i: usize) -> usize {
     if word(s.get(i)) == Some("format") && is_punct(s.get(i + 1), "=") {
@@ -1339,13 +1359,16 @@ fn wrapper_level(s: &[Tok]) -> Option<(&[Tok], Wrapper)> {
             }
             None
         }
+        // `ANALYZE` anywhere before the statement (`EXPLAIN ANALYZE
+        // FORMAT=JSON INTO @x DELETE …`, `EXPLAIN FORMAT=JSON INTO @x
+        // ANALYZE …`): the statement runs.
         (Some("explain" | "describe" | "desc"), _) => {
-            let i = skip_format(s, 1);
-            if word(s.get(i)) != Some("analyze") {
-                return None;
-            }
-            let i = skip_format(s, i + 1);
-            runs_statement_at(s, i, true).then(|| (&s[i..], Wrapper::Analyze))
+            let start = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
+                .find(|&j| runs_statement_at(s, j, true))?;
+            s[1..start]
+                .iter()
+                .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
+                .then(|| (&s[start..], Wrapper::Analyze))
         }
         // `ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE …` stays a utility.
         (Some("analyze"), _) => {
@@ -1402,8 +1425,10 @@ fn my_wrappers(s: &[Tok]) -> Vec<Wrapper> {
 /// Whether a statement holds a subquery: `(` followed by `SELECT` or
 /// `WITH`.
 fn has_subquery(s: &[Tok]) -> bool {
-    s.windows(2)
-        .any(|w| is_punct(Some(&w[0]), "(") && matches!(word(w.get(1)), Some("select" | "with")))
+    s.windows(2).any(|w| {
+        is_punct(Some(&w[0]), "(")
+            && matches!(word(w.get(1)), Some("select" | "with" | "table" | "values"))
+    })
 }
 
 /// Whether a statement calls a function: a name followed by `(`.
@@ -2479,6 +2504,12 @@ fn read_relation(
 ) -> usize {
     while matches!(word(s.get(i)), Some("only" | "lateral")) {
         i += 1;
+    }
+    // MySQL `UPDATE [LOW_PRIORITY] [IGNORE] t …`: modifiers, not names.
+    if word(i.checked_sub(1).and_then(|j| s.get(j))) == Some("update") {
+        while matches!(word(s.get(i)), Some("low_priority" | "ignore")) {
+            i += 1;
+        }
     }
     // MySQL `INTO OUTFILE '…'` / `INTO DUMPFILE '…'`: a file, not a relation.
     if matches!(word(s.get(i)), Some("outfile" | "dumpfile"))
