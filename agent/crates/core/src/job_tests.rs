@@ -485,7 +485,7 @@ mod guard_props {
         #[test]
         fn a_ticket_id_never_reaches_a_finding_or_a_log(
             others in proptest::collection::vec("[a-z]{3,8}\\.[a-z]{3,8}@example\\.(org|com)", 1..20),
-            prefix in "(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)",
+            prefix in "(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR)",
             n in 1u32..100_000,
             tail in "[A-Za-z0-9]{8,24}",
             pos in any::<prop::sample::Index>(),

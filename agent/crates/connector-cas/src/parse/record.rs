@@ -18,8 +18,26 @@
 //! `service` drops the record. Any other JSON type (`null`, a number, an
 //! array) names no service. The text kept is held in a zeroizing buffer
 //! only while the record is parsed, then reduced to the service URL's
-//! scheme and host **for service-ticket issuance only**
+//! scheme and host **for service-ticket or token issuance only**
 //! ([`super::url::service_of`]) and dropped. Nothing else of it is kept.
+//!
+//! OAuth 2.0 / OIDC (verified against CAS 8.0.2): the token endpoint's
+//! issuance is `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`, whose `what` holds
+//! the token values (`access_token`, `refresh_token`, `id_token`) and no
+//! `service`: they are skipped like `ticketId`. The other OAuth / OIDC
+//! actions (`OAUTH2_AUTHORIZATION_RESPONSE_CREATED`,
+//! `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED`, `OIDC_ID_TOKEN_CREATED`,
+//! `OAUTH2_USER_PROFILE_CREATED`) are counted per base and give no event.
+//!
+//! **No unzeroized copy of a kept string** (ROADMAP phase 8 follow-up).
+//! The caller holds the line in a zeroizing buffer. Kept keys and values
+//! are taken as `serde_json` raw values, borrowed from the line, and
+//! unescaped by [`super::jtext`] into zeroizing buffers allocated once:
+//! `serde_json` never unescapes them into its private scratch buffer (which
+//! is not wiped). A line whose first byte (after white space) is not `{` is
+//! refused before parsing. Raw values are UTF-8 checked as a whole, so a
+//! kept key whose value (even a skipped non-string one, such as an object
+//! `what`) holds invalid UTF-8 drops the line (`NotJson`); CAS writes UTF-8.
 //!
 //! The `DEFAULT` (`WHO: … WHAT: …`) format is not supported (ADR-0041 open
 //! question 6, confirmed: JSON is required).
@@ -28,10 +46,11 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
-use super::bounded_owned;
+use super::jtext::{self, Invalid, Scalar};
 use super::url::{ServiceHost, service_of};
 use super::when::{from_epoch, parse_when};
 use crate::config::UtcOffset;
@@ -68,6 +87,11 @@ pub enum Action {
     AuthFailed,
     /// `SERVICE_TICKET_CREATED`.
     ServiceTicketCreated,
+    /// `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`: the OAuth 2.0 / OIDC token
+    /// endpoint issued tokens (every grant type; verified against CAS
+    /// 8.0.2: `who` is the user, or the client id for `client_credentials`,
+    /// and `what` holds the token values and no service).
+    TokenIssued,
     /// `SAVE_SERVICE_SUCCESS`.
     SaveService,
     /// `DELETE_SERVICE_SUCCESS`.
@@ -91,6 +115,7 @@ impl Action {
             "AUTHENTICATION_SUCCESS" => Self::AuthSuccess,
             "AUTHENTICATION_FAILED" => Self::AuthFailed,
             "SERVICE_TICKET_CREATED" => Self::ServiceTicketCreated,
+            "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED" => Self::TokenIssued,
             "SAVE_SERVICE_SUCCESS" => Self::SaveService,
             "DELETE_SERVICE_SUCCESS" => Self::DeleteService,
             other => {
@@ -103,12 +128,12 @@ impl Action {
         })
     }
 
-    /// Whether the record issues a ticket or token for a service (the
-    /// OIDC / OAuth issuance actions are to verify against CAS 8.0 and are
-    /// not listed yet).
+    /// Whether the record issues a ticket or token for a service
+    /// (ADR-0041 decisions 7 and 10): a service ticket, or tokens from the
+    /// OAuth 2.0 / OIDC token endpoint.
     #[must_use]
     pub fn issues_for_service(&self) -> bool {
-        matches!(self, Self::ServiceTicketCreated)
+        matches!(self, Self::ServiceTicketCreated | Self::TokenIssued)
     }
 }
 
@@ -167,107 +192,30 @@ enum K {
     Other,
 }
 
-struct KeySeed;
+/// Longest key compared, in bytes: a longer key is none of the kept ones.
+const MAX_KEY_BYTES: usize = 32;
 
-impl<'de> de::DeserializeSeed<'de> for KeySeed {
-    type Value = K;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<K, D::Error> {
-        d.deserialize_str(self)
-    }
+/// A deserialization error that carries none of the input.
+fn refused<E: de::Error>(_: Invalid) -> E {
+    E::custom("invalid JSON string")
 }
 
-impl Visitor<'_> for KeySeed {
-    type Value = K;
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a key")
-    }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<K, E> {
-        Ok(match v {
-            "who" => K::Who,
-            "what" => K::What,
-            "action" => K::Action,
-            "when" => K::When,
-            "clientIpAddress" => K::Client,
-            "userAgent" => K::Agent,
-            "headers" => K::Headers,
-            _ => K::Other,
-        })
-    }
+/// The text of a key, unescaped by [`jtext`] (bounded, zeroized).
+fn key_text<E: de::Error>(raw: &RawValue) -> Result<Zeroizing<String>, E> {
+    jtext::unescape(raw.get(), MAX_KEY_BYTES + 1).map_err(refused)
 }
 
-/// A string (bounded, zeroized) or `None` for any other JSON type.
-struct Text(Option<Zeroizing<String>>);
-
-struct TextSeed(usize);
-
-impl<'de> de::DeserializeSeed<'de> for TextSeed {
-    type Value = Text;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Text, D::Error> {
-        d.deserialize_any(self)
-    }
-}
-
-impl<'de> Visitor<'de> for TextSeed {
-    type Value = Text;
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a string")
-    }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Text, E> {
-        Ok(Text(Some(bounded_owned(v, self.0))))
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Text, E> {
-        Ok(Text(None))
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Text, E> {
-        Ok(Text(None))
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Text, E> {
-        Ok(Text(None))
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Text, E> {
-        Ok(Text(None))
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<Text, E> {
-        Ok(Text(None))
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Text, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Text(None))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Text, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(Text(None))
-    }
-}
-
-/// The keys of an object-form `what`: only `service` is read.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WhatKey {
-    Service,
-    Other,
-}
-
-struct WhatKeySeed;
-
-impl<'de> de::DeserializeSeed<'de> for WhatKeySeed {
-    type Value = WhatKey;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<WhatKey, D::Error> {
-        d.deserialize_str(self)
-    }
-}
-
-impl Visitor<'_> for WhatKeySeed {
-    type Value = WhatKey;
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a key")
-    }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<WhatKey, E> {
-        Ok(if v == "service" {
-            WhatKey::Service
-        } else {
-            WhatKey::Other
-        })
-    }
+fn record_key<E: de::Error>(raw: &RawValue) -> Result<K, E> {
+    Ok(match key_text::<E>(raw)?.as_str() {
+        "who" => K::Who,
+        "what" => K::What,
+        "action" => K::Action,
+        "when" => K::When,
+        "clientIpAddress" => K::Client,
+        "userAgent" => K::Agent,
+        "headers" => K::Headers,
+        _ => K::Other,
+    })
 }
 
 /// `what`: the text to reduce (the string form, or the `service` string of
@@ -278,70 +226,48 @@ struct What {
     duplicate: bool,
 }
 
-struct WhatSeed;
-
-impl<'de> de::DeserializeSeed<'de> for WhatSeed {
-    type Value = What;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<What, D::Error> {
-        d.deserialize_any(self)
-    }
-}
-
-impl WhatSeed {
-    fn none() -> What {
-        What {
+/// Reads `what` from its raw text: a string is unescaped by [`jtext`]; an
+/// object is parsed again from the same borrowed text by [`WhatVisitor`];
+/// any other JSON type names no service.
+fn what_of<E: de::Error>(raw: &RawValue) -> Result<What, E> {
+    let text = raw.get();
+    match text.as_bytes().first() {
+        Some(b'"') => Ok(What {
+            text: Some(jtext::unescape(text, MAX_WHAT_BYTES).map_err(refused)?),
+            duplicate: false,
+        }),
+        Some(b'{') => serde_json::Deserializer::from_str(text)
+            .deserialize_map(WhatVisitor)
+            .map_err(|_| E::custom("invalid what")),
+        _ => Ok(What {
             text: None,
             duplicate: false,
-        }
+        }),
     }
 }
 
-impl<'de> Visitor<'de> for WhatSeed {
+/// The object form of `what`: only `service` is read (a string, or nothing
+/// for any other type); every other key and value is skipped without being
+/// copied.
+struct WhatVisitor;
+
+impl<'de> Visitor<'de> for WhatVisitor {
     type Value = What;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a string or an object")
+        f.write_str("an object")
     }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<What, E> {
-        Ok(What {
-            text: Some(bounded_owned(v, MAX_WHAT_BYTES)),
-            duplicate: false,
-        })
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<What, E> {
-        Ok(Self::none())
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<What, E> {
-        Ok(Self::none())
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<What, E> {
-        Ok(Self::none())
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<What, E> {
-        Ok(Self::none())
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<What, E> {
-        Ok(Self::none())
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<What, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Self::none())
-    }
-    // Only `service` is read (a string, or nothing for any other type);
-    // every other key and value is skipped without being copied.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<What, A::Error> {
         let mut service: Option<Option<Zeroizing<String>>> = None;
         let mut duplicate = false;
-        while let Some(k) = map.next_key_seed(WhatKeySeed)? {
-            match k {
-                WhatKey::Service => {
-                    let v = map.next_value_seed(TextSeed(MAX_WHAT_BYTES))?.0;
-                    if service.replace(v).is_some() {
-                        duplicate = true;
-                    }
+        while let Some(k) = map.next_key::<&'de RawValue>()? {
+            if key_text::<A::Error>(k)?.as_str() == "service" {
+                let raw = map.next_value::<&'de RawValue>()?;
+                let v = jtext::string(raw, MAX_WHAT_BYTES).map_err(refused)?;
+                if service.replace(v).is_some() {
+                    duplicate = true;
                 }
-                WhatKey::Other => {
-                    map.next_value::<IgnoredAny>()?;
-                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
             }
         }
         Ok(What {
@@ -358,48 +284,6 @@ enum When {
     Other,
 }
 
-struct WhenSeed;
-
-impl<'de> de::DeserializeSeed<'de> for WhenSeed {
-    type Value = When;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<When, D::Error> {
-        d.deserialize_any(self)
-    }
-}
-
-impl<'de> Visitor<'de> for WhenSeed {
-    type Value = When;
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a time")
-    }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<When, E> {
-        Ok(When::Text(bounded_owned(v, 64)))
-    }
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<When, E> {
-        Ok(When::Number(v))
-    }
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<When, E> {
-        Ok(i64::try_from(v).map_or(When::Other, When::Number))
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<When, E> {
-        Ok(When::Other)
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<When, E> {
-        Ok(When::Other)
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<When, E> {
-        Ok(When::Other)
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<When, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(When::Other)
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<When, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(When::Other)
-    }
-}
-
 #[derive(Default)]
 struct Raw {
     who: Option<Option<Zeroizing<String>>>,
@@ -412,22 +296,26 @@ struct Raw {
     duplicate: bool,
 }
 
+/// The record object. Kept keys and values are taken as [`RawValue`]s
+/// (borrowed from the line, never unescaped by `serde_json`, see
+/// [`jtext`]); skipped values go through `IgnoredAny`.
 struct RecordVisitor;
 
 impl<'de> Visitor<'de> for RecordVisitor {
-    type Value = Option<Raw>;
+    type Value = Raw;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("an audit record")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<Raw>, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Raw, A::Error> {
         let mut r = Raw::default();
-        while let Some(k) = map.next_key_seed(KeySeed)? {
+        while let Some(k) = map.next_key::<&'de RawValue>()? {
+            let k = record_key::<A::Error>(k)?;
             let slot = match k {
                 K::Who => &mut r.who,
                 K::What => {
-                    let w = map.next_value_seed(WhatSeed)?;
+                    let w = what_of::<A::Error>(map.next_value::<&'de RawValue>()?)?;
                     if w.duplicate || r.what.replace(w).is_some() {
                         r.duplicate = true;
                     }
@@ -437,7 +325,12 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 K::Client => &mut r.client,
                 K::Agent => &mut r.agent,
                 K::When => {
-                    let w = map.next_value_seed(WhenSeed)?;
+                    let raw = map.next_value::<&'de RawValue>()?;
+                    let w = match jtext::scalar(raw, 64).map_err(refused)? {
+                        Scalar::Str(s) => When::Text(s),
+                        Scalar::Int(n) => When::Number(n),
+                        Scalar::Other => When::Other,
+                    };
                     if r.when.replace(w).is_some() {
                         r.duplicate = true;
                     }
@@ -458,35 +351,13 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 K::Action => MAX_ACTION_BYTES + 1,
                 _ => 256,
             };
-            let v = map.next_value_seed(TextSeed(max))?.0;
+            let raw = map.next_value::<&'de RawValue>()?;
+            let v = jtext::string(raw, max).map_err(refused)?;
             if slot.replace(v).is_some() {
                 r.duplicate = true;
             }
         }
-        Ok(Some(r))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<Raw>, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(None)
-    }
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<Option<Raw>, E> {
-        Ok(None)
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Option<Raw>, E> {
-        Ok(None)
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Option<Raw>, E> {
-        Ok(None)
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Option<Raw>, E> {
-        Ok(None)
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Option<Raw>, E> {
-        Ok(None)
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<Option<Raw>, E> {
-        Ok(None)
+        Ok(r)
     }
 }
 
@@ -516,12 +387,20 @@ fn first_token(ua: &str) -> Option<String> {
 /// # Errors
 /// [`RecordError`].
 pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordError> {
+    // Only an object is a record: anything else (a JSON string included,
+    // whose escapes `serde_json` would unescape into its own buffer) is
+    // refused before it is parsed.
+    let first = line
+        .iter()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    if first != Some(&b'{') {
+        return Err(RecordError::NotJson);
+    }
     let mut de = serde_json::Deserializer::from_slice(line);
     let raw = de
-        .deserialize_any(RecordVisitor)
+        .deserialize_map(RecordVisitor)
         .map_err(|_| RecordError::NotJson)?;
     de.end().map_err(|_| RecordError::NotJson)?;
-    let raw = raw.ok_or(RecordError::NotJson)?;
     if raw.duplicate {
         return Err(RecordError::Invalid);
     }
@@ -536,7 +415,7 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
         _ => None,
     }
     .ok_or(RecordError::Invalid)?;
-    // `what` is read only for service-ticket issuance, then dropped
+    // `what` is read only for service-ticket or token issuance, then dropped
     // (zeroized) whatever the action.
     let what = raw.what.and_then(|w| w.text);
     let service = if action.issues_for_service() {
@@ -704,6 +583,152 @@ mod tests {
         );
     }
 
+    /// Escaped strings (no unzeroized `serde_json` copy, [`super::jtext`])
+    /// parse as before: in the object-form `service`, the string form, the
+    /// kept keys and the other kept values.
+    #[test]
+    fn escaped_strings_parse_as_before() {
+        let service = |what: &str| {
+            parse_record(
+                &line(&format!(
+                    r#""action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": {what}"#
+                )),
+                UTC,
+            )
+            .map(|r| r.service.as_ref().map(ServiceHost::as_url))
+        };
+        let app = Ok(Some("https://app.example.org/".to_owned()));
+        for what in [
+            r#"{"service": "https:\/\/app.example.org\/x?ticket=ST-1-FAKE"}"#,
+            r#"{"service": "\u0068ttps://app.example.org/", "ticketId": "ST-1-\u0046AKE"}"#,
+            r#"{"serv\u0069ce": "https://app.example.org/"}"#,
+            r#""ST-1-FAKE for https:\/\/app.example.org\/x""#,
+            r#""ST-1-FAKE for \u0068ttps://app.example.\u006frg/""#,
+        ] {
+            assert_eq!(service(what), app, "{what}");
+        }
+        // An escaped duplicate `service` is still a duplicate.
+        assert_eq!(
+            service(
+                r#"{"service": "https://app.example.org/", "s\u0065rvice": "https://evil.example.net/"}"#
+            ),
+            Err(RecordError::Invalid)
+        );
+        // A lone surrogate in a kept string drops the line, as before.
+        assert_eq!(
+            service(r#"{"service": "https://app.example.org/\ud800"}"#),
+            Err(RecordError::NotJson)
+        );
+        assert_eq!(
+            service(r#""https://app.example.org/\udc00""#),
+            Err(RecordError::NotJson)
+        );
+        // ... but not in a skipped one (serde_json only skips it).
+        assert_eq!(
+            service(r#"{"service": "https://app.example.org/", "ticketId": "\ud800"}"#),
+            app
+        );
+        let r = parse_record(
+            &line(
+                r#""w\u0068o": "j\u00e9r\u00f4me", "\u0061ction": "AUTHENTICATION_\u0053UCCESS",
+                   "when": "2026\u002d10-04T12:00:00Z", "clientIpAddress": "192.0.2.\u0031",
+                   "userAgent": "curl\/8.5.0""#,
+            ),
+            UTC,
+        )
+        .unwrap();
+        assert_eq!(r.action, Action::AuthSuccess);
+        assert_eq!(r.who.as_deref().map(String::as_str), Some("jérôme"));
+        assert_eq!(r.client, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(r.user_agent.as_deref(), Some("curl/8.5.0"));
+        assert_eq!(
+            parse_record(
+                &line(
+                    r#""who": "a", "w\u0068o": "b", "action": "AUTHENTICATION_SUCCESS", "when": 1"#
+                ),
+                UTC
+            )
+            .err(),
+            Some(RecordError::Invalid)
+        );
+    }
+
+    #[test]
+    fn only_objects_are_records() {
+        for l in [
+            &br#""{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": 1}""#[..],
+            b" \t\r\n[{}]",
+            b"1",
+            b"null",
+            b"  ",
+        ] {
+            assert_eq!(
+                parse_record(l, UTC).err(),
+                Some(RecordError::NotJson),
+                "{}",
+                String::from_utf8_lossy(l)
+            );
+        }
+        assert!(
+            parse_record(
+                b" \r\n\t{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": 1791115200000}",
+                UTC
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn token_responses_are_issuance_without_token_values() {
+        // CAS 8.0.2 `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED` (token values
+        // masked by CAS there; in clear here: never read either way).
+        let r = parse_record(
+            &line(
+                r#""who": "jdoe", "what": {"access_token": "AT-1-FAKEclearTOKEN-cas01",
+                   "refresh_token": "RT-1-FAKEclearTOKEN-cas01", "id_token": "eyJFAKE.eyJFAKE.FAKE",
+                   "scope": "openid email", "token_type": "Bearer", "expires_in": "28800"},
+                   "action": "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+                   "when": "2026-10-08T11:46:43.332813548", "clientIpAddress": "172.18.0.1",
+                   "serverIpAddress": "172.18.0.3", "userAgent": "python-requests/2.33.1""#,
+            ),
+            UTC,
+        )
+        .unwrap();
+        assert_eq!(r.action, Action::TokenIssued);
+        assert!(r.action.issues_for_service());
+        assert!(r.service.is_none());
+        let dbg = format!("{r:?}");
+        for leak in ["FAKE", "eyJ", "jdoe", "Bearer"] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
+        // The other OAuth / OIDC actions are not issuance: their `what`
+        // (codes, refresh tokens, the token request's HTTP headers) is
+        // never read.
+        for (action, base) in [
+            (
+                "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+                "OAUTH2_ACCESS_TOKEN_REQUEST",
+            ),
+            ("OIDC_ID_TOKEN_CREATED", "OIDC_ID_TOKEN"),
+            (
+                "OAUTH2_AUTHORIZATION_RESPONSE_CREATED",
+                "OAUTH2_AUTHORIZATION_RESPONSE",
+            ),
+            ("OAUTH2_USER_PROFILE_CREATED", "OAUTH2_USER_PROFILE"),
+        ] {
+            let r = parse_record(
+                &line(&format!(
+                    r#""who": "audit:unknown", "what": {{"service": "https://app.example.org/cb", "code": "OC-1-FAKE"}},
+                       "action": "{action}", "when": 1791115200000"#
+                )),
+                UTC,
+            )
+            .unwrap();
+            assert_eq!(r.action, Action::Other(base.to_owned()));
+            assert!(r.service.is_none());
+        }
+    }
+
     #[test]
     fn an_object_what_is_ignored_for_other_actions() {
         let r = parse_record(
@@ -743,6 +768,10 @@ mod tests {
         assert_eq!(a("AUTHENTICATION_FAILED"), Some(Action::AuthFailed));
         assert_eq!(a("SAVE_SERVICE_SUCCESS"), Some(Action::SaveService));
         assert_eq!(a("DELETE_SERVICE_SUCCESS"), Some(Action::DeleteService));
+        assert_eq!(
+            a("OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED"),
+            Some(Action::TokenIssued)
+        );
         assert_eq!(
             a("TICKET_GRANTING_TICKET_NOT_CREATED"),
             Some(Action::Other("TICKET_GRANTING_TICKET".to_owned()))

@@ -11,7 +11,7 @@ use databastion_classifiers::masking::RawSample;
 use proptest::prelude::*;
 use std::sync::LazyLock;
 
-const NAMED: &str = "(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)";
+const NAMED: &str = "(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR)";
 
 fn reference(v: &str) -> Verdict {
     // Leading white space skipped; the letter run is maximal (`XTGT-1-`

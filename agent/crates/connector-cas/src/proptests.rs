@@ -335,6 +335,60 @@ proptest! {
         prop_assert!(!dbg.contains("evil"));
     }
 
+    /// The object-form `what` with every kind of `service` value and
+    /// duplicate `service` keys (escaped or not, among random other keys):
+    /// a string names its host, any other JSON type names no service (the
+    /// record is kept), and a second `service` key drops the record.
+    #[test]
+    fn object_what_service_kinds_and_duplicates(
+        ticket in marker(),
+        services in proptest::collection::vec((0u8..8, any::<bool>()), 0..4),
+        extra in proptest::collection::vec("[a-zA-Z]{1,12}", 0..4),
+        action in prop::sample::select(vec![
+            "SERVICE_TICKET_CREATED", "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+        ]),
+    ) {
+        // Kind 0 is a string (the only one naming a service); the others
+        // are `null`, a number, a boolean, an array, an object, an empty
+        // string and a string that is no URL.
+        let value = |kind: u8| match kind {
+            0 => lit(&format!("https://app.example.org/{ticket}?ticket=ST-1-{ticket}")),
+            1 => "null".to_owned(),
+            2 => "3".to_owned(),
+            3 => "true".to_owned(),
+            4 => format!("[{}]", lit("https://evil.example.net/")),
+            5 => format!("{{\"service\": {}, \"id\": {}}}", lit("https://evil.example.net/"), lit(&ticket)),
+            6 => lit(""),
+            _ => lit(&format!("ST-1-{ticket}")),
+        };
+        let mut fields: Vec<String> = extra
+            .iter()
+            .filter(|k| k.as_str() != "service")
+            .map(|k| format!("{}: {}", lit(k), lit(&format!("TGT-1-{ticket}"))))
+            .collect();
+        for (i, (kind, escaped)) in services.iter().enumerate() {
+            let key = if *escaped { r#""serv\u0069ce""# } else { r#""service""# };
+            fields.insert(i.min(fields.len()), format!("{key}: {}", value(*kind)));
+        }
+        let line = format!(
+            r#"{{"who": "jdoe", "what": {{{}}}, "action": "{action}", "when": 1791115200000}}"#,
+            fields.join(", ")
+        );
+        let r = parse_record(line.as_bytes(), UtcOffset(0));
+        match services.as_slice() {
+            [] => prop_assert!(r.unwrap().service.is_none()),
+            [(kind, _)] => {
+                let r = r.unwrap();
+                let host = r.service.as_ref().map(crate::parse::url::ServiceHost::as_url);
+                let expected = (*kind == 0).then(|| "https://app.example.org/".to_owned());
+                prop_assert_eq!(host, expected);
+                let dbg = format!("{r:?}");
+                prop_assert!(!dbg.contains(&ticket));
+            }
+            _ => prop_assert_eq!(r.err(), Some(crate::parse::record::RecordError::Invalid)),
+        }
+    }
+
     #[test]
     fn only_closed_facts_reach_events(
         who in marker(),

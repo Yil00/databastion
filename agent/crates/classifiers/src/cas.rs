@@ -2,7 +2,7 @@
 //! and the PR #141 review M4 / L1).
 //!
 //! A CAS ticket id (`TGT-12-…`, `ST-3-…`, `PT-…`, `PGT-…`, `PGTIOU-…`,
-//! `OC-…`, `AT-…`, `RT-…`) is a live bearer credential: it is never
+//! `TST-…`, `OC-…`, `AT-…`, `RT-…`, …) is a live bearer credential: it is never
 //! classified, masked, fingerprinted nor logged. The shared sampling path
 //! of every connector (`ScanJob::classify` in the agent core) screens each
 //! column's values with [`screen`] **before** classification:
@@ -28,11 +28,19 @@
 use crate::masking::RawSample;
 
 /// Named CAS ticket prefixes: ADR-0041 decision 5 (`TGT`, `ST`, `PT`,
-/// `PGT`, `OC`, `AT`, `RT`), plus the proxy-granting ticket IOU
-/// (`PGTIOU`), the transient session ticket (`TST`) and `CT` (to verify
-/// against CAS 8.0).
+/// `PGT`, `OC`, `AT`, `RT`) and the other ticket prefixes of CAS 8.0.2,
+/// verified against the constants of its jars (`javap -constants`; the
+/// core war, and the OAuth / OIDC modules of the dev overlay):
+/// `ProxyGrantingTicket.PROXY_GRANTING_TICKET_IOU_PREFIX` (`PGTIOU`),
+/// `TransientSessionTicket.PREFIX` (`TST`), `OAuth20DeviceToken.PREFIX`
+/// (`ODT`), `OAuth20DeviceUserCode.PREFIX` (`ODUC`),
+/// `OidcCibaRequest.PREFIX` (`CIBA`) and
+/// `OidcPushedAuthorizationRequest.PREFIX` (`OPAR`). CAS 8.0.2 has no `CT`
+/// prefix (formerly listed, to verify): a `CT-1-…` value only has the
+/// generic shape. Prefixes of modules outside the dev overlay (SAML2 IdP,
+/// WS-Federation) are not verified: they fall under the generic shape.
 pub const TICKET_PREFIXES: &[&str] = &[
-    "TGT", "ST", "PT", "PGT", "PGTIOU", "OC", "AT", "RT", "CT", "TST",
+    "TGT", "ST", "PT", "PGT", "PGTIOU", "TST", "OC", "AT", "RT", "ODT", "ODUC", "CIBA", "OPAR",
 ];
 
 /// Shortest and longest prefix of the generic shape.
@@ -219,8 +227,11 @@ mod tests {
             "OC-5-code",
             "AT-6-token",
             "RT-7-refresh",
-            "CT-8-x",
             "TST-9-x",
+            "ODT-1-device",
+            "ODUC-2-usercode",
+            "CIBA-3-request",
+            "OPAR-4-request",
             "  TGT-9-padded",
             "\tST-1-",
         ] {
@@ -233,6 +244,7 @@ mod tests {
     fn generic_shapes_and_embedded_tickets_drop_the_value() {
         for v in [
             "ABCD-0-",
+            "CT-8-x",
             "INV-2026-0001",
             "ABCDEFGH-1-x",
             "XTGT-1-x",

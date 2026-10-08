@@ -339,7 +339,7 @@ impl Builder {
         match &r.action {
             Action::AuthSuccess => out.push(self.event(r, ts, EventAction::Connect, who)),
             Action::AuthFailed => self.failure(r, ts, who, out),
-            Action::ServiceTicketCreated => {
+            Action::ServiceTicketCreated | Action::TokenIssued => {
                 let found = r
                     .service
                     .as_ref()
@@ -676,6 +676,75 @@ mod tests {
         let dbg = format!("{out:?} {r:?} {b:?}");
         for leak in ["ST-1", "FAKE", "cas01", "MRK", "intranet.example", "jdoe"] {
             assert!(!dbg.contains(leak), "{leak}");
+        }
+    }
+
+    /// Real CAS 8.0.2 OAuth 2.0 / OIDC records (dev CAS: authorization
+    /// code, `refresh_token`, `client_credentials` on `/oidc/token` and
+    /// `/oauth2.0/accessToken`, `password`, implicit; token values
+    /// redacted, `fixtures/README.md` of this crate).
+    #[test]
+    fn cas_802_oauth_records_map_issuance_only() {
+        let def = parse_definition(
+            br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org(/.*)?$", "clientId": "scratch-m2m"}"#,
+        )
+        .unwrap();
+        let mut b = builder(ClientAddrMode::Truncated);
+        b.set_services(Some(Arc::new(ServiceIndex::new([&def]))));
+        let recs: Vec<AuditRecord> =
+            include_str!("../../fixtures/cas-8.0.2-oauth-oidc-audit.jsonl")
+                .lines()
+                .map(|l| parse_record(l.as_bytes(), UtcOffset(0)).unwrap())
+                .collect();
+        assert_eq!(recs.len(), 26);
+        let mut out = Vec::new();
+        for r in &recs {
+            b.push(r, at(10), &mut out);
+        }
+        let reads = |object: &str| {
+            out.iter()
+                .filter(|e| {
+                    e.action == EventAction::Read
+                        && e.rows == Some(1)
+                        && e.object.as_ref().map(|o| o.object().as_str()) == Some(object)
+                })
+                .count()
+        };
+        // Service tickets (authorization code and implicit logins: `service`
+        // is the redirect URI) name the client's registry entry (a pattern
+        // that matches `scheme://host/`); token responses (every grant)
+        // name no service (`*`).
+        assert_eq!(reads("M2M"), 2);
+        assert_eq!(reads("*"), 5);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.action == EventAction::Connect)
+                .count(),
+            3
+        );
+        assert_eq!(out.len(), 10);
+        let dbg = format!("{out:?} {recs:?} {b:?}");
+        for leak in [
+            "FAKEredacted",
+            "REDACTED",
+            "eyJ",
+            "Basic",
+            "camille",
+            "scratch-m2m",
+            "m2m.example",
+            "N/A",
+        ] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
+        // The other OAuth / OIDC actions are counted per base.
+        for base in [
+            "OAUTH2_ACCESS_TOKEN_REQUEST",
+            "OIDC_ID_TOKEN",
+            "OAUTH2_AUTHORIZATION_RESPONSE",
+            "OAUTH2_USER_PROFILE",
+        ] {
+            assert!(b.ignored.contains_key(base), "{base}");
         }
     }
 
