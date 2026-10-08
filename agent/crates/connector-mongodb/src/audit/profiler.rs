@@ -789,6 +789,29 @@ mod tests {
         assert!(projection.contains("kp") && projection.contains("$objectToArray"));
     }
 
+    /// Drift test (phase 8 follow-up): the `kp` projection compares the
+    /// profiled command's pipeline with exactly the pipeline the CAS store
+    /// guard's key probe sends (`discover::key_probe_command`), byte for
+    /// byte, so the server flags the probe and nothing else.
+    #[test]
+    fn the_key_probe_flag_compares_the_pipeline_the_guard_sends() {
+        let sent = crate::discover::key_probe_command("CasTickets").finish();
+        let sent = Doc::new(&sent).unwrap().array("pipeline").unwrap().unwrap();
+        let p = projection().finish();
+        let kp = Doc::new(&p).unwrap().doc("kp").unwrap().unwrap();
+        let eq = kp.array("$eq").unwrap().unwrap();
+        assert_eq!(eq.str("0").unwrap(), Some("$command.pipeline"));
+        let literal = eq
+            .doc("1")
+            .unwrap()
+            .unwrap()
+            .array("$literal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(literal.as_bytes(), sent.as_bytes());
+        assert_eq!(literal.iter().count(), 2);
+    }
+
     /// End-of-phase-5 review I1: a truncated command (or one that is not
     /// an object) has an unknown shape; one whose name was cut off is
     /// reported by what it did.

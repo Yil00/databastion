@@ -1868,4 +1868,152 @@ mod tests {
         assert!(parse_audit_log(br#"{"activity_id":1,"category_uid":3}"#).is_err());
         assert!(parse_audit_log(b"{\"atype\":").is_err());
     }
+
+    /// The JSON a mongod writes for a BSON document: relaxed extended JSON
+    /// (numbers plain, as the server log and the auditLog do), or canonical
+    /// (`$numberInt`, `$numberLong`, `$numberDouble`, as some builds and
+    /// Percona write). Keys keep their order. Test only.
+    fn ext_json(doc: crate::bson::Doc<'_>, array: bool, canonical: bool, out: &mut String) {
+        use crate::bson::Value;
+        out.push(if array { '[' } else { '{' });
+        for (i, e) in doc.iter().enumerate() {
+            let (k, v) = e.unwrap();
+            if i > 0 {
+                out.push(',');
+            }
+            if !array {
+                out.push_str(&serde_json::to_string(std::str::from_utf8(k).unwrap()).unwrap());
+                out.push(':');
+            }
+            match v {
+                Value::Doc(d) => ext_json(d, false, canonical, out),
+                Value::Array(d) => ext_json(d, true, canonical, out),
+                Value::Str(b) => {
+                    out.push_str(&serde_json::to_string(std::str::from_utf8(b).unwrap()).unwrap());
+                }
+                Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                Value::Int32(n) if canonical => out.push_str(&format!(r#"{{"$numberInt":"{n}"}}"#)),
+                Value::Int64(n) if canonical => {
+                    out.push_str(&format!(r#"{{"$numberLong":"{n}"}}"#));
+                }
+                Value::Double(d) if canonical => {
+                    out.push_str(&format!(r#"{{"$numberDouble":"{d:?}"}}"#));
+                }
+                Value::Int32(n) => out.push_str(&n.to_string()),
+                Value::Int64(n) => out.push_str(&n.to_string()),
+                Value::Double(d) => out.push_str(&format!("{d:?}")),
+                other => panic!("no extended JSON form for {other:?} in this test"),
+            }
+        }
+        out.push(if array { ']' } else { '}' });
+    }
+
+    /// A command as the server writes it, with the `$db` the driver adds.
+    fn command_json(cmd: crate::bson::DocBuf, canonical: bool) -> String {
+        let bytes = cmd.str("$db", "app").finish();
+        let mut out = String::new();
+        ext_json(
+            crate::bson::Doc::new(&bytes).unwrap(),
+            false,
+            canonical,
+            &mut out,
+        );
+        out
+    }
+
+    /// The command in a server log "Slow query" line and in an auditLog
+    /// `authCheck` record, parsed by each source.
+    fn as_logged(command: &str) -> [Record; 2] {
+        let server = format!(
+            r#"{{"t":{{"$date":"2026-10-08T10:00:00.000+00:00"}},"s":"I","c":"COMMAND","id":51803,"ctx":"conn12","msg":"Slow query","attr":{{"type":"command","ns":"app.CasTickets","appName":"databastion-agent","command":{command},"planSummary":"COLLSCAN","keysExamined":0,"docsExamined":3,"cursorExhausted":true,"numYields":0,"nreturned":1,"reslen":120,"remote":"172.18.0.1:53422","protocol":"op_msg","durationMillis":0}}}}"#
+        );
+        let audit = format!(
+            r#"{{"atype":"authCheck","ts":{{"$date":"2026-10-08T10:00:00.000+00:00"}},"local":{{"ip":"127.0.0.1","port":27017}},"remote":{{"ip":"172.18.0.1","port":53422}},"users":[{{"user":"databastion","db":"admin"}}],"roles":[{{"role":"read","db":"app"}}],"param":{{"command":"aggregate","ns":"app.CasTickets","args":{command}}},"result":0}}"#
+        );
+        [
+            parse_server_log(server.as_bytes()).unwrap().unwrap(),
+            parse_audit_log(audit.as_bytes()).unwrap().unwrap(),
+        ]
+    }
+
+    /// Drift test (phase 8 follow-up): the commands the CAS store guard
+    /// actually sends (`discover::key_probe_command`,
+    /// `discover::ticket_types_command`), written by the server in its log
+    /// and auditLog, are recognized as the agent's own reads by the fixed
+    /// shapes `SAMPLE_ONE`, `KEY_PROJECT`, `TYPE_GROUP` and `LIMIT_256`;
+    /// a near miss is not.
+    #[test]
+    fn the_guard_commands_as_logged_are_recognized() {
+        use crate::bson::DocBuf;
+        use crate::discover;
+        let pipeline = |r: &Record| {
+            assert_eq!(r.kind, Kind::Op(Cmd::Aggregate));
+            r.shape.pipeline.unwrap()
+        };
+        for canonical in [false, true] {
+            for r in as_logged(&command_json(
+                discover::key_probe_command("CasTickets"),
+                canonical,
+            )) {
+                let p = pipeline(&r);
+                assert!(p.own_key_probe && !p.own_type_count && !p.writes, "{p:?}");
+            }
+            for field in ["type", "TYPE", "Type"] {
+                for r in as_logged(&command_json(
+                    discover::ticket_types_command("CasTickets", field),
+                    canonical,
+                )) {
+                    let p = pipeline(&r);
+                    assert!(p.own_type_count && !p.own_key_probe && !p.writes, "{p:?}");
+                }
+            }
+
+            // Near misses, built from the guard's own stages.
+            let probe = |stages: Vec<DocBuf>| {
+                DocBuf::new()
+                    .str("aggregate", "CasTickets")
+                    .array("pipeline", stages)
+                    .doc("cursor", DocBuf::new().i64("batchSize", 2))
+                    .bool("allowDiskUse", false)
+            };
+            let mut sample_two = discover::key_probe_pipeline();
+            sample_two[0] = DocBuf::new().doc("$sample", DocBuf::new().i64("size", 2));
+            let mut extra = discover::key_probe_pipeline();
+            extra.push(DocBuf::new().i64("$limit", 1));
+            let mut first_extra = discover::key_probe_pipeline();
+            first_extra.insert(0, DocBuf::new().doc("$match", DocBuf::new()));
+            let mut project_only = discover::key_probe_pipeline();
+            project_only.remove(0);
+            for stages in [sample_two, extra, first_extra, project_only] {
+                for r in as_logged(&command_json(probe(stages), canonical)) {
+                    assert!(!pipeline(&r).own_key_probe);
+                }
+            }
+            let types = command_json(
+                discover::ticket_types_command("CasTickets", "type"),
+                canonical,
+            );
+            let limit = if canonical {
+                r#"{"$limit":{"$numberLong":"256"}}"#
+            } else {
+                r#"{"$limit":256}"#
+            };
+            assert!(types.contains(limit), "{types}");
+            for not in [
+                types.replace(limit, &limit.replace("256", "257")),
+                types.replace(limit, &format!(r#"{limit},{{"$limit":1}}"#)),
+                types.replace(limit, &format!(r#"{{"$sample":{{"size":1}}}},{limit}"#)),
+                types.replace("$type", "$email"),
+            ] {
+                for r in as_logged(&not) {
+                    assert!(!pipeline(&r).own_type_count, "{not}");
+                }
+            }
+        }
+        // The Audit side's `$limit` of the type count is the guard's.
+        assert_eq!(
+            u64::try_from(discover::MAX_TICKET_TYPES).unwrap(),
+            crate::audit::events::OWN_TYPE_COUNT_LIMIT
+        );
+    }
 }
