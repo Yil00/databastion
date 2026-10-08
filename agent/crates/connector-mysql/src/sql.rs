@@ -954,6 +954,22 @@ mod tests {
             ] {
                 assert!(!upper.contains(w), "{w} in {s}");
             }
+            // No server configuration change either (I4): the Audit
+            // stream reports these from any account, the agent's included.
+            for w in [
+                "TRUNCATE",
+                "SET GLOBAL",
+                "SET PERSIST",
+                "SET @@",
+                ", GLOBAL ",
+                ", PERSIST",
+                "INSTALL",
+                "ALTER ",
+                "RENAME ",
+                "LOAD ",
+            ] {
+                assert!(!upper.contains(w), "{w} in {s}");
+            }
         }
     }
 

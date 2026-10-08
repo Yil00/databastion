@@ -707,7 +707,9 @@ pub enum StatementKind {
     /// `COPY`.
     Copy,
     /// Schema change: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COMMENT`
-    /// (role and account statements aside).
+    /// (role and account statements aside); MySQL also server
+    /// configuration changes: `INSTALL` / `UNINSTALL` and a `SET` of a
+    /// global or persisted variable.
     Ddl,
     /// Privilege change: `GRANT`, `REVOKE`, and the role and account
     /// statements: `CREATE` / `ALTER` / `DROP` `ROLE` / `USER` / `GROUP`
@@ -1159,7 +1161,12 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         }
         Err(_) => return QueryAnalysis::unparsed(my_kind_prefix(text)),
     };
-    let statements = split_statements(&tokens);
+    // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
+    // statement after `FOR` is what runs.
+    let statements: Vec<&[Tok]> = split_statements(&tokens)
+        .into_iter()
+        .map(|s| my_set_statement_body(s).unwrap_or(s))
+        .collect();
     let kind = statements
         .first()
         .map_or(StatementKind::Other, |s| my_kind(s));
@@ -1189,9 +1196,62 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     }
 }
 
+/// The statement of a MariaDB `SET STATEMENT var = value[, …] FOR
+/// <statement>`: the tokens after the first top-level `FOR`. `None` for
+/// any other statement.
+fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
+    if word(s.first()) != Some("set") || word(s.get(1)) != Some("statement") {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (j, t) in s.iter().enumerate().skip(2) {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
+            Tok::Word(w) if depth == 0 && w == "for" => return Some(&s[j + 1..]),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A MySQL `SET` that assigns a global or persisted system variable in
+/// any of its assignments: `SET GLOBAL x = …`, `SET PERSIST` /
+/// `PERSIST_ONLY`, `SET @@global.x = …` (also after a comma: `SET
+/// autocommit = 1, GLOBAL x = …`). Reading `@@global.x` on the right of
+/// `=` is not an assignment.
+fn my_sets_global(s: &[Tok]) -> bool {
+    if word(s.first()) != Some("set") {
+        return false;
+    }
+    let scope = |t: Option<&Tok>| matches!(word(t), Some("global" | "persist" | "persist_only"));
+    let mut depth = 0usize;
+    for (j, t) in s.iter().enumerate() {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
+            _ if depth == 0 && (j == 0 || is_punct(Some(t), ",")) => {
+                let next = s.get(j + 1);
+                // `@@` lexes as two `@` punctuation tokens.
+                let at_at = is_punct(next, "@") && is_punct(s.get(j + 2), "@");
+                if scope(next) || (at_at && scope(s.get(j + 3))) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Statement kind of a MySQL statement: [`first_kind`], plus `REPLACE`
-/// (a write), `HANDLER`, and account / role statements as DCL.
+/// (a write), `HANDLER`, account / role statements as DCL, and server
+/// configuration changes as DDL: `INSTALL` / `UNINSTALL` (plugins,
+/// libraries, components) and a `SET` of a global or persisted variable
+/// ([`my_sets_global`]). A MariaDB `SET STATEMENT … FOR <statement>` has
+/// the kind of its statement.
 fn my_kind(s: &[Tok]) -> StatementKind {
+    let s = my_set_statement_body(s).unwrap_or(s);
     let Some(i) = main_start(s) else {
         return StatementKind::Other;
     };
@@ -1199,6 +1259,8 @@ fn my_kind(s: &[Tok]) -> StatementKind {
     match word(s.get(i)) {
         Some("replace") => StatementKind::Insert,
         Some("handler") => StatementKind::Handler,
+        Some("install" | "uninstall") => StatementKind::Ddl,
+        Some("set") if my_sets_global(&s[i..]) => StatementKind::Ddl,
         // Digest text writes `USER` as `SYSTEM_USER` (MySQL).
         Some("create" | "alter" | "drop" | "rename")
             if matches!(second, Some("user" | "role" | "system_user")) =>
@@ -2694,6 +2756,63 @@ mod tests {
         ] {
             assert_eq!(my(q).kind(), k, "{q}");
         }
+    }
+
+    /// Server configuration changes (they can turn the Audit sources off)
+    /// are DDL, also from a text that does not lex; session settings stay
+    /// `Other`. A MariaDB `SET STATEMENT … FOR` has its statement's kind,
+    /// relations and shape.
+    #[test]
+    fn mysql_server_configuration_and_set_statement() {
+        for q in [
+            "SET GLOBAL server_audit_logging = OFF",
+            "set global server_audit_events = ''",
+            "SET @@global.server_audit_logging = 0",
+            "SET @@GLOBAL.audit_log_disable = ON",
+            "SET autocommit = 1, GLOBAL server_audit_logging = OFF",
+            "SET PERSIST audit_log_disable = ON",
+            "SET PERSIST_ONLY performance_schema = OFF",
+            "SET @@persist.audit_log_flush = ON",
+            "SET GLOBAL `server_audit_logging` = ?",
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET GLOBAL server_audit_excl_users = 'x\\'",
+            "UNINSTALL PLUGIN server_audit",
+            "UNINSTALL SONAME 'server_audit'",
+            "UNINSTALL COMPONENT 'file://component_audit_log_filter'",
+            "INSTALL PLUGIN server_audit SONAME 'server_audit'",
+            "INSTALL COMPONENT 'file://component_audit_log_filter'",
+            "TRUNCATE performance_schema.events_statements_history_long",
+        ] {
+            assert_eq!(my(q).kind(), StatementKind::Ddl, "{q}");
+            assert!(my_norm(q).is_none(), "{q}");
+        }
+        for q in [
+            "SET SESSION sql_mode = 'ANSI_QUOTES'",
+            "SET autocommit = 1",
+            "SET @x = @@global.server_audit_logging",
+            "SET @@session.sql_log_off = 1",
+            "SET sql_mode = CONCAT(@@global.sql_mode, ',x')",
+            "SET NAMES utf8mb4",
+            "SET STATEMENT max_statement_time = 1 FOR SHOW TABLES",
+        ] {
+            assert_eq!(my(q).kind(), StatementKind::Other, "{q}");
+        }
+        let a = my(
+            "SET STATEMENT max_statement_time = 1.5, sql_mode = 'x' FOR \
+             UPDATE performance_schema.setup_consumers SET enabled = 'NO'",
+        );
+        assert_eq!(a.kind(), StatementKind::Update);
+        assert_eq!(
+            a.relations()
+                .iter()
+                .map(|r| (r.schema.clone(), r.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![r(Some("performance_schema"), "setup_consumers")]
+        );
+        let a = my("SET STATEMENT max_statement_time = 1 FOR SELECT * FROM hr.t");
+        assert_eq!(a.kind(), StatementKind::Select);
+        assert!(a.shape().is_some_and(|s| s.whole_relation(10_001)));
+        assert_eq!(a.parts()[0].lead, ["select"]);
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege

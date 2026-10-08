@@ -33,10 +33,16 @@
 //! otherwise from the statement text (reads and writes only: DDL and DCL
 //! events take no name from text); an unqualified name is in the
 //! statement's current database. `information_schema`,
-//! `performance_schema`, `sys`, `DUAL` and MariaDB's internal statistics
-//! tables (`mysql.*_stats`) are not application data and are skipped; the
+//! `performance_schema`, `sys`, `DUAL` and the internal statistics tables
+//! (`mysql.*_stats`) are skipped from the objects of reads only: a write
+//! names them (`UPDATE performance_schema.setup_consumers …` turns the
+//! `performance_schema` source off), and so does a table record that
+//! writes a system schema table, whatever the statement's action. The
 //! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
-//! access worth reporting). A read or write whose objects cannot be told
+//! access worth reporting). Server configuration changes (`SET GLOBAL` /
+//! `PERSIST`, `INSTALL` / `UNINSTALL`, `TRUNCATE`) are DDL events. A
+//! statement that writes or changes something is never left out as the
+//! agent's own (I4). A read or write whose objects cannot be told
 //! (text that does not lex, `CALL`) is reported against `*`. Statements
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
@@ -86,7 +92,13 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
     o
 }
 
-/// Schemas that hold no application data.
+/// The server's own schemas: dictionary views (`information_schema`),
+/// instrumentation (`performance_schema`) and its helper views (`sys`).
+/// They hold no application rows, but they are not harmless:
+/// `performance_schema` holds other sessions' statement texts (literals
+/// included on `SQL_TEXT`, clear-text passwords on MariaDB) and its setup
+/// tables drive the `performance_schema` Audit source. Reads of them are
+/// not reported; writes are (see [`EventBuilder::statement`]).
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
@@ -110,12 +122,28 @@ fn is_internal_table(db: &str, table: &str) -> bool {
 
 /// A relation named by a statement (unqualified: in `database`) that holds
 /// no application data: a system schema, an internal statistics table, or
-/// `DUAL`.
+/// `DUAL`. Skipped from the objects of reads only.
 fn is_system_relation(r: &RelationName, database: &str) -> bool {
     let db = r.schema.as_deref().unwrap_or(database);
     is_system_schema(db)
         || is_internal_table(db, &r.name)
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
+}
+
+/// A statement kind that writes rows.
+fn is_write_kind(k: StatementKind) -> bool {
+    matches!(
+        k,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+    )
+}
+
+/// `DUAL`, unqualified: no table at all.
+fn is_dual(r: &RelationName) -> bool {
+    r.schema.is_none() && r.name.eq_ignore_ascii_case("dual")
 }
 
 /// Connection errors that are not authentication failures: bad handshake
@@ -673,9 +701,9 @@ impl EventBuilder {
     fn own_guard(&self, a: &Access<'_>) -> bool {
         a.text
             .is_some_and(|t| self.own_statement(t, a.truncated, a.opaque))
-            && a.tables
-                .iter()
-                .all(|(db, _, _)| db.eq_ignore_ascii_case("information_schema"))
+            && a.tables.iter().all(|(db, _, op)| {
+                *op == TableOp::Read && db.eq_ignore_ascii_case("information_schema")
+            })
     }
 
     /// The agent's address as the server sees it, refreshed at each
@@ -785,6 +813,17 @@ impl EventBuilder {
             },
         };
         let rw = matches!(action, EventAction::Read | EventAction::Write);
+        let write = action == EventAction::Write;
+        // The statement changed something, whatever its reported action
+        // (a `CALL` whose table records write, a write after a read in a
+        // multi-statement text): the agent only reads (I4), so such a
+        // statement with its identity is never left out as its own.
+        let changes = parts.iter().any(|p| {
+            is_write_kind(p.kind) || matches!(p.kind, StatementKind::Ddl | StatementKind::Dcl)
+        }) || a
+            .tables
+            .iter()
+            .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
         let mut objects: Vec<(String, String)> = Vec::new();
         let mut unknown = false;
         if a.tables.is_empty() && rw {
@@ -794,9 +833,13 @@ impl EventBuilder {
             // events need no object.
             let mut named_any = false;
             for p in parts {
+                // A write names its system tables (`UPDATE
+                // performance_schema.setup_consumers …` turns the
+                // `performance_schema` source off): only reads skip them.
+                let keep_system = write || is_write_kind(p.kind);
                 for r in &p.relations {
                     named_any = true;
-                    if is_system_relation(r, a.database) {
+                    if is_dual(r) || (!keep_system && is_system_relation(r, a.database)) {
                         continue;
                     }
                     let db = r.schema.as_deref().unwrap_or(a.database);
@@ -810,9 +853,13 @@ impl EventBuilder {
                 unknown = true;
             }
         } else {
-            for (db, table, _) in &a.tables {
-                let system = is_system_schema(db)
-                    || is_internal_table(db, table)
+            for (db, table, op) in &a.tables {
+                // System tables are skipped from reads only: a write
+                // statement names every table it touched, and a table
+                // record that writes or changes a system schema table
+                // names it whatever the statement's action (a `CALL`).
+                let system = (is_system_schema(db) && !write && *op == TableOp::Read)
+                    || (is_internal_table(db, table) && !write)
                     || (!rw && db.eq_ignore_ascii_case("mysql"));
                 let o = ((*db).to_owned(), (*table).to_owned());
                 if !system && !objects.contains(&o) {
@@ -821,7 +868,8 @@ impl EventBuilder {
             }
         }
         if rw && objects.is_empty() && !unknown {
-            // Only system tables, or no table at all (`SELECT 1`).
+            // A read of system tables only, or no table at all (`SELECT
+            // 1`). A write keeps its system tables above.
             return None;
         }
         let ts = a.ts.min(now);
@@ -865,9 +913,10 @@ impl EventBuilder {
         if a.rows.is_some_and(|r| r > LARGE_ROWS) {
             e = e.with_signal(Signal::LargeResult);
         }
-        if self
-            .own
-            .routine(a.user, a.application, a.client, &e, Instant::now())
+        if !changes
+            && self
+                .own
+                .routine(a.user, a.application, a.client, &e, Instant::now())
         {
             return None;
         }
@@ -2122,6 +2171,259 @@ mod tests {
             b.convert_file_at(recs, EventSource::MysqlAuditLog, SystemTime::now(), t0);
             assert!(b.pending.sizes().2 <= MAX_PENDING_BYTES);
         }
+    }
+
+    /// A `server_audit` QUERY line of `user` from `host`.
+    fn sa_line(user: &str, host: &str, q: u64, text: &str) -> String {
+        sa_query(user, host, q, text, None)
+    }
+
+    /// A Percona `audit_log` JSON statement record.
+    fn json_query(user: &str, ip: &str, c: u64, text: &str) -> FileRecord {
+        let rec = format!(
+            r#"{{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":{c},"login":{{"user":"{user}","ip":"{ip}"}},"general_data":{{"command":"Query","query":{},"status":0}}}}"#,
+            serde_json::to_string(text).unwrap()
+        );
+        parse_json(rec.as_bytes()).unwrap()
+    }
+
+    const DISABLE_CONSUMER: &str = "UPDATE performance_schema.setup_consumers SET ENABLED = 'NO' WHERE NAME = 'events_statements_history_long'";
+    const DISABLE_DIGEST: &str =
+        "UPDATE `performance_schema` . `setup_consumers` SET `ENABLED` = ? WHERE `NAME` = ?";
+
+    /// Writes to system schema tables turn the `performance_schema` source
+    /// off: reported with the table named, from any account, the agent's
+    /// included, on every source.
+    #[test]
+    fn writes_to_system_schemas_are_reported_with_their_tables() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] None []";
+        for user in ["app", "databastion"] {
+            // server_audit, QUERY record only (text path) and with its
+            // WRITE table record (table path).
+            let mut b = EventBuilder::new(own());
+            let out = file(
+                &mut b,
+                sa_at(
+                    &[
+                        sa_line(user, "172.18.0.1", 1, DISABLE_CONSUMER),
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            2,
+                            "update performance_schema.setup_instruments set enabled = 'NO'",
+                        ),
+                        format!(
+                            "20260929 09:40:35,h,{user},172.18.0.1,30,3,WRITE,performance_schema,setup_consumers,"
+                        ),
+                        sa_line(user, "172.18.0.1", 3, DISABLE_CONSUMER),
+                        // MariaDB `SET STATEMENT … FOR`: the write it wraps.
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            4,
+                            &format!("SET STATEMENT max_statement_time = 1 FOR {DISABLE_CONSUMER}"),
+                        ),
+                        // Copying other sessions' statement texts.
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            5,
+                            "insert into shop.t select sql_text from performance_schema.events_statements_history_long",
+                        ),
+                    ],
+                    1024,
+                ),
+            );
+            assert_eq!(
+                out,
+                [
+                    consumers,
+                    "write [\"performance_schema.setup_instruments\"] None []",
+                    consumers,
+                    consumers,
+                    "write [\"performance_schema.events_statements_history_long\", \"shop.t\"] None []",
+                ],
+                "{user}: {out:#?}"
+            );
+            // The Percona `audit_log` JSON file.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                vec![json_query(user, "172.18.0.1", 7, DISABLE_CONSUMER)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(show).collect::<Vec<_>>(),
+                [consumers],
+                "{user}"
+            );
+            // performance_schema (`DIGEST_TEXT`), with an affected row
+            // count far below the own-account budget.
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(DISABLE_DIGEST.as_bytes(), false, Vec::new());
+            access.user = user;
+            access.principal = EventPrincipal::account(user);
+            access.rows = Some(1);
+            let e = b.statement(access, SystemTime::now()).expect(user);
+            assert_eq!(
+                show(&e),
+                "write [\"performance_schema.setup_consumers\"] Some(1) []"
+            );
+        }
+    }
+
+    /// Reads of system schema tables stay unreported (a separate ROADMAP
+    /// item), from the text or from table records.
+    #[test]
+    fn reads_of_system_schemas_are_unchanged() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[
+                    sa_line(
+                        "app",
+                        "10.0.0.5",
+                        1,
+                        "select sql_text from performance_schema.events_statements_history_long",
+                    ),
+                    sa_line("app", "10.0.0.5", 2, "select * from sys.statement_analysis"),
+                    "20260929 09:40:35,h,app,10.0.0.5,30,3,READ,performance_schema,setup_consumers,"
+                        .to_owned(),
+                    sa_line(
+                        "app",
+                        "10.0.0.5",
+                        3,
+                        "select * from performance_schema.setup_consumers",
+                    ),
+                    sa_line("app", "10.0.0.5", 4, "select 1 from dual"),
+                ],
+                1024,
+            ),
+        );
+        assert_eq!(out, Vec::<String>::new());
+        let access = pfs_access(
+            b"SELECT * FROM `performance_schema` . `setup_consumers`",
+            false,
+            Vec::new(),
+        );
+        assert!(b.statement(access, SystemTime::now()).is_none());
+    }
+
+    /// Changes to the audit configuration: DDL events (no object: DDL
+    /// takes no name from text, ADR-0023 decision 7), from any account;
+    /// session `SET`s stay unreported.
+    #[test]
+    fn audit_configuration_changes_are_reported() {
+        for user in ["app", "databastion"] {
+            let texts = [
+                "TRUNCATE performance_schema.events_statements_history_long",
+                "TRUNCATE TABLE performance_schema.events_statements_history_long",
+                "SET GLOBAL server_audit_logging = OFF",
+                "set global server_audit_events = ''",
+                "SET @@global.server_audit_logging = 0",
+                "SET autocommit = 1, GLOBAL server_audit_logging = OFF",
+                "SET PERSIST audit_log_disable = ON",
+                "SET GLOBAL audit_log_flush = ON",
+                "SET GLOBAL performance_schema_max_sql_text_length = 0",
+                "UNINSTALL PLUGIN server_audit",
+                "UNINSTALL SONAME 'server_audit'",
+                "UNINSTALL COMPONENT 'file://component_audit_log_filter'",
+                "INSTALL PLUGIN server_audit SONAME 'server_audit'",
+            ];
+            let lines: Vec<String> = texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| sa_line(user, "172.18.0.1", i as u64 + 1, t))
+                .collect();
+            let mut b = EventBuilder::new(own());
+            let out = file(&mut b, sa_at(&lines, 1024));
+            assert_eq!(out, vec!["ddl [] None []"; texts.len()], "{user}");
+            // The same from performance_schema digests and the JSON file.
+            for t in [
+                "TRUNCATE TABLE `performance_schema` . `events_statements_history_long`",
+                "SET GLOBAL `server_audit_logging` = ?",
+                "UNINSTALL PLUGIN `server_audit`",
+            ] {
+                let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+                access.user = user;
+                let e = b.statement(access, SystemTime::now()).expect(t);
+                assert_eq!(e.action(), EventAction::Ddl, "{t}");
+                let ev = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 9, t)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{t}");
+            }
+        }
+        // Session settings (the agent's own, any account's): no event.
+        let mut b = EventBuilder::new(own());
+        for t in [
+            crate::sql::session_setup(crate::conn::Flavor::Mariadb, 1000),
+            crate::sql::session_setup(crate::conn::Flavor::Mysql, 1000),
+            crate::sql::SESSION_READ_ONLY.to_owned(),
+            "SET @x = @@global.server_audit_logging".to_owned(),
+            "SET NAMES utf8mb4".to_owned(),
+        ] {
+            let out = file(&mut b, sa_at(&[sa_line("app", "10.0.0.5", 1, &t)], 1024));
+            assert!(out.is_empty(), "{t}: {out:?}");
+            let access = pfs_access(t.as_bytes(), false, Vec::new());
+            assert!(b.statement(access, SystemTime::now()).is_none(), "{t}");
+        }
+    }
+
+    /// A statement whose table records change something is never left out
+    /// as the agent's own, whatever its action (a `CALL` of a procedure
+    /// that writes); the agent's MariaDB `SET STATEMENT … FOR SELECT`
+    /// samples stay its own reads.
+    #[test]
+    fn own_statements_that_change_something_are_reported() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[
+                    "20260929 09:40:35,h,databastion,172.18.0.1,30,1,WRITE,performance_schema,setup_consumers,"
+                        .to_owned(),
+                    sa_line("databastion", "172.18.0.1", 1, "call shop.p()"),
+                ],
+                1024,
+            ),
+        );
+        assert_eq!(
+            out,
+            ["read [\"performance_schema.setup_consumers\"] None []"]
+        );
+        // The agent's own MariaDB sample on performance_schema: a read of
+        // the sampled table, within the row budget.
+        let sample = crate::sql::sample_statement(
+            crate::conn::Flavor::Mariadb,
+            1000,
+            "support",
+            "tickets",
+            &[("c", crate::sql::Sampled::Text)],
+            10,
+        )
+        .unwrap();
+        let mut access = pfs_access(sample.as_bytes(), false, Vec::new());
+        access.rows = Some(10);
+        assert!(b.statement(access, SystemTime::now()).is_none());
+        // The same text from another address: reported as a read.
+        let mut access = pfs_access(sample.as_bytes(), false, Vec::new());
+        access.rows = Some(10);
+        access.client = ClientSeen::Logged(ClientAddr::parse("10.9.9.9"));
+        let e = b.statement(access, SystemTime::now()).unwrap();
+        assert_eq!(show(&e), "read [\"support.tickets\"] Some(10) []");
+        // The CAS guard text with a write table record in
+        // `information_schema` never takes the uncharged path.
+        let set = guard_sets().remove(0);
+        let b = guard_builder(&set);
+        assert!(!b.own_guard(&pfs_access(
+            set[0].as_bytes(),
+            false,
+            vec![("information_schema", "COLUMNS", TableOp::Write)]
+        )));
     }
 
     #[test]
