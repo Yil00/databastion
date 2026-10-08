@@ -152,6 +152,23 @@ fn is_audit_table(db: &str, table: &str) -> bool {
             .any(|t| t.eq_ignore_ascii_case(table))
 }
 
+/// Utility statements that name tables without reading their rows
+/// (metadata, locks, maintenance), by their leading words. `EXPLAIN
+/// ANALYZE` runs its statement and is not one of them.
+fn is_utility(lead: &[String]) -> bool {
+    let first = lead.first().map(String::as_str);
+    let second = lead.get(1).map(String::as_str);
+    match first {
+        Some("explain" | "describe" | "desc") => second != Some("analyze"),
+        Some(
+            "show" | "lock" | "unlock" | "flush" | "analyze" | "optimize" | "check" | "checksum"
+            | "repair" | "cache" | "load" | "help" | "use" | "kill" | "reset" | "purge" | "begin"
+            | "commit" | "rollback" | "start" | "savepoint" | "release" | "xa",
+        ) => true,
+        _ => false,
+    }
+}
+
 /// A statement kind that changes something: rows, schema or privileges.
 fn is_change_kind(k: StatementKind) -> bool {
     is_write_kind(k) || matches!(k, StatementKind::Ddl | StatementKind::Dcl)
@@ -874,10 +891,24 @@ impl EventBuilder {
                             | StatementKind::Handler
                     ))
         });
+        // A statement of no read kind that reads tables in a subquery:
+        // `SET @x = (SELECT … FROM hr.customers)` (then `SELECT @x`),
+        // `DO (SELECT …)`. Reported as a read naming them, never the
+        // agent's own (its session `SET`s name no table). Utility
+        // statements that name tables without reading rows (`SHOW`,
+        // `LOCK TABLES`, `FLUSH`, `ANALYZE`…) are left as before.
+        let embedded_read = parts.iter().any(|p| {
+            p.kind == StatementKind::Other
+                && !is_utility(&p.lead)
+                && p.relations
+                    .iter()
+                    .any(|r| !is_dual(r) && !is_system_relation(r, a.database))
+        });
         let changes = is_change_kind(kind)
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
             || dquoted
+            || embedded_read
             || blind
             || a.tables
                 .iter()
@@ -898,6 +929,7 @@ impl EventBuilder {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
                 (None, true) => EventAction::Read,
+                (None, false) if embedded_read => EventAction::Read,
                 (None, false) => return None,
             },
         };
@@ -3030,6 +3062,83 @@ mod tests {
         expect_everywhere("UPDATE mysql.user SET a = 1 WHERE b = 2", |_| {
             "write [\"mysql.user\"]".to_owned()
         });
+    }
+
+    /// Re-review of 07b04d6, H1: reads inside a session `SET` or `DO`
+    /// (then `SELECT @x`) are reads of their tables, from any account,
+    /// never the agent's own; utility statements and the agent's session
+    /// settings are unchanged.
+    #[test]
+    fn reads_inside_session_sets_are_reported() {
+        for text in [
+            "SET @x = (SELECT GROUP_CONCAT(email) FROM hr.customers)",
+            "SET @x := (SELECT GROUP_CONCAT(email) FROM hr.customers)",
+            "SET @a = 1, @x = (SELECT email FROM hr.customers WHERE id = 1)",
+            "DO (SELECT COUNT(*) FROM hr.customers)",
+            "SET @x = CONCAT('a', (SELECT GROUP_CONCAT(email) FROM hr.customers))",
+            "SET STATEMENT max_statement_time = 1 FOR SET @x = (SELECT email FROM hr.customers LIMIT 1)",
+        ] {
+            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+        }
+        // A subquery inside a function call of a read names its table.
+        for (source, ev) in on_every_source(
+            "app",
+            "SELECT CONCAT((SELECT GROUP_CONCAT(email) FROM hr.customers))",
+        ) {
+            assert_eq!(
+                ev.as_ref().map(shown).as_deref(),
+                Some("read [\"hr.customers\"]"),
+                "{source:?}"
+            );
+        }
+        // Already a read (and the agent's own within its budget).
+        for (source, ev) in on_every_source("app", "SELECT email INTO @x FROM hr.customers LIMIT 1")
+        {
+            assert_eq!(
+                ev.as_ref().map(shown).as_deref(),
+                Some("read [\"hr.customers\"]"),
+                "{source:?}"
+            );
+        }
+        // No table, a system table only, or a utility statement: no event.
+        for text in [
+            "SELECT @x",
+            "SET @x = (SELECT 1)",
+            "SET @x = (SELECT COUNT(*) FROM performance_schema.threads)",
+            "SHOW CREATE TABLE hr.customers",
+            "SHOW COLUMNS FROM hr.customers",
+            "LOCK TABLES hr.customers READ",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "FLUSH TABLES hr.customers",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+        // `EXPLAIN ANALYZE` runs its statement.
+        for (source, ev) in on_every_source("app", "EXPLAIN ANALYZE SELECT a FROM hr.t WHERE b = 1")
+        {
+            assert!(ev.is_some(), "{source:?}");
+        }
+        // The agent's session settings and its MariaDB sample statements.
+        for text in [
+            crate::sql::session_setup(crate::conn::Flavor::Mariadb, 1000),
+            crate::sql::session_setup(crate::conn::Flavor::Mysql, 1000),
+            crate::sql::SESSION_READ_ONLY.to_owned(),
+            crate::sql::sample_statement(
+                crate::conn::Flavor::Mariadb,
+                1000,
+                "support",
+                "tickets",
+                &[("c", crate::sql::Sampled::Text)],
+                10,
+            )
+            .unwrap(),
+        ] {
+            for (source, ev) in on_every_source("databastion", &text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
     }
 
     #[test]

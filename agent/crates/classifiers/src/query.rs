@@ -69,6 +69,8 @@
 
 use std::fmt;
 
+use zeroize::Zeroizing;
+
 use crate::names;
 
 /// Largest statement text analyzed, in bytes. Longer text is not lexed.
@@ -277,7 +279,7 @@ fn lex_mysql_range(
                 let from = i + 1;
                 i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
                 // The content is only compared in place, never copied.
-                let audit_function = text
+                let audit_function = b
                     .get(from..i.saturating_sub(1))
                     .is_some_and(is_audit_function);
                 out.push(Tok::DQuoted { audit_function });
@@ -1175,10 +1177,7 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
             let prefix = std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or("");
             let mut a = analyze(prefix, opts.opaque(true));
             // MySQL: an audit function call anywhere in the bytes.
-            if opts.dialect == Dialect::Mysql
-                && !a.audit_function
-                && raw_audit_function(&String::from_utf8_lossy(raw))
-            {
+            if opts.dialect == Dialect::Mysql && !a.audit_function && raw_audit_function(raw) {
                 a.kind = most_reportable(a.kind, StatementKind::Ddl);
                 a.audit_function = true;
             }
@@ -1191,7 +1190,7 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
 /// an audit log administration function call ([`raw_audit_function`]).
 fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
     let mut a = QueryAnalysis::unparsed(kind);
-    if raw_audit_function(text) {
+    if raw_audit_function(text.as_bytes()) {
         a.kind = most_reportable(kind, StatementKind::Ddl);
         a.audit_function = true;
     }
@@ -1381,17 +1380,16 @@ fn has_qualified_call(s: &[Tok], kind: StatementKind) -> bool {
 /// `audit_log_read`, `audit_log_read_bookmark`, `audit_log_rotate`.
 /// MariaDB `server_audit` and the Percona `audit_log` plugin have no
 /// functions (system variables only).
-fn is_audit_function(name: &str) -> bool {
-    // Compared in place (no lowercased copy: `name` may be literal
-    // content).
-    let b = name.as_bytes();
-    let starts = |p: &[u8]| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p);
+fn is_audit_function(name: &[u8]) -> bool {
+    // Compared in place, on bytes (no copy: `name` may be literal
+    // content, and only ASCII names match).
+    let starts = |p: &[u8]| name.len() > p.len() && name[..p.len()].eq_ignore_ascii_case(p);
     starts(b"audit_log_filter_")
         || starts(b"audit_log_encryption_")
         || [
-            "audit_log_read",
-            "audit_log_read_bookmark",
-            "audit_log_rotate",
+            b"audit_log_read".as_slice(),
+            b"audit_log_read_bookmark",
+            b"audit_log_rotate",
         ]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -1402,7 +1400,7 @@ fn is_audit_function(name: &str) -> bool {
 /// tokens only: never in a literal or a comment.
 fn has_audit_function(s: &[Tok]) -> bool {
     s.windows(2).any(|w| {
-        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n))
+        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n.as_bytes()))
             || matches!(
                 w[0],
                 Tok::DQuoted {
@@ -1422,9 +1420,8 @@ fn has_audit_function(s: &[Tok]) -> bool {
 /// backtick, then whitespace, comments, ends of comments (`*/`) and
 /// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`.
 /// Compared in place: no copy of the text is made.
-fn raw_audit_function(text: &str) -> bool {
+fn raw_audit_function(b: &[u8]) -> bool {
     const NAME: &[u8] = b"audit_log_";
-    let b = text.as_bytes();
     let n = b.len();
     for start in 0..n.saturating_sub(NAME.len() - 1) {
         if !b[start..start + NAME.len()].eq_ignore_ascii_case(NAME) {
@@ -1434,7 +1431,7 @@ fn raw_audit_function(text: &str) -> bool {
         while j < n && is_my_ident_cont(b[j]) {
             j += 1;
         }
-        if !text.get(start..j).is_some_and(is_audit_function) {
+        if !is_audit_function(&b[start..j]) {
             continue;
         }
         if matches!(b.get(j), Some(b'"' | b'`')) {
@@ -1618,17 +1615,21 @@ const MAX_KIND_PREFIX_BYTES: usize = 4096;
 /// comments removed. Executable comments (`/*!…*/`, `/*M!…*/`) are kept
 /// as code when `versioned_as_code`, removed otherwise. Also returns
 /// whether the text was cut before its end.
-fn my_prefix_code(text: &str, versioned_as_code: bool) -> (String, bool) {
+fn my_prefix_code(text: &str, versioned_as_code: bool) -> (Zeroizing<String>, bool) {
     let b = text.as_bytes();
-    let n = b.len().min(MAX_KIND_PREFIX_BYTES);
-    let mut out: Vec<u8> = Vec::new();
+    let mut n = b.len().min(MAX_KIND_PREFIX_BYTES);
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    // Zeroized: it may hold code before a password literal's cut.
+    let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     let mut in_versioned = false;
     let mut i = 0;
     while i < n {
         let c = b[i];
         let next = b.get(i + 1).copied();
         match c {
-            b'\'' | b'"' | b'`' => return (String::from_utf8_lossy(&out).into_owned(), true),
+            b'\'' | b'"' | b'`' => return (prefix_string(out), true),
             b'#' => {
                 while i < n && b[i] != b'\n' {
                     i += 1;
@@ -1666,7 +1667,7 @@ fn my_prefix_code(text: &str, versioned_as_code: bool) -> (String, bool) {
                     }
                     _ => match find(&b[i + 2..n], b"*/") {
                         Some(k) => i += k + 4,
-                        None => return (String::from_utf8_lossy(&out).into_owned(), true),
+                        None => return (prefix_string(out), true),
                     },
                 }
                 out.push(b' ');
@@ -1677,7 +1678,19 @@ fn my_prefix_code(text: &str, versioned_as_code: bool) -> (String, bool) {
             }
         }
     }
-    (String::from_utf8_lossy(&out).into_owned(), n < b.len())
+    (prefix_string(out), n < b.len())
+}
+
+/// The bytes of [`my_prefix_code`] as a string, moved (not copied). They
+/// are whole characters of a `&str` (cut at ASCII bytes or a character
+/// boundary), so always UTF-8; anything else gives an empty string.
+fn prefix_string(mut out: Zeroizing<Vec<u8>>) -> Zeroizing<String> {
+    Zeroizing::new(
+        String::from_utf8(std::mem::take(&mut *out)).unwrap_or_else(|e| {
+            drop(Zeroizing::new(e.into_bytes()));
+            String::new()
+        }),
+    )
 }
 
 /// Kind of a MySQL text that did not lex (or is opaque): its code up to
@@ -2245,14 +2258,20 @@ fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
     let prev_word = |i: usize| word(i.checked_sub(1).and_then(|j| s.get(j)));
     let mut i = 0;
     while i < s.len() {
-        let in_call = frames.iter().any(|f| f.call);
+        // Inside a function call's parentheses (`EXTRACT(YEAR FROM d)`),
+        // unless a subquery opens there again: `CONCAT((SELECT … FROM t))`
+        // and `DO (SELECT … FROM t)` name `t`.
+        let in_call = frames.last().is_some_and(|f| f.call);
         match &s[i] {
             Tok::Punct(p) if p == "(" => {
-                let call = match i.checked_sub(1).and_then(|j| s.get(j)) {
-                    Some(Tok::Word(w)) => !opens_query(w),
-                    Some(Tok::Quoted(_)) => true,
-                    _ => false,
-                };
+                let subquery = matches!(word(s.get(i + 1)), Some("select" | "with"));
+                let call = !subquery
+                    && (in_call
+                        || match i.checked_sub(1).and_then(|j| s.get(j)) {
+                            Some(Tok::Word(w)) => !opens_query(w),
+                            Some(Tok::Quoted(_)) => true,
+                            _ => false,
+                        });
                 if frames.len() < MAX_DEPTH {
                     frames.push(Frame {
                         call,
@@ -3499,7 +3518,7 @@ mod tests {
             "x `audit_log_read` -- c\n (1)",
             "x \"audit_log_filter_set_user\" # c\n ('%')",
         ] {
-            assert!(raw_audit_function(t), "{t}");
+            assert!(raw_audit_function(t.as_bytes()), "{t}");
         }
         // No left boundary (fail closed), executable comments skipped.
         for t in [
@@ -3509,14 +3528,14 @@ mod tests {
             "x /*M!100000 audit_log_filter_flush */ /*!80000 (*/ )",
             "x audit_log_rotate /*!80000 */ ()",
         ] {
-            assert!(raw_audit_function(t), "{t}");
+            assert!(raw_audit_function(t.as_bytes()), "{t}");
         }
         for t in [
             "audit_log_rotate",
             "audit_log_rotated()",
             "audit_log_session_filter_id()",
         ] {
-            assert!(!raw_audit_function(t), "{t}");
+            assert!(!raw_audit_function(t.as_bytes()), "{t}");
         }
         let a = analyze_raw(
             "SELECT a FROM t WHERE x = '\u{e9}\\' AND audit_log_filter_remove_user('%')".as_bytes(),
@@ -3528,6 +3547,26 @@ mod tests {
         raw.push(b' ');
         let a = analyze_raw(&raw, AnalyzeOptions::mysql());
         assert!(a.audit_function() && a.kind() == StatementKind::Ddl);
+    }
+
+    /// Re-review of 07b04d6, H1: a subquery inside a call or `DO` names its
+    /// relations; `FROM` inside a call is not a table.
+    #[test]
+    fn subqueries_inside_calls_name_their_relations() {
+        assert_eq!(
+            my_rels("SELECT CONCAT('a', (SELECT GROUP_CONCAT(e) FROM hr.c))"),
+            vec![r(Some("hr"), "c")]
+        );
+        assert_eq!(
+            my_rels("DO (SELECT COUNT(*) FROM hr.c)"),
+            vec![r(Some("hr"), "c")]
+        );
+        assert_eq!(
+            my_rels("SET @x = (SELECT e FROM hr.c), @y := COALESCE((SELECT 1 FROM hr.d), 0)"),
+            vec![r(Some("hr"), "c"), r(Some("hr"), "d")]
+        );
+        assert!(my_rels("SELECT EXTRACT(YEAR FROM d), TRIM(LEADING 'x' FROM y)").is_empty());
+        assert!(my_rels("SELECT CONCAT(TRIM(x FROM y), SUBSTRING(z FROM 2))").is_empty());
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege

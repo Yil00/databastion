@@ -448,11 +448,17 @@ pub(crate) fn parse_json(record: &[u8]) -> Option<FileRecord> {
     // A client in a legacy character set writes bytes that are not UTF-8
     // into the statement: the structure is read from a lossy decoding and
     // the text is opaque (kind only), rather than the record dropped.
-    let (json, utf8) = match std::str::from_utf8(record) {
-        Ok(s) => (std::borrow::Cow::Borrowed(s), true),
-        Err(_) => (String::from_utf8_lossy(record), false),
+    // The lossy decoding is a full copy of the record, statement text
+    // included: zeroized when dropped.
+    let owned: Zeroizing<String>;
+    let (json, utf8): (&str, bool) = match std::str::from_utf8(record) {
+        Ok(s) => (s, true),
+        Err(_) => {
+            owned = Zeroizing::new(String::from_utf8_lossy(record).into_owned());
+            (owned.as_str(), false)
+        }
     };
-    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let mut parsed = if value.get("audit_record").is_some() {
         let line: LegacyLine = serde_json::from_value(value).ok()?;
         parse_legacy(line.audit_record)
