@@ -73,6 +73,10 @@ grep -qx 'SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register' "$u
   || fail "io_uring not denied by the unit"
 log "ok  no socket unit, no Listen*=, SocketBindDeny=any, bind / listen / accept / accept4 / io_uring denied"
 
+log "no core dumps"
+grep -qx 'LimitCORE=0' "$unit" || fail "the unit does not set LimitCORE=0"
+log "ok  LimitCORE=0"
+
 log "systemd-analyze verify"
 out="$(systemd-analyze verify "$unit" 2>&1)" || { echo "$out"; fail "systemd-analyze verify failed"; }
 [ -z "$out" ] || { echo "$out"; fail "systemd-analyze verify reported warnings"; }

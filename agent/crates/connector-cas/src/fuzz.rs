@@ -4,8 +4,8 @@
 //! Each function feeds arbitrary bytes to a parser of CAS data, which a
 //! hostile service definition author or a hostile end user (`who`,
 //! `userAgent`, the service URL in `what`) controls: the service
-//! definition visitor with the field naming and service index built on
-//! it, and the audit record visitor with the `what` reducer, the time
+//! definition visitor (JSON, and YAML behind its pre-scan) with the field
+//! naming and service index built on it, and the audit record visitor with the `what` reducer, the time
 //! parser and the event builder. They must never panic nor hang; results
 //! are dropped at once, nothing is logged.
 
@@ -28,6 +28,23 @@ pub fn registry(data: &[u8]) {
     for s in &d.values {
         let _ = field_name(&s.path);
         let _ = url::strip_credentials(&s.value);
+    }
+    let _ = object_name(&d);
+    let idx = ServiceIndex::new([&d]);
+    if let Some(h) = url::service_of("https://app.example.org/") {
+        let _ = idx.lookup(&h);
+    }
+}
+
+/// One YAML service definition file: pre-scanned, parsed when accepted,
+/// then named and indexed as [`registry`] does.
+pub fn registry_yaml(data: &[u8]) {
+    let _ = crate::parse::yaml::prescan(data);
+    let Ok(d) = definition::parse_yaml_definition(data) else {
+        return;
+    };
+    for s in &d.values {
+        let _ = field_name(&s.path);
     }
     let _ = object_name(&d);
     let idx = ServiceIndex::new([&d]);
@@ -82,8 +99,11 @@ mod tests {
             br#"{"action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": "https://[::1]:1/"}"#,
             br#"{"action": "SERVICE_TICKET_CREATED", "when": "2026-10-04T12:00:00Z", "what": {"service": "https://app.example.org/login", "ticketId": "ST-1-****-cas01"}}"#,
             br#"{"action": "SERVICE_TICKET_CREATED", "when": 1791115200000, "what": {"service": "https://a.example.org/", "service": "x"}}"#,
+            b"--- !<org.apereo.cas.services.CasRegisteredService>\nserviceId: \"(\"\nname: x\n",
+            b"--- !<org.apereo.cas.services.CasRegisteredService>\na: &a [*a]\n",
         ] {
             registry(input);
+            registry_yaml(input);
             audit_log(input);
         }
     }

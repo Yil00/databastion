@@ -37,6 +37,9 @@ Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=30s
 UMask=0077
+# No core dumps: the process holds database credentials and, while it parses, copies of sampled
+# values that some parsers free without wiping (the YAML parser's internal buffers).
+LimitCORE=0
 
 # Filesystem: everything read-only but the state directory (identity, HMAC key, spool, cursors).
 StateDirectory=databastion

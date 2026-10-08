@@ -847,7 +847,7 @@ targets:
     engine: cas
     cas:
       service_registry:
-        json_dir: /etc/cas/services        # JSON definitions (yaml_dir is refused for now)
+        json_dir: /etc/cas/services        # JSON definitions, or yaml_dir (YAML, pre-scanned)
       audit_log:
         path: /var/log/cas/cas_audit.log   # audit-format JSON, one record per line
         timezone: UTC                      # or ±HH:MM, for `when` without an offset

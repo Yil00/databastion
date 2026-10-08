@@ -1,0 +1,38 @@
+--- !<org.apereo.cas.services.OidcRegisteredService>
+# The OIDC relying party of HR-Portal-10000003.json, as CAS 8.0.2 writes
+# YAML (Jackson's YAMLFactory: class hints as verbatim tags).
+id: 10000003
+name: "HR-Portal"
+serviceId: "^https://user:hunter2-SECRET@hr.example.org/.*?token=abc#frag"
+evaluationOrder: 3
+clientId: "hr-portal"
+clientSecret: "fake-clear-secret-0000"
+description: "Owner jane.doe@example.org"
+jwks: "{\"keys\": [{\"d\": \"FAKE-PRIVATE\"}]}"
+contacts: !<java.util.ArrayList>
+- !<org.apereo.cas.services.DefaultRegisteredServiceContact>
+  name: "Jane Doe"
+  email: "jane.doe@example.org"
+  phone: "+33 6 12 34 56 78"
+- !<org.apereo.cas.services.DefaultRegisteredServiceContact>
+  name: John Roe
+  email: john.roe@example.org
+  department: R&D *core*
+properties: !<java.util.HashMap>
+  costCenter: !<org.apereo.cas.services.DefaultRegisteredServiceProperty>
+    values: !<java.util.HashSet>
+    - "CC-42"
+  apiPassword:
+    values: ["fake-property-secret"]
+attributeReleasePolicy: !<org.apereo.cas.services.ReturnStaticAttributeReleasePolicy>
+  allowedAttributes: !<java.util.LinkedHashMap>
+    employeeNumber: !<java.util.ArrayList>
+    - "E-1234"
+accessStrategy: !<org.apereo.cas.services.DefaultRegisteredServiceAccessStrategy>
+  requiredAttributes: !<java.util.HashMap>
+    memberOf: !<java.util.HashSet>
+    - "hr-staff"
+logoutType: "BACK_CHANNEL"
+signingKeyAlias: "fake-alias"
+accessTokenExpiration: "PT1H"
+enabled: true

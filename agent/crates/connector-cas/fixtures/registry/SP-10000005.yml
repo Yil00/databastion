@@ -1,0 +1,14 @@
+--- !<org.apereo.cas.support.saml.services.SamlRegisteredService>
+serviceId: '^https://sp\.example\.org/shibboleth'
+name: SP
+id: 10000005
+metadataLocation: "https://md.example.org/sp.xml?sig=FAKE-SIG"
+description: |
+  Contact: sam.sp@example.org
+  R&D *team*, 'quoted'
+signingCredentialFingerprint: FAKE-FINGERPRINT # never sampled
+contacts: !<java.util.ArrayList>
+- !<org.apereo.cas.services.DefaultRegisteredServiceContact>
+  name: "Sam Sp"
+  phone: "+44 20 7946 0958"
+  type: TECHNICAL

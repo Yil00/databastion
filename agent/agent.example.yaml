@@ -176,7 +176,9 @@ targets:
     engine: cas
     cas:
       service_registry:
-        # JSON service definitions, listed non-recursively (yaml_dir: not yet)
+        # JSON service definitions, listed non-recursively. Or yaml_dir: CAS
+        # YAML definitions (`--- !<class>`); a file with an anchor, an alias,
+        # a merge key or a tag other than a class hint is refused (counted).
         json_dir: /etc/cas/services
       audit_log:
         # cas.audit.engine.audit-format: JSON, one record per line (%m%n)

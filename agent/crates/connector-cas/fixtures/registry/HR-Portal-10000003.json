@@ -1,0 +1,33 @@
+{
+  "@class": "org.apereo.cas.services.OidcRegisteredService",
+  "id": 10000003,
+  "name": "HR-Portal",
+  "serviceId": "^https://user:hunter2-SECRET@hr.example.org/.*?token=abc#frag",
+  "evaluationOrder": 3,
+  "clientId": "hr-portal",
+  "clientSecret": "fake-clear-secret-0000",
+  "description": "Owner jane.doe@example.org",
+  "jwks": "{\"keys\": [{\"d\": \"FAKE-PRIVATE\"}]}",
+  "contacts": ["java.util.ArrayList", [
+    {"@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+     "name": "Jane Doe", "email": "jane.doe@example.org", "phone": "+33 6 12 34 56 78"},
+    {"@class": "org.apereo.cas.services.DefaultRegisteredServiceContact",
+     "name": "John Roe", "email": "john.roe@example.org", "department": "R&D *core*"}
+  ]],
+  "properties": {"@class": "java.util.HashMap",
+    "costCenter": {"@class": "org.apereo.cas.services.DefaultRegisteredServiceProperty",
+                   "values": ["java.util.HashSet", ["CC-42"]]},
+    "apiPassword": {"values": ["fake-property-secret"]}},
+  "attributeReleasePolicy": {
+    "@class": "org.apereo.cas.services.ReturnStaticAttributeReleasePolicy",
+    "allowedAttributes": {"@class": "java.util.LinkedHashMap",
+      "employeeNumber": ["java.util.ArrayList", ["E-1234"]]}},
+  "accessStrategy": {
+    "@class": "org.apereo.cas.services.DefaultRegisteredServiceAccessStrategy",
+    "requiredAttributes": {"@class": "java.util.HashMap",
+      "memberOf": ["java.util.HashSet", ["hr-staff"]]}},
+  "logoutType": "BACK_CHANNEL",
+  "signingKeyAlias": "fake-alias",
+  "accessTokenExpiration": "PT1H",
+  "enabled": true
+}
