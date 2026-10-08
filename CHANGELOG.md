@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🐛 Bug Fixes
+- Agent dependencies: `base64` 0.23.1 in `databastion-core` (agent secret bodies) and `connector-mongodb` (SCRAM), with the fuzz harness lockfile updated too (replaces Dependabot #174, which left `agent/fuzz/Cargo.lock` stale and failed the `--locked` fuzz and cargo-deny jobs). No code change was needed: the engines used (`STANDARD` with padding, `URL_SAFE_NO_PAD`), their alphabets and padding modes are unchanged, now pinned by fixed-vector tests; the agent still uses only the scalar `GeneralPurpose` engine. `base64` 0.22.1 stays in the graph for `reqwest`, `postgres-protocol` and `wiremock`. Its MSRV is 1.71, below the agent's 1.88
+
 ## [0.5.0](https://github.com/Yil00/databastion/compare/0.4.0...0.5.0) (2026-10-08)
 
 ### ⚠️ Upgrade notes

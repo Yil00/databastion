@@ -209,7 +209,7 @@ name = "databastion-connector-mongodb"
 version = "0.5.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "databastion-classifiers",
  "databastion-core",
  "getrandom 0.4.3",
@@ -250,7 +250,7 @@ name = "databastion-core"
 version = "0.5.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "databastion-classifiers",
  "databastion-protocol",

@@ -389,6 +389,20 @@ p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
             ),
             ("r=abcdefXYZ,s=,i=4096".to_owned(), ScramError::Malformed),
             ("r=abcdefXYZ,s=!!,i=4096".to_owned(), ScramError::Malformed),
+            // Standard alphabet with canonical padding only: an unpadded,
+            // URL-safe or over-padded salt is refused.
+            (
+                "r=abcdefXYZ,s=W22ZaJ0SNY7soEsUEjb6gQ,i=4096".to_owned(),
+                ScramError::Malformed,
+            ),
+            (
+                "r=abcdefXYZ,s=W22ZaJ0SNY7soEsUEjb6g-_=,i=4096".to_owned(),
+                ScramError::Malformed,
+            ),
+            (
+                "r=abcdefXYZ,s=W22ZaJ0SNY7soEsUEjb6gQ===,i=4096".to_owned(),
+                ScramError::Malformed,
+            ),
             (format!("r=abcdefXYZ,{s}"), ScramError::Malformed),
             (String::new(), ScramError::Malformed),
         ] {
