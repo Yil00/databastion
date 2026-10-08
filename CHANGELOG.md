@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### 🐛 Bug Fixes
+- Agent dependencies: `tokio` 1.53.2. The other updates of Dependabot #158 are left out: `syn` 3, `prettyplease` 0.3 and `schemars` 1 must move together with `typify` in `protocol-codegen` (Dependabot now ignores them on their own), and `base64` 0.23 changes its API (evaluated separately).
+
 ## [0.4.0](https://github.com/Yil00/databastion/compare/0.3.1...0.4.0) (2026-10-07)
 
 ### ⚠️ Upgrade notes
