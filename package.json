@@ -1,6 +1,6 @@
 {
   "name": "databastion",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Release tooling for the DataBastion repository (the console has its own package.json in console/).",
   "license": "Apache-2.0",
