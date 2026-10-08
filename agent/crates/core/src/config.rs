@@ -1641,6 +1641,12 @@ targets:
         assert_eq!(t.effective_port(), None);
         let s = t.cas_settings().unwrap();
         assert!(s.registry_dir.is_some());
+        assert_eq!(s.registry_format, cas::RegistryFormat::Json);
+        // A YAML registry is accepted since the pre-scanning reader landed.
+        let yaml = parse(&CAS.replace("        json_dir:", "        yaml_dir:")).unwrap();
+        let ys = yaml.targets[0].cas_settings().unwrap();
+        assert_eq!(ys.registry_format, cas::RegistryFormat::Yaml);
+        assert!(ys.registry_dir.is_some());
         let log = s.audit_log.as_ref().unwrap();
         assert_eq!(log.offset, cas::UtcOffset(7200));
         assert_eq!(s.client_addr, cas::ClientAddrMode::Truncated);
@@ -1687,7 +1693,7 @@ targets:
             ),
             (
                 "        json_dir: /etc/cas/services",
-                "        yaml_dir: /etc/cas/services",
+                "        yaml_dir: /var/lib/databastion/services",
                 "targets[0].cas.service_registry.yaml_dir",
             ),
             (

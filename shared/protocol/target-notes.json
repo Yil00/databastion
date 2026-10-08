@@ -375,11 +375,12 @@
     ]
   },
   "privilege.not_evaluated": {
-    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable).",
+    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable; on PostgreSQL, the CAS store guard's candidate relation or column list cut at its limit, a name not UTF-8, or its query failed).",
     "engines": [
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "postgres"
     ]
   },
   "privilege.other_roles": {

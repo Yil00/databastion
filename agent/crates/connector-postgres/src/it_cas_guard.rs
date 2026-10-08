@@ -300,7 +300,7 @@ async fn recreated_ticket_tables_and_cut_candidate_lists() {
     let not_evaluated = |h: &databastion_core::TargetHealth| {
         h.notes
             .iter()
-            .any(|n| n.code() == NoteCode::CheckStageFailed)
+            .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated)
     };
     assert!(!not_evaluated(&h), "{h:?}");
 

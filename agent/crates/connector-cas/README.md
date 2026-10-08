@@ -26,7 +26,7 @@ targets:
     engine: cas
     cas:
       service_registry:
-        json_dir: /etc/cas/services        # JSON only for now (yaml_dir is refused)
+        json_dir: /etc/cas/services        # or yaml_dir: YAML definitions (exclusive)
       audit_log:
         path: /var/log/cas/cas_audit.log   # audit-format: JSON, one record per line
         timezone: UTC                      # or a fixed offset ±HH:MM
@@ -53,13 +53,66 @@ refused as a whole, and those files are never opened.
 
 ## Service registry (Discovery)
 
-- The directory is listed non-recursively; each `.json` entry (at most 4096,
-  each at most 1 MiB) is opened with `openat(…, O_NOFOLLOW | O_NONBLOCK)` and
+- The directory is listed non-recursively; each `.json` entry (`json_dir`),
+  or `.yml` / `.yaml` entry (`yaml_dir`) (at most 4096, each at most 1 MiB) is opened with `openat(…, O_NOFOLLOW | O_NONBLOCK)` and
   checked on the descriptor (`fstat`): regular file, one hard link, not
   writable by the agent. Other entries are ignored; refused ones are counted.
 - A file is used only when its top-level object has an `@class` of a CAS
   registered service and a `serviceId`; anything else is skipped and none of
   its values is classified. JSON comments are not accepted.
+- **YAML** (`yaml_dir`, `src/parse/yaml.rs`): CAS 8.0.2 loads a YAML file
+  only when it starts with `--- !<class>` (`RegisteredServiceYamlSerializer`:
+  Jackson writes class hints as verbatim tags) and reads one document. The
+  agent requires the same start (after blank lines of spaces only, as CAS
+  trims the content; `---` at column 0), takes the class from that root
+  tag (a top-level `@class` next to it refuses the file), and **pre-scans
+  the raw bytes before any YAML parsing**, following libyaml's tokenizer:
+  the file is refused (skipped, counted) on an anchor (`&a`) or an alias
+  (`*a`) starting a token; a tag other than a verbatim Java class name
+  (`!<[A-Za-z_$][A-Za-z0-9_$.]*>`) placed after `:`, a block `-` or a flow
+  sequence `[` / `,` and not on a key; a scalar starting with `<<` (merge
+  key, quoted or not); a directive, a second `---` or a `...`; an explicit
+  (`?`), empty, multi-line or collection key; `@` or a backquote starting a
+  token; a tab outside quoted scalars, comments and block scalar content;
+  an indentation indicator on a block scalar; `:` followed by a non-blank
+  inside a flow collection; invalid UTF-8, control characters, a BOM, a
+  lone CR or a Unicode line break (`U+0085`, `U+2028`, `U+2029`); flow
+  collections nested deeper than 4, collections deeper than 32 (a lower
+  bound: indentless sequences are not counted; the visitor's depth 32 and
+  `serde_yaml_ng`'s recursion limit 128 are the backstops), more than
+  32 768 lines, or more than 196 608 tokens (scalars, flow collection
+  starts, `-` entries and `:` values: three per node the visitor allows),
+  since `serde_yaml_ng` loads every event before the visitor's bounds apply
+  (a 1 MiB `[a,a,…]` is refused before parsing). `&`, `*`, `!` and `#` inside quoted, plain and block
+  scalars and comments are text. The class hints are then blanked (replaced
+  by spaces, positions unchanged) in a zeroizing copy, which goes through
+  the same closed visitor and bounds as JSON with `serde_yaml_ng`: the YAML
+  parser never sees an anchor, an alias, a merge key nor a tag.
+- **Unquoted numbers (YAML)**: YAML resolves `phone: 33612345678` or a card
+  number to an integer; below the top level the visitor classifies it as
+  its decimal text (a leading `+`, a `0x` / `0o` prefix and `_` are lost;
+  a number with a leading zero stays a string). Floats are not classified.
+  JSON numbers are not classified (unchanged).
+- **YAML parser choice**: `serde_yaml_ng` 0.10, the maintained fork of the
+  deprecated `serde_yaml` (MIT / Apache-2.0), which the core already links
+  to read `agent.yaml`: no new crate in the agent binary (ADR-0041 decisions
+  4 and 13). It drives the closed serde visitor directly (no generic value
+  first) and refuses a stream of several documents. `serde_yml` was not
+  taken (unsound, unmaintained: RUSTSEC-2025-0068), nor `yaml-rust2` /
+  `saphyr` (new dependencies, and their event APIs would need a second
+  walker beside the serde visitor). Its scanner is `unsafe-libyaml` 0.2.11,
+  a machine translation of libyaml with `unsafe` code, archived by its
+  author (no advisory against 0.2.11; RUSTSEC-2023-0075 is fixed in it): the
+  pre-scan is what keeps hostile constructs away from it, and
+  `serde_yaml_ng` still bounds alias expansion and recursion on its own.
+  Moving the core and this crate together to a maintained fork
+  (`serde_norway`) or a safe parser is a separate decision.
+- **Zeroization gap (YAML)**: the file buffer, the blanked copy and every
+  kept value are zeroizing, as for JSON, but libyaml's internal buffers and
+  `serde_yaml_ng`'s event list hold copies of every scalar (the
+  `clientSecret` included) that are freed without being wiped. The JSON
+  path has the narrower gap of `serde_json`'s escape scratch buffer (ROADMAP
+  follow-up: move `definition.rs` to `jtext`).
 - Credential fields are never sampled: `clientSecret`, and every key whose
   name contains (case-insensitively) `secret`, `password`, `passwd`, `pass`,
   `pwd`, `key`, `token`, `credential`, `jwk`, `private`, `keystore`,
@@ -130,14 +183,33 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 
 - `AUTHENTICATION_SUCCESS` → `connect`, `AUTHENTICATION_FAILED` →
   `auth_failure`, `SERVICE_TICKET_CREATED` → `read` of the matching service,
-  `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`; other actions are
-  counted only.
+  `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED` (OAuth 2.0 / OIDC tokens issued by
+  the token endpoint, any grant) → `read` of `*` (CAS 8.0.2 writes no service
+  in that record), `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`;
+  other actions are counted only.
+- OAuth 2.0 / OIDC action names and `what` shapes were taken from the CAS
+  8.0.2 dev service (authorization code, implicit, `refresh_token`,
+  `client_credentials`, `password`): real records, token values redacted, in
+  [fixtures/cas-8.0.2-oauth-oidc-audit.jsonl](fixtures/cas-8.0.2-oauth-oidc-audit.jsonl)
+  (the client `scratch-m2m` and `https://m2m.example.org/cb` come from a
+  local-only service definition with every grant enabled, not from the dev
+  registry). An authorization code login writes `SERVICE_TICKET_CREATED`
+  (`service` = the redirect URI) and then the token response: two `read`
+  events. `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` (`who` `audit:unknown`),
+  `OIDC_ID_TOKEN_CREATED` (its `what` holds the ID token and the token
+  request's `Authorization` header, client secret included),
+  `OAUTH2_AUTHORIZATION_RESPONSE_CREATED` and `OAUTH2_USER_PROFILE_CREATED`
+  are counted only; their `what` is never read.
 - `what` (which can hold a ticket id, a live SSO bearer credential) is a
   string or, as CAS 8.0 writes it, an object such as
   `{"service": "https://…", "ticketId": "ST-1-…"}`: from an object only the
   string `service` is read, every other key (`ticketId`, `principal`,
   `credential`…) and nested value is skipped without being copied, and a
-  duplicate `service` drops the record. It is reduced
+  duplicate `service` drops the record. Kept keys and values are borrowed
+  from the line (held by the tailer in a zeroizing buffer) as raw JSON and
+  unescaped by the crate (`parse/jtext.rs`) into zeroizing buffers sized once,
+  so `serde_json`'s private scratch buffer, which is never wiped, receives no
+  string of the record. It is reduced
   to the service URL's scheme and host at parse time, used only to pick a
   registry entry, then dropped. Ticket ids are never kept, logged,
   fingerprinted nor reported. Only a literal `@` ends a userinfo there; an
@@ -170,11 +242,12 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   `EventPrincipal::many_accounts`: the core sends `db_user` `*` only for it,
   on a `cas_audit_log` `auth_failure` with the many-accounts signal.
 - Level: never Full; Partial with a successful authentication and a service
-  ticket in the last 24 h; Limited with one of them; None before any record.
+  ticket or token issuance (`OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`) in the
+  last 24 h; Limited with one of them; None before any record.
 
 ## Not done yet
 
-YAML registries, the OIDC / OAuth token issuance actions (names to verify
-against CAS 8.0), the CAS store guard in the other connectors (ticket
-registry metadata, `security.ticket_registry_unencrypted`), the CAS dev
-service and the end-to-end, I2 and load tests (P8-D).
+Subdirectories of the registry (CAS reads the JSON and YAML registries
+recursively, with one subdirectory per service type; the agent lists one
+level only), YAML anchors, aliases and merge keys (refused), and the records
+of the OAuth 2.0 device authorization grant (not exercised against CAS 8.0.2).

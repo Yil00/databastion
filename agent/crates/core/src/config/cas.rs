@@ -9,7 +9,7 @@
 //!     engine: cas
 //!     cas:
 //!       service_registry:
-//!         json_dir: /etc/cas/services
+//!         json_dir: /etc/cas/services   # or yaml_dir (exclusive)
 //!       audit_log:
 //!         path: /var/log/cas/cas_audit.log
 //!         timezone: UTC
@@ -152,11 +152,25 @@ pub struct AuditLogSettings {
     pub offset: UtcOffset,
 }
 
+/// Format of the service registry directory's definitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegistryFormat {
+    /// `json_dir`: `*.json` files, one definition each.
+    #[default]
+    Json,
+    /// `yaml_dir`: `*.yml` / `*.yaml` files, one definition each, read only
+    /// after a pre-scan that refuses anchors, aliases, merge keys and tags
+    /// other than CAS class hints (ADR-0041 decision 4, security review L8).
+    Yaml,
+}
+
 /// The validated `cas:` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasSettings {
-    /// JSON service registry directory.
+    /// Service registry directory (`json_dir` or `yaml_dir`).
     pub registry_dir: Option<ResolvedPath>,
+    /// Format of `registry_dir` (meaningless without it).
+    pub registry_format: RegistryFormat,
     /// JSON audit log.
     pub audit_log: Option<AuditLogSettings>,
     /// Principals sent in clear (exact names).
@@ -184,8 +198,8 @@ impl CasSettings {
     /// # Errors
     /// [`CasConfigError`] naming the offending key.
     pub fn validate(raw: RawCasSettings, agent_dirs: &[&Path]) -> Result<Self, CasConfigError> {
-        let registry_dir = match raw.service_registry {
-            None => None,
+        let (registry_dir, registry_format) = match raw.service_registry {
+            None => (None, RegistryFormat::Json),
             Some(r) => match (r.json_dir, r.yaml_dir) {
                 (Some(_), Some(_)) => {
                     return Err(invalid(
@@ -194,20 +208,19 @@ impl CasSettings {
                     ));
                 }
                 (None, None) => {
-                    return Err(invalid("service_registry", "json_dir is required"));
-                }
-                // TODO(P8-B follow-up): the YAML registry needs a reader
-                // that refuses anchors, aliases and merge keys before
-                // expansion (ADR-0041 decision 4, security review L8).
-                (None, Some(_)) => {
                     return Err(invalid(
-                        "service_registry.yaml_dir",
-                        "the YAML service registry is not supported yet; use json_dir",
+                        "service_registry",
+                        "one of json_dir and yaml_dir is required",
                     ));
                 }
-                (Some(dir), None) => {
-                    Some(checked_path(&dir, "service_registry.json_dir", agent_dirs)?)
-                }
+                (Some(dir), None) => (
+                    Some(checked_path(&dir, "service_registry.json_dir", agent_dirs)?),
+                    RegistryFormat::Json,
+                ),
+                (None, Some(dir)) => (
+                    Some(checked_path(&dir, "service_registry.yaml_dir", agent_dirs)?),
+                    RegistryFormat::Yaml,
+                ),
             },
         };
         let audit_log = match raw.audit_log {
@@ -255,6 +268,7 @@ impl CasSettings {
         }
         Ok(Self {
             registry_dir,
+            registry_format,
             audit_log,
             clear_principals: raw.clear_principals,
             client_addr: raw.client_addr,
@@ -390,6 +404,34 @@ mod tests {
     }
 
     #[test]
+    fn yaml_dir_selects_the_yaml_format() {
+        let dir = tmp();
+        let json = CasSettings::from_yaml(
+            &format!(
+                "{{service_registry: {{json_dir: {}/services}}}}",
+                dir.display()
+            ),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(json.registry_format, RegistryFormat::Json);
+        let yaml = CasSettings::from_yaml(
+            &format!(
+                "{{service_registry: {{yaml_dir: {}/services}}}}",
+                dir.display()
+            ),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(yaml.registry_format, RegistryFormat::Yaml);
+        assert_eq!(
+            yaml.registry_dir.unwrap().path(),
+            std::fs::canonicalize(&dir).unwrap().join("services")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn network_and_credential_keys_are_refused() {
         for extra in [
             "host: cas.example.org",
@@ -425,9 +467,10 @@ mod tests {
             "service_registry.json_dir"
         );
         assert_eq!(
-            e("{service_registry: {yaml_dir: /etc/cas/services}}").key,
+            e("{service_registry: {yaml_dir: /dev/shm}}").key,
             "service_registry.yaml_dir"
         );
+        assert_eq!(e("{service_registry: {}}").key, "service_registry");
         assert_eq!(
             e("{service_registry: {json_dir: /a, yaml_dir: /b}}").key,
             "service_registry"

@@ -511,7 +511,7 @@ uses a fresh cookie jar (no SSO reuse).
    nor SHA-256 / SHA-512 of a ticket, no typed name of a failed login, no password (typed or
    generated) in the same places (positive control: the copy of the ticket table holds tickets of the
    run); no generated secret in any log, CAS's included. Also by shape, as `oidc.sh` scans for JWTs:
-   no `(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)-<digits>-<8+ characters>` value in the same places,
+   no `(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR|SART|SATQ|STS)-<digits>-<8+ characters>` value in the same places (anywhere in the text, glued to other characters or percent-encoded with `%2D` too),
    which covers the tickets never seen on the wire (the ticket-granting tickets of the encrypted
    phase); positive control: the ids of the ticket table's copy. The pages' scans have their own
    controls (the events and incidents pages list `svc-monitoring`, the findings page names

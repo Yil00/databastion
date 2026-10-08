@@ -577,10 +577,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                     "CAS store guard privilege check failed"
                 );
                 // Not evaluated: never read as least privilege.
-                codes.add(
-                    TargetNote::new(NoteCode::CheckStageFailed)
-                        .with_labels([databastion_core::NoteLabel::stage("check")]),
-                );
+                codes.add(guard_not_evaluated_note());
             }
         }
         level = level.max(probe.level(log_readable));
@@ -900,9 +897,8 @@ pub(crate) async fn prerequisites_with(
 }
 
 /// The CAS store guard's privilege check of `database` was cut (PR #141
-/// review L2): reported as not evaluated (`check.stage_failed`, label
-/// `stage_check`: PostgreSQL has no `privilege.not_evaluated` code), never
-/// as least privilege.
+/// review L2): reported as not evaluated (`privilege.not_evaluated`, as on
+/// MySQL / MariaDB and MongoDB), never as least privilege.
 fn guard_not_evaluated(
     target: &TargetConfig,
     database: &str,
@@ -920,10 +916,14 @@ fn guard_not_evaluated(
          relations or columns, or a name not UTF-8)",
         normalize(database).as_str()
     ));
-    codes.add(
-        TargetNote::new(NoteCode::CheckStageFailed)
-            .with_labels([databastion_core::NoteLabel::stage("check")]),
-    );
+    codes.add(guard_not_evaluated_note());
+}
+
+/// The note of a CAS store guard privilege check that was cut or failed:
+/// `privilege.not_evaluated` (registered for `postgres`), as on MySQL /
+/// MariaDB and MongoDB.
+fn guard_not_evaluated_note() -> TargetNote {
+    TargetNote::new(NoteCode::PrivilegeNotEvaluated)
 }
 
 /// How many CAS ticket registry or audit trail relations of the session's
@@ -1406,6 +1406,16 @@ mod tests {
         );
         let (_, notes) = probe_notes(&AuditProbe::default(), false, false);
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn an_incomplete_cas_guard_is_privilege_not_evaluated() {
+        let note = guard_not_evaluated_note();
+        assert_registered(std::slice::from_ref(&note));
+        assert_eq!(
+            notes_json(&[note]),
+            serde_json::json!([{"code": "privilege.not_evaluated"}])
+        );
     }
 
     #[test]

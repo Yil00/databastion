@@ -1,5 +1,5 @@
-//! CAS service definitions (JSON), read through a closed, bounded serde
-//! visitor (ADR-0041 decision 4). Never through a generic
+//! CAS service definitions (JSON or YAML), read through a closed, bounded
+//! serde visitor (ADR-0041 decision 4). Never through a generic
 //! `serde_json::Value`: nodes are counted while deserializing (depth at
 //! most [`MAX_DEPTH`], at most [`MAX_NODES`] nodes and [`MAX_ARRAY_ITEMS`]
 //! array items per file), strings are cut to [`MAX_STRING_BYTES`] on a
@@ -26,6 +26,19 @@
 //! Comments are not accepted (whether CAS 8.0 still accepts them in JSON
 //! definitions is to verify, ADR-0041 decision 4): a file with comments
 //! does not parse and is skipped.
+//!
+//! **YAML** ([`parse_yaml_definition`]): the bytes are first pre-scanned
+//! ([`super::yaml::prescan`]: anchors, aliases, merge keys, tags other
+//! than CAS class hints, directives and second documents refused before
+//! any parsing), then the copy with its class hints blanked goes through
+//! the same visitor with `serde_yaml_ng`. The class is the root node's tag
+//! (`--- !<org.apereo.cas.…>`, what CAS 8.0.2 requires); a top-level
+//! `@class` key next to it refuses the document. YAML resolves unquoted
+//! digits to integers (`phone: 33612345678`, a card number): below the
+//! top level they are classified as their decimal text, which drops a
+//! leading `+`, a `0x` / `0o` prefix or `_` separators' meaning; a number
+//! with a leading zero stays a string. Floats are not classified. JSON
+//! numbers are never classified (unchanged).
 
 use std::fmt;
 
@@ -33,7 +46,10 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqA
 use zeroize::Zeroizing;
 
 use super::url::strip_credentials;
+use super::yaml::{self, Refusal};
 use super::{bounded_owned, is_java_type};
+
+pub use databastion_core::config::cas::RegistryFormat;
 
 /// Deepest nesting (the top-level object is depth 1).
 pub const MAX_DEPTH: usize = 32;
@@ -284,8 +300,57 @@ pub enum DefinitionError {
     NotDefinition,
     /// Not valid JSON, a duplicate top-level key, or trailing data.
     Malformed,
-    /// Beyond a structural bound (depth, nodes, array items).
+    /// Beyond a structural bound (depth, nodes, array items; for YAML
+    /// also lines and flow nesting).
     Bounds,
+    /// YAML outside the accepted subset (an anchor, an alias, a merge key,
+    /// a tag other than a class hint, a directive, a second document…),
+    /// refused by the pre-scan before any parsing.
+    Refused,
+}
+
+impl From<Refusal> for DefinitionError {
+    fn from(r: Refusal) -> Self {
+        match r {
+            Refusal::NotCas => Self::NotDefinition,
+            Refusal::Bounds => Self::Bounds,
+            Refusal::Encoding
+            | Refusal::Anchor
+            | Refusal::Alias
+            | Refusal::Tag
+            | Refusal::MergeKey
+            | Refusal::Directive
+            | Refusal::Documents
+            | Refusal::ComplexKey
+            | Refusal::Syntax => Self::Refused,
+        }
+    }
+}
+
+/// Parses one service definition file of a registry in `format`.
+///
+/// # Errors
+/// [`DefinitionError`]; nothing of a refused document is returned.
+pub fn parse_registry_file(
+    format: RegistryFormat,
+    bytes: &[u8],
+) -> Result<Definition, DefinitionError> {
+    match format {
+        RegistryFormat::Json => parse_definition(bytes),
+        RegistryFormat::Yaml => parse_yaml_definition(bytes),
+    }
+}
+
+/// Parses one YAML service definition file: pre-scanned, then read by the
+/// same visitor as JSON (see the module documentation).
+///
+/// # Errors
+/// [`DefinitionError`]; nothing of a refused document is returned.
+pub fn parse_yaml_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
+    let pre = yaml::prescan(bytes)?;
+    let de = serde_yaml_ng::Deserializer::from_slice(&pre.text);
+    // The by-value deserializer refuses a stream of several documents.
+    parse_with(de, Some(pre.class))
 }
 
 /// Parses one service definition file.
@@ -293,23 +358,43 @@ pub enum DefinitionError {
 /// # Errors
 /// [`DefinitionError`]; nothing of a refused document is returned.
 pub fn parse_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
-    let mut ctx = Ctx::default();
     let mut de = serde_json::Deserializer::from_slice(bytes);
-    let top = de.deserialize_any(TopVisitor { ctx: &mut ctx });
+    let top = parse_with(&mut de, None)?;
+    if de.end().is_err() {
+        return Err(DefinitionError::Malformed);
+    }
+    Ok(top)
+}
+
+/// The visitor over any deserializer; `root_class` is the class given
+/// outside the mapping (the YAML root tag), in which case an `@class` key
+/// refuses the document.
+fn parse_with<'de, D: Deserializer<'de>>(
+    de: D,
+    root_class: Option<String>,
+) -> Result<Definition, DefinitionError> {
+    let preset = root_class.is_some();
+    // YAML resolves unquoted digits to integers: on that path they are
+    // classified as their decimal text (JSON numbers stay unsampled).
+    let mut ctx = Ctx {
+        numbers_as_text: preset,
+        ..Ctx::default()
+    };
+    let top = de.deserialize_any(TopVisitor {
+        ctx: &mut ctx,
+        preset_class: preset,
+    });
     let top = match top {
         Ok(t) => t,
         Err(_) => {
             return Err(ctx.error.unwrap_or(DefinitionError::Malformed));
         }
     };
-    if de.end().is_err() {
-        return Err(DefinitionError::Malformed);
-    }
     let Top::Object(top) = top else {
         return Err(DefinitionError::NotDefinition);
     };
-    let service_type = top
-        .class
+    let class = if preset { root_class } else { top.class };
+    let service_type = class
         .as_deref()
         .and_then(ServiceType::from_class)
         .ok_or(DefinitionError::NotDefinition)?;
@@ -327,6 +412,8 @@ pub fn parse_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
 
 #[derive(Default)]
 struct Ctx {
+    /// Integers are sampled as their decimal text (YAML only).
+    numbers_as_text: bool,
     path: Vec<Seg>,
     depth: usize,
     nodes: usize,
@@ -364,6 +451,14 @@ impl Ctx {
             return Err(self.fail(DefinitionError::Bounds));
         }
         Ok(())
+    }
+
+    /// An integer node: sampled as text on the YAML path.
+    fn number(&mut self, text: impl FnOnce() -> String) {
+        if self.numbers_as_text {
+            let t = Zeroizing::new(text());
+            self.sample(&t);
+        }
     }
 
     fn sample(&mut self, s: &str) {
@@ -429,6 +524,8 @@ impl Visitor<'_> for KeySeed {
 
 struct TopVisitor<'a> {
     ctx: &'a mut Ctx,
+    /// The class came from outside the mapping: `@class` refuses.
+    preset_class: bool,
 }
 
 impl<'de> Visitor<'de> for TopVisitor<'_> {
@@ -440,6 +537,7 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Top, A::Error> {
         let ctx = self.ctx;
+        let preset_class = self.preset_class;
         ctx.node()?;
         ctx.enter()?;
         let mut top = TopFields::default();
@@ -461,6 +559,7 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
                 }
             }
             match name {
+                "@class" if preset_class => return Err(ctx.fail(DefinitionError::Malformed)),
                 "@class" => {
                     top.class = map.next_value::<MaybeStr>()?.0.map(|b| b.to_string());
                 }
@@ -517,6 +616,12 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<Top, E> {
         Ok(Top::Other)
     }
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<Top, E> {
+        Ok(Top::Other)
+    }
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<Top, E> {
+        Ok(Top::Other)
+    }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Top, E> {
         Ok(Top::Other)
     }
@@ -547,6 +652,12 @@ impl<'de> de::Deserialize<'de> for MaybeStr {
                 Ok(MaybeStr(None))
             }
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<MaybeStr, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_i128<E: de::Error>(self, _: i128) -> Result<MaybeStr, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_u128<E: de::Error>(self, _: u128) -> Result<MaybeStr, E> {
                 Ok(MaybeStr(None))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<MaybeStr, E> {
@@ -583,6 +694,12 @@ impl<'de> de::Deserialize<'de> for Number {
                 Ok(Number(Some(v)))
             }
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Number, E> {
+                Ok(Number(i64::try_from(v).ok()))
+            }
+            fn visit_i128<E: de::Error>(self, v: i128) -> Result<Number, E> {
+                Ok(Number(i64::try_from(v).ok()))
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<Number, E> {
                 Ok(Number(i64::try_from(v).ok()))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<Number, E> {
@@ -636,6 +753,12 @@ impl<'de> de::Deserialize<'de> for FormOf {
                 Ok(FormOf(SecretForm::Clear))
             }
             fn visit_u64<E: de::Error>(self, _: u64) -> Result<FormOf, E> {
+                Ok(FormOf(SecretForm::Clear))
+            }
+            fn visit_i128<E: de::Error>(self, _: i128) -> Result<FormOf, E> {
+                Ok(FormOf(SecretForm::Clear))
+            }
+            fn visit_u128<E: de::Error>(self, _: u128) -> Result<FormOf, E> {
                 Ok(FormOf(SecretForm::Clear))
             }
             fn visit_f64<E: de::Error>(self, _: f64) -> Result<FormOf, E> {
@@ -695,12 +818,26 @@ impl<'de> Visitor<'de> for Node<'_> {
         self.ctx.node()?;
         Ok(NodeKind::Other)
     }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<NodeKind, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<NodeKind, E> {
         self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
         Ok(NodeKind::Other)
     }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<NodeKind, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<NodeKind, E> {
         self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
+        Ok(NodeKind::Other)
+    }
+    // Integers beyond 64 bits (YAML: 20 digits or more; never from JSON
+    // without `arbitrary_precision`).
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<NodeKind, E> {
+        self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
+        Ok(NodeKind::Other)
+    }
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<NodeKind, E> {
+        self.ctx.node()?;
+        self.ctx.number(|| v.to_string());
         Ok(NodeKind::Other)
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<NodeKind, E> {
@@ -1097,5 +1234,166 @@ mod tests {
             .unwrap()
             .value;
         assert!(v.len() <= MAX_STRING_BYTES && v.chars().all(|c| c == 'é'));
+    }
+
+    /// The fixture pairs of `fixtures/registry/`: a JSON definition and the
+    /// same definition in CAS 8.0.2's YAML form.
+    const PAIRS: [(&str, &str); 3] = [
+        (
+            include_str!("../../fixtures/registry/HR-Portal-10000003.json"),
+            include_str!("../../fixtures/registry/HR-Portal-10000003.yml"),
+        ),
+        (
+            include_str!("../../fixtures/registry/Wiki-10000004.json"),
+            include_str!("../../fixtures/registry/Wiki-10000004.yaml"),
+        ),
+        (
+            include_str!("../../fixtures/registry/SP-10000005.json"),
+            include_str!("../../fixtures/registry/SP-10000005.yml"),
+        ),
+    ];
+
+    #[test]
+    fn yaml_definitions_reduce_like_their_json_equivalents() {
+        for (json, yaml) in PAIRS {
+            let j = parse_definition(json.as_bytes()).unwrap();
+            let y = parse_registry_file(RegistryFormat::Yaml, yaml.as_bytes()).unwrap();
+            assert_eq!(j.service_type, y.service_type);
+            assert_eq!(j.id, y.id);
+            assert_eq!(j.evaluation_order, y.evaluation_order);
+            assert_eq!(j.name, y.name);
+            assert_eq!(j.service_id, y.service_id);
+            assert_eq!(j.client_secret, y.client_secret);
+            assert!(!j.values.is_empty());
+            assert_eq!(paths(&j), paths(&y), "{yaml}");
+        }
+        let y = parse_yaml_definition(PAIRS[0].1.as_bytes()).unwrap();
+        assert_eq!(y.service_type, ServiceType::Oidc);
+        assert_eq!(y.client_secret, SecretForm::Clear);
+        let kept = format!("{:?} {y:?}", paths(&y));
+        for bad in [
+            "fake-clear-secret",
+            "FAKE-PRIVATE",
+            "hunter2",
+            "fake-property",
+            "fake-alias",
+            "token=",
+            "BACK_CHANNEL",
+            "java.util",
+            "org.apereo",
+        ] {
+            assert!(!kept.contains(bad), "{bad} in {kept}");
+        }
+        let saml = parse_yaml_definition(PAIRS[2].1.as_bytes()).unwrap();
+        let kept = format!("{:?}", paths(&saml));
+        assert!(!kept.contains("FAKE-"), "{kept}");
+        assert!(kept.contains("R&D *team*"), "{kept}");
+    }
+
+    const YAML_HEAD: &str = "--- !<org.apereo.cas.services.OidcRegisteredService>\n\
+                             serviceId: \"^https://app.example.org/.*\"\nname: App\n";
+
+    fn yaml(body: &str) -> Result<Definition, DefinitionError> {
+        parse_yaml_definition(format!("{YAML_HEAD}{body}").as_bytes())
+    }
+
+    #[test]
+    fn hostile_yaml_is_refused_before_parsing() {
+        // Billion laughs: every alias level would multiply the nodes.
+        let mut laughs = String::from("a0: &a0 [\"lol\", \"lol\", \"lol\", \"lol\", \"lol\"]\n");
+        for i in 1..10 {
+            let p = i - 1;
+            laughs.push_str(&format!(
+                "a{i}: &a{i} [*a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}]\n"
+            ));
+        }
+        assert_eq!(yaml(&laughs).unwrap_err(), DefinitionError::Refused);
+        // Deep nesting bombs, block and flow.
+        let mut deep = String::new();
+        for i in 0..200 {
+            deep.push_str(&" ".repeat(i));
+            deep.push_str("k:\n");
+        }
+        assert_eq!(yaml(&deep).unwrap_err(), DefinitionError::Bounds);
+        let flow = format!("a: {}{}\n", "[".repeat(10_000), "]".repeat(10_000));
+        assert_eq!(yaml(&flow).unwrap_err(), DefinitionError::Bounds);
+        let seqs = format!("a:\n{}x\n", "- ".repeat(10_000));
+        assert_eq!(yaml(&seqs).unwrap_err(), DefinitionError::Bounds);
+        for body in [
+            "description: !!python/object/apply:os.system [\"id\"]\n",
+            "description: !!str x\n",
+            "description: !local x\n",
+            "description: !<tag:yaml.org,2002:str> x\n",
+            "base: &b {email: jane.doe@example.org}\nother:\n  <<: *b\n",
+            "other:\n  <<: {email: jane.doe@example.org}\n",
+            "description: x\n---\nname: B\n",
+            "description: x\n...\n",
+        ] {
+            assert_eq!(yaml(body).unwrap_err(), DefinitionError::Refused, "{body}");
+        }
+        // Not what CAS loads: no class hint at the start.
+        for doc in [
+            "serviceId: x\n",
+            "{\"@class\": \"org.apereo.cas.services.CasRegisteredService\", \"serviceId\": \"x\"}",
+            "--- !<com.example.Evil>\nserviceId: x\n",
+            "",
+        ] {
+            assert_eq!(
+                parse_yaml_definition(doc.as_bytes()).unwrap_err(),
+                DefinitionError::NotDefinition,
+                "{doc}"
+            );
+        }
+        // An `@class` key next to the class hint, a duplicate kept key.
+        assert_eq!(
+            yaml("\"@class\": org.apereo.cas.services.CasRegisteredService\n").unwrap_err(),
+            DefinitionError::Malformed
+        );
+        assert_eq!(yaml("name: B\n").unwrap_err(), DefinitionError::Malformed);
+        // Syntax errors found by the parser.
+        assert_eq!(yaml("a: b: c\n").unwrap_err(), DefinitionError::Refused);
+        assert_eq!(
+            yaml("a: \"x\" y\n").unwrap_err(),
+            DefinitionError::Malformed
+        );
+        // The visitor's own bounds still apply.
+        let items = vec!["1"; MAX_ARRAY_ITEMS + 1].join(", ");
+        assert_eq!(
+            yaml(&format!("a: [{items}]\n")).unwrap_err(),
+            DefinitionError::Bounds
+        );
+        assert!(yaml("a: [1, 2]\nclientSecret: ${S}\n").is_ok());
+    }
+
+    #[test]
+    fn unquoted_yaml_numbers_are_classified_as_text() {
+        let json = r#"{"@class": "org.apereo.cas.services.CasRegisteredService",
+          "serviceId": "^https://app.example.org/.*", "name": "App",
+          "contacts": [{"name": "Jane Doe", "phone": "0612345678", "mobile": "33612345678"}],
+          "properties": {"card": {"values": ["4111111111111111"]},
+                         "iban": {"values": ["12345678901234567890123"]}}}"#;
+        let yaml = "--- !<org.apereo.cas.services.CasRegisteredService>\n\
+                    serviceId: \"^https://app.example.org/.*\"\nname: App\n\
+                    contacts:\n- name: Jane Doe\n  phone: 0612345678\n  mobile: 33612345678\n\
+                    properties:\n  card:\n    values: [4111111111111111]\n\
+                    \x20 iban:\n    values:\n    - 12345678901234567890123\n";
+        let j = parse_definition(json.as_bytes()).unwrap();
+        let y = parse_yaml_definition(yaml.as_bytes()).unwrap();
+        assert_eq!(paths(&j), paths(&y));
+        assert!(paths(&y).iter().any(|(_, v)| v == "4111111111111111"));
+        // JSON numbers are still not sampled; top-level `id` never is.
+        let j = parse_definition(
+            br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "serviceId": "x",
+                 "id": 4111111111111111, "phone": 33612345678}"#,
+        )
+        .unwrap();
+        assert_eq!(paths(&j), [("[serviceId]".to_owned(), "x".to_owned())]);
+        let y = parse_yaml_definition(
+            b"--- !<org.apereo.cas.services.CasRegisteredService>\nserviceId: x\n\
+              id: 4111111111111111\nevaluationOrder: 3\nratio: 1.5\n",
+        )
+        .unwrap();
+        assert_eq!(y.id, Some(4_111_111_111_111_111));
+        assert_eq!(paths(&y), [("[serviceId]".to_owned(), "x".to_owned())]);
     }
 }

@@ -33,12 +33,24 @@ export const POLICY_JOB_BUDGET_MS = 50_000;
  */
 export const PGBOSS_SCHEMA = "pgboss";
 
+/**
+ * `registerInstance` (pg-boss >= 12.36, schema 44): each instance upserts a row in
+ * `pgboss.instance` every 30 s (host name, pid, pg-boss and Node versions, `application_name`,
+ * pool counters, CPU / memory / event-loop figures, queue names and work options, and an
+ * allow-list of constructor options). The allow-list excludes `connectionString`, `password`,
+ * `db` and every option not named in it, and worker errors are stored as a time only, never as a
+ * message: no credential nor job data reaches the table. Kept on, explicitly, for the two
+ * long-lived instances (worker, web sender); no short-lived process (migrate, CLI) creates a
+ * pg-boss instance. `application_name` is always set here, so pg-boss never renames the pools
+ * `pgboss:<id>`.
+ */
 export function pgBossOptions(connectionString: string) {
   return {
     connectionString,
     application_name: "databastion-worker",
     schema: PGBOSS_SCHEMA,
     createSchema: false,
+    registerInstance: true,
   };
 }
 

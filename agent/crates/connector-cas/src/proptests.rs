@@ -335,6 +335,60 @@ proptest! {
         prop_assert!(!dbg.contains("evil"));
     }
 
+    /// The object-form `what` with every kind of `service` value and
+    /// duplicate `service` keys (escaped or not, among random other keys):
+    /// a string names its host, any other JSON type names no service (the
+    /// record is kept), and a second `service` key drops the record.
+    #[test]
+    fn object_what_service_kinds_and_duplicates(
+        ticket in marker(),
+        services in proptest::collection::vec((0u8..8, any::<bool>()), 0..4),
+        extra in proptest::collection::vec("[a-zA-Z]{1,12}", 0..4),
+        action in prop::sample::select(vec![
+            "SERVICE_TICKET_CREATED", "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+        ]),
+    ) {
+        // Kind 0 is a string (the only one naming a service); the others
+        // are `null`, a number, a boolean, an array, an object, an empty
+        // string and a string that is no URL.
+        let value = |kind: u8| match kind {
+            0 => lit(&format!("https://app.example.org/{ticket}?ticket=ST-1-{ticket}")),
+            1 => "null".to_owned(),
+            2 => "3".to_owned(),
+            3 => "true".to_owned(),
+            4 => format!("[{}]", lit("https://evil.example.net/")),
+            5 => format!("{{\"service\": {}, \"id\": {}}}", lit("https://evil.example.net/"), lit(&ticket)),
+            6 => lit(""),
+            _ => lit(&format!("ST-1-{ticket}")),
+        };
+        let mut fields: Vec<String> = extra
+            .iter()
+            .filter(|k| k.as_str() != "service")
+            .map(|k| format!("{}: {}", lit(k), lit(&format!("TGT-1-{ticket}"))))
+            .collect();
+        for (i, (kind, escaped)) in services.iter().enumerate() {
+            let key = if *escaped { r#""serv\u0069ce""# } else { r#""service""# };
+            fields.insert(i.min(fields.len()), format!("{key}: {}", value(*kind)));
+        }
+        let line = format!(
+            r#"{{"who": "jdoe", "what": {{{}}}, "action": "{action}", "when": 1791115200000}}"#,
+            fields.join(", ")
+        );
+        let r = parse_record(line.as_bytes(), UtcOffset(0));
+        match services.as_slice() {
+            [] => prop_assert!(r.unwrap().service.is_none()),
+            [(kind, _)] => {
+                let r = r.unwrap();
+                let host = r.service.as_ref().map(crate::parse::url::ServiceHost::as_url);
+                let expected = (*kind == 0).then(|| "https://app.example.org/".to_owned());
+                prop_assert_eq!(host, expected);
+                let dbg = format!("{r:?}");
+                prop_assert!(!dbg.contains(&ticket));
+            }
+            _ => prop_assert_eq!(r.err(), Some(crate::parse::record::RecordError::Invalid)),
+        }
+    }
+
     #[test]
     fn only_closed_facts_reach_events(
         who in marker(),
@@ -450,5 +504,317 @@ proptest! {
                 prop_assert!(databastion_classifiers::masking::masked_sample_conforms(s.as_str()));
             }
         }
+    }
+}
+
+/// A YAML node of the generated documents (the pre-scanner's properties).
+#[derive(Clone, Debug)]
+enum Y {
+    Plain(String),
+    Single(String),
+    Double(String),
+    Block(Vec<String>),
+    Flow(Vec<String>),
+    Map(Vec<(String, Y)>),
+    Seq(Vec<Y>),
+}
+
+/// What to put at the chosen node position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inject {
+    Nothing,
+    Anchor,
+    Alias,
+}
+
+/// Renders a document: the CAS class hint, then the root mapping. Node
+/// positions (keys, values, sequence items, flow items) are numbered in
+/// order; the one numbered `at` gets `inject`.
+struct Render {
+    out: String,
+    n: usize,
+    at: usize,
+    inject: Inject,
+}
+
+impl Render {
+    /// The property before a node (` &a`), or whether to replace it by an
+    /// alias.
+    fn position(&mut self) -> (String, bool) {
+        let here = self.n == self.at;
+        self.n += 1;
+        match (here, self.inject) {
+            (true, Inject::Anchor) => (" &a1".to_owned(), false),
+            (true, Inject::Alias) => (String::new(), true),
+            _ => (String::new(), false),
+        }
+    }
+
+    fn doc(entries: &[(String, Y)], at: usize, inject: Inject) -> (String, usize) {
+        let mut r = Self {
+            out: "--- !<org.apereo.cas.services.CasRegisteredService>\n# &c *c\n".to_owned(),
+            n: 0,
+            at,
+            inject,
+        };
+        r.map(entries, 0);
+        (r.out, r.n)
+    }
+
+    fn map(&mut self, entries: &[(String, Y)], indent: usize) {
+        let sp = " ".repeat(indent);
+        for (k, v) in entries {
+            let (prop, alias) = self.position();
+            if alias {
+                self.out.push_str(&format!("{sp}*a1 :"));
+            } else {
+                self.out.push_str(&format!(
+                    "{sp}{}{k}:",
+                    prop.trim_start().to_owned() + if prop.is_empty() { "" } else { " " }
+                ));
+            }
+            self.value(v, indent);
+        }
+    }
+
+    /// A value after `key:` or `-` (the parent's column is `indent`).
+    fn value(&mut self, v: &Y, indent: usize) {
+        let (prop, alias) = self.position();
+        if alias {
+            self.out.push_str(" *a1\n");
+            return;
+        }
+        self.out.push_str(&prop);
+        let sp = " ".repeat(indent + 2);
+        match v {
+            Y::Plain(s) => self.out.push_str(&format!(" {s} # &c\n")),
+            Y::Single(s) => self
+                .out
+                .push_str(&format!(" '{}'\n", s.replace('\'', "''"))),
+            Y::Double(s) => self.out.push_str(&format!(
+                " \"{}\"\n",
+                s.replace('\\', "\\\\").replace('"', "\\\"")
+            )),
+            Y::Block(lines) => {
+                self.out.push_str(" |\n");
+                for l in lines {
+                    self.out.push_str(&format!("{sp}{l}\n"));
+                }
+            }
+            Y::Flow(items) => {
+                let mut parts = Vec::new();
+                for i in items {
+                    let (p, a) = self.position();
+                    parts.push(if a {
+                        "*a1".to_owned()
+                    } else {
+                        format!(
+                            "{}{i}",
+                            p.trim_start().to_owned() + if p.is_empty() { "" } else { " " }
+                        )
+                    });
+                }
+                self.out.push_str(&format!(" [{}]\n", parts.join(", ")));
+            }
+            Y::Map(entries) => {
+                self.out.push('\n');
+                self.map(entries, indent + 2);
+            }
+            Y::Seq(items) => {
+                self.out.push('\n');
+                for i in items {
+                    self.out.push_str(&format!("{sp}-"));
+                    self.value(i, indent + 2);
+                }
+            }
+        }
+    }
+}
+
+fn yaml_node() -> impl Strategy<Value = Y> {
+    // Scalars hold the characters the pre-scanner must read as text.
+    let plain = "[a-z][a-z0-9&*!'\"@./-]{0,6}( [a-z&*!'][a-z0-9&*!'\"@./-]{0,6}){0,2}";
+    let quoted = "[a-z &*!#:,'\"\\[\\]{}<>%@-]{0,16}";
+    let line = "[a-z&*!#'\"%@<-][a-z &*!#:'\"%@<>-]{0,12}";
+    let flow_item = "[a-z][a-z0-9&*!.]{0,6}( [a-z&*!][a-z0-9&*!.]{0,4})?";
+    let leaf = prop_oneof![
+        plain.prop_map(Y::Plain),
+        // A scalar starting with `<<` is refused as a merge key, quoted
+        // or not (conservative).
+        quoted.prop_map(|s| Y::Single(format!("x{s}"))),
+        quoted.prop_map(|s| Y::Double(format!("x{s}"))),
+        proptest::collection::vec(line, 1..4).prop_map(Y::Block),
+        proptest::collection::vec(flow_item, 0..4).prop_map(Y::Flow),
+    ];
+    leaf.prop_recursive(4, 24, 4, |inner| {
+        prop_oneof![
+            proptest::collection::vec(("k[a-z0-9]{0,5}", inner.clone()), 1..4).prop_map(Y::Map),
+            proptest::collection::vec(inner, 1..4).prop_map(Y::Seq),
+        ]
+    })
+}
+
+fn yaml_doc() -> impl Strategy<Value = Vec<(String, Y)>> {
+    proptest::collection::vec(("k[a-z0-9]{0,5}", yaml_node()), 1..5)
+}
+
+/// YAML-ish fragments, concatenated into hostile inputs.
+fn yaml_ish() -> impl Strategy<Value = Vec<u8>> {
+    let frags = prop::sample::select(vec![
+        "--- !<a.B>\n",
+        "\n",
+        " ",
+        "  ",
+        "- ",
+        ": ",
+        ":",
+        "? ",
+        "&a",
+        "*a",
+        "!<x.Y>",
+        "!<x.Y> ",
+        "!!str ",
+        "!",
+        "<<",
+        "'",
+        "''",
+        "\"",
+        "\\",
+        "\\\"",
+        "#",
+        " #",
+        "|",
+        "|-",
+        ">",
+        "[",
+        "]",
+        "{",
+        "}",
+        ",",
+        "a",
+        "key",
+        "%",
+        "...",
+        "---",
+        "\t",
+        "\r\n",
+        "\r",
+        "é",
+        "\u{2028}",
+        "@",
+        "`",
+        "1",
+    ]);
+    proptest::collection::vec(frags, 0..64).prop_map(|v| v.concat().into_bytes())
+}
+
+proptest! {
+    #![proptest_config(config(512))]
+
+    /// Random YAML-ish inputs, with or without the class hint, never panic.
+    #[test]
+    fn yaml_prescan_and_parse_never_panic(data in yaml_ish(), head in any::<bool>()) {
+        let mut bytes = if head {
+            b"--- !<org.apereo.cas.services.CasRegisteredService>\n".to_vec()
+        } else {
+            Vec::new()
+        };
+        bytes.extend_from_slice(&data);
+        let _ = crate::parse::yaml::prescan(&bytes);
+        let _ = crate::parse::definition::parse_yaml_definition(&bytes);
+    }
+
+    #[test]
+    fn mutated_yaml_definitions_never_panic(
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>(), any::<u8>()), 0..8),
+    ) {
+        let base = include_str!("../fixtures/registry/HR-Portal-10000003.yml");
+        let bytes = mutate(base.as_bytes().to_vec(), &edits);
+        let _ = crate::parse::definition::parse_yaml_definition(&bytes);
+    }
+
+    /// Generated documents are accepted (their `&`, `*`, `!`, `#` and
+    /// quotes are text) and parse; the same document with an anchor or an
+    /// alias at any node position is refused for it.
+    #[test]
+    fn anchors_and_aliases_in_node_position_are_always_refused(
+        doc in yaml_doc(),
+        at in any::<usize>(),
+        alias in any::<bool>(),
+    ) {
+        use crate::parse::yaml::{Refusal, prescan};
+        let (clean, positions) = Render::doc(&doc, usize::MAX, Inject::Nothing);
+        let pre = prescan(clean.as_bytes());
+        prop_assert!(pre.is_ok(), "{:?} for\n{}", pre.err(), clean);
+        let parsed: Result<serde::de::IgnoredAny, _> =
+            serde_yaml_ng::from_slice(&pre.unwrap().text);
+        prop_assert!(parsed.is_ok(), "{:?} for\n{}", parsed.err(), clean);
+        let inject = if alias { Inject::Alias } else { Inject::Anchor };
+        let (hostile, _) = Render::doc(&doc, at % positions, inject);
+        let want = if alias { Refusal::Alias } else { Refusal::Anchor };
+        prop_assert_eq!(prescan(hostile.as_bytes()).err(), Some(want), "{}", hostile);
+    }
+}
+
+/// The YAML form of [`definition`] (class hints as CAS 8.0.2 writes them).
+fn yaml_definition(secret: &str, cred_key: &str, value: &str, user: &str) -> String {
+    format!(
+        "--- !<org.apereo.cas.services.OidcRegisteredService>\n\
+         serviceId: {sid}\nname: App\nclientSecret: {secret}\ndescription: {value}\n\
+         properties: !<java.util.HashMap>\n  {cred_key}:\n    values: [{secret}]\n\
+         nested:\n  {cred_key}:\n  - {secret}\n  - x: {secret}\n\
+         logoutUrl: {logout}\n",
+        sid = lit(&format!(
+            "^https://{user}:{user}@app.example.org/.*?t={user}#{user}"
+        )),
+        secret = lit(secret),
+        cred_key = lit(cred_key),
+        value = lit(value),
+        logout = lit(&format!("https://app.example.org/logout?token={user}")),
+    )
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    #[test]
+    fn yaml_credentials_never_reach_sampled_values(
+        secret in marker(),
+        user in marker(),
+        word in prop::sample::select(vec![
+            "secret", "PASSWORD", "passwd", "Key", "token", "credential", "jwk", "private", "keystore",
+        ]),
+        prefix in "[a-z]{0,6}",
+        value in "[ -~]{0,40}",
+    ) {
+        use crate::parse::definition::{SecretForm, parse_yaml_definition};
+        let cred_key = format!("{prefix}{word}X");
+        let doc = yaml_definition(&secret, &cred_key, &value, &user);
+        let d = match parse_yaml_definition(doc.as_bytes()) {
+            Ok(d) => d,
+            // JSON string literals are valid YAML double-quoted scalars,
+            // but a value starting with `<<` is refused (merge key).
+            Err(e) => {
+                prop_assert!(value.starts_with("<<"), "{:?} for\n{}", e, doc);
+                return Ok(());
+            }
+        };
+        prop_assert_eq!(d.client_secret, SecretForm::Clear);
+        for s in &d.values {
+            prop_assert!(!s.value.contains(&secret));
+            prop_assert!(!s.value.contains(&user));
+            prop_assert!(!s.path.iter().any(|p| matches!(p, Seg::Key(k) if k == &cred_key)));
+        }
+        let dbg = format!("{d:?}");
+        prop_assert!(!dbg.contains(&secret) && !dbg.contains(&user));
+        let json = parse_definition(definition(&secret, &cred_key, &value, &user).as_bytes()).unwrap();
+        let pairs = |d: &crate::parse::definition::Definition| {
+            let mut v: Vec<(String, String)> = d.values.iter()
+                .map(|s| (format!("{:?}", s.path), s.value.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        prop_assert_eq!(pairs(&d), pairs(&json));
     }
 }

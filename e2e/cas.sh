@@ -1028,12 +1028,23 @@ fi
 # seen on the wire (the ticket-granting tickets of the encrypted phase), in the console database, the
 # exports, the pages, the agent's state and the non-CAS logs. Positive control: the ids of the copy
 # of the ticket table (clear tickets of the run).
-TICKET_SHAPE='\b(TGT|ST|PT|PGT|PGTIOU|OC|AT|RT|CT|TST)-[0-9]+-[A-Za-z0-9._-]{8,}'
+# Unanchored, as the agent's tripwire (`contains_named`): a ticket glued to other text
+# (`x_ST-1-…`, `%3DST-1-…`) counts too. A second pattern finds percent-encoded ones (`ST%2D1%2D…`).
+TICKET_SHAPE='(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR|SART|SATQ|STS)-[0-9]+-[A-Za-z0-9._-]{8,}'
+TICKET_SHAPE_PCT='(TGT|ST|PT|PGT|PGTIOU|TST|OC|AT|RT|ODT|ODUC|CIBA|OPAR|SART|SATQ|STS)%2[Dd][0-9]+%2[Dd][A-Za-z0-9._%-]{8,}'
 LC_ALL=C grep -qE "$TICKET_SHAPE" "$E2E_WORK_DIR/tickets-control.txt" \
   || fail "ticket-shape scan positive control: no ticket shape in the copy of cas_tickets"
-shaped="$(LC_ALL=C grep -rlE "$TICKET_SHAPE" -- "$D" "$E2E_WORK_DIR/scan-logs" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ' || true)"
+sed 's/-/%2D/g' "$E2E_WORK_DIR/tickets-control.txt" > "$E2E_WORK_DIR/tickets-control-pct.txt"
+LC_ALL=C grep -qE "$TICKET_SHAPE_PCT" "$E2E_WORK_DIR/tickets-control-pct.txt" \
+  || fail "ticket-shape scan positive control: no percent-encoded ticket shape in the encoded copy"
+rm -f -- "$E2E_WORK_DIR/tickets-control-pct.txt"
+shaped="$(LC_ALL=C grep -rlE -e "$TICKET_SHAPE" -e "$TICKET_SHAPE_PCT" -- "$D" "$E2E_WORK_DIR/scan-logs" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ' || true)"
 if [ -n "$shaped" ]; then
   log "LEAK: ticket-shaped value(s) in: $shaped"
+  # Triage without printing the value: file, line and matched prefix only.
+  LC_ALL=C grep -rHnoE -e "$TICKET_SHAPE" -e "$TICKET_SHAPE_PCT" -- "$D" "$E2E_WORK_DIR/scan-logs" 2>/dev/null \
+    | awk -F: '{ n = split($1, p, "/"); m = $3; sub(/(-|%2[Dd]).*/, "", m); print "  " p[n] ":" $2 ": prefix " m }' \
+    | sort -u | head -n 50 >&2 || true
   leaks=1
 fi
 rm -f -- "$E2E_WORK_DIR/tickets-control.txt"

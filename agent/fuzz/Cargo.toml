@@ -1,7 +1,7 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
 # server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
-# cn=accesslog entries; CAS service definitions and JSON audit log lines. See
+# cn=accesslog entries; CAS service definitions (JSON and YAML) and JSON audit log lines. See
 # README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
@@ -95,6 +95,13 @@ bench = false
 [[bin]]
 name = "cas_registry"
 path = "fuzz_targets/cas_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cas_registry_yaml"
+path = "fuzz_targets/cas_registry_yaml.rs"
 test = false
 doc = false
 bench = false

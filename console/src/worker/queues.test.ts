@@ -20,7 +20,21 @@ import {
   createRateLimitsPruneHandler,
   NOOP_QUEUE,
   type NoopPayload,
+  pgBossOptions,
+  PGBOSS_SCHEMA,
 } from "./queues";
+
+describe("pg-boss options", () => {
+  it("pins the schema, never creates it, names the pools and registers the instance explicitly", () => {
+    expect(pgBossOptions("postgres://u:p@h/db")).toEqual({
+      connectionString: "postgres://u:p@h/db",
+      application_name: "databastion-worker",
+      schema: PGBOSS_SCHEMA,
+      createSchema: false,
+      registerInstance: true,
+    });
+  });
+});
 
 describe("noop queue handler", () => {
   it("acknowledges every job of the batch without throwing", async () => {

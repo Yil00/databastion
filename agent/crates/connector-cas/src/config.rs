@@ -10,5 +10,5 @@
 pub use databastion_core::config::cas::{
     AuditLogSettings, CasConfigError as ConfigError, CasSettings, ClientAddrMode,
     MAX_CLEAR_PRINCIPALS, MAX_PRINCIPAL_BYTES, RawAuditLog, RawCasSettings, RawServiceRegistry,
-    ResolvedPath, UtcOffset, parse_timezone,
+    RegistryFormat, ResolvedPath, UtcOffset, parse_timezone,
 };

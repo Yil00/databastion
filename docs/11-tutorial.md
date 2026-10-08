@@ -1,6 +1,6 @@
 # Tutorial – first steps with DataBastion
 
-This tutorial is for newcomers. Part A installs the latest release (v0.3.1 at the time of writing) and takes you to a first Discovery scan and a first incident. Part B sets up a development machine with `make`: the seeded databases, the console and an agent running on your host, and the tests.
+This tutorial is for newcomers. Part A installs the latest release (v0.4.0 at the time of writing) and takes you to a first Discovery scan and a first incident. Part B sets up a development machine with `make`: the seeded databases, the console and an agent running on your host, and the tests.
 
 The commands can be copied as they are into bash or zsh. They contain no comments, because zsh does not accept `#` comments on an interactive command line by default.
 
@@ -20,13 +20,13 @@ You need:
 - [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or later, to check the signatures.
 
 ### A1. Verify the artifacts
-Follow [Verify the artifacts](../deploy/README.md#verify-the-artifacts). The release files and the images are signed only by the publish workflow, in the run triggered by the release tag. Check the signer's identity exactly, not with a pattern. For v0.3.1 it is:
+Follow [Verify the artifacts](../deploy/README.md#verify-the-artifacts). The release files and the images are signed only by the publish workflow, in the run triggered by the release tag. Check the signer's identity exactly, not with a pattern. For v0.4.0 it is:
 
 ```
-https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/0.3.1
+https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/0.4.0
 ```
 
-For another version, replace `0.3.1` with the version (`.../publish.yml@refs/tags/<version>`). The OIDC issuer is `https://token.actions.githubusercontent.com`.
+For another version, replace `0.4.0` with the version (`.../publish.yml@refs/tags/<version>`). The OIDC issuer is `https://token.actions.githubusercontent.com`.
 
 **You should see**: `Verified OK` for `SHA256SUMS`, one `OK` line per file you downloaded, `verified: …` for each image and then `all images verified`. If anything prints `FAILED`, do not install anything.
 

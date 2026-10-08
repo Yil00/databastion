@@ -13,7 +13,7 @@ It is separate from the dev seed ([../seed/generate.py](../seed/generate.py), [.
 ## Files
 | File | Content |
 |------|---------|
-| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `891937215` |
+| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `896320835` |
 | `corpus.json` (**not committed**, git-ignored, about 8 MB) | `{"generator", "seed", "version", "rows_per_column", "columns": [...]}`. Each column is `{id, engine, database, container, object, field, values}`, with 200 string `values` |
 | `labels.json` (committed, the reviewable artifact) | `{"generator", "seed", "version", "classifiers", "notes", "corpus_sha256", "locations": [...]}`, one location per column, joined on `id`. `corpus_sha256` is the SHA-256 of the exact bytes of `corpus.json` |
 | [test_generate.py](test_generate.py) | Unit tests: check-digit validators, determinism, validation, committed `labels.json` and pinned corpus SHA-256 up to date, minimum counts |
@@ -72,7 +72,7 @@ The Wilson lower bound for a perfect score is n / (n + 3.84). **With 30 positive
 
 For precision (LB ≥ 0.85): with TP = 62 the gate tolerates up to 4 FP, with TP = 78 up to 6 FP. So in practice the gate asks for about 98 % recall at column level. Anyone who wants more slack should raise `TARGET_POSITIVES` (for example 100 allows 4 misses) and not lower the bar.
 
-## Counts (seed 891937215)
+## Counts (seed 896320835)
 1416 columns × 200 rows: 643 positive columns, 759 hard-negative columns and 14 ambiguous columns (excluded).
 
 Non-ambiguous positive columns per classifier:
@@ -90,7 +90,13 @@ Non-ambiguous positive columns per classifier:
 | `secret.aws_key` | 62 | 6 / 10 | |
 | `secret.password_hash` | 62 | 6 / 10 | |
 
-Hard negatives, 759 columns in 45 types with at least 16 columns each. 165 of them have misleading names (`email_opt_in`, `phone_country`, `card_brand`…) and 44 have opaque names:
+Hard negatives, 759 columns in 45 types with at least 16 columns each. 165 of them have misleading names (`email_opt_in`, `phone_country`, `card_brand`…) and 39 have opaque names (3 columns for each of the 13 types whose values are plausible under an opaque name). These are the `negative_control` columns tagged `naming:misleading` and `naming:opaque`; the 5 other opaque-named columns of the corpus are ambiguous and excluded (below), not hard negatives. `generate.py` prints the per-type totals but not these per-naming counts; they come from the `naming:*` tags of `labels.json`:
+
+```sh
+python3 -c 'import json, collections; L = json.load(open("dev/holdout/labels.json"))["locations"]; print(collections.Counter(t for x in L if x["negative_control"] and not x["ambiguous"] for t in x["tags"] if t.startswith("naming:")))'
+```
+
+Hard-negative types:
 
 | Type | Targets mostly |
 |---|---|
@@ -158,9 +164,5 @@ Two judgment calls are **not** flagged ambiguous, and a classifier owner may dis
 It also checks that locations are unique and that labels and corpus agree.
 
 ## CI
-The dev-env workflow does not run this yet: `.github/` belongs to another owner. Proposed steps:
-```sh
-timeout 300 python3 -m unittest discover -s dev/holdout -v
-timeout 120 python3 dev/holdout/generate.py --check
-```
+The agent job of [ci.yml](../../.github/workflows/ci.yml) ("Holdout classifier gate", blocking) runs `generate.py --check`, writes `corpus.json`, then runs the scorer. The unit tests (`python3 -m unittest discover -s dev/holdout -v`) are not run in CI; run them locally when changing this directory.
 **Consumer contract.** The scorer (the Rust classifier scorer in CI) must first run `python3 dev/holdout/generate.py` (Python 3, standard library only, no network; it takes a few seconds). Then it loads `dev/holdout/corpus.json` and `dev/holdout/labels.json` and applies the method above. The scorer should also check that the SHA-256 of `corpus.json` equals `labels.json` `corpus_sha256`, and refuse to score otherwise.

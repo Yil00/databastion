@@ -23,9 +23,15 @@ zeroize.workspace = true
 # serviceId patterns, compiled under a size limit (ADR-0041 decision 7).
 regex.workspace = true
 # Service definitions and audit records, read through closed serde visitors
-# (never a generic `serde_json::Value`, ADR-0041 decisions 4 and 7).
+# (never a generic `serde_json::Value`, ADR-0041 decisions 4 and 7). `raw_value`: audit
+# record strings are unescaped by the crate into zeroizing buffers, never by serde_json.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
+# YAML service definitions (`yaml_dir`), read by the same closed visitor
+# after a pre-scan of the raw bytes (src/parse/yaml.rs). The crate the core
+# already links for `agent.yaml` (ADR-0041 decisions 4 and 13): no new
+# dependency in the agent binary.
+serde_yaml_ng = "0.10"
 # openat / fstat / faccessat without `unsafe` (ADR-0041 decision 3), as the
 # core's state files.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }

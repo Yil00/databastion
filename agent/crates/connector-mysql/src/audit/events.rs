@@ -33,10 +33,26 @@
 //! otherwise from the statement text (reads and writes only: DDL and DCL
 //! events take no name from text); an unqualified name is in the
 //! statement's current database. `information_schema`,
-//! `performance_schema`, `sys`, `DUAL` and MariaDB's internal statistics
-//! tables (`mysql.*_stats`) are not application data and are skipped; the
+//! `performance_schema`, `sys`, `DUAL` and the internal statistics tables
+//! (`mysql.*_stats`) are skipped from the objects of reads only: a write
+//! names them (`UPDATE performance_schema.setup_consumers …` turns the
+//! `performance_schema` source off), and so does a table record that
+//! writes a system schema table, whatever the statement's action. The
 //! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
-//! access worth reporting). A read or write whose objects cannot be told
+//! access worth reporting). Server configuration changes (`SET GLOBAL` /
+//! `PERSIST`, `INSTALL` / `UNINSTALL`, `TRUNCATE`) are DDL events. A
+//! text that only kept its kind (opaque, ambiguous readings, not
+//! lexable) is reported against `*` with the most reportable kind of its
+//! readings; code that runs out of sight (`CALL`, `EXECUTE`, `PREPARE`, a
+//! schema-qualified function call) adds `*`. A text with several
+//! statements takes the action of its most reportable one. A statement
+//! that writes or changes something, runs code out of sight or cannot be
+//! read is never left out as the agent's own (I4), unless table records
+//! that all read decide for an unreadable text. Changes that touch a
+//! system schema, configuration DDL (audit log administration functions
+//! included), code out of sight and unreadable texts are marked always
+//! reported (never dropped by `min_rows`). Read signals are computed per
+//! read statement, whatever the event's action. A read or write whose objects cannot be told
 //! (text that does not lex, `CALL`) is reported against `*`. Statements
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
@@ -50,6 +66,7 @@ use databastion_classifiers::masking::{
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
     AnalyzeOptions, QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze_raw,
+    most_reportable,
 };
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use databastion_core::audit::tail::RecordPos;
@@ -86,7 +103,13 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
     o
 }
 
-/// Schemas that hold no application data.
+/// The server's own schemas: dictionary views (`information_schema`),
+/// instrumentation (`performance_schema`) and its helper views (`sys`).
+/// They hold no application rows, but they are not harmless:
+/// `performance_schema` holds other sessions' statement texts (literals
+/// included on `SQL_TEXT`, clear-text passwords on MariaDB) and its setup
+/// tables drive the `performance_schema` Audit source. Reads of them are
+/// not reported; writes are (see [`EventBuilder::statement`]).
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
@@ -110,12 +133,87 @@ fn is_internal_table(db: &str, table: &str) -> bool {
 
 /// A relation named by a statement (unqualified: in `database`) that holds
 /// no application data: a system schema, an internal statistics table, or
-/// `DUAL`.
+/// `DUAL`. Skipped from the objects of reads only.
 fn is_system_relation(r: &RelationName, database: &str) -> bool {
     let db = r.schema.as_deref().unwrap_or(database);
     is_system_schema(db)
         || is_internal_table(db, &r.name)
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
+}
+
+/// The tables behind the audit log administration functions (MySQL
+/// Enterprise Audit and the Percona `audit_log_filter` component):
+/// `mysql.audit_log_filter` and `mysql.audit_log_user`. Writing them
+/// changes what the audit log records.
+fn is_audit_table(db: &str, table: &str) -> bool {
+    db.eq_ignore_ascii_case("mysql")
+        && ["audit_log_filter", "audit_log_user"]
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(table))
+}
+
+/// The closed allow-list of statements of no known kind that produce no
+/// event: they can neither read nor change data, and hold no subquery.
+/// Session `SET` without a table or a schema-qualified function call
+/// (`SET NAMES`,
+/// `SET CHARACTER SET`, `SET TRANSACTION`, `SET autocommit = 1`…), `USE`,
+/// `BEGIN` (not `BEGIN NOT ATOMIC`), `START TRANSACTION`, `COMMIT`,
+/// `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SHOW`, `EXPLAIN` / `DESCRIBE` /
+/// `DESC` without `ANALYZE`, `LOCK` / `UNLOCK TABLES`, `FLUSH`, `ANALYZE`
+/// / `OPTIMIZE` / `CHECK` / `CHECKSUM` / `REPAIR TABLE`, `KILL`,
+/// `DEALLOCATE PREPARE`.
+pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
+    if p.subquery || p.compound || p.analyze_wrapped || p.audit_function {
+        return false;
+    }
+    let lead: Vec<&str> = p.lead.iter().map(String::as_str).collect();
+    let table_word = |w: Option<&&str>| matches!(w.copied(), Some("table" | "tables"));
+    match lead.as_slice() {
+        // Built-in calls are fine (`SET sql_mode = CONCAT(@@sql_mode, …)`,
+        // sent by Connector/J on every pooled connection); a
+        // schema-qualified (stored) function is not, nor an audit
+        // function (excluded above).
+        ["set", ..] => !p.routine_call && p.relations.is_empty(),
+        ["begin"] | ["begin", "work"] => true,
+        ["start", "transaction", ..]
+        | [
+            "commit" | "rollback" | "savepoint" | "release" | "use" | "kill" | "flush",
+            ..,
+        ]
+        | ["show" | "explain" | "describe" | "desc", ..]
+        | ["lock" | "unlock", "table" | "tables", ..]
+        | ["deallocate", "prepare", ..] => true,
+        [
+            "analyze" | "optimize" | "check" | "checksum" | "repair",
+            rest @ ..,
+        ] => {
+            table_word(rest.first())
+                || (matches!(rest.first().copied(), Some("no_write_to_binlog" | "local"))
+                    && table_word(rest.get(1)))
+        }
+        _ => false,
+    }
+}
+
+/// A statement kind that changes something: rows, schema or privileges.
+fn is_change_kind(k: StatementKind) -> bool {
+    is_write_kind(k) || matches!(k, StatementKind::Ddl | StatementKind::Dcl)
+}
+
+/// A statement kind that writes rows.
+fn is_write_kind(k: StatementKind) -> bool {
+    matches!(
+        k,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+    )
+}
+
+/// `DUAL`, unqualified: no table at all.
+fn is_dual(r: &RelationName) -> bool {
+    r.schema.is_none() && r.name.eq_ignore_ascii_case("dual")
 }
 
 /// Connection errors that are not authentication failures: bad handshake
@@ -619,6 +717,12 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
 /// Builds events for one target and source.
 pub(crate) struct EventBuilder {
     own: OwnAccount,
+    /// Exact texts of the statements the connector itself sends that read
+    /// no relation but `information_schema.COLUMNS` (the CAS store guard's
+    /// column queries, ADR-0041 decision 6, each short enough never to be
+    /// cut at the default log limits): recognized by their whole text and
+    /// left out without a charge (see [`Self::own_statement`]).
+    own_statements: Vec<Vec<u8>>,
     sessions: Sessions,
     /// Table-access records waiting for their statement record.
     pending: Pending,
@@ -633,11 +737,43 @@ impl EventBuilder {
     pub(crate) fn new(own: OwnAccount) -> Self {
         Self {
             own,
+            own_statements: Vec::new(),
             sessions: Sessions::default(),
             pending: Pending::default(),
             panicked: 0,
             failed: 0,
         }
+    }
+
+    /// The connector's own statements of this target (exact texts, as
+    /// sent): see [`Self::own_statement`].
+    #[must_use]
+    pub(crate) fn with_own_statements(mut self, texts: Vec<Vec<u8>>) -> Self {
+        self.own_statements = texts;
+        self
+    }
+
+    /// Whether a statement record is one of the connector's own statements
+    /// (text only; the caller checks the account, the application, the
+    /// address and the tables): its decoded text (`server_audit` escapes
+    /// undone by `records::parse_server_audit`, the JSON string of the
+    /// `audit_log` file, `performance_schema`'s `SQL_TEXT`) is **equal** to
+    /// one of them, and the record is **not** marked truncated. A cut text
+    /// proves nothing about what followed the cut: it is never matched
+    /// (security review of f9bab99, H1). A `DIGEST_TEXT` never matches
+    /// (its literals are replaced), nor does an opaque text.
+    fn own_statement(&self, text: &[u8], truncated: bool, opaque: bool) -> bool {
+        !truncated && !opaque && self.own_statements.iter().any(|g| text == g.as_slice())
+    }
+
+    /// The text and table conditions of an own guard statement (the
+    /// identity conditions are `OwnAccount::routine_unbudgeted`'s).
+    fn own_guard(&self, a: &Access<'_>) -> bool {
+        a.text
+            .is_some_and(|t| self.own_statement(t, a.truncated, a.opaque))
+            && a.tables.iter().all(|(db, _, op)| {
+                *op == TableOp::Read && db.eq_ignore_ascii_case("information_schema")
+            })
     }
 
     /// The agent's address as the server sees it, refreshed at each
@@ -651,6 +787,27 @@ impl EventBuilder {
 
     /// The event of one statement, if any (see the module documentation).
     pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
+        // The connector's own guard statements, by their exact whole text:
+        // they read `information_schema.COLUMNS` only. Left out without a
+        // charge when the account, application and address are the agent's,
+        // every table record (if any) is in `information_schema` (not
+        // `performance_schema` nor `sys`: security review of f9bab99, M1),
+        // and no signal applies. Anything else takes the usual path.
+        if self.own_guard(&a) {
+            let e = MaskedEvent::new(
+                a.source,
+                EventAction::Read,
+                a.principal.clone(),
+                a.ts.min(now),
+            )
+            .with_object(unknown_object(a.database));
+            if self
+                .own
+                .routine_unbudgeted(a.user, a.application, a.client, &e)
+            {
+                return None;
+            }
+        }
         let opaque = a.opaque || a.text.is_some_and(|t| std::str::from_utf8(t).is_err());
         let analysis: Option<QueryAnalysis> = a.text.map(|t| {
             // performance_schema texts come transcoded to utf8mb4 by the
@@ -666,6 +823,11 @@ impl EventBuilder {
         });
         let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
         let parsed = !parts.is_empty();
+        // A text that only kept its kind (opaque, ambiguous under the
+        // possible `sql_mode` / version-comment readings, or not lexable):
+        // what it touched cannot be told (fail closed).
+        let unparsed =
+            opaque || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed);
         if let Some(app) = a.application {
             let s = self.sessions.entry(&a.session);
             if s.program.is_none() {
@@ -689,10 +851,6 @@ impl EventBuilder {
                 return None;
             }
         }
-        let lead0 = parts
-            .first()
-            .and_then(|p| p.lead.first())
-            .map(String::as_str);
         let table_action = if a.tables.iter().any(|t| t.2 == TableOp::Read) {
             Some(EventAction::Read)
         } else if a.tables.iter().any(|t| t.2 == TableOp::Write) {
@@ -702,10 +860,87 @@ impl EventBuilder {
         } else {
             None
         };
-        let kind = analysis
-            .as_ref()
-            .map_or(StatementKind::Other, QueryAnalysis::kind);
-        let call = lead0 == Some("call");
+        // The most reportable statement of a multi-statement text
+        // (`SET @a = 1; UPDATE performance_schema.setup_consumers …`).
+        let kind = if parsed {
+            parts
+                .iter()
+                .fold(StatementKind::Other, |k, p| most_reportable(k, p.kind))
+        } else {
+            analysis
+                .as_ref()
+                .map_or(StatementKind::Other, QueryAnalysis::kind)
+        };
+        // Code that runs out of sight: a procedure, a prepared statement,
+        // a stored function (schema-qualified calls only: `f()` cannot be
+        // told from a built-in function).
+        // A `"…"` name (`ANSI_QUOTES`) hides the objects the same way.
+        let call = parts.iter().any(|p| {
+            p.routine_call
+                || p.dquoted_name
+                || p.compound
+                || matches!(
+                    p.lead.first().map(String::as_str),
+                    Some("call" | "execute" | "prepare")
+                )
+        });
+        // The statement changed something, or may have, whatever its
+        // reported action (a `CALL` whose table records write, a write
+        // after a read in a multi-statement text, code that runs out of
+        // sight, a text that cannot be read): the agent only reads (I4)
+        // and never sends these, so such a statement with its identity is
+        // never left out as its own.
+        //
+        // An unreadable text with table records that all read (a name
+        // ending in a non-ASCII character before a backtick trips the
+        // multibyte rule) is decided by its records: they name what it
+        // read.
+        // A raw scan of an unreadable text that finds an audit log
+        // administration function makes it blind whatever its records
+        // (fail closed).
+        let audit_function = analysis.as_ref().is_some_and(QueryAnalysis::audit_function);
+        let blind = unparsed
+            && (a.tables.is_empty()
+                || a.tables.iter().any(|t| t.2 != TableOp::Read)
+                || audit_function);
+        // Backstop for `"…"` names the positions above miss: a read or a
+        // write holding any `"…"` token adds `*` and is never the agent's
+        // own (the agent never sends `"`), but is not marked always
+        // reported (double-quoted string literals are common).
+        let dquoted = parts.iter().any(|p| {
+            p.dquoted
+                && (is_write_kind(p.kind)
+                    || matches!(
+                        p.kind,
+                        StatementKind::Select
+                            | StatementKind::Table
+                            | StatementKind::Values
+                            | StatementKind::Handler
+                    ))
+        });
+        // Fail closed for statements of no known kind: one produces no
+        // event only when it is on a closed allow-list of statements that
+        // can neither read nor change data ([`is_quiet`]). Any other
+        // (`DO`, `SET @x = (SELECT …)`, `XA`, a utility statement with a
+        // subquery…) is a read, of the tables it names or of `*`, and
+        // never the agent's own (its own statements are all on the list
+        // or recognized reads).
+        let loud_other = parts
+            .iter()
+            .any(|p| p.kind == StatementKind::Other && !is_quiet(p));
+        // `ANALYZE` / `EXPLAIN ANALYZE` run their statement; the agent
+        // never sends them.
+        let analyze_wrapped = parts.iter().any(|p| p.analyze_wrapped);
+        let changes = is_change_kind(kind)
+            || parts.iter().any(|p| is_change_kind(p.kind))
+            || call
+            || dquoted
+            || loud_other
+            || analyze_wrapped
+            || blind
+            || a.tables
+                .iter()
+                .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
         let action = match kind {
             StatementKind::Select
             | StatementKind::Table
@@ -718,14 +953,16 @@ impl EventBuilder {
             StatementKind::Ddl => EventAction::Ddl,
             StatementKind::Dcl => EventAction::Dcl,
             _ if call => EventAction::Read,
-            _ => match (table_action, opaque) {
+            _ => match (table_action, unparsed) {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
                 (None, true) => EventAction::Read,
+                (None, false) if loud_other => EventAction::Read,
                 (None, false) => return None,
             },
         };
         let rw = matches!(action, EventAction::Read | EventAction::Write);
+        let write = action == EventAction::Write;
         let mut objects: Vec<(String, String)> = Vec::new();
         let mut unknown = false;
         if a.tables.is_empty() && rw {
@@ -735,9 +972,13 @@ impl EventBuilder {
             // events need no object.
             let mut named_any = false;
             for p in parts {
+                // A write names its system tables (`UPDATE
+                // performance_schema.setup_consumers …` turns the
+                // `performance_schema` source off): only reads skip them.
+                let keep_system = write || is_write_kind(p.kind);
                 for r in &p.relations {
                     named_any = true;
-                    if is_system_relation(r, a.database) {
+                    if is_dual(r) || (!keep_system && is_system_relation(r, a.database)) {
                         continue;
                     }
                     let db = r.schema.as_deref().unwrap_or(a.database);
@@ -747,13 +988,19 @@ impl EventBuilder {
                     }
                 }
             }
-            if !named_any && (!parsed || call) {
+            // Unknown objects: a text that cannot be read, code that runs
+            // out of sight, a write that names no table (or only `DUAL`).
+            if (!named_any && !parsed) || call || ((write || loud_other) && objects.is_empty()) {
                 unknown = true;
             }
         } else {
-            for (db, table, _) in &a.tables {
-                let system = is_system_schema(db)
-                    || is_internal_table(db, table)
+            for (db, table, op) in &a.tables {
+                // System tables are skipped from reads only: a write
+                // statement names every table it touched, and a table
+                // record that writes or changes a system schema table
+                // names it whatever the statement's action (a `CALL`).
+                let system = (is_system_schema(db) && !write && *op == TableOp::Read)
+                    || (is_internal_table(db, table) && !write)
                     || (!rw && db.eq_ignore_ascii_case("mysql"));
                 let o = ((*db).to_owned(), (*table).to_owned());
                 if !system && !objects.contains(&o) {
@@ -761,8 +1008,9 @@ impl EventBuilder {
                 }
             }
         }
-        if rw && objects.is_empty() && !unknown {
-            // Only system tables, or no table at all (`SELECT 1`).
+        if rw && objects.is_empty() && !unknown && !dquoted {
+            // A read of system tables only, or no table at all (`SELECT
+            // 1`). A write keeps its system tables above.
             return None;
         }
         let ts = a.ts.min(now);
@@ -770,10 +1018,48 @@ impl EventBuilder {
         for (db, name) in objects.iter().take(16) {
             e = e.with_object(object(db, name));
         }
-        if unknown {
+        if unknown || (dquoted && rw) {
             e = e.with_object(unknown_object(a.database));
         }
-        if action == EventAction::Read {
+        // Never filtered by `min_rows` (ADR-0022 settings, agent side):
+        // changes that touch a system schema (they can turn the
+        // `performance_schema` source off or erase it), server
+        // configuration changes (`SET GLOBAL`, `INSTALL` / `UNINSTALL`),
+        // and changes whose text cannot be read.
+        let system = |db: &str| is_system_schema(db);
+        let touches_system = a.tables.iter().any(|(db, table, op)| {
+            (system(db) || is_audit_table(db, table))
+                && (*op != TableOp::Read || action != EventAction::Read)
+        }) || (action != EventAction::Read
+            && (objects
+                .iter()
+                .any(|(db, table)| system(db) || is_audit_table(db, table))
+                || parts.iter().any(|p| {
+                    p.relations.iter().any(|r| {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        system(db) || is_audit_table(db, &r.name)
+                    })
+                })));
+        let configuration = audit_function
+            || parts.iter().any(|p| {
+                p.audit_function
+                    || p.kind == StatementKind::Ddl
+                        && matches!(
+                            p.lead.first().map(String::as_str),
+                            Some("set" | "install" | "uninstall")
+                        )
+            });
+        // Also reads of `*`: code that runs out of sight or a text that
+        // cannot be read never matches `sensitive_objects` and has no
+        // useful row count, so `min_rows` would drop it.
+        if touches_system || configuration || call || blind {
+            e = e.with_always_report();
+        }
+        // Read signals per read statement, whatever the event's action (a
+        // multi-statement text whose most reportable statement is a
+        // write keeps the signals of its reads; the contract allows any
+        // registered signal on any action).
+        {
             let session = self.sessions.get(&a.session);
             let dumper = a
                 .application
@@ -806,9 +1092,10 @@ impl EventBuilder {
         if a.rows.is_some_and(|r| r > LARGE_ROWS) {
             e = e.with_signal(Signal::LargeResult);
         }
-        if self
-            .own
-            .routine(a.user, a.application, a.client, &e, Instant::now())
+        if !changes
+            && self
+                .own
+                .routine(a.user, a.application, a.client, &e, Instant::now())
         {
             return None;
         }
@@ -1133,6 +1420,226 @@ mod tests {
             .iter()
             .map(show)
             .collect()
+    }
+
+    /// The CAS store guard statements `check()` sends: for the built-in
+    /// names, and for 64 names of 128 characters in each `cas_stores` list
+    /// (the most allowed).
+    fn guard_sets() -> Vec<Vec<String>> {
+        let names = |p: char| -> Vec<String> {
+            (0..64)
+                .map(|i| format!("{i:02}{}", p.to_string().repeat(126)))
+                .collect()
+        };
+        let full = databastion_core::cas_guard::CasStores {
+            ticket_registry: names('t'),
+            service_registry: names('s'),
+            audit_trail: names('a'),
+        };
+        vec![
+            crate::sql::cas_guard_statement_texts(None).unwrap(),
+            crate::sql::cas_guard_statement_texts(Some(&full)).unwrap(),
+        ]
+    }
+
+    fn guard_builder(texts: &[String]) -> EventBuilder {
+        EventBuilder::new(own())
+            .with_own_statements(texts.iter().map(|t| t.clone().into_bytes()).collect())
+    }
+
+    /// A `server_audit` QUERY line for `text` as `user` from `host`, cut as
+    /// the plugin cuts it at `limit` escaped bytes (`None`: not cut).
+    fn sa_query(user: &str, host: &str, q: u64, text: &str, limit: Option<usize>) -> String {
+        let mut esc = String::new();
+        for c in text.chars() {
+            match c {
+                '\'' => esc.push_str("\\'"),
+                '\\' => esc.push_str("\\\\"),
+                '\n' => esc.push_str("\\n"),
+                '\r' => esc.push_str("\\r"),
+                '\t' => esc.push_str("\\t"),
+                c => esc.push(c),
+            }
+        }
+        if let Some(l) = limit {
+            esc.truncate(l.min(esc.len()));
+            // Never end inside an escape.
+            if esc.ends_with('\\') && !esc.ends_with("\\\\") {
+                esc.pop();
+            }
+        }
+        format!("20260929 09:40:35,h,{user},{host},30,{q},QUERY,shop,'{esc}',0")
+    }
+
+    fn sa_at(lines: &[String], limit: usize) -> Vec<FileRecord> {
+        lines
+            .iter()
+            .map(|l| parse_server_audit(l.as_bytes(), 0, limit).unwrap())
+            .collect()
+    }
+
+    fn pfs_access<'a>(
+        text: &'a [u8],
+        truncated: bool,
+        tables: Vec<(&'a str, &'a str, TableOp)>,
+    ) -> Access<'a> {
+        Access {
+            session: "t9".to_owned(),
+            user: "databastion",
+            principal: EventPrincipal::account("databastion"),
+            client: ClientSeen::NotVisible,
+            application: Some("databastion-agent"),
+            database: "",
+            text: Some(text),
+            opaque: false,
+            truncated,
+            tables,
+            rows: None,
+            status: 0,
+            ts: SystemTime::now(),
+            source: EventSource::PerformanceSchema,
+        }
+    }
+
+    /// E2E regression (mariadb-e2e I2): every guard statement stays under
+    /// the default 1024-byte log limits, is never cut, and is left out at
+    /// every heartbeat on each source.
+    #[test]
+    fn the_cas_guard_statement_is_left_out_whole_or_truncated() {
+        for set in guard_sets() {
+            for g in &set {
+                assert!(
+                    crate::sql::server_audit_escaped_len(g) <= 900,
+                    "{}",
+                    g.len()
+                );
+                let mut b = guard_builder(&set);
+                for q in 1..=3 {
+                    let recs = sa_at(
+                        &[sa_query("databastion", "172.18.0.1", q, g, Some(1024))],
+                        1024,
+                    );
+                    assert!(!recs[0].truncated);
+                    assert_eq!(
+                        recs[0].text.as_deref().map(Vec::as_slice),
+                        Some(g.as_bytes())
+                    );
+                    assert_eq!(file(&mut b, recs), Vec::<String>::new());
+                }
+                // The `audit_log` JSON file.
+                let mut b = guard_builder(&set);
+                for c in 1..=3u64 {
+                    let rec = format!(
+                        r#"{{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":{c},"login":{{"user":"databastion","ip":"172.18.0.1"}},"general_data":{{"command":"Query","query":{},"status":0}}}}"#,
+                        serde_json::to_string(g).unwrap()
+                    );
+                    let recs = vec![parse_json(rec.as_bytes()).unwrap()];
+                    let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+                    assert!(
+                        ev.is_empty(),
+                        "{:?}",
+                        ev.iter().map(show).collect::<Vec<_>>()
+                    );
+                }
+                // performance_schema `SQL_TEXT`, not cut.
+                let mut b = guard_builder(&set);
+                for _ in 0..3 {
+                    let access = pfs_access(g.as_bytes(), false, Vec::new());
+                    assert!(b.own_guard(&access));
+                    assert!(b.statement(access, SystemTime::now()).is_none());
+                }
+            }
+        }
+    }
+
+    /// Only the whole, uncut guard text with no table record outside
+    /// `information_schema` takes the uncharged path (security review of
+    /// f9bab99, H1, M1, L1).
+    #[test]
+    fn the_cas_guard_match_is_narrow() {
+        let set = guard_sets().remove(0);
+        let g = &set[0];
+        // Three heartbeats: an unknown read of the agent's account is
+        // charged the whole budget, so the first may still be left out by
+        // the row budget; the next ones are reported.
+        let heartbeats = |text: &str, limit: usize| {
+            let mut b = guard_builder(&set);
+            let mut out = Vec::new();
+            for q in 1..=3u64 {
+                let cut = (limit < text.len()).then_some(limit);
+                out.extend(file(
+                    &mut b,
+                    sa_at(
+                        &[sa_query("databastion", "172.18.0.1", q, text, cut)],
+                        limit,
+                    ),
+                ));
+            }
+            out
+        };
+        // The guard text followed by another read, cut at the limit inside
+        // a literal (server_audit with QUERY events only: no table record).
+        let forged = format!(
+            "{g} UNION ALL SELECT name, email, phone, '{}' FROM shop.customers",
+            "x".repeat(400)
+        );
+        let out = heartbeats(&forged, 1024);
+        assert!(out.len() >= 2, "{out:?}");
+        assert!(
+            out.iter().all(|e| e.starts_with("read [\"shop.*\"]")),
+            "{out:?}"
+        );
+        // The same on performance_schema (`SQL_TEXT` cut, no table record).
+        let mut b = guard_builder(&set);
+        let mut reported = 0;
+        for _ in 0..3 {
+            let access = pfs_access(&forged.as_bytes()[..1020], true, Vec::new());
+            assert!(!b.own_guard(&access));
+            reported += usize::from(b.statement(access, SystemTime::now()).is_some());
+        }
+        assert!(reported >= 2);
+        // The exact guard text cut by a lowered limit (here inside its
+        // regular expression literal): no longer matched, reported as a
+        // read of `*` (documented: keep the limits at 1024).
+        let regex_at = g.find("[^ABC").unwrap();
+        let low = crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10;
+        let out = heartbeats(g, low);
+        assert!(out.len() >= 2, "{out:?}");
+        // The exact guard text with a table record outside
+        // `information_schema` never takes the uncharged path.
+        let b = guard_builder(&set);
+        for db in ["performance_schema", "sys", "shop"] {
+            let access = pfs_access(g.as_bytes(), false, vec![(db, "t", TableOp::Read)]);
+            assert!(!b.own_guard(&access), "{db}");
+        }
+        assert!(b.own_guard(&pfs_access(
+            g.as_bytes(),
+            false,
+            vec![("information_schema", "COLUMNS", TableOp::Read)]
+        )));
+        // A truncated record whose text equals the guard is not matched
+        // either, nor an opaque one.
+        assert!(!b.own_guard(&pfs_access(g.as_bytes(), true, Vec::new())));
+        let mut opaque = pfs_access(g.as_bytes(), false, Vec::new());
+        opaque.opaque = true;
+        assert!(!b.own_guard(&opaque));
+        // Exact text from another account or address: not the uncharged
+        // path (whatever the usual path then decides).
+        let mut b = guard_builder(&set);
+        let line = sa_query("app", "172.18.0.1", 1, g, None);
+        let _ = file(&mut b, sa_at(&[line], 1024));
+        let mut other = pfs_access(g.as_bytes(), false, Vec::new());
+        other.user = "app";
+        let e = MaskedEvent::new(
+            other.source,
+            EventAction::Read,
+            other.principal.clone(),
+            other.ts,
+        );
+        assert!(
+            !b.own
+                .routine_unbudgeted(other.user, other.application, other.client, &e)
+        );
     }
 
     #[test]
@@ -1843,6 +2350,1013 @@ mod tests {
             b.convert_file_at(recs, EventSource::MysqlAuditLog, SystemTime::now(), t0);
             assert!(b.pending.sizes().2 <= MAX_PENDING_BYTES);
         }
+    }
+
+    /// A `server_audit` QUERY line of `user` from `host`.
+    fn sa_line(user: &str, host: &str, q: u64, text: &str) -> String {
+        sa_query(user, host, q, text, None)
+    }
+
+    /// A Percona `audit_log` JSON statement record.
+    fn json_query(user: &str, ip: &str, c: u64, text: &str) -> FileRecord {
+        let rec = format!(
+            r#"{{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":{c},"login":{{"user":"{user}","ip":"{ip}"}},"general_data":{{"command":"Query","query":{},"status":0}}}}"#,
+            serde_json::to_string(text).unwrap()
+        );
+        parse_json(rec.as_bytes()).unwrap()
+    }
+
+    const DISABLE_CONSUMER: &str = "UPDATE performance_schema.setup_consumers SET ENABLED = 'NO' WHERE NAME = 'events_statements_history_long'";
+    const DISABLE_DIGEST: &str =
+        "UPDATE `performance_schema` . `setup_consumers` SET `ENABLED` = ? WHERE `NAME` = ?";
+
+    /// Writes to system schema tables turn the `performance_schema` source
+    /// off: reported with the table named, from any account, the agent's
+    /// included, on every source.
+    #[test]
+    fn writes_to_system_schemas_are_reported_with_their_tables() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] None []";
+        for user in ["app", "databastion"] {
+            // server_audit, QUERY record only (text path) and with its
+            // WRITE table record (table path).
+            let mut b = EventBuilder::new(own());
+            let out = file(
+                &mut b,
+                sa_at(
+                    &[
+                        sa_line(user, "172.18.0.1", 1, DISABLE_CONSUMER),
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            2,
+                            "update performance_schema.setup_instruments set enabled = 'NO'",
+                        ),
+                        format!(
+                            "20260929 09:40:35,h,{user},172.18.0.1,30,3,WRITE,performance_schema,setup_consumers,"
+                        ),
+                        sa_line(user, "172.18.0.1", 3, DISABLE_CONSUMER),
+                        // MariaDB `SET STATEMENT … FOR`: the write it wraps.
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            4,
+                            &format!("SET STATEMENT max_statement_time = 1 FOR {DISABLE_CONSUMER}"),
+                        ),
+                        // Copying other sessions' statement texts.
+                        sa_line(
+                            user,
+                            "172.18.0.1",
+                            5,
+                            "insert into shop.t select sql_text from performance_schema.events_statements_history_long",
+                        ),
+                    ],
+                    1024,
+                ),
+            );
+            assert_eq!(
+                out,
+                [
+                    consumers,
+                    "write [\"performance_schema.setup_instruments\"] None []",
+                    consumers,
+                    consumers,
+                    "write [\"performance_schema.events_statements_history_long\", \"shop.t\"] None []",
+                ],
+                "{user}: {out:#?}"
+            );
+            // The Percona `audit_log` JSON file.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                vec![json_query(user, "172.18.0.1", 7, DISABLE_CONSUMER)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(show).collect::<Vec<_>>(),
+                [consumers],
+                "{user}"
+            );
+            // performance_schema (`DIGEST_TEXT`), with an affected row
+            // count far below the own-account budget.
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(DISABLE_DIGEST.as_bytes(), false, Vec::new());
+            access.user = user;
+            access.principal = EventPrincipal::account(user);
+            access.rows = Some(1);
+            let e = b.statement(access, SystemTime::now()).expect(user);
+            assert_eq!(
+                show(&e),
+                "write [\"performance_schema.setup_consumers\"] Some(1) []"
+            );
+        }
+    }
+
+    /// Reads of system schema tables stay unreported (a separate ROADMAP
+    /// item), from the text or from table records.
+    #[test]
+    fn reads_of_system_schemas_are_unchanged() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[
+                    sa_line(
+                        "app",
+                        "10.0.0.5",
+                        1,
+                        "select sql_text from performance_schema.events_statements_history_long",
+                    ),
+                    sa_line("app", "10.0.0.5", 2, "select * from sys.statement_analysis"),
+                    "20260929 09:40:35,h,app,10.0.0.5,30,3,READ,performance_schema,setup_consumers,"
+                        .to_owned(),
+                    sa_line(
+                        "app",
+                        "10.0.0.5",
+                        3,
+                        "select * from performance_schema.setup_consumers",
+                    ),
+                    sa_line("app", "10.0.0.5", 4, "select 1 from dual"),
+                ],
+                1024,
+            ),
+        );
+        assert_eq!(out, Vec::<String>::new());
+        let access = pfs_access(
+            b"SELECT * FROM `performance_schema` . `setup_consumers`",
+            false,
+            Vec::new(),
+        );
+        assert!(b.statement(access, SystemTime::now()).is_none());
+    }
+
+    /// Changes to the audit configuration: DDL events (no object: DDL
+    /// takes no name from text, ADR-0023 decision 7), from any account;
+    /// session `SET`s stay unreported.
+    #[test]
+    fn audit_configuration_changes_are_reported() {
+        for user in ["app", "databastion"] {
+            let texts = [
+                "TRUNCATE performance_schema.events_statements_history_long",
+                "TRUNCATE TABLE performance_schema.events_statements_history_long",
+                "SET GLOBAL server_audit_logging = OFF",
+                "set global server_audit_events = ''",
+                "SET @@global.server_audit_logging = 0",
+                "SET autocommit = 1, GLOBAL server_audit_logging = OFF",
+                "SET PERSIST audit_log_disable = ON",
+                "SET GLOBAL audit_log_flush = ON",
+                "SET GLOBAL performance_schema_max_sql_text_length = 0",
+                "UNINSTALL PLUGIN server_audit",
+                "UNINSTALL SONAME 'server_audit'",
+                "UNINSTALL COMPONENT 'file://component_audit_log_filter'",
+                "INSTALL PLUGIN server_audit SONAME 'server_audit'",
+            ];
+            let lines: Vec<String> = texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| sa_line(user, "172.18.0.1", i as u64 + 1, t))
+                .collect();
+            let mut b = EventBuilder::new(own());
+            let out = file(&mut b, sa_at(&lines, 1024));
+            assert_eq!(out, vec!["ddl [] None []"; texts.len()], "{user}");
+            // The same from performance_schema digests and the JSON file.
+            for t in [
+                "TRUNCATE TABLE `performance_schema` . `events_statements_history_long`",
+                "SET GLOBAL `server_audit_logging` = ?",
+                "UNINSTALL PLUGIN `server_audit`",
+            ] {
+                let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+                access.user = user;
+                let e = b.statement(access, SystemTime::now()).expect(t);
+                assert_eq!(e.action(), EventAction::Ddl, "{t}");
+                let ev = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 9, t)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{t}");
+            }
+        }
+        // Session settings (the agent's own, any account's): no event.
+        let mut b = EventBuilder::new(own());
+        for t in [
+            crate::sql::session_setup(crate::conn::Flavor::Mariadb, 1000),
+            crate::sql::session_setup(crate::conn::Flavor::Mysql, 1000),
+            crate::sql::SESSION_READ_ONLY.to_owned(),
+            "SET @x = @@global.server_audit_logging".to_owned(),
+            "SET NAMES utf8mb4".to_owned(),
+        ] {
+            let out = file(&mut b, sa_at(&[sa_line("app", "10.0.0.5", 1, &t)], 1024));
+            assert!(out.is_empty(), "{t}: {out:?}");
+            let access = pfs_access(t.as_bytes(), false, Vec::new());
+            assert!(b.statement(access, SystemTime::now()).is_none(), "{t}");
+        }
+    }
+
+    /// A statement whose table records change something is never left out
+    /// as the agent's own, whatever its action (a `CALL` of a procedure
+    /// that writes); the agent's MariaDB `SET STATEMENT … FOR SELECT`
+    /// samples stay its own reads.
+    #[test]
+    fn own_statements_that_change_something_are_reported() {
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[
+                    "20260929 09:40:35,h,databastion,172.18.0.1,30,1,WRITE,performance_schema,setup_consumers,"
+                        .to_owned(),
+                    sa_line("databastion", "172.18.0.1", 1, "call shop.p()"),
+                ],
+                1024,
+            ),
+        );
+        assert_eq!(
+            out,
+            ["read [\"performance_schema.setup_consumers\"] None []"]
+        );
+        // The agent's own MariaDB sample on performance_schema: a read of
+        // the sampled table, within the row budget.
+        let sample = crate::sql::sample_statement(
+            crate::conn::Flavor::Mariadb,
+            1000,
+            "support",
+            "tickets",
+            &[("c", crate::sql::Sampled::Text)],
+            10,
+        )
+        .unwrap();
+        let mut access = pfs_access(sample.as_bytes(), false, Vec::new());
+        access.rows = Some(10);
+        assert!(b.statement(access, SystemTime::now()).is_none());
+        // The same text from another address: reported as a read.
+        let mut access = pfs_access(sample.as_bytes(), false, Vec::new());
+        access.rows = Some(10);
+        access.client = ClientSeen::Logged(ClientAddr::parse("10.9.9.9"));
+        let e = b.statement(access, SystemTime::now()).unwrap();
+        assert_eq!(show(&e), "read [\"support.tickets\"] Some(10) []");
+        // The CAS guard text with a write table record in
+        // `information_schema` never takes the uncharged path.
+        let set = guard_sets().remove(0);
+        let b = guard_builder(&set);
+        assert!(!b.own_guard(&pfs_access(
+            set[0].as_bytes(),
+            false,
+            vec![("information_schema", "COLUMNS", TableOp::Write)]
+        )));
+    }
+
+    /// The events of `text` sent by `user` from the agent's address, on
+    /// each source: `server_audit` (QUERY record only), the `audit_log`
+    /// JSON file and `performance_schema`; a fresh builder each time.
+    fn on_every_source(user: &str, text: &str) -> Vec<(EventSource, Option<MaskedEvent>)> {
+        let one = |ev: Vec<MaskedEvent>| {
+            assert!(ev.len() <= 1, "{text}");
+            ev.into_iter().next()
+        };
+        let mut out = Vec::new();
+        let mut b = EventBuilder::new(own());
+        let recs = sa_at(&[sa_line(user, "172.18.0.1", 1, text)], 4096);
+        out.push((
+            EventSource::MariadbServerAudit,
+            one(b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now())),
+        ));
+        let mut b = EventBuilder::new(own());
+        out.push((
+            EventSource::MysqlAuditLog,
+            one(b.convert_file(
+                vec![json_query(user, "172.18.0.1", 1, text)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            )),
+        ));
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+        access.user = user;
+        access.principal = EventPrincipal::account(user);
+        access.rows = Some(1);
+        out.push((
+            EventSource::PerformanceSchema,
+            b.statement(access, SystemTime::now()),
+        ));
+        out
+    }
+
+    /// `show` without the rows (they differ per source) and with the
+    /// always-reported mark.
+    fn shown(e: &MaskedEvent) -> String {
+        format!(
+            "{} {:?}{}",
+            e.action().as_str(),
+            e.objects()
+                .iter()
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect::<Vec<_>>(),
+            if e.always_report() { " always" } else { "" }
+        )
+    }
+
+    /// Checks `text` from `app` and from the agent's account on every
+    /// source: `want(source)` is the expected [`shown`] event.
+    fn expect_everywhere(text: &str, want: impl Fn(EventSource) -> String) {
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, text) {
+                let got = ev.as_ref().map(shown);
+                assert_eq!(
+                    got.as_deref(),
+                    Some(want(source).as_str()),
+                    "{user} {source:?}: {text}"
+                );
+            }
+        }
+    }
+
+    /// The database of an unknown object: the session's (`shop` in the
+    /// `server_audit` lines), none in the other records of these tests.
+    fn star(source: EventSource) -> &'static str {
+        if source == EventSource::MariadbServerAudit {
+            "shop.*"
+        } else {
+            "*.*"
+        }
+    }
+
+    /// Security review of #168, H1: texts whose readings differ (version
+    /// comments) or that do not lex keep their most reportable kind and
+    /// are reported (fail closed), never dropped.
+    #[test]
+    fn ambiguous_and_unlexable_texts_are_reported() {
+        for text in [
+            "SET /*M! GLOBAL */ server_audit_excl_users = 'mallory'",
+            "/*!80000 SET GLOBAL audit_log_exclude_accounts = 'mallory@%' */",
+            "SET /**/ GLOBAL server_audit_excl_users = 'x\u{e9}\\'",
+            "SET STATEMENT sql_mode='' FOR SET GLOBAL server_audit_excl_users = CONCAT('mallory', LEFT('\u{e9}\\',0))",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+        expect_everywhere(
+            "SET STATEMENT max_statement_time=1 /*M! FOR UPDATE performance_schema.setup_consumers SET enabled='NO' */",
+            |s| format!("write [{:?}] always", star(s)),
+        );
+        for text in [
+            "/*M! SELECT * FROM hr.customers */",
+            "/*!80000 SELECT * FROM hr.customers */",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+        }
+    }
+
+    /// Review of #168, M3, M1, L2: nested `SET STATEMENT`, code that runs
+    /// out of sight, `LOAD DATA`, `RENAME TABLE`, multi-statement texts.
+    #[test]
+    fn hidden_changes_are_reported() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        for text in [
+            "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR SET STATEMENT c=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET @a=1; UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "LOAD DATA INFILE '/tmp/x' INTO TABLE performance_schema.setup_consumers",
+        ] {
+            expect_everywhere(text, |_| consumers.to_owned());
+        }
+        // Deeper than 8 levels: DDL (fail closed).
+        let deep = format!(
+            "{}UPDATE performance_schema.setup_consumers SET enabled='NO'",
+            "SET STATEMENT a=1 FOR ".repeat(9)
+        );
+        expect_everywhere(&deep, |_| "ddl [] always".to_owned());
+        expect_everywhere(
+            "SET autocommit=1; SET GLOBAL server_audit_logging=OFF",
+            |_| "ddl [] always".to_owned(),
+        );
+        expect_everywhere(
+            "LOAD DATA LOCAL INFILE '/tmp/x' REPLACE INTO TABLE `hr`.`t` (a, b)",
+            |_| "write [\"hr.t\"]".to_owned(),
+        );
+        expect_everywhere("INSERT hr.t (a) VALUES (1)", |_| {
+            "write [\"hr.t\"]".to_owned()
+        });
+        expect_everywhere("RENAME TABLE hr.a TO hr.b", |_| "ddl []".to_owned());
+        for text in [
+            "EXECUTE s",
+            "EXECUTE IMMEDIATE @q",
+            "PREPARE s FROM @q",
+            "SELECT hr.f(1)",
+            "DO `hr`.`f`()",
+            "SET @x = hr.f()",
+            "CALL hr.p()",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+        }
+        // A named read that also calls a stored function: both.
+        expect_everywhere(
+            "SELECT email, hr.f(id) FROM hr.customers WHERE id = 1",
+            // Objects are sorted: `*` first.
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
+        );
+        // An ordinary small write is not marked: `min_rows` applies.
+        expect_everywhere("UPDATE hr.t SET a = 1 WHERE id = 2", |_| {
+            "write [\"hr.t\"]".to_owned()
+        });
+    }
+
+    /// Review of #168, L1: with the agent's identity, a `CALL`, an
+    /// `EXECUTE`, a stored function call and a text that cannot be read
+    /// are never its own, even within its row budget; its plain reads
+    /// still are.
+    #[test]
+    fn the_agents_hidden_code_is_never_its_own() {
+        for text in [
+            "CALL hr.p()",
+            "EXECUTE s",
+            "SELECT hr.f(1) FROM hr.t LIMIT 1",
+            "/*M! SELECT a FROM hr.t LIMIT 1 */",
+            "SELECT a FROM hr.t WHERE b = 'x\u{e9}\\' LIMIT 1",
+        ] {
+            for (source, ev) in on_every_source("databastion", text) {
+                assert!(ev.is_some(), "{source:?}: {text}");
+            }
+        }
+        for (source, ev) in on_every_source("databastion", "SELECT a FROM hr.t LIMIT 1") {
+            assert!(ev.is_none(), "{source:?}");
+        }
+    }
+
+    /// Re-review of #168, N1: a multi-statement text whose most
+    /// reportable statement is a write keeps the signals of its reads.
+    #[test]
+    fn read_signals_survive_a_write_in_the_same_text() {
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'; UPDATE shop.t SET a = a WHERE 0",
+            ) {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert_eq!(e.action(), EventAction::Write, "{source:?}");
+                assert!(e.signals().contains(&Signal::IntoOutfile), "{source:?}");
+                assert!(e.signals().contains(&Signal::FullTableRead), "{source:?}");
+            }
+            for (source, ev) in on_every_source(
+                user,
+                "SELECT SQL_NO_CACHE * FROM hr.customers; INSERT INTO shop.t VALUES (1)",
+            ) {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert_eq!(e.action(), EventAction::Write, "{source:?}");
+                assert_eq!(
+                    e.signals(),
+                    [Signal::FullTableRead, Signal::Mysqldump],
+                    "{source:?}"
+                );
+            }
+        }
+    }
+
+    /// Re-review of #168, N2: audit log administration functions are
+    /// configuration DDL, always reported, qualified or not.
+    #[test]
+    fn audit_functions_are_reported() {
+        for text in [
+            "SELECT audit_log_filter_set_user('%', 'log_none')",
+            "SELECT audit_log_filter_set_filter('log_none', '{\"filter\": {\"log\": false}}')",
+            "SELECT audit_log_filter_remove_user('%')",
+            "SELECT audit_log_filter_remove_filter('log_all')",
+            "SELECT audit_log_filter_flush()",
+            "SELECT audit_log_read()",
+            "SELECT audit_log_read_bookmark()",
+            "SELECT audit_log_rotate()",
+            "SELECT audit_log_encryption_password_set('x')",
+            "SELECT mysql.audit_log_filter_set_user('%', 'log_none')",
+            "DO audit_log_filter_remove_user('%')",
+            "SET @x = audit_log_filter_remove_user('%')",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+    }
+
+    /// Re-review of #168, N3: a qualified call after `ON` in a read is a
+    /// call: reported against `*`, never the agent's own.
+    #[test]
+    fn calls_after_on_in_a_read_are_calls() {
+        expect_everywhere(
+            "SELECT a FROM hr.t JOIN hr.u ON hr.disable_consumers() LIMIT 1",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.t\", \"hr.u\"] always".to_owned(),
+                st => format!("read [\"hr.t\", \"hr.u\", {st:?}] always"),
+            },
+        );
+    }
+
+    /// Re-review of #168, N5: a text that trips the multibyte rule (a name
+    /// ending in a non-ASCII character, before its closing backtick) is decided by
+    /// its table records when they all read; without records it is
+    /// reported.
+    #[test]
+    fn unreadable_own_samples_with_read_records_stay_own() {
+        let text = "SELECT LEFT(`c`, 4096) FROM `hr`.`caf\u{e9}` LIMIT 10";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        let records = |q: u64| {
+            vec![
+                format!("20260929 09:40:35,h,databastion,172.18.0.1,30,{q},READ,hr,caf\u{e9},"),
+                sa_line("databastion", "172.18.0.1", q, text),
+            ]
+        };
+        let mut b = EventBuilder::new(own());
+        // Within the budget (unknown rows: the whole budget): left out,
+        // then reported, as any own read of a table.
+        assert_eq!(file(&mut b, sa_at(&records(1), 4096)), Vec::<String>::new());
+        assert_eq!(file(&mut b, sa_at(&records(2), 4096)).len(), 1);
+        // Without table records: never the agent's own.
+        let mut b = EventBuilder::new(own());
+        let out = b.convert_file(
+            sa_at(&[sa_line("databastion", "172.18.0.1", 1, text)], 4096),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            out.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"shop.*\"] always"]
+        );
+    }
+
+    /// Re-review of d162baa, P1: double-quoted names (`ANSI_QUOTES`, set
+    /// by any session without an event) hide the objects: reported against
+    /// `*`, always reported, never the agent's own.
+    #[test]
+    fn double_quoted_names_are_reported() {
+        let star = |s: EventSource, action: &str| format!("{action} [{:?}] always", star(s));
+        for text in [
+            "SELECT * FROM \"hr\".\"customers\"",
+            "SELECT * FROM \"customers\"",
+            "SELECT a FROM hr.t JOIN \"customers\" c ON c.id = t.id",
+            "SELECT \"hr\".\"f\"(1)",
+        ] {
+            expect_everywhere(text, |s| match text {
+                t if t.contains("JOIN") => match super::tests::star(s) {
+                    "*.*" => "read [\"*.*\", \"hr.t\"] always".to_owned(),
+                    st => format!("read [\"hr.t\", {st:?}] always"),
+                },
+                _ => star(s, "read"),
+            });
+        }
+        expect_everywhere("SELECT * FROM hr.a, \"b\"", |s| {
+            match super::tests::star(s) {
+                "*.*" => "read [\"*.*\", \"hr.a\"] always".to_owned(),
+                st => format!("read [\"hr.a\", {st:?}] always"),
+            }
+        });
+        expect_everywhere(
+            "UPDATE \"performance_schema\".\"setup_consumers\" SET \"ENABLED\" = 'NO'",
+            |s| star(s, "write"),
+        );
+        expect_everywhere("DELETE FROM \"hr\".\"customers\"", |s| star(s, "write"));
+        for text in [
+            "SELECT \"audit_log_filter_remove_user\"('%')",
+            "SELECT \"AUDIT_LOG_ROTATE\" ()",
+        ] {
+            expect_everywhere(text, |_| "ddl [] always".to_owned());
+        }
+        // Double-quoted strings in value positions: the backstop adds `*`
+        // without the always-reported mark (from any account: the agent
+        // never sends `"`).
+        let with_star = |s: EventSource, action: &str, table: &str| match self::star(s) {
+            "*.*" => format!("{action} [\"*.*\", {table:?}]"),
+            st => format!("{action} [{table:?}, {st:?}]"),
+        };
+        expect_everywhere("SELECT a FROM hr.t WHERE a = \"x\"", |s| {
+            with_star(s, "read", "hr.t")
+        });
+        expect_everywhere("INSERT INTO hr.t VALUES (\"x\", \"y\")", |s| {
+            with_star(s, "write", "hr.t")
+        });
+        expect_everywhere("UPDATE hr.t SET a = \"x\", b = \"y\" WHERE id = 1", |s| {
+            with_star(s, "write", "hr.t")
+        });
+        expect_everywhere("SELECT \"x\", CONCAT(\"a\", \"b\")", |s| {
+            format!("read [{:?}]", self::star(s))
+        });
+        // INTO OUTFILE "…" keeps its signal.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, "SELECT a FROM hr.t INTO OUTFILE \"/x\"") {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert!(e.signals().contains(&Signal::IntoOutfile), "{source:?}");
+                assert!(!e.always_report(), "{source:?}");
+            }
+        }
+        // Session settings with double quotes: no event.
+        for (source, ev) in on_every_source("app", "SET NAMES \"utf8mb4\"") {
+            assert!(ev.is_none(), "{source:?}");
+        }
+    }
+
+    /// Re-review of 86e2d31, R1: double-quoted names in positions the
+    /// precise rule now covers, and the backstop for the others, on the
+    /// file sources without table records, and from the agent's account
+    /// with a READ record of a decoy table.
+    #[test]
+    fn double_quoted_name_bypasses_are_closed() {
+        let precise = [
+            "SELECT * FROM (\"customers\")",
+            "SELECT * FROM ((\"customers\"))",
+            "SELECT * FROM (SELECT 1) x, \"customers\"",
+            "SELECT * FROM hr.a AS x, \"customers\"",
+            "HANDLER \"customers\" OPEN",
+            "HANDLER \"customers\" READ FIRST",
+            "SELECT * FROM hr.a STRAIGHT_JOIN \"customers\"",
+            "SELECT * FROM hr.a USE INDEX (i), \"customers\"",
+        ];
+        for text in precise {
+            let parts = analyze_raw(text.as_bytes(), analyze_opts(false));
+            assert!(
+                parts.parts().iter().any(|p| p.dquoted_name),
+                "precise: {text}"
+            );
+        }
+        for text in precise {
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let out = b.convert_file(
+                    sa_at(&[sa_line(user, "172.18.0.1", 1, text)], 4096),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(out.len(), 1, "{user} server_audit: {text}");
+                assert!(out[0].always_report(), "{user}: {text}");
+                assert!(show(&out[0]).contains("shop.*"), "{user}: {text}");
+                let mut b = EventBuilder::new(own());
+                let out = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 1, text)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(out.len(), 1, "{user} json: {text}");
+                assert!(out[0].always_report(), "{user}: {text}");
+            }
+            // The agent's account with a READ record of a decoy table:
+            // reported, `*` added.
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        "20260929 09:40:35,h,databastion,172.18.0.1,30,1,READ,hr,a,".to_owned(),
+                        sa_line("databastion", "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(out.len(), 1, "own with record: {text}");
+            assert!(show(&out[0]).contains("shop.*"), "{text}");
+        }
+        // Backstop only: a double-quoted token the precise rule does not
+        // place (`FROM a JOIN b ON x, "t"` style), still `*`, never own.
+        let text = "SELECT * FROM hr.a JOIN hr.b ON hr.a.id = hr.b.id, \"customers\"";
+        let a = analyze_raw(text.as_bytes(), analyze_opts(false));
+        assert!(a.parts().iter().all(|p| !p.dquoted_name && p.dquoted));
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,a,"),
+                        sa_line(user, "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.a\", \"shop.*\"]"],
+                "{user}"
+            );
+        }
+    }
+
+    /// Re-review of d162baa, P2: an audit function after an unreadable
+    /// literal is found by a raw scan: DDL, always reported, never the
+    /// agent's own, also with table records that all read.
+    #[test]
+    fn audit_functions_after_unreadable_literals_are_reported() {
+        let text = "SELECT a FROM hr.t WHERE x = 'x\u{e9}\\' AND audit_log_filter_remove_user /* c */ ('%') IS NOT NULL";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,t,"),
+                        sa_line(user, "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["ddl [\"hr.t\"] always"],
+                "{user}"
+            );
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                vec![json_query(user, "172.18.0.1", 1, text)],
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["ddl [] always"],
+                "{user}"
+            );
+        }
+    }
+
+    /// Writes to the tables behind the audit functions are always
+    /// reported.
+    #[test]
+    fn writes_to_audit_filter_tables_are_always_reported() {
+        expect_everywhere(
+            "UPDATE mysql.audit_log_user SET FILTERNAME = 'log_none' WHERE USER = '%'",
+            |_| "write [\"mysql.audit_log_user\"] always".to_owned(),
+        );
+        expect_everywhere(
+            "INSERT INTO mysql.audit_log_filter (NAME, FILTER) VALUES ('n', '{}')",
+            |_| "write [\"mysql.audit_log_filter\"] always".to_owned(),
+        );
+        expect_everywhere("UPDATE mysql.user SET a = 1 WHERE b = 2", |_| {
+            "write [\"mysql.user\"]".to_owned()
+        });
+    }
+
+    /// Re-review of 07b04d6, H1: reads inside a session `SET` or `DO`
+    /// (then `SELECT @x`) are reads of their tables, from any account,
+    /// never the agent's own; utility statements and the agent's session
+    /// settings are unchanged.
+    #[test]
+    fn reads_inside_session_sets_are_reported() {
+        for text in [
+            "SET @x = (SELECT GROUP_CONCAT(email) FROM hr.customers)",
+            "SET @x := (SELECT GROUP_CONCAT(email) FROM hr.customers)",
+            "SET @a = 1, @x = (SELECT email FROM hr.customers WHERE id = 1)",
+            "DO (SELECT COUNT(*) FROM hr.customers)",
+            "SET @x = CONCAT('a', (SELECT GROUP_CONCAT(email) FROM hr.customers))",
+            "SET STATEMENT max_statement_time = 1 FOR SET @x = (SELECT email FROM hr.customers LIMIT 1)",
+        ] {
+            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+        }
+        // A subquery inside a function call of a read names its table.
+        for (source, ev) in on_every_source(
+            "app",
+            "SELECT CONCAT((SELECT GROUP_CONCAT(email) FROM hr.customers))",
+        ) {
+            assert_eq!(
+                ev.as_ref().map(shown).as_deref(),
+                Some("read [\"hr.customers\"]"),
+                "{source:?}"
+            );
+        }
+        // Already a read (and the agent's own within its budget).
+        for (source, ev) in on_every_source("app", "SELECT email INTO @x FROM hr.customers LIMIT 1")
+        {
+            assert_eq!(
+                ev.as_ref().map(shown).as_deref(),
+                Some("read [\"hr.customers\"]"),
+                "{source:?}"
+            );
+        }
+        // A subquery without a user table: a read of `*` (fail closed).
+        for text in [
+            "SET @x = (SELECT 1)",
+            "SET @x = (SELECT COUNT(*) FROM performance_schema.threads)",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(format!("read [{:?}]", star(source)).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        // No table, or an allow-listed utility statement: no event.
+        for text in [
+            "SELECT @x",
+            "SHOW CREATE TABLE hr.customers",
+            "SHOW COLUMNS FROM hr.customers",
+            "LOCK TABLES hr.customers READ",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "FLUSH TABLES hr.customers",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+        // `EXPLAIN ANALYZE` runs its statement.
+        for (source, ev) in on_every_source("app", "EXPLAIN ANALYZE SELECT a FROM hr.t WHERE b = 1")
+        {
+            assert!(ev.is_some(), "{source:?}");
+        }
+        // The agent's session settings and its MariaDB sample statements.
+        for text in [
+            crate::sql::session_setup(crate::conn::Flavor::Mariadb, 1000),
+            crate::sql::session_setup(crate::conn::Flavor::Mysql, 1000),
+            crate::sql::SESSION_READ_ONLY.to_owned(),
+            crate::sql::sample_statement(
+                crate::conn::Flavor::Mariadb,
+                1000,
+                "support",
+                "tickets",
+                &[("c", crate::sql::Sampled::Text)],
+                10,
+            )
+            .unwrap(),
+        ] {
+            for (source, ev) in on_every_source("databastion", &text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+    }
+
+    /// Re-review of a2684a2: `ANALYZE` / `EXPLAIN ANALYZE` run their
+    /// statement, `BEGIN NOT ATOMIC` runs a block, and statements of no
+    /// known kind fail closed outside a closed allow-list.
+    #[test]
+    fn wrapped_and_unknown_statements_fail_closed() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        let actors = "write [\"performance_schema.setup_actors\"] always";
+        for (text, want) in [
+            (
+                "ANALYZE UPDATE performance_schema.setup_consumers SET ENABLED='NO'",
+                consumers,
+            ),
+            (
+                "ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "ANALYZE FORMAT=JSON DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "EXPLAIN ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "EXPLAIN FORMAT=TREE ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "SET STATEMENT max_statement_time=1 FOR ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "ANALYZE DELETE FROM hr.customers",
+                "write [\"hr.customers\"]",
+            ),
+            (
+                "ANALYZE SELECT * FROM hr.customers",
+                "read [\"hr.customers\"]",
+            ),
+            (
+                "DESCRIBE ANALYZE SELECT * FROM hr.customers",
+                "read [\"hr.customers\"]",
+            ),
+            (
+                "EXPLAIN ANALYZE UPDATE performance_schema.setup_consumers c, performance_schema.setup_instruments i SET c.ENABLED='NO'",
+                "write [\"performance_schema.setup_consumers\", \"performance_schema.setup_instruments\"] always",
+            ),
+            (
+                "EXPLAIN ANALYZE DELETE a FROM performance_schema.setup_actors a, performance_schema.setup_objects o",
+                "write [\"performance_schema.setup_actors\", \"performance_schema.setup_objects\"] always",
+            ),
+        ] {
+            expect_everywhere(text, |_| want.to_owned());
+        }
+        // `BEGIN NOT ATOMIC`: like a procedure (`*`, always reported),
+        // with what its statements name.
+        expect_everywhere(
+            "BEGIN NOT ATOMIC SELECT * FROM hr.customers; END",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
+        );
+        expect_everywhere(
+            "lbl: BEGIN NOT ATOMIC UPDATE performance_schema.setup_consumers SET ENABLED='NO'; END",
+            |s| match star(s) {
+                "*.*" => {
+                    "write [\"*.*\", \"performance_schema.setup_consumers\"] always".to_owned()
+                }
+                st => format!("write [\"performance_schema.setup_consumers\", {st:?}] always"),
+            },
+        );
+        // Not on the allow-list: a read of what they name, or of `*`.
+        expect_everywhere(
+            "SHOW TABLES WHERE (SELECT COUNT(*) FROM hr.customers) > 0",
+            |_| "read [\"hr.customers\"]".to_owned(),
+        );
+        for text in ["DO 1", "XA START 'x'", "HELP 'select'", "END"] {
+            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+        }
+        // The allow-list: no event.
+        for text in [
+            "SET NAMES utf8mb4",
+            "SET CHARACTER SET utf8mb4",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET autocommit = 1",
+            "SET @x = 1",
+            "SET @x = NOW()",
+            "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+            "FLUSH TABLES hr.customers FOR EXPORT",
+            "USE hr",
+            "BEGIN",
+            "BEGIN WORK",
+            "START TRANSACTION READ ONLY",
+            "COMMIT",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT s",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "SHOW TABLES",
+            "SHOW GRANTS FOR CURRENT_USER()",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "DESCRIBE hr.customers",
+            "LOCK TABLES hr.customers READ",
+            "UNLOCK TABLES",
+            "FLUSH PRIVILEGES",
+            "ANALYZE TABLE hr.customers",
+            "ANALYZE NO_WRITE_TO_BINLOG TABLE hr.customers",
+            "OPTIMIZE TABLE hr.customers",
+            "CHECK TABLE hr.customers",
+            "CHECKSUM TABLE hr.customers",
+            "REPAIR TABLE hr.customers",
+            "KILL 5",
+            "KILL QUERY 5",
+            "DEALLOCATE PREPARE s",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+    }
+
+    /// Re-review of c173fe8: `UPDATE` / `DELETE` / `REPLACE` modifiers,
+    /// `EXPLAIN … ANALYZE` anywhere before the statement, `(TABLE …)` /
+    /// `(VALUES …)` subqueries, and session `SET`s with function calls.
+    #[test]
+    fn modifiers_explain_forms_and_set_calls() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        for text in [
+            "UPDATE LOW_PRIORITY performance_schema.setup_consumers SET ENABLED = 'NO'",
+            "UPDATE IGNORE performance_schema.setup_consumers SET ENABLED = 'NO'",
+            "DELETE LOW_PRIORITY QUICK IGNORE FROM performance_schema.setup_consumers",
+            "REPLACE LOW_PRIORITY INTO performance_schema.setup_consumers VALUES ('x', 'NO')",
+            "REPLACE DELAYED performance_schema.setup_consumers VALUES ('x', 'NO')",
+        ] {
+            expect_everywhere(text, |_| consumers.to_owned());
+        }
+        expect_everywhere(
+            "UPDATE LOW_PRIORITY IGNORE performance_schema.setup_consumers, hr.a SET ENABLED = 'NO'",
+            |_| "write [\"hr.a\", \"performance_schema.setup_consumers\"] always".to_owned(),
+        );
+        let actors = "write [\"performance_schema.setup_actors\"] always";
+        for text in [
+            "EXPLAIN ANALYZE FORMAT=JSON INTO @x DELETE FROM performance_schema.setup_actors",
+            "EXPLAIN FORMAT=JSON INTO @x ANALYZE DELETE FROM performance_schema.setup_actors",
+        ] {
+            expect_everywhere(text, |_| actors.to_owned());
+        }
+        // `ANALYZE` without a statement found: never quiet (`*`).
+        expect_everywhere("EXPLAIN ANALYZE FOR CONNECTION 5", |s| {
+            format!("read [{:?}]", star(s))
+        });
+        for text in [
+            "SHOW TABLES WHERE 'a' IN (TABLE hr.customers)",
+            "SHOW TABLES WHERE ROW(1) IN (VALUES ROW(1)) AND 'a' IN (TABLE hr.customers)",
+        ] {
+            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+        }
+        // Session SETs: built-in calls are quiet; a stored or audit
+        // function is not.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+            ) {
+                assert!(ev.is_none(), "{user} {source:?}");
+            }
+        }
+        expect_everywhere("SET @x = hr.f()", |s| {
+            format!("read [{:?}] always", star(s))
+        });
+        expect_everywhere("SET @x = audit_log_rotate()", |_| {
+            "ddl [] always".to_owned()
+        });
     }
 
     #[test]

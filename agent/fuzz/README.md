@@ -16,6 +16,7 @@ tests of each connector (`src/proptests.rs`).
 | `openldap_filter` | `…::fuzz::search_filter` | One logged search filter (`reqFilter`) |
 | `openldap_accesslog` | `…::fuzz::accesslog` | One `cn=accesslog` entry, NUL-separated attribute values |
 | `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
+| `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the same visitor |
 | `cas_audit_log` | `…::fuzz::audit_log` | One CAS JSON audit log line; `what` reducer, time parser, event builder |
 
 The connectors expose these entry points only with their `fuzzing` feature, which the agent binary
@@ -30,6 +31,11 @@ cargo-fuzz uses but without a sanitizer:
 ```sh
 agent/fuzz/smoke.sh 60     # seconds per target
 ```
+
+`smoke.sh` seeds `cas_registry` and `cas_registry_yaml` with the committed fake definitions of
+`crates/connector-cas/fixtures/registry/` (JSON and YAML respectively): from an empty corpus a
+YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. The other targets
+start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
 
 Longer campaigns with AddressSanitizer need a nightly toolchain and cargo-fuzz:
 
