@@ -8,6 +8,7 @@ The project follows [semantic versioning](https://semver.org/).
 ## Unreleased
 
 ### 🐛 Bug Fixes
+- Console dependencies: `next` 16.3.8 (security fixes, among them GHSA-cjq9-62q9-8jv4, an SSRF in image optimization, which the console disables, and several cache-poisoning advisories), with `eslint-config-next` 16.3.8, `react` / `react-dom` 19.3.0, `pg` 8.23.1, `pg-boss` 12.35.1, `vitest` 5.0.3, `@types/node` 24.19.1 and the matching `@types/react*`. TypeScript stays on 5.x and `@types/node` on 24.x: typescript-eslint does not support TypeScript 7 yet, and the console runs on Node.js 24 (Dependabot now ignores TypeScript 6+ and `@types/node` majors; replaces #150).
 - Dev environment: `make dev-cas` no longer fails at random after CAS is healthy. `docker compose up --wait` could report the normal exit (0) of the one-shot `cas-db-grants` as a failure; it now runs on its own with `docker compose run --rm` once CAS is healthy.
 
 ### 👷 CI
