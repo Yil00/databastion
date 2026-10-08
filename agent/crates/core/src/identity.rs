@@ -222,6 +222,13 @@ impl StateDir {
     }
 }
 
+/// The body of an agent secret: base64url without padding (RFC 4648
+/// section 5), 43 characters for 32 bytes. Pinned by a fixed vector test so
+/// that a `base64` upgrade cannot change it.
+fn encode_secret_body(raw: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
 /// Generates a new agent secret: `dbs_` + base64url of 32 bytes from the OS
 /// CSPRNG (ADR-0008). Retries in the (astronomically unlikely) case of a
 /// body with fewer than 16 distinct characters, which the console rejects.
@@ -229,7 +236,7 @@ pub(crate) fn generate_secret() -> Result<AgentSecret, IdentityError> {
     for _ in 0..8 {
         let mut raw = Zeroizing::new([0u8; 32]);
         getrandom::fill(raw.as_mut()).map_err(|_| IdentityError::Random)?;
-        let body = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*raw));
+        let body = encode_secret_body(&raw);
         let distinct = body.bytes().collect::<std::collections::HashSet<_>>().len();
         if distinct < 16 {
             continue;
@@ -371,5 +378,27 @@ pub(crate) mod tests {
         assert_eq!(a.expose().len(), 47);
         assert!(a.expose().starts_with("dbs_"));
         assert_ne!(a.expose(), b.expose());
+    }
+
+    /// Fixed vectors for the secret body: URL-safe alphabet (`-` and `_`,
+    /// never `+` or `/`), no `=` padding, 43 characters.
+    #[test]
+    fn secret_body_encoding_is_pinned() {
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap();
+        }
+        assert_eq!(
+            encode_secret_body(&raw).as_str(),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        );
+        assert_eq!(
+            encode_secret_body(&[0xfb; 32]).as_str(),
+            "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+        );
+        assert_eq!(
+            encode_secret_body(&[0xff; 32]).as_str(),
+            "__________________________________________8"
+        );
     }
 }
