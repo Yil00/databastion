@@ -1,6 +1,7 @@
 //! Discovery of a `cas` target (ADR-0041 decision 4).
 //!
-//! - **Service registry**: each listed `.json` file is one unit of work
+//! - **Service registry**: each listed `.json` (or, for `yaml_dir`, `.yml` /
+//!   `.yaml`) file is one unit of work
 //!   (paced, ADR-0035), read through [`crate::fsread`] and parsed by
 //!   [`crate::parse::definition`] under panic isolation. String values are
 //!   pooled per (service type, field path) across services and classified
@@ -42,7 +43,7 @@ use zeroize::Zeroizing;
 use crate::audit::events::is_unidentified;
 use crate::config::CasSettings;
 use crate::fsread::{self, FileSkip, Policy, Refusal};
-use crate::parse::definition::{DefinitionError, SecretForm, ServiceType, parse_definition};
+use crate::parse::definition::{DefinitionError, SecretForm, ServiceType, parse_registry_file};
 use crate::parse::record::Action;
 use crate::registry::{ServiceIndex, field_name, object_name};
 use crate::state::{CasState, RegistryFacts};
@@ -146,10 +147,11 @@ async fn scan_registry(
     let Some(dir) = settings.registry_dir.clone() else {
         return Ok(());
     };
+    let format = settings.registry_format;
     let listed = job
         .paced(tokio::task::spawn_blocking(move || {
             if dir.still_resolves() {
-                fsread::list_registry(dir.path(), policy)
+                fsread::list_registry(dir.path(), format, policy)
             } else {
                 Err(Refusal::ResolvedChanged)
             }
@@ -193,7 +195,7 @@ async fn scan_registry(
                 // panic costs that file only (review of #138 I6).
                 databastion_core::isolate(|| match l.read(&name, policy) {
                     Err(skip) => FileOutcome::Skipped(skip),
-                    Ok(bytes) => match parse_definition(&bytes) {
+                    Ok(bytes) => match parse_registry_file(format, &bytes) {
                         Err(e) => FileOutcome::Refused(e),
                         Ok(d) => FileOutcome::Parsed(d),
                     },
@@ -335,7 +337,8 @@ pub(crate) fn index_registry(
     if !dir.still_resolves() {
         return None;
     }
-    let listing = fsread::list_registry(dir.path(), policy).ok()?;
+    let format = settings.registry_format;
+    let listing = fsread::list_registry(dir.path(), format, policy).ok()?;
     let mut facts = RegistryFacts {
         skipped: listing.over_cap,
         ..RegistryFacts::default()
@@ -345,7 +348,7 @@ pub(crate) fn index_registry(
         // Err(true): refused because the agent could write it.
         let parsed = databastion_core::isolate(|| match listing.read(name, policy) {
             Err(skip) => Err(skip == FileSkip::Writable),
-            Ok(bytes) => parse_definition(&bytes).map_err(|_| false),
+            Ok(bytes) => parse_registry_file(format, &bytes).map_err(|_| false),
         })
         .unwrap_or(Err(false));
         match parsed {
@@ -584,5 +587,160 @@ mod tests {
         );
         let all = format!("{findings:?}");
         assert!(!all.contains("user1") && !all.contains("TGT-") && !all.contains("typed"));
+    }
+
+    const FIXTURES: [(&str, &str, &str); 3] = [
+        (
+            "HR-Portal-10000003",
+            include_str!("../fixtures/registry/HR-Portal-10000003.json"),
+            include_str!("../fixtures/registry/HR-Portal-10000003.yml"),
+        ),
+        (
+            "Wiki-10000004",
+            include_str!("../fixtures/registry/Wiki-10000004.json"),
+            include_str!("../fixtures/registry/Wiki-10000004.yaml"),
+        ),
+        (
+            "SP-10000005",
+            include_str!("../fixtures/registry/SP-10000005.json"),
+            include_str!("../fixtures/registry/SP-10000005.yml"),
+        ),
+    ];
+
+    fn yaml_settings(dir: &TempDir) -> CasSettings {
+        CasSettings::from_yaml(
+            &format!(
+                "{{service_registry: {{yaml_dir: {}}}}}",
+                dir.path().join("services").display()
+            ),
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// Findings in a comparable form, sorted: masked samples sorted too
+    /// (their order is keyed per scan job) and fingerprints counted (each
+    /// scan job has its own key).
+    fn comparable(findings: &[MaskedFinding]) -> Vec<String> {
+        let mut v: Vec<String> = findings
+            .iter()
+            .map(|f| {
+                let mut samples: Vec<String> = f
+                    .masked_samples()
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect();
+                samples.sort();
+                format!(
+                    "{:?} {samples:?} {} {:?} {} {} {} {:?}",
+                    f.classifier(),
+                    f.fingerprints().len(),
+                    f.location(),
+                    f.sampled(),
+                    f.matched(),
+                    f.confidence(),
+                    f.estimated_rows()
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn a_yaml_registry_gives_the_findings_of_its_json_equivalent() {
+        let json_dir = TempDir::new("disc-json-eq");
+        let yaml_dir = TempDir::new("disc-yaml-eq");
+        let jreg = json_dir.path().join("services");
+        let yreg = yaml_dir.path().join("services");
+        std::fs::create_dir(&jreg).unwrap();
+        std::fs::create_dir(&yreg).unwrap();
+        for (stem, json, yaml) in FIXTURES {
+            std::fs::write(jreg.join(format!("{stem}.json")), json).unwrap();
+            std::fs::write(yreg.join(format!("{stem}.yml")), yaml).unwrap();
+        }
+        // A JSON file in a YAML registry is not listed.
+        std::fs::write(yreg.join("Stray-9.json"), FAKE_SERVICE).unwrap();
+        let (jf, jstate) = scan(&settings(&json_dir, false)).await;
+        let (yf, ystate) = scan(&yaml_settings(&yaml_dir)).await;
+        assert!(!jf.is_empty());
+        assert_eq!(comparable(&jf), comparable(&yf));
+        assert_eq!(jstate.snapshot().registry, ystate.snapshot().registry);
+        assert_eq!(
+            ystate.snapshot().registry,
+            Some(RegistryFacts {
+                skipped: 0,
+                clear_secrets: 1,
+                writable: 0,
+            })
+        );
+        assert_eq!(ystate.services().unwrap().len(), 3);
+        let all = format!("{yf:?}");
+        for leak in [
+            "jane.doe@example.org",
+            "john.roe",
+            "fake-clear-secret",
+            "FAKE-",
+            "hunter2",
+            "HR-Portal-10000003",
+        ] {
+            assert!(!all.contains(leak), "{leak} in {all}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_yaml_files_are_skipped_and_counted() {
+        let dir = TempDir::new("disc-yaml-hostile");
+        let outside = TempDir::new("disc-yaml-outside");
+        let reg = dir.path().join("services");
+        std::fs::create_dir(&reg).unwrap();
+        let (_, _, good) = FIXTURES[0];
+        std::fs::write(reg.join("Good-1.yml"), good).unwrap();
+        let head = "--- !<org.apereo.cas.services.CasRegisteredService>\nserviceId: x\n";
+        let mut laughs = format!("{head}a0: &a0 [\"lol\", \"lol\"]\n");
+        for i in 1..10 {
+            let p = i - 1;
+            laughs.push_str(&format!("a{i}: &a{i} [*a{p}, *a{p}, *a{p}]\n"));
+        }
+        std::fs::write(reg.join("Laughs-2.yml"), laughs).unwrap();
+        let mut deep = head.to_owned();
+        for i in 0..100 {
+            deep.push_str(&format!("{}k:\n", " ".repeat(i)));
+        }
+        std::fs::write(reg.join("Deep-3.yml"), deep).unwrap();
+        std::fs::write(
+            reg.join("Tag-4.yml"),
+            format!("{head}description: !!python/object/apply:os.system [id]\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            reg.join("Merge-5.yml"),
+            format!("{head}other:\n  <<: {{email: hidden.value@example.org}}\n"),
+        )
+        .unwrap();
+        let target = outside.path().join("Target.yml");
+        std::fs::write(&target, good).unwrap();
+        std::os::unix::fs::symlink(&target, reg.join("Sym-6.yml")).unwrap();
+        let linked = outside.path().join("Linked.yml");
+        std::fs::write(&linked, good).unwrap();
+        std::fs::hard_link(&linked, reg.join("Hard-7.yml")).unwrap();
+        let mut big = head.to_owned();
+        big.push_str(&"# padding\n".repeat(110_000));
+        std::fs::write(reg.join("Big-8.yml"), big).unwrap();
+        let (findings, state) = scan(&yaml_settings(&dir)).await;
+        assert_eq!(
+            state.snapshot().registry,
+            Some(RegistryFacts {
+                skipped: 7,
+                clear_secrets: 1,
+                writable: 0,
+            })
+        );
+        assert_eq!(state.services().unwrap().len(), 1);
+        let all = format!("{findings:?}");
+        assert!(
+            !all.contains("hidden.value") && !all.contains("lol"),
+            "{all}"
+        );
     }
 }

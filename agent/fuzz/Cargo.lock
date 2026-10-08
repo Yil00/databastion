@@ -197,6 +197,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",

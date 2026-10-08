@@ -139,7 +139,7 @@ pub(crate) fn check_blocking(
     let snap = state.snapshot();
     if let Some(dir) = &settings.registry_dir {
         let listed = if dir.still_resolves() {
-            fsread::list_registry(dir.path(), policy)
+            fsread::list_registry(dir.path(), settings.registry_format, policy)
         } else {
             Err(Refusal::ResolvedChanged)
         };

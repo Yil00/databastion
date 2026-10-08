@@ -1,5 +1,6 @@
 //! I/O-free parsers of CAS data (ADR-0041 decision 2, last item): the
-//! service definition ([`definition`]), the audit record ([`record`]), the
+//! service definition ([`definition`], JSON or YAML after the pre-scan of
+//! [`yaml`]), the audit record ([`record`]), the
 //! `what` reducer and URL credential stripping ([`url`]) and audit times
 //! ([`when`]). The existing connectors can later reuse the service
 //! definition parser for registries held in a database (ADR-0041 open
@@ -10,6 +11,7 @@ pub(crate) mod jtext;
 pub mod record;
 pub mod url;
 pub mod when;
+pub mod yaml;
 
 use zeroize::Zeroizing;
 

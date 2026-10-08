@@ -26,7 +26,7 @@ targets:
     engine: cas
     cas:
       service_registry:
-        json_dir: /etc/cas/services        # JSON only for now (yaml_dir is refused)
+        json_dir: /etc/cas/services        # or yaml_dir: YAML definitions (exclusive)
       audit_log:
         path: /var/log/cas/cas_audit.log   # audit-format: JSON, one record per line
         timezone: UTC                      # or a fixed offset ±HH:MM
@@ -53,13 +53,55 @@ refused as a whole, and those files are never opened.
 
 ## Service registry (Discovery)
 
-- The directory is listed non-recursively; each `.json` entry (at most 4096,
-  each at most 1 MiB) is opened with `openat(…, O_NOFOLLOW | O_NONBLOCK)` and
+- The directory is listed non-recursively; each `.json` entry (`json_dir`),
+  or `.yml` / `.yaml` entry (`yaml_dir`) (at most 4096, each at most 1 MiB) is opened with `openat(…, O_NOFOLLOW | O_NONBLOCK)` and
   checked on the descriptor (`fstat`): regular file, one hard link, not
   writable by the agent. Other entries are ignored; refused ones are counted.
 - A file is used only when its top-level object has an `@class` of a CAS
   registered service and a `serviceId`; anything else is skipped and none of
   its values is classified. JSON comments are not accepted.
+- **YAML** (`yaml_dir`, `src/parse/yaml.rs`): CAS 8.0.2 loads a YAML file
+  only when it starts with `--- !<class>` (`RegisteredServiceYamlSerializer`:
+  Jackson writes class hints as verbatim tags) and reads one document. The
+  agent requires the same start at byte 0, takes the class from that root
+  tag (a top-level `@class` next to it refuses the file), and **pre-scans
+  the raw bytes before any YAML parsing**, following libyaml's tokenizer:
+  the file is refused (skipped, counted) on an anchor (`&a`) or an alias
+  (`*a`) starting a token; a tag other than a verbatim Java class name
+  (`!<[A-Za-z_$][A-Za-z0-9_$.]*>`) placed after `:`, a block `-` or a flow
+  sequence `[` / `,` and not on a key; a scalar starting with `<<` (merge
+  key, quoted or not); a directive, a second `---` or a `...`; an explicit
+  (`?`), empty, multi-line or collection key; `@` or a backquote starting a
+  token; a tab outside quoted scalars, comments and block scalar content;
+  an indentation indicator on a block scalar; `:` followed by a non-blank
+  inside a flow collection; invalid UTF-8, control characters, a BOM, a
+  lone CR or a Unicode line break (`U+0085`, `U+2028`, `U+2029`); flow
+  collections nested deeper than 4, collections deeper than 32, or more than
+  32 768 lines. `&`, `*`, `!` and `#` inside quoted, plain and block
+  scalars and comments are text. The class hints are then blanked (replaced
+  by spaces, positions unchanged) in a zeroizing copy, which goes through
+  the same closed visitor and bounds as JSON with `serde_yaml_ng`: the YAML
+  parser never sees an anchor, an alias, a merge key nor a tag.
+- **YAML parser choice**: `serde_yaml_ng` 0.10, the maintained fork of the
+  deprecated `serde_yaml` (MIT / Apache-2.0), which the core already links
+  to read `agent.yaml`: no new crate in the agent binary (ADR-0041 decisions
+  4 and 13). It drives the closed serde visitor directly (no generic value
+  first) and refuses a stream of several documents. `serde_yml` was not
+  taken (unsound, unmaintained: RUSTSEC-2025-0068), nor `yaml-rust2` /
+  `saphyr` (new dependencies, and their event APIs would need a second
+  walker beside the serde visitor). Its scanner is `unsafe-libyaml` 0.2.11,
+  a machine translation of libyaml with `unsafe` code, archived by its
+  author (no advisory against 0.2.11; RUSTSEC-2023-0075 is fixed in it): the
+  pre-scan is what keeps hostile constructs away from it, and
+  `serde_yaml_ng` still bounds alias expansion and recursion on its own.
+  Moving the core and this crate together to a maintained fork
+  (`serde_norway`) or a safe parser is a separate decision.
+- **Zeroization gap (YAML)**: the file buffer, the blanked copy and every
+  kept value are zeroizing, as for JSON, but libyaml's internal buffers and
+  `serde_yaml_ng`'s event list hold copies of every scalar (the
+  `clientSecret` included) that are freed without being wiped. The JSON
+  path has the narrower gap of `serde_json`'s escape scratch buffer (ROADMAP
+  follow-up: move `definition.rs` to `jtext`).
 - Credential fields are never sampled: `clientSecret`, and every key whose
   name contains (case-insensitively) `secret`, `password`, `passwd`, `pass`,
   `pwd`, `key`, `token`, `credential`, `jwk`, `private`, `keystore`,
@@ -194,5 +236,7 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 
 ## Not done yet
 
-YAML registries (ROADMAP phase 8 follow-ups), and the records of the OAuth 2.0
-device authorization grant (not exercised against CAS 8.0.2).
+Subdirectories of the registry (CAS reads the JSON and YAML registries
+recursively, with one subdirectory per service type; the agent lists one
+level only), YAML anchors, aliases and merge keys (refused), and the records
+of the OAuth 2.0 device authorization grant (not exercised against CAS 8.0.2).
