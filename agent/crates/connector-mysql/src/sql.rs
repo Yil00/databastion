@@ -941,6 +941,24 @@ mod tests {
         }
     }
 
+    /// Every statement the agent sends is a recognized read or on the
+    /// Audit stream's allow-list of statements of no known kind: the
+    /// fail-closed `Other` path never reports the agent's own traffic.
+    #[test]
+    fn own_statements_are_reads_or_allow_listed() {
+        use databastion_classifiers::query::{AnalyzeOptions, StatementKind, analyze};
+        for s in all_statements() {
+            let a = analyze(&s, AnalyzeOptions::mysql());
+            assert!(a.lexed(), "{s}");
+            for p in a.parts() {
+                let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
+                let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
+                assert!(read || quiet, "{s}");
+                assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+            }
+        }
+    }
+
     #[test]
     fn statements_are_single_and_never_read_write() {
         for s in all_statements() {

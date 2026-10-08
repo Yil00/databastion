@@ -152,19 +152,40 @@ fn is_audit_table(db: &str, table: &str) -> bool {
             .any(|t| t.eq_ignore_ascii_case(table))
 }
 
-/// Utility statements that name tables without reading their rows
-/// (metadata, locks, maintenance), by their leading words. `EXPLAIN
-/// ANALYZE` runs its statement and is not one of them.
-fn is_utility(lead: &[String]) -> bool {
-    let first = lead.first().map(String::as_str);
-    let second = lead.get(1).map(String::as_str);
-    match first {
-        Some("explain" | "describe" | "desc") => second != Some("analyze"),
-        Some(
-            "show" | "lock" | "unlock" | "flush" | "analyze" | "optimize" | "check" | "checksum"
-            | "repair" | "cache" | "load" | "help" | "use" | "kill" | "reset" | "purge" | "begin"
-            | "commit" | "rollback" | "start" | "savepoint" | "release" | "xa",
-        ) => true,
+/// The closed allow-list of statements of no known kind that produce no
+/// event: they can neither read nor change data, and hold no subquery.
+/// Session `SET` without a function call or a table (`SET NAMES`,
+/// `SET CHARACTER SET`, `SET TRANSACTION`, `SET autocommit = 1`…), `USE`,
+/// `BEGIN` (not `BEGIN NOT ATOMIC`), `START TRANSACTION`, `COMMIT`,
+/// `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SHOW`, `EXPLAIN` / `DESCRIBE` /
+/// `DESC` without `ANALYZE`, `LOCK` / `UNLOCK TABLES`, `FLUSH`, `ANALYZE`
+/// / `OPTIMIZE` / `CHECK` / `CHECKSUM` / `REPAIR TABLE`, `KILL`,
+/// `DEALLOCATE PREPARE`.
+pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
+    if p.subquery || p.compound || p.analyze_wrapped || p.audit_function {
+        return false;
+    }
+    let lead: Vec<&str> = p.lead.iter().map(String::as_str).collect();
+    let table_word = |w: Option<&&str>| matches!(w.copied(), Some("table" | "tables"));
+    match lead.as_slice() {
+        ["set", ..] => !p.function_call && p.relations.is_empty(),
+        ["begin"] | ["begin", "work"] => true,
+        ["start", "transaction", ..]
+        | [
+            "commit" | "rollback" | "savepoint" | "release" | "use" | "kill" | "flush",
+            ..,
+        ]
+        | ["show" | "explain" | "describe" | "desc", ..]
+        | ["lock" | "unlock", "table" | "tables", ..]
+        | ["deallocate", "prepare", ..] => true,
+        [
+            "analyze" | "optimize" | "check" | "checksum" | "repair",
+            rest @ ..,
+        ] => {
+            table_word(rest.first())
+                || (matches!(rest.first().copied(), Some("no_write_to_binlog" | "local"))
+                    && table_word(rest.get(1)))
+        }
         _ => false,
     }
 }
@@ -852,6 +873,7 @@ impl EventBuilder {
         let call = parts.iter().any(|p| {
             p.routine_call
                 || p.dquoted_name
+                || p.compound
                 || matches!(
                     p.lead.first().map(String::as_str),
                     Some("call" | "execute" | "prepare")
@@ -891,24 +913,25 @@ impl EventBuilder {
                             | StatementKind::Handler
                     ))
         });
-        // A statement of no read kind that reads tables in a subquery:
-        // `SET @x = (SELECT … FROM hr.customers)` (then `SELECT @x`),
-        // `DO (SELECT …)`. Reported as a read naming them, never the
-        // agent's own (its session `SET`s name no table). Utility
-        // statements that name tables without reading rows (`SHOW`,
-        // `LOCK TABLES`, `FLUSH`, `ANALYZE`…) are left as before.
-        let embedded_read = parts.iter().any(|p| {
-            p.kind == StatementKind::Other
-                && !is_utility(&p.lead)
-                && p.relations
-                    .iter()
-                    .any(|r| !is_dual(r) && !is_system_relation(r, a.database))
-        });
+        // Fail closed for statements of no known kind: one produces no
+        // event only when it is on a closed allow-list of statements that
+        // can neither read nor change data ([`is_quiet`]). Any other
+        // (`DO`, `SET @x = (SELECT …)`, `XA`, a utility statement with a
+        // subquery…) is a read, of the tables it names or of `*`, and
+        // never the agent's own (its own statements are all on the list
+        // or recognized reads).
+        let loud_other = parts
+            .iter()
+            .any(|p| p.kind == StatementKind::Other && !is_quiet(p));
+        // `ANALYZE` / `EXPLAIN ANALYZE` run their statement; the agent
+        // never sends them.
+        let analyze_wrapped = parts.iter().any(|p| p.analyze_wrapped);
         let changes = is_change_kind(kind)
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
             || dquoted
-            || embedded_read
+            || loud_other
+            || analyze_wrapped
             || blind
             || a.tables
                 .iter()
@@ -929,7 +952,7 @@ impl EventBuilder {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
                 (None, true) => EventAction::Read,
-                (None, false) if embedded_read => EventAction::Read,
+                (None, false) if loud_other => EventAction::Read,
                 (None, false) => return None,
             },
         };
@@ -962,7 +985,7 @@ impl EventBuilder {
             }
             // Unknown objects: a text that cannot be read, code that runs
             // out of sight, a write that names no table (or only `DUAL`).
-            if (!named_any && !parsed) || call || (write && objects.is_empty()) {
+            if (!named_any && !parsed) || call || ((write || loud_other) && objects.is_empty()) {
                 unknown = true;
             }
         } else {
@@ -3100,11 +3123,22 @@ mod tests {
                 "{source:?}"
             );
         }
-        // No table, a system table only, or a utility statement: no event.
+        // A subquery without a user table: a read of `*` (fail closed).
         for text in [
-            "SELECT @x",
             "SET @x = (SELECT 1)",
             "SET @x = (SELECT COUNT(*) FROM performance_schema.threads)",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(format!("read [{:?}]", star(source)).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        // No table, or an allow-listed utility statement: no event.
+        for text in [
+            "SELECT @x",
             "SHOW CREATE TABLE hr.customers",
             "SHOW COLUMNS FROM hr.customers",
             "LOCK TABLES hr.customers READ",
@@ -3137,6 +3171,134 @@ mod tests {
         ] {
             for (source, ev) in on_every_source("databastion", &text) {
                 assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+    }
+
+    /// Re-review of a2684a2: `ANALYZE` / `EXPLAIN ANALYZE` run their
+    /// statement, `BEGIN NOT ATOMIC` runs a block, and statements of no
+    /// known kind fail closed outside a closed allow-list.
+    #[test]
+    fn wrapped_and_unknown_statements_fail_closed() {
+        let consumers = "write [\"performance_schema.setup_consumers\"] always";
+        let actors = "write [\"performance_schema.setup_actors\"] always";
+        for (text, want) in [
+            (
+                "ANALYZE UPDATE performance_schema.setup_consumers SET ENABLED='NO'",
+                consumers,
+            ),
+            (
+                "ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "ANALYZE FORMAT=JSON DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "EXPLAIN ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "EXPLAIN FORMAT=TREE ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "SET STATEMENT max_statement_time=1 FOR ANALYZE DELETE FROM performance_schema.setup_actors",
+                actors,
+            ),
+            (
+                "ANALYZE DELETE FROM hr.customers",
+                "write [\"hr.customers\"]",
+            ),
+            (
+                "ANALYZE SELECT * FROM hr.customers",
+                "read [\"hr.customers\"]",
+            ),
+            (
+                "DESCRIBE ANALYZE SELECT * FROM hr.customers",
+                "read [\"hr.customers\"]",
+            ),
+            (
+                "EXPLAIN ANALYZE UPDATE performance_schema.setup_consumers c, performance_schema.setup_instruments i SET c.ENABLED='NO'",
+                "write [\"performance_schema.setup_consumers\", \"performance_schema.setup_instruments\"] always",
+            ),
+            (
+                "EXPLAIN ANALYZE DELETE a FROM performance_schema.setup_actors a, performance_schema.setup_objects o",
+                "write [\"performance_schema.setup_actors\", \"performance_schema.setup_objects\"] always",
+            ),
+        ] {
+            expect_everywhere(text, |_| want.to_owned());
+        }
+        // `BEGIN NOT ATOMIC`: like a procedure (`*`, always reported),
+        // with what its statements name.
+        expect_everywhere(
+            "BEGIN NOT ATOMIC SELECT * FROM hr.customers; END",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
+        );
+        expect_everywhere(
+            "lbl: BEGIN NOT ATOMIC UPDATE performance_schema.setup_consumers SET ENABLED='NO'; END",
+            |s| match star(s) {
+                "*.*" => {
+                    "write [\"*.*\", \"performance_schema.setup_consumers\"] always".to_owned()
+                }
+                st => format!("write [\"performance_schema.setup_consumers\", {st:?}] always"),
+            },
+        );
+        // Not on the allow-list: a read of what they name, or of `*`.
+        expect_everywhere(
+            "SHOW TABLES WHERE (SELECT COUNT(*) FROM hr.customers) > 0",
+            |_| "read [\"hr.customers\"]".to_owned(),
+        );
+        for text in [
+            "DO 1",
+            "XA START 'x'",
+            "SET @x = NOW()",
+            "HELP 'select'",
+            "END",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}]", star(s)));
+        }
+        // The allow-list: no event.
+        for text in [
+            "SET NAMES utf8mb4",
+            "SET CHARACTER SET utf8mb4",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET autocommit = 1",
+            "SET @x = 1",
+            "USE hr",
+            "BEGIN",
+            "BEGIN WORK",
+            "START TRANSACTION READ ONLY",
+            "COMMIT",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT s",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "SHOW TABLES",
+            "SHOW GRANTS FOR CURRENT_USER()",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "DESCRIBE hr.customers",
+            "LOCK TABLES hr.customers READ",
+            "UNLOCK TABLES",
+            "FLUSH PRIVILEGES",
+            "ANALYZE TABLE hr.customers",
+            "ANALYZE NO_WRITE_TO_BINLOG TABLE hr.customers",
+            "OPTIMIZE TABLE hr.customers",
+            "CHECK TABLE hr.customers",
+            "CHECKSUM TABLE hr.customers",
+            "REPAIR TABLE hr.customers",
+            "KILL 5",
+            "KILL QUERY 5",
+            "DEALLOCATE PREPARE s",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
             }
         }
     }

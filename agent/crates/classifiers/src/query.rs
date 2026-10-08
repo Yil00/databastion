@@ -913,6 +913,14 @@ pub struct StatementInfo {
     /// name under `ANSI_QUOTES` in a position [`Self::dquoted_name`] does
     /// not recognize): the fail-closed backstop of the Audit connector.
     pub dquoted: bool,
+    /// MySQL: run by `ANALYZE` / `EXPLAIN ANALYZE` (the statement runs).
+    pub analyze_wrapped: bool,
+    /// MariaDB: the first statement of a `BEGIN NOT ATOMIC … END` block.
+    pub compound: bool,
+    /// MySQL: holds a subquery (`(SELECT …`, `(WITH …`).
+    pub subquery: bool,
+    /// MySQL: calls a function (a name followed by `(`).
+    pub function_call: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1228,8 +1236,9 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
     // statement after `FOR` is what runs.
-    let statements: Vec<&[Tok]> = split_statements(&tokens)
-        .into_iter()
+    let originals = split_statements(&tokens);
+    let statements: Vec<&[Tok]> = originals
+        .iter()
         .map(|s| my_set_statement_body(s).unwrap_or(s))
         .collect();
     let kind = statements
@@ -1241,8 +1250,15 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     }
     let parts: Vec<StatementInfo> = statements
         .iter()
+        .zip(&originals)
         .take(MAX_PARTS)
-        .map(|s| statement_info(s, opts, false))
+        .map(|(s, original)| {
+            let mut info = statement_info(s, opts, false);
+            let wrappers = my_wrappers(original);
+            info.analyze_wrapped = wrappers.contains(&Wrapper::Analyze);
+            info.compound = wrappers.contains(&Wrapper::Compound);
+            info
+        })
         .collect();
     let shape = match statements.first() {
         Some(first) if !opts.possibly_truncated && kind.is_read() => main_shape(first),
@@ -1268,32 +1284,95 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     }
 }
 
-/// Most nested `SET STATEMENT … FOR` levels unwrapped; a deeper nesting
-/// is DDL (fail closed).
+/// Most nested wrapper levels unwrapped (`SET STATEMENT … FOR`,
+/// `ANALYZE`, `EXPLAIN ANALYZE`, `BEGIN NOT ATOMIC`, in any combination);
+/// a deeper nesting is DDL (fail closed).
 const MAX_SET_STATEMENT_DEPTH: usize = 8;
 
-/// One level of a MariaDB `SET STATEMENT var = value[, …] FOR
-/// <statement>`: the tokens after the first top-level `FOR`.
-fn set_statement_level(s: &[Tok]) -> Option<&[Tok]> {
-    if word(s.first()) != Some("set") || word(s.get(1)) != Some("statement") {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (j, t) in s.iter().enumerate().skip(2) {
-        match t {
-            Tok::Punct(p) if p == "(" => depth += 1,
-            Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
-            Tok::Word(w) if depth == 0 && w == "for" => return Some(&s[j + 1..]),
-            _ => {}
-        }
-    }
-    None
+/// A statement prefix that runs the statement after it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wrapper {
+    /// MariaDB `SET STATEMENT var = value[, …] FOR <statement>`.
+    SetStatement,
+    /// `EXPLAIN | DESCRIBE | DESC ANALYZE [FORMAT = x] <statement>`
+    /// (MySQL) and MariaDB `ANALYZE [FORMAT = x] <statement>`: the
+    /// statement runs, writes included.
+    Analyze,
+    /// MariaDB `[label:] BEGIN NOT ATOMIC <statement>; … END`: a compound
+    /// statement run in place, like a procedure.
+    Compound,
 }
 
-/// The statement of a MariaDB `SET STATEMENT var = value[, …] FOR
-/// <statement>`, nested levels included. `None` for any other statement,
-/// and for a nesting deeper than [`MAX_SET_STATEMENT_DEPTH`] levels, which
-/// [`my_kind`] reads as DDL (fail closed).
+/// Skips `FORMAT = name` at `i`.
+fn skip_format(s: &[Tok], i: usize) -> usize {
+    if word(s.get(i)) == Some("format") && is_punct(s.get(i + 1), "=") {
+        i + 3
+    } else {
+        i
+    }
+}
+
+/// Whether a statement that a wrapper runs starts at `i`.
+fn runs_statement_at(s: &[Tok], i: usize, table_ok: bool) -> bool {
+    is_punct(s.get(i), "(")
+        || match word(s.get(i)) {
+            Some("select" | "update" | "delete" | "insert" | "replace" | "with" | "values") => true,
+            Some("table") => table_ok,
+            _ => false,
+        }
+}
+
+/// One wrapper level ([`Wrapper`]): the tokens of the statement it runs.
+fn wrapper_level(s: &[Tok]) -> Option<(&[Tok], Wrapper)> {
+    match (word(s.first()), word(s.get(1))) {
+        (Some("set"), Some("statement")) => {
+            let mut depth = 0usize;
+            for (j, t) in s.iter().enumerate().skip(2) {
+                match t {
+                    Tok::Punct(p) if p == "(" => depth += 1,
+                    Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
+                    Tok::Word(w) if depth == 0 && w == "for" => {
+                        return Some((&s[j + 1..], Wrapper::SetStatement));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        (Some("explain" | "describe" | "desc"), _) => {
+            let i = skip_format(s, 1);
+            if word(s.get(i)) != Some("analyze") {
+                return None;
+            }
+            let i = skip_format(s, i + 1);
+            runs_statement_at(s, i, true).then(|| (&s[i..], Wrapper::Analyze))
+        }
+        // `ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE …` stays a utility.
+        (Some("analyze"), _) => {
+            let i = skip_format(s, 1);
+            runs_statement_at(s, i, false).then(|| (&s[i..], Wrapper::Analyze))
+        }
+        _ => {
+            // `[label:] BEGIN NOT ATOMIC`.
+            let i = if is_punct(s.get(1), ":") { 2 } else { 0 };
+            (word(s.get(i)) == Some("begin")
+                && word(s.get(i + 1)) == Some("not")
+                && word(s.get(i + 2)) == Some("atomic"))
+            .then(|| (&s[i + 3..], Wrapper::Compound))
+        }
+    }
+}
+
+/// One wrapper level's statement ([`wrapper_level`]).
+fn set_statement_level(s: &[Tok]) -> Option<&[Tok]> {
+    wrapper_level(s).map(|(body, _)| body)
+}
+
+/// The statement that wrappers run ([`Wrapper`]: `SET STATEMENT … FOR`,
+/// `ANALYZE`, `EXPLAIN ANALYZE`, `BEGIN NOT ATOMIC`), nested levels
+/// included. `None` for any other statement, and for a nesting deeper
+/// than [`MAX_SET_STATEMENT_DEPTH`] levels, which [`my_kind`] reads as DDL
+/// (fail closed).
 fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
     let mut body = set_statement_level(s)?;
     for _ in 1..MAX_SET_STATEMENT_DEPTH {
@@ -1303,6 +1382,36 @@ fn my_set_statement_body(s: &[Tok]) -> Option<&[Tok]> {
         }
     }
     set_statement_level(body).is_none().then_some(body)
+}
+
+/// The wrappers a statement passes through before the statement it runs
+/// (bounded like [`my_set_statement_body`]).
+fn my_wrappers(s: &[Tok]) -> Vec<Wrapper> {
+    let mut out = Vec::new();
+    let mut cur = s;
+    while out.len() < MAX_SET_STATEMENT_DEPTH + 1 {
+        let Some((body, w)) = wrapper_level(cur) else {
+            break;
+        };
+        out.push(w);
+        cur = body;
+    }
+    out
+}
+
+/// Whether a statement holds a subquery: `(` followed by `SELECT` or
+/// `WITH`.
+fn has_subquery(s: &[Tok]) -> bool {
+    s.windows(2)
+        .any(|w| is_punct(Some(&w[0]), "(") && matches!(word(w.get(1)), Some("select" | "with")))
+}
+
+/// Whether a statement calls a function: a name followed by `(`.
+fn has_function_call(s: &[Tok]) -> bool {
+    s.windows(2).any(|w| {
+        matches!(&w[0], Tok::Word(_) | Tok::Quoted(_) | Tok::DQuoted { .. })
+            && is_punct(Some(&w[1]), "(")
+    })
 }
 
 /// Rank of a kind for [`most_reportable`]: DCL, DDL, writes, reads,
@@ -1788,6 +1897,10 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         audit_function: opts.dialect == Dialect::Mysql && has_audit_function(s),
         dquoted_name: opts.dialect == Dialect::Mysql && has_dquoted_name(s),
         dquoted: s.iter().any(|t| matches!(t, Tok::DQuoted { .. })),
+        analyze_wrapped: false,
+        compound: false,
+        subquery: opts.dialect == Dialect::Mysql && has_subquery(s),
+        function_call: opts.dialect == Dialect::Mysql && has_function_call(s),
     }
 }
 
@@ -2300,11 +2413,11 @@ fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
                     "join" => (true, false, false),
                     "into" | "copy" => (true, true, false),
                     // `UPDATE t SET …`, not `FOR UPDATE` / `DO UPDATE`.
-                    "update" => (
-                        !matches!(prev_word(i), Some("for" | "do" | "key" | "no")),
-                        false,
-                        false,
-                    ),
+                    // A table list (`UPDATE a x, b y SET …`, MySQL).
+                    "update" => {
+                        let real = !matches!(prev_word(i), Some("for" | "do" | "key" | "no"));
+                        (real, false, real)
+                    }
                     "table" => (
                         i == 0
                             || is_punct(i.checked_sub(1).and_then(|j| s.get(j)), "(")
@@ -3567,6 +3680,54 @@ mod tests {
         );
         assert!(my_rels("SELECT EXTRACT(YEAR FROM d), TRIM(LEADING 'x' FROM y)").is_empty());
         assert!(my_rels("SELECT CONCAT(TRIM(x FROM y), SUBSTRING(z FROM 2))").is_empty());
+    }
+
+    /// Re-review of a2684a2: `ANALYZE` / `EXPLAIN ANALYZE` / `BEGIN NOT
+    /// ATOMIC` wrappers, composable with `SET STATEMENT`; multi-table
+    /// `UPDATE` lists.
+    #[test]
+    fn mysql_analyze_and_compound_wrappers() {
+        for (q, k) in [
+            ("ANALYZE UPDATE t SET a = 1", StatementKind::Update),
+            ("ANALYZE FORMAT=JSON DELETE FROM t", StatementKind::Delete),
+            ("ANALYZE SELECT * FROM t", StatementKind::Select),
+            ("ANALYZE (SELECT * FROM t)", StatementKind::Select),
+            (
+                "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+                StatementKind::Insert,
+            ),
+            ("DESC ANALYZE FORMAT=TREE TABLE t", StatementKind::Table),
+            (
+                "SET STATEMENT a=1 FOR EXPLAIN ANALYZE DELETE FROM t",
+                StatementKind::Delete,
+            ),
+            (
+                "BEGIN NOT ATOMIC UPDATE t SET a = 1; END",
+                StatementKind::Update,
+            ),
+            ("ANALYZE TABLE t", StatementKind::Other),
+            ("ANALYZE LOCAL TABLE t", StatementKind::Other),
+            ("EXPLAIN SELECT * FROM t", StatementKind::Other),
+            ("BEGIN", StatementKind::Other),
+        ] {
+            assert_eq!(my(q).kind(), k, "{q}");
+        }
+        let a = my("EXPLAIN ANALYZE DELETE FROM t");
+        assert!(a.parts()[0].analyze_wrapped && !a.parts()[0].compound);
+        let a = my("BEGIN NOT ATOMIC SELECT 1; END");
+        assert!(a.parts()[0].compound);
+        assert!(!my("ANALYZE TABLE t").parts()[0].analyze_wrapped);
+        let deep = format!(
+            "{}ANALYZE DELETE FROM t",
+            "SET STATEMENT a = 1 FOR ".repeat(MAX_SET_STATEMENT_DEPTH)
+        );
+        assert_eq!(my(&deep).kind(), StatementKind::Ddl);
+        assert_eq!(
+            my_rels("UPDATE hr.a x, hr.b y SET x.v = y.v"),
+            vec![r(Some("hr"), "a"), r(Some("hr"), "b")]
+        );
+        assert!(my("SHOW TABLES WHERE (SELECT 1) = 1").parts()[0].subquery);
+        assert!(my("SET @x = NOW()").parts()[0].function_call);
     }
 
     /// Security review of #85: PostgreSQL role statements are privilege
