@@ -202,6 +202,8 @@ Classifiers and their semantics: [agent/crates/classifiers/README.md](../agent/c
 
 Audit read positions (log offsets, cursors, profiler positions) and the agent's own-account row counters are kept in `state_dir` across agent restarts, so a restart resumes where the agent stopped, within what the source still holds; `pg_stat_statements` counters are the exception. Keep `state_dir` on a persistent volume.
 
+**MySQL / MariaDB** (since 0.5.0): Audit fails closed. Writes to `information_schema`, `performance_schema` and `sys`, server and audit configuration changes, and statements it cannot read with certainty (version comments, double-quoted names, `ANALYZE`, `SET STATEMENT`, reads inside `SET` or `DO`, any statement outside a short allow-list of harmless ones) are reported, some of them against the object `*`, and configuration changes are never dropped by the minimum rows. What is and is not reported: [08-engine-capabilities.md](08-engine-capabilities.md#statement-text-and-passwords).
+
 The export signatures recognized per engine are listed in [08-engine-capabilities.md](08-engine-capabilities.md#known-export-signatures).
 
 ## 11. Policies, incidents and notifications
@@ -211,6 +213,12 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 
 ## 12. Upgrading
 Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
+
+From 0.4.x to **0.5.0** (the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)):
+- **MySQL / MariaDB Audit reports more**: system-schema writes, configuration changes and statements outside a closed allow-list are now reported, so expect more events, some against the object `*` (for example from applications that write string literals in double quotes). A multi-statement text that holds a write is a `write` event that keeps the signals of its reads: a policy limited to the action `read` does not match it ([section 10](#10-audit-enabling-it-and-reading-events)).
+- **MySQL / MariaDB log limits**: keep `server_audit_query_log_limit` and `performance_schema_max_sql_text_length` at 1024 or more (the defaults), otherwise the CAS store guard's statements are reported at every heartbeat as the agent's own reads.
+- **Console worker**: at its first start the worker upgrades the pg-boss schema (to version 44) with its usual database role; back up the console database first.
+- **Agent package**: the systemd unit sets `LimitCORE=0` (no core dumps).
 
 From 0.3.x to **0.4.0** (the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)):
 - **Audit log paths**: every log-file Audit source now refuses an `audit_log.path` whose last component is a symlink, and a log file with more than one hard link (`audit.log_not_readable`, [ADR-0043](adr/0043-audit-logs-opened-without-following-a-final-symlink.md)). Point the path at the real file; symlinked parent directories still work.
