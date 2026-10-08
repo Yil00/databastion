@@ -99,11 +99,11 @@ enum Tok {
     Param,
     /// MySQL `"…"`: a string literal, or an identifier under
     /// `ANSI_QUOTES` (the session mode is unknown). A literal everywhere a
-    /// literal is expected; its content (raw, at most
-    /// [`MAX_DQUOTED_CHARS`] characters, ASCII-lowercased) is kept only to
-    /// recognize a name position (`FROM "t"`, `"db"."t"`, `"f"(`). Never
-    /// written to the normalized text.
-    DQuoted(String),
+    /// literal is expected, kept apart only to recognize a name position
+    /// (`FROM "t"`, `"db"."t"`, `"f"(`). Its content is not kept: only
+    /// whether it is an audit log administration function name
+    /// ([`is_audit_function`]), decided at lex time.
+    DQuoted { audit_function: bool },
     /// Operator or punctuation.
     Punct(String),
 }
@@ -164,10 +164,6 @@ fn version_always_executed(mariadb_only: bool, digits: &[u8]) -> bool {
             .and_then(|d| d.parse::<u32>().ok())
             .is_some_and(|v| v < 50_700)
 }
-
-/// Characters of a `"…"` token kept ([`Tok::DQuoted`]): enough for any
-/// audit function name.
-const MAX_DQUOTED_CHARS: usize = 64;
 
 /// Longest version number of an executable comment (`/*!NNNNNN`).
 const MAX_COMMENT_VERSION_DIGITS: usize = 6;
@@ -280,13 +276,11 @@ fn lex_mysql_range(
                 // so that a name position can be told (fail closed).
                 let from = i + 1;
                 i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
-                let content: String = text
+                // The content is only compared in place, never copied.
+                let audit_function = text
                     .get(from..i.saturating_sub(1))
-                    .unwrap_or("")
-                    .chars()
-                    .take(MAX_DQUOTED_CHARS)
-                    .collect();
-                out.push(Tok::DQuoted(content.to_ascii_lowercase()));
+                    .is_some_and(is_audit_function);
+                out.push(Tok::DQuoted { audit_function });
             }
             b'`' => {
                 let mut j = i + 1;
@@ -913,6 +907,10 @@ pub struct StatementInfo {
     /// MySQL: a `"…"` token in a name position (an identifier under
     /// `ANSI_QUOTES`, never resolved): the objects cannot be told.
     pub dquoted_name: bool,
+    /// MySQL: the statement holds a `"…"` token anywhere (a string, or a
+    /// name under `ANSI_QUOTES` in a position [`Self::dquoted_name`] does
+    /// not recognize): the fail-closed backstop of the Audit connector.
+    pub dquoted: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1384,13 +1382,19 @@ fn has_qualified_call(s: &[Tok], kind: StatementKind) -> bool {
 /// MariaDB `server_audit` and the Percona `audit_log` plugin have no
 /// functions (system variables only).
 fn is_audit_function(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n.starts_with("audit_log_filter_")
-        || n.starts_with("audit_log_encryption_")
-        || matches!(
-            n.as_str(),
-            "audit_log_read" | "audit_log_read_bookmark" | "audit_log_rotate"
-        )
+    // Compared in place (no lowercased copy: `name` may be literal
+    // content).
+    let b = name.as_bytes();
+    let starts = |p: &[u8]| b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p);
+    starts(b"audit_log_filter_")
+        || starts(b"audit_log_encryption_")
+        || [
+            "audit_log_read",
+            "audit_log_read_bookmark",
+            "audit_log_rotate",
+        ]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
 }
 
 /// A call of an audit log administration function ([`is_audit_function`]),
@@ -1398,59 +1402,80 @@ fn is_audit_function(name: &str) -> bool {
 /// tokens only: never in a literal or a comment.
 fn has_audit_function(s: &[Tok]) -> bool {
     s.windows(2).any(|w| {
-        matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) | Tok::DQuoted(n) if is_audit_function(n))
+        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n))
+            || matches!(
+                w[0],
+                Tok::DQuoted {
+                    audit_function: true
+                }
+            ))
             && is_punct(Some(&w[1]), "(")
     })
 }
 
 /// Raw-text scan for a call of an audit log administration function, for
 /// a text that did not lex (fail closed: a name inside a literal or a
-/// comment counts too): a function name ([`is_audit_function`],
-/// ASCII case-insensitive, not preceded by an identifier character),
-/// optionally followed by a closing quote or backtick, then whitespace and
-/// comments, then `(`.
+/// comment counts too, and nothing is required before the name, so
+/// `/*!80000audit_log_rotate*/()` matches): a function name
+/// ([`is_audit_function`], ASCII case-insensitive, the whole identifier
+/// run that starts there), optionally followed by a closing quote or
+/// backtick, then whitespace, comments, ends of comments (`*/`) and
+/// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`.
+/// Compared in place: no copy of the text is made.
 fn raw_audit_function(text: &str) -> bool {
+    const NAME: &[u8] = b"audit_log_";
     let b = text.as_bytes();
-    let lower = text.to_ascii_lowercase();
-    let lb = lower.as_bytes();
-    let mut from = 0;
-    while let Some(k) = find(&lb[from..], b"audit_log_") {
-        let start = from + k;
-        from = start + 1;
-        if start > 0 && is_my_ident_cont(b[start - 1]) {
+    let n = b.len();
+    for start in 0..n.saturating_sub(NAME.len() - 1) {
+        if !b[start..start + NAME.len()].eq_ignore_ascii_case(NAME) {
             continue;
         }
         let mut j = start;
-        while j < lb.len() && is_my_ident_cont(lb[j]) {
+        while j < n && is_my_ident_cont(b[j]) {
             j += 1;
         }
-        if !lower.get(start..j).is_some_and(is_audit_function) {
+        if !text.get(start..j).is_some_and(is_audit_function) {
             continue;
         }
-        if matches!(lb.get(j), Some(b'"' | b'`')) {
+        if matches!(b.get(j), Some(b'"' | b'`')) {
             j += 1;
         }
         loop {
-            match lb.get(j) {
+            match b.get(j) {
                 Some(c) if c.is_ascii_whitespace() => j += 1,
-                Some(b'/') if lb.get(j + 1) == Some(&b'*') => match find(&lb[j + 2..], b"*/") {
-                    Some(e) => j += e + 4,
-                    None => break,
-                },
+                Some(b'*') if b.get(j + 1) == Some(&b'/') => j += 2,
+                Some(b'/') if b.get(j + 1) == Some(&b'*') => {
+                    let bang = match (b.get(j + 2), b.get(j + 3)) {
+                        (Some(b'!'), _) => Some(j + 3),
+                        (Some(b'M' | b'm'), Some(b'!')) => Some(j + 4),
+                        _ => None,
+                    };
+                    if let Some(mut k) = bang {
+                        while k < n && b[k].is_ascii_digit() {
+                            k += 1;
+                        }
+                        j = k;
+                    } else {
+                        match find(&b[j + 2..], b"*/") {
+                            Some(e) => j += e + 4,
+                            None => break,
+                        }
+                    }
+                }
                 Some(b'#') => {
-                    while j < lb.len() && lb[j] != b'\n' {
+                    while j < n && b[j] != b'\n' {
                         j += 1;
                     }
                 }
-                Some(b'-') if my_dash_comment(lb, j, lb.len()) => {
-                    while j < lb.len() && lb[j] != b'\n' {
+                Some(b'-') if my_dash_comment(b, j, n) => {
+                    while j < n && b[j] != b'\n' {
                         j += 1;
                     }
                 }
                 _ => break,
             }
         }
-        if lb.get(j) == Some(&b'(') {
+        if b.get(j) == Some(&b'(') {
             return true;
         }
     }
@@ -1459,33 +1484,58 @@ fn raw_audit_function(text: &str) -> bool {
 
 /// A `"…"` token ([`Tok::DQuoted`]) in a name position, where it can only
 /// be an identifier under `ANSI_QUOTES` (as a string it would be a syntax
-/// error): after `FROM`, `JOIN`, `UPDATE`, `INTO`, `TABLE`, after a comma
-/// in a `FROM` list, next to a `.`, or right before `(`.
+/// error): after `FROM`, `JOIN`, `STRAIGHT_JOIN`, `UPDATE`, `INTO`,
+/// `TABLE` or `HANDLER`; after a comma in a table list (`FROM`, `JOIN`,
+/// `UPDATE` context, tracked per parenthesis depth, so `FROM (SELECT 1)
+/// x, "t"` and `USE INDEX (i), "t"` count); alone between parentheses in
+/// such a context (`FROM ("t")`); next to a `.`; or right before `(`.
 fn has_dquoted_name(s: &[Tok]) -> bool {
-    let mut in_from = false;
+    // The table-list context of each open parenthesis level; a new level
+    // starts with its parent's context (`FROM ((t))`).
+    let mut ctx: Vec<bool> = vec![false];
     for (i, t) in s.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|j| s.get(j));
+        let next = s.get(i + 1);
+        let in_list = ctx.last().copied().unwrap_or(false);
         match t {
-            Tok::DQuoted(_) => {
+            Tok::DQuoted { .. } => {
                 let after_keyword = matches!(
                     word(prev),
-                    Some("from" | "join" | "update" | "into" | "table")
+                    Some(
+                        "from" | "join" | "straight_join" | "update" | "into" | "table" | "handler"
+                    )
                 );
-                let in_list = in_from && is_punct(prev, ",");
-                let dotted = is_punct(prev, ".") || is_punct(s.get(i + 1), ".");
-                let called = is_punct(s.get(i + 1), "(");
-                if after_keyword || in_list || dotted || called {
+                let listed = in_list && is_punct(prev, ",");
+                let parenthesized = in_list && is_punct(prev, "(") && is_punct(next, ")");
+                let dotted = is_punct(prev, ".") || is_punct(next, ".");
+                let called = is_punct(next, "(");
+                if after_keyword || listed || parenthesized || dotted || called {
                     return true;
                 }
             }
-            Tok::Word(w) => match w.as_str() {
-                "from" | "join" | "update" | "into" | "table" => in_from = true,
-                "where" | "group" | "having" | "order" | "limit" | "union" | "set" | "values"
-                | "value" | "select" | "on" | "using" | "for" | "window" | "lock" | "procedure"
-                | "partition" | "as" => in_from = false,
-                _ => {}
-            },
-            Tok::Punct(p) if p == "(" || p == ")" || p == ";" => in_from = false,
+            Tok::Word(w) => {
+                let set = match w.as_str() {
+                    "from" | "join" | "straight_join" | "update" | "handler" => Some(true),
+                    "where" | "group" | "having" | "order" | "limit" | "union" | "set"
+                    | "values" | "value" | "select" | "on" | "using" | "for" | "window"
+                    | "lock" | "procedure" | "into" => Some(false),
+                    _ => None,
+                };
+                if let (Some(v), Some(c)) = (set, ctx.last_mut()) {
+                    *c = v;
+                }
+            }
+            Tok::Punct(p) if p == "(" => {
+                if ctx.len() < MAX_DEPTH {
+                    ctx.push(in_list);
+                }
+            }
+            Tok::Punct(p) if p == ")" => {
+                if ctx.len() > 1 {
+                    ctx.pop();
+                }
+            }
+            Tok::Punct(p) if p == ";" => ctx = vec![false],
             _ => {}
         }
     }
@@ -1678,7 +1728,7 @@ fn has_outfile(s: &[Tok]) -> bool {
     s.windows(3).any(|w| {
         matches!(&w[0], Tok::Word(i) if i == "into")
             && matches!(&w[1], Tok::Word(f) if f == "outfile" || f == "dumpfile")
-            && matches!(w[2], Tok::Literal | Tok::DQuoted(_) | Tok::Param)
+            && matches!(w[2], Tok::Literal | Tok::DQuoted { .. } | Tok::Param)
     })
 }
 
@@ -1724,6 +1774,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
         audit_function: opts.dialect == Dialect::Mysql && has_audit_function(s),
         dquoted_name: opts.dialect == Dialect::Mysql && has_dquoted_name(s),
+        dquoted: s.iter().any(|t| matches!(t, Tok::DQuoted { .. })),
     }
 }
 
@@ -2301,7 +2352,7 @@ fn read_relation(
     if matches!(word(s.get(i)), Some("outfile" | "dumpfile"))
         && matches!(
             s.get(i + 1),
-            Some(Tok::Literal | Tok::DQuoted(_) | Tok::Param)
+            Some(Tok::Literal | Tok::DQuoted { .. } | Tok::Param)
         )
     {
         return i + 2;
@@ -2545,7 +2596,7 @@ fn normalize_tokens(tokens: &[Tok]) -> NormalizedQuery {
                 }
             }
             Tok::Quoted(q) => format!("\"{}\"", names::normalize_path(q).as_str()),
-            Tok::Literal | Tok::DQuoted(_) | Tok::Int(_) | Tok::Param => "?".to_owned(),
+            Tok::Literal | Tok::DQuoted { .. } | Tok::Int(_) | Tok::Param => "?".to_owned(),
             Tok::Punct(p) => p.clone(),
         };
         let len = piece.chars().count() + usize::from(!out.is_empty());
@@ -3399,7 +3450,21 @@ mod tests {
             assert!(dq(q), "{q}");
         }
         for q in [
+            "SELECT * FROM (\"t\")",
+            "SELECT * FROM ((\"t\"))",
+            "SELECT * FROM (SELECT 1) x, \"t\"",
+            "SELECT * FROM a AS x, \"t\"",
+            "SELECT * FROM a STRAIGHT_JOIN \"t\"",
+            "SELECT * FROM a USE INDEX (i), \"t\"",
+            "HANDLER \"t\" OPEN",
+            "HANDLER \"t\" READ FIRST",
+        ] {
+            assert!(dq(q), "{q}");
+        }
+        // Not a name position (the connector's backstop still adds `*`).
+        for q in [
             "SELECT a FROM t WHERE a = \"x\"",
+            "SELECT a FROM t WHERE a IN (\"x\")",
             "SELECT \"x\", CONCAT(\"a\", \"b\")",
             "INSERT INTO t VALUES (\"x\", \"y\")",
             "INSERT INTO t (a, b) VALUES (\"x\", \"y\")",
@@ -3425,6 +3490,9 @@ mod tests {
             my("SELECT \"audit_log_rotate\"()").kind(),
             StatementKind::Ddl
         );
+        assert_ne!(my("SELECT \"audit_log_rotate\"").kind(), StatementKind::Ddl);
+        assert!(my("SELECT a FROM t WHERE b = \"x\"").parts()[0].dquoted);
+        assert!(!my("SELECT a FROM t WHERE b = 'x'").parts()[0].dquoted);
         for t in [
             "x = 'a\\' AND audit_log_filter_remove_user('%')",
             "x AUDIT_LOG_ROTATE /* c */ ()",
@@ -3433,8 +3501,17 @@ mod tests {
         ] {
             assert!(raw_audit_function(t), "{t}");
         }
+        // No left boundary (fail closed), executable comments skipped.
         for t in [
             "my_audit_log_rotate()",
+            "x /*!80000audit_log_rotate*/()",
+            "x /*!audit_log_rotate*/ ()",
+            "x /*M!100000 audit_log_filter_flush */ /*!80000 (*/ )",
+            "x audit_log_rotate /*!80000 */ ()",
+        ] {
+            assert!(raw_audit_function(t), "{t}");
+        }
+        for t in [
             "audit_log_rotate",
             "audit_log_rotated()",
             "audit_log_session_filter_id()",

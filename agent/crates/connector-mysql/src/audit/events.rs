@@ -859,9 +859,25 @@ impl EventBuilder {
             && (a.tables.is_empty()
                 || a.tables.iter().any(|t| t.2 != TableOp::Read)
                 || audit_function);
+        // Backstop for `"…"` names the positions above miss: a read or a
+        // write holding any `"…"` token adds `*` and is never the agent's
+        // own (the agent never sends `"`), but is not marked always
+        // reported (double-quoted string literals are common).
+        let dquoted = parts.iter().any(|p| {
+            p.dquoted
+                && (is_write_kind(p.kind)
+                    || matches!(
+                        p.kind,
+                        StatementKind::Select
+                            | StatementKind::Table
+                            | StatementKind::Values
+                            | StatementKind::Handler
+                    ))
+        });
         let changes = is_change_kind(kind)
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
+            || dquoted
             || blind
             || a.tables
                 .iter()
@@ -932,7 +948,7 @@ impl EventBuilder {
                 }
             }
         }
-        if rw && objects.is_empty() && !unknown {
+        if rw && objects.is_empty() && !unknown && !dquoted {
             // A read of system tables only, or no table at all (`SELECT
             // 1`). A write keeps its system tables above.
             return None;
@@ -942,7 +958,7 @@ impl EventBuilder {
         for (db, name) in objects.iter().take(16) {
             e = e.with_object(object(db, name));
         }
-        if unknown {
+        if unknown || (dquoted && rw) {
             e = e.with_object(unknown_object(a.database));
         }
         // Never filtered by `min_rows` (ADR-0022 settings, agent side):
@@ -2841,32 +2857,122 @@ mod tests {
         ] {
             expect_everywhere(text, |_| "ddl [] always".to_owned());
         }
-        // Double-quoted strings in value positions: as before (from
-        // another account; the agent's own reads are left out).
-        for (text, want) in [
-            ("SELECT a FROM hr.t WHERE a = \"x\"", "read [\"hr.t\"]"),
-            ("INSERT INTO hr.t VALUES (\"x\", \"y\")", "write [\"hr.t\"]"),
-            (
-                "UPDATE hr.t SET a = \"x\", b = \"y\" WHERE id = 1",
-                "write [\"hr.t\"]",
-            ),
-        ] {
-            for (source, ev) in on_every_source("app", text) {
-                assert_eq!(
-                    ev.as_ref().map(shown).as_deref(),
-                    Some(want),
-                    "{source:?}: {text}"
-                );
+        // Double-quoted strings in value positions: the backstop adds `*`
+        // without the always-reported mark (from any account: the agent
+        // never sends `"`).
+        let with_star = |s: EventSource, action: &str, table: &str| match self::star(s) {
+            "*.*" => format!("{action} [\"*.*\", {table:?}]"),
+            st => format!("{action} [{table:?}, {st:?}]"),
+        };
+        expect_everywhere("SELECT a FROM hr.t WHERE a = \"x\"", |s| {
+            with_star(s, "read", "hr.t")
+        });
+        expect_everywhere("INSERT INTO hr.t VALUES (\"x\", \"y\")", |s| {
+            with_star(s, "write", "hr.t")
+        });
+        expect_everywhere("UPDATE hr.t SET a = \"x\", b = \"y\" WHERE id = 1", |s| {
+            with_star(s, "write", "hr.t")
+        });
+        expect_everywhere("SELECT \"x\", CONCAT(\"a\", \"b\")", |s| {
+            format!("read [{:?}]", self::star(s))
+        });
+        // INTO OUTFILE "…" keeps its signal.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, "SELECT a FROM hr.t INTO OUTFILE \"/x\"") {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert!(e.signals().contains(&Signal::IntoOutfile), "{source:?}");
+                assert!(!e.always_report(), "{source:?}");
             }
         }
-        for (source, ev) in on_every_source("app", "SELECT \"x\", CONCAT(\"a\", \"b\")") {
+        // Session settings with double quotes: no event.
+        for (source, ev) in on_every_source("app", "SET NAMES \"utf8mb4\"") {
             assert!(ev.is_none(), "{source:?}");
         }
-        // The agent's own read with a double-quoted value: still its own.
-        for (source, ev) in
-            on_every_source("databastion", "SELECT a FROM hr.t WHERE a = \"x\" LIMIT 1")
-        {
-            assert!(ev.is_none(), "{source:?}");
+    }
+
+    /// Re-review of 86e2d31, R1: double-quoted names in positions the
+    /// precise rule now covers, and the backstop for the others, on the
+    /// file sources without table records, and from the agent's account
+    /// with a READ record of a decoy table.
+    #[test]
+    fn double_quoted_name_bypasses_are_closed() {
+        let precise = [
+            "SELECT * FROM (\"customers\")",
+            "SELECT * FROM ((\"customers\"))",
+            "SELECT * FROM (SELECT 1) x, \"customers\"",
+            "SELECT * FROM hr.a AS x, \"customers\"",
+            "HANDLER \"customers\" OPEN",
+            "HANDLER \"customers\" READ FIRST",
+            "SELECT * FROM hr.a STRAIGHT_JOIN \"customers\"",
+            "SELECT * FROM hr.a USE INDEX (i), \"customers\"",
+        ];
+        for text in precise {
+            let parts = analyze_raw(text.as_bytes(), analyze_opts(false));
+            assert!(
+                parts.parts().iter().any(|p| p.dquoted_name),
+                "precise: {text}"
+            );
+        }
+        for text in precise {
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let out = b.convert_file(
+                    sa_at(&[sa_line(user, "172.18.0.1", 1, text)], 4096),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(out.len(), 1, "{user} server_audit: {text}");
+                assert!(out[0].always_report(), "{user}: {text}");
+                assert!(show(&out[0]).contains("shop.*"), "{user}: {text}");
+                let mut b = EventBuilder::new(own());
+                let out = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 1, text)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(out.len(), 1, "{user} json: {text}");
+                assert!(out[0].always_report(), "{user}: {text}");
+            }
+            // The agent's account with a READ record of a decoy table:
+            // reported, `*` added.
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        "20260929 09:40:35,h,databastion,172.18.0.1,30,1,READ,hr,a,".to_owned(),
+                        sa_line("databastion", "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(out.len(), 1, "own with record: {text}");
+            assert!(show(&out[0]).contains("shop.*"), "{text}");
+        }
+        // Backstop only: a double-quoted token the precise rule does not
+        // place (`FROM a JOIN b ON x, "t"` style), still `*`, never own.
+        let text = "SELECT * FROM hr.a JOIN hr.b ON hr.a.id = hr.b.id, \"customers\"";
+        let a = analyze_raw(text.as_bytes(), analyze_opts(false));
+        assert!(a.parts().iter().all(|p| !p.dquoted_name && p.dquoted));
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(
+                    &[
+                        format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,a,"),
+                        sa_line(user, "172.18.0.1", 1, text),
+                    ],
+                    4096,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.a\", \"shop.*\"]"],
+                "{user}"
+            );
         }
     }
 

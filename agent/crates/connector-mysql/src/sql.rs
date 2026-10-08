@@ -945,6 +945,8 @@ mod tests {
     fn statements_are_single_and_never_read_write() {
         for s in all_statements() {
             assert!(!s.contains(';'), "multi-statement: {s}");
+            // The Audit stream's double-quote backstop relies on it.
+            assert!(!s.contains('"'), "double quote: {s}");
             let upper = s.to_uppercase();
             assert!(!upper.contains("READ WRITE"), "{s}");
             assert!(!upper.contains("CONSISTENT SNAPSHOT"), "{s}");
