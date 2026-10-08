@@ -3,9 +3,9 @@
 ## Supported versions
 | Version | Supported |
 |---------|-----------|
-| 0.4.x | Yes: security fixes are released as `0.4.Z` patch versions |
-| 0.1.x, 0.2.x, 0.3.x | No: upgrade to the latest `0.4.x` release |
-| Pre-releases (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) | No: upgrade to the latest `0.4.x` release |
+| 0.5.x | Yes: security fixes are released as `0.5.Z` patch versions |
+| 0.1.x, 0.2.x, 0.3.x, 0.4.x | No: upgrade to the latest `0.5.x` release |
+| Pre-releases (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) | No: upgrade to the latest `0.5.x` release |
 | Unreleased commits of `main` / `dev` | No |
 
 The console and the agent share one version number and are released together ([RELEASE.md](RELEASE.md#2-versions)). A fix may require upgrading both: the console first, then the agents.
@@ -57,8 +57,9 @@ These are known and documented; reporting them again is not needed, but a way to
 - **Carried forward**: name-normalization gaps ([ADR-0009](docs/adr/0009-name-normalization-and-item-sanitization.md)); OpenLDAP `check()` does not probe `userPKCS12`; e-mail notifications are plain text only; the system-alert budget needs the same setting on every console process ([ADR-0033](docs/adr/0033-system-alert-budget.md)); webhook and e-mail consumers must escape principals ([docs/05](docs/05-security.md#alerting)).
 - **OpenID Connect login** (since 0.4.0): without refresh tokens, a user disabled at the provider keeps their console session until its maximum age (12 h by default); with OIDC on, `DATABASTION_LOCAL_LOGIN=enabled` lets local users bypass the provider's policies; the role, group and domain expressions are written by the operator and must not read user-editable claims ([docs/05](docs/05-security.md#console-login-with-openid-connect)).
 - **Apereo CAS** (since 0.4.0): client addresses come from `X-Forwarded-For` unless a proxy overwrites it; CAS stores that match no CAS store guard rule are sampled like any table until the first ticket id is read ([docs/05](docs/05-security.md#apereo-cas-connector)).
+- **MySQL / MariaDB Audit blind spots** (since 0.5.0 the stream fails closed on hidden statements, #168): reads that touch only `information_schema`, `performance_schema` or `sys`, other sessions' statement texts included, unqualified function calls (stored functions included) and table-less `LOAD_FILE()` produce no event; grant `performance_schema`, `PROCESS` and `FILE` sparingly ([docs/08](docs/08-engine-capabilities.md#known-limits-1)).
 - **Audit log paths**: since 0.4.0 a final symlink and a file with more than one hard link are refused, but symlinks in parent directories are still followed; outside CAS targets, the directory permissions must keep others from replacing a parent directory ([ADR-0043](docs/adr/0043-audit-logs-opened-without-following-a-final-symlink.md)).
-- **Upgrades**: upgrade the console first, then the agents; a 0.4.0 agent holds its `cas` targets, findings and events until the console lists `engine.cas` ([ADR-0042](docs/adr/0042-hold-items-of-unlisted-engines.md)). Agents built before #60 (before 0.1.0) cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md)).
+- **Upgrades**: upgrade the console first, then the agents; the 0.5.0 worker upgrades the pg-boss schema at its first start (back up the console database first); a 0.4.0 or later agent holds its `cas` targets, findings and events until the console lists `engine.cas` ([ADR-0042](docs/adr/0042-hold-items-of-unlisted-engines.md)). Agents built before #60 (before 0.1.0) cannot decode `HeartbeatResponse.accepts` ([ADR-0022](docs/adr/0022-protocol-capability-negotiation.md)).
 - **Release trust**: a single maintainer approves releases ([RELEASE.md](RELEASE.md#repository-configuration-one-time)).
 
 ## Verifying release artifacts
@@ -66,7 +67,7 @@ The console and agent images are published to GHCR by [publish.yml](.github/work
 
 1. Resolve the digest of the tag (a tag can be moved in a registry; a digest cannot):
    ```bash
-   VERSION=0.4.0
+   VERSION=0.5.0
    IMAGE=ghcr.io/yil00/databastion-agent
    docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest
    # or: crane digest "$IMAGE:$VERSION"
