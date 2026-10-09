@@ -3,7 +3,8 @@
 //! built in (recognized by its column shape), a plain table holding
 //! ticket-id-shaped values (the tripwire), a ticket table recreated with a
 //! table grant (reported at the next check), a ticket table readable
-//! through a role, the `COM_AUDIT_TRAIL` and `RegisteredServices` rules.
+//! through a role, a ticket table readable through a column grant only,
+//! the `COM_AUDIT_TRAIL` and `RegisteredServices` rules.
 //!
 //! Needs `DATABASTION_TEST_<S>_ADMIN_URL` (skipped otherwise, as the other
 //! fixture tests). The fixtures are created here, in their own database
@@ -240,6 +241,30 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         .await;
         assert_eq!(ticket_note(&guard_check(&t).await), None, "{name}");
 
+        // A column-level grant only, on a credential column (security
+        // review of #181, M1): the table list (`information_schema.TABLES`)
+        // must show a table the account holds only column privileges on,
+        // so that its name key is found and its column statement sent.
+        exec(
+            &mut a,
+            &format!("GRANT SELECT (id) ON `{GUARD_DB}`.cas_tickets TO '{CAS_USER}'@'%'"),
+        )
+        .await;
+        let notes = guard_check(&t).await;
+        assert_eq!(ticket_note(&notes), Some(1), "{name}: {notes:?}");
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated),
+            "{name}: {notes:?}"
+        );
+        exec(
+            &mut a,
+            &format!("REVOKE SELECT (id) ON `{GUARD_DB}`.cas_tickets FROM '{CAS_USER}'@'%'"),
+        )
+        .await;
+        assert_eq!(ticket_note(&guard_check(&t).await), None, "{name}");
+
         // Through a role: MySQL evaluates every applicable role (here one
         // that is granted, not enabled); MariaDB only the default role.
         exec(
@@ -278,5 +303,51 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         drop_fixtures(&mut a).await;
         assert_eq!(through_role, Some(1), "{name}");
         assert_eq!(with_audit, Some(2), "{name}");
+    }
+}
+
+/// The guard's `check()` cost on the server's current catalog (ROADMAP
+/// phase 8 follow-up, docs/08 "CAS store guard"): the wall time of
+/// [`crate::check::cas_guard_readable`] with the agent account, with the
+/// built-in names and with 64 names of 128 characters per `cas_stores`
+/// list, median of 5 runs. Opt-in (`--ignored`): the figures only mean
+/// something on a catalog of the size under study (e.g. 5 000 tables).
+/// Prints times and counts only.
+#[tokio::test]
+#[ignore = "measurement: run with --ignored on a large catalog"]
+async fn cas_guard_cost() {
+    let _serial = SERIAL.lock().await;
+    let names = |p: char| -> Vec<String> {
+        (0..64)
+            .map(|i| format!("{i:02}{}", p.to_string().repeat(126)))
+            .collect()
+    };
+    let full = databastion_core::cas_guard::CasStores {
+        ticket_registry: names('t'),
+        service_registry: names('s'),
+        audit_trail: names('a'),
+    };
+    for server in servers() {
+        let (_dir, t) = agent_target(&server);
+        let mut s = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        for (label, stores) in [("built-in", None), ("cas_stores 3 x 64", Some(&full))] {
+            let mut times = Vec::new();
+            let mut last = None;
+            for _ in 0..5 {
+                let start = Instant::now();
+                let r = crate::check::cas_guard_readable(&mut s, stores)
+                    .await
+                    .unwrap();
+                times.push(start.elapsed());
+                last = Some((r.readable, r.complete));
+            }
+            times.sort();
+            eprintln!(
+                "{} {label}: median {:?} (min {:?}, max {:?}), readable and complete {:?}",
+                server.name, times[2], times[0], times[4], last
+            );
+        }
     }
 }

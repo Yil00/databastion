@@ -24,6 +24,7 @@
 //!   the events are handed to the core, which aggregates them before
 //!   spooling.
 
+pub(crate) mod credits;
 pub(crate) mod events;
 pub(crate) mod pfs;
 pub(crate) mod records;
@@ -183,7 +184,7 @@ fn own_account(
 }
 
 /// The event builder of a target's stream, with the connector's own
-/// statements of that target (the CAS store guard's column query, built
+/// statements of that target (the CAS store guard's catalog queries, built
 /// from the same `cas_stores` as `check()`).
 fn builder(
     cfg: &AuditConfig,
@@ -193,6 +194,7 @@ fn builder(
 ) -> EventBuilder {
     EventBuilder::new(own_account(cfg, target, pre, state))
         .with_own_statements(own_statements(target))
+        .with_sample_credits(state.sample_credits(&target.id))
 }
 
 /// Exact texts of the statements `check()` sends that read
@@ -345,6 +347,13 @@ pub(crate) async fn audit_stream(
 ) -> Result<(), ConnectorError> {
     let target = cfg.target().ok_or_else(internal)?;
     let _running = state.stream_started(&target.id);
+    // Discovery grants sampling credits only while this stream runs, for
+    // about two polls (`audit::credits`).
+    state
+        .sample_credits(&target.id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_poll_interval(cfg.poll_interval());
     let timeouts = Timeouts::new(cfg.statement_timeout().min(Duration::from_secs(30)));
     let mut file: Option<FileStream> = None;
     let mut ps: Option<PsStream> = None;

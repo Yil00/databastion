@@ -1091,10 +1091,20 @@ async fn probes() {
                 server.name
             );
         }
-        // Byte budget: rows of ~1 MiB, 32 MiB per table: 31 rows, the
-        // statement killed, the next tables sampled on a new session.
+        // Byte budget: rows of ~1 MiB, 32 MiB per table, the statement
+        // killed, the next tables sampled on a new session. The columns
+        // are sampled in batches whose statements stay under the audit
+        // logs' limits (`sql::sample_statements`), each within its share
+        // of the budget (security review of 914c9d2, N2): the first batch
+        // (`email` and about half the text columns) stops on its share,
+        // the second runs on a new session.
         assert!(text.contains("sample byte budget reached"), "{text}");
-        assert_eq!(sampled(&findings, &db, "a_wide", "email"), Some(31));
+        let email = sampled(&findings, &db, "a_wide", "email");
+        assert!(email.is_some_and(|n| (10..40).contains(&n)), "{email:?}");
+        assert!(
+            text.matches("sample stopped: statement killed").count() >= 2,
+            "{text}"
+        );
         let mut lingering = -1;
         for _ in 0..50 {
             lingering = count(

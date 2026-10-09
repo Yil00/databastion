@@ -343,7 +343,7 @@ async fn a_server_ignoring_the_limit_is_stopped() {
         }
     });
     let mut values = vec![Vec::new(), Vec::new()];
-    let mut sampler = RowSampler::new(200, 0, &mut values);
+    let mut sampler = RowSampler::new(200, MAX_SAMPLE_BYTES, &mut values);
     let r = read_result(&mut client, "SELECT a, b", |row| sampler.accept(row))
         .await
         .unwrap();
@@ -359,7 +359,7 @@ async fn a_server_ignoring_the_limit_is_stopped() {
 
     // Empty values alone reach the byte budget.
     let mut values = vec![Vec::new()];
-    let mut sampler = RowSampler::new(u32::MAX, MAX_SAMPLE_BYTES - 3 * VALUE_OVERHEAD, &mut values);
+    let mut sampler = RowSampler::new(u32::MAX, 3 * VALUE_OVERHEAD, &mut values);
     for _ in 0..3 {
         assert_eq!(sampler.accept(&[Some(&b""[..])]), Flow::Continue);
     }
