@@ -57,7 +57,7 @@ use crate::error::{MyError, Stage};
 use crate::sql;
 
 /// Statements read per query.
-const BATCH: usize = 2000;
+const BATCH: usize = sql::PS_BATCH;
 /// Queries per poll at most (then the next poll continues).
 const MAX_BATCHES: usize = 10;
 /// Re-read window for statements finishing out of order.
@@ -523,16 +523,17 @@ impl PsPoller {
         self.threads.insert(thread, info.clone());
     }
 
+    /// Sets the session user variables of the constant poll texts
+    /// (ADR-0045 decision 4) on the poll session, right before one.
+    async fn set_variables(&self, session: &mut Session, from: u64) -> Result<(), MyError> {
+        let set = sql::ps_poll_variables(self.own_thread, from, sql_text_from(self.digest_limit));
+        session.exec(Stage::Audit, &set).await.map(drop)
+    }
+
     /// Reads one batch of rows.
     async fn read_rows(&mut self, session: &mut Session, from: u64) -> Result<Vec<Row>, MyError> {
-        let statement = sql::ps_statements(
-            self.table.name(),
-            self.own_thread,
-            from,
-            BATCH,
-            self.with_program,
-            sql_text_from(self.digest_limit),
-        );
+        self.set_variables(session, from).await?;
+        let statement = sql::ps_statements(self.table.name(), self.with_program);
         let (text_limit, digest_limit) = (self.text_limit, self.digest_limit);
         let mut rows: Vec<Row> = Vec::new();
         let streamed = session
@@ -592,7 +593,8 @@ impl PsPoller {
         session: &mut Session,
         sink: &EventSink,
     ) -> Result<(), PollError> {
-        let stats = sql::ps_stats(self.table.name(), self.own_thread);
+        self.set_variables(session, 0).await?;
+        let stats = sql::ps_stats(self.table.name());
         let row = session
             .query(Stage::Audit, &stats)
             .await?

@@ -267,6 +267,21 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   holding the agent's credentials on the agent host, spoofing its
   `program_name` and reading at most that many rows per table and day with
   filtered queries stays unreported.
+- **Statement-text tables** (ADR-0045 part (a)): reads of the system
+  tables that hold other sessions' statement texts
+  (`audit::events::STATEMENT_TEXT_TABLES`: `performance_schema`
+  `events_statements_*`, `threads`, `processlist`, `data_locks`,
+  `information_schema.PROCESSLIST`, `INNODB_TRX`, the `sys` session and
+  lock-wait views…), and `SHOW [FULL] PROCESSLIST`, are read events naming
+  them, always reported, never the agent's own; `SHOW ENGINE INNODB
+  STATUS` and the plan of another connection (`SHOW EXPLAIN`, `EXPLAIN …
+  FOR CONNECTION`) are reads of `*`. The agent's own `performance_schema`
+  polls are constant texts (the poll's thread id, timer and text
+  threshold are session user variables, `sql::ps_poll_variables`), left
+  out uncharged only by their whole uncut text with table records of
+  their own tables (`sql::own_performance_schema_reads`); its readability
+  probes are `EXPLAIN`s (the same privilege, no row read, quiet). Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by
   `server_audit`, JSON-encoded by `audit_log`), so it cannot add records.
@@ -297,7 +312,7 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   closed), `src/audit/events.rs` (grouping, objects, signals, own account,
   sessions), `src/check.rs` (source choice, levels, the
   `performance_schema` grant rule), `src/sql.rs` (the poll statement reads
-  text only through the digest rule).
+  text only through the digest rule; the poll texts are constant).
 - Normalizer property tests: `../classifiers/tests/query_mysql_props.rs`.
 - Integration tests against `dev/` (`src/it/audit_it.rs`): the MariaDB
   `server_audit` log, the Percona `audit_log_filter` JSON log and
@@ -307,3 +322,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   and the agent's address as the server sees it (the Docker bridge gateway
   in CI). Environment variables are listed at the top of that file; CI
   requires them (`DATABASTION_TEST_REQUIRE`).
+- Statement-text tables (`src/it/stmt_text_it.rs`): the drift test of the
+  list against each server's `information_schema.COLUMNS` (engine matrix),
+  and a second account's reads of `events_statements_history_long` and
+  `information_schema.PROCESSLIST` reported, while the agent's own probes
+  and polls (two targets on one server) are not.

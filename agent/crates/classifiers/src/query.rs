@@ -945,6 +945,18 @@ pub struct StatementInfo {
     /// finding one (not valid SQL today): what it runs cannot be told, so
     /// it is never quiet (defence in depth, #168 review L3).
     pub explain_unbounded: bool,
+    /// MySQL: shows the plan of the statement another connection runs:
+    /// MariaDB `SHOW EXPLAIN` / `SHOW ANALYZE` (`[FORMAT = x] FOR id`),
+    /// and `EXPLAIN` / `DESCRIBE` / `DESC` with a `FOR` word before any
+    /// statement (`… [FORMAT = x] FOR CONNECTION id`). MariaDB 11.4 adds
+    /// that statement's whole text as a note, and its JSON plan and MySQL
+    /// 8.4's `FORMAT=TREE` show its conditions with their literals: a read
+    /// of another session's statement text (ADR-0045 open question 3).
+    pub explain_connection: bool,
+    /// [`Self::relations`] reached [`MAX_RELATIONS`]: the statement may
+    /// name more relations than were kept (a caller that must see every
+    /// name fails closed).
+    pub relations_full: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1401,6 +1413,25 @@ fn explain_unbounded(s: &[Tok]) -> bool {
     matches!(word(s.first()), Some("explain" | "describe" | "desc"))
         && s.len() > MAX_EXPLAIN_PREFIX_TOKENS
         && !(1..MAX_EXPLAIN_PREFIX_TOKENS).any(|j| runs_statement_at(s, j, true))
+}
+
+/// See [`StatementInfo::explain_connection`]. An `EXPLAIN` whose
+/// statement is not found within [`MAX_EXPLAIN_PREFIX_TOKENS`] is searched
+/// for `FOR` up to that bound (`explain_unbounded` covers the rest).
+fn explain_connection(s: &[Tok]) -> bool {
+    match (word(s.first()), word(s.get(1))) {
+        (Some("show"), Some("explain" | "analyze")) => true,
+        (Some("explain" | "describe" | "desc"), _) => {
+            let bound = s.len().min(MAX_EXPLAIN_PREFIX_TOKENS);
+            let end = (1..bound)
+                .find(|&j| runs_statement_at(s, j, true))
+                .unwrap_or(bound);
+            s[1..end]
+                .iter()
+                .any(|t| matches!(t, Tok::Word(w) if w == "for"))
+        }
+        _ => false,
+    }
 }
 
 /// Skips `FORMAT = name` at `i`.
@@ -2132,9 +2163,11 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
             _ => (None, None),
         }
     };
+    let relations_full = relations.len() >= MAX_RELATIONS;
     StatementInfo {
         kind,
         relations,
+        relations_full,
         shape,
         copy,
         nested,
@@ -2151,6 +2184,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         file_read: opts.dialect == Dialect::Mysql && (has_file_function(s) || server_file_load(s)),
         non_ascii_call: opts.dialect == Dialect::Mysql && has_non_ascii_call(s, kind),
         explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
+        explain_connection: opts.dialect == Dialect::Mysql && explain_connection(s),
     }
 }
 
@@ -4180,6 +4214,64 @@ mod tests {
             "FORMAT = TREE ".repeat(10)
         ));
         assert!(a.parts()[0].analyze_wrapped);
+    }
+
+    /// A statement naming [`MAX_RELATIONS`] relations or more says so: the
+    /// later ones are not kept.
+    #[test]
+    fn mysql_relations_full() {
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("hr.t{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for (n, full) in [(1, false), (14, false), (15, true), (16, true), (40, true)] {
+            let q = format!("SELECT * FROM {}, performance_schema.threads", names(n));
+            let a = my(&q);
+            let p = &a.parts()[0];
+            assert_eq!(p.relations_full, full, "{n}");
+            assert_eq!(p.relations.len(), (n + 1).min(MAX_RELATIONS), "{n}");
+        }
+    }
+
+    /// ADR-0045 open question 3: the plan of another connection's
+    /// statement shows its text (MariaDB 11.4: a note; MySQL 8.4
+    /// `FORMAT=TREE`: its literals). Explaining a statement does not.
+    #[test]
+    fn mysql_explain_of_another_connection() {
+        for q in [
+            "SHOW EXPLAIN FOR 12",
+            "show explain format=json for 12",
+            "SHOW ANALYZE FOR 12",
+            "SHOW ANALYZE FORMAT = JSON FOR 12",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN FORMAT=TREE FOR CONNECTION 12",
+            "EXPLAIN FORMAT = JSON FOR CONNECTION 12",
+            "DESCRIBE FOR CONNECTION 12",
+            "desc for connection 12",
+            "EXPLAIN EXTENDED FOR CONNECTION 12",
+            "SET STATEMENT max_statement_time = 1 FOR SHOW EXPLAIN FOR 12",
+            "SET STATEMENT max_statement_time = 1 FOR EXPLAIN FOR CONNECTION 12",
+            "/* x */ EXPLAIN /* y */ FOR CONNECTION 12",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(a.parts()[0].explain_connection, "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT * FROM t FOR UPDATE",
+            "EXPLAIN (SELECT a FROM t) FOR UPDATE",
+            "EXPLAIN FORMAT=JSON SELECT * FROM t WHERE a = 1 FOR SHARE",
+            "DESCRIBE t",
+            "DESC hr.t a",
+            "EXPLAIN t",
+            "SHOW TABLES",
+            "SHOW PROCESSLIST",
+            "SELECT 1 FOR UPDATE",
+        ] {
+            assert!(!my(q).parts()[0].explain_connection, "{q}");
+        }
     }
 
     /// Re-review of a2684a2: `ANALYZE` / `EXPLAIN ANALYZE` / `BEGIN NOT

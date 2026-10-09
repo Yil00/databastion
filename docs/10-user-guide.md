@@ -204,6 +204,18 @@ Audit read positions (log offsets, cursors, profiler positions) and the agent's 
 
 **MySQL / MariaDB** (since 0.5.0): Audit fails closed. Writes to `information_schema`, `performance_schema` and `sys`, server and audit configuration changes, and statements it cannot read with certainty (version comments, double-quoted names, `ANALYZE`, `SET STATEMENT`, reads inside `SET` or `DO`, any statement outside a short allow-list of harmless ones) are reported, some of them against the object `*`, and configuration changes are never dropped by the minimum rows. What is and is not reported: [08-engine-capabilities.md](08-engine-capabilities.md#statement-text-and-passwords).
 
+**MySQL / MariaDB statement-text tables** (next release): reads of the system tables that hold other sessions' statement texts with their literal values (`performance_schema.events_statements_*`, `threads`, `information_schema.PROCESSLIST` and the others listed in [08-engine-capabilities.md](08-engine-capabilities.md#statement-text-tables)) are read events naming these tables, always reported whatever the minimum rows, from every account, the agent's included. `SHOW PROCESSLIST` is a read of `information_schema.PROCESSLIST`; `SHOW ENGINE INNODB STATUS` and the plan of another connection's statement (`SHOW EXPLAIN`, `EXPLAIN … FOR CONNECTION`) are reads of `*`. Monitoring tools (PMM, Datadog DBM, `sys`-based dashboards) read these tables on a schedule, so their accounts show regular events. A sample policy that opens an incident when any other account reads them (access events; `exclude_principals` takes globs on the account name):
+
+| Key | Value |
+|-----|-------|
+| `engines` | `mysql`, `mariadb` |
+| `event_actions` | `read` |
+| `objects` | `{database: performance_schema, object: events_statements_*}`, `{database: performance_schema, object: threads}`, `{database: performance_schema, object: processlist}`, `{database: performance_schema, object: prepared_statements_instances}`, `{database: performance_schema, object: data_locks}`, `{database: information_schema, object: PROCESSLIST}`, `{database: information_schema, object: INNODB_*}`, `{database: sys, object: *}` |
+| `exclude_principals` | your monitoring account, for example `pmm` |
+| Action | an incident of severity `high` |
+
+The agent has no allow-list of monitoring accounts: a monitoring credential is often shared and holds exactly these grants, so it is excluded in the console, where the exclusion is visible.
+
 The export signatures recognized per engine are listed in [08-engine-capabilities.md](08-engine-capabilities.md#known-export-signatures).
 
 ## 11. Policies, incidents and notifications
