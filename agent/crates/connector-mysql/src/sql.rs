@@ -264,11 +264,7 @@ pub(crate) fn sample_statement(
     }
     let mut list = Vec::with_capacity(columns.len());
     for (name, kind) in columns {
-        let q = quote_ident(name)?;
-        list.push(match kind {
-            Sampled::Text => format!("LEFT({q}, {MAX_VALUE_CHARS})"),
-            Sampled::Plain => q,
-        });
+        list.push(sample_item(name, *kind)?);
     }
     let from = format!("{}.{}", quote_ident(schema)?, quote_ident(table)?);
     let ms = statement_ms.max(100);
@@ -283,6 +279,82 @@ pub(crate) fn sample_statement(
             ms % 1000,
             list.join(", ")
         ),
+    })
+}
+
+/// The sampling statements of one table ([`sample_statement`]): `columns`
+/// split, in order, into consecutive batches of at most `max_columns`, each
+/// as long as its statement stays within [`MAX_OWN_STATEMENT`] (so that it
+/// is never cut in the audit logs, where a cut text is reported as a read
+/// of `*`), counting [`SAMPLE_DIGEST_MARGIN`] more bytes per column for its
+/// `performance_schema` digest text. A batch has at least one column: one
+/// column always fits (three names of at most 64 characters). Each item:
+/// the batch's range in `columns` and its statement.
+#[must_use]
+pub(crate) fn sample_statements(
+    flavor: Flavor,
+    statement_ms: u32,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, Sampled)],
+    limit: u32,
+    max_columns: usize,
+) -> Option<Vec<(std::ops::Range<usize>, String)>> {
+    let first = sample_statement(
+        flavor,
+        statement_ms,
+        schema,
+        table,
+        columns.get(..1)?,
+        limit,
+    )?;
+    let items: Vec<usize> = columns
+        .iter()
+        .map(|(n, k)| sample_item(n, *k).map(|i| server_audit_escaped_len(&i)))
+        .collect::<Option<_>>()?;
+    // The statement without its column list (`, ` has nothing to escape).
+    let base = server_audit_escaped_len(&first) - items[0];
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < columns.len() {
+        let mut len = base + items[start];
+        let mut end = start + 1;
+        while end < columns.len()
+            && end - start < max_columns.max(1)
+            && len + 2 + items[end] + SAMPLE_DIGEST_MARGIN * (end - start + 1) <= MAX_OWN_STATEMENT
+        {
+            len += 2 + items[end];
+            end += 1;
+        }
+        let s = sample_statement(
+            flavor,
+            statement_ms,
+            schema,
+            table,
+            &columns[start..end],
+            limit,
+        )?;
+        debug_assert_eq!(server_audit_escaped_len(&s), len);
+        out.push((start..end, s));
+        start = end;
+    }
+    Some(out)
+}
+
+/// Bytes counted per sampled column on top of its text by
+/// [`sample_statements`]: a `performance_schema` digest text spaces its
+/// tokens (`LEFT ( `c` , ? ) , ` for `LEFT(`c`, 4096), `), at most 3 bytes
+/// more per column, and is reported cut from 4 bytes under
+/// `performance_schema_max_digest_length` (`audit::pfs`). Measured on MySQL
+/// 8.4 and MariaDB 11.4: see the `sample_statements_stay_short` test.
+pub(crate) const SAMPLE_DIGEST_MARGIN: usize = 4;
+
+/// One selected column of [`sample_statement`].
+fn sample_item(name: &str, kind: Sampled) -> Option<String> {
+    let q = quote_ident(name)?;
+    Some(match kind {
+        Sampled::Text => format!("LEFT({q}, {MAX_VALUE_CHARS})"),
+        Sampled::Plain => q,
     })
 }
 
@@ -338,12 +410,20 @@ macro_rules! name_key {
 /// to tell a cut list (then reported as not evaluated, PR #141 review L2).
 pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
 
-/// Longest CAS store guard statement, in bytes as `server_audit` logs it
+/// Longest statement the agent sends, in bytes as `server_audit` logs it
 /// (escaped): well under the 1024-byte defaults of
 /// `server_audit_query_log_limit` and `performance_schema_max_sql_text_length`,
-/// so that a guard statement is never cut at the default limits and its
-/// exact text can be recognized by the Audit stream.
-pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = 900;
+/// so that the agent's statements are never cut at the default limits. The
+/// Audit stream reports a cut text with no table record as a read of `*`,
+/// always, whoever sent it (security review of #181, H1). Held by every
+/// fixed statement and the CAS store guard statements, and by the sampling
+/// statements, split into column batches ([`sample_statements`]). Not held
+/// by `SHOW GRANTS … USING` with many roles ([`show_grants_using`]).
+pub(crate) const MAX_OWN_STATEMENT: usize = 900;
+
+/// Longest CAS store guard statement ([`MAX_OWN_STATEMENT`]): its exact
+/// text must be recognized by the Audit stream.
+pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = MAX_OWN_STATEMENT;
 
 /// Length of `s` once escaped by MariaDB's `server_audit` (`'`, `\`,
 /// newline, carriage return, tab, backspace and form feed gain a `\`).
@@ -366,10 +446,15 @@ const CAS_GUARD_SCHEMAS: &str =
 /// `Opened_table_definitions` on MariaDB, a data dictionary index read on
 /// MySQL). `check()` streams it, computes each name key in Rust
 /// (`databastion_core::cas_guard::name_key`, the key of [`name_key!`]) and
-/// keeps only the keys it knows; no name is kept.
+/// keeps only the keys it knows; no name is kept. At most
+/// [`CAS_GUARD_MAX_TABLES`] + 1 rows: one more tells a cut list (the guard
+/// is then not evaluated).
 pub(crate) const CAS_GUARD_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME \
      FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) NOT IN \
-     ('mysql', 'sys', 'information_schema', 'performance_schema')";
+     ('mysql', 'sys', 'information_schema', 'performance_schema') LIMIT 1000001";
+
+/// Most rows of [`CAS_GUARD_TABLES`] read; it asks for one more.
+pub(crate) const CAS_GUARD_MAX_TABLES: usize = 1_000_000;
 
 /// The CAS store guard statements of `check()` (ADR-0041 decision 6),
 /// every text known from the configuration alone (the Audit stream
@@ -918,6 +1003,161 @@ mod tests {
         }
         // A key that cannot fit one statement: no statement at all.
         assert!(cas_guard_statements(&["k".repeat(800)]).is_none());
+    }
+
+    /// The agent's statements stay within `MAX_OWN_STATEMENT`, so that
+    /// the audit logs never cut them at their default limits (a cut text
+    /// with no table record is reported as a read of `*`: security review
+    /// of #181, H1). Sampling statements are split into column batches;
+    /// their digest texts measured at most 850 bytes on MySQL 8.4 and
+    /// MariaDB 11.4 for these shapes (`SAMPLE_DIGEST_MARGIN`).
+    #[test]
+    fn sample_statements_stay_short() {
+        let name = |i: usize, n: usize| -> String {
+            let s = format!("{i:x}{}", "c".repeat(n));
+            s.chars().take(n.max(1)).collect::<String>() + &format!("{i}")
+        };
+        for (n, kind) in [
+            (1, Sampled::Plain),
+            (1, Sampled::Text),
+            (20, Sampled::Text),
+            (60, Sampled::Plain),
+        ] {
+            let cols: Vec<String> = (0..4096).map(|i| name(i, n)).collect();
+            let sel: Vec<(&str, Sampled)> = cols.iter().map(|c| (c.as_str(), kind)).collect();
+            for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+                for max in [1024, 3] {
+                    let all = sample_statements(
+                        flavor,
+                        4_294_967_295,
+                        "s'chema",
+                        "t\\able",
+                        &sel,
+                        u32::MAX,
+                        max,
+                    )
+                    .unwrap();
+                    let mut next = 0;
+                    for (range, s) in &all {
+                        assert_eq!(range.start, next);
+                        assert!(!range.is_empty() && range.len() <= max);
+                        next = range.end;
+                        let len = server_audit_escaped_len(s);
+                        assert!(
+                            len + SAMPLE_DIGEST_MARGIN * range.len() <= MAX_OWN_STATEMENT,
+                            "{len}"
+                        );
+                        assert_eq!(
+                            *s,
+                            sample_statement(
+                                flavor,
+                                4_294_967_295,
+                                "s'chema",
+                                "t\\able",
+                                &sel[range.clone()],
+                                u32::MAX
+                            )
+                            .unwrap()
+                        );
+                    }
+                    assert_eq!(next, cols.len());
+                }
+            }
+        }
+        // The longest names (64 characters of 4 bytes, or of characters
+        // `server_audit` escapes): one column always fits.
+        for c in ["\u{1F600}", "'", "`"] {
+            let long = c.repeat(64);
+            for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+                let all = sample_statements(
+                    flavor,
+                    4_294_967_295,
+                    &long,
+                    &long,
+                    &[
+                        (long.as_str(), Sampled::Text),
+                        (long.as_str(), Sampled::Plain),
+                    ],
+                    u32::MAX,
+                    1024,
+                )
+                .unwrap();
+                assert_eq!(all.iter().map(|(r, _)| r.len()).sum::<usize>(), 2, "{c}");
+                for (_, s) in &all {
+                    assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{c}");
+                }
+            }
+        }
+        assert!(sample_statements(Flavor::Mysql, 1, "s", "t", &[], 1, 1).is_none());
+    }
+
+    /// Every fixed statement, and the per-table catalog statements with the
+    /// longest names, stay within `MAX_OWN_STATEMENT`.
+    #[test]
+    fn own_statements_stay_short() {
+        let long = ["\u{1F600}".repeat(64), "'".repeat(64), "`".repeat(64)];
+        let mut all: Vec<String> = [
+            INTROSPECT,
+            SESSION_READ_ONLY,
+            BEGIN,
+            CURRENT_USER,
+            USER_PRIVILEGES,
+            SCHEMA_PRIVILEGES,
+            TABLE_PRIVILEGES,
+            COLUMN_PRIVILEGES,
+            APPLICABLE_ROLES_MYSQL,
+            APPLICABLE_ROLES_MARIADB,
+            CURRENT_ROLE,
+            SHOW_GRANTS_OWN,
+            MANDATORY_ROLES,
+            SHOW_GRANTS_CURRENT_ROLE,
+            SHOW_GRANTS_PUBLIC,
+            INIT_CONNECT,
+            AUDIT_PLUGINS,
+            SERVER_AUDIT_SETTINGS,
+            AUDIT_LOG_SETTINGS,
+            AUDIT_LOG_FILTER_FORMAT,
+            SERVER_AUDIT_QUERY_LIMIT,
+            SYSTEM_UTC_OFFSET,
+            SESSION_USER,
+            PS_ENABLED,
+            PS_CONSUMERS,
+            PS_HISTORY_LONG,
+            PS_HISTORY,
+            PS_CURRENT,
+            PS_OWN_THREAD,
+            SERVER_UPTIME,
+            PS_TEXT_LIMIT,
+            PS_DIGEST_LIMIT,
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            all.push(session_setup(flavor, u32::MAX));
+            all.push(set_statement_timeout(flavor, u32::MAX));
+            all.push(session_check(flavor, "transaction_read_only"));
+            for n in &long {
+                all.push(ticket_type_counts(flavor, u32::MAX, n, n, n).unwrap());
+            }
+        }
+        for n in &long {
+            all.push(table_engine(n, n).unwrap());
+            all.push(table_rows(n, n).unwrap());
+            all.push(columns(n, n).unwrap());
+        }
+        for table in [
+            "events_statements_history_long",
+            "events_statements_history",
+        ] {
+            all.push(ps_stats(table, u64::MAX));
+            all.push(ps_statements(table, u64::MAX, u64::MAX, usize::MAX, true));
+        }
+        all.push(kill_query(u32::MAX));
+        all.extend(cas_guard_statement_texts(None).unwrap());
+        for s in &all {
+            assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
+        }
     }
 
     /// The table list reads the schema and name only, outside the same

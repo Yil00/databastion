@@ -550,9 +550,30 @@ async fn performance_schema_gives_events_with_rows() {
              WHERE NAME = 'events_stages_current'",
         )
         .await;
+        // Security review of #181, H1: token padding fills the digest
+        // (cut at its token storage, rendered past the limit): the read
+        // after the cut is reported as a read of `*`, always.
+        a.query(
+            Stage::Check,
+            &format!(
+                "SELECT i FROM {AUDIT_DB}.d WHERE 1 = 1{} UNION ALL SELECT i FROM {AUDIT_DB}.big",
+                " AND i = i".repeat(300)
+            ),
+        )
+        .await
+        .unwrap();
+        let cut_star = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.always_report()
+                    && e.principal().account_name() == admin.user
+                    && e.objects().iter().any(|o| o.object().as_str() == "*")
+                    && e.objects().iter().any(|o| o.object().as_str() == "d")
+            })
+        };
         let mut events: Events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
-            has_write(ev, "setup_consumers")
+            cut_star(ev)
+                && has_write(ev, "setup_consumers")
                 && has(ev, "big", "volume.large_result")
                 && has(ev, "d", "signature.mysqldump")
                 && has(ev, "d", "signature.into_outfile")
@@ -598,6 +619,7 @@ async fn performance_schema_gives_events_with_rows() {
             "{}: write to performance_schema.setup_consumers: {all:#?}",
             server.name
         );
+        assert!(cut_star(&events), "{}: cut digest: {all:#?}", server.name);
         if real {
             assert!(
                 has(&events, "employees", "signature.mysqldump"),

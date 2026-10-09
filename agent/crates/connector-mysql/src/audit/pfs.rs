@@ -134,6 +134,18 @@ struct ThreadInfo {
     program: Option<String>,
 }
 
+/// Whether a statement text (`SQL_TEXT`) or digest text (`DIGEST_TEXT`) of
+/// `performance_schema` may have been cut at the server's `limit` (bytes):
+/// within 4 bytes of it, or longer than it (a text past
+/// [`MAX_TEXT_BYTES`] is dropped, and still cut), or a digest ending in
+/// `...`. A digest spaces its tokens: one cut at its token storage limit
+/// can render longer than the limit, without `...` (measured on MySQL 8.4
+/// and MariaDB 11.4). A cut text with no table record is reported as a
+/// read of `*` (`events::EventBuilder::statement`).
+pub(crate) fn text_cut(t: &[u8], is_digest: bool, limit: usize) -> bool {
+    t.len() + 4 >= limit || t.len() > MAX_TEXT_BYTES || (is_digest && t.ends_with(b"..."))
+}
+
 /// One statement row (the text in a zeroizing buffer).
 struct Row {
     thread: u64,
@@ -418,6 +430,7 @@ impl PsPoller {
                     None => (get(5).map(|t| Zeroizing::new(t.to_vec())), false),
                 };
                 let limit = if is_digest { digest_limit } else { text_limit };
+                let truncated = body.as_ref().is_some_and(|t| text_cut(t, is_digest, limit));
                 let body = body.filter(|t| t.len() <= MAX_TEXT_BYTES);
                 let user = text_of(get(9));
                 let thread_info = user.map(|user| ThreadInfo {
@@ -430,11 +443,7 @@ impl PsPoller {
                     event,
                     timer_end,
                     schema: text(get(3), 1024).unwrap_or_default(),
-                    // At the server's limit, or a digest the server cut
-                    // (it ends with `...`).
-                    truncated: body.as_ref().is_some_and(|t| {
-                        t.len() + 4 >= limit || (is_digest && t.ends_with(b"..."))
-                    }),
+                    truncated,
                     text: body,
                     rows: num(get(6)).unwrap_or(0).max(num(get(7)).unwrap_or(0)),
                     errno: num(get(8)).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),

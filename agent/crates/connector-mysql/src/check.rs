@@ -1450,11 +1450,20 @@ pub(crate) async fn cas_guard_readable(
     // The name keys present in the catalog: the table list is streamed and
     // each name key computed here, as the column statements compute it in
     // SQL; only the known keys are kept. A name that is not UTF-8 cannot
-    // be keyed: not complete (fail closed, as a skipped row below).
+    // be keyed: not complete (fail closed, as a skipped row below). More
+    // than `CAS_GUARD_MAX_TABLES` tables: the list is cut, not complete
+    // (security review of #181, L1).
     let mut present: BTreeSet<&str> = BTreeSet::new();
     let mut unkeyed = 0usize;
+    let mut listed = 0usize;
     session
         .query_stream(Stage::Check, guard.tables, |row| {
+            // The statement's `LIMIT` sends at most one row more (not
+            // stopped: a stopped stream poisons the session).
+            listed += 1;
+            if listed > sql::CAS_GUARD_MAX_TABLES {
+                return Flow::Continue;
+            }
             match row.get(1).copied().flatten().map(std::str::from_utf8) {
                 Some(Ok(name)) => {
                     let key = cas_guard::name_key(name);
@@ -1468,7 +1477,7 @@ pub(crate) async fn cas_guard_readable(
             Flow::Continue
         })
         .await?;
-    complete &= unkeyed == 0;
+    complete &= unkeyed == 0 && listed <= sql::CAS_GUARD_MAX_TABLES;
     let statements = guard
         .by_key
         .iter()

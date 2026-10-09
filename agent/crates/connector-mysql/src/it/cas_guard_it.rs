@@ -3,7 +3,8 @@
 //! built in (recognized by its column shape), a plain table holding
 //! ticket-id-shaped values (the tripwire), a ticket table recreated with a
 //! table grant (reported at the next check), a ticket table readable
-//! through a role, the `COM_AUDIT_TRAIL` and `RegisteredServices` rules.
+//! through a role, a ticket table readable through a column grant only,
+//! the `COM_AUDIT_TRAIL` and `RegisteredServices` rules.
 //!
 //! Needs `DATABASTION_TEST_<S>_ADMIN_URL` (skipped otherwise, as the other
 //! fixture tests). The fixtures are created here, in their own database
@@ -236,6 +237,30 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         exec(
             &mut a,
             &format!("REVOKE SELECT ON `{GUARD_DB}`.cas_tickets FROM '{CAS_USER}'@'%'"),
+        )
+        .await;
+        assert_eq!(ticket_note(&guard_check(&t).await), None, "{name}");
+
+        // A column-level grant only, on a credential column (security
+        // review of #181, M1): the table list (`information_schema.TABLES`)
+        // must show a table the account holds only column privileges on,
+        // so that its name key is found and its column statement sent.
+        exec(
+            &mut a,
+            &format!("GRANT SELECT (id) ON `{GUARD_DB}`.cas_tickets TO '{CAS_USER}'@'%'"),
+        )
+        .await;
+        let notes = guard_check(&t).await;
+        assert_eq!(ticket_note(&notes), Some(1), "{name}: {notes:?}");
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated),
+            "{name}: {notes:?}"
+        );
+        exec(
+            &mut a,
+            &format!("REVOKE SELECT (id) ON `{GUARD_DB}`.cas_tickets FROM '{CAS_USER}'@'%'"),
         )
         .await;
         assert_eq!(ticket_note(&guard_check(&t).await), None, "{name}");

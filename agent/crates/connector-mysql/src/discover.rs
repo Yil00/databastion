@@ -598,23 +598,22 @@ async fn read_table(
     let mut rows = 0u32;
     // Columns in batches, so that one row of a batch stays well under the
     // largest packet the connector accepts (a table with thousands of text
-    // columns cannot make a single row oversized and abort the scan).
-    for (batch, (cols_batch, values_batch)) in cols
-        .chunks(MAX_BATCH_COLUMNS)
-        .zip(values.chunks_mut(MAX_BATCH_COLUMNS))
-        .enumerate()
-    {
-        let selected: Vec<(&str, Sampled)> =
-            cols_batch.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        let statement = sql::sample_statement(
-            tx.flavor(),
-            tx.timeouts().statement_ms(),
-            &table.schema,
-            &table.name,
-            &selected,
-            limit,
-        )
-        .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
+    // columns cannot make a single row oversized and abort the scan), and
+    // each statement under the audit logs' default text limits
+    // (`sql::MAX_OWN_STATEMENT`: a cut text is reported as a read of `*`).
+    let selected: Vec<(&str, Sampled)> = cols.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+    let statements = sql::sample_statements(
+        tx.flavor(),
+        tx.timeouts().statement_ms(),
+        &table.schema,
+        &table.name,
+        &selected,
+        limit,
+        MAX_BATCH_COLUMNS,
+    )
+    .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
+    for (batch, (range, statement)) in statements.into_iter().enumerate() {
+        let values_batch = &mut values[range];
         let mut sampler = RowSampler::new(limit, bytes, values_batch);
         let streamed = tx
             .query_stream(Stage::Sample, &statement, |row| sampler.accept(row))

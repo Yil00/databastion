@@ -829,6 +829,15 @@ impl EventBuilder {
         // what it touched cannot be told (fail closed).
         let unparsed =
             opaque || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed);
+        // A text cut by the source (`server_audit_query_log_limit`,
+        // `performance_schema_max_sql_text_length`, a full digest) with no
+        // table record: what followed the cut cannot be told (whitespace,
+        // comment or token padding before a `UNION`, a subquery, a second
+        // statement). Fail closed: never quiet, never the agent's own, a
+        // read or write of what the visible part names and of `*`, always
+        // reported (security review of #181, H1). The agent keeps its own
+        // statements under the default limits (`sql::MAX_OWN_STATEMENT`).
+        let cut_blind = a.truncated && a.tables.is_empty();
         if let Some(app) = a.application {
             let s = self.sessions.entry(&a.session);
             if s.program.is_none() {
@@ -939,6 +948,7 @@ impl EventBuilder {
             || loud_other
             || analyze_wrapped
             || blind
+            || cut_blind
             || a.tables
                 .iter()
                 .any(|(db, table, op)| *op != TableOp::Read && !is_internal_table(db, table));
@@ -958,7 +968,7 @@ impl EventBuilder {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
                 (None, true) => EventAction::Read,
-                (None, false) if loud_other => EventAction::Read,
+                (None, false) if loud_other || cut_blind => EventAction::Read,
                 (None, false) => return None,
             },
         };
@@ -990,8 +1000,13 @@ impl EventBuilder {
                 }
             }
             // Unknown objects: a text that cannot be read, code that runs
-            // out of sight, a write that names no table (or only `DUAL`).
-            if (!named_any && !parsed) || call || ((write || loud_other) && objects.is_empty()) {
+            // out of sight, a write that names no table (or only `DUAL`), a
+            // text cut with no table record.
+            if (!named_any && !parsed)
+                || call
+                || cut_blind
+                || ((write || loud_other) && objects.is_empty())
+            {
                 unknown = true;
             }
         } else {
@@ -1053,7 +1068,7 @@ impl EventBuilder {
         // Also reads of `*`: code that runs out of sight or a text that
         // cannot be read never matches `sensitive_objects` and has no
         // useful row count, so `min_rows` would drop it.
-        if touches_system || configuration || call || blind {
+        if touches_system || configuration || call || blind || cut_blind {
             e = e.with_always_report();
         }
         // Read signals per read statement, whatever the event's action (a
@@ -1584,31 +1599,32 @@ mod tests {
             "x".repeat(pad)
         );
         let out = heartbeats(&forged, 1024);
-        assert!(out.len() >= 2, "{out:?}");
+        assert_eq!(out.len(), 3, "{out:?}");
         assert!(
             out.iter().all(|e| e.starts_with("read [\"shop.*\"]")),
             "{out:?}"
         );
         // The same on performance_schema (`SQL_TEXT` cut, no table record).
         let mut b = guard_builder(set);
-        let mut reported = 0;
         for _ in 0..3 {
             let access = pfs_access(&forged.as_bytes()[..1020], true, Vec::new());
             assert!(!b.own_guard(&access));
-            reported += usize::from(b.statement(access, SystemTime::now()).is_some());
+            let e = b.statement(access, SystemTime::now()).unwrap();
+            assert!(e.always_report());
         }
-        assert!(reported >= 2);
-        // The exact guard text cut by a lowered limit (here inside its
-        // regular expression literal): no longer matched, reported as a
-        // read of `*` (documented: keep the limits at 1024). The table list
-        // has no such literal: cut, it is not matched either (below: a
-        // truncated record never is), and then reads as any cut text whose
-        // visible part names `information_schema` only, as the column
-        // statements cut inside their schema list do.
+        // The exact guard text cut by a lowered limit, anywhere: no longer
+        // matched (a truncated record never is, below), and a cut text with
+        // no table record is a read of `*`, always reported, at every
+        // heartbeat (security review of #181, H1; documented: keep the
+        // limits at 1024).
+        let mut cuts = vec![crate::sql::server_audit_escaped_len(g) / 2];
         if let Some(regex_at) = g.find("[^ABC") {
-            let low = crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10;
+            cuts.push(crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10);
+        }
+        for low in cuts {
             let out = heartbeats(g, low);
-            assert!(out.len() >= 2, "{out:?}");
+            assert_eq!(out.len(), 3, "{out:?}");
+            assert!(out.iter().all(|e| e.contains(".*\"")), "{out:?}");
         }
         // The exact guard text with a table record outside
         // `information_schema` never takes the uncharged path.
@@ -1661,6 +1677,158 @@ mod tests {
             !b.own
                 .routine_unbudgeted(other.user, other.application, other.client, &e)
         );
+    }
+
+    /// Padding that pushes a read past the cut of a source with no table
+    /// record: whitespace, a line comment, repeated tokens. `hr.customers`
+    /// is never visible.
+    fn padded_reads(head: &str) -> Vec<String> {
+        let tail = " UNION ALL SELECT name, email, phone FROM hr.customers";
+        vec![
+            format!("{head} WHERE 1 = 1{}{tail}", " ".repeat(1200)),
+            format!("{head} WHERE 1 = 1 -- {}\n{tail}", "x".repeat(1200)),
+            format!(
+                "{head} WHERE 1 = 1{}{tail}",
+                " AND TABLE_NAME = TABLE_NAME".repeat(200)
+            ),
+        ]
+    }
+
+    /// Every padded read, from the agent's account (after the exact guard
+    /// table list) and from another one.
+    fn padded_cases(set: &[String]) -> Vec<String> {
+        let mut texts = padded_reads("SELECT * FROM information_schema.TABLES");
+        // The exact table list as the visible head.
+        let list = crate::sql::CAS_GUARD_TABLES;
+        assert!(set.iter().any(|t| t == list));
+        texts.extend(padded_reads(&format!("{list}\n")));
+        texts.push(format!(
+            "SELECT 1 {} UNION SELECT * FROM hr.customers",
+            " ".repeat(1200)
+        ));
+        texts
+    }
+
+    fn assert_cut_read(e: &MaskedEvent, db: &str) {
+        assert_eq!(e.action(), EventAction::Read, "{}", show(e));
+        assert!(e.always_report(), "{}", show(e));
+        assert!(
+            e.objects()
+                .iter()
+                .any(|o| o.database().as_str() == db && o.object().as_str() == "*"),
+            "{}",
+            show(e)
+        );
+    }
+
+    /// Security review of #181, H1: a text cut by the source with no table
+    /// record is never quiet nor the agent's own: a read of `*`, always
+    /// reported, from any account, on a QUERY-only `server_audit` log.
+    #[test]
+    fn cut_texts_are_reads_of_star_on_server_audit() {
+        let set = guard_sets().remove(0);
+        for text in padded_cases(&set) {
+            for (user, host) in [("databastion", "172.18.0.1"), ("app", "10.0.0.5")] {
+                let mut b = guard_builder(&set);
+                for q in 1..=3u64 {
+                    // The guard table list, exact, then the padded text.
+                    let list = sa_query(user, host, 2 * q, crate::sql::CAS_GUARD_TABLES, None);
+                    let line = sa_query(user, host, 2 * q + 1, &text, Some(1024));
+                    let recs = sa_at(&[list, line], 1024);
+                    assert!(recs[1].truncated, "{text}");
+                    let ev =
+                        b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now());
+                    let cut: Vec<_> = ev.iter().filter(|e| e.always_report()).collect();
+                    assert_eq!(
+                        cut.len(),
+                        1,
+                        "{user}: {:?}",
+                        ev.iter().map(show).collect::<Vec<_>>()
+                    );
+                    assert_cut_read(cut[0], "shop");
+                    if user == "databastion" {
+                        // The exact table list itself stays left out.
+                        assert_eq!(ev.len(), 1, "{:?}", ev.iter().map(show).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+        // A cut quiet statement (`SHOW`, `SET`) is a read of `*` too.
+        for text in [
+            format!(
+                "SHOW TABLES WHERE 1 = 1{} OR 1 IN (SELECT 1 FROM hr.customers)",
+                " ".repeat(1200)
+            ),
+            format!(
+                "SET @x = 1{}, @y = (SELECT email FROM hr.customers LIMIT 1)",
+                " ".repeat(1200)
+            ),
+        ] {
+            let mut b = guard_builder(&set);
+            let recs = sa_at(&[sa_query("app", "10.0.0.5", 1, &text, Some(1024))], 1024);
+            let ev = b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now());
+            assert_eq!(ev.len(), 1, "{text}");
+            assert_cut_read(&ev[0], "shop");
+        }
+        // Not cut: the same texts with their tables named are reported as
+        // usual (no `*`).
+        let mut b = guard_builder(&set);
+        let short = "SELECT 1 UNION SELECT * FROM hr.customers";
+        let recs = sa_at(&[sa_query("app", "10.0.0.5", 1, short, None)], 1024);
+        assert_eq!(file(&mut b, recs), ["read [\"hr.customers\"] None []"]);
+    }
+
+    /// The same on `performance_schema`, with the cut rule of the poller
+    /// (`pfs::text_cut`): `SQL_TEXT` cut at 1024 bytes (the server ends it
+    /// with `...`), and a `DIGEST_TEXT` cut at its token storage (token
+    /// padding renders past the limit, without `...`: measured on MySQL
+    /// 8.4 and MariaDB 11.4).
+    #[test]
+    fn cut_texts_are_reads_of_star_on_performance_schema() {
+        let set = guard_sets().remove(0);
+        let mut texts: Vec<(Vec<u8>, bool)> = Vec::new();
+        for t in padded_cases(&set) {
+            let mut cut = t.as_bytes()[..1021].to_vec();
+            cut.extend_from_slice(b"...");
+            texts.push((cut, false));
+        }
+        // Digest texts: whitespace and comments are not kept, tokens are.
+        let digest = format!(
+            "SELECT * FROM `information_schema` . `TABLES` WHERE ? = ?{}",
+            " AND `TABLE_NAME` = `TABLE_NAME`".repeat(100)
+        );
+        texts.push((digest.as_bytes()[..1023].to_vec(), true));
+        texts.push((digest.into_bytes(), true));
+        let full = "SELECT * FROM `information_schema` . `TABLES` WHERE ? = ? AND `TABLE_NAME` ...";
+        texts.push((full.as_bytes().to_vec(), true));
+        for (text, is_digest) in &texts {
+            assert!(super::super::pfs::text_cut(text, *is_digest, 1024));
+            for user in ["databastion", "app"] {
+                let mut b = guard_builder(&set);
+                for _ in 0..3 {
+                    let mut a = pfs_access(text, true, Vec::new());
+                    a.user = user;
+                    if user != "databastion" {
+                        a.principal = EventPrincipal::account(user);
+                        a.application = None;
+                    }
+                    assert!(!b.own_guard(&a));
+                    let e = b.statement(a, SystemTime::now()).unwrap();
+                    assert_cut_read(&e, "*");
+                }
+            }
+        }
+        // A text past the poller's size bound is dropped and still cut: a
+        // read of `*`.
+        let mut b = guard_builder(&set);
+        let mut a = pfs_access(b"", true, Vec::new());
+        a.text = None;
+        assert_cut_read(&b.statement(a, SystemTime::now()).unwrap(), "*");
+        // Not cut: the agent's guard statements (at most 900 bytes) and
+        // their digests.
+        for g in &set {
+            assert!(!super::super::pfs::text_cut(g.as_bytes(), false, 1024));
+        }
     }
 
     #[test]
