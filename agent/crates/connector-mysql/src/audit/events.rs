@@ -920,14 +920,17 @@ impl EventBuilder {
             || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed)
             || alt_analysis.as_ref().is_some_and(|x| !x.lexed());
         // A text cut by the source (`server_audit_query_log_limit`,
-        // `performance_schema_max_sql_text_length`, a full digest) with no
-        // table record: what followed the cut cannot be told (whitespace,
-        // comment or token padding before a `UNION`, a subquery, a second
-        // statement). Fail closed: never quiet, never the agent's own, a
-        // read or write of what the visible part names and of `*`, always
-        // reported (security review of #181, H1). The agent keeps its own
-        // statements under the default limits (`sql::MAX_OWN_STATEMENT`).
-        let cut_blind = a.truncated && a.tables.is_empty();
+        // `performance_schema_max_sql_text_length`, a full digest): what
+        // followed the cut cannot be told (whitespace, comment or token
+        // padding before a `UNION`, a subquery, a second statement, a
+        // `LOAD_FILE` call). Fail closed whatever its table records: never
+        // quiet, never the agent's own, a read or write of what the records
+        // or the visible part name and of `*`, always reported (security
+        // review of #181, H1; of #184, M1: table records do not name the
+        // server file a `LOAD_FILE` past the cut read). The agent keeps
+        // its own statements under the default limits
+        // (`sql::MAX_OWN_STATEMENT`).
+        let cut_blind = a.truncated;
         if let Some(app) = a.application {
             let s = self.sessions.entry(&a.session);
             if s.program.is_none() {
@@ -972,17 +975,21 @@ impl EventBuilder {
                 .chain(&alt_analysis)
                 .fold(StatementKind::Other, |k, x| most_reportable(k, x.kind()))
         };
-        // A `LOAD_FILE` call (#168 review L2), in a lexed statement or
-        // found by a raw scan of a text that did not lex, and an `EXPLAIN`
-        // whose statement is past the prefix bound (#168 review L3): what
-        // they read (a server file, a statement that may run) is named by
-        // no audit source, so the event adds `*` whatever its table
-        // records.
-        let hidden = parts.iter().any(|p| p.file_read || p.explain_unbounded)
+        // A `LOAD_FILE` call (#168 review L2) or a server-side `LOAD DATA
+        // INFILE` / `LOAD XML INFILE` (#184 review L2), a call of a name
+        // holding a non-ASCII character (#184 review M2: never a built-in
+        // function), each in a lexed statement or found by a raw scan of a
+        // text that did not lex, and an `EXPLAIN` whose statement is past
+        // the prefix bound (#168 review L3): what they read (a server
+        // file, a statement that may run) is named by no audit source, so
+        // the event adds `*` whatever its table records.
+        let hidden = parts
+            .iter()
+            .any(|p| p.file_read || p.non_ascii_call || p.explain_unbounded)
             || analysis
                 .iter()
                 .chain(&alt_analysis)
-                .any(QueryAnalysis::file_read);
+                .any(|x| x.file_read() || x.non_ascii_call());
         // Code that runs out of sight: a procedure, a prepared statement,
         // a stored function (schema-qualified calls only: `f()` cannot be
         // told from a built-in function), `LOAD_FILE` and an unbounded
@@ -1132,8 +1139,8 @@ impl EventBuilder {
                 }
             }
             // The table records do not name the server file `LOAD_FILE`
-            // read.
-            unknown = hidden && rw;
+            // read, nor what a cut text hid past the cut.
+            unknown = (hidden || cut_blind) && rw;
         }
         if rw && objects.is_empty() && !unknown && !dquoted {
             // A read of system tables only, or no table at all (`SELECT
@@ -3189,9 +3196,27 @@ mod tests {
             "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
             "SET STATEMENT a=1 FOR SET STATEMENT b=1 FOR SET STATEMENT c=1 FOR UPDATE performance_schema.setup_consumers SET enabled='NO'",
             "SET @a=1; UPDATE performance_schema.setup_consumers SET enabled='NO'",
-            "LOAD DATA INFILE '/tmp/x' INTO TABLE performance_schema.setup_consumers",
         ] {
             expect_everywhere(text, |_| consumers.to_owned());
+        }
+        // A server-side `LOAD DATA` / `LOAD XML` also reads a server file
+        // no source names (#184 review L2): the table and `*`.
+        for (text, table) in [
+            (
+                "LOAD DATA INFILE '/tmp/x' INTO TABLE performance_schema.setup_consumers",
+                "performance_schema.setup_consumers",
+            ),
+            (
+                "LOAD DATA INFILE '/var/lib/mysql/hr/customers.ibd' INTO TABLE shop.t",
+                "shop.t",
+            ),
+            ("LOAD XML INFILE '/etc/passwd' INTO TABLE `hr`.`t`", "hr.t"),
+        ] {
+            expect_everywhere(text, |s| {
+                let mut o = [star(s), table];
+                o.sort_unstable();
+                format!("write [{:?}, {:?}] always", o[0], o[1])
+            });
         }
         // Deeper than 8 levels: DDL (fail closed).
         let deep = format!(
@@ -3447,6 +3472,122 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// One `server_audit` statement of `user` with its table records
+    /// (`op`, `db`, `table`), logged under the 1024-byte default limit.
+    fn sa_with_records(user: &str, records: &[(&str, &str, &str)], text: &str) -> Vec<String> {
+        let host = if user == "databastion" {
+            "172.18.0.1"
+        } else {
+            "10.0.0.5"
+        };
+        let mut lines: Vec<String> = records
+            .iter()
+            .map(|(op, db, t)| format!("20260929 09:40:35,h,{user},{host},30,1,{op},{db},{t},"))
+            .collect();
+        lines.push(sa_query(user, host, 1, text, Some(1024)));
+        lines
+    }
+
+    /// Security review of #184, M1: a text cut by the source is never the
+    /// agent's own and adds `*`, always reported, even with table records:
+    /// the records do not name what followed the cut (a `LOAD_FILE` call
+    /// padded past the limit). `server_audit` TABLE + QUERY records.
+    #[test]
+    fn cut_texts_with_table_records_are_reads_of_star() {
+        let pad = " ".repeat(1100);
+        let cases = [
+            (
+                format!(
+                    "SELECT a,{pad}, LOAD_FILE('/var/lib/mysql/hr/customers.ibd') FROM hr.t LIMIT 1"
+                ),
+                vec![("READ", "hr", "t")],
+                "read [\"hr.t\", \"shop.*\"] always",
+            ),
+            (
+                format!(
+                    "SELECT a FROM hr.t WHERE id = 1{pad} UNION SELECT LOAD_FILE('/etc/passwd')"
+                ),
+                vec![("READ", "hr", "t")],
+                "read [\"hr.t\", \"shop.*\"] always",
+            ),
+            (
+                format!(
+                    "UPDATE hr.t SET a = 1 WHERE id = 2{pad} OR LOAD_FILE('/etc/passwd') IS NULL"
+                ),
+                vec![("WRITE", "hr", "t")],
+                "write [\"hr.t\", \"shop.*\"] always",
+            ),
+        ];
+        for (text, records, want) in &cases {
+            for user in ["databastion", "app"] {
+                let lines = sa_with_records(user, records, text);
+                let recs = sa_at(&lines, 1024);
+                assert!(recs.last().unwrap().truncated, "{text}");
+                let mut b = EventBuilder::new(own());
+                let out = b.convert_file(recs, EventSource::MariadbServerAudit, SystemTime::now());
+                assert_eq!(
+                    out.iter().map(shown).collect::<Vec<_>>(),
+                    [*want],
+                    "{user}: {text}"
+                );
+            }
+        }
+        // Not cut: the agent's plain read with its records stays its own,
+        // another account's is a plain read.
+        let text = "SELECT a FROM hr.t LIMIT 1";
+        for (user, want) in [
+            ("databastion", Vec::<String>::new()),
+            ("app", vec!["read [\"hr.t\"]".to_owned()]),
+        ] {
+            let lines = sa_with_records(user, &[("READ", "hr", "t")], text);
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(out.iter().map(shown).collect::<Vec<_>>(), want, "{user}");
+        }
+    }
+
+    /// Security review of #184, M2: a call of a name holding a non-ASCII
+    /// character is never a built-in function (`LOAD_FÍLE` and the like
+    /// are stored function lookups on MySQL 8.4 and MariaDB 11.4): `*`,
+    /// always reported, never the agent's own, with or without table
+    /// records. A table name before a column list is not a call.
+    #[test]
+    fn non_ascii_calls_are_reported() {
+        for text in [
+            "SELECT LOAD_F\u{cd}LE('/etc/passwd')",
+            "SELECT \u{ff2c}OAD_FILE('/etc/passwd')",
+            "SET @x = `LOAD_F\u{130}LE`('/etc/passwd')",
+            "DO caf\u{e9}(1)",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+        }
+        for user in ["databastion", "app"] {
+            let lines = sa_with_records(
+                user,
+                &[("READ", "hr", "t")],
+                "SELECT a, LOAD_FIL\u{c9}('/etc/passwd') FROM hr.t LIMIT 1",
+            );
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.t\", \"shop.*\"] always"],
+                "{user}"
+            );
+        }
+        expect_everywhere("INSERT INTO hr.`client\u{e8}le` (nom) VALUES ('x')", |_| {
+            "write [\"hr.client\u{e8}le\"]".to_owned()
+        });
     }
 
     /// Security review of 914c9d2 (Low): the `SHOW GRANTS … USING`
@@ -4032,8 +4173,22 @@ mod tests {
         for text in [
             "EXPLAIN ANALYZE FORMAT=JSON INTO @x DELETE FROM performance_schema.setup_actors",
             "EXPLAIN FORMAT=JSON INTO @x ANALYZE DELETE FROM performance_schema.setup_actors",
+            // #184 review L3: a variable named like a statement keyword
+            // is not the statement.
+            "EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM performance_schema.setup_actors",
+            "EXPLAIN FORMAT=JSON INTO @table ANALYZE DELETE FROM performance_schema.setup_actors",
         ] {
             expect_everywhere(text, |_| actors.to_owned());
+        }
+        expect_everywhere(
+            "EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM hr.t",
+            |_| "write [\"hr.t\"]".to_owned(),
+        );
+        for (source, ev) in on_every_source(
+            "databastion",
+            "EXPLAIN FORMAT=JSON INTO @select ANALYZE SELECT a FROM hr.t LIMIT 1",
+        ) {
+            assert!(ev.is_some(), "{source:?}");
         }
         // `ANALYZE` without a statement found: never quiet (`*`).
         expect_everywhere("EXPLAIN ANALYZE FOR CONNECTION 5", |s| {

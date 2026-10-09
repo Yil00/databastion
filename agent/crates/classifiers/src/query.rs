@@ -104,11 +104,12 @@ enum Tok {
     /// literal is expected, kept apart only to recognize a name position
     /// (`FROM "t"`, `"db"."t"`, `"f"(`). Its content is not kept: only
     /// whether it is an audit log administration function name
-    /// ([`is_audit_function`]) or `LOAD_FILE` ([`is_file_function`]),
-    /// decided at lex time.
+    /// ([`is_audit_function`]) or `LOAD_FILE` ([`is_file_function`]), and
+    /// whether it holds a non-ASCII character, decided at lex time.
     DQuoted {
         audit_function: bool,
         file_function: bool,
+        non_ascii: bool,
     },
     /// Operator or punctuation.
     Punct(String),
@@ -287,6 +288,7 @@ fn lex_mysql_range(
                 out.push(Tok::DQuoted {
                     audit_function: content.is_some_and(is_audit_function),
                     file_function: content.is_some_and(is_file_function),
+                    non_ascii: content.is_some_and(|c| !c.is_ascii()),
                 });
             }
             b'`' => {
@@ -930,6 +932,14 @@ pub struct StatementInfo {
     /// double-quoted: it reads a file on the database server that no audit
     /// source names (code that runs out of sight, like a stored function).
     pub file_read: bool,
+    /// MySQL: calls a function whose name (plain, backquoted or
+    /// double-quoted, qualified or not) holds a non-ASCII character, out
+    /// of a table name position ([`has_non_ascii_call`]). Never a built-in
+    /// function (MySQL 8.4 and MariaDB 11.4 resolve `LOAD_FÍLE(…)`,
+    /// `LOAD_FİLE(…)`, `ＬOAD_FILE(…)` to a stored function of the default
+    /// database): a stored function, code that runs out of sight (fail
+    /// closed, #184 review M2).
+    pub non_ascii_call: bool,
     /// MySQL: an `EXPLAIN` / `DESCRIBE` / `DESC` whose search for the
     /// statement it explains reached [`MAX_EXPLAIN_PREFIX_TOKENS`] without
     /// finding one (not valid SQL today): what it runs cannot be told, so
@@ -953,6 +963,7 @@ pub struct QueryAnalysis {
     lexed: bool,
     audit_function: bool,
     file_read: bool,
+    non_ascii_call: bool,
 }
 
 impl QueryAnalysis {
@@ -968,6 +979,7 @@ impl QueryAnalysis {
             lexed: false,
             audit_function: false,
             file_read: false,
+            non_ascii_call: false,
         }
     }
 
@@ -985,6 +997,15 @@ impl QueryAnalysis {
     #[must_use]
     pub fn file_read(&self) -> bool {
         self.file_read || self.parts.iter().any(|p| p.file_read)
+    }
+
+    /// MySQL: the text calls a function whose name holds a non-ASCII
+    /// character ([`StatementInfo::non_ascii_call`]): in a statement of a
+    /// lexed text, or found by a raw scan of a text that did not lex (fail
+    /// closed: also inside a literal or a comment).
+    #[must_use]
+    pub fn non_ascii_call(&self) -> bool {
+        self.non_ascii_call || self.parts.iter().any(|p| p.non_ascii_call)
     }
 
     /// Whether the text lexed unambiguously: `false` when only the kind
@@ -1195,6 +1216,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         lexed: true,
         audit_function: false,
         file_read: false,
+        non_ascii_call: false,
     }
 }
 
@@ -1218,6 +1240,10 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
             if opts.dialect == Dialect::Mysql && !a.file_read && raw_file_function(raw) {
                 a.file_read = true;
             }
+            // MySQL: a call of a non-ASCII name anywhere in the bytes.
+            if opts.dialect == Dialect::Mysql && !a.non_ascii_call && raw_non_ascii_call(raw) {
+                a.non_ascii_call = true;
+            }
             a
         }
     }
@@ -1226,7 +1252,8 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
 /// A MySQL text that did not lex: `kind`, made DDL when a raw scan finds
 /// an audit log administration function call ([`raw_audit_function`]),
 /// and marked as reading a file when one finds a `LOAD_FILE` call
-/// ([`raw_file_function`]).
+/// ([`raw_file_function`]) or as calling a non-ASCII name when one finds
+/// such a call ([`raw_non_ascii_call`]).
 fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
     let mut a = QueryAnalysis::unparsed(kind);
     if raw_audit_function(text.as_bytes()) {
@@ -1234,6 +1261,7 @@ fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
         a.audit_function = true;
     }
     a.file_read = raw_file_function(text.as_bytes());
+    a.non_ascii_call = raw_non_ascii_call(text.as_bytes());
     a
 }
 
@@ -1319,6 +1347,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         lexed: true,
         audit_function: false,
         file_read: false,
+        non_ascii_call: false,
     }
 }
 
@@ -1383,14 +1412,20 @@ fn skip_format(s: &[Tok], i: usize) -> usize {
     }
 }
 
-/// Whether a statement that a wrapper runs starts at `i`.
+/// Whether a statement that a wrapper runs starts at `i`. A word right
+/// after `@` is a variable name (`INTO @select`, `@@delete`), never a
+/// statement keyword (#184 review L3).
 fn runs_statement_at(s: &[Tok], i: usize, table_ok: bool) -> bool {
+    let variable = i.checked_sub(1).is_some_and(|j| is_punct(s.get(j), "@"));
     is_punct(s.get(i), "(")
-        || match word(s.get(i)) {
-            Some("select" | "update" | "delete" | "insert" | "replace" | "with" | "values") => true,
-            Some("table") => table_ok,
-            _ => false,
-        }
+        || (!variable
+            && match word(s.get(i)) {
+                Some("select" | "update" | "delete" | "insert" | "replace" | "with" | "values") => {
+                    true
+                }
+                Some("table") => table_ok,
+                _ => false,
+            })
 }
 
 /// One wrapper level ([`Wrapper`]): the tokens of the statement it runs.
@@ -1542,20 +1577,85 @@ fn has_qualified_call(s: &[Tok], kind: StatementKind) -> bool {
     );
     let schema_change = matches!(kind, StatementKind::Ddl | StatementKind::Dcl);
     s.windows(4).enumerate().any(|(i, w)| {
-        let table_before = match i.checked_sub(1).and_then(|j| word(s.get(j))) {
-            Some(
-                "into" | "insert" | "replace" | "ignore" | "low_priority" | "delayed"
-                | "high_priority",
-            ) => write,
-            Some("table") => write || schema_change,
-            Some("exists" | "on" | "view" | "references") => schema_change,
-            _ => false,
-        };
+        let table_before = table_name_before(s, i, write, schema_change);
         name(&w[0])
             && is_punct(Some(&w[1]), ".")
             && name(&w[2])
             && is_punct(Some(&w[3]), "(")
             && !table_before
+    })
+}
+
+/// Whether the (possibly qualified) name starting at `i` stands where a
+/// statement of this kind names a table followed by a column list
+/// (`INSERT INTO t (a)`, `CREATE TABLE t (…)`, `REFERENCES t (id)`), not
+/// a function call: `write` for `INSERT` / `UPDATE` / `DELETE` /
+/// `REPLACE`, `schema_change` for DDL and DCL.
+fn table_name_before(s: &[Tok], i: usize, write: bool, schema_change: bool) -> bool {
+    match i.checked_sub(1).and_then(|j| word(s.get(j))) {
+        Some(
+            "into" | "insert" | "replace" | "ignore" | "low_priority" | "delayed" | "high_priority",
+        ) => write,
+        Some("table") => write || schema_change,
+        Some("exists" | "on" | "view" | "references") => schema_change,
+        _ => false,
+    }
+}
+
+/// A call of a function whose name holds a non-ASCII character
+/// ([`StatementInfo::non_ascii_call`]): a plain or backquoted name with a
+/// byte >= 0x80, or a `"…"` token holding one, followed by `(`, unless the
+/// name (with its qualifier) stands where the statement names a table
+/// before a column list ([`table_name_before`]), or a common table
+/// expression (`WITH [RECURSIVE] x (a) AS`). Code tokens only: never in a
+/// literal or a comment.
+fn has_non_ascii_call(s: &[Tok], kind: StatementKind) -> bool {
+    let write = matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+    );
+    let schema_change = matches!(kind, StatementKind::Ddl | StatementKind::Dcl);
+    let name = |t: &Tok| matches!(t, Tok::Word(_) | Tok::Quoted(_) | Tok::DQuoted { .. });
+    s.windows(2).enumerate().any(|(i, w)| {
+        let non_ascii = match &w[0] {
+            Tok::Word(n) | Tok::Quoted(n) => !n.is_ascii(),
+            Tok::DQuoted { non_ascii, .. } => *non_ascii,
+            _ => false,
+        };
+        if !non_ascii || !is_punct(Some(&w[1]), "(") {
+            return false;
+        }
+        // The start of a qualified name (`db.t`).
+        let mut start = i;
+        while start >= 2 && is_punct(s.get(start - 1), ".") && s.get(start - 2).is_some_and(name) {
+            start -= 2;
+        }
+        let cte = matches!(
+            start.checked_sub(1).and_then(|j| word(s.get(j))),
+            Some("with" | "recursive")
+        );
+        !cte && !table_name_before(s, start, write, schema_change)
+    })
+}
+
+/// A server-side `LOAD DATA INFILE` / `LOAD XML INFILE` (no `LOCAL`), at
+/// the start of the statement or after `SET STATEMENT … FOR`: it reads a
+/// file on the database server (with the `FILE` privilege), which no
+/// audit source names; the table it loads is named as a write (#184
+/// review L2). `LOCAL` reads a file of the client host.
+fn server_file_load(s: &[Tok]) -> bool {
+    (0..s.len()).any(|k| {
+        word(s.get(k)) == Some("load")
+            && matches!(word(s.get(k + 1)), Some("data" | "xml"))
+            && (k == 0 || word(s.get(k - 1)) == Some("for"))
+            && s[k + 2..]
+                .iter()
+                .map(|t| word(Some(t)))
+                .take_while(|w| *w != Some("infile"))
+                .all(|w| w != Some("local"))
     })
 }
 
@@ -1644,6 +1744,30 @@ fn raw_file_function(b: &[u8]) -> bool {
     raw_call(b, b"load_file", is_file_function)
 }
 
+/// Raw-text scan for a call of a name holding a non-ASCII character
+/// ([`StatementInfo::non_ascii_call`]), for a text that did not lex, with
+/// the rules of [`raw_audit_function`] (fail closed: inside a literal or a
+/// comment too, and no table name position is told apart): an identifier
+/// run holding a byte >= 0x80, then `(` as described there.
+fn raw_non_ascii_call(b: &[u8]) -> bool {
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        if !is_my_ident_cont(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_my_ident_cont(b[i]) {
+            i += 1;
+        }
+        if !b[start..i].is_ascii() && raw_call_follows(b, i) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The raw scan of [`raw_audit_function`] and [`raw_file_function`]: an
 /// identifier run that starts with `head` (ASCII case-insensitive) and
 /// that `is_name` accepts, then `(` as described there.
@@ -1657,52 +1781,58 @@ fn raw_call(b: &[u8], head: &[u8], is_name: fn(&[u8]) -> bool) -> bool {
         while j < n && is_my_ident_cont(b[j]) {
             j += 1;
         }
-        if !is_name(&b[start..j]) {
-            continue;
-        }
-        if matches!(b.get(j), Some(b'"' | b'`')) {
-            j += 1;
-        }
-        loop {
-            match b.get(j) {
-                Some(c) if c.is_ascii_whitespace() => j += 1,
-                Some(b'*') if b.get(j + 1) == Some(&b'/') => j += 2,
-                Some(b'/') if b.get(j + 1) == Some(&b'*') => {
-                    let bang = match (b.get(j + 2), b.get(j + 3)) {
-                        (Some(b'!'), _) => Some(j + 3),
-                        (Some(b'M' | b'm'), Some(b'!')) => Some(j + 4),
-                        _ => None,
-                    };
-                    if let Some(mut k) = bang {
-                        while k < n && b[k].is_ascii_digit() {
-                            k += 1;
-                        }
-                        j = k;
-                    } else {
-                        match find(&b[j + 2..], b"*/") {
-                            Some(e) => j += e + 4,
-                            None => break,
-                        }
-                    }
-                }
-                Some(b'#') => {
-                    while j < n && b[j] != b'\n' {
-                        j += 1;
-                    }
-                }
-                Some(b'-') if my_dash_comment(b, j, n) => {
-                    while j < n && b[j] != b'\n' {
-                        j += 1;
-                    }
-                }
-                _ => break,
-            }
-        }
-        if b.get(j) == Some(&b'(') {
+        if is_name(&b[start..j]) && raw_call_follows(b, j) {
             return true;
         }
     }
     false
+}
+
+/// Whether, after a name ending at `j`, a raw text holds a call: an
+/// optional closing quote or backtick, then whitespace (the lexer's set,
+/// `0x0b` and `0x0c` included), comments, ends of comments (`*/`) and
+/// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`.
+fn raw_call_follows(b: &[u8], mut j: usize) -> bool {
+    let n = b.len();
+    if matches!(b.get(j), Some(b'"' | b'`')) {
+        j += 1;
+    }
+    loop {
+        match b.get(j) {
+            Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) => j += 1,
+            Some(b'*') if b.get(j + 1) == Some(&b'/') => j += 2,
+            Some(b'/') if b.get(j + 1) == Some(&b'*') => {
+                let bang = match (b.get(j + 2), b.get(j + 3)) {
+                    (Some(b'!'), _) => Some(j + 3),
+                    (Some(b'M' | b'm'), Some(b'!')) => Some(j + 4),
+                    _ => None,
+                };
+                if let Some(mut k) = bang {
+                    while k < n && b[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    j = k;
+                } else {
+                    match find(&b[j + 2..], b"*/") {
+                        Some(e) => j += e + 4,
+                        None => break,
+                    }
+                }
+            }
+            Some(b'#') => {
+                while j < n && b[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            Some(b'-') if my_dash_comment(b, j, n) => {
+                while j < n && b[j] != b'\n' {
+                    j += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    b.get(j) == Some(&b'(')
 }
 
 /// A `"…"` token ([`Tok::DQuoted`]) in a name position, where it can only
@@ -2018,7 +2148,8 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         compound: false,
         subquery: opts.dialect == Dialect::Mysql && has_subquery(s),
         function_call: opts.dialect == Dialect::Mysql && has_function_call(s),
-        file_read: opts.dialect == Dialect::Mysql && has_file_function(s),
+        file_read: opts.dialect == Dialect::Mysql && (has_file_function(s) || server_file_load(s)),
+        non_ascii_call: opts.dialect == Dialect::Mysql && has_non_ascii_call(s, kind),
         explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
     }
 }
@@ -3876,6 +4007,131 @@ mod tests {
             assert!(!raw_file_function(t.as_bytes()), "{t}");
         }
         assert!(!my("SELECT 'a\u{e9}\\'").file_read());
+    }
+
+    /// #184 review M2: a call of a name holding a non-ASCII character is
+    /// never a built-in function (MySQL 8.4 and MariaDB 11.4 look
+    /// `LOAD_FÍLE`, `LOAD_FİLE`, `LOAD_FILÉ` and `ＬOAD_FILE` up as stored
+    /// functions): fail closed. Table names before a column list are not
+    /// calls.
+    #[test]
+    fn mysql_non_ascii_calls() {
+        for q in [
+            "SELECT LOAD_F\u{cd}LE('/etc/hostname')",
+            "SELECT LOAD_F\u{130}LE('/etc/hostname')",
+            "SELECT LOAD_FIL\u{c9}('/etc/hostname')",
+            "SELECT \u{ff2c}OAD_FILE('/etc/hostname')",
+            "SELECT `load_f\u{131}le` /* c */ ('/x')",
+            "SELECT \"LOAD_F\u{cd}LE\"('/x')",
+            "SELECT a FROM t JOIN u ON f\u{e9}(a)",
+            "SELECT hr.f\u{e9}(a) FROM t",
+            "INSERT INTO t VALUES (f\u{e9}(1))",
+            "INSERT INTO t (a) SELECT f\u{e9}(1)",
+            "SET @x = caf\u{e9}(1)",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(a.non_ascii_call(), "{q}");
+            assert!(!a.file_read(), "{q}");
+        }
+        for q in [
+            "SELECT 'caf\u{e9}(1)'",
+            "SELECT 1 /* f\u{e9}(1) */",
+            "SELECT nom_\u{e9} FROM caf\u{e9}",
+            "INSERT INTO `client\u{e8}le` (nom) VALUES ('x')",
+            "INSERT INTO hr.`client\u{e8}le` (nom) VALUES ('x')",
+            "REPLACE INTO caf\u{e9} (a) VALUES (1)",
+            "CREATE TABLE caf\u{e9} (a INT)",
+            "CREATE TABLE IF NOT EXISTS hr.caf\u{e9} (a INT, FOREIGN KEY (a) REFERENCES th\u{e9} (id))",
+            "WITH ct\u{e9} (a) AS (SELECT 1) SELECT a FROM ct\u{e9}",
+            "SELECT LOAD_FILE('/x')",
+        ] {
+            assert!(!my(q).non_ascii_call(), "{q}");
+        }
+        // A text that does not lex, and raw bytes: raw scan.
+        let a = my("SELECT f\u{e9}('/x\u{e9}\\')");
+        assert!(!a.lexed() && a.non_ascii_call());
+        let raw = b"SELECT a FROM t WHERE x = '\xff' AND f\xc3\xa9 ('/x') ";
+        assert!(analyze_raw(raw, AnalyzeOptions::mysql()).non_ascii_call());
+        for t in [
+            "f\u{e9}(",
+            "`f\u{e9}`\x0b(",
+            "\"\u{ff2c}OAD_FILE\" /* c */ (",
+            "x\u{e9} -- c\n (",
+        ] {
+            assert!(raw_non_ascii_call(t.as_bytes()), "{t:?}");
+        }
+        for t in ["f\u{e9}", "f\u{e9} x(", "fe(", "'\u{e9}' ("] {
+            assert!(!raw_non_ascii_call(t.as_bytes()), "{t:?}");
+        }
+    }
+
+    /// #184 review L1: the raw scans skip the lexer's whitespace set,
+    /// vertical tab and form feed included.
+    #[test]
+    fn mysql_raw_scans_skip_every_whitespace() {
+        for ws in [" ", "\t", "\n", "\r", "\x0b", "\x0c"] {
+            let t = format!("x LOAD_FILE{ws}('/x')");
+            assert!(raw_file_function(t.as_bytes()), "{t:?}");
+            let t = format!("x audit_log_rotate{ws}()");
+            assert!(raw_audit_function(t.as_bytes()), "{t:?}");
+        }
+        // A text that does not lex (a trail-byte hazard).
+        let q = "SELECT a FROM t WHERE b = '\u{e9}\\' AND LOAD_FILE\x0b('/etc/passwd') IS NULL";
+        let a = my(q);
+        assert!(!a.lexed() && a.file_read(), "{q:?}");
+        let q = "SELECT '\u{e9}\\', audit_log_rotate\x0c()";
+        assert!(my(q).audit_function(), "{q:?}");
+    }
+
+    /// #184 review L3: a word right after `@` is a variable name, never
+    /// the statement an `EXPLAIN` runs.
+    #[test]
+    fn mysql_explain_variable_named_like_a_keyword() {
+        for q in [
+            "EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM t",
+            "EXPLAIN FORMAT=JSON INTO @delete ANALYZE UPDATE t SET a = 1",
+            "EXPLAIN FORMAT=TREE INTO @table ANALYZE SELECT * FROM hr.t",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(a.parts()[0].analyze_wrapped, "{q}");
+            assert_ne!(a.kind(), StatementKind::Other, "{q}");
+        }
+        assert_eq!(
+            my("EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM t").kind(),
+            StatementKind::Delete
+        );
+        // A variable alone is no statement: the `SELECT` after it is.
+        let a = my("EXPLAIN FORMAT=JSON INTO @x SELECT 1");
+        assert!(!a.parts()[0].analyze_wrapped);
+    }
+
+    /// #184 review L2: a server-side `LOAD DATA` / `LOAD XML` reads a
+    /// server file; `LOCAL` reads a client file. The table stays a write.
+    #[test]
+    fn mysql_server_file_loads() {
+        for q in [
+            "LOAD DATA INFILE '/var/lib/mysql/hr/customers.ibd' INTO TABLE hr.t",
+            "load data low_priority infile '/x' replace into table t (a)",
+            "LOAD DATA CONCURRENT INFILE '/x' IGNORE INTO TABLE t",
+            "LOAD XML INFILE '/x' INTO TABLE hr.t ROWS IDENTIFIED BY '<r>'",
+            "SET STATEMENT max_statement_time = 1 FOR LOAD DATA INFILE '/x' INTO TABLE t",
+        ] {
+            let a = my(q);
+            assert!(a.file_read(), "{q}");
+            assert_eq!(a.kind(), StatementKind::Insert, "{q}");
+            assert!(!a.relations().is_empty(), "{q}");
+        }
+        for q in [
+            "LOAD DATA LOCAL INFILE '/x' INTO TABLE hr.t",
+            "LOAD DATA LOW_PRIORITY LOCAL INFILE '/x' INTO TABLE t",
+            "LOAD XML LOCAL INFILE '/x' INTO TABLE hr.t",
+            "LOAD INDEX INTO CACHE t",
+            "SELECT 'LOAD DATA INFILE'",
+        ] {
+            assert!(!my(q).file_read(), "{q}");
+        }
     }
 
     /// #168 review L3: an `EXPLAIN` / `DESCRIBE` whose statement keyword
