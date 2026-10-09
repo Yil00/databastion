@@ -14,6 +14,8 @@
 //! - [`cas_guard`]: the CAS store guard of every database and directory
 //!   connector (ADR-0041 decision 5): store recognition, column rules,
 //!   ticket registry metadata.
+//! - [`jtext`]: JSON values unescaped into zeroizing buffers, for the
+//!   connectors' JSON parsers (no unzeroized `serde_json` copy).
 //! - [`notes`]: closed target notes ([`NoteCode`], [`TargetNote`]) that
 //!   `check()` reports with [`TargetHealth`].
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
@@ -51,6 +53,7 @@ mod fsutil;
 pub mod identity;
 pub mod job;
 mod jobs;
+pub mod jtext;
 pub mod notes;
 pub mod pacing;
 mod panics;

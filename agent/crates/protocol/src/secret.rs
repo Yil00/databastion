@@ -59,16 +59,24 @@ macro_rules! credential {
             }
         }
 
-        impl TryFrom<String> for $name {
+        impl TryFrom<Zeroizing<String>> for $name {
             type Error = InvalidCredential;
-            fn try_from(value: String) -> Result<Self, Self::Error> {
-                // Wrap first so that a rejected value is zeroized too.
-                let value = Zeroizing::new(value);
+            /// For values built in a zeroizing buffer from the start: a
+            /// rejected value is zeroized when dropped here.
+            fn try_from(value: Zeroizing<String>) -> Result<Self, Self::Error> {
                 if is_valid(&value, $prefix) {
                     Ok(Self(value))
                 } else {
                     Err(InvalidCredential { kind: $kind })
                 }
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = InvalidCredential;
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                // Wrap first so that a rejected value is zeroized too.
+                Self::try_from(Zeroizing::new(value))
             }
         }
 

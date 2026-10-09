@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 
 use databastion_protocol::{AgentSecret, ErrorCode, RotateRequest, Uuid};
 use reqwest::Method;
-use zeroize::Zeroizing;
 
 use crate::identity::{self, Identity, IdentityError, StateDir};
 use crate::uplink::{Auth, Reply, Uplink, UplinkError};
@@ -360,9 +359,8 @@ impl Session {
             job_id,
             new_secret: s1,
         };
-        let body = Zeroizing::new(
-            serde_json::to_vec(&request).map_err(|_| UplinkError::Setup("rotate body"))?,
-        );
+        let body = crate::identity::json_zeroizing(&request, false)
+            .map_err(|_| UplinkError::Setup("rotate body"))?;
         let auth = Auth::Agent {
             agent_id: &agent_id,
             secret: &s0,

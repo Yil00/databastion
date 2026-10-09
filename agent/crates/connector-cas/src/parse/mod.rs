@@ -7,12 +7,12 @@
 //! question 4) without depending on file reading.
 
 pub mod definition;
-pub(crate) mod jtext;
 pub mod record;
 pub mod url;
 pub mod when;
 pub mod yaml;
 
+pub(crate) use databastion_core::jtext;
 use zeroize::Zeroizing;
 
 /// `s` cut to at most `max` bytes on a character boundary, in a zeroizing

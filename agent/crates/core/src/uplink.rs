@@ -277,10 +277,16 @@ impl Uplink {
             request = request.query(query);
         }
         if let Auth::Agent { agent_id, secret } = auth {
-            // The temporary string is zeroized; the header value itself is
-            // an immutable `Bytes` that reqwest owns and drops after the
-            // request (not zeroizable).
-            let bearer = zeroize::Zeroizing::new(format!("Bearer {}", secret.expose()));
+            // The temporary string is zeroized and allocated once at its
+            // final length (`format!` grows its buffer, leaving freed
+            // copies); the header value itself is an immutable `Bytes`
+            // that reqwest owns and drops after the request (not
+            // zeroizable), as is the request body.
+            let mut bearer = zeroize::Zeroizing::new(String::with_capacity(
+                "Bearer ".len() + secret.expose().len(),
+            ));
+            bearer.push_str("Bearer ");
+            bearer.push_str(secret.expose());
             let mut value = HeaderValue::from_str(&bearer)
                 .map_err(|_| UplinkError::Setup("invalid secret header"))?;
             value.set_sensitive(true);

@@ -1,29 +1,38 @@
-//! JSON values of an audit line read from the line's own bytes (ROADMAP
-//! phase 8 follow-up: no unzeroized copy of a kept string).
+//! JSON values read from the caller's own bytes, without an unzeroized
+//! copy of a kept string (ROADMAP phase 8 follow-ups). Shared by the
+//! connectors that parse JSON holding credentials or statement texts: the
+//! CAS audit record and service-definition parsers, and the MySQL / MariaDB
+//! JSON audit-log records. It lives in the core because both connectors
+//! already depend on it (and on `serde_json`), and it is not a classifier
+//! nor a masking function (`databastion-classifiers` has no JSON parser).
 //!
 //! `serde_json` unescapes a string that holds an escape sequence (`\/`,
-//! `A`…) into the deserializer's private scratch buffer, a plain
+//! `\u0041`…) into the deserializer's private scratch buffer, a plain
 //! `Vec<u8>` that is reused, grown (leaving freed copies behind) and dropped
-//! without being wiped, and that this crate cannot reach. The audit record
-//! parser therefore never lets `serde_json` deserialize a kept string: every
-//! kept key and value is taken as a [`RawValue`], which borrows the raw JSON
-//! text from the caller's line (`serde_json` only *skips* it, without
-//! copying a byte of it: its skip path validates the escapes in place), and
-//! is unescaped here into a [`Zeroizing`] buffer allocated once at its final
-//! capacity, so it never reallocates either.
+//! without being wiped, and that no caller can reach. A parser built on
+//! this module therefore never lets `serde_json` deserialize a kept string:
+//! every kept key and value is taken as a [`RawValue`], which borrows the
+//! raw JSON text from the caller's buffer (`serde_json` only *skips* it,
+//! without copying a byte of it: its skip path validates the escapes in
+//! place), and is unescaped here into a [`Zeroizing`] buffer allocated once
+//! at its final capacity, so it never reallocates either.
 //!
-//! The caller holds the line itself in a zeroizing buffer (the core tailer's
-//! `Zeroizing<Vec<u8>>` records). What `serde_json`'s scratch buffer still
-//! receives while a line is parsed: the `[` / `{` nesting bytes of skipped
-//! values, and nothing else (no number here is parsed as a float, the only
-//! other use of that buffer).
+//! The caller holds the input itself in a zeroizing buffer. What
+//! `serde_json`'s scratch buffer still receives while a value is parsed:
+//! the `[` / `{` nesting bytes of skipped values, and nothing else (no
+//! number is parsed as a float here, the only other use of that buffer).
+//!
+//! `serde_json`'s skip path is more lenient than its typed path: a lone
+//! surrogate escape (`\ud800`) or an out-of-range number in a *skipped*
+//! value is accepted. A kept string with a lone surrogate is refused here
+//! ([`Invalid`]), as `serde_json` would refuse it.
 
 use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
 /// A kept JSON value: a string (unescaped, bounded, zeroized), an integer,
 /// or anything else (`null`, a boolean, a float, an array, an object).
-pub(crate) enum Scalar {
+pub enum Scalar {
     /// A string, cut to the caller's bound on a character boundary.
     Str(Zeroizing<String>),
     /// An integer that fits an `i64`.
@@ -35,12 +44,12 @@ pub(crate) enum Scalar {
 /// Why a raw value was refused (an escape `serde_json` accepts when it
 /// skips a string but refuses when it reads one: a lone surrogate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Invalid;
+pub struct Invalid;
 
 /// Reads a raw value: a string is unescaped and cut to `max` bytes (the
 /// whole string is still validated), an integer is parsed, anything else is
 /// [`Scalar::Other`].
-pub(crate) fn scalar(raw: &RawValue, max: usize) -> Result<Scalar, Invalid> {
+pub fn scalar(raw: &RawValue, max: usize) -> Result<Scalar, Invalid> {
     let text = raw.get();
     match text.as_bytes().first() {
         Some(b'"') => unescape(text, max).map(Scalar::Str),
@@ -50,7 +59,7 @@ pub(crate) fn scalar(raw: &RawValue, max: usize) -> Result<Scalar, Invalid> {
 }
 
 /// The string of a raw value, or `None` for any other JSON type.
-pub(crate) fn string(raw: &RawValue, max: usize) -> Result<Option<Zeroizing<String>>, Invalid> {
+pub fn string(raw: &RawValue, max: usize) -> Result<Option<Zeroizing<String>>, Invalid> {
     Ok(match scalar(raw, max)? {
         Scalar::Str(s) => Some(s),
         Scalar::Int(_) | Scalar::Other => None,
@@ -73,7 +82,7 @@ fn hex4(chars: &mut std::str::Chars<'_>) -> Result<u32, Invalid> {
 /// character that does not fit ends the copy, the rest is only validated.
 /// The buffer is allocated once with a capacity no push can exceed (an
 /// escape is never shorter than what it decodes to).
-pub(crate) fn unescape(literal: &str, max: usize) -> Result<Zeroizing<String>, Invalid> {
+pub fn unescape(literal: &str, max: usize) -> Result<Zeroizing<String>, Invalid> {
     let inner = literal
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
@@ -125,6 +134,81 @@ pub(crate) fn unescape(literal: &str, max: usize) -> Result<Zeroizing<String>, I
         }
     }
     Ok(out)
+}
+
+/// An unsigned integer value, as `serde_json` reads one into a `u64`: only
+/// digits (no sign, fraction nor exponent: those are floats or negative
+/// for `serde_json`), and within range. `None` for anything else.
+#[must_use]
+pub fn unsigned(raw: &RawValue) -> Option<u64> {
+    let text = raw.get();
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Whether a raw value is JSON `null`.
+#[must_use]
+pub fn is_null(raw: &RawValue) -> bool {
+    raw.get() == "null"
+}
+
+/// The values of `keys` in one JSON object, borrowed from `json` (one JSON
+/// value, surrounding white space allowed): `Ok(None)` when it is not an
+/// object, `Err` when it is not valid JSON or a key does not unescape.
+/// Keys are compared after unescaping (`"a\u0062"` is `ab`); a repeated
+/// key keeps its last value, as `serde_json::Value` does. Every other value
+/// is skipped (borrowed, never copied nor unescaped).
+///
+/// # Errors
+/// [`Invalid`]: not JSON, or an invalid escape in a key.
+pub fn object<'a, const N: usize>(
+    json: &'a str,
+    keys: &[&str; N],
+) -> Result<Option<[Option<&'a RawValue>; N]>, Invalid> {
+    let raw: &'a RawValue = serde_json::from_str(json).map_err(|_| Invalid)?;
+    let text = raw.get();
+    if !text.starts_with('{') {
+        return Ok(None);
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    let fields =
+        serde::Deserializer::deserialize_map(&mut de, Fields { keys }).map_err(|_| Invalid)?;
+    Ok(Some(fields))
+}
+
+/// Reads an object's kept values (see [`object`]).
+struct Fields<'k, const N: usize> {
+    keys: &'k [&'k str; N],
+}
+
+impl<'de, const N: usize> serde::de::Visitor<'de> for Fields<'_, N> {
+    type Value = [Option<&'de RawValue>; N];
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = [None; N];
+        // A longer key cannot match: it is validated but not kept.
+        let max = self.keys.iter().map(|k| k.len()).max().unwrap_or(0) + 1;
+        while let Some(k) = map.next_key::<&'de RawValue>()? {
+            let v = map.next_value::<&'de RawValue>()?;
+            let name = unescape(k.get(), max)
+                .map_err(|_| <A::Error as serde::de::Error>::custom("invalid key"))?;
+            if let Some(slot) = self
+                .keys
+                .iter()
+                .position(|w| *w == name.as_str())
+                .and_then(|i| out.get_mut(i))
+            {
+                *slot = Some(v);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +295,44 @@ mod tests {
         ] {
             assert!(matches!(scalar(&raw(json), 8), Ok(Scalar::Other)), "{json}");
         }
+    }
+
+    #[test]
+    fn unsigned_reads_what_serde_json_reads_as_u64() {
+        for json in ["0", "11", "18446744073709551615", "4294967296"] {
+            let theirs: Option<u64> = serde_json::from_str(json).ok();
+            assert_eq!(unsigned(&raw(json)), theirs, "{json}");
+        }
+        for json in [
+            "-1",
+            "-0",
+            "1.0",
+            "1e2",
+            "18446744073709551616",
+            "\"1\"",
+            "null",
+        ] {
+            assert!(serde_json::from_str::<u64>(json).is_err(), "{json}");
+            assert_eq!(unsigned(&raw(json)), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn objects_keep_the_last_value_of_a_key() {
+        let json = r#" {"a": 1, "b": "x\/y", "a\u0062": [1, {"c": 2}], "a": "last", "z": null} "#;
+        let [a, b, ab, missing] = object(json, &["a", "b", "ab", "missing"]).unwrap().unwrap();
+        assert_eq!(a.unwrap().get(), r#""last""#);
+        assert_eq!(b.unwrap().get(), r#""x\/y""#);
+        assert_eq!(ab.unwrap().get(), r#"[1, {"c": 2}]"#);
+        assert!(missing.is_none());
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["a"], "last");
+        // Not an object, not JSON, an invalid key escape.
+        assert!(object("[1]", &["a"]).unwrap().is_none());
+        assert!(object(r#""a""#, &["a"]).unwrap().is_none());
+        assert!(object("{", &["a"]).is_err());
+        assert!(object(r#"{"a": 1} x"#, &["a"]).is_err());
+        assert!(object(r#"{"\ud800": 1}"#, &["a"]).is_err());
+        assert!(is_null(&raw("null")) && !is_null(&raw("0")));
     }
 }
