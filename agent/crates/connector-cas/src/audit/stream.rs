@@ -25,7 +25,7 @@ use databastion_core::audit::CursorStore;
 use databastion_core::audit::tail::{Framing, TailError, Tailer};
 use zeroize::Zeroizing;
 
-use super::events::{Builder, CasEvent};
+use super::events::{Builder, CasEvent, CorrelationLog};
 use super::level::Evidence;
 use crate::config::{AuditLogSettings, CasSettings, UtcOffset};
 use crate::fsread::{self, Policy, Refusal};
@@ -113,6 +113,8 @@ pub struct AuditRunner {
     policy: Policy,
     /// Why the tailer's open check last refused the file.
     refused: Arc<std::sync::Mutex<Option<Refusal>>>,
+    /// Rate limit of the token correlation log line (ADR-0044).
+    correlation_log: CorrelationLog,
 }
 
 impl std::fmt::Debug for AuditRunner {
@@ -156,6 +158,7 @@ impl AuditRunner {
             reported: (0, 0),
             policy,
             refused,
+            correlation_log: CorrelationLog::default(),
         })
     }
 
@@ -210,6 +213,18 @@ impl AuditRunner {
             tracing::warn!(
                 dropped,
                 "CAS audit records dropped (unparsable, oversized or internal error)"
+            );
+        }
+        // Token responses left unnamed (ADR-0044): counts only, at most one
+        // line per interval.
+        if let Some(d) = self.correlation_log.due(now, self.builder.correlation) {
+            tracing::info!(
+                named = d.named,
+                unmatched = d.unmatched,
+                ambiguous = d.ambiguous,
+                evicted = d.evicted,
+                "CAS token responses not named after their token request (no request record of \
+                 their client in the window, or several clients behind one address and user agent)"
             );
         }
         self.state.note_evidence(&batch.evidence);

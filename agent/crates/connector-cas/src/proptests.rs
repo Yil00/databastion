@@ -439,6 +439,106 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(config(128))]
+
+    /// ADR-0044 (I2): a token request's `code` (an authorization code or a
+    /// refresh token id), its other skipped keys and the response's token
+    /// values never reach an event, a contract body, a record's or the
+    /// builder's debug line, whatever the grant; the client id itself
+    /// leaves only as its registry entry's name.
+    #[test]
+    fn token_request_and_response_values_never_leave(
+        code in marker(),
+        token in marker(),
+        scope in marker(),
+        client_suffix in marker(),
+        user in marker(),
+        extra in "[a-z_]{1,12}",
+        grant in prop::sample::select(vec![
+            "refresh_token", "client_credentials", "password", "authorization_code",
+            "urn:ietf:params:oauth:grant-type:device_code",
+        ]),
+        registered in any::<bool>(),
+        code_first in any::<bool>(),
+        gap_ms in 0u64..8000,
+    ) {
+        let client = format!("client-{client_suffix}");
+        let registered_id = if registered { client.clone() } else { "someone-else".to_owned() };
+        let def = crate::parse::definition::parse_definition(
+            format!(
+                r#"{{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                    "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": {}}}"#,
+                lit(&registered_id)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        let code_kv = format!(r#""code": {}"#, lit(&format!("RT-1-{code}")));
+        let extra_kv = if extra == "service" || extra == "grant_type" {
+            format!(r#""x{extra}": {}"#, lit(&code))
+        } else {
+            format!(r#"{}: {{"service": {}, "grant_type": "password", "v": [{}]}}"#, lit(&extra), lit(&code), lit(&token))
+        };
+        let mut fields = vec![
+            format!(r#""grant_type": {}"#, lit(grant)),
+            format!(r#""service": {}"#, lit(&client)),
+            format!(r#""scope": [{}, "openid"]"#, lit(&scope)),
+            format!(r#""response_type": {}"#, lit(&code)),
+            extra_kv,
+        ];
+        if code_first { fields.insert(0, code_kv) } else { fields.push(code_kv) }
+        let request = format!(
+            r#"{{"who": "audit:unknown", "what": {{{}}}, "action": "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+                "when": 1791115200000, "clientIpAddress": "203.0.113.7", "serverIpAddress": "198.51.100.3",
+                "userAgent": "python-requests/2.33.1", "headers": {{"Authorization": {}}}}}"#,
+            fields.join(", "),
+            lit(&format!("Basic {token}")),
+        );
+        let who = if grant == "client_credentials" { client.clone() } else { user.clone() };
+        let response = format!(
+            r#"{{"who": {}, "what": {{"access_token": {at}, "refresh_token": {rt}, "id_token": {it},
+                "scope": {sc}, "token_type": "Bearer", "expires_in": "28800"}},
+                "action": "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED", "when": {},
+                "clientIpAddress": "203.0.113.7", "serverIpAddress": "198.51.100.3",
+                "userAgent": "python-requests/2.33.1"}}"#,
+            lit(&who),
+            1_791_115_200_000u64 + gap_ms,
+            at = lit(&format!("AT-1-{token}")),
+            rt = lit(&format!("RT-1-{token}")),
+            it = lit(&format!("eyJ{token}.{code}.sig")),
+            sc = lit(&scope),
+        );
+        let recs: Vec<_> = [request, response]
+            .iter()
+            .map(|l| parse_record(l.as_bytes(), UtcOffset(0)).unwrap())
+            .collect();
+        let mut b = Builder::new(key(), &[], ClientAddrMode::Truncated, Some(idx));
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut out = Vec::new();
+        for r in &recs {
+            b.push(r, now, &mut out);
+        }
+        b.flush(SystemTime::now(), true, &mut out);
+        prop_assert_eq!(out.len(), 1);
+        let object = out[0].object.as_ref().map(|o| o.object().as_str().to_owned());
+        let expect_named = registered
+            && gap_ms <= 5000
+            && matches!(grant, "refresh_token" | "client_credentials" | "password");
+        prop_assert_eq!(object.as_deref(), Some(if expect_named { "M2M" } else { "*" }));
+        let dbg = format!("{out:?} {recs:?} {b:?}");
+        let masked: Vec<_> = out.into_iter().map(crate::audit::events::CasEvent::into_masked).collect();
+        let hmac = databastion_classifiers::masking::HmacKey::new(&[9u8; 32]).unwrap();
+        let sent = databastion_core::test_support::contract_events_json(&masked, &hmac);
+        for m in [&code, &token, &scope, &client_suffix, &user] {
+            prop_assert!(!dbg.contains(m.as_str()), "{} leaked in debug", m);
+            prop_assert!(!sent.contains(m.as_str()), "{} leaked in the contract", m);
+        }
+        prop_assert!(!sent.contains("198.51.100.3"));
+    }
+}
+
+proptest! {
     #![proptest_config(config(24))]
 
     /// The masking path: registry values only leave as masked samples

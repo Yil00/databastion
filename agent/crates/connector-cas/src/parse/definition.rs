@@ -300,6 +300,12 @@ pub struct Definition {
     pub service_id: Zeroizing<String>,
     /// Form of the top-level `clientSecret`.
     pub client_secret: SecretForm,
+    /// The top-level `clientId` string, exact (bounded to
+    /// [`super::MAX_CLIENT_ID_BYTES`] + 1 bytes, zeroized), for the audit
+    /// client match of the token-only grants only (ADR-0044); `None` when
+    /// absent, not a string, or present twice. Still classified as a value
+    /// (`values`), unchanged.
+    pub client_id: Option<Zeroizing<String>>,
     /// String values to classify (credential and structural fields
     /// excluded).
     pub values: Vec<Sampled>,
@@ -455,6 +461,10 @@ fn parse_with<'de, D: Deserializer<'de>>(
         evaluation_order: top.evaluation_order,
         service_id,
         client_secret: top.client_secret,
+        client_id: match ctx.client_id {
+            ClientIdSlot::One(id) => Some(id),
+            ClientIdSlot::Absent | ClientIdSlot::Many => None,
+        },
         values: ctx.values,
     })
 }
@@ -471,8 +481,20 @@ struct Ctx {
     nodes: usize,
     array_items: usize,
     values: Vec<Sampled>,
+    /// The top-level `clientId` string (see [`Definition::client_id`]).
+    client_id: ClientIdSlot,
     /// The first bound or duplicate hit (serde errors carry text only).
     error: Option<DefinitionError>,
+}
+
+/// The top-level `clientId` strings seen.
+#[derive(Default)]
+enum ClientIdSlot {
+    #[default]
+    Absent,
+    One(Zeroizing<String>),
+    /// Twice (a duplicate key): no client id.
+    Many,
 }
 
 impl Ctx {
@@ -514,6 +536,19 @@ impl Ctx {
     }
 
     fn sample(&mut self, s: &str) {
+        // The top-level `clientId` string, kept exact (before any
+        // stripping) for the audit client match (ADR-0044); its sampling
+        // below is unchanged.
+        if let [Seg::Key(k)] = self.path.as_slice()
+            && k == "clientId"
+        {
+            self.client_id = match std::mem::take(&mut self.client_id) {
+                ClientIdSlot::Absent => {
+                    ClientIdSlot::One(bounded_owned(s, super::MAX_CLIENT_ID_BYTES + 1))
+                }
+                ClientIdSlot::One(_) | ClientIdSlot::Many => ClientIdSlot::Many,
+            };
+        }
         if is_java_type(s) {
             return;
         }
@@ -1082,6 +1117,55 @@ impl<'de> Visitor<'de> for Node<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The top-level `clientId` is kept exact for the audit client match
+    /// (ADR-0044), and still sampled as before.
+    #[test]
+    fn the_top_level_client_id_is_kept_exact() {
+        let client = |json: &str| {
+            parse_definition(json.as_bytes())
+                .unwrap()
+                .client_id
+                .map(|c| c.as_str().to_owned())
+        };
+        let base = r#""@class": "org.apereo.cas.services.OidcRegisteredService", "serviceId": "x""#;
+        assert_eq!(
+            client(&format!(r#"{{{base}, "clientId": "Scratch-M2M "}}"#)).as_deref(),
+            Some("Scratch-M2M ")
+        );
+        assert_eq!(
+            client(&format!(
+                r#"{{{base}, "clientId": "https:\/\/u:p@h\/?q=1"}}"#
+            ))
+            .as_deref(),
+            Some("https://u:p@h/?q=1"),
+            "exact, not stripped like the sampled value"
+        );
+        for json in [
+            format!("{{{base}}}"),
+            format!(r#"{{{base}, "clientId": 3}}"#),
+            format!(r#"{{{base}, "clientId": ["a"]}}"#),
+            format!(r#"{{{base}, "clientId": {{"id": "a"}}}}"#),
+            format!(r#"{{{base}, "clientId": "a", "clientId": "a"}}"#),
+            format!(r#"{{{base}, "nested": {{"clientId": "a"}}}}"#),
+        ] {
+            assert_eq!(client(&json), None, "{json}");
+        }
+        let d =
+            parse_definition(format!(r#"{{{base}, "clientId": "hr-portal"}}"#).as_bytes()).unwrap();
+        assert!(d.values.iter().any(
+            |v| v.path == [Seg::Key("clientId".to_owned())] && v.value.as_str() == "hr-portal"
+        ));
+        let y = parse_yaml_definition(
+            b"--- !<org.apereo.cas.services.OidcRegisteredService>\nserviceId: x\nclientId: hr-portal\n",
+        )
+        .unwrap();
+        assert_eq!(
+            y.client_id.as_deref().map(String::as_str),
+            Some("hr-portal")
+        );
+        assert!(!format!("{d:?}").contains("hr-portal"));
+    }
 
     const OIDC: &str = r#"{
       "@class": "org.apereo.cas.services.OidcRegisteredService",

@@ -5,6 +5,8 @@
 //! | `AUTHENTICATION_SUCCESS` | `connect` |
 //! | `AUTHENTICATION_FAILED` | `auth_failure` (flood rules below) |
 //! | `SERVICE_TICKET_CREATED` | `read`, object = the service (or `*`), rows 1 |
+//! | `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED` | `read`, object = the client of a token-only grant (or `*`), rows 1 |
+//! | `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` | no event: a pending request (below), counted per base |
 //! | `SAVE_SERVICE_SUCCESS`, `DELETE_SERVICE_SUCCESS` | `dcl` on `service_registry` |
 //! | anything else | no event, counted per action base (at most 64 bases) |
 //!
@@ -30,6 +32,24 @@
 //!   in a full window is aggregated into one event per minute without a
 //!   client address, principal `*`, and counted ([`Builder::overflow`]).
 //!
+//! - **Token-only grants** (ADR-0044): a token request is kept pending
+//!   for [`TOKEN_WINDOW`] (at most [`MAX_PENDING_REQUESTS`] per stream, the
+//!   oldest evicted and counted; never persisted), keyed by a tag of its
+//!   correlation key (client address, server address, whole user agent).
+//!   It can name a response only when its grant is `refresh_token`,
+//!   `client_credentials` or `password` and its `service` (the client id)
+//!   selects one registry entry by keyed tag ([`ServiceIndex::client`]);
+//!   any other request (`authorization_code`, the device grant, an unknown
+//!   grant or client id, a client id shared by two entries, no object
+//!   `what`) is pending too but names nothing: it can only make a response
+//!   `*`. A token response is named only when every pending request with
+//!   its key selects the same entry; the request consumed is the oldest
+//!   one the response can belong to: for a `client_credentials` request,
+//!   only a response whose `who` tag equals the client id tag. Otherwise
+//!   the object is `*`, nothing is consumed, and the case is counted
+//!   ([`TokenCorrelation`], agent log only). The pending state is cleared
+//!   when the service index is replaced.
+//!
 //! [`CasEvent::into_masked`] gives the `MaskedEvent` the core accepts
 //! (source `cas_audit_log`, the signals as `masking::Signal`, the `*`
 //! aggregate as `EventPrincipal::many_accounts`).
@@ -46,8 +66,8 @@ use databastion_classifiers::names::{NormalizedName, normalize_path};
 
 use crate::config::ClientAddrMode;
 use crate::notes::CasSignal;
-use crate::parse::record::{Action, AuditRecord};
-use crate::registry::ServiceIndex;
+use crate::parse::record::{Action, AuditRecord, Grant};
+use crate::registry::{ClientTag, EntryRef, ServiceIndex};
 
 /// Window of the failed-login signals.
 pub const WINDOW: Duration = Duration::from_secs(600);
@@ -63,6 +83,120 @@ pub const MAX_ACTION_BASES: usize = 64;
 pub const UNIDENTIFIED: &str = "unidentified";
 /// Purpose of the agent key's sub-key for the window tags.
 pub const TAG_PURPOSE: &str = "cas-failed-login-windows";
+/// Window of the token request / response correlation (ADR-0044).
+pub const TOKEN_WINDOW: Duration = Duration::from_secs(5);
+/// Most pending token requests per stream (ADR-0044).
+pub const MAX_PENDING_REQUESTS: usize = 1024;
+/// Base under which token requests are counted (they give no event).
+const TOKEN_REQUEST_BASE: &str = "OAUTH2_ACCESS_TOKEN_REQUEST";
+/// Least time between two agent log lines on the token correlation.
+pub const CORRELATION_LOG_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Token response correlation counters (ADR-0044: kept in the agent log,
+/// no heartbeat metric).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenCorrelation {
+    /// Responses named after a pending request.
+    pub named: u64,
+    /// Responses with no pending request of their key, or whose `who`
+    /// matches no pending `client_credentials` request of their client.
+    pub unmatched: u64,
+    /// Responses whose pending requests select different entries (or an
+    /// entry and an unnamed request).
+    pub ambiguous: u64,
+    /// Pending requests evicted because the state was full.
+    pub evicted: u64,
+}
+
+impl TokenCorrelation {
+    /// The counts since `before` (saturating).
+    #[must_use]
+    pub fn since(&self, before: &Self) -> Self {
+        Self {
+            named: self.named.saturating_sub(before.named),
+            unmatched: self.unmatched.saturating_sub(before.unmatched),
+            ambiguous: self.ambiguous.saturating_sub(before.ambiguous),
+            evicted: self.evicted.saturating_sub(before.evicted),
+        }
+    }
+
+    /// Whether a response could not be named or a request was evicted.
+    #[must_use]
+    pub fn has_misses(&self) -> bool {
+        self.unmatched > 0 || self.ambiguous > 0 || self.evicted > 0
+    }
+}
+
+/// Rate limit of the agent log line on the token correlation: at most one
+/// per [`CORRELATION_LOG_INTERVAL`], with the counts since the last one.
+#[derive(Debug, Default)]
+pub struct CorrelationLog {
+    reported: TokenCorrelation,
+    last: Option<SystemTime>,
+}
+
+impl CorrelationLog {
+    /// The counts to log at `now` (`None` when there is nothing missed to
+    /// report or the last line is too recent).
+    pub fn due(&mut self, now: SystemTime, current: TokenCorrelation) -> Option<TokenCorrelation> {
+        let delta = current.since(&self.reported);
+        if !delta.has_misses() {
+            return None;
+        }
+        if let Some(last) = self.last
+            && now
+                .duration_since(last)
+                .is_ok_and(|age| age < CORRELATION_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.reported = current;
+        self.last = Some(now);
+        Some(delta)
+    }
+}
+
+/// What a pending token request can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingClient {
+    /// A token-only grant whose client id selects one entry.
+    Named {
+        entry: EntryRef,
+        client: ClientTag,
+        client_credentials: bool,
+    },
+    /// Any other request: it can only make a response `*`.
+    Unnamed,
+}
+
+/// A pending token request (no value: tags, an entry reference, a time).
+#[derive(Debug)]
+struct PendingRequest {
+    key: [u8; 16],
+    when: SystemTime,
+    client: PendingClient,
+}
+
+/// One part of a correlation key: an absent address, an IPv4 or an IPv6
+/// address, each self-delimiting.
+fn addr_part(ip: Option<IpAddr>, buf: &mut [u8; 17]) -> &[u8] {
+    match ip {
+        None => {
+            buf[0] = 0;
+            &buf[..1]
+        }
+        Some(IpAddr::V4(v4)) => {
+            buf[0] = 4;
+            buf[1..5].copy_from_slice(&v4.octets());
+            &buf[..5]
+        }
+        Some(IpAddr::V6(v6)) => {
+            buf[0] = 6;
+            buf[1..17].copy_from_slice(&v6.octets());
+            &buf[..17]
+        }
+    }
+}
 
 /// Who an event is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +377,10 @@ pub struct Builder {
     addrs: HashMap<AddrKey, AddrWindow>,
     principals: HashMap<[u8; 16], VecDeque<SystemTime>>,
     aggregates: BTreeMap<AggKey, CasEvent>,
+    /// Pending token requests, in file order (ADR-0044).
+    pending: VecDeque<PendingRequest>,
+    /// Token response correlation counters.
+    pub correlation: TokenCorrelation,
     /// Failures aggregated because a window was full (heartbeat metric
     /// `audit_window_overflow_total` once wired).
     pub overflow: u64,
@@ -256,6 +394,8 @@ impl std::fmt::Debug for Builder {
         f.debug_struct("Builder")
             .field("addresses", &self.addrs.len())
             .field("principals", &self.principals.len())
+            .field("pending_token_requests", &self.pending.len())
+            .field("correlation", &self.correlation)
             .field("overflow", &self.overflow)
             .finish_non_exhaustive()
     }
@@ -280,14 +420,182 @@ impl Builder {
             addrs: HashMap::new(),
             principals: HashMap::new(),
             aggregates: BTreeMap::new(),
+            pending: VecDeque::new(),
+            correlation: TokenCorrelation::default(),
             overflow: 0,
             ignored: BTreeMap::new(),
         }
     }
 
-    /// Replaces the service index (after a registry reload).
+    /// Replaces the service index (after a registry reload). Pending token
+    /// requests refer to the entries and tags of the index they were made
+    /// with: they are dropped when it changes.
     pub fn set_services(&mut self, services: Option<Arc<ServiceIndex>>) {
+        let same = match (&self.services, &services) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.pending.clear();
+        }
         self.services = services;
+    }
+
+    /// The tag of a record's correlation key (client address, server
+    /// address, whole user agent; ADR-0044).
+    fn correlation_key(&self, r: &AuditRecord) -> [u8; 16] {
+        let (server, ua) = r
+            .correlation
+            .as_ref()
+            .map_or((None, None), |c| (c.server, c.user_agent.as_deref()));
+        let (mut a, mut b) = ([0u8; 17], [0u8; 17]);
+        let client = addr_part(r.client, &mut a);
+        let server = addr_part(server, &mut b);
+        let ua_present: &[u8] = if ua.is_some() { &[1] } else { &[0] };
+        let t = self.key.tag(&[
+            b"cas/token-correlation\0",
+            client,
+            server,
+            ua_present,
+            ua.map_or(&b""[..], |u| u.as_bytes()),
+        ]);
+        let mut out = [0u8; 16];
+        for (o, b) in out.iter_mut().zip(t.iter()) {
+            *o = *b;
+        }
+        out
+    }
+
+    /// Drops the pending requests whose window ended at `when`.
+    fn expire_pending(&mut self, when: SystemTime) {
+        self.pending.retain(|p| {
+            when.duration_since(p.when)
+                .map_or(true, |age| age <= TOKEN_WINDOW)
+        });
+    }
+
+    /// A token request: kept pending (see the module documentation).
+    fn token_request(&mut self, r: &AuditRecord) {
+        self.expire_pending(r.when);
+        let key = self.correlation_key(r);
+        let named = r.token_request.as_ref().and_then(|tr| {
+            if !tr.grant.is_token_only() {
+                return None;
+            }
+            let idx = self.services.as_ref()?;
+            let client = idx.client_tag(tr.client_id.as_deref()?)?;
+            let entry = idx.client(client)?;
+            Some(PendingClient::Named {
+                entry,
+                client,
+                client_credentials: tr.grant == Grant::ClientCredentials,
+            })
+        });
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            self.pending.pop_front();
+            self.correlation.evicted = self.correlation.evicted.saturating_add(1);
+        }
+        self.pending.push_back(PendingRequest {
+            key,
+            when: r.when,
+            client: named.unwrap_or(PendingClient::Unnamed),
+        });
+    }
+
+    /// A token response: the entry it names, if any (see the module
+    /// documentation); the pending request it belongs to is consumed.
+    fn token_response(&mut self, r: &AuditRecord) -> Option<EntryRef> {
+        self.expire_pending(r.when);
+        let key = self.correlation_key(r);
+        let matching: Vec<usize> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.key == key)
+            .map(|(i, _)| i)
+            .collect();
+        let clients: Vec<PendingClient> = matching
+            .iter()
+            .filter_map(|i| self.pending.get(*i).map(|p| p.client))
+            .collect();
+        let Some(first) = clients.first().copied() else {
+            self.correlation.unmatched = self.correlation.unmatched.saturating_add(1);
+            return None;
+        };
+        let Some(entry) = (match first {
+            PendingClient::Named { entry, .. } => Some(entry),
+            PendingClient::Unnamed => None,
+        }) else {
+            if clients.iter().all(|c| *c == PendingClient::Unnamed) {
+                // An authorization code (or other unnamed) exchange: `*`,
+                // as before; its request is consumed.
+                if let Some(i) = matching.first() {
+                    self.pending.remove(*i);
+                }
+            } else {
+                self.correlation.ambiguous = self.correlation.ambiguous.saturating_add(1);
+            }
+            return None;
+        };
+        let mut client = None;
+        for c in &clients {
+            match c {
+                PendingClient::Named {
+                    entry: e,
+                    client: t,
+                    ..
+                } if *e == entry => client = Some(*t),
+                _ => {
+                    self.correlation.ambiguous = self.correlation.ambiguous.saturating_add(1);
+                    return None;
+                }
+            }
+        }
+        // Every pending request of the key selects `entry` (one client id):
+        // the oldest the response can belong to is consumed.
+        let who_is_client = client.is_some()
+            && r.who
+                .as_deref()
+                .zip(self.services.as_ref())
+                .and_then(|(w, idx)| idx.client_tag(w))
+                == client;
+        let is_cc = |c: &PendingClient| {
+            matches!(
+                c,
+                PendingClient::Named {
+                    client_credentials: true,
+                    ..
+                }
+            )
+        };
+        let pick = if who_is_client {
+            clients.iter().position(is_cc).or(Some(0))
+        } else {
+            clients.iter().position(|c| !is_cc(c))
+        };
+        let Some(pos) = pick else {
+            // Only `client_credentials` requests, and `who` is not their
+            // client.
+            self.correlation.unmatched = self.correlation.unmatched.saturating_add(1);
+            return None;
+        };
+        if let Some(i) = matching.get(pos) {
+            self.pending.remove(*i);
+        }
+        self.correlation.named = self.correlation.named.saturating_add(1);
+        Some(entry)
+    }
+
+    /// Counts a record of another action under its base.
+    fn count_ignored(&mut self, base: &str) {
+        let key = if self.ignored.contains_key(base) || self.ignored.len() < MAX_ACTION_BASES {
+            base.to_owned()
+        } else {
+            String::new()
+        };
+        let n = self.ignored.entry(key).or_insert(0);
+        *n = n.saturating_add(1);
     }
 
     fn tag(&self, who: &str) -> [u8; 16] {
@@ -339,12 +647,27 @@ impl Builder {
         match &r.action {
             Action::AuthSuccess => out.push(self.event(r, ts, EventAction::Connect, who)),
             Action::AuthFailed => self.failure(r, ts, who, out),
+            Action::TokenRequested => {
+                self.token_request(r);
+                self.count_ignored(TOKEN_REQUEST_BASE);
+            }
             Action::ServiceTicketCreated | Action::TokenIssued => {
-                let found = r
-                    .service
-                    .as_ref()
-                    .zip(self.services.as_ref())
-                    .and_then(|(h, idx)| idx.lookup(h));
+                // A token response is named after its token request
+                // (ADR-0044), which is consumed whatever the response's own
+                // `what` names.
+                let client = if r.action == Action::TokenIssued {
+                    self.token_response(r)
+                } else {
+                    None
+                };
+                let found = match self.services.as_ref() {
+                    Some(idx) => r
+                        .service
+                        .as_ref()
+                        .and_then(|h| idx.lookup(h))
+                        .or_else(|| client.and_then(|c| idx.entry(c))),
+                    None => None,
+                };
                 let object = match found {
                     Some((t, name)) => EventObject::new(
                         self.registry_db.clone(),
@@ -369,16 +692,7 @@ impl Builder {
                 ));
                 out.push(e);
             }
-            Action::Other(base) => {
-                let key =
-                    if self.ignored.contains_key(base) || self.ignored.len() < MAX_ACTION_BASES {
-                        base.clone()
-                    } else {
-                        String::new()
-                    };
-                let n = self.ignored.entry(key).or_insert(0);
-                *n = n.saturating_add(1);
-            }
+            Action::Other(base) => self.count_ignored(base),
         }
     }
 
@@ -713,10 +1027,29 @@ mod tests {
         };
         // Service tickets (authorization code and implicit logins: `service`
         // is the redirect URI) name the client's registry entry (a pattern
-        // that matches `scheme://host/`); token responses (every grant)
-        // name no service (`*`).
-        assert_eq!(reads("M2M"), 2);
-        assert_eq!(reads("*"), 5);
+        // that matches `scheme://host/`); the token responses of the
+        // token-only grants (`refresh_token`, `client_credentials` with and
+        // without `openid`, `password`) name it after their token request
+        // (ADR-0044); the authorization code's token response stays `*`.
+        assert_eq!(reads("M2M"), 6);
+        assert_eq!(reads("*"), 1);
+        let tokens: Vec<&str> = out
+            .iter()
+            .zip(recs.iter().filter(|r| {
+                r.action != Action::TokenRequested && !matches!(r.action, Action::Other(_))
+            }))
+            .filter(|(_, r)| r.action == Action::TokenIssued)
+            .map(|(e, _)| e.object.as_ref().unwrap().object().as_str())
+            .collect();
+        assert_eq!(tokens, ["*", "M2M", "M2M", "M2M", "M2M"]);
+        assert_eq!(
+            b.correlation,
+            TokenCorrelation {
+                named: 4,
+                ..TokenCorrelation::default()
+            }
+        );
+        assert!(b.pending.is_empty());
         assert_eq!(
             out.iter()
                 .filter(|e| e.action == EventAction::Connect)
@@ -737,7 +1070,9 @@ mod tests {
         ] {
             assert!(!dbg.contains(leak), "{leak}");
         }
-        // The other OAuth / OIDC actions are counted per base.
+        // The other OAuth / OIDC actions, and the token requests, are counted
+        // per base.
+        assert_eq!(b.ignored.get("OAUTH2_ACCESS_TOKEN_REQUEST"), Some(&5));
         for base in [
             "OAUTH2_ACCESS_TOKEN_REQUEST",
             "OIDC_ID_TOKEN",
@@ -745,6 +1080,438 @@ mod tests {
             "OAUTH2_USER_PROFILE",
         ] {
             assert!(b.ignored.contains_key(base), "{base}");
+        }
+    }
+
+    // ----------------------------------------------------------- ADR-0044
+
+    /// A registry with an OIDC client `scratch-m2m` (M2M), an OAuth client
+    /// `batch-job` (Batch), a client id shared by two entries (`shared`),
+    /// and a CAS service with a `clientId` key (never a client).
+    fn clients_index() -> Arc<ServiceIndex> {
+        let defs: Vec<_> = [
+            r#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#,
+            r#"{"@class": "org.apereo.cas.support.oauth.services.OAuthRegisteredService",
+                "name": "Batch", "serviceId": "^https://batch\\.example\\.org/cb$",
+                "clientId": "batch-job"}"#,
+            r#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "Shared-A",
+                "serviceId": "^https://a\\.example\\.org/cb$", "clientId": "shared"}"#,
+            r#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "Shared-B",
+                "serviceId": "^https://b\\.example\\.org/cb$", "clientId": "shared"}"#,
+            r#"{"@class": "org.apereo.cas.services.CasRegisteredService", "name": "Plain",
+                "serviceId": "^https://plain\\.example\\.org/.*", "clientId": "plain"}"#,
+        ]
+        .iter()
+        .map(|d| parse_definition(d.as_bytes()).unwrap())
+        .collect();
+        Arc::new(ServiceIndex::new(&defs))
+    }
+
+    const UA: &str = "python-requests/2.33.1";
+
+    /// A CAS 8.0.2 token request (fake code value).
+    fn treq(grant: &str, client: &str, ip: &str, ua: &str, ms: u64) -> AuditRecord {
+        parse_record(
+            format!(
+                r#"{{"who": "audit:unknown", "what": {{"code": "RT-1-FAKEcodeVALUE-cas01",
+                     "grant_type": "{grant}", "service": "{client}", "scope": ["openid"],
+                     "response_type": "none"}},
+                   "action": "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED", "when": {},
+                   "clientIpAddress": "{ip}", "serverIpAddress": "198.51.100.3",
+                   "userAgent": "{ua}"}}"#,
+                T0 * 1000 + ms
+            )
+            .as_bytes(),
+            UtcOffset(0),
+        )
+        .unwrap()
+    }
+
+    /// A CAS 8.0.2 token response (fake token values).
+    fn tresp(who: &str, ip: &str, ua: &str, ms: u64) -> AuditRecord {
+        parse_record(
+            format!(
+                r#"{{"who": "{who}", "what": {{"access_token": "AT-1-FAKEtokenVALUE-cas01",
+                     "refresh_token": "RT-1-FAKEtokenVALUE-cas01", "token_type": "Bearer",
+                     "expires_in": "28800"}},
+                   "action": "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED", "when": {},
+                   "clientIpAddress": "{ip}", "serverIpAddress": "198.51.100.3",
+                   "userAgent": "{ua}"}}"#,
+                T0 * 1000 + ms
+            )
+            .as_bytes(),
+            UtcOffset(0),
+        )
+        .unwrap()
+    }
+
+    /// The objects of the token responses (`read` events) of `recs`.
+    fn named(b: &mut Builder, recs: &[AuditRecord]) -> Vec<String> {
+        run(b, recs, at(100_000))
+            .iter()
+            .filter(|e| e.action == EventAction::Read)
+            .map(|e| {
+                let o = e.object.as_ref().unwrap();
+                assert_eq!(o.database().as_str(), "service_registry");
+                match o.schema() {
+                    Some(s) => format!("{}.{}", s.as_str(), o.object().as_str()),
+                    None => o.object().as_str().to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    fn clients_builder() -> Builder {
+        let mut b = builder(ClientAddrMode::Truncated);
+        b.set_services(Some(clients_index()));
+        b
+    }
+
+    #[test]
+    fn token_only_grants_name_their_client() {
+        let ip = "192.0.2.10";
+        for (grant, who, want) in [
+            ("refresh_token", "jdoe", "oidc.M2M"),
+            ("password", "jdoe", "oidc.M2M"),
+            ("client_credentials", "scratch-m2m", "oidc.M2M"),
+            ("authorization_code", "jdoe", "*"),
+            ("urn:ietf:params:oauth:grant-type:device_code", "jdoe", "*"),
+            ("implicit", "jdoe", "*"),
+        ] {
+            let mut b = clients_builder();
+            let got = named(
+                &mut b,
+                &[
+                    treq(grant, "scratch-m2m", ip, UA, 0),
+                    tresp(who, ip, UA, 40),
+                ],
+            );
+            assert_eq!(got, [want], "{grant}");
+            assert!(b.pending.is_empty(), "{grant}: the request is consumed");
+            assert_eq!((b.correlation.unmatched, b.correlation.ambiguous), (0, 0));
+        }
+        // OAuth entries too; a CAS entry's `clientId`, an unknown client
+        // and a client id shared by two entries name nothing.
+        for (client, want) in [
+            ("batch-job", "oauth.Batch"),
+            ("plain", "*"),
+            ("unknown", "*"),
+            ("shared", "*"),
+            ("SCRATCH-M2M", "*"),
+            ("scratch-m2m ", "*"),
+        ] {
+            let mut b = clients_builder();
+            let got = named(
+                &mut b,
+                &[
+                    treq("refresh_token", client, ip, UA, 0),
+                    tresp("jdoe", ip, UA, 40),
+                ],
+            );
+            assert_eq!(got, [want], "{client}");
+        }
+        // No service index: `*`.
+        let mut b = builder(ClientAddrMode::Truncated);
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 0),
+                tresp("jdoe", ip, UA, 40),
+            ],
+        );
+        assert_eq!(got, ["*"]);
+    }
+
+    #[test]
+    fn interleaved_requests_name_one_client_only() {
+        let ip = "192.0.2.10";
+        // Two requests of the same client before either response: both
+        // named, in any order of the responses.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("refresh_token", "batch-job", ip, UA, 0),
+                treq("password", "batch-job", ip, UA, 10),
+                tresp("alice", ip, UA, 30),
+                tresp("bob", ip, UA, 35),
+            ],
+        );
+        assert_eq!(got, ["oauth.Batch", "oauth.Batch"]);
+        assert!(b.pending.is_empty());
+        // Two clients behind one address and user agent: never a guess.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("refresh_token", "batch-job", ip, UA, 0),
+                treq("refresh_token", "scratch-m2m", ip, UA, 10),
+                tresp("alice", ip, UA, 30),
+                tresp("bob", ip, UA, 35),
+            ],
+        );
+        assert_eq!(got, ["*", "*"]);
+        assert_eq!(b.correlation.ambiguous, 2);
+        // ... but other addresses, servers or user agents are other keys.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("refresh_token", "batch-job", ip, UA, 0),
+                treq("refresh_token", "scratch-m2m", "192.0.2.11", UA, 5),
+                treq("refresh_token", "scratch-m2m", ip, "curl/8.5.0", 10),
+                tresp("carol", ip, "curl/8.5.0", 20),
+                tresp("bob", "192.0.2.11", UA, 30),
+                tresp("alice", ip, UA, 35),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M", "oidc.M2M", "oauth.Batch"]);
+        // The whole user agent is the key, not its first token.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("refresh_token", "batch-job", ip, "Mozilla/5.0 (X11)", 0),
+                treq("refresh_token", "scratch-m2m", ip, "Mozilla/5.0 (Mac)", 5),
+                tresp("alice", ip, "Mozilla/5.0 (Mac)", 20),
+                tresp("bob", ip, "Mozilla/5.0 (X11)", 30),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M", "oauth.Batch"]);
+        // An authorization code exchange of the same key pending: the
+        // other client's response is not named (it could be the code's).
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("authorization_code", "https://a.example.org/cb", ip, UA, 0),
+                treq("refresh_token", "batch-job", ip, UA, 10),
+                tresp("alice", ip, UA, 30),
+                tresp("bob", ip, UA, 35),
+            ],
+        );
+        assert_eq!(got, ["*", "*"]);
+        assert_eq!(b.correlation.ambiguous, 2);
+        // In sequence (the usual login then refresh), both are as before.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq(
+                    "authorization_code",
+                    "https://m2m.example.org/cb",
+                    ip,
+                    UA,
+                    0,
+                ),
+                tresp("alice", ip, UA, 30),
+                treq("refresh_token", "scratch-m2m", ip, UA, 100),
+                tresp("alice", ip, UA, 130),
+            ],
+        );
+        assert_eq!(got, ["*", "oidc.M2M"]);
+        assert_eq!(
+            b.correlation,
+            TokenCorrelation {
+                named: 1,
+                ..TokenCorrelation::default()
+            }
+        );
+    }
+
+    #[test]
+    fn missing_and_expired_requests_leave_the_response_unnamed() {
+        let ip = "192.0.2.10";
+        let mut b = clients_builder();
+        assert_eq!(named(&mut b, &[tresp("jdoe", ip, UA, 0)]), ["*"]);
+        assert_eq!(b.correlation.unmatched, 1);
+        // Expired: the window is 5 s from the request's `when`.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 0),
+                tresp("jdoe", ip, UA, 5_001),
+            ],
+        );
+        assert_eq!(got, ["*"]);
+        assert_eq!(b.correlation.unmatched, 1);
+        assert!(b.pending.is_empty(), "expired requests are dropped");
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 0),
+                tresp("jdoe", ip, UA, 5_000),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M"]);
+        // A refused request (no response) does not name a later response
+        // once its window ended; a request is consumed once.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 0),
+                tresp("jdoe", ip, UA, 100),
+                tresp("jdoe", ip, UA, 200),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M", "*"]);
+        assert_eq!(b.correlation.unmatched, 1);
+        // A new service index drops the pending requests.
+        let mut b = clients_builder();
+        run(
+            &mut b,
+            &[treq("password", "scratch-m2m", ip, UA, 0)],
+            at(100_000),
+        );
+        assert_eq!(b.pending.len(), 1);
+        b.set_services(b.services.clone());
+        assert_eq!(b.pending.len(), 1, "same index: kept");
+        b.set_services(Some(clients_index()));
+        assert!(b.pending.is_empty());
+    }
+
+    #[test]
+    fn client_credentials_responses_must_be_the_clients() {
+        let ip = "192.0.2.10";
+        // `who` is the client id for `client_credentials`: another `who`
+        // leaves the response unnamed and the request pending.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("client_credentials", "scratch-m2m", ip, UA, 0),
+                tresp("batch-job", ip, UA, 30),
+                tresp("jdoe", ip, UA, 40),
+                tresp("scratch-m2m", ip, UA, 50),
+            ],
+        );
+        assert_eq!(got, ["*", "*", "oidc.M2M"]);
+        assert_eq!(b.correlation.unmatched, 2);
+        assert!(b.pending.is_empty());
+        // A `client_credentials` and a `password` request of one client:
+        // each response consumes the request it can belong to.
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 0),
+                treq("client_credentials", "scratch-m2m", ip, UA, 10),
+                tresp("scratch-m2m", ip, UA, 30),
+                tresp("jdoe", ip, UA, 40),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M", "oidc.M2M"]);
+        assert!(b.pending.is_empty());
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("client_credentials", "scratch-m2m", ip, UA, 0),
+                treq("password", "scratch-m2m", ip, UA, 10),
+                tresp("jdoe", ip, UA, 30),
+                tresp("scratch-m2m", ip, UA, 40),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M", "oidc.M2M"]);
+        assert!(b.pending.is_empty());
+    }
+
+    #[test]
+    fn pending_requests_are_bounded() {
+        let mut b = clients_builder();
+        let recs: Vec<AuditRecord> = (0..(MAX_PENDING_REQUESTS as u64 + 10))
+            .map(|i| {
+                treq(
+                    "password",
+                    "scratch-m2m",
+                    &format!("10.0.{}.{}", i / 256, i % 256),
+                    UA,
+                    0,
+                )
+            })
+            .collect();
+        assert!(run(&mut b, &recs, at(100_000)).is_empty());
+        assert_eq!(b.pending.len(), MAX_PENDING_REQUESTS);
+        assert_eq!(b.correlation.evicted, 10);
+        // The oldest were evicted: their responses are unnamed.
+        assert_eq!(named(&mut b, &[tresp("jdoe", "10.0.0.0", UA, 1)]), ["*"]);
+        assert_eq!(
+            named(&mut b, &[tresp("jdoe", "10.0.0.10", UA, 1)]),
+            ["oidc.M2M"]
+        );
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("pending_token_requests"));
+        for leak in ["scratch", "10.0.", "python"] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
+    }
+
+    #[test]
+    fn correlation_log_lines_are_rate_limited() {
+        let mut log = CorrelationLog::default();
+        let mut c = TokenCorrelation {
+            named: 3,
+            ..TokenCorrelation::default()
+        };
+        assert_eq!(log.due(at(0), c), None, "nothing missed");
+        c.unmatched = 2;
+        assert_eq!(
+            log.due(at(1), c),
+            Some(TokenCorrelation {
+                named: 3,
+                unmatched: 2,
+                ..TokenCorrelation::default()
+            })
+        );
+        c.ambiguous = 1;
+        assert_eq!(log.due(at(2), c), None, "too recent");
+        assert_eq!(log.due(at(1 + 599), c), None);
+        assert_eq!(
+            log.due(at(1 + 600), c),
+            Some(TokenCorrelation {
+                ambiguous: 1,
+                ..TokenCorrelation::default()
+            })
+        );
+        assert_eq!(log.due(at(5000), c), None, "nothing new");
+    }
+
+    #[test]
+    fn named_token_responses_reach_the_contract_as_registry_names() {
+        let ip = "192.0.2.10";
+        let mut b = clients_builder();
+        let sent = contract(run(
+            &mut b,
+            &[
+                treq("client_credentials", "scratch-m2m", ip, UA, 0),
+                tresp("scratch-m2m", ip, UA, 30),
+            ],
+            at(100_000),
+        ));
+        assert_eq!(sent.len(), 1);
+        let e = &sent[0];
+        assert_eq!(e["action"], "read");
+        assert_eq!(e["rows"], 1);
+        assert_eq!(
+            e["objects"],
+            serde_json::json!([{"database": "service_registry", "schema": "oidc", "object": "M2M"}])
+        );
+        assert!(e["principal"].get("db_user").is_none());
+        assert!(e["principal"]["db_user_fingerprint"].is_string());
+        let all = serde_json::to_string(&sent).unwrap();
+        for leak in [
+            "scratch",
+            "FAKE",
+            "Bearer",
+            "198.51",
+            "192.0.2.10",
+            "openid",
+        ] {
+            assert!(!all.contains(leak), "{leak} in {all}");
         }
     }
 
