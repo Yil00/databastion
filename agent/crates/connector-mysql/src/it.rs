@@ -33,6 +33,7 @@
 
 mod audit_it;
 mod cas_guard_it;
+mod stmt_text_it;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
