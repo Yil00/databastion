@@ -115,6 +115,8 @@ pub struct AuditRunner {
     refused: Arc<std::sync::Mutex<Option<Refusal>>>,
     /// Rate limit of the token correlation log line (ADR-0044).
     correlation_log: CorrelationLog,
+    /// Tailer rotations and truncations already seen.
+    rotations: u64,
 }
 
 impl std::fmt::Debug for AuditRunner {
@@ -149,6 +151,11 @@ impl AuditRunner {
         let log = settings.audit_log.clone()?;
         let refused = Arc::new(std::sync::Mutex::new(None));
         let check = fsread::log_open_check(log.path.clone(), policy, Arc::clone(&refused));
+        // A fresh or resumed stream: records before its start were not seen
+        // (a token request just before it, or before a restart), so the
+        // first records name nothing (review of #182 L6).
+        let mut builder = builder;
+        builder.note_loss(None);
         Some(Self {
             tailer: Tailer::new(log.path.path().to_path_buf(), Framing::Lines, store)
                 .with_open_check(check),
@@ -159,6 +166,7 @@ impl AuditRunner {
             policy,
             refused,
             correlation_log: CorrelationLog::default(),
+            rotations: 0,
         })
     }
 
@@ -206,7 +214,11 @@ impl AuditRunner {
                 Some(acc.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t))))
             },
         );
-        if batch.dropped > 0 || skipped > 0 {
+        // A rotation or a truncation (the tailer resets its partial record)
+        // may lose a record too (review of #182 L5).
+        let rotated = self.tailer.rotations > self.rotations;
+        self.rotations = self.tailer.rotations;
+        if batch.dropped > 0 || skipped > 0 || rotated {
             self.builder.note_loss(span);
         }
         let mut panicked = 0u64;
@@ -386,6 +398,16 @@ mod tests {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
+            // The stream's start taints around its first record (review of
+            // #182 L6): one a minute earlier.
+            append(
+                &dir,
+                &format!(
+                    "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": {}}}\n",
+                    when - 60_000
+                ),
+            );
+            assert_eq!(r.poll(now).unwrap().events.len(), 1);
             if let Some(lost) = before {
                 append(&dir, lost);
                 assert!(r.poll(now).unwrap().events.is_empty());
@@ -408,6 +430,78 @@ mod tests {
             assert_eq!(objects(&lost, None), ["*"], "between");
             assert_eq!(objects("", Some(&lost)), ["*"], "in the read before");
         }
+    }
+
+    /// Review of #182 L5 / L6: a rotation or a truncation between a token
+    /// request and its response, and the stream's start, leave the
+    /// response `*`.
+    #[test]
+    fn rotations_truncations_and_the_start_taint_token_responses() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let def = crate::parse::definition::parse_definition(
+            br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#,
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        // `cut`: 0 nothing, 1 rotation, 2 truncation, between request and
+        // response; `warm`: a record a minute earlier first.
+        let objects = |cut: u8, warm: bool| {
+            let dir = TempDir::new("stream-rotate");
+            append(&dir, "");
+            let s = settings(&dir);
+            let b = Builder::new(
+                key(),
+                &[],
+                ClientAddrMode::Truncated,
+                Some(Arc::clone(&idx)),
+            );
+            let mut r =
+                AuditRunner::with_policy(&s, None, b, Arc::new(CasState::default()), Policy::TESTS)
+                    .unwrap();
+            let now = SystemTime::now();
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let when = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            if warm {
+                append(
+                    &dir,
+                    &format!(
+                        "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": {}}}\n",
+                        when - 60_000
+                    ),
+                );
+                assert_eq!(r.poll(now).unwrap().events.len(), 1);
+            }
+            let pair = token_lines(when, "");
+            let (request, response) = pair.split_once('\n').unwrap();
+            // Long enough that a truncated file is shorter than the offset.
+            append(&dir, &format!("{request}\n{request}\n"));
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let log = dir.path().join("cas_audit.log");
+            match cut {
+                1 => {
+                    std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+                    append(&dir, "");
+                }
+                2 => std::fs::write(&log, "").unwrap(),
+                _ => {}
+            }
+            append(&dir, response);
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.extend(r.poll(now).unwrap().events);
+            }
+            out.iter()
+                .map(|e| e.object.as_ref().unwrap().object().as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(objects(0, true), ["M2M"], "control");
+        assert_eq!(objects(0, false), ["*"], "the stream's first records");
+        assert_eq!(objects(1, true), ["*"], "rotation");
+        assert_eq!(objects(2, true), ["*"], "truncation");
     }
 
     #[test]

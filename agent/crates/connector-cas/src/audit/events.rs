@@ -445,7 +445,8 @@ impl Builder {
 
     /// Replaces the service index (after a registry reload). Pending token
     /// requests refer to the entries and tags of the index they were made
-    /// with: they are dropped when it changes.
+    /// with: they are dropped when it changes, and the change counts as a
+    /// loss ([`Self::note_loss`]).
     pub fn set_services(&mut self, services: Option<Arc<ServiceIndex>>) {
         let same = match (&self.services, &services) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -453,7 +454,10 @@ impl Builder {
             _ => false,
         };
         if !same {
+            // Dropped requests may be the requests of responses still to
+            // come (review of #182 L6): taint as for a loss.
             self.pending.clear();
+            self.note_loss(None);
         }
         self.services = services;
     }
@@ -1061,8 +1065,12 @@ mod tests {
                 "serviceId": "^https://m2m\\.example\\.org(/.*)?$", "clientId": "scratch-m2m"}"#,
         )
         .unwrap();
-        let mut b = builder(ClientAddrMode::Truncated);
-        b.set_services(Some(Arc::new(ServiceIndex::new([&def]))));
+        let mut b = Builder::new(
+            key(),
+            &["svc-monitoring".to_owned()],
+            ClientAddrMode::Truncated,
+            Some(Arc::new(ServiceIndex::new([&def]))),
+        );
         let recs: Vec<AuditRecord> =
             include_str!("../../fixtures/cas-8.0.2-oauth-oidc-audit.jsonl")
                 .lines()
@@ -1220,9 +1228,12 @@ mod tests {
     }
 
     fn clients_builder() -> Builder {
-        let mut b = builder(ClientAddrMode::Truncated);
-        b.set_services(Some(clients_index()));
-        b
+        Builder::new(
+            key(),
+            &["svc-monitoring".to_owned()],
+            ClientAddrMode::Truncated,
+            Some(clients_index()),
+        )
     }
 
     #[test]
@@ -1429,6 +1440,23 @@ mod tests {
         assert_eq!(b.pending.len(), 1, "same index: kept");
         b.set_services(Some(clients_index()));
         assert!(b.pending.is_empty());
+        // ... and taints (review of #182 L6): the next records name nothing.
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 20_000),
+                tresp("jdoe", ip, UA, 20_040),
+            ],
+        );
+        assert_eq!(got, ["*"]);
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 30_000),
+                tresp("jdoe", ip, UA, 30_040),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M"]);
     }
 
     #[test]
