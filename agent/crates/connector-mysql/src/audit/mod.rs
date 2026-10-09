@@ -183,7 +183,7 @@ fn own_account(
 }
 
 /// The event builder of a target's stream, with the connector's own
-/// statements of that target (the CAS store guard's column query, built
+/// statements of that target (the CAS store guard's catalog queries, built
 /// from the same `cas_stores` as `check()`).
 fn builder(
     cfg: &AuditConfig,

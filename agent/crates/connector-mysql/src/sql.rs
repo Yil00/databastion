@@ -359,63 +359,94 @@ pub(crate) fn server_audit_escaped_len(s: &str) -> usize {
 const CAS_GUARD_SCHEMAS: &str =
     "LOWER(TABLE_SCHEMA) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')";
 
-/// The CAS store guard statements of `check()` (ADR-0041 decision 6): the
-/// columns of the tables that may be CAS stores, with the account's
-/// privileges on each. Columns: schema, table, column, privileges; each
-/// statement ordered by schema, table and column position, at most
-/// [`CAS_GUARD_MAX_ROWS`] + 1 rows.
+/// The CAS store guard's table list (ADR-0041 decision 6): the schema and
+/// name of every table and view outside the system schemas, nothing else.
+/// Selecting only these columns lets the server answer from the catalog
+/// without opening any table definition (measured: no
+/// `Opened_table_definitions` on MariaDB, a data dictionary index read on
+/// MySQL). `check()` streams it, computes each name key in Rust
+/// (`databastion_core::cas_guard::name_key`, the key of [`name_key!`]) and
+/// keeps only the keys it knows; no name is kept.
+pub(crate) const CAS_GUARD_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME \
+     FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) NOT IN \
+     ('mysql', 'sys', 'information_schema', 'performance_schema')";
+
+/// The CAS store guard statements of `check()` (ADR-0041 decision 6),
+/// every text known from the configuration alone (the Audit stream
+/// recognizes them by their exact text; none depends on the catalog).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CasGuardStatements {
+    /// [`CAS_GUARD_TABLES`].
+    pub(crate) tables: &'static str,
+    /// Per name key, in key order: the columns, with the account's
+    /// privileges, of the tables whose name key is that key. Sent only for
+    /// the keys found in the table list.
+    pub(crate) by_key: Vec<(String, String)>,
+    /// The columns of the tables with a `body` / `json` / `AUD_RESOURCE` /
+    /// `AUD_USER` column (recognition by shape), sent last.
+    pub(crate) shape: String,
+}
+
+impl CasGuardStatements {
+    /// Every text, for the Audit stream: the name statements, the shape
+    /// statement, then the table list.
+    #[must_use]
+    pub(crate) fn texts(&self) -> Vec<String> {
+        self.by_key
+            .iter()
+            .map(|(_, s)| s.clone())
+            .chain([self.shape.clone(), self.tables.to_owned()])
+            .collect()
+    }
+}
+
+/// The CAS store guard statements for the name keys `keys` (the built-in
+/// names and `cas_stores`; see [`CasGuardStatements`]). Columns of the
+/// column statements: schema, table, column, privileges; each ordered by
+/// schema, table and column position, at most [`CAS_GUARD_MAX_ROWS`] + 1
+/// rows; each within [`CAS_GUARD_MAX_STATEMENT`].
 ///
-/// - First, tables whose name key is in `keys` (the built-in names and
-///   `cas_stores`), in as many statements as needed for each to stay within
-///   [`CAS_GUARD_MAX_STATEMENT`] (tables matched by name come first, PR
-///   #141 review L2);
-/// - last, the tables with a `body` / `json` / `AUD_RESOURCE` / `AUD_USER`
-///   column (recognition by shape).
+/// One column statement per key (PR #165 follow-up, measured cost): a
+/// filter on the name key cannot use the catalog's name lookup, so each
+/// statement walks the whole table list (without opening a table
+/// definition); `check()` sends only those of the keys the table list
+/// holds, usually none, instead of one per chunk of every key.
 ///
 /// `None` when a key cannot be quoted or does not fit one statement.
 #[must_use]
-pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<Vec<String>> {
+pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<CasGuardStatements> {
     let head = format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
          FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} AND {} IN (",
         name_key!("TABLE_NAME"),
     );
     let tail = ") ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001";
-    let mut out = Vec::new();
-    let mut list = String::new();
+    let mut by_key = Vec::with_capacity(keys.len());
     for k in keys {
-        let q = quote_str(k)?;
-        let candidate = if list.is_empty() {
-            q.clone()
-        } else {
-            format!("{list}, {q}")
-        };
-        let fits = |l: &str| {
-            server_audit_escaped_len(&head) + server_audit_escaped_len(l) + tail.len()
-                <= CAS_GUARD_MAX_STATEMENT
-        };
-        if fits(&candidate) {
-            list = candidate;
-        } else if list.is_empty() || !fits(&q) {
+        let s = format!("{head}{}{tail}", quote_str(k)?);
+        if server_audit_escaped_len(&s) > CAS_GUARD_MAX_STATEMENT {
             return None;
-        } else {
-            out.push(format!("{head}{list}{tail}"));
-            list = q;
         }
+        by_key.push((k.clone(), s));
     }
-    if !list.is_empty() {
-        out.push(format!("{head}{list}{tail}"));
-    }
-    out.push(format!(
+    by_key.sort();
+    by_key.dedup();
+    let shape = format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
          FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} \
          AND (TABLE_SCHEMA, TABLE_NAME) IN (SELECT x.TABLE_SCHEMA, x.TABLE_NAME \
          FROM information_schema.COLUMNS x WHERE {} IN ('body', 'json', 'audresource', 'auduser')) \
          ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001",
         name_key!("x.COLUMN_NAME"),
-    ));
+    );
+    let out = CasGuardStatements {
+        tables: CAS_GUARD_TABLES,
+        by_key,
+        shape,
+    };
     debug_assert!(
-        out.iter()
+        out.texts()
+            .iter()
             .all(|s| server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT)
     );
     Some(out)
@@ -425,10 +456,18 @@ pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<Vec<String>> {
 /// of the built-in and `cas_stores` name keys. One builder for `check()`
 /// and for the Audit stream, which recognizes them by their exact text.
 #[must_use]
+pub(crate) fn cas_guard_statements_of(
+    stores: Option<&databastion_core::cas_guard::CasStores>,
+) -> Option<CasGuardStatements> {
+    cas_guard_statements(&databastion_core::cas_guard::known_name_keys(stores))
+}
+
+/// Every CAS store guard text of a target ([`CasGuardStatements::texts`]).
+#[must_use]
 pub(crate) fn cas_guard_statement_texts(
     stores: Option<&databastion_core::cas_guard::CasStores>,
 ) -> Option<Vec<String>> {
-    cas_guard_statements(&databastion_core::cas_guard::known_name_keys(stores))
+    cas_guard_statements_of(stores).map(|g| g.texts())
 }
 
 // ------------------------------------------------------------------ check()
@@ -817,7 +856,9 @@ mod tests {
             ps_stats("events_statements_history_long", 7),
         ];
         v.extend(
-            cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
+            cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()])
+                .unwrap()
+                .texts(),
         );
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
@@ -828,8 +869,8 @@ mod tests {
     }
 
     /// The guard statements never reach the default 1024-byte log limits
-    /// (security review of f9bab99): every name key is in exactly one of
-    /// them, the shape statement comes last.
+    /// (security review of f9bab99): one column statement per name key,
+    /// the shape statement, and the table list, which reads names only.
     #[test]
     fn cas_guard_statements_stay_short_and_cover_every_key() {
         let names = |p: char| -> Vec<String> {
@@ -844,27 +885,52 @@ mod tests {
         };
         for stores in [None, Some(&full)] {
             let keys = databastion_core::cas_guard::known_name_keys(stores);
-            let all = cas_guard_statement_texts(stores).unwrap();
+            let guard = cas_guard_statements_of(stores).unwrap();
+            let all = guard.texts();
+            assert_eq!(cas_guard_statement_texts(stores).unwrap(), all);
             for s in &all {
                 assert!(
                     server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT,
                     "{}",
                     s.len()
                 );
-                assert!(s.ends_with("LIMIT 20001"));
             }
-            let (shape, by_name) = all.split_last().unwrap();
-            assert!(shape.contains("'audresource'"));
-            for k in &keys {
-                let q = format!("'{k}'");
-                assert_eq!(by_name.iter().filter(|s| s.contains(&q)).count(), 1, "{k}");
+            assert_eq!(all.last().map(String::as_str), Some(CAS_GUARD_TABLES));
+            assert!(guard.shape.contains("'audresource'"));
+            assert!(guard.shape.ends_with("LIMIT 20001"));
+            // One column statement per key, with that key only.
+            assert_eq!(
+                guard.by_key.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                keys.iter().collect::<Vec<_>>()
+            );
+            for (k, s) in &guard.by_key {
+                assert!(
+                    s.ends_with(&format!(
+                        "IN ('{k}') ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001"
+                    )),
+                    "{s}"
+                );
+                assert_eq!(s.matches('\'').count(), 2 * 8, "{s}");
             }
-            // Built-in names: two name statements and the shape one; 64
-            // names of 128 characters per list: 67.
-            assert_eq!(all.len(), if stores.is_none() { 3 } else { 67 });
+            // Built-in names: 27 keys; 64 names of 128 characters per list
+            // more: 219.
+            assert_eq!(guard.by_key.len(), if stores.is_none() { 27 } else { 219 });
         }
         // A key that cannot fit one statement: no statement at all.
         assert!(cas_guard_statements(&["k".repeat(800)]).is_none());
+    }
+
+    /// The table list reads the schema and name only, outside the same
+    /// system schemas as the column statements.
+    #[test]
+    fn the_cas_guard_table_list_reads_names_only() {
+        assert!(CAS_GUARD_TABLES.contains(CAS_GUARD_SCHEMAS));
+        assert!(
+            CAS_GUARD_TABLES.starts_with(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE "
+            )
+        );
+        assert!(!CAS_GUARD_TABLES.contains("COLUMNS"));
     }
 
     #[test]

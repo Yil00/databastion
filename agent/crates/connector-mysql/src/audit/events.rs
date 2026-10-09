@@ -718,7 +718,8 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
 pub(crate) struct EventBuilder {
     own: OwnAccount,
     /// Exact texts of the statements the connector itself sends that read
-    /// no relation but `information_schema.COLUMNS` (the CAS store guard's
+    /// no relation but `information_schema.TABLES` names and
+    /// `information_schema.COLUMNS` (the CAS store guard's table list and
     /// column queries, ADR-0041 decision 6, each short enough never to be
     /// cut at the default log limits): recognized by their whole text and
     /// left out without a charge (see [`Self::own_statement`]).
@@ -788,7 +789,7 @@ impl EventBuilder {
     /// The event of one statement, if any (see the module documentation).
     pub(crate) fn statement(&mut self, a: Access<'_>, now: SystemTime) -> Option<MaskedEvent> {
         // The connector's own guard statements, by their exact whole text:
-        // they read `information_schema.COLUMNS` only. Left out without a
+        // they read `information_schema.TABLES` / `.COLUMNS` only. Left out without a
         // charge when the account, application and address are the agent's,
         // every table record (if any) is in `information_schema` (not
         // `performance_schema` nor `sys`: security review of f9bab99, M1),
@@ -1552,18 +1553,14 @@ mod tests {
         }
     }
 
-    /// Only the whole, uncut guard text with no table record outside
-    /// `information_schema` takes the uncharged path (security review of
-    /// f9bab99, H1, M1, L1).
-    #[test]
-    fn the_cas_guard_match_is_narrow() {
-        let set = guard_sets().remove(0);
-        let g = &set[0];
+    /// The narrow-match checks of [`the_cas_guard_match_is_narrow`] for one
+    /// guard text `g` of `set`.
+    fn narrow_for(set: &[String], g: &str) {
         // Three heartbeats: an unknown read of the agent's account is
         // charged the whole budget, so the first may still be left out by
         // the row budget; the next ones are reported.
         let heartbeats = |text: &str, limit: usize| {
-            let mut b = guard_builder(&set);
+            let mut b = guard_builder(set);
             let mut out = Vec::new();
             for q in 1..=3u64 {
                 let cut = (limit < text.len()).then_some(limit);
@@ -1579,9 +1576,12 @@ mod tests {
         };
         // The guard text followed by another read, cut at the limit inside
         // a literal (server_audit with QUERY events only: no table record).
+        // (The padding puts the cut inside the literal, whatever the
+        // guard text's length.)
+        let pad = 1100 - crate::sql::server_audit_escaped_len(g);
         let forged = format!(
             "{g} UNION ALL SELECT name, email, phone, '{}' FROM shop.customers",
-            "x".repeat(400)
+            "x".repeat(pad)
         );
         let out = heartbeats(&forged, 1024);
         assert!(out.len() >= 2, "{out:?}");
@@ -1590,7 +1590,7 @@ mod tests {
             "{out:?}"
         );
         // The same on performance_schema (`SQL_TEXT` cut, no table record).
-        let mut b = guard_builder(&set);
+        let mut b = guard_builder(set);
         let mut reported = 0;
         for _ in 0..3 {
             let access = pfs_access(&forged.as_bytes()[..1020], true, Vec::new());
@@ -1600,14 +1600,19 @@ mod tests {
         assert!(reported >= 2);
         // The exact guard text cut by a lowered limit (here inside its
         // regular expression literal): no longer matched, reported as a
-        // read of `*` (documented: keep the limits at 1024).
-        let regex_at = g.find("[^ABC").unwrap();
-        let low = crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10;
-        let out = heartbeats(g, low);
-        assert!(out.len() >= 2, "{out:?}");
+        // read of `*` (documented: keep the limits at 1024). The table list
+        // has no such literal: cut, it is not matched either (below: a
+        // truncated record never is), and then reads as any cut text whose
+        // visible part names `information_schema` only, as the column
+        // statements cut inside their schema list do.
+        if let Some(regex_at) = g.find("[^ABC") {
+            let low = crate::sql::server_audit_escaped_len(&g[..regex_at]) + 10;
+            let out = heartbeats(g, low);
+            assert!(out.len() >= 2, "{out:?}");
+        }
         // The exact guard text with a table record outside
         // `information_schema` never takes the uncharged path.
-        let b = guard_builder(&set);
+        let b = guard_builder(set);
         for db in ["performance_schema", "sys", "shop"] {
             let access = pfs_access(g.as_bytes(), false, vec![(db, "t", TableOp::Read)]);
             assert!(!b.own_guard(&access), "{db}");
@@ -1623,6 +1628,22 @@ mod tests {
         let mut opaque = pfs_access(g.as_bytes(), false, Vec::new());
         opaque.opaque = true;
         assert!(!b.own_guard(&opaque));
+    }
+
+    /// Only the whole, uncut guard text with no table record outside
+    /// `information_schema` takes the uncharged path (security review of
+    /// f9bab99, H1, M1, L1).
+    #[test]
+    fn the_cas_guard_match_is_narrow() {
+        let set = guard_sets().remove(0);
+        // A column statement of one name key, the shape statement and the
+        // table list.
+        let (list, shape) = (&set[set.len() - 1], &set[set.len() - 2]);
+        assert_eq!(list, crate::sql::CAS_GUARD_TABLES);
+        for g in [&set[0], shape, list] {
+            narrow_for(&set, g);
+        }
+        let g = &set[0];
         // Exact text from another account or address: not the uncharged
         // path (whatever the usual path then decides).
         let mut b = guard_builder(&set);

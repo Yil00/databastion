@@ -280,3 +280,49 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         assert_eq!(with_audit, Some(2), "{name}");
     }
 }
+
+/// The guard's `check()` cost on the server's current catalog (ROADMAP
+/// phase 8 follow-up, docs/08 "CAS store guard"): the wall time of
+/// [`crate::check::cas_guard_readable`] with the agent account, with the
+/// built-in names and with 64 names of 128 characters per `cas_stores`
+/// list, median of 5 runs. Opt-in (`--ignored`): the figures only mean
+/// something on a catalog of the size under study (e.g. 5 000 tables).
+/// Prints times and counts only.
+#[tokio::test]
+#[ignore = "measurement: run with --ignored on a large catalog"]
+async fn cas_guard_cost() {
+    let _serial = SERIAL.lock().await;
+    let names = |p: char| -> Vec<String> {
+        (0..64)
+            .map(|i| format!("{i:02}{}", p.to_string().repeat(126)))
+            .collect()
+    };
+    let full = databastion_core::cas_guard::CasStores {
+        ticket_registry: names('t'),
+        service_registry: names('s'),
+        audit_trail: names('a'),
+    };
+    for server in servers() {
+        let (_dir, t) = agent_target(&server);
+        let mut s = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        for (label, stores) in [("built-in", None), ("cas_stores 3 x 64", Some(&full))] {
+            let mut times = Vec::new();
+            let mut last = None;
+            for _ in 0..5 {
+                let start = Instant::now();
+                let r = crate::check::cas_guard_readable(&mut s, stores)
+                    .await
+                    .unwrap();
+                times.push(start.elapsed());
+                last = Some((r.readable, r.complete));
+            }
+            times.sort();
+            eprintln!(
+                "{} {label}: median {:?} (min {:?}, max {:?}), readable and complete {:?}",
+                server.name, times[2], times[0], times[4], last
+            );
+        }
+    }
+}

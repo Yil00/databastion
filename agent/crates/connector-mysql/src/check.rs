@@ -59,7 +59,7 @@ use databastion_core::{
 
 use crate::audit::pfs::PsTable;
 use crate::catalog::{self, Coverage, EngineSkip};
-use crate::conn::{Flavor, Rows, Session, Timeouts};
+use crate::conn::{Flavor, Flow, Rows, Session, Timeouts};
 use crate::discover::normalize;
 use crate::error::{MyError, Stage};
 use crate::grants::{self as grant_lines, Line, Scope};
@@ -1444,15 +1444,43 @@ pub(crate) async fn cas_guard_readable(
     // Several statements, each short enough never to be cut in the audit
     // logs (`sql::CAS_GUARD_MAX_STATEMENT`): tables matched by name first,
     // then by shape; at most `CAS_GUARD_MAX_ROWS` rows in all.
-    let statements = sql::cas_guard_statement_texts(stores)
+    let guard = sql::cas_guard_statements_of(stores)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
     let mut complete = true;
+    // The name keys present in the catalog: the table list is streamed and
+    // each name key computed here, as the column statements compute it in
+    // SQL; only the known keys are kept. A name that is not UTF-8 cannot
+    // be keyed: not complete (fail closed, as a skipped row below).
+    let mut present: BTreeSet<&str> = BTreeSet::new();
+    let mut unkeyed = 0usize;
+    session
+        .query_stream(Stage::Check, guard.tables, |row| {
+            match row.get(1).copied().flatten().map(std::str::from_utf8) {
+                Some(Ok(name)) => {
+                    let key = cas_guard::name_key(name);
+                    // `by_key` is in key order.
+                    if let Ok(i) = guard.by_key.binary_search_by(|(k, _)| k.as_str().cmp(&key)) {
+                        present.insert(guard.by_key[i].0.as_str());
+                    }
+                }
+                _ => unkeyed += 1,
+            }
+            Flow::Continue
+        })
+        .await?;
+    complete &= unkeyed == 0;
+    let statements = guard
+        .by_key
+        .iter()
+        .filter(|(k, _)| present.contains(k.as_str()))
+        .map(|(_, s)| s)
+        .chain([&guard.shape]);
     let mut taken = 0usize;
     // Per table: (column, readable).
     type Columns = Vec<(String, bool)>;
     let mut tables: Vec<((String, String), Columns)> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for statement in &statements {
+    for statement in statements {
         if taken > sql::CAS_GUARD_MAX_ROWS {
             break;
         }

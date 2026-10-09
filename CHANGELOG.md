@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ⚡️ Performance
+- Agent (MySQL / MariaDB): the CAS store guard's heartbeat check no longer sends one `information_schema.COLUMNS` query per 900-byte chunk of the name list (3 with the built-in names, up to 67 with long `cas_stores` lists). It reads the table names once from `information_schema.TABLES` (no table definition opened), matches the name keys in the agent, and sends a column query only for each name key present. Measured at 5 000 tables with three 64-name `cas_stores` lists: 1.00 s → 0.24 to 0.29 s on MySQL 8.4, 1.11 s → 0.50 to 0.66 s on MariaDB 11.4 (built-in names: 0.16 → 0.22 s and 0.41 → 0.48 to 0.53 s, one more statement); the same stores are recognized. The Audit stream recognizes the new statements by their exact text, as before; the column-shape query is unchanged and is the remaining cost (about 0.1 s per 1 000 tables on MariaDB) ([docs/08](docs/08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap))
+
 ### 🐛 Bug Fixes
 - Agent dependencies: `base64` 0.23.1 in `databastion-core` (agent secret bodies) and `connector-mongodb` (SCRAM), with the fuzz harness lockfile updated too (replaces Dependabot #174, which left `agent/fuzz/Cargo.lock` stale and failed the `--locked` fuzz and cargo-deny jobs). No code change was needed: the engines used (`STANDARD` with padding, `URL_SAFE_NO_PAD`), their alphabets and padding modes are unchanged, now pinned by fixed-vector tests; the agent still uses only the scalar `GeneralPurpose` engine. `base64` 0.22.1 stays in the graph for `reqwest`, `postgres-protocol` and `wiremock`. Its MSRV is 1.71, below the agent's 1.88
 
