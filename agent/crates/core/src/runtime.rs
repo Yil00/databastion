@@ -205,10 +205,8 @@ pub async fn enroll(
         os: Some(EnrollRequestOs::Linux),
         token,
     };
-    let body = Zeroizing::new(
-        serde_json::to_vec(&request)
-            .map_err(|_| AgentError::Enrollment("cannot encode the request".into()))?,
-    );
+    let body = crate::identity::json_zeroizing(&request, false)
+        .map_err(|_| AgentError::Enrollment("cannot encode the request".into()))?;
     drop(request);
     let mut attempt = 0;
     let reply = loop {
