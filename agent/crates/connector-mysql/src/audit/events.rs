@@ -659,6 +659,11 @@ pub(crate) struct Access<'a> {
     /// `records::FileRecord::opaque`).
     pub(crate) opaque: bool,
     pub(crate) truncated: bool,
+    /// A second whole text of the same statement (`performance_schema`:
+    /// the digest next to an uncut `SQL_TEXT`), analyzed too: the event
+    /// takes the objects and signals of both (security review of 09e93da,
+    /// R1). The agent's exact-text matches use `text` only.
+    pub(crate) alt_text: Option<&'a [u8]>,
     /// Table-access records of the statement.
     pub(crate) tables: Vec<(&'a str, &'a str, TableOp)>,
     pub(crate) rows: Option<u64>,
@@ -866,11 +871,11 @@ impl EventBuilder {
             return None;
         }
         let opaque = a.opaque || a.text.is_some_and(|t| std::str::from_utf8(t).is_err());
+        // performance_schema texts come transcoded to utf8mb4 by the
+        // server: the multibyte trail-byte guard is for raw client bytes
+        // (audit log files) only.
+        let transcoded = a.source == EventSource::PerformanceSchema;
         let analysis: Option<QueryAnalysis> = a.text.map(|t| {
-            // performance_schema texts come transcoded to utf8mb4 by the
-            // server: the multibyte trail-byte guard is for raw client
-            // bytes (audit log files) only.
-            let transcoded = a.source == EventSource::PerformanceSchema;
             analyze_raw(
                 t,
                 analyze_opts(a.truncated)
@@ -878,13 +883,35 @@ impl EventBuilder {
                     .transcoded(transcoded),
             )
         });
-        let parts: &[StatementInfo] = analysis.as_ref().map_or(&[], QueryAnalysis::parts);
+        // A second whole text of the statement (the digest next to an
+        // uncut `SQL_TEXT`): its statements are analyzed with the first
+        // one's, so the event takes the objects and signals of both
+        // (security review of 09e93da, R1).
+        let alt_analysis: Option<QueryAnalysis> = a
+            .alt_text
+            .map(|t| analyze_raw(t, analyze_opts(false).transcoded(transcoded)));
+        let joined: Vec<StatementInfo>;
+        let parts: &[StatementInfo] = match &alt_analysis {
+            None => analysis.as_ref().map_or(&[], QueryAnalysis::parts),
+            Some(alt) => {
+                joined = analysis
+                    .as_ref()
+                    .map_or(&[][..], QueryAnalysis::parts)
+                    .iter()
+                    .chain(alt.parts())
+                    .cloned()
+                    .collect();
+                &joined
+            }
+        };
         let parsed = !parts.is_empty();
         // A text that only kept its kind (opaque, ambiguous under the
         // possible `sql_mode` / version-comment readings, or not lexable):
-        // what it touched cannot be told (fail closed).
-        let unparsed =
-            opaque || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed);
+        // what it touched cannot be told (fail closed). A second text that
+        // does not lex makes the statement unparsed too.
+        let unparsed = opaque
+            || a.text.is_some() && !analysis.as_ref().is_some_and(QueryAnalysis::lexed)
+            || alt_analysis.as_ref().is_some_and(|x| !x.lexed());
         // A text cut by the source (`server_audit_query_log_limit`,
         // `performance_schema_max_sql_text_length`, a full digest) with no
         // table record: what followed the cut cannot be told (whitespace,
@@ -934,8 +961,9 @@ impl EventBuilder {
                 .fold(StatementKind::Other, |k, p| most_reportable(k, p.kind))
         } else {
             analysis
-                .as_ref()
-                .map_or(StatementKind::Other, QueryAnalysis::kind)
+                .iter()
+                .chain(&alt_analysis)
+                .fold(StatementKind::Other, |k, x| most_reportable(k, x.kind()))
         };
         // Code that runs out of sight: a procedure, a prepared statement,
         // a stored function (schema-qualified calls only: `f()` cannot be
@@ -964,7 +992,10 @@ impl EventBuilder {
         // A raw scan of an unreadable text that finds an audit log
         // administration function makes it blind whatever its records
         // (fail closed).
-        let audit_function = analysis.as_ref().is_some_and(QueryAnalysis::audit_function);
+        let audit_function = analysis
+            .iter()
+            .chain(&alt_analysis)
+            .any(QueryAnalysis::audit_function);
         let blind = unparsed
             && (a.tables.is_empty()
                 || a.tables.iter().any(|t| t.2 != TableOp::Read)
@@ -1418,6 +1449,7 @@ impl EventBuilder {
             database: query.map_or(first.database.as_str(), |q| q.database.as_str()),
             text: text_record.and_then(|r| r.text.as_deref().map(Vec::as_slice)),
             opaque: text_record.is_some_and(|r| r.opaque),
+            alt_text: None,
             truncated: text_record.is_some_and(|r| r.truncated),
             tables,
             rows: None,
@@ -1564,6 +1596,7 @@ mod tests {
             database: "",
             text: Some(text),
             opaque: false,
+            alt_text: None,
             truncated,
             tables,
             rows: None,
@@ -1857,8 +1890,8 @@ mod tests {
         texts.push((digest.into_bytes(), true));
         let full = "SELECT * FROM `information_schema` . `TABLES` WHERE ? = ? AND `TABLE_NAME` ...";
         texts.push((full.as_bytes().to_vec(), true));
-        for (text, is_digest) in &texts {
-            assert!(super::super::pfs::text_cut(text, *is_digest, 1024));
+        for (text, _) in &texts {
+            assert!(super::super::pfs::text_cut(text, 1024));
             for user in ["databastion", "app"] {
                 let mut b = guard_builder(&set);
                 for _ in 0..3 {
@@ -1883,7 +1916,7 @@ mod tests {
         // Not cut: the agent's guard statements (at most 900 bytes) and
         // their digests.
         for g in &set {
-            assert!(!super::super::pfs::text_cut(g.as_bytes(), false, 1024));
+            assert!(!super::super::pfs::text_cut(g.as_bytes(), 1024));
         }
     }
 
@@ -1935,7 +1968,13 @@ mod tests {
             let grant = || {
                 let mut c = credits.lock().unwrap();
                 for t in &batches[1..] {
-                    c.grant(t, "shop", "customers", Instant::now());
+                    c.grant(
+                        t,
+                        "shop",
+                        "customers",
+                        Duration::from_secs(30),
+                        Instant::now(),
+                    );
                 }
             };
             // One scan: no event.
@@ -1978,10 +2017,13 @@ mod tests {
         let credits = super::super::credits::SharedCredits::default();
         let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
         for t in &batches[1..] {
-            credits
-                .lock()
-                .unwrap()
-                .grant(t, "shop", "customers", Instant::now());
+            credits.lock().unwrap().grant(
+                t,
+                "shop",
+                "customers",
+                Duration::from_secs(30),
+                Instant::now(),
+            );
         }
         for t in &batches {
             let mut a = pfs_access(t.as_bytes(), false, Vec::new());
@@ -1992,6 +2034,60 @@ mod tests {
         let mut a = pfs_access(batches[1].as_bytes(), false, Vec::new());
         a.rows = Some(1000);
         assert!(b.statement(a, SystemTime::now()).is_some());
+    }
+
+    /// Security review of 09e93da, R1 (defence in depth): with a whole
+    /// `SQL_TEXT` and a whole digest, the event takes the objects and
+    /// signals of both, so that preferring one text never drops a table
+    /// the other names; the agent's exact-text matches still use
+    /// `SQL_TEXT` only.
+    #[test]
+    fn both_whole_texts_are_analyzed() {
+        let sql = b"SELECT TABLE_NAME FROM information_schema.TABLES WHERE 1 = 1";
+        let digest = b"SELECT `TABLE_NAME` FROM `information_schema` . `TABLES` WHERE ? = ? \
+                       UNION ALL SELECT * FROM `hr` . `customers` INTO OUTFILE ?";
+        let mut b = EventBuilder::new(own());
+        let mut a = pfs_access(sql, false, Vec::new());
+        a.user = "app";
+        a.principal = EventPrincipal::account("app");
+        a.application = None;
+        a.alt_text = Some(digest);
+        let e = b.statement(a, SystemTime::now()).unwrap();
+        assert_eq!(
+            show(&e),
+            "read [\"hr.customers\"] None [\"signature.into_outfile\"]"
+        );
+        // Without the second text: no event (system tables only).
+        let mut a = pfs_access(sql, false, Vec::new());
+        a.user = "app";
+        a.principal = EventPrincipal::account("app");
+        a.application = None;
+        assert!(b.statement(a, SystemTime::now()).is_none());
+        // The exact guard text with its digest: still the agent's own.
+        let set = guard_sets().remove(0);
+        let b = guard_builder(&set);
+        let mut a = pfs_access(set[0].as_bytes(), false, Vec::new());
+        a.alt_text = Some(b"SELECT `TABLE_SCHEMA` FROM `information_schema` . `COLUMNS`");
+        assert!(b.own_guard(&a));
+        // A sampling batch with its digest: its credit still applies.
+        let batches = wide_batches();
+        let credits = super::super::credits::SharedCredits::default();
+        let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+        credits.lock().unwrap().grant(
+            &batches[1],
+            "shop",
+            "customers",
+            Duration::from_secs(30),
+            Instant::now(),
+        );
+        for t in &batches[..2] {
+            let mut a = pfs_access(t.as_bytes(), false, Vec::new());
+            a.rows = Some(1000);
+            a.alt_text =
+                Some(b"SELECT LEFT ( `customer_field_00` , ? ) FROM `shop` . `customers` LIMIT ?");
+            assert!(b.statement(a, SystemTime::now()).is_none());
+        }
+        assert_eq!(credits.lock().unwrap().len(), 0);
     }
 
     #[test]
@@ -2214,6 +2310,7 @@ mod tests {
                 database: "support",
                 text: Some(b"select a from `escalations_jean.richard@example.com` where x = 1"),
                 opaque: false,
+                alt_text: None,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(20_000),
@@ -2316,6 +2413,7 @@ mod tests {
                 database: "hr",
                 text: Some(b"select email from employees where id > 0"),
                 opaque: false,
+                alt_text: None,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(99),
@@ -2363,6 +2461,7 @@ mod tests {
             database: "hr",
             text: Some(text.as_bytes()),
             opaque: false,
+            alt_text: None,
             truncated: false,
             tables: Vec::new(),
             rows: Some(3),

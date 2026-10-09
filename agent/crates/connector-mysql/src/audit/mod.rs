@@ -347,6 +347,13 @@ pub(crate) async fn audit_stream(
 ) -> Result<(), ConnectorError> {
     let target = cfg.target().ok_or_else(internal)?;
     let _running = state.stream_started(&target.id);
+    // Discovery grants sampling credits only while this stream runs, for
+    // about two polls (`audit::credits`).
+    state
+        .sample_credits(&target.id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_poll_interval(cfg.poll_interval());
     let timeouts = Timeouts::new(cfg.statement_timeout().min(Duration::from_secs(30)));
     let mut file: Option<FileStream> = None;
     let mut ps: Option<PsStream> = None;

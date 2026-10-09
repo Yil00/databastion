@@ -22,6 +22,10 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 
 use crate::audit::credits::SharedCredits;
+
+/// Where Discovery grants its sampling credits, with the scan's statement
+/// timeout (`None`: no Audit stream runs for the target).
+type Credits<'a> = Option<(&'a SharedCredits, std::time::Duration)>;
 use crate::catalog::{self, Coverage, EngineSkip, Table};
 use crate::check::CheckState;
 use crate::conn::{Flow, ReadTx, Session, Streamed, Timeouts};
@@ -86,7 +90,14 @@ pub(crate) async fn discover(
     let Some(target) = job.target() else {
         return Err(MyError::new(FailureCode::Internal, Stage::Connect).into_connector_error());
     };
-    let credits = state.sample_credits(&target.id);
+    let shared_credits = state.sample_credits(&target.id);
+    // Credits only while the target's Audit stream runs (security review
+    // of 09e93da, L1), checked per table.
+    let credits_now = || {
+        state
+            .stream_running(&target.id)
+            .then_some((&shared_credits, job.statement_timeout()))
+    };
     let timeouts = Timeouts::new(job.statement_timeout());
     if job.out_of_time() {
         job.skip_out_of_time(sink, 1);
@@ -165,7 +176,7 @@ pub(crate) async fn discover(
                 unit,
                 job.sample_rows(),
                 job.cas_stores(),
-                &credits,
+                credits_now(),
             ))
             .await?
         {
@@ -248,7 +259,7 @@ pub(crate) async fn discover(
                     &mut s,
                     &mut sample,
                     job.sample_rows(),
-                    &credits,
+                    credits_now(),
                 ))
                 .await?
             {
@@ -609,7 +620,7 @@ pub(crate) async fn sample_table(
     table: &Table,
     limit: u32,
     stores: Option<&CasStores>,
-    credits: &SharedCredits,
+    credits: Credits<'_>,
 ) -> Result<TableSample, MyError> {
     let mut tx = session.begin().await?;
     match read_table(&mut tx, table, limit, stores, credits).await {
@@ -631,7 +642,7 @@ pub(crate) async fn resume_table(
     session: &mut Session,
     sample: &mut TableSample,
     limit: u32,
-    credits: &SharedCredits,
+    credits: Credits<'_>,
 ) -> Result<(), MyError> {
     let mut tx = session.begin().await?;
     match run_batches(&mut tx, sample, limit, credits).await {
@@ -656,7 +667,7 @@ async fn run_batches(
     tx: &mut ReadTx<'_>,
     sample: &mut TableSample,
     limit: u32,
-    credits: &SharedCredits,
+    credits: Credits<'_>,
 ) -> Result<(), MyError> {
     while sample.batches.next < sample.batches.statements.len() {
         let i = sample.batches.next;
@@ -668,7 +679,9 @@ async fn run_batches(
         let cap = sample.batches.share(i);
         let left = sample.batches.left();
         let (range, statement) = sample.batches.statements[i].clone();
-        if i > 0 {
+        if i > 0
+            && let Some((credits, timeout)) = credits
+        {
             credits
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -676,6 +689,7 @@ async fn run_batches(
                     &statement,
                     &sample.schema,
                     &sample.table,
+                    timeout,
                     std::time::Instant::now(),
                 );
         }
@@ -712,7 +726,7 @@ async fn read_table(
     table: &Table,
     limit: u32,
     stores: Option<&CasStores>,
-    credits: &SharedCredits,
+    credits: Credits<'_>,
 ) -> Result<TableSample, MyError> {
     let mut sample = TableSample {
         columns: Vec::new(),

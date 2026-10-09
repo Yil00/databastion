@@ -606,7 +606,7 @@ impl CheckState {
         }
     }
 
-    fn stream_running(&self, target_id: &str) -> bool {
+    pub(crate) fn stream_running(&self, target_id: &str) -> bool {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

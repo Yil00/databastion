@@ -775,8 +775,9 @@ pub(crate) fn ps_stats(table: &str, own_thread: u64) -> String {
 /// that reads statement text, ADR-0018): `DIGEST_TEXT`, and `SQL_TEXT` only
 /// for a statement without a digest, with a digest of `sql_text_from` bytes
 /// or more (it may have been cut at its token storage: `pfs::digest_cut`),
-/// or of the agent's own account (its Discovery statements are recognized
-/// by their exact text); with the session's account, host,
+/// or of the agent's own sessions (the poll session's login user and
+/// client host, from `USER()`: its Discovery statements are recognized by
+/// their exact text); with the session's account, host,
 /// type and `program_name` while it is connected. Rows are ordered by end
 /// timer from `from`, this session's own thread excluded, at most `limit`.
 /// `table` is one of the three statement tables (`PsTable`).
@@ -798,7 +799,8 @@ pub(crate) fn ps_statements(
     format!(
         "SELECT h.THREAD_ID, h.EVENT_ID, h.TIMER_END, h.CURRENT_SCHEMA, h.DIGEST_TEXT, \
          CASE WHEN h.DIGEST_TEXT IS NULL OR LENGTH(h.DIGEST_TEXT) >= {sql_text_from} \
-           OR t.PROCESSLIST_USER = SUBSTRING_INDEX(CURRENT_USER(), '@', 1) \
+           OR (t.PROCESSLIST_USER = SUBSTRING_INDEX(USER(), '@', 1) \
+               AND t.PROCESSLIST_HOST = SUBSTRING_INDEX(USER(), '@', -1)) \
          THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
          h.MYSQL_ERRNO, t.PROCESSLIST_USER, t.PROCESSLIST_HOST, t.TYPE, {program} \
          FROM performance_schema.{table} h \
@@ -1251,7 +1253,8 @@ mod tests {
             assert!(
                 lower.contains(
                     "case when h.digest_text is null or length(h.digest_text) >= 254 \
-                     or t.processlist_user = substring_index(current_user(), '@', 1) \
+                     or (t.processlist_user = substring_index(user(), '@', 1) \
+                     and t.processlist_host = substring_index(user(), '@', -1)) \
                      then h.sql_text end"
                 ),
                 "{s}"
