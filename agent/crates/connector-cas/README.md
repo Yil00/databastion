@@ -132,7 +132,8 @@ refused as a whole, and those files are never opened.
   is borrowed from the zeroizing copy of the file; any other (line folding,
   escapes, block scalars) is built once in a zeroizing buffer allocated at
   its final size, which never grows, and wiped when the visitor returns.
-  Deserializer errors carry no text. A test parses a definition whose
+  Deserializer errors carry no text. Keys (field names) are copied into
+  ordinary strings by the visitor. A test parses a definition whose
   credential values hold a run-time marker in every form that reaches the
   parser, then searches the process's writable memory for it (none left;
   the former `serde_yaml_ng` path left dozens of copies).

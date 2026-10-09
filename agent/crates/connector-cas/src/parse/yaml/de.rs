@@ -839,50 +839,85 @@ mod tests {
         assert!(parse_yaml_definition(doc.as_bytes()).is_err());
     }
 
-    /// Occurrences of `needle` in the process's writable memory, outside
-    /// the `skip` address range (Linux: `/proc/self/maps` and
-    /// `/proc/self/mem`, read with safe file I/O).
+    /// A search of the process's writable memory (Linux: `/proc/self/maps`
+    /// and `/proc/self/mem`, read with safe file I/O). Its buffers are
+    /// allocated up front, before what it checks, so that searching
+    /// allocates nothing that could reuse (and overwrite) a freed block
+    /// before it is read (security review of #187, L1).
     #[cfg(target_os = "linux")]
-    fn occurrences(needle: &[u8], skip: &std::ops::Range<usize>) -> usize {
-        use std::io::{Read, Seek, SeekFrom};
+    struct MemScan {
+        maps: String,
+        /// Zeroizing (its earlier contents never linger), its own range
+        /// skipped.
+        buf: Zeroizing<Vec<u8>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl MemScan {
         const CHUNK: usize = 1 << 20;
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let mut mem = std::fs::File::open("/proc/self/mem").unwrap();
-        // The read buffer is zeroizing (its earlier contents never linger)
-        // and its own range is skipped.
-        let mut buf = Zeroizing::new(vec![0u8; CHUNK + needle.len()]);
-        let own = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
-        let mut found = 0;
-        for line in maps.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            if !perms.starts_with("rw") {
-                continue;
-            }
-            let Some((lo, hi)) = range.split_once('-') else {
-                continue;
-            };
-            let lo = usize::from_str_radix(lo, 16).unwrap();
-            let hi = usize::from_str_radix(hi, 16).unwrap();
-            let mut at = lo;
-            while at < hi {
-                let len = (hi - at).min(CHUNK + needle.len());
-                let ok = mem.seek(SeekFrom::Start(at as u64)).is_ok()
-                    && mem.read_exact(&mut buf[..len]).is_ok();
-                if ok {
-                    for (i, w) in buf[..len].windows(needle.len()).enumerate() {
-                        let addr = at + i;
-                        if w == needle && !own.contains(&addr) && !skip.contains(&addr) {
-                            found += 1;
-                        }
-                    }
-                }
-                at += CHUNK;
+
+        fn new() -> Self {
+            Self {
+                maps: String::with_capacity(1 << 20),
+                buf: Zeroizing::new(vec![0u8; Self::CHUNK + 64]),
             }
         }
-        found
+
+        /// Occurrences of `needle` (at most 64 bytes) outside the `skip`
+        /// address ranges.
+        fn occurrences(&mut self, needle: &[u8], skip: &[std::ops::Range<usize>]) -> usize {
+            use std::io::{Read, Seek, SeekFrom};
+            let cap = self.maps.capacity();
+            self.maps.clear();
+            std::fs::File::open("/proc/self/maps")
+                .unwrap()
+                .read_to_string(&mut self.maps)
+                .unwrap();
+            assert_eq!(self.maps.capacity(), cap, "the maps buffer grew");
+            let mut mem = std::fs::File::open("/proc/self/mem").unwrap();
+            let buf = &mut self.buf;
+            let own = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+            let mut found = 0;
+            for line in self.maps.lines() {
+                let mut fields = line.split_whitespace();
+                let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                if !perms.starts_with("rw") {
+                    continue;
+                }
+                let Some((lo, hi)) = range.split_once('-') else {
+                    continue;
+                };
+                let lo = usize::from_str_radix(lo, 16).unwrap();
+                let hi = usize::from_str_radix(hi, 16).unwrap();
+                let mut at = lo;
+                while at < hi {
+                    let len = (hi - at).min(Self::CHUNK + needle.len());
+                    let ok = mem.seek(SeekFrom::Start(at as u64)).is_ok()
+                        && mem.read_exact(&mut buf[..len]).is_ok();
+                    if ok {
+                        for (i, w) in buf[..len].windows(needle.len()).enumerate() {
+                            let addr = at + i;
+                            if w == needle
+                                && !own.contains(&addr)
+                                && !skip.iter().any(|r| r.contains(&addr))
+                            {
+                                found += 1;
+                            }
+                        }
+                    }
+                    at += Self::CHUNK;
+                }
+            }
+            found
+        }
+    }
+
+    /// The address range of a buffer (skipped by the search).
+    #[cfg(target_os = "linux")]
+    fn range_of(b: &[u8]) -> std::ops::Range<usize> {
+        b.as_ptr() as usize..b.as_ptr() as usize + b.len()
     }
 
     /// ADR-0046 decision 3: no copy of a credential value outlives the
@@ -891,11 +926,13 @@ mod tests {
     /// workspace; instead, after parsing a definition whose credential
     /// values hold a marker (made at run time, in every form that reaches
     /// the parser: next-line, multi-line, block, flow and tagged values,
-    /// and a top-level `clientSecret` the visitor decodes) and dropping
-    /// everything, the process's writable memory (heap, stacks, data) is
-    /// searched for the marker: a copy freed without being wiped would be
-    /// found there. A control (an unwiped `String` copy, dropped) shows the
-    /// search finds such a copy.
+    /// and a top-level `clientSecret` over 1 KiB with escapes, which the
+    /// visitor decodes into a large buffer) and dropping everything, the
+    /// process's writable memory (heap, stacks, data) is searched for the
+    /// marker: a copy freed without being wiped would be found there. The
+    /// controls (an unwiped `String` copy of each size, small, medium and
+    /// over the allocator's small-block limit, dropped) show the search
+    /// finds such a copy, each size on its own.
     #[cfg(target_os = "linux")]
     #[test]
     fn no_unwiped_copy_of_a_credential_value_survives_parsing() {
@@ -914,12 +951,12 @@ mod tests {
             x ^= x << 17;
             marker.push(b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[(x % 32) as usize]);
         }
-        let needle = &marker[16..];
-        let mut doc = Zeroizing::new(Vec::with_capacity(4096));
+        let mut scan = MemScan::new();
+        let mut doc = Zeroizing::new(Vec::with_capacity(8192));
         let cap = doc.capacity();
         for (part, secret) in [
             (&b"--- !<org.apereo.cas.support.oauth.services.OAuthRegisteredService>\nserviceId: x\nname: App\nclientSecret: \"F"[..], true),
-            (b"\\x41\"\napiPassword:\n  ", true),
+            (b"\"\napiPassword:\n  ", true),
             (b"\nprivateKey: |\n  ", true),
             (b"\n  second line\ntokens:\n- ", true),
             (b"\n- {a: ", true),
@@ -933,24 +970,39 @@ mod tests {
             if secret {
                 doc.extend_from_slice(&marker);
             }
+            if doc.len() < 200 {
+                // The top-level `clientSecret`: over 1 KiB, with escapes.
+                for _ in 0..300 {
+                    doc.extend_from_slice(b"\\x41");
+                }
+            }
         }
         assert_eq!(doc.capacity(), cap);
-        let skip = marker.as_ptr() as usize..marker.as_ptr() as usize + marker.len();
         let d = parse_yaml_definition(&doc).unwrap();
         assert_eq!(d.client_secret, crate::parse::definition::SecretForm::Clear);
         assert_eq!(d.values.len(), 3, "{d:?}");
         drop(d);
         drop(doc);
-        assert_eq!(occurrences(needle, &skip), 0);
-        // The control: unwiped copies, dropped, are found.
-        for pad in [64, 300, 2000] {
-            let mut leak = String::with_capacity(2 * pad + marker.len());
+        let skip = range_of(&marker);
+        assert_eq!(
+            scan.occurrences(&marker[16..], std::slice::from_ref(&skip)),
+            0
+        );
+        // The controls: an unwiped copy of each size, dropped, is found,
+        // each with its own marker.
+        for (pad, tag) in [(64, b'a'), (300, b'b'), (2000, b'c')] {
+            let mut variant = Zeroizing::new(marker.to_vec());
+            if let Some(last) = variant.last_mut() {
+                *last = tag;
+            }
+            let mut leak = String::with_capacity(2 * pad + variant.len());
             leak.push_str(&"-".repeat(pad));
-            leak.push_str(std::str::from_utf8(&marker).unwrap());
+            leak.push_str(std::str::from_utf8(&variant).unwrap());
             leak.push_str(&"-".repeat(pad));
             drop(leak);
+            let found = scan.occurrences(&variant[16..], &[skip.clone(), range_of(&variant)]);
+            assert!(found > 0, "control of {pad} bytes not found");
         }
-        assert!(occurrences(needle, &skip) > 0);
     }
 
     #[test]

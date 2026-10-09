@@ -419,6 +419,9 @@ pub(super) struct Scanner<'a> {
     /// the bottom one for the block context.
     candidates: Vec<Option<Candidate>>,
     last: Last,
+    /// The line of the last `:`, `-`, `[` / `{` or `,` (a tag must be on
+    /// it).
+    last_line: usize,
     /// Byte spans of the tags to blank.
     tags: Vec<(usize, usize)>,
     /// Tokens seen (see [`MAX_TOKENS`]).
@@ -538,6 +541,7 @@ impl<'a> Scanner<'a> {
             simple_key_allowed: mode == Mode::Parse,
             candidates: vec![None],
             last: Last::Start,
+            last_line: 0,
             tags: Vec::new(),
             tokens: 0,
             last_scalar: None,
@@ -857,6 +861,7 @@ impl<'a> Scanner<'a> {
                 }
                 self.simple_key_allowed = true;
                 self.last = Last::FlowOpen;
+                self.last_line = self.line;
                 self.advance();
                 self.emit(tok);
             }
@@ -886,6 +891,7 @@ impl<'a> Scanner<'a> {
                 self.remove_candidate()?;
                 self.simple_key_allowed = true;
                 self.last = Last::FlowEntry;
+                self.last_line = self.line;
                 self.advance();
                 self.emit(Tok::FlowEntry);
             }
@@ -897,6 +903,7 @@ impl<'a> Scanner<'a> {
                 self.remove_candidate()?;
                 self.simple_key_allowed = true;
                 self.last = Last::BlockEntry;
+                self.last_line = self.line;
                 self.advance();
                 self.emit(Tok::BlockEntry);
             }
@@ -984,6 +991,7 @@ impl<'a> Scanner<'a> {
             None => return Err(Refusal::ComplexKey.into()),
         }
         self.last = Last::Value;
+        self.last_line = self.line;
         self.advance();
         self.emit(Tok::Value);
         Ok(())
@@ -998,6 +1006,12 @@ impl<'a> Scanner<'a> {
             Last::FlowOpen | Last::FlowEntry => in_seq,
             _ => false,
         };
+        // On the line of the indicator it follows, as Jackson writes it
+        // (security review of #187, M1): a tag alone on a later line would
+        // move the block indentation on the raw bytes but not on the
+        // blanked copy the parse pass reads (where it is spaces), so the
+        // two passes would disagree.
+        let placed = placed && self.last_line == self.line;
         if !placed || self.parse_mode() {
             return Err(Refusal::Tag.into());
         }
@@ -1550,6 +1564,33 @@ mod tests {
             "a: !<java.util.ArrayList>\n- !<org.apereo.cas.services.DefaultRegisteredServiceContact>\n  name: \"J\"\n",
         );
         ok("a: [!<java.lang.String> x, !<java.lang.String> y]\n");
+        // Not on the line of its indicator (security review of #187, M1).
+        for body in [
+            "a:\n  !<java.util.HashMap>\n  b: 1\n",
+            "a:\n  b:\n!<java.util.HashMap>\n  c: 1\n",
+            "-\n  !<java.util.HashMap>\n  b: 1\n",
+            "a: [\n  !<java.lang.String> x]\n",
+            "a: [x,\n !<java.lang.String> y]\n",
+        ] {
+            assert_eq!(refused(body), Refusal::Tag, "{body:?}");
+        }
+        // The review's repro: a clear top-level `clientSecret` whose form
+        // a later nested one could replace.
+        let doc = "--- !<org.apereo.cas.support.oauth.services.OAuthRegisteredService>\n  serviceId: x\n  clientSecret: fake-clear-1\n  a:\n    b:\n!<java.util.HashMap>\n    clientSecret: ${REF}\n";
+        assert_eq!(prescan(doc.as_bytes()).unwrap_err(), Refusal::Tag);
+        // A tag line in the middle of a deep block nesting (it reset the
+        // pre-scan's indentation stack, not the parse pass's).
+        let mut deep = String::from(HEAD);
+        for i in 0..40 {
+            if i == 20 {
+                deep.push_str("!<java.util.HashMap>\n");
+            }
+            deep.push_str(&" ".repeat(i));
+            deep.push_str("k:\n");
+        }
+        deep.push_str(&" ".repeat(40));
+        deep.push_str("v: 1\n");
+        assert_eq!(prescan(deep.as_bytes()).unwrap_err(), Refusal::Tag);
     }
 
     #[test]
