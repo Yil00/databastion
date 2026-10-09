@@ -63,8 +63,38 @@
 //!   ([`Refusal::Syntax`]).
 //!
 //! The scanner never panics (`get`, no indexing) and runs in linear time.
+//!
+//! **Credential values are blanked before parsing** (review of #169, L2):
+//! `serde_yaml_ng` copies every scalar into plain `String`s (libyaml's
+//! buffers, then the event's value), which are freed without being wiped.
+//! The copy handed to the parser therefore also has, replaced by spaces
+//! (byte positions unchanged), the content of every single-line scalar
+//! (plain, single-quoted or double-quoted) that starts on the line of a
+//! key's `:` right after it, when the key names a credential
+//! ([`super::definition::is_credential_key`], the visitor's rule): a
+//! blanked plain scalar reads as `null`, a blanked quoted one as spaces,
+//! and the visitor skips the value of such a key either way. The
+//! [`SecretForm`] of the top-level `clientSecret` (a key of the root
+//! block mapping, at its first indentation level whatever its column, or
+//! of a root flow mapping) is computed here first, from the value before
+//! blanking, and given back in [`Prescanned::client_secret`]; any other
+//! key spelled `clientSecret` is never blanked, so that the visitor reads
+//! it as before. A double-quoted value is blanked only when every escape
+//! in it is one libyaml accepts ([`escapes_valid`]); a value with a refused
+//! escape is left for the parser to refuse (blanking must not turn an
+//! invalid document into a valid one), and the top-level `clientSecret`
+//! with any escape is left to the visitor. Out of scope (left to a future
+//! parser change, ROADMAP phase 8 follow-ups): values on the next line,
+//! multi-line and block scalars, values after a tag, nested credential
+//! subtrees (`password:` followed by a mapping or a sequence), keys
+//! written with a double-quoted escape, and double-quoted values with a
+//! refused escape. This fails safe: whatever the
+//! scanner does not blank is still skipped by the visitor, as before
+//! (only the unwiped copies remain).
 
 use zeroize::Zeroizing;
+
+use super::definition::{SecretForm, is_credential_key};
 
 /// Most lines per file.
 pub const MAX_LINES: usize = 32_768;
@@ -118,8 +148,12 @@ pub enum Refusal {
 pub struct Prescanned {
     /// The root node's class (the CAS class hint).
     pub class: String,
-    /// The file with every tag replaced by spaces (positions unchanged).
+    /// The file with every tag and every blanked credential value
+    /// replaced by spaces (positions unchanged).
     pub text: Zeroizing<Vec<u8>>,
+    /// The form of the top-level `clientSecret` value, when the scanner
+    /// blanked it (`None`: not present, or left to the visitor).
+    pub client_secret: Option<SecretForm>,
 }
 
 impl std::fmt::Debug for Prescanned {
@@ -142,12 +176,16 @@ pub fn prescan(bytes: &[u8]) -> Result<Prescanned, Refusal> {
     let class = s.header()?;
     s.run()?;
     let mut text = Zeroizing::new(bytes.to_vec());
-    for &(start, end) in &s.tags {
+    for &(start, end) in s.tags.iter().chain(&s.blanks) {
         if let Some(span) = text.get_mut(start..end) {
             span.fill(b' ');
         }
     }
-    Ok(Prescanned { class, text })
+    Ok(Prescanned {
+        class,
+        text,
+        client_secret: s.client_secret,
+    })
 }
 
 /// UTF-8, no control character but tab and line feed (CR only before LF),
@@ -216,7 +254,35 @@ enum CandKind {
 struct Candidate {
     line: usize,
     col: usize,
+    /// Byte position of its first byte.
+    pos: usize,
     kind: CandKind,
+}
+
+/// The extent of the last scalar read (to name keys and blank values).
+#[derive(Clone, Copy)]
+struct ScalarSpan {
+    /// Its first byte (the opening quote of a quoted scalar).
+    start: usize,
+    /// After its last byte (the closing quote; for a plain scalar, its
+    /// last non-blank byte).
+    end: usize,
+    /// The line it starts on.
+    line: usize,
+    /// `'`, `"`, or `None` for a plain scalar.
+    quote: Option<u8>,
+    single_line: bool,
+}
+
+/// A credential key whose `:` was just read.
+#[derive(Clone, Copy)]
+struct CredentialKey {
+    /// The line of its `:`.
+    line: usize,
+    /// It is spelled `clientSecret`.
+    client_secret: bool,
+    /// It is a key of the root mapping.
+    top: bool,
 }
 
 struct Scanner<'a> {
@@ -237,6 +303,58 @@ struct Scanner<'a> {
     tags: Vec<(usize, usize)>,
     /// Tokens seen (see [`MAX_TOKENS`]).
     tokens: usize,
+    /// The last scalar read.
+    last_scalar: Option<ScalarSpan>,
+    /// Set by a credential key's `:`, taken by the next token.
+    credential_key: Option<CredentialKey>,
+    /// Byte spans of the credential values to blank.
+    blanks: Vec<(usize, usize)>,
+    /// The form of the blanked top-level `clientSecret`.
+    client_secret: Option<SecretForm>,
+}
+
+/// Whether every escape of a single-line double-quoted scalar's content
+/// is one libyaml accepts (`scan_flow_scalar`, as vendored by
+/// `unsafe-libyaml` 0.2.11): a one-character escape of its list, or `x`,
+/// `u`, `U` with 2, 4 or 8 hexadecimal digits naming a Unicode scalar
+/// value (no surrogate, at most `U+10FFFF`; libyaml has no surrogate
+/// pairs). An escaped line break never reaches here (single-line only)
+/// and is refused.
+fn escapes_valid(raw: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&c) = raw.get(i) {
+        i += 1;
+        if c != b'\\' {
+            continue;
+        }
+        let Some(&e) = raw.get(i) else {
+            return false;
+        };
+        i += 1;
+        let digits = match e {
+            b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f' | b'r' | b'e' | b' ' | b'"'
+            | b'/' | b'\\' | b'N' | b'_' | b'L' | b'P' => continue,
+            b'x' => 2,
+            b'u' => 4,
+            b'U' => 8,
+            _ => return false,
+        };
+        let Some(hex) = raw.get(i..i + digits) else {
+            return false;
+        };
+        i += digits;
+        let mut value = 0u32;
+        for &h in hex {
+            let Some(d) = char::from(h).to_digit(16) else {
+                return false;
+            };
+            value = (value << 4) | d;
+        }
+        if (0xD800..=0xDFFF).contains(&value) || value > 0x10_FFFF {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_break(c: Option<u8>) -> bool {
@@ -277,6 +395,10 @@ impl<'a> Scanner<'a> {
             last: Last::Start,
             tags: Vec::new(),
             tokens: 0,
+            last_scalar: None,
+            credential_key: None,
+            blanks: Vec::new(),
+            client_secret: None,
         }
     }
 
@@ -353,6 +475,7 @@ impl<'a> Scanner<'a> {
             let k = Candidate {
                 line: self.line,
                 col: self.col,
+                pos: self.pos,
                 kind,
             };
             if let Some(slot) = self.candidates.last_mut() {
@@ -475,6 +598,9 @@ impl<'a> Scanner<'a> {
             {
                 return Err(Refusal::Documents);
             }
+            // Only the token right after a credential key's `:` may be
+            // its value.
+            let credential_key = self.credential_key.take();
             // Closers, separators and tags (blanked) make no event.
             if !matches!(c, b']' | b'}' | b',' | b'!') {
                 self.token()?;
@@ -540,9 +666,15 @@ impl<'a> Scanner<'a> {
                     }
                     self.block_scalar()?;
                 }
-                b'\'' | b'"' => self.quoted(c)?,
+                b'\'' | b'"' => {
+                    self.quoted(c)?;
+                    self.blank_value(credential_key);
+                }
                 b'%' | b'@' | b'`' | b'\t' => return Err(Refusal::Syntax),
-                _ => self.plain()?,
+                _ => {
+                    self.plain()?;
+                    self.blank_value(credential_key);
+                }
             }
         }
         if !self.flow.is_empty() {
@@ -555,6 +687,7 @@ impl<'a> Scanner<'a> {
     fn value(&mut self) -> Result<(), Refusal> {
         match self.take_candidate() {
             Some(k) if k.kind == CandKind::Scalar => {
+                self.credential_key = self.credential_key_of(k);
                 self.roll(k.col)?;
                 // libyaml: no simple key right after a key's `:`.
                 self.simple_key_allowed = false;
@@ -591,6 +724,7 @@ impl<'a> Scanner<'a> {
     fn quoted(&mut self, q: u8) -> Result<(), Refusal> {
         self.save_candidate(CandKind::Scalar);
         let line = self.line;
+        let start = self.pos;
         self.advance();
         if self.starts_with(b"<<") {
             return Err(Refusal::MergeKey);
@@ -627,6 +761,13 @@ impl<'a> Scanner<'a> {
         if self.line != line {
             let _ = self.take_candidate();
         }
+        self.last_scalar = Some(ScalarSpan {
+            start,
+            end: self.pos,
+            line,
+            quote: Some(q),
+            single_line: self.line == line,
+        });
         self.simple_key_allowed = false;
         self.last = Last::Scalar;
         Ok(())
@@ -640,6 +781,8 @@ impl<'a> Scanner<'a> {
         }
         let indent = self.top() + 1;
         let mut crossed = false;
+        let (start, line) = (self.pos, self.line);
+        let (mut end, mut end_line) = (self.pos, self.line);
         loop {
             if self.col == 0
                 && (self.starts_with(b"---") || self.starts_with(b"..."))
@@ -666,6 +809,7 @@ impl<'a> Scanner<'a> {
                     break;
                 }
                 self.advance();
+                (end, end_line) = (self.pos, self.line);
             }
             if !(is_blank(self.peek()) || is_break(self.peek())) {
                 break;
@@ -685,6 +829,13 @@ impl<'a> Scanner<'a> {
                 break;
             }
         }
+        self.last_scalar = Some(ScalarSpan {
+            start,
+            end,
+            line,
+            quote: None,
+            single_line: end_line == line,
+        });
         if crossed {
             // libyaml allows a simple key after a plain scalar that ended
             // on a line break (the candidate itself went stale).
@@ -694,6 +845,120 @@ impl<'a> Scanner<'a> {
         }
         self.last = Last::Scalar;
         Ok(())
+    }
+
+    /// The text of a single-line scalar key, as the visitor will read it;
+    /// `None` when it cannot be known without decoding escapes (a
+    /// double-quoted key holding `\\`). A single-quoted key is read with
+    /// its `''` pairs, which changes no credential word match (no word
+    /// holds a quote) nor the comparison with `clientSecret`.
+    fn key_text(&self, s: ScalarSpan) -> Option<&'a str> {
+        let b = self.b;
+        let raw = match s.quote {
+            None => b.get(s.start..s.end)?,
+            Some(_) => b.get(s.start + 1..s.end.checked_sub(1)?)?,
+        };
+        if s.quote == Some(b'"') && raw.contains(&b'\\') {
+            return None;
+        }
+        std::str::from_utf8(raw).ok()
+    }
+
+    /// The credential key whose `:` is being read, if the candidate `k`
+    /// is one (see the module documentation).
+    fn credential_key_of(&self, k: Candidate) -> Option<CredentialKey> {
+        let span = self
+            .last_scalar
+            .filter(|s| s.start == k.pos && s.single_line)?;
+        let key = self.key_text(span)?;
+        if !is_credential_key(key) {
+            return None;
+        }
+        // A key of the root mapping (`indents` is read before this key's
+        // `roll`): in the block context, the first key of the document (no
+        // block indentation yet) or a key at the root mapping's own
+        // indentation, whatever its column (`--- !<class>` may be followed
+        // by an indented mapping); or directly in a root flow mapping.
+        let col = isize::try_from(k.col).ok()?;
+        let top = if self.flow.is_empty() {
+            match self.indents.as_slice() {
+                [_] => true,
+                [_, root] => *root == col,
+                _ => false,
+            }
+        } else {
+            self.flow == [Flow::Map] && self.indents.len() == 1
+        };
+        Some(CredentialKey {
+            line: self.line,
+            client_secret: key == "clientSecret",
+            top,
+        })
+    }
+
+    /// Blanks the scalar just read if it is the single-line value of a
+    /// credential key on the line of its `:`; for the top-level
+    /// `clientSecret`, records its [`SecretForm`] first (or leaves it to
+    /// the visitor when it cannot be computed here).
+    fn blank_value(&mut self, key: Option<CredentialKey>) {
+        let (Some(key), Some(s)) = (key, self.last_scalar) else {
+            return;
+        };
+        if !s.single_line || s.line != key.line {
+            return;
+        }
+        let (from, to) = match s.quote {
+            None => (s.start, s.end),
+            Some(_) => (s.start + 1, s.end.saturating_sub(1)),
+        };
+        if from >= to {
+            return;
+        }
+        // Blanking must not hide an escape the parser would refuse
+        // (`"\q"`, `"\uD800"`): such a value is left for it to refuse.
+        if s.quote == Some(b'"') && !self.b.get(from..to).is_some_and(escapes_valid) {
+            return;
+        }
+        if key.client_secret {
+            // Fail safe: only the top-level `clientSecret`, whose form is
+            // computed here, is blanked; any other is the visitor's.
+            if !key.top {
+                return;
+            }
+            let Some(form) = self.form_of(s, from, to) else {
+                return;
+            };
+            self.client_secret = Some(form);
+        }
+        self.blanks.push((from, to));
+    }
+
+    /// The [`SecretForm`] of a scalar value whose content is `from..to`,
+    /// as the visitor computes it from the parsed value; `None` for a
+    /// double-quoted value with an escape.
+    fn form_of(&self, s: ScalarSpan, from: usize, to: usize) -> Option<SecretForm> {
+        let raw = std::str::from_utf8(self.b.get(from..to)?).ok()?;
+        Some(match s.quote {
+            // YAML's null spellings; any other plain scalar (a string, a
+            // number, a boolean) is what `SecretForm::of` makes of its
+            // text (numbers and booleans are clear either way).
+            None if matches!(raw, "~" | "null" | "Null" | "NULL") => SecretForm::Absent,
+            None => SecretForm::of(raw),
+            Some(b'"') if raw.contains('\\') => return None,
+            Some(b'"') => SecretForm::of(raw),
+            // `''` is one quote; the copy is zeroizing and never grows.
+            Some(_) => {
+                let mut text = Zeroizing::new(String::with_capacity(raw.len()));
+                let mut rest = raw;
+                while let Some((head, tail)) = rest.split_once("''") {
+                    text.push_str(head);
+                    text.push('\'');
+                    rest = tail;
+                }
+                text.push_str(rest);
+                SecretForm::of(&text)
+            }
+        })
     }
 
     /// A block scalar (`|` or `>`), as libyaml's `scan_block_scalar`

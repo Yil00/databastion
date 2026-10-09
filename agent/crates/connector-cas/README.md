@@ -107,12 +107,37 @@ refused as a whole, and those files are never opened.
   `serde_yaml_ng` still bounds alias expansion and recursion on its own.
   Moving the core and this crate together to a maintained fork
   (`serde_norway`) or a safe parser is a separate decision.
-- **Zeroization gap (YAML)**: the file buffer, the blanked copy and every
-  kept value are zeroizing, as for JSON, but libyaml's internal buffers and
-  `serde_yaml_ng`'s event list hold copies of every scalar (the
-  `clientSecret` included) that are freed without being wiped. The JSON
-  path has the narrower gap of `serde_json`'s escape scratch buffer (ROADMAP
-  follow-up: move `definition.rs` to `jtext`).
+- **JSON without unwiped copies**: on the JSON path every key and value
+  the visitor reads is a raw value borrowed from the zeroizing file buffer,
+  and strings (the `clientSecret` whose form is taken, the classified
+  values) are unescaped by `databastion_core::jtext` into zeroizing
+  buffers sized once: `serde_json` never unescapes one into its scratch
+  buffer, which is not wiped. Containers are walked by parsing their raw
+  text again (at most 32 passes over a 1 MiB file). A definition whose
+  bytes are not all UTF-8 is refused as malformed (before, bytes that are
+  not UTF-8 in a skipped value were accepted); a lone surrogate escape or
+  an out-of-range number in a skipped value is not examined, as before.
+- **Credential values blanked before YAML parsing** (review of #169, L2):
+  libyaml's internal buffers and `serde_yaml_ng`'s event list hold copies
+  of every scalar they parse, freed without being wiped. The pre-scan
+  therefore also blanks (spaces, positions unchanged) the content of every
+  single-line plain, single-quoted or double-quoted scalar that starts on
+  the line of a credential key's `:` (a key matching the visitor's
+  credential words): the parser never sees it, and the visitor skips the
+  key's value as before. The `SecretForm` of the top-level `clientSecret`
+  (a key of the root mapping, whatever the root block mapping's
+  indentation) is computed by the pre-scan from the value before blanking
+  (YAML's null spellings are absent); any other key spelled `clientSecret`
+  is never blanked (fail safe, review of #180, M1). A double-quoted value
+  with an escape libyaml refuses (`"\q"`, `"\uD800"`) is never blanked,
+  so that blanking never turns an invalid document into a valid one
+  (review of #180, L1). **Remaining gap**: values on the next line,
+  multi-line and block scalars, values after a tag, nested credential
+  subtrees (`apiPassword:` then a mapping or a list), keys written with a
+  double-quoted escape, a nested `clientSecret`, and a top-level
+  `clientSecret` whose double-quoted value holds an escape are not blanked (left to a future parser change,
+  ROADMAP phase 8 follow-ups); they are still skipped by the visitor, and
+  every other scalar (the values classified) is copied by the parser.
 - Credential fields are never sampled: `clientSecret`, and every key whose
   name contains (case-insensitively) `secret`, `password`, `passwd`, `pass`,
   `pwd`, `key`, `token`, `credential`, `jwk`, `private`, `keystore`,
@@ -207,7 +232,9 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   `credential`…) and nested value is skipped without being copied, and a
   duplicate `service` drops the record. Kept keys and values are borrowed
   from the line (held by the tailer in a zeroizing buffer) as raw JSON and
-  unescaped by the crate (`parse/jtext.rs`) into zeroizing buffers sized once,
+  unescaped by the core's `jtext` module (`databastion_core::jtext`, shared
+  with the service-definition parser and the MySQL / MariaDB JSON audit
+  records) into zeroizing buffers sized once,
   so `serde_json`'s private scratch buffer, which is never wiped, receives no
   string of the record. It is reduced
   to the service URL's scheme and host at parse time, used only to pick a

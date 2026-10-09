@@ -26,6 +26,8 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use databastion_core::jtext;
+use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
 /// Longest user, host or database name kept, in bytes (longer: the record
@@ -345,105 +347,253 @@ fn op_of(raw: &str) -> Option<Op> {
     })
 }
 
-/// Percona `audit_log` JSON record (`{"audit_record": {…}}`).
-#[derive(serde::Deserialize)]
-struct LegacyLine {
-    audit_record: LegacyRecord,
+/// A JSON field type that does not match what the record layout declares
+/// (a string where a number is expected…): the record is dropped.
+struct Mismatch;
+
+/// A required string field.
+fn req_str(raw: Option<&RawValue>) -> Result<Zeroizing<String>, Mismatch> {
+    opt_str(raw)?.ok_or(Mismatch)
 }
 
-#[derive(serde::Deserialize)]
-struct LegacyRecord {
-    name: String,
-    #[serde(default)]
-    record: Option<String>,
-    timestamp: String,
-    #[serde(default)]
-    connection_id: Option<serde_json::Value>,
-    #[serde(default)]
+/// An optional string field (absent or `null`: `None`), unescaped whole
+/// into a zeroizing buffer.
+fn opt_str(raw: Option<&RawValue>) -> Result<Option<Zeroizing<String>>, Mismatch> {
+    let Some(raw) = raw.filter(|r| !jtext::is_null(r)) else {
+        return Ok(None);
+    };
+    match jtext::string(raw, usize::MAX) {
+        Ok(Some(s)) => Ok(Some(s)),
+        Ok(None) | Err(_) => Err(Mismatch),
+    }
+}
+
+/// An optional unsigned integer field.
+fn opt_u64(raw: Option<&RawValue>) -> Result<Option<u64>, Mismatch> {
+    let Some(raw) = raw.filter(|r| !jtext::is_null(r)) else {
+        return Ok(None);
+    };
+    jtext::unsigned(raw).map(Some).ok_or(Mismatch)
+}
+
+fn opt_u32(raw: Option<&RawValue>) -> Result<Option<u32>, Mismatch> {
+    opt_u64(raw)?
+        .map(|n| u32::try_from(n).map_err(|_| Mismatch))
+        .transpose()
+}
+
+/// An optional object field: the raw values of `keys` in it.
+fn opt_obj<'a, const N: usize>(
+    raw: Option<&'a RawValue>,
+    keys: &[&str; N],
+) -> Result<Option<[Option<&'a RawValue>; N]>, Mismatch> {
+    let Some(raw) = raw.filter(|r| !jtext::is_null(r)) else {
+        return Ok(None);
+    };
+    match jtext::object(raw.get(), keys) {
+        Ok(Some(fields)) => Ok(Some(fields)),
+        Ok(None) | Err(_) => Err(Mismatch),
+    }
+}
+
+/// The bytes of a zeroizing string, moved (not copied) into a zeroizing
+/// byte buffer.
+fn into_bytes(mut s: Zeroizing<String>) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(std::mem::take(&mut *s).into_bytes())
+}
+
+/// Keys of a JSON record line: `audit_record` (Percona `audit_log`) or
+/// the `audit_log_filter` / Enterprise layout.
+const LINE_KEYS: [&str; 10] = [
+    "audit_record",
+    "timestamp",
+    "class",
+    "event",
+    "connection_id",
+    "account",
+    "login",
+    "general_data",
+    "connection_data",
+    "table_access_data",
+];
+
+/// Percona `audit_log` JSON record (`{"audit_record": {…}}`).
+struct LegacyRecord<'a> {
+    name: Zeroizing<String>,
+    record: Option<Zeroizing<String>>,
+    timestamp: Zeroizing<String>,
+    /// A string or a number.
+    connection_id: Option<&'a RawValue>,
     status: Option<u32>,
-    #[serde(default)]
-    sqltext: Option<String>,
-    #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    host: Option<String>,
-    #[serde(default)]
-    ip: Option<String>,
-    #[serde(default)]
-    db: Option<String>,
+    sqltext: Option<Zeroizing<String>>,
+    user: Option<Zeroizing<String>>,
+    host: Option<Zeroizing<String>>,
+    ip: Option<Zeroizing<String>>,
+    db: Option<Zeroizing<String>>,
+}
+
+impl<'a> LegacyRecord<'a> {
+    const KEYS: [&'static str; 10] = [
+        "name",
+        "record",
+        "timestamp",
+        "connection_id",
+        "status",
+        "sqltext",
+        "user",
+        "host",
+        "ip",
+        "db",
+    ];
+
+    fn read(raw: &'a RawValue) -> Result<Self, Mismatch> {
+        let [
+            name,
+            record,
+            timestamp,
+            connection_id,
+            status,
+            sqltext,
+            user,
+            host,
+            ip,
+            db,
+        ] = opt_obj(Some(raw), &Self::KEYS)?.ok_or(Mismatch)?;
+        Ok(Self {
+            name: req_str(name)?,
+            record: opt_str(record)?,
+            timestamp: req_str(timestamp)?,
+            connection_id: connection_id.filter(|r| !jtext::is_null(r)),
+            status: opt_u32(status)?,
+            sqltext: opt_str(sqltext)?,
+            user: opt_str(user)?,
+            host: opt_str(host)?,
+            ip: opt_str(ip)?,
+            db: opt_str(db)?,
+        })
+    }
 }
 
 /// `audit_log_filter` / MySQL Enterprise JSON record.
-#[derive(serde::Deserialize)]
 struct FilterRecord {
-    timestamp: String,
-    class: String,
-    event: String,
-    #[serde(default)]
+    timestamp: Zeroizing<String>,
+    class: Zeroizing<String>,
+    event: Zeroizing<String>,
     connection_id: Option<u64>,
-    #[serde(default)]
-    account: Option<Account>,
-    #[serde(default)]
+    /// `account.user`.
+    account_user: Option<Zeroizing<String>>,
     login: Option<Login>,
-    #[serde(default)]
     general_data: Option<GeneralData>,
-    #[serde(default)]
     connection_data: Option<ConnectionData>,
-    #[serde(default)]
     table_access_data: Option<TableAccess>,
 }
 
-#[derive(serde::Deserialize)]
-struct Account {
-    #[serde(default)]
-    user: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
 struct Login {
-    #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    ip: Option<String>,
+    user: Option<Zeroizing<String>>,
+    ip: Option<Zeroizing<String>>,
 }
 
-#[derive(serde::Deserialize)]
 struct GeneralData {
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    query: Option<String>,
-    #[serde(default)]
+    command: Option<Zeroizing<String>>,
+    query: Option<Zeroizing<String>>,
     status: Option<u32>,
 }
 
-#[derive(serde::Deserialize)]
 struct ConnectionData {
-    #[serde(default)]
     status: Option<u32>,
-    #[serde(default)]
-    db: Option<String>,
-    #[serde(default)]
-    connection_attributes: Option<ConnectionAttributes>,
+    db: Option<Zeroizing<String>>,
+    /// `connection_attributes.program_name`.
+    program_name: Option<Zeroizing<String>>,
 }
 
-#[derive(serde::Deserialize)]
-struct ConnectionAttributes {
-    #[serde(default)]
-    program_name: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
 struct TableAccess {
-    #[serde(default)]
-    db: Option<String>,
-    #[serde(default)]
-    table: Option<String>,
-    #[serde(default)]
-    query: Option<String>,
+    db: Option<Zeroizing<String>>,
+    table: Option<Zeroizing<String>>,
+    query: Option<Zeroizing<String>>,
+}
+
+impl FilterRecord {
+    /// Every field the layout declares is type-checked, used or not (as
+    /// the typed deserialization this replaces did).
+    fn read(f: [Option<&RawValue>; LINE_KEYS.len()]) -> Result<Self, Mismatch> {
+        let [
+            _,
+            timestamp,
+            class,
+            event,
+            connection_id,
+            account,
+            login,
+            general_data,
+            connection_data,
+            table_access_data,
+        ] = f;
+        let account_user = match opt_obj(account, &["user"])? {
+            Some([user]) => opt_str(user)?,
+            None => None,
+        };
+        let login = match opt_obj(login, &["user", "ip"])? {
+            Some([user, ip]) => Some(Login {
+                user: opt_str(user)?,
+                ip: opt_str(ip)?,
+            }),
+            None => None,
+        };
+        let general_data = match opt_obj(general_data, &["command", "query", "status"])? {
+            Some([command, query, status]) => Some(GeneralData {
+                command: opt_str(command)?,
+                query: opt_str(query)?,
+                status: opt_u32(status)?,
+            }),
+            None => None,
+        };
+        let connection_data =
+            match opt_obj(connection_data, &["status", "db", "connection_attributes"])? {
+                Some([status, db, attributes]) => Some(ConnectionData {
+                    status: opt_u32(status)?,
+                    db: opt_str(db)?,
+                    program_name: match opt_obj(attributes, &["program_name"])? {
+                        Some([program]) => opt_str(program)?,
+                        None => None,
+                    },
+                }),
+                None => None,
+            };
+        let table_access_data = match opt_obj(table_access_data, &["db", "table", "query"])? {
+            Some([db, table, query]) => Some(TableAccess {
+                db: opt_str(db)?,
+                table: opt_str(table)?,
+                query: opt_str(query)?,
+            }),
+            None => None,
+        };
+        Ok(Self {
+            timestamp: req_str(timestamp)?,
+            class: req_str(class)?,
+            event: req_str(event)?,
+            connection_id: opt_u64(connection_id)?,
+            account_user,
+            login,
+            general_data,
+            connection_data,
+            table_access_data,
+        })
+    }
 }
 
 /// Parses one JSON record of either layout.
+///
+/// No unzeroized copy of a string (ROADMAP phase 8 follow-up, review of
+/// #168 M2): the record is read as `serde_json` raw values borrowed from
+/// `record` (the caller's zeroizing buffer), and the kept strings,
+/// statement text included, are unescaped by [`jtext`] into zeroizing
+/// buffers allocated once. `serde_json` never unescapes a string into its
+/// private scratch buffer, and no `serde_json::Value` (whose strings are
+/// freed without being wiped) is built. Field types are checked as before
+/// (a kept field of the wrong type drops the record, a repeated key keeps
+/// its last value); values the layouts do not declare are only skipped
+/// and, as `serde_json`'s skip path does, not checked for lone surrogate
+/// escapes nor out-of-range numbers.
 pub(crate) fn parse_json(record: &[u8]) -> Option<FileRecord> {
     // A client in a legacy character set writes bytes that are not UTF-8
     // into the statement: the structure is read from a lossy decoding and
@@ -458,13 +608,10 @@ pub(crate) fn parse_json(record: &[u8]) -> Option<FileRecord> {
             (owned.as_str(), false)
         }
     };
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let mut parsed = if value.get("audit_record").is_some() {
-        let line: LegacyLine = serde_json::from_value(value).ok()?;
-        parse_legacy(line.audit_record)
-    } else {
-        let r: FilterRecord = serde_json::from_value(value).ok()?;
-        parse_filter(r)
+    let fields = jtext::object(json, &LINE_KEYS).ok()??;
+    let mut parsed = match fields[0] {
+        Some(audit_record) => parse_legacy(LegacyRecord::read(audit_record).ok()?),
+        None => parse_filter(FilterRecord::read(fields).ok()?),
     }?;
     parsed.opaque = !utf8;
     Some(parsed)
@@ -479,10 +626,12 @@ fn legacy_user(raw: &str) -> Option<String> {
     bounded(user)
 }
 
-fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
-    let connection = match r.connection_id? {
-        serde_json::Value::String(s) => s.parse().ok()?,
-        serde_json::Value::Number(n) => n.as_u64()?,
+fn parse_legacy(r: LegacyRecord<'_>) -> Option<FileRecord> {
+    // A string or a number, as a `serde_json::Value` was read before.
+    let id = r.connection_id?;
+    let connection = match id.get().as_bytes().first() {
+        Some(b'"') => jtext::string(id, usize::MAX).ok()??.parse().ok()?,
+        Some(b'-' | b'0'..=b'9') => jtext::unsigned(id)?,
         _ => return None,
     };
     let status = r.status.unwrap_or(0);
@@ -499,7 +648,7 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
     };
     let host = match r.ip.as_deref().filter(|ip| !ip.is_empty()) {
         Some(ip) => bounded(ip)?,
-        None => bounded(r.host.as_deref().unwrap_or(""))?,
+        None => bounded(r.host.as_deref().map_or("", String::as_str))?,
     };
     // `record` is `<sequence>_<start time>`: unique per record.
     let query_id = r
@@ -514,10 +663,10 @@ fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
         op,
         user,
         host,
-        database: bounded(r.db.as_deref().unwrap_or(""))?,
+        database: bounded(r.db.as_deref().map_or("", String::as_str))?,
         table: None,
         text: match op {
-            Op::Query => Some(Zeroizing::new(r.sqltext?.into_bytes())),
+            Op::Query => Some(into_bytes(r.sqltext?)),
             _ => None,
         },
         opaque: false,
@@ -534,8 +683,10 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
     let login = r.login.as_ref();
     let user = login
         .and_then(|l| l.user.as_deref())
-        .or_else(|| r.account.as_ref().and_then(|a| a.user.as_deref()))?;
-    let host = login.and_then(|l| l.ip.as_deref()).unwrap_or("");
+        .or(r.account_user.as_deref())?;
+    let host = login
+        .and_then(|l| l.ip.as_deref())
+        .map_or("", String::as_str);
     let mut record = FileRecord {
         ts: json_time(&r.timestamp),
         connection,
@@ -562,20 +713,17 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
             } else {
                 Op::FailedConnect
             };
-            record.database = bounded(c.db.as_deref().unwrap_or(""))?;
-            record.program = c
-                .connection_attributes
-                .and_then(|a| a.program_name)
-                .and_then(|p| bounded(&p));
+            record.database = bounded(c.db.as_deref().map_or("", String::as_str))?;
+            record.program = c.program_name.and_then(|p| bounded(&p));
         }
         ("connection", "disconnect") => record.op = Op::Disconnect,
         ("general", "status") => {
             let g = r.general_data?;
-            if g.command.as_deref() != Some("Query") {
+            if g.command.as_deref().map(String::as_str) != Some("Query") {
                 return None;
             }
             record.status = g.status.unwrap_or(0);
-            record.text = Some(Zeroizing::new(g.query?.into_bytes()));
+            record.text = Some(into_bytes(g.query?));
         }
         ("table_access", event) => {
             let t = r.table_access_data?;
@@ -587,7 +735,7 @@ fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
             let db = bounded(t.db.as_deref()?)?;
             record.table = Some((db.clone(), bounded(t.table.as_deref()?)?));
             record.database = db;
-            record.text = t.query.map(|q| Zeroizing::new(q.into_bytes()));
+            record.text = t.query.map(into_bytes);
         }
         _ => return None,
     }
@@ -806,6 +954,439 @@ mod tests {
         .unwrap();
         let d = format!("{r:?}");
         assert!(!d.contains("jane"), "{d}");
+    }
+
+    /// The typed `serde_json` parser this module used before reading raw
+    /// values (kept as the reference of the equivalence tests).
+    mod typed {
+        #![allow(clippy::all)]
+        use super::super::{FileRecord, Op, TableOp, bounded, json_time, legacy_user};
+        use zeroize::Zeroizing;
+
+        /// Percona `audit_log` JSON record (`{"audit_record": {…}}`).
+        #[derive(serde::Deserialize)]
+        struct LegacyLine {
+            audit_record: LegacyRecord,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct LegacyRecord {
+            name: String,
+            #[serde(default)]
+            record: Option<String>,
+            timestamp: String,
+            #[serde(default)]
+            connection_id: Option<serde_json::Value>,
+            #[serde(default)]
+            status: Option<u32>,
+            #[serde(default)]
+            sqltext: Option<String>,
+            #[serde(default)]
+            user: Option<String>,
+            #[serde(default)]
+            host: Option<String>,
+            #[serde(default)]
+            ip: Option<String>,
+            #[serde(default)]
+            db: Option<String>,
+        }
+
+        /// `audit_log_filter` / MySQL Enterprise JSON record.
+        #[derive(serde::Deserialize)]
+        struct FilterRecord {
+            timestamp: String,
+            class: String,
+            event: String,
+            #[serde(default)]
+            connection_id: Option<u64>,
+            #[serde(default)]
+            account: Option<Account>,
+            #[serde(default)]
+            login: Option<Login>,
+            #[serde(default)]
+            general_data: Option<GeneralData>,
+            #[serde(default)]
+            connection_data: Option<ConnectionData>,
+            #[serde(default)]
+            table_access_data: Option<TableAccess>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Account {
+            #[serde(default)]
+            user: Option<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Login {
+            #[serde(default)]
+            user: Option<String>,
+            #[serde(default)]
+            ip: Option<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct GeneralData {
+            #[serde(default)]
+            command: Option<String>,
+            #[serde(default)]
+            query: Option<String>,
+            #[serde(default)]
+            status: Option<u32>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ConnectionData {
+            #[serde(default)]
+            status: Option<u32>,
+            #[serde(default)]
+            db: Option<String>,
+            #[serde(default)]
+            connection_attributes: Option<ConnectionAttributes>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ConnectionAttributes {
+            #[serde(default)]
+            program_name: Option<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TableAccess {
+            #[serde(default)]
+            db: Option<String>,
+            #[serde(default)]
+            table: Option<String>,
+            #[serde(default)]
+            query: Option<String>,
+        }
+
+        /// Parses one JSON record of either layout.
+        pub(super) fn parse_json(record: &[u8]) -> Option<FileRecord> {
+            // A client in a legacy character set writes bytes that are not UTF-8
+            // into the statement: the structure is read from a lossy decoding and
+            // the text is opaque (kind only), rather than the record dropped.
+            // The lossy decoding is a full copy of the record, statement text
+            // included: zeroized when dropped.
+            let owned: Zeroizing<String>;
+            let (json, utf8): (&str, bool) = match std::str::from_utf8(record) {
+                Ok(s) => (s, true),
+                Err(_) => {
+                    owned = Zeroizing::new(String::from_utf8_lossy(record).into_owned());
+                    (owned.as_str(), false)
+                }
+            };
+            let value: serde_json::Value = serde_json::from_str(json).ok()?;
+            let mut parsed = if value.get("audit_record").is_some() {
+                let line: LegacyLine = serde_json::from_value(value).ok()?;
+                parse_legacy(line.audit_record)
+            } else {
+                let r: FilterRecord = serde_json::from_value(value).ok()?;
+                parse_filter(r)
+            }?;
+            parsed.opaque = !utf8;
+            Some(parsed)
+        }
+
+        fn parse_legacy(r: LegacyRecord) -> Option<FileRecord> {
+            let connection = match r.connection_id? {
+                serde_json::Value::String(s) => s.parse().ok()?,
+                serde_json::Value::Number(n) => n.as_u64()?,
+                _ => return None,
+            };
+            let status = r.status.unwrap_or(0);
+            let op = match r.name.as_str() {
+                "Query" => Op::Query,
+                "Connect" if status == 0 => Op::Connect,
+                "Connect" => Op::FailedConnect,
+                "Quit" => Op::Disconnect,
+                _ => return None,
+            };
+            let user = match op {
+                Op::Query => legacy_user(r.user.as_deref()?)?,
+                _ => bounded(r.user.as_deref()?)?,
+            };
+            let host = match r.ip.as_deref().filter(|ip| !ip.is_empty()) {
+                Some(ip) => bounded(ip)?,
+                None => bounded(r.host.as_deref().unwrap_or(""))?,
+            };
+            // `record` is `<sequence>_<start time>`: unique per record.
+            let query_id = r
+                .record
+                .as_deref()
+                .and_then(|v| v.split('_').next())
+                .and_then(|v| v.parse().ok());
+            Some(FileRecord {
+                ts: json_time(&r.timestamp),
+                connection,
+                query_id,
+                op,
+                user,
+                host,
+                database: bounded(r.db.as_deref().unwrap_or(""))?,
+                table: None,
+                text: match op {
+                    Op::Query => Some(Zeroizing::new(r.sqltext?.into_bytes())),
+                    _ => None,
+                },
+                opaque: false,
+                truncated: false,
+                status,
+                program: None,
+                pos: None,
+                replayed: false,
+            })
+        }
+
+        fn parse_filter(r: FilterRecord) -> Option<FileRecord> {
+            let connection = r.connection_id?;
+            let login = r.login.as_ref();
+            let user = login
+                .and_then(|l| l.user.as_deref())
+                .or_else(|| r.account.as_ref().and_then(|a| a.user.as_deref()))?;
+            let host = login.and_then(|l| l.ip.as_deref()).unwrap_or("");
+            let mut record = FileRecord {
+                ts: json_time(&r.timestamp),
+                connection,
+                query_id: None,
+                op: Op::Query,
+                user: bounded(user)?,
+                host: bounded(host)?,
+                database: String::new(),
+                table: None,
+                text: None,
+                opaque: false,
+                truncated: false,
+                status: 0,
+                program: None,
+                pos: None,
+                replayed: false,
+            };
+            match (r.class.as_str(), r.event.as_str()) {
+                ("connection", "connect" | "change_user") => {
+                    let c = r.connection_data?;
+                    record.status = c.status.unwrap_or(0);
+                    record.op = if record.status == 0 {
+                        Op::Connect
+                    } else {
+                        Op::FailedConnect
+                    };
+                    record.database = bounded(c.db.as_deref().unwrap_or(""))?;
+                    record.program = c
+                        .connection_attributes
+                        .and_then(|a| a.program_name)
+                        .and_then(|p| bounded(&p));
+                }
+                ("connection", "disconnect") => record.op = Op::Disconnect,
+                ("general", "status") => {
+                    let g = r.general_data?;
+                    if g.command.as_deref() != Some("Query") {
+                        return None;
+                    }
+                    record.status = g.status.unwrap_or(0);
+                    record.text = Some(Zeroizing::new(g.query?.into_bytes()));
+                }
+                ("table_access", event) => {
+                    let t = r.table_access_data?;
+                    record.op = Op::Table(match event {
+                        "read" => TableOp::Read,
+                        "insert" | "update" | "delete" => TableOp::Write,
+                        _ => return None,
+                    });
+                    let db = bounded(t.db.as_deref()?)?;
+                    record.table = Some((db.clone(), bounded(t.table.as_deref()?)?));
+                    record.database = db;
+                    record.text = t.query.map(|q| Zeroizing::new(q.into_bytes()));
+                }
+                _ => return None,
+            }
+            Some(record)
+        }
+    }
+
+    /// What a parsed record holds, for comparisons.
+    fn summary(r: Option<&FileRecord>) -> Option<String> {
+        r.map(|r| {
+            format!(
+                "{:?} {} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {} {} {:?}",
+                r.ts,
+                r.connection,
+                r.query_id,
+                r.op,
+                r.user,
+                r.host,
+                r.database,
+                r.table,
+                r.text.as_deref(),
+                r.opaque,
+                r.truncated,
+                r.status,
+                r.program
+            )
+        })
+    }
+
+    /// A JSON string literal of `s`, each character written plain or as
+    /// an escape according to `styles` (always a valid literal, never a
+    /// lone surrogate).
+    fn escaped(s: &str, styles: &[u8]) -> String {
+        let mut out = String::from("\"");
+        for (i, c) in s.chars().enumerate() {
+            let style = styles.get(i % styles.len().max(1)).copied().unwrap_or(0) % 3;
+            match c {
+                '"' if style == 0 => out.push_str("\\\""),
+                '\\' if style == 0 => out.push_str("\\\\"),
+                '/' if style == 2 => out.push_str("\\/"),
+                '\n' if style != 1 => out.push_str("\\n"),
+                c if style == 1 || c == '"' || c == '\\' || c < ' ' => {
+                    let mut buf = [0u16; 2];
+                    for unit in c.encode_utf16(&mut buf) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// A value for a field: the right type (a string, escaped), or another
+    /// JSON type, or absent.
+    fn field(kind: u8, text: &str, styles: &[u8]) -> Option<String> {
+        Some(match kind % 12 {
+            0 => return None,
+            1 => "null".to_owned(),
+            2 => "17".to_owned(),
+            3 => "-1".to_owned(),
+            4 => "1.5".to_owned(),
+            5 => "true".to_owned(),
+            6 => format!("{{\"x\": {}}}", escaped(text, styles)),
+            7 => "4294967296".to_owned(),
+            8 => "-0".to_owned(),
+            _ => escaped(text, styles),
+        })
+    }
+
+    fn object(fields: &[(&str, Option<String>)], styles: &[u8]) -> String {
+        let body: Vec<String> = fields
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| format!("{}: {v}", escaped(k, styles))))
+            .collect();
+        format!("{{{}}}", body.join(", "))
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 2048,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// The raw-value parser reads every record as the typed
+        /// `serde_json` parser did: same fields, same drops.
+        #[test]
+        fn raw_and_typed_json_parsers_agree(
+            legacy in proptest::prelude::any::<bool>(),
+            kinds in proptest::collection::vec(proptest::prelude::any::<u8>(), 24),
+            styles in proptest::collection::vec(proptest::prelude::any::<u8>(), 1..8),
+            text in "(select|SELECT|insert|update|\\PC){0,6}[ -~\\n\\t\"\\\\/é😀]{0,24}",
+            user in "[a-z\\[\\] @.0-9]{0,12}",
+            event in proptest::sample::select(vec![
+                "connect", "change_user", "disconnect", "status", "read", "insert", "update",
+                "delete", "other",
+            ]),
+            class in proptest::sample::select(vec!["connection", "general", "table_access", "x"]),
+            name in proptest::sample::select(vec!["Query", "Connect", "Quit", "Audit"]),
+            dup in proptest::prelude::any::<bool>(),
+        ) {
+            let k = |i: usize| kinds[i];
+            // Mostly well-typed fields.
+            let f = |i: usize, t: &str| field(if k(i) % 3 == 0 { k(i) } else { 9 }, t, &styles);
+            let num = |i: usize, n: &str| match k(i) % 4 {
+                0 => field(k(i) / 4, n, &styles),
+                _ => Some(n.to_owned()),
+            };
+            let json = if legacy {
+                let mut fields = vec![
+                    ("name", f(0, name)),
+                    ("record", f(1, "7306164_2026-09-29T09:45:09")),
+                    ("timestamp", f(2, "2026-09-29T09:45:20Z")),
+                    ("connection_id", match k(3) % 3 { 0 => num(4, "11"), 1 => f(4, "11"), _ => field(k(4), "x", &styles) }),
+                    ("status", num(5, if k(5) % 2 == 0 { "0" } else { "1045" })),
+                    ("sqltext", f(6, &text)),
+                    ("user", f(7, &format!("{user}[{user}] @  [127.0.0.1]"))),
+                    ("host", f(8, "")),
+                    ("ip", f(9, "127.0.0.1")),
+                    ("db", f(10, "hr")),
+                    ("command_class", field(k(11), "select", &styles)),
+                ];
+                if dup {
+                    fields.push(("sqltext", f(12, "select 2")));
+                }
+                format!("{{\"audit_record\": {}, \"x\": [1, {{\"y\": null}}]}}", object(&fields, &styles))
+            } else {
+                let mut fields = vec![
+                    ("timestamp", f(0, "2026-09-29 10:06:12")),
+                    ("id", num(1, "24")),
+                    ("class", f(2, class)),
+                    ("event", f(3, event)),
+                    ("connection_id", num(4, "22")),
+                    ("account", Some(object(&[("user", f(5, &user)), ("host", f(6, ""))], &styles))),
+                    ("login", match k(7) % 4 { 0 => field(k(7) / 4, "x", &styles), _ => Some(object(&[("user", f(8, &user)), ("ip", f(9, "10.1.2.3"))], &styles)) }),
+                    ("connection_data", Some(object(&[
+                        ("status", num(10, "0")),
+                        ("db", f(11, "hr")),
+                        ("connection_attributes", match k(12) % 4 { 0 => field(k(12) / 4, "x", &styles), _ => Some(object(&[("program_name", f(13, "mysqldump"))], &styles)) }),
+                    ], &styles))),
+                    ("general_data", match k(14) % 4 { 0 => field(k(14) / 4, "x", &styles), _ => Some(object(&[
+                        ("command", f(15, "Query")),
+                        ("query", f(16, &text)),
+                        ("status", num(17, "1146")),
+                    ], &styles)) }),
+                    ("table_access_data", match k(18) % 4 { 0 => field(k(18) / 4, "x", &styles), _ => Some(object(&[
+                        ("db", f(19, "hr")),
+                        ("table", f(20, "t")),
+                        ("query", f(21, &text)),
+                    ], &styles)) }),
+                ];
+                if dup {
+                    fields.push(("event", f(22, "read")));
+                }
+                object(&fields, &styles)
+            };
+            let ours = parse_json(json.as_bytes());
+            let theirs = typed::parse_json(json.as_bytes());
+            proptest::prop_assert_eq!(summary(ours.as_ref()), summary(theirs.as_ref()), "{}", json);
+        }
+
+        /// Any byte string: same outcome (lone surrogate escapes and
+        /// out-of-range numbers aside, which the generator cannot write).
+        #[test]
+        fn raw_and_typed_json_parsers_agree_on_noise(
+            data in proptest::collection::vec(proptest::sample::select(b"{}[]:,\"\\ux0123456789abcdefnulltrue-. audit_recordsqltextnameQuery".to_vec()), 0..96),
+        ) {
+            let ours = parse_json(&data);
+            let theirs = typed::parse_json(&data);
+            proptest::prop_assert_eq!(summary(ours.as_ref()), summary(theirs.as_ref()));
+        }
+    }
+
+    #[test]
+    fn statement_texts_with_escapes_are_unescaped() {
+        let q = br#"{"audit_record":{"name":"Query","record":"1_x","timestamp":"2026-09-29T09:45:20Z","connection_id":"1\u0031","status":0,"sqltext":"select \"caf\u00e9\" from hr.t \/* \ud83d\ude00 *\/","user":"root[root] @  [127.0.0.1]","ip":"127.0.0.1","db":"hr"}}"#;
+        let r = parse_json(q).unwrap();
+        assert_eq!(r.connection, 11);
+        assert_eq!(
+            r.text
+                .as_deref()
+                .map(|t| std::str::from_utf8(t).unwrap().to_owned()),
+            Some("select \"café\" from hr.t /* 😀 */".to_owned())
+        );
+        // A lone surrogate in the statement drops the record, as before.
+        let bad = br#"{"audit_record":{"name":"Query","timestamp":"x","connection_id":1,"sqltext":"\ud800","user":"u[u] @  [h]"}}"#;
+        assert!(parse_json(bad).is_none());
+        assert!(typed::parse_json(bad).is_none());
     }
 
     #[test]

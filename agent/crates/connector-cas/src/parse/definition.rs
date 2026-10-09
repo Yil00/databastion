@@ -23,6 +23,24 @@
 //! - A duplicate top-level `@class`, `serviceId`, `name`, `id`,
 //!   `evaluationOrder` or `clientSecret` refuses the document.
 //!
+//! **No unzeroized copy of a JSON string** (ROADMAP phase 8 follow-ups):
+//! on the JSON path, every key and every value the visitor reads is taken
+//! as a `serde_json` raw value borrowed from the file buffer (which the
+//! caller holds in a zeroizing buffer), and strings are unescaped by
+//! [`databastion_core::jtext`] into zeroizing buffers allocated once:
+//! `serde_json` never unescapes a string (a `clientSecret`, a classified
+//! value) into its private scratch buffer, which is not wiped. Objects and
+//! arrays are walked by parsing their raw text again (each level once
+//! more: at most [`MAX_DEPTH`] passes over a bounded file). Skipped values
+//! are only skipped (`IgnoredAny`, never copied); like `serde_json`'s skip
+//! path, they are not checked for lone surrogate escapes nor out-of-range
+//! numbers (a kept string with a lone surrogate still refuses the
+//! document).
+//!
+//! A definition whose bytes are not all UTF-8 is malformed (a YAML file
+//! is refused before parsing; before raw values, bytes that are not UTF-8
+//! in a skipped value were accepted).
+//!
 //! Comments are not accepted (whether CAS 8.0 still accepts them in JSON
 //! definitions is to verify, ADR-0041 decision 4): a file with comments
 //! does not parse and is skipped.
@@ -41,9 +59,15 @@
 //! numbers are never classified (unchanged).
 
 use std::fmt;
+use std::marker::PhantomData;
 
-use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    self, Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
+use serde_json::value::RawValue;
 use zeroize::Zeroizing;
+
+use databastion_core::jtext;
 
 use super::url::strip_credentials;
 use super::yaml::{self, Refusal};
@@ -350,7 +374,13 @@ pub fn parse_yaml_definition(bytes: &[u8]) -> Result<Definition, DefinitionError
     let pre = yaml::prescan(bytes)?;
     let de = serde_yaml_ng::Deserializer::from_slice(&pre.text);
     // The by-value deserializer refuses a stream of several documents.
-    parse_with(de, Some(pre.class))
+    let mut def = parse_with(de, Some(pre.class), false)?;
+    // A top-level `clientSecret` the pre-scan blanked: its form was taken
+    // from the value before blanking.
+    if let Some(form) = pre.client_secret {
+        def.client_secret = form;
+    }
+    Ok(def)
 }
 
 /// Parses one service definition file.
@@ -358,8 +388,22 @@ pub fn parse_yaml_definition(bytes: &[u8]) -> Result<Definition, DefinitionError
 /// # Errors
 /// [`DefinitionError`]; nothing of a refused document is returned.
 pub fn parse_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
+    // The document's value as one raw value: UTF-8 and JSON are checked
+    // without unescaping any string.
     let mut de = serde_json::Deserializer::from_slice(bytes);
-    let top = parse_with(&mut de, None)?;
+    let raw = <&RawValue>::deserialize(&mut de).map_err(|_| DefinitionError::Malformed)?;
+    let text = raw.get();
+    match text.as_bytes().first() {
+        Some(b'{') => {}
+        // A string with an invalid escape is malformed, as before.
+        Some(b'"') => {
+            jtext::unescape(text, 0).map_err(|_| DefinitionError::Malformed)?;
+            return Err(DefinitionError::NotDefinition);
+        }
+        _ => return Err(DefinitionError::NotDefinition),
+    }
+    let top = parse_with(&mut serde_json::Deserializer::from_str(text), None, true)?;
+    // Trailing data, checked last as before.
     if de.end().is_err() {
         return Err(DefinitionError::Malformed);
     }
@@ -369,14 +413,19 @@ pub fn parse_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
 /// The visitor over any deserializer; `root_class` is the class given
 /// outside the mapping (the YAML root tag), in which case an `@class` key
 /// refuses the document.
+///
+/// `json`: `de` is a `serde_json` deserializer, read through raw values
+/// (see the module documentation).
 fn parse_with<'de, D: Deserializer<'de>>(
     de: D,
     root_class: Option<String>,
+    json: bool,
 ) -> Result<Definition, DefinitionError> {
     let preset = root_class.is_some();
     // YAML resolves unquoted digits to integers: on that path they are
     // classified as their decimal text (JSON numbers stay unsampled).
     let mut ctx = Ctx {
+        json,
         numbers_as_text: preset,
         ..Ctx::default()
     };
@@ -412,6 +461,9 @@ fn parse_with<'de, D: Deserializer<'de>>(
 
 #[derive(Default)]
 struct Ctx {
+    /// The deserializer is `serde_json`'s: keys and values are read as
+    /// raw values and unescaped by [`jtext`].
+    json: bool,
     /// Integers are sampled as their decimal text (YAML only).
     numbers_as_text: bool,
     path: Vec<Seg>,
@@ -500,13 +552,36 @@ struct Key {
     credential: bool,
 }
 
-struct KeySeed;
+/// Reads a key; `json`: from its raw text (see [`Ctx::json`]).
+struct KeySeed {
+    json: bool,
+}
 
 impl<'de> DeserializeSeed<'de> for KeySeed {
     type Value = Key;
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Key, D::Error> {
-        d.deserialize_str(KeySeed)
+        if self.json {
+            let raw = <&'de RawValue>::deserialize(d)?;
+            let text = jtext::unescape(raw.get(), usize::MAX).map_err(refused)?;
+            return self.visit_str(&text);
+        }
+        d.deserialize_str(self)
     }
+}
+
+/// A raw value [`jtext`] refused (a lone surrogate escape): the document
+/// is malformed, as when `serde_json` reads such a string.
+fn refused<E: de::Error>(_: jtext::Invalid) -> E {
+    E::custom("invalid escape")
+}
+
+/// An integer as `serde_json` deserializes one into an `i64`; `None` for
+/// any other number (`-0` is a float for `serde_json`).
+fn json_int(text: &str) -> Option<i64> {
+    if text == "-0" {
+        return None;
+    }
+    text.parse().ok()
 }
 
 impl Visitor<'_> for KeySeed {
@@ -544,7 +619,8 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
         // Top-level keys kept are seen once at most: a second `@class` or
         // `serviceId` could otherwise override the first.
         let mut seen = [false; KEPT_TOP_KEYS.len()];
-        while let Some(key) = map.next_key_seed(KeySeed)? {
+        let json = ctx.json;
+        while let Some(key) = map.next_key_seed(KeySeed { json })? {
             let Some(name) = key.text.as_deref() else {
                 // An over-long key: its value is skipped.
                 map.next_value::<IgnoredAny>()?;
@@ -561,15 +637,20 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
             match name {
                 "@class" if preset_class => return Err(ctx.fail(DefinitionError::Malformed)),
                 "@class" => {
-                    top.class = map.next_value::<MaybeStr>()?.0.map(|b| b.to_string());
+                    top.class = map
+                        .next_value_seed(seed::<MaybeStr>(json))?
+                        .0
+                        .map(|b| b.to_string());
                 }
                 "clientSecret" => {
-                    top.client_secret = map.next_value::<FormOf>()?.0;
+                    top.client_secret = map.next_value_seed(seed::<FormOf>(json))?.0;
                 }
-                "id" => top.id = map.next_value::<Number>()?.0,
-                "evaluationOrder" => top.evaluation_order = map.next_value::<Number>()?.0,
+                "id" => top.id = map.next_value_seed(seed::<Number>(json))?.0,
+                "evaluationOrder" => {
+                    top.evaluation_order = map.next_value_seed(seed::<Number>(json))?.0;
+                }
                 "serviceId" | "name" => {
-                    let Some(raw) = map.next_value::<MaybeStr>()?.0 else {
+                    let Some(raw) = map.next_value_seed(seed::<MaybeStr>(json))?.0 else {
                         continue;
                     };
                     ctx.path.push(Seg::Key(name.to_owned()));
@@ -627,6 +708,65 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
     }
     fn visit_unit<E: de::Error>(self) -> Result<Top, E> {
         Ok(Top::Other)
+    }
+}
+
+/// A value read by its `Deserialize` impl (YAML), or from its raw text
+/// (JSON, see [`Ctx::json`]).
+struct Seed<T> {
+    json: bool,
+    kind: PhantomData<T>,
+}
+
+fn seed<T>(json: bool) -> Seed<T> {
+    Seed {
+        json,
+        kind: PhantomData,
+    }
+}
+
+/// Reading a value from its raw JSON text.
+trait FromRaw: Sized {
+    fn from_raw(raw: &RawValue) -> Result<Self, jtext::Invalid>;
+}
+
+impl<'de, T: Deserialize<'de> + FromRaw> DeserializeSeed<'de> for Seed<T> {
+    type Value = T;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<T, D::Error> {
+        if self.json {
+            let raw = <&'de RawValue>::deserialize(d)?;
+            return T::from_raw(raw).map_err(refused);
+        }
+        T::deserialize(d)
+    }
+}
+
+impl FromRaw for MaybeStr {
+    fn from_raw(raw: &RawValue) -> Result<Self, jtext::Invalid> {
+        jtext::string(raw, MAX_STRING_BYTES).map(MaybeStr)
+    }
+}
+
+impl FromRaw for Number {
+    fn from_raw(raw: &RawValue) -> Result<Self, jtext::Invalid> {
+        let text = raw.get();
+        Ok(Number(match text.as_bytes().first() {
+            Some(b'-' | b'0'..=b'9') => json_int(text),
+            _ => None,
+        }))
+    }
+}
+
+impl FromRaw for FormOf {
+    fn from_raw(raw: &RawValue) -> Result<Self, jtext::Invalid> {
+        let text = raw.get();
+        Ok(FormOf(match text.as_bytes().first() {
+            // Unescaped into a zeroizing buffer, read, wiped.
+            Some(b'"') => SecretForm::of(&jtext::unescape(text, usize::MAX)?),
+            _ if jtext::is_null(raw) => SecretForm::Absent,
+            // Any other shape is counted as clear (as on the YAML path).
+            _ => SecretForm::Clear,
+        }))
     }
 }
 
@@ -794,7 +934,26 @@ struct Node<'a> {
 impl<'de> DeserializeSeed<'de> for Node<'_> {
     type Value = NodeKind;
     fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<NodeKind, D::Error> {
-        d.deserialize_any(self)
+        if !self.ctx.json {
+            return d.deserialize_any(self);
+        }
+        let raw = <&'de RawValue>::deserialize(d)?;
+        let text = raw.get();
+        match text.as_bytes().first() {
+            Some(b'"') => match jtext::unescape(text, usize::MAX) {
+                Ok(s) => self.visit_str(&s),
+                Err(_) => Err(self.ctx.fail(DefinitionError::Malformed)),
+            },
+            // The raw text of a container, parsed again at this level.
+            Some(b'{' | b'[') => serde_json::Deserializer::from_str(text)
+                .deserialize_any(self)
+                .map_err(|_| <D::Error as de::Error>::custom("refused")),
+            // Numbers (never sampled from JSON), booleans, null.
+            _ => {
+                self.ctx.node()?;
+                Ok(NodeKind::Other)
+            }
+        }
     }
 }
 
@@ -890,7 +1049,8 @@ impl<'de> Visitor<'de> for Node<'_> {
         let ctx = self.ctx;
         ctx.node()?;
         ctx.enter()?;
-        while let Some(key) = map.next_key_seed(KeySeed)? {
+        let json = ctx.json;
+        while let Some(key) = map.next_key_seed(KeySeed { json })? {
             let structural = key
                 .text
                 .as_deref()
@@ -960,6 +1120,293 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// The typed `serde_json` path this module used before reading raw
+    /// values (`deserialize_any`, strings unescaped by `serde_json`): the
+    /// reference of the equivalence tests.
+    fn typed_json(bytes: &[u8]) -> Result<Definition, DefinitionError> {
+        let mut de = serde_json::Deserializer::from_slice(bytes);
+        let top = parse_with(&mut de, None, false)?;
+        if de.end().is_err() {
+            return Err(DefinitionError::Malformed);
+        }
+        Ok(top)
+    }
+
+    fn summary(r: &Result<Definition, DefinitionError>) -> String {
+        match r {
+            Ok(d) => format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                d.service_type,
+                d.name.as_deref(),
+                d.id,
+                d.evaluation_order,
+                d.service_id.as_str(),
+                d.client_secret,
+                paths(d)
+            ),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    /// A JSON string literal of `s`, each character plain or escaped
+    /// according to `styles` (never a lone surrogate).
+    fn escaped(s: &str, styles: &[u8]) -> String {
+        let mut out = String::from("\"");
+        for (i, c) in s.chars().enumerate() {
+            let style = styles.get(i % styles.len().max(1)).copied().unwrap_or(0) % 3;
+            match c {
+                '"' if style == 0 => out.push_str("\\\""),
+                '\\' if style == 0 => out.push_str("\\\\"),
+                '/' if style == 2 => out.push_str("\\/"),
+                c if style == 1 || c == '"' || c == '\\' || c < ' ' => {
+                    let mut buf = [0u16; 2];
+                    for unit in c.encode_utf16(&mut buf) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[derive(Debug, Clone)]
+    enum J {
+        Str(String),
+        Num(&'static str),
+        Lit(&'static str),
+        Arr(Vec<J>),
+        Obj(Vec<(String, J)>),
+    }
+
+    fn render(j: &J, styles: &[u8], out: &mut String) {
+        match j {
+            J::Str(s) => out.push_str(&escaped(s, styles)),
+            J::Num(n) | J::Lit(n) => out.push_str(n),
+            J::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    render(item, styles, out);
+                }
+                out.push(']');
+            }
+            J::Obj(entries) => {
+                out.push('{');
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&escaped(k, styles));
+                    out.push(':');
+                    render(v, styles, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    fn key() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop_oneof![
+            proptest::sample::select(vec![
+                "name",
+                "email",
+                "phone",
+                "clientSecret",
+                "apiPassword",
+                "values",
+                "properties",
+                "@class",
+                "logoutType",
+                "description",
+                "contacts",
+                "attributes",
+                "signingKey",
+                "id",
+                "serviceId",
+                "evaluationOrder",
+                "k/v",
+                "é",
+            ])
+            .prop_map(str::to_owned),
+            "\\PC{0,6}",
+        ]
+    }
+
+    fn tree() -> impl proptest::strategy::Strategy<Value = J> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            "\\PC{0,16}".prop_map(J::Str),
+            proptest::sample::select(vec![
+                "java.util.ArrayList",
+                "https://u:FAKE-P@h.example.org/x?token=FAKE-Q#f",
+                "${CLIENT_SECRET}",
+                "{cipher}AbCd",
+                "eyJhbGciOiJSU0EtT0FFUCJ9.a2V5.aXY.Y2lwaGVy.dGFn",
+                "jane.doe@example.org",
+                "",
+                " ",
+            ])
+            .prop_map(|s| J::Str(s.to_owned())),
+            proptest::sample::select(vec![
+                "0",
+                "-0",
+                "12",
+                "-7",
+                "1.5",
+                "4111111111111111",
+                "18446744073709551616",
+                "9223372036854775808",
+                "-9223372036854775808",
+            ])
+            .prop_map(J::Num),
+            proptest::sample::select(vec!["true", "false", "null"]).prop_map(J::Lit),
+        ];
+        leaf.prop_recursive(4, 32, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(J::Arr),
+                proptest::collection::vec((key(), inner), 0..4).prop_map(J::Obj),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 1024,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Reading raw values changes nothing: same definition, values,
+        /// `SecretForm` and errors as the typed `serde_json` path, with
+        /// keys and strings written with any mix of escapes.
+        #[test]
+        fn raw_and_typed_json_paths_agree(
+            class in proptest::sample::select(vec![
+                "org.apereo.cas.services.OidcRegisteredService",
+                "org.apereo.cas.services.CasRegisteredService",
+                "com.example.Evil",
+            ]),
+            service_id in "\\PC{0,12}",
+            entries in proptest::collection::vec((key(), tree()), 0..8),
+            styles in proptest::collection::vec(proptest::prelude::any::<u8>(), 1..6),
+            top in 0u8..4,
+        ) {
+            let mut all = vec![
+                ("@class".to_owned(), J::Str(class.to_owned())),
+                ("serviceId".to_owned(), J::Str(service_id)),
+            ];
+            all.extend(entries);
+            let doc = match top {
+                0 => J::Arr(all.into_iter().map(|(_, v)| v).collect()),
+                _ => J::Obj(all),
+            };
+            let mut text = String::from(" ");
+            render(&doc, &styles, &mut text);
+            let ours = parse_definition(text.as_bytes());
+            let theirs = typed_json(text.as_bytes());
+            proptest::prop_assert_eq!(summary(&ours), summary(&theirs), "{}", text);
+        }
+
+        /// Mutated definitions (truncations, flips, insertions): same
+        /// outcome, except where `serde_json`'s skip path is more lenient
+        /// than its typed path (a lone surrogate escape, an exponent).
+        #[test]
+        fn raw_and_typed_json_paths_agree_on_mutations(
+            base in 0usize..4,
+            edits in proptest::collection::vec(
+                (proptest::prelude::any::<usize>(), proptest::prelude::any::<u8>(), proptest::prelude::any::<u8>()),
+                0..8,
+            ),
+        ) {
+            let docs = [OIDC, PAIRS[0].0, PAIRS[1].0, PAIRS[2].0];
+            let mut bytes = docs[base].as_bytes().to_vec();
+            for &(pos, kind, value) in &edits {
+                if bytes.is_empty() {
+                    break;
+                }
+                let i = pos % bytes.len();
+                match kind % 4 {
+                    0 => bytes[i] = value,
+                    1 => bytes.truncate(i),
+                    2 => bytes.insert(i, value),
+                    _ => {
+                        bytes.remove(i);
+                    }
+                }
+            }
+            let lenient = bytes.windows(3).any(|w| w[0] == b'\\' && w[1] == b'u' && matches!(w[2], b'd' | b'D'))
+                || bytes.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E' | b'.'));
+            proptest::prop_assume!(!lenient);
+            // A file that is not UTF-8 is refused as a whole now (the
+            // typed path accepted bytes that are not UTF-8 in skipped
+            // values).
+            if std::str::from_utf8(&bytes).is_err() {
+                let ours = parse_definition(&bytes);
+                proptest::prop_assert!(ours.is_err());
+                if summary(&ours) != summary(&typed_json(&bytes)) {
+                    proptest::prop_assert_eq!(ours.err(), Some(DefinitionError::Malformed));
+                }
+                return Ok(());
+            }
+            proptest::prop_assert_eq!(summary(&parse_definition(&bytes)), summary(&typed_json(&bytes)));
+        }
+    }
+
+    #[test]
+    fn escaped_keys_and_strings_read_as_before() {
+        let doc = r#"{"@class": "org.apereo.cas.services.OidcRegisteredService",
+          "serviceId": "^https:\/\/u:FAKE-P@app.example.org\/.*",
+          "clientSecret": "${CLIENT_SECRET}",
+          "apiPassword": "FAKE-SECRET",
+          "description": "Owner jane.doe@example.org 😀",
+          "id": -0, "evaluationOrder": 9223372036854775808}"#;
+        let d = parse_definition(doc.as_bytes()).unwrap();
+        assert_eq!(summary(&Ok(d)), summary(&typed_json(doc.as_bytes())));
+        let d = parse_definition(doc.as_bytes()).unwrap();
+        assert_eq!(d.client_secret, SecretForm::Reference);
+        assert_eq!((d.id, d.evaluation_order), (None, None));
+        let kept = format!("{:?}", paths(&d));
+        assert!(kept.contains("jane.doe@example.org 😀"), "{kept}");
+        assert!(!kept.contains("FAKE-"), "{kept}");
+        // A lone surrogate in a kept string (or key) refuses the document,
+        // as before; in a skipped credential value it is not examined.
+        let base = r#""@class": "org.apereo.cas.services.CasRegisteredService", "serviceId": "x""#;
+        for bad in [
+            r#""description": "\ud800""#,
+            r#""\udc00": 1"#,
+            r#""clientSecret": "\ud800""#,
+        ] {
+            let doc = format!("{{{base}, {bad}}}");
+            assert_eq!(
+                parse_definition(doc.as_bytes()).unwrap_err(),
+                DefinitionError::Malformed,
+                "{doc}"
+            );
+            assert_eq!(
+                typed_json(doc.as_bytes()).unwrap_err(),
+                DefinitionError::Malformed,
+                "{doc}"
+            );
+        }
+        let doc = format!(r#"{{{base}, "apiPassword": "\ud800"}}"#);
+        assert!(parse_definition(doc.as_bytes()).is_ok());
+        // A file that is not UTF-8 is malformed, wherever the bytes are
+        // (as a YAML file is refused before parsing).
+        let mut doc = format!(r#"{{{base}, "apiPassword": "x"}}"#).into_bytes();
+        let at = doc.len() - 3;
+        doc.insert(at, 0xe9);
+        assert!(typed_json(&doc).is_ok());
+        assert_eq!(
+            parse_definition(&doc).unwrap_err(),
+            DefinitionError::Malformed
+        );
     }
 
     #[test]
@@ -1223,6 +1670,28 @@ mod tests {
             parse_definition(many.as_bytes()).unwrap_err(),
             DefinitionError::Bounds
         );
+        // Beyond the bounds and broken: refused as malformed (the whole
+        // document is checked as JSON first, review of #180).
+        let broken = format!("{{{base}, \"m\": {{{}", keys.join(","));
+        assert_eq!(
+            parse_definition(broken.as_bytes()).unwrap_err(),
+            DefinitionError::Malformed
+        );
+        let broken = format!("{{{base}, \"a\": {}", "[".repeat(10_000));
+        assert_eq!(
+            parse_definition(broken.as_bytes()).unwrap_err(),
+            DefinitionError::Malformed
+        );
+        // Valid but deep (no recursion limit when skipping): still bounds.
+        let deeper = format!(
+            "{{{base}, \"a\": {}{}}}",
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        assert_eq!(
+            parse_definition(deeper.as_bytes()).unwrap_err(),
+            DefinitionError::Bounds
+        );
         // Strings are cut on a character boundary.
         let long = "é".repeat(MAX_STRING_BYTES);
         let d = parse_definition(format!("{{{base}, \"description\": \"{long}\"}}").as_bytes())
@@ -1363,6 +1832,299 @@ mod tests {
             DefinitionError::Bounds
         );
         assert!(yaml("a: [1, 2]\nclientSecret: ${S}\n").is_ok());
+    }
+
+    /// The YAML path without the pre-scan's credential blanking (tags
+    /// blanked only): the reference of the blanking tests. Values must not
+    /// hold `!<`.
+    fn yaml_unblanked(bytes: &[u8]) -> Result<Definition, DefinitionError> {
+        let pre = yaml::prescan(bytes)?;
+        let mut in_tag = vec![false; bytes.len()];
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'!' && bytes[i + 1] == b'<' {
+                while i < bytes.len() && bytes[i] != b'>' {
+                    in_tag[i] = true;
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    in_tag[i] = true;
+                }
+            }
+            i += 1;
+        }
+        let mut text = pre.text.to_vec();
+        for (j, b) in text.iter_mut().enumerate() {
+            if *b == b' ' && !in_tag[j] {
+                *b = bytes[j];
+            }
+        }
+        parse_with(
+            serde_yaml_ng::Deserializer::from_slice(&text),
+            Some(pre.class),
+            false,
+        )
+    }
+
+    #[test]
+    fn yaml_credential_values_are_blanked_before_parsing() {
+        for (_, yaml) in PAIRS {
+            let pre = yaml::prescan(yaml.as_bytes()).unwrap();
+            // Positions unchanged: every byte is kept or a space.
+            assert_eq!(pre.text.len(), yaml.len());
+            assert!(
+                pre.text
+                    .iter()
+                    .zip(yaml.bytes())
+                    .all(|(a, b)| *a == b || *a == b' ')
+            );
+            let text = String::from_utf8(pre.text.to_vec()).unwrap();
+            for gone in [
+                "fake-clear-secret-0000",
+                "FAKE-PRIVATE",
+                "fake-alias",
+                "PT1H",
+            ] {
+                assert!(!text.contains(gone), "{gone} in {text}");
+            }
+            // Values the visitor reads are untouched.
+            for kept in ["HR-Portal", "jane.doe@example.org", "hr-staff"] {
+                assert_eq!(text.contains(kept), yaml.contains(kept), "{kept}");
+            }
+            assert_eq!(
+                summary(&parse_yaml_definition(yaml.as_bytes())),
+                summary(&yaml_unblanked(yaml.as_bytes()))
+            );
+        }
+        let pre = yaml::prescan(PAIRS[0].1.as_bytes()).unwrap();
+        assert_eq!(pre.client_secret, Some(SecretForm::Clear));
+        // Out of scope: a nested credential subtree keeps its values (the
+        // visitor skips them).
+        assert!(String::from_utf8_lossy(&pre.text).contains("fake-property-secret"));
+    }
+
+    #[test]
+    fn yaml_client_secret_forms_survive_blanking() {
+        for (value, form, blanked) in [
+            ("${CLIENT_SECRET}", SecretForm::Reference, true),
+            ("\"${CLIENT_SECRET}\"", SecretForm::Reference, true),
+            ("'#{systemProperties[''x'']}'", SecretForm::Reference, true),
+            ("'{cipher}AbCd'", SecretForm::Encrypted, true),
+            (
+                "eyJhbGciOiJSU0EtT0FFUCJ9.a2V5.aXY.Y2lwaGVy.dGFn",
+                SecretForm::Encrypted,
+                true,
+            ),
+            ("eyJhbGciOiJub25lIn0.ZmFrZQ.", SecretForm::Clear, true),
+            ("fake-clear # comment", SecretForm::Clear, true),
+            ("'it''s'", SecretForm::Clear, true),
+            ("\"  \"", SecretForm::Absent, true),
+            ("''", SecretForm::Absent, false),
+            ("~", SecretForm::Absent, true),
+            ("null", SecretForm::Absent, true),
+            ("NULL", SecretForm::Absent, true),
+            ("nil", SecretForm::Clear, true),
+            ("12345", SecretForm::Clear, true),
+            ("1.5", SecretForm::Clear, true),
+            ("true", SecretForm::Clear, true),
+            ("", SecretForm::Absent, false),
+            // Left to the visitor: an escape, a block scalar, a tag.
+            ("\"$\\x7bS}\"", SecretForm::Reference, false),
+            ("|\n  fake-block", SecretForm::Clear, false),
+            ("!<java.lang.String> fake-tagged", SecretForm::Clear, false),
+            ("\n  fake-next-line", SecretForm::Clear, false),
+        ] {
+            let doc = format!("{YAML_HEAD}clientSecret: {value}\ndescription: x\n");
+            let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+            assert_eq!(d.client_secret, form, "{value:?}");
+            assert_eq!(
+                summary(&Ok(d)),
+                summary(&yaml_unblanked(doc.as_bytes())),
+                "{value:?}"
+            );
+            let pre = yaml::prescan(doc.as_bytes()).unwrap();
+            assert_eq!(pre.client_secret.is_some(), blanked, "{value:?}");
+            assert_eq!(pre.text.len(), doc.len());
+        }
+        // Not at the top level: a key spelled `clientSecret` is left to
+        // the visitor (never blanked, no form).
+        let doc = format!(
+            "{YAML_HEAD}nested:\n  clientSecret: FAKE-NESTED\n  other: {{clientSecret: FAKE-FLOW, b: c}}\n"
+        );
+        let pre = yaml::prescan(doc.as_bytes()).unwrap();
+        let text = String::from_utf8_lossy(&pre.text).into_owned();
+        assert!(text.contains("FAKE-NESTED") && text.contains("FAKE-FLOW"));
+        assert_eq!(pre.client_secret, None);
+        let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+        assert_eq!(d.client_secret, SecretForm::Absent);
+        assert_eq!(summary(&Ok(d)), summary(&yaml_unblanked(doc.as_bytes())));
+        // A root flow mapping: its `clientSecret` is top-level.
+        let doc = "--- !<org.apereo.cas.services.OidcRegisteredService> {serviceId: x, clientSecret: '${S}', b: {clientSecret: FAKE-N}}\n";
+        let pre = yaml::prescan(doc.as_bytes()).unwrap();
+        assert_eq!(pre.client_secret, Some(SecretForm::Reference));
+        assert!(!String::from_utf8_lossy(&pre.text).contains("${S}"));
+        assert!(String::from_utf8_lossy(&pre.text).contains("FAKE-N"));
+        let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+        assert_eq!(d.client_secret, SecretForm::Reference);
+        assert_eq!(summary(&Ok(d)), summary(&yaml_unblanked(doc.as_bytes())));
+    }
+
+    /// A root block mapping indented under `--- !<class>` (valid YAML, and
+    /// CAS loads it): its `clientSecret` is top-level whatever the column
+    /// (review of #180, M1: it read as `Absent`, hiding a clear secret).
+    #[test]
+    fn yaml_indented_root_mappings_keep_the_client_secret_form() {
+        for indent in [1, 2, 3, 4, 8] {
+            let pad = " ".repeat(indent);
+            for (value, form) in [
+                ("fake-clear-secret", SecretForm::Clear),
+                ("'${S}'", SecretForm::Reference),
+                ("\"{cipher}AbCd\"", SecretForm::Encrypted),
+                ("~", SecretForm::Absent),
+            ] {
+                for (before, after) in [
+                    ("serviceId: \"^https://a\"\n", ""),
+                    ("", "serviceId: \"^https://a\"\n"),
+                    ("serviceId: x\nnested:\n  password: FAKE-P\n", "name: n\n"),
+                ] {
+                    let body: String = format!("{before}clientSecret: {value}\n{after}")
+                        .lines()
+                        .map(|l| format!("{pad}{l}\n"))
+                        .collect();
+                    let doc =
+                        format!("--- !<org.apereo.cas.services.OidcRegisteredService>\n{body}");
+                    let pre = yaml::prescan(doc.as_bytes()).unwrap();
+                    assert_eq!(pre.client_secret, Some(form), "{doc}");
+                    assert!(!String::from_utf8_lossy(&pre.text).contains("fake-clear"));
+                    let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+                    assert_eq!(d.client_secret, form, "{doc}");
+                    assert_eq!(summary(&Ok(d)), summary(&yaml_unblanked(doc.as_bytes())));
+                }
+            }
+        }
+        // The review's probe.
+        let doc = "--- !<org.apereo.cas.services.OidcRegisteredService>\n  serviceId: \"^https://a\"\n  clientSecret: fake-clear-secret\n";
+        assert_eq!(
+            parse_yaml_definition(doc.as_bytes()).unwrap().client_secret,
+            SecretForm::Clear
+        );
+        // A nested mapping at a deeper indentation is not top-level.
+        let doc = "--- !<org.apereo.cas.services.OidcRegisteredService>\n  serviceId: x\n  n:\n    clientSecret: FAKE-NESTED\n";
+        let pre = yaml::prescan(doc.as_bytes()).unwrap();
+        assert_eq!(pre.client_secret, None);
+        assert!(String::from_utf8_lossy(&pre.text).contains("FAKE-NESTED"));
+        let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+        assert_eq!(d.client_secret, SecretForm::Absent);
+    }
+
+    /// Blanking never turns an invalid escape into a valid document
+    /// (review of #180, L1): a double-quoted value with `\` is left as is.
+    #[test]
+    fn yaml_blanking_leaves_escapes_to_the_parser() {
+        for value in [
+            r#""\q""#,
+            r#""\uD800""#,
+            r#""ok\q""#,
+            r#""\uD83D\uDE00""#,
+            r#""\U00110000""#,
+            r#""\x4""#,
+            r#""\'""#,
+        ] {
+            for key in ["apiPassword", "password", "clientSecret"] {
+                let doc = format!("{YAML_HEAD}{key}: {value}\n");
+                let ours = parse_yaml_definition(doc.as_bytes());
+                assert!(matches!(ours, Err(DefinitionError::Malformed)), "{doc}");
+                assert_eq!(summary(&ours), summary(&yaml_unblanked(doc.as_bytes())));
+                let pre = yaml::prescan(doc.as_bytes()).unwrap();
+                assert_eq!(pre.text.len(), doc.len());
+                assert!(String::from_utf8_lossy(&pre.text).contains(value), "{doc}");
+            }
+        }
+        // Escapes libyaml accepts are blanked, and read the same.
+        for value in [
+            r#""fake\x41""#,
+            r#""fake\U0001F600\u00e9\"\\\/""#,
+            r#""{\"d\": \"FAKE-K\"}""#,
+        ] {
+            let doc = format!("{YAML_HEAD}apiPassword: {value}\n");
+            let text = yaml::prescan(doc.as_bytes()).unwrap().text;
+            assert!(!String::from_utf8_lossy(&text).contains("FAKE"), "{doc}");
+            assert!(!String::from_utf8_lossy(&text).contains("fake"), "{doc}");
+            assert_eq!(
+                summary(&parse_yaml_definition(doc.as_bytes())),
+                summary(&yaml_unblanked(doc.as_bytes())),
+                "{doc}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 1024,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Blanking never changes what the visitor reads (findings,
+        /// `SecretForm`, errors), and a same-line single-line value of a
+        /// credential key never reaches the parser.
+        #[test]
+        fn yaml_blanking_changes_nothing_the_visitor_reads(
+            entries in proptest::collection::vec((
+                proptest::sample::select(vec![
+                    "clientSecret", "password", "apiKey", "'pass''word'", "\"token\"", "name",
+                    "description", "x",
+                ]),
+                0u8..7,
+                "[A-Za-z0-9$./-]{0,12}|[A-Za-z0-9 ${}#'\".:~/-]{0,16}",
+                0u8..3,
+            ), 0..6),
+        ) {
+            let mut doc = YAML_HEAD.to_owned();
+            let mut markers = Vec::new();
+            for (i, (key, style, text, indent)) in entries.iter().enumerate() {
+                let marker = format!("MRK{i}Q");
+                let value = match style {
+                    0 => format!("{marker}{text}"),
+                    1 => format!("'{marker}{}'", text.replace('\'', "''")),
+                    2 => format!("\"{marker}{}\"", text.replace(['"', '\\'], "")),
+                    3 => format!("\n  {marker}{text}"),
+                    4 => format!("{text}{marker}"),
+                    5 => format!("{{a: {marker}, {key}: {marker}}}"),
+                    // An escape libyaml may accept or refuse (review of
+                    // #180, L1): the outcome must not change (`Z` keeps the
+                    // closing quote out of the escape).
+                    _ => format!("\"{marker}\\{}Z\"", text.replace(['"', '\\'], "")),
+                };
+                if *indent == 1 {
+                    doc.push_str(&format!("n{i}:\n  {key}: {}\n", value.replace('\n', "\n  ")));
+                } else {
+                    doc.push_str(&format!("{key}: {value}\n"));
+                }
+                let same_line_scalar = matches!(style, 0..=2) && !key.starts_with('"');
+                let is_cred = !matches!(*key, "name" | "description" | "x");
+                // A nested `clientSecret` is left to the visitor.
+                let nested_cs = *key == "clientSecret" && *indent == 1;
+                markers.push((marker, same_line_scalar && is_cred && !nested_cs));
+            }
+            let ours = parse_yaml_definition(doc.as_bytes());
+            let theirs = yaml_unblanked(doc.as_bytes());
+            proptest::prop_assert_eq!(summary(&ours), summary(&theirs), "{}", doc);
+            // The marker check needs every entry to stay where it was
+            // written (no quote, comment or flow indicator in plain text).
+            let clean = entries
+                .iter()
+                .all(|(_, _, t, _)| !t.contains(['\'', '"', '#', '{', '}', ':']) && !t.starts_with([' ', '-', '~']));
+            if let (true, Ok(pre)) = (clean, yaml::prescan(doc.as_bytes())) {
+                proptest::prop_assert_eq!(pre.text.len(), doc.len());
+                let text = String::from_utf8_lossy(&pre.text).into_owned();
+                for (marker, gone) in &markers {
+                    if *gone {
+                        proptest::prop_assert!(!text.contains(marker.as_str()), "{} in {}", marker, text);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

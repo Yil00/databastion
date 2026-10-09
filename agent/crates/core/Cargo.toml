@@ -24,7 +24,7 @@ tracing.workspace = true
 # compression.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
 serde_yaml_ng = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
 getrandom = { version = "0.4", default-features = false }
