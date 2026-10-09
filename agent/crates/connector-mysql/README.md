@@ -276,11 +276,12 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   them, always reported, never the agent's own; `SHOW ENGINE INNODB
   STATUS` and the plan of another connection (`SHOW EXPLAIN`, `EXPLAIN …
   FOR CONNECTION`) are reads of `*`. The agent's own `performance_schema`
-  polls are constant texts (the poll's thread id, timer and text
-  threshold are session user variables, `sql::ps_poll_variables`), left
-  out uncharged only by their whole uncut text with table records of
-  their own tables (`sql::own_performance_schema_reads`); its readability
-  probes are `EXPLAIN`s (the same privilege, no row read, quiet). Details:
+  polls are constant texts (the server computes their own thread and
+  `SQL_TEXT` threshold; only the cursor is a session user variable,
+  `sql::ps_poll_variables`), left out uncharged only by their whole uncut
+  text with table records of their own tables
+  (`sql::own_performance_schema_reads`); its readability probes are
+  `EXPLAIN`s (the same privilege, no row read, quiet). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by

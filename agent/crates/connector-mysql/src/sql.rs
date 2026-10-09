@@ -799,7 +799,7 @@ pub(crate) const PS_CONSUMERS: &str = "SELECT c.NAME, c.ENABLED \
      FROM performance_schema.setup_consumers c \
      WHERE c.NAME IN ('events_statements_history_long', 'events_statements_history', \
                       'events_statements_current', 'global_instrumentation', \
-                      'thread_instrumentation')";
+                      'thread_instrumentation', 'statements_digest')";
 
 /// Readability of the statement history: `EXPLAIN` needs the `SELECT`
 /// privilege on the table (error 1142 without it, 1146 for a table that
@@ -844,31 +844,55 @@ pub(crate) const PS_POLL_TABLES: [&str; 3] = [
 /// [`ps_statements`]).
 pub(crate) const PS_BATCH: usize = 2000;
 
-/// The session user variables of the poll texts (ADR-0045 decision 4),
-/// sent on the poll session right before [`ps_stats`] and each
-/// [`ps_statements`]: this session's thread id, the end timer to read
-/// from, and the digest length from which `SQL_TEXT` is read. A session
-/// `SET` of user variables produces no event (`audit::events::is_quiet`),
-/// and keeps the poll texts constant, so that the Audit stream recognizes
-/// them by their exact text.
+/// This session's `performance_schema` thread id, computed by the server
+/// inside the stats texts (security review of #186, H1: a session variable
+/// set by the client could be set to another value by anyone replaying
+/// the constant text with the agent's credential). The poll texts leave
+/// their own thread out on the `threads` row they join instead
+/// ([`ps_statements`]).
+pub(crate) const PS_OWN_THREAD_EXPR: &str = "(SELECT o.THREAD_ID FROM performance_schema.threads o \
+     WHERE o.PROCESSLIST_ID = CONNECTION_ID())";
+
+/// The digest length from which the poll also reads `SQL_TEXT`
+/// (`audit::pfs::sql_text_from` of the smaller digest limit), computed by
+/// the server from its own settings inside the poll text (security review
+/// of #186, H1). Both settings are global only (`@@` reads the global
+/// value) and at most 1 MiB (`audit::pfs::MAX_TEXT_BYTES`); `GREATEST`
+/// before the subtraction keeps the unsigned value from going below zero.
+/// Pinned to the Rust function by a unit test and, on each server, by an
+/// integration test.
 #[must_use]
-pub(crate) fn ps_poll_variables(own_thread: u64, from: u64, sql_text_from: usize) -> String {
+pub(crate) fn ps_sql_text_from_expr() -> String {
+    let sub = crate::audit::pfs::MAX_DIGEST_TOKEN + 3;
     format!(
-        "SET @databastion_thread = {own_thread}, @databastion_from = {from}, \
-         @databastion_text_from = {sql_text_from}"
+        "(GREATEST(LEAST(@@performance_schema_max_digest_length, @@max_digest_length), \
+         {sub}) - {sub}) DIV 3"
     )
+}
+
+/// The session user variable of the poll texts (ADR-0045 decision 4),
+/// sent on the poll session right before each [`ps_statements`]: the end
+/// timer to read from (the agent's cursor). A session `SET` of a user
+/// variable produces no event (`audit::events::is_quiet`), and keeps the
+/// poll texts constant, so that the Audit stream recognizes them by their
+/// exact text. The thread id and the `SQL_TEXT` threshold are computed by
+/// the server ([`PS_OWN_THREAD_EXPR`], [`ps_sql_text_from_expr`]): whoever
+/// replays a poll text with the agent's credential chooses only where to
+/// read from, and reads what the poll reads.
+#[must_use]
+pub(crate) fn ps_poll_variables(from: u64) -> String {
+    format!("SET @databastion_from = {from}")
 }
 
 /// Timers of an Audit poll: this session's current statement start (the
 /// timer's "now") and the oldest and newest end in the polled table. No
-/// text. `table` is one of [`PS_POLL_TABLES`]; the thread id is
-/// `@databastion_thread` ([`ps_poll_variables`]). A constant text per
-/// table.
+/// text. `table` is one of [`PS_POLL_TABLES`]. A constant text per table,
+/// with no variable.
 #[must_use]
 pub(crate) fn ps_stats(table: &str) -> String {
     format!(
         "SELECT (SELECT c.TIMER_START FROM performance_schema.events_statements_current c \
-                 WHERE c.THREAD_ID = @databastion_thread ORDER BY c.EVENT_ID DESC LIMIT 1), \
+                 WHERE c.THREAD_ID = {PS_OWN_THREAD_EXPR} ORDER BY c.EVENT_ID DESC LIMIT 1), \
                 MIN(h.TIMER_END), MAX(h.TIMER_END) FROM performance_schema.{table} h"
     )
 }
@@ -876,16 +900,16 @@ pub(crate) fn ps_stats(table: &str) -> String {
 /// The Audit poll of `performance_schema` statements (the only statement
 /// that reads statement text, ADR-0018): `DIGEST_TEXT`, and `SQL_TEXT` only
 /// for a statement without a digest, with a digest of
-/// `@databastion_text_from` bytes or more (it may have been cut at its
+/// [`ps_sql_text_from_expr`] bytes or more (it may have been cut at its
 /// token storage: `pfs::digest_cut`), or of the agent's own sessions (the
 /// poll session's login user and client host, from `USER()`: its
 /// Discovery statements are recognized by their exact text); with the
 /// session's account, host, type and `program_name` while it is
 /// connected. Rows are ordered by end timer from `@databastion_from`, this
-/// session's own thread (`@databastion_thread`) excluded, at most
+/// session's own thread excluded (its `threads` row has this connection's
+/// id; `<=>` keeps the rows of ended threads, which have none), at most
 /// [`PS_BATCH`]. `table` is one of [`PS_POLL_TABLES`]. A constant text per
-/// table and `with_program` (the variables are set by
-/// [`ps_poll_variables`]).
+/// table and `with_program` (the cursor is set by [`ps_poll_variables`]).
 #[must_use]
 pub(crate) fn ps_statements(table: &str, with_program: bool) -> String {
     let program = if with_program {
@@ -894,17 +918,17 @@ pub(crate) fn ps_statements(table: &str, with_program: bool) -> String {
     } else {
         "NULL"
     };
+    let text_from = ps_sql_text_from_expr();
     format!(
         "SELECT h.THREAD_ID, h.EVENT_ID, h.TIMER_END, h.CURRENT_SCHEMA, h.DIGEST_TEXT, \
-         CASE WHEN h.DIGEST_TEXT IS NULL OR LENGTH(h.DIGEST_TEXT) >= @databastion_text_from \
-           OR (t.PROCESSLIST_USER = SUBSTRING_INDEX(USER(), '@', 1) \
-               AND t.PROCESSLIST_HOST = SUBSTRING_INDEX(USER(), '@', -1)) \
+         CASE WHEN h.DIGEST_TEXT IS NULL OR LENGTH(h.DIGEST_TEXT) >= {text_from} \
+           OR CONCAT(t.PROCESSLIST_USER, '@', t.PROCESSLIST_HOST) = USER() \
          THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
          h.MYSQL_ERRNO, t.PROCESSLIST_USER, t.PROCESSLIST_HOST, t.TYPE, {program} \
          FROM performance_schema.{table} h \
          LEFT JOIN performance_schema.threads t ON t.THREAD_ID = h.THREAD_ID \
          WHERE h.TIMER_END >= @databastion_from AND h.END_EVENT_ID IS NOT NULL \
-           AND h.THREAD_ID <> @databastion_thread \
+           AND NOT t.PROCESSLIST_ID <=> CONNECTION_ID() \
          ORDER BY h.TIMER_END, h.THREAD_ID, h.EVENT_ID LIMIT {PS_BATCH}"
     )
 }
@@ -932,7 +956,10 @@ pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)>
         (PS_OWN_THREAD.to_owned(), vec!["threads"]),
     ];
     for table in PS_POLL_TABLES {
-        v.push((ps_stats(table), vec!["events_statements_current", table]));
+        v.push((
+            ps_stats(table),
+            vec!["events_statements_current", "threads", table],
+        ));
         v.push((ps_statements(table, false), vec![table, "threads"]));
         v.push((
             ps_statements(table, true),
@@ -1103,7 +1130,7 @@ mod tests {
             MAX_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long"),
-            ps_poll_variables(7, 8, 9),
+            ps_poll_variables(8),
         ];
         for roles in role_lists() {
             v.extend(show_grants_using(&roles).unwrap());
@@ -1341,7 +1368,7 @@ mod tests {
             all.push(columns(n, n).unwrap());
         }
         all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
-        all.push(ps_poll_variables(u64::MAX, u64::MAX, usize::MAX));
+        all.push(ps_poll_variables(u64::MAX));
         all.push(kill_query(u32::MAX));
         all.extend(cas_guard_statement_texts(None).unwrap());
         for roles in role_lists() {
@@ -1396,6 +1423,16 @@ mod tests {
                 if d == "general_log" && lower.contains("@@global.general_log") {
                     continue;
                 }
+                // The poll stats text finds its own thread by its
+                // connection id (`PS_OWN_THREAD_EXPR`), not the processlist.
+                if d == "processlist"
+                    && lower
+                        .replace(&PS_OWN_THREAD_EXPR.to_lowercase(), "")
+                        .find("processlist")
+                        .is_none()
+                {
+                    continue;
+                }
                 // A length setting, not the statement text.
                 if d == "sql_text"
                     && lower == "select @@global.performance_schema_max_sql_text_length"
@@ -1419,9 +1456,10 @@ mod tests {
             assert_eq!(lower.matches("sql_text").count(), 1, "{s}");
             assert!(
                 lower.contains(
-                    "case when h.digest_text is null or length(h.digest_text) >= @databastion_text_from \
-                     or (t.processlist_user = substring_index(user(), '@', 1) \
-                     and t.processlist_host = substring_index(user(), '@', -1)) \
+                    "case when h.digest_text is null or length(h.digest_text) >= \
+                     (greatest(least(@@performance_schema_max_digest_length, \
+                     @@max_digest_length), 263) - 263) div 3 \
+                     or concat(t.processlist_user, '@', t.processlist_host) = user() \
                      then h.sql_text end"
                 ),
                 "{s}"
@@ -1443,7 +1481,11 @@ mod tests {
             if with_program {
                 assert!(lower.contains("a.attr_name = 'program_name'"));
             }
-            assert!(lower.contains("h.thread_id <> @databastion_thread"), "{s}");
+            assert!(
+                lower.contains("and not t.processlist_id <=> connection_id() order by"),
+                "{s}"
+            );
+            assert!(!lower.contains("@databastion_thread") && !lower.contains("@databastion_text"));
             assert!(lower.contains("h.timer_end >= @databastion_from"), "{s}");
             assert!(lower.ends_with(" limit 2000"), "{s}");
         }
@@ -1476,8 +1518,10 @@ mod tests {
             listed.sort();
             listed.dedup();
             assert_eq!(named, listed, "{text}");
-            // Constant: no number but the fixed limits.
+            // Constant: no number but the fixed limits and the threshold
+            // formula's constants (security review of #186, H1).
             let stripped = text
+                .replace(&ps_sql_text_from_expr(), "")
                 .replace("LIMIT 2000", "")
                 .replace("LIMIT 1", "")
                 .replace("'@', -1", "")
@@ -1490,8 +1534,9 @@ mod tests {
             );
             assert!(stored_len(text.as_bytes()) <= MAX_OWN_STATEMENT, "{text}");
         }
-        for (thread, from, text_from) in [(0, 0, 0), (u64::MAX, u64::MAX, usize::MAX)] {
-            let set = ps_poll_variables(thread, from, text_from);
+        for from in [0, u64::MAX] {
+            let set = ps_poll_variables(from);
+            assert_eq!(set, format!("SET @databastion_from = {from}"));
             let a = analyze(&set, AnalyzeOptions::mysql());
             assert!(a.lexed(), "{set}");
             for p in a.parts() {
@@ -1509,6 +1554,42 @@ mod tests {
             ]
             .map(|t| t.name().to_owned())
         );
+    }
+
+    /// The server-side `SQL_TEXT` threshold of the poll text is the Rust
+    /// one (`pfs::sql_text_from` of the smaller digest limit, each capped
+    /// at `pfs::MAX_TEXT_BYTES`; security review of #186, H1).
+    #[test]
+    fn the_server_side_threshold_is_the_rust_one() {
+        use crate::audit::pfs::{MAX_DIGEST_TOKEN, MAX_TEXT_BYTES, sql_text_from};
+        let expr = ps_sql_text_from_expr();
+        assert_eq!(
+            expr,
+            "(GREATEST(LEAST(@@performance_schema_max_digest_length, @@max_digest_length), \
+             263) - 263) DIV 3"
+        );
+        // The SQL formula, evaluated as the server does (unsigned values
+        // that never go below zero, `DIV` truncating). The servers cap
+        // both settings at 1 MiB (`MAX_TEXT_BYTES`).
+        let sql = |ps: u64, parser: u64| -> u64 {
+            let sub = u64::try_from(MAX_DIGEST_TOKEN + 3).unwrap();
+            (ps.min(parser).max(sub) - sub) / 3
+        };
+        let values = [
+            0, 1, 100, 262, 263, 264, 265, 266, 500, 1023, 1024, 1025, 4096, 65_536, 1_048_575,
+            1_048_576,
+        ];
+        for ps in values {
+            for parser in values {
+                let limit = |v: u64| usize::try_from(v).unwrap().min(MAX_TEXT_BYTES);
+                let rust = sql_text_from(limit(ps).min(limit(parser)));
+                assert_eq!(
+                    usize::try_from(sql(ps, parser)).unwrap(),
+                    rust,
+                    "{ps} {parser}"
+                );
+            }
+        }
     }
 
     /// Every statement the agent sends is a recognized read or on the

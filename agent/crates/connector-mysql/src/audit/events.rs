@@ -143,12 +143,14 @@ fn is_system_relation(r: &RelationName, database: &str) -> bool {
 }
 
 /// Where a statement-text table holds statement text (ADR-0045 decision
-/// 1): on both flavors, or on one only.
+/// 1): on both flavors, or on MySQL only (`events_statements_summary_by_digest`
+/// holds digests only on MariaDB). A table that one flavor does not have
+/// is still listed for both: the flavor comes from the server's version
+/// string, which a proxy can rewrite (security review of #186, L2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextOn {
     Both,
     Mysql,
-    Mariadb,
 }
 
 /// The system tables that hold other sessions' statement texts with their
@@ -193,17 +195,28 @@ pub(crate) const STATEMENT_TEXT_TABLES: &[(&str, &str, TextOn)] = &[
     // `PROCESSLIST_INFO`.
     ("performance_schema", "threads", TextOn::Both),
     // `INFO` (MySQL 8.0.22+).
-    ("performance_schema", "processlist", TextOn::Mysql),
+    ("performance_schema", "processlist", TextOn::Both),
     // `LOCK_DATA`: values of locked index records (MySQL 8.0+).
-    ("performance_schema", "data_locks", TextOn::Mysql),
+    ("performance_schema", "data_locks", TextOn::Both),
+    // `VARIABLE_VALUE`: other sessions' user variables, which can hold
+    // values read from tables (`SET @x = (SELECT …)`).
+    (
+        "performance_schema",
+        "user_variables_by_thread",
+        TextOn::Both,
+    ),
     // `INFO` (and `INFO_BINARY` on MariaDB).
     ("information_schema", "PROCESSLIST", TextOn::Both),
+    // `WORD`: words of the rows of the table set in the global
+    // `innodb_ft_aux_table` (its full-text index).
+    ("information_schema", "INNODB_FT_INDEX_TABLE", TextOn::Both),
+    ("information_schema", "INNODB_FT_INDEX_CACHE", TextOn::Both),
     // `trx_query`.
     ("information_schema", "INNODB_TRX", TextOn::Both),
     // `lock_data` (MariaDB; MySQL 8.0 removed the table).
-    ("information_schema", "INNODB_LOCKS", TextOn::Mariadb),
+    ("information_schema", "INNODB_LOCKS", TextOn::Both),
     // `STATEMENT_TEXT` (the `query_cache_info` plugin, when loaded).
-    ("information_schema", "QUERY_CACHE_INFO", TextOn::Mariadb),
+    ("information_schema", "QUERY_CACHE_INFO", TextOn::Both),
     // `current_statement`, `last_statement` (MariaDB: `sys` since 10.6).
     ("sys", "processlist", TextOn::Both),
     ("sys", "x$processlist", TextOn::Both),
@@ -230,11 +243,41 @@ pub(crate) fn statement_text_table(
             let here = match (on, flavor) {
                 (TextOn::Both, _) | (_, None) => true,
                 (TextOn::Mysql, Some(f)) => f == Flavor::Mysql,
-                (TextOn::Mariadb, Some(f)) => f == Flavor::Mariadb,
             };
             here && d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table)
         })
         .map(|(d, t, _)| (*d, *t))
+}
+
+/// A `USE` with another statement in one text, in either order (security
+/// review of #186, M1): unqualified names after it resolve in the database
+/// it sets, and the database a source logs for the whole text may be the
+/// one before or after it, so the objects cannot be told (`USE
+/// performance_schema; SELECT SQL_TEXT FROM events_statements_history_long`).
+/// Fails closed like a hidden read. (MariaDB 11.4 `server_audit` and the
+/// Percona 8.4 `audit_log_filter` log each statement of a multi-statement
+/// packet as its own record, with the database current at it on
+/// `server_audit`; this is for sources or clients that do not.)
+fn use_then(x: &QueryAnalysis) -> bool {
+    x.statements() > 1
+        && x.parts()
+            .iter()
+            .any(|p| p.lead.first().map(String::as_str) == Some("use"))
+}
+
+/// Whether an object resolved in an unknown database (`db` empty: an
+/// unqualified name on a source that logs no current database, the
+/// `audit_log_filter` JSON general records) may be a statement-text table:
+/// its name is a listed table's name in any schema (`USE
+/// performance_schema` in an earlier record, or a connect database, then
+/// `SELECT … FROM events_statements_history_long`). It keeps the name the
+/// source shows (`processlist` is in three schemas), and is marked like a
+/// listed table: always reported, never the agent's own.
+fn unresolved_text_table(flavor: Option<Flavor>, db: &str, table: &str) -> bool {
+    db.is_empty()
+        && STATEMENT_TEXT_TABLES.iter().any(|(d, t, _)| {
+            t.eq_ignore_ascii_case(table) && statement_text_table(flavor, d, t).is_some()
+        })
 }
 
 /// `SHOW [FULL] PROCESSLIST`: a read of `information_schema.PROCESSLIST`
@@ -253,14 +296,18 @@ fn is_show_processlist(p: &StatementInfo) -> bool {
 /// `PERFORMANCE_SCHEMA STATUS` and `… MUTEX`, fail closed), and the plan
 /// of another connection's statement (`SHOW EXPLAIN` / `SHOW ANALYZE …
 /// FOR`, `EXPLAIN … FOR CONNECTION`: its text, verified on MariaDB 11.4,
-/// and its literals in MySQL 8.4's `FORMAT=TREE`). A read of `*`, always
-/// reported, never the agent's own.
+/// and its literals in MySQL 8.4's `FORMAT=TREE`), and the statements of
+/// the binary and relay logs (`SHOW BINLOG EVENTS`, `SHOW RELAYLOG EVENTS`:
+/// security review of #186, M3). A read of `*`, always reported, never the
+/// agent's own.
 fn shows_session_text(p: &StatementInfo) -> bool {
     let lead: Vec<&str> = p.lead.iter().map(String::as_str).collect();
     let engine = match lead.as_slice() {
         ["show", "engine", "performance_schema", "status", ..]
         | ["show", "engine", _, "mutex", ..] => false,
-        ["show", "engine", ..] | ["show", "innodb", "status", ..] => true,
+        ["show", "engine", ..]
+        | ["show", "innodb", "status", ..]
+        | ["show", "binlog" | "relaylog", "events", ..] => true,
         _ => false,
     };
     engine || p.explain_connection
@@ -1193,7 +1240,7 @@ impl EventBuilder {
         }) || analysis
             .iter()
             .chain(&alt_analysis)
-            .any(|x| x.lexed() && x.statements() > x.parts().len())
+            .any(|x| x.lexed() && (x.statements() > x.parts().len() || use_then(x)))
             || analysis
                 .iter()
                 .chain(&alt_analysis)
@@ -1380,12 +1427,16 @@ impl EventBuilder {
         // named first (an event names 16 objects at most), always
         // reported, and never the agent's own (its exact texts are left
         // out above).
-        let text_tables = objects
-            .iter()
-            .any(|(db, t)| statement_text_table(self.flavor, db, t).is_some());
+        let text_tables = objects.iter().any(|(db, t)| {
+            statement_text_table(self.flavor, db, t).is_some()
+                || unresolved_text_table(self.flavor, db, t)
+        });
         if text_tables {
             let flavor = self.flavor;
-            objects.sort_by_key(|(db, t)| statement_text_table(flavor, db, t).is_none());
+            objects.sort_by_key(|(db, t)| {
+                statement_text_table(flavor, db, t).is_none()
+                    && !unresolved_text_table(flavor, db, t)
+            });
         }
         if rw && objects.is_empty() && !unknown && !dquoted {
             // A read of system tables only, or no table at all (`SELECT
@@ -4671,10 +4722,21 @@ mod tests {
         assert!(
             statement_text_table(Some(Flavor::Mysql), "performance_schema", "DATA_LOCKS").is_some()
         );
-        assert!(
-            statement_text_table(Some(Flavor::Mariadb), "performance_schema", "data_locks")
-                .is_none()
-        );
+        // Only `summary_by_digest` depends on the flavor; the version string
+        // can lie (a proxy), so tables one flavor lacks are listed for both
+        // (security review of #186, L2).
+        for (db, t) in [
+            ("performance_schema", "data_locks"),
+            ("performance_schema", "processlist"),
+            ("information_schema", "INNODB_LOCKS"),
+            ("information_schema", "QUERY_CACHE_INFO"),
+            ("information_schema", "INNODB_FT_INDEX_TABLE"),
+            ("performance_schema", "user_variables_by_thread"),
+        ] {
+            for f in [Flavor::Mysql, Flavor::Mariadb] {
+                assert!(statement_text_table(Some(f), db, t).is_some(), "{f:?} {t}");
+            }
+        }
         assert!(statement_text_table(None, "information_schema", "TABLES").is_none());
         assert!(statement_text_table(None, "hr", "threads").is_none());
     }
@@ -4718,6 +4780,70 @@ mod tests {
             for user in ["app", "databastion"] {
                 for (source, ev) in on_every_source(user, text) {
                     assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+    }
+
+    /// Security review of #186: a `USE` with another statement in one
+    /// text, in either order (M1); the binary and relay log events (M3);
+    /// an unqualified listed name in an unknown database (the JSON general
+    /// records log none): always reported, never the agent's own.
+    #[test]
+    fn use_binlog_and_unknown_databases_fail_closed() {
+        for text in [
+            "USE performance_schema; SELECT SQL_TEXT FROM events_statements_history_long",
+            "SELECT SQL_TEXT FROM events_statements_history_long; USE performance_schema",
+            "USE hr; SELECT 1",
+            "SELECT 1; USE performance_schema",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let e = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert!(e.always_report(), "{user} {source:?}: {text}");
+                    assert!(
+                        e.objects().iter().any(|o| o.object().as_str() == "*"),
+                        "{user} {source:?}: {text}"
+                    );
+                }
+            }
+        }
+        // `USE` alone stays quiet.
+        for (source, ev) in on_every_source("app", "USE performance_schema") {
+            assert!(ev.is_none(), "{source:?}");
+        }
+        for text in [
+            "SHOW BINLOG EVENTS",
+            "SHOW BINLOG EVENTS IN 'binlog.000002' FROM 4 LIMIT 10",
+            "show relaylog events",
+            "SHOW RELAYLOG EVENTS FOR CHANNEL 'c'",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+        }
+        for (source, ev) in on_every_source("app", "SHOW BINARY LOGS") {
+            assert!(ev.is_none(), "{source:?}");
+        }
+        // An unqualified listed name with no database logged (the JSON
+        // file and `performance_schema` records of these tests log none):
+        // always reported, from any account; `server_audit` logs `shop`.
+        for (table, want) in [
+            ("events_statements_history_long", true),
+            ("processlist", true),
+            ("user_variables_by_thread", true),
+            ("customers", false),
+        ] {
+            let text = format!("SELECT * FROM {table}");
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, &text) {
+                    if source == EventSource::MariadbServerAudit {
+                        continue;
+                    }
+                    if want {
+                        let e = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                        assert!(e.always_report(), "{user} {source:?}: {text}");
+                    } else if let Some(e) = ev {
+                        assert!(!e.always_report(), "{user} {source:?}: {text}");
+                    }
                 }
             }
         }
@@ -4861,10 +4987,9 @@ mod tests {
         }
         // The session variables of the poll texts: quiet, from any account.
         for user in ["databastion", "app"] {
-            for (source, ev) in on_every_source(
-                user,
-                &crate::sql::ps_poll_variables(42, 1_234_567_890_123, 253),
-            ) {
+            for (source, ev) in
+                on_every_source(user, &crate::sql::ps_poll_variables(1_234_567_890_123))
+            {
                 assert!(ev.is_none(), "{user} {source:?}");
             }
         }

@@ -92,6 +92,10 @@ pub(crate) struct AuditProbe {
     pub(crate) current_readable: bool,
     pub(crate) history_readable: bool,
     pub(crate) history_long_readable: bool,
+    /// The `statements_digest` consumer is listed and disabled: no
+    /// statement gets a digest, so the `performance_schema` poll reads
+    /// every statement's `SQL_TEXT` (security review of #186, H1).
+    pub(crate) digest_disabled: bool,
     /// MariaDB `server_audit`: active, logging on, file output, and
     /// statements or tables among the logged events.
     pub(crate) server_audit: Option<ServerAudit>,
@@ -293,6 +297,17 @@ impl AuditProbe {
         if self.history_long_enabled && self.consumers_readable && !self.history_long_readable {
             out.push("performance_schema statement history not readable by the account".to_owned());
             codes.push(TargetNote::new(NoteCode::AuditHistoryNotReadable));
+        }
+        if self.ps_enabled && self.consumers_readable && self.digest_disabled {
+            // No closed note code fits (`shared/protocol` unchanged): the
+            // local detail only.
+            out.push(
+                "performance_schema statements_digest consumer disabled: no statement has a \
+                 digest, so the performance_schema Audit poll reads every statement's text \
+                 (SQL_TEXT, with its literals), and so does whoever replays the poll with \
+                 the agent's credential"
+                    .to_owned(),
+            );
         }
         if self.general_log {
             out.push("general log enabled (not used as an audit source)".to_owned());
@@ -1112,6 +1127,7 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
                     Some("events_statements_current") => p.current_enabled = enabled,
                     Some("global_instrumentation") => global = enabled,
                     Some("thread_instrumentation") => thread = enabled,
+                    Some("statements_digest") => p.digest_disabled = !enabled,
                     _ => {}
                 }
             }
@@ -2425,11 +2441,34 @@ mod tests {
             current_readable: true,
             history_readable: true,
             history_long_readable: true,
+            digest_disabled: false,
             server_audit: None,
             audit_log: None,
             audit_log_filter: None,
             general_log: false,
         }
+    }
+
+    /// Security review of #186, H1: a disabled `statements_digest`
+    /// consumer is shown (local detail; no closed note code fits) and
+    /// changes neither the level nor the notes.
+    #[test]
+    fn a_disabled_digest_consumer_is_shown() {
+        let on = ps_probe();
+        let off = AuditProbe {
+            digest_disabled: true,
+            ..ps_probe()
+        };
+        let (text_on, codes_on) = on.explain(None);
+        let (text_off, codes_off) = off.explain(None);
+        assert!(!text_on.iter().any(|t| t.contains("statements_digest")));
+        assert!(
+            text_off
+                .iter()
+                .any(|t| t.contains("statements_digest consumer disabled"))
+        );
+        assert_eq!(codes_on, codes_off);
+        assert_eq!(on.level(), off.level());
     }
 
     #[test]

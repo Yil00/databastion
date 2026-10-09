@@ -127,14 +127,28 @@ async fn statement_text_tables_match_the_server() {
              or to NOT_STATEMENT_TEXT with a reason): {missing:#?}",
             server.name
         );
-        // Listed tables this server does not have (a plugin not loaded, an
-        // older series): noted, not a failure.
+        // Listed tables this server does not have (a plugin not loaded, a
+        // table of the other flavor): noted, not a failure.
+        let existing: Vec<(String, String)> = a
+            .query(
+                Stage::Check,
+                "SELECT LOWER(TABLE_SCHEMA), TABLE_NAME FROM information_schema.TABLES \
+                 WHERE LOWER(TABLE_SCHEMA) IN ('information_schema', 'performance_schema', 'sys')",
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                let get = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+                (get(0), get(1))
+            })
+            .collect();
         let absent: Vec<String> = STATEMENT_TEXT_TABLES
             .iter()
             .filter(|(d, t, _)| statement_text_table(Some(flavor), d, t).is_some())
             .filter(|(d, t, _)| {
-                !tables
-                    .keys()
+                !existing
+                    .iter()
                     .any(|(x, y)| x.eq_ignore_ascii_case(d) && y.eq_ignore_ascii_case(t))
             })
             .map(|(d, t, _)| format!("{d}.{t}"))
@@ -219,6 +233,9 @@ async fn statement_text_reads_are_named_and_the_agents_own_are_not() {
                 Some(EventSource::PerformanceSchema)
             );
         }
+        // Statements of earlier tests' ended sessions (no account) stay
+        // out of the streams' first overlap window (2 s).
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let (s1, s2) = (TempDir::new(), TempDir::new());
         let (task1, mut rx1) = start_audit(Arc::clone(&connector), &t1, &s1.0);
         let (task2, mut rx2) = start_audit(Arc::clone(&connector), &t2, &s2.0);
@@ -332,5 +349,51 @@ async fn statement_text_reads_are_named_and_the_agents_own_are_not() {
         for user in [STX_AGENT, STX_READER] {
             exec(&mut a, &format!("DROP USER IF EXISTS '{user}'@'%'")).await;
         }
+    }
+}
+
+/// Security review of #186, H1: every constant own `performance_schema`
+/// text runs on the server after the poll's `SET`, and the server-side
+/// `SQL_TEXT` threshold equals the Rust one for the server's settings.
+#[tokio::test]
+async fn own_performance_schema_texts_run_and_their_threshold_is_the_rust_one() {
+    let _serial = SERIAL.lock().await;
+    let mut all = servers();
+    all.extend(percona());
+    for server in all {
+        let Some(admin) = server.admin.clone() else {
+            skip(
+                &format!("{}-admin", server.name),
+                "admin URL not set (own performance_schema texts)",
+            );
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        let version = scalar(&mut a, "SELECT VERSION()").await.unwrap_or_default();
+        exec(&mut a, &crate::sql::ps_poll_variables(0)).await;
+        for (text, _) in crate::sql::own_performance_schema_reads() {
+            if let Err(e) = a.query(Stage::Check, &text).await {
+                panic!("{} {version}: {e:?}: {text}", server.name);
+            }
+        }
+        let limit = |v: Option<String>| {
+            v.and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1024)
+                .min(crate::audit::pfs::MAX_TEXT_BYTES)
+        };
+        let ps = limit(scalar(&mut a, crate::sql::PS_DIGEST_LIMIT).await);
+        let parser = limit(scalar(&mut a, crate::sql::MAX_DIGEST_LIMIT).await);
+        let server_value = scalar(
+            &mut a,
+            &format!("SELECT {}", crate::sql::ps_sql_text_from_expr()),
+        )
+        .await
+        .and_then(|v| v.parse::<usize>().ok());
+        let rust = crate::audit::pfs::sql_text_from(ps.min(parser));
+        eprintln!(
+            "{} {version}: digest limits {ps} / {parser}, SQL_TEXT from {server_value:?} (Rust {rust})",
+            server.name
+        );
+        assert_eq!(server_value, Some(rust), "{} {version}", server.name);
     }
 }
