@@ -79,14 +79,16 @@
 //! of a root flow mapping) is computed here first, from the value before
 //! blanking, and given back in [`Prescanned::client_secret`]; any other
 //! key spelled `clientSecret` is never blanked, so that the visitor reads
-//! it as before. A double-quoted value holding `\` is never blanked
-//! either: its escapes are left for the parser to accept or refuse
-//! (blanking must not turn an invalid document into a valid one). Out of
-//! scope (left to a future parser change, ROADMAP phase 8 follow-ups):
-//! values on the next line, multi-line and block scalars, values after a
-//! tag, nested credential subtrees (`password:` followed by a mapping or
-//! a sequence), keys written with a double-quoted escape, and
-//! double-quoted values with an escape. This fails safe: whatever the
+//! it as before. A double-quoted value is blanked only when every escape
+//! in it is one libyaml accepts ([`escapes_valid`]); a value with a refused
+//! escape is left for the parser to refuse (blanking must not turn an
+//! invalid document into a valid one), and the top-level `clientSecret`
+//! with any escape is left to the visitor. Out of scope (left to a future
+//! parser change, ROADMAP phase 8 follow-ups): values on the next line,
+//! multi-line and block scalars, values after a tag, nested credential
+//! subtrees (`password:` followed by a mapping or a sequence), keys
+//! written with a double-quoted escape, and double-quoted values with a
+//! refused escape. This fails safe: whatever the
 //! scanner does not blank is still skipped by the visitor, as before
 //! (only the unwiped copies remain).
 
