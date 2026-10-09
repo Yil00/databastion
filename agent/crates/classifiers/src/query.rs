@@ -104,8 +104,12 @@ enum Tok {
     /// literal is expected, kept apart only to recognize a name position
     /// (`FROM "t"`, `"db"."t"`, `"f"(`). Its content is not kept: only
     /// whether it is an audit log administration function name
-    /// ([`is_audit_function`]), decided at lex time.
-    DQuoted { audit_function: bool },
+    /// ([`is_audit_function`]) or `LOAD_FILE` ([`is_file_function`]),
+    /// decided at lex time.
+    DQuoted {
+        audit_function: bool,
+        file_function: bool,
+    },
     /// Operator or punctuation.
     Punct(String),
 }
@@ -279,10 +283,11 @@ fn lex_mysql_range(
                 let from = i + 1;
                 i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
                 // The content is only compared in place, never copied.
-                let audit_function = b
-                    .get(from..i.saturating_sub(1))
-                    .is_some_and(is_audit_function);
-                out.push(Tok::DQuoted { audit_function });
+                let content = b.get(from..i.saturating_sub(1));
+                out.push(Tok::DQuoted {
+                    audit_function: content.is_some_and(is_audit_function),
+                    file_function: content.is_some_and(is_file_function),
+                });
             }
             b'`' => {
                 let mut j = i + 1;
@@ -921,6 +926,15 @@ pub struct StatementInfo {
     pub subquery: bool,
     /// MySQL: calls a function (a name followed by `(`).
     pub function_call: bool,
+    /// MySQL: calls `LOAD_FILE(…)`, qualified or not, plain, backquoted or
+    /// double-quoted: it reads a file on the database server that no audit
+    /// source names (code that runs out of sight, like a stored function).
+    pub file_read: bool,
+    /// MySQL: an `EXPLAIN` / `DESCRIBE` / `DESC` whose search for the
+    /// statement it explains reached [`MAX_EXPLAIN_PREFIX_TOKENS`] without
+    /// finding one (not valid SQL today): what it runs cannot be told, so
+    /// it is never quiet (defence in depth, #168 review L3).
+    pub explain_unbounded: bool,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -938,6 +952,7 @@ pub struct QueryAnalysis {
     parts: Vec<StatementInfo>,
     lexed: bool,
     audit_function: bool,
+    file_read: bool,
 }
 
 impl QueryAnalysis {
@@ -952,6 +967,7 @@ impl QueryAnalysis {
             parts: Vec::new(),
             lexed: false,
             audit_function: false,
+            file_read: false,
         }
     }
 
@@ -961,6 +977,14 @@ impl QueryAnalysis {
     #[must_use]
     pub fn audit_function(&self) -> bool {
         self.audit_function || self.parts.iter().any(|p| p.audit_function)
+    }
+
+    /// MySQL: the text calls `LOAD_FILE`: in a statement of a lexed text,
+    /// or found by a raw scan of a text that did not lex (fail closed: also
+    /// inside a literal or a comment).
+    #[must_use]
+    pub fn file_read(&self) -> bool {
+        self.file_read || self.parts.iter().any(|p| p.file_read)
     }
 
     /// Whether the text lexed unambiguously: `false` when only the kind
@@ -1170,6 +1194,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         parts,
         lexed: true,
         audit_function: false,
+        file_read: false,
     }
 }
 
@@ -1189,19 +1214,26 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
                 a.kind = most_reportable(a.kind, StatementKind::Ddl);
                 a.audit_function = true;
             }
+            // MySQL: a `LOAD_FILE` call anywhere in the bytes.
+            if opts.dialect == Dialect::Mysql && !a.file_read && raw_file_function(raw) {
+                a.file_read = true;
+            }
             a
         }
     }
 }
 
 /// A MySQL text that did not lex: `kind`, made DDL when a raw scan finds
-/// an audit log administration function call ([`raw_audit_function`]).
+/// an audit log administration function call ([`raw_audit_function`]),
+/// and marked as reading a file when one finds a `LOAD_FILE` call
+/// ([`raw_file_function`]).
 fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
     let mut a = QueryAnalysis::unparsed(kind);
     if raw_audit_function(text.as_bytes()) {
         a.kind = most_reportable(kind, StatementKind::Ddl);
         a.audit_function = true;
     }
+    a.file_read = raw_file_function(text.as_bytes());
     a
 }
 
@@ -1255,8 +1287,12 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map(|(s, original)| {
             let mut info = statement_info(s, opts, false);
             let wrappers = my_wrappers(original);
-            info.analyze_wrapped =
-                wrappers.contains(&Wrapper::Analyze) || explain_analyze(original);
+            // `explain_analyze` on the statement after the wrappers too:
+            // `SET STATEMENT … FOR EXPLAIN … ANALYZE …` whose `ANALYZE`
+            // statement is not found within the bound.
+            info.analyze_wrapped = wrappers.contains(&Wrapper::Analyze)
+                || explain_analyze(original)
+                || explain_analyze(s);
             info.compound = wrappers.contains(&Wrapper::Compound);
             info
         })
@@ -1282,6 +1318,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         parts,
         lexed: true,
         audit_function: false,
+        file_read: false,
     }
 }
 
@@ -1321,6 +1358,20 @@ fn explain_analyze(s: &[Tok]) -> bool {
     s[1..end]
         .iter()
         .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
+}
+
+/// Whether an `EXPLAIN` / `DESCRIBE` / `DESC` has more than
+/// [`MAX_EXPLAIN_PREFIX_TOKENS`] tokens and no statement keyword in its
+/// first [`MAX_EXPLAIN_PREFIX_TOKENS`] (the search of [`wrapper_level`]
+/// hit its bound): an `ANALYZE` past the bound, or before a statement past
+/// it, would run that statement. Such texts are not valid SQL today
+/// (`EXPLAIN` takes a few options, then the statement); fail closed
+/// whatever words they hold (#168 review L3). Short forms without a
+/// statement (`DESCRIBE t`, `EXPLAIN FOR CONNECTION 1`) stay quiet.
+fn explain_unbounded(s: &[Tok]) -> bool {
+    matches!(word(s.first()), Some("explain" | "describe" | "desc"))
+        && s.len() > MAX_EXPLAIN_PREFIX_TOKENS
+        && !(1..MAX_EXPLAIN_PREFIX_TOKENS).any(|j| runs_statement_at(s, j, true))
 }
 
 /// Skips `FORMAT = name` at `i`.
@@ -1538,7 +1589,34 @@ fn has_audit_function(s: &[Tok]) -> bool {
             || matches!(
                 w[0],
                 Tok::DQuoted {
-                    audit_function: true
+                    audit_function: true,
+                    ..
+                }
+            ))
+            && is_punct(Some(&w[1]), "(")
+    })
+}
+
+/// Whether a function name is `LOAD_FILE` (ASCII case-insensitive): it
+/// reads a file on the database server (with the `FILE` privilege and a
+/// permissive `secure_file_priv`), table files included, and no audit
+/// source records which file.
+fn is_file_function(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"load_file")
+}
+
+/// A call of `LOAD_FILE` ([`is_file_function`]), qualified or not: its
+/// name (plain, backquoted or double-quoted) followed by `(`. Code tokens
+/// only (executable comments are code), never in a literal or a comment;
+/// a text that does not lex is scanned raw ([`raw_file_function`]).
+fn has_file_function(s: &[Tok]) -> bool {
+    s.windows(2).any(|w| {
+        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_file_function(n.as_bytes()))
+            || matches!(
+                w[0],
+                Tok::DQuoted {
+                    file_function: true,
+                    ..
                 }
             ))
             && is_punct(Some(&w[1]), "(")
@@ -1555,17 +1633,31 @@ fn has_audit_function(s: &[Tok]) -> bool {
 /// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`.
 /// Compared in place: no copy of the text is made.
 fn raw_audit_function(b: &[u8]) -> bool {
-    const NAME: &[u8] = b"audit_log_";
+    raw_call(b, b"audit_log_", is_audit_function)
+}
+
+/// Raw-text scan for a call of `LOAD_FILE` ([`is_file_function`]), for a
+/// text that did not lex, with the rules of [`raw_audit_function`] (fail
+/// closed: inside a literal or a comment too, no boundary before the
+/// name, so `/*!80000LOAD_FILE*/(` and `x_load_file(` match).
+fn raw_file_function(b: &[u8]) -> bool {
+    raw_call(b, b"load_file", is_file_function)
+}
+
+/// The raw scan of [`raw_audit_function`] and [`raw_file_function`]: an
+/// identifier run that starts with `head` (ASCII case-insensitive) and
+/// that `is_name` accepts, then `(` as described there.
+fn raw_call(b: &[u8], head: &[u8], is_name: fn(&[u8]) -> bool) -> bool {
     let n = b.len();
-    for start in 0..n.saturating_sub(NAME.len() - 1) {
-        if !b[start..start + NAME.len()].eq_ignore_ascii_case(NAME) {
+    for start in 0..n.saturating_sub(head.len() - 1) {
+        if !b[start..start + head.len()].eq_ignore_ascii_case(head) {
             continue;
         }
         let mut j = start;
         while j < n && is_my_ident_cont(b[j]) {
             j += 1;
         }
-        if !is_audit_function(&b[start..j]) {
+        if !is_name(&b[start..j]) {
             continue;
         }
         if matches!(b.get(j), Some(b'"' | b'`')) {
@@ -1926,6 +2018,8 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         compound: false,
         subquery: opts.dialect == Dialect::Mysql && has_subquery(s),
         function_call: opts.dialect == Dialect::Mysql && has_function_call(s),
+        file_read: opts.dialect == Dialect::Mysql && has_file_function(s),
+        explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
     }
 }
 
@@ -3711,6 +3805,125 @@ mod tests {
         );
         assert!(my_rels("SELECT EXTRACT(YEAR FROM d), TRIM(LEADING 'x' FROM y)").is_empty());
         assert!(my_rels("SELECT CONCAT(TRIM(x FROM y), SUBSTRING(z FROM 2))").is_empty());
+    }
+
+    /// #168 review L2: `LOAD_FILE(` reads a server file; matched on code
+    /// (plain, backquoted, double-quoted, in an executable comment), never
+    /// in a literal or a comment, and by a raw scan of a text that does not
+    /// lex.
+    #[test]
+    fn mysql_load_file_calls() {
+        for q in [
+            "SELECT LOAD_FILE('/etc/passwd')",
+            "select load_file ( '/etc/passwd' )",
+            "SELECT Load_File /* c */ ('/etc/passwd')",
+            "SET @x = LOAD_FILE('/var/lib/mysql/hr/customers.ibd')",
+            "SET @x := `LOAD_FILE`('/etc/passwd')",
+            "SELECT \"load_file\"('/etc/passwd')",
+            "SELECT /*!LOAD_FILE*/('/etc/passwd')",
+            "SELECT /*!40000 LOAD_FILE*/('/etc/passwd')",
+            "DO LOAD_FILE('/etc/passwd')",
+            "SELECT a FROM t WHERE LOAD_FILE('/etc/passwd') IS NOT NULL",
+            "SHOW DATABASES WHERE LOAD_FILE('/etc/passwd') LIKE 'r%'",
+            "INSERT INTO t VALUES (LOAD_FILE('/etc/passwd'))",
+            "SELECT 1; SELECT LOAD_FILE('/etc/passwd')",
+            // Digest texts.
+            "SELECT `LOAD_FILE` (?)",
+            "SELECT LOAD_FILE (?)",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(a.file_read(), "{q}");
+            assert!(a.parts().iter().any(|p| p.file_read), "{q}");
+        }
+        for q in [
+            "SELECT 'LOAD_FILE(x)'",
+            "SELECT 1 /* LOAD_FILE('/etc/passwd') */",
+            "SELECT 1 -- LOAD_FILE('/etc/passwd')",
+            "SELECT load_file FROM t",
+            "SELECT \"load_file\" FROM t",
+            "SELECT load_files('/x')",
+            "SELECT my_load_file('/x')",
+            "SET NAMES utf8mb4",
+        ] {
+            assert!(!my(q).file_read(), "{q}");
+        }
+        // Readings that differ (a MariaDB-only executable comment), and a
+        // text that does not lex: raw scan.
+        for q in [
+            "SELECT /*M! LOAD_FILE */('/etc/passwd')",
+            "SELECT 1 /*M! , LOAD_FILE('/etc/passwd') */",
+            "SELECT LOAD_FILE('/etc/x\u{e9}\\')",
+            "SELECT a FROM t WHERE b = '\u{e9}\\' AND LOAD_FILE('/etc/passwd') IS NULL",
+        ] {
+            let a = my(q);
+            assert!(!a.lexed() && a.file_read(), "{q}");
+        }
+        let mut raw = b"SELECT a FROM t WHERE x = '\xff' AND LOAD_FILE('/etc/passwd')".to_vec();
+        raw.push(b' ');
+        assert!(analyze_raw(&raw, AnalyzeOptions::mysql()).file_read());
+        for t in [
+            "x = 'a\\' AND load_file('/x')",
+            "x LOAD_FILE /* c */ ('/x')",
+            "x `load_file` -- c\n ('/x')",
+            "x \"LOAD_FILE\" # c\n ('/x')",
+            "x /*!80000load_file*/('/x')",
+            "x_load_file('/x')",
+        ] {
+            assert!(raw_file_function(t.as_bytes()), "{t}");
+        }
+        for t in ["load_file", "load_files('/x')", "load_file_x('/x')"] {
+            assert!(!raw_file_function(t.as_bytes()), "{t}");
+        }
+        assert!(!my("SELECT 'a\u{e9}\\'").file_read());
+    }
+
+    /// #168 review L3: an `EXPLAIN` / `DESCRIBE` whose statement keyword
+    /// is not found within the prefix bound is never quiet, whatever it
+    /// holds; the short forms are unchanged.
+    #[test]
+    fn mysql_explain_prefix_bound() {
+        let junk = "FORMAT = TREE ".repeat(11);
+        for lead in ["EXPLAIN", "DESCRIBE", "DESC", "explain"] {
+            for tail in [
+                "ANALYZE DELETE FROM t",
+                "DELETE FROM t",
+                "SELECT * FROM hr.customers",
+                "",
+            ] {
+                let q = format!("{lead} {junk}{tail}");
+                let a = my(&q);
+                assert!(a.lexed(), "{q}");
+                assert!(a.parts()[0].explain_unbounded, "{q}");
+            }
+        }
+        // Behind `SET STATEMENT … FOR`, `ANALYZE` past the bound too.
+        let q = format!("SET STATEMENT a = 1 FOR EXPLAIN {junk}ANALYZE DELETE FROM t");
+        assert!(my(&q).parts()[0].explain_unbounded, "{q}");
+        let q = format!("SET STATEMENT a = 1 FOR EXPLAIN ANALYZE {junk}DELETE FROM t");
+        let a = my(&q);
+        let p = &a.parts()[0];
+        assert!(p.explain_unbounded && p.analyze_wrapped, "{q}");
+        // Within the bound: as before.
+        for q in [
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN FORMAT=JSON INTO @x SELECT 1",
+            "DESCRIBE t",
+            "DESC hr.t a",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN EXTENDED SELECT 1",
+            "SHOW TABLES",
+        ] {
+            assert!(!my(q).parts()[0].explain_unbounded, "{q}");
+        }
+        // A statement keyword just within the bound is found.
+        let near = format!("EXPLAIN {}SELECT 1", "FORMAT = TREE ".repeat(10));
+        assert!(!my(&near).parts()[0].explain_unbounded, "{near}");
+        let a = my(&format!(
+            "EXPLAIN {}ANALYZE DELETE FROM t",
+            "FORMAT = TREE ".repeat(10)
+        ));
+        assert!(a.parts()[0].analyze_wrapped);
     }
 
     /// Re-review of a2684a2: `ANALYZE` / `EXPLAIN ANALYZE` / `BEGIN NOT

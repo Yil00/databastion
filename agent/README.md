@@ -581,7 +581,9 @@ Behavior:
   (granted directly or through a role, MySQL mandatory roles, the MariaDB default role; enabled
   or not). MySQL: `SHOW GRANTS FOR CURRENT_USER() USING …` with the direct and mandatory roles
   (at most 16; names written into the statement only when they match an allow-listed charset),
-  which covers every role. MariaDB shows a role's grants to a least-privilege account only for
+  which covers every role; the role list is split over statements of at most 900 bytes, never
+  cut in the audit logs, and the privileges they show are added up (role privileges combine as
+  a union in MySQL, partial revokes included; `REVOKE` lines are ignored). MariaDB shows a role's grants to a least-privilege account only for
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as
