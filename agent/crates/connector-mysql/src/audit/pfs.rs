@@ -138,23 +138,7 @@ struct ThreadInfo {
 /// bytes and its 4-byte header.
 pub(crate) const MAX_DIGEST_TOKEN: usize = 4 + 64 * 4;
 
-/// Upper estimate of the bytes `t` took on the server, in the client's
-/// character set (security review of 09e93da, R1): MySQL keeps `SQL_TEXT`
-/// and digest identifiers in the client character set, applies its limits
-/// to those bytes, and converts to utf8mb4 when the row is read. In
-/// gb18030, `Ā` (U+0100) takes 4 bytes stored but 2 in UTF-8, and any
-/// account can `SET NAMES gb18030`. Every allowed client character set is
-/// ASCII-compatible with at most 4 bytes per character: an ASCII byte
-/// counts 1, any other character 4 (any other byte 4 when `t` is not
-/// UTF-8). Never more than twice the length.
-pub(crate) fn stored_len(t: &[u8]) -> usize {
-    let ascii = t.iter().filter(|b| b.is_ascii()).count();
-    let other = match std::str::from_utf8(t) {
-        Ok(s) => s.chars().filter(|c| !c.is_ascii()).count(),
-        Err(_) => t.len() - ascii,
-    };
-    ascii + 4 * other
-}
+pub(crate) use crate::sql::stored_len;
 
 /// Upper estimate of the bytes a rendered `DIGEST_TEXT` took in the
 /// server's digest token storage, which is what the digest limit bounds

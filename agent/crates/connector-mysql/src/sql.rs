@@ -308,22 +308,33 @@ pub(crate) fn sample_statements(
         columns.get(..1)?,
         limit,
     )?;
-    let items: Vec<usize> = columns
+    // Per column: its length as `server_audit` logs it (escaped) and as
+    // `performance_schema` may have stored it ([`stored_len`]: 4 bytes per
+    // non-ASCII character, security review of cea63c5, S1); a statement
+    // is bounded by the larger of the two.
+    let items: Vec<(usize, usize)> = columns
         .iter()
-        .map(|(n, k)| sample_item(n, *k).map(|i| server_audit_escaped_len(&i)))
+        .map(|(n, k)| {
+            sample_item(n, *k).map(|i| (server_audit_escaped_len(&i), stored_len(i.as_bytes())))
+        })
         .collect::<Option<_>>()?;
-    // The statement without its column list (`, ` has nothing to escape).
-    let base = server_audit_escaped_len(&first) - items[0];
+    // The statement without its column list (`, ` is ASCII, unescaped).
+    let base = (
+        server_audit_escaped_len(&first) - items[0].0,
+        stored_len(first.as_bytes()) - items[0].1,
+    );
     let mut out = Vec::new();
     let mut start = 0;
     while start < columns.len() {
-        let mut len = base + items[start];
+        let mut len = (base.0 + items[start].0, base.1 + items[start].1);
         let mut end = start + 1;
         while end < columns.len()
             && end - start < max_columns.max(1)
-            && len + 2 + items[end] + SAMPLE_DIGEST_MARGIN * (end - start + 1) <= MAX_OWN_STATEMENT
+            && (len.0 + 2 + items[end].0).max(len.1 + 2 + items[end].1)
+                + SAMPLE_DIGEST_MARGIN * (end - start + 1)
+                <= MAX_OWN_STATEMENT
         {
-            len += 2 + items[end];
+            len = (len.0 + 2 + items[end].0, len.1 + 2 + items[end].1);
             end += 1;
         }
         let s = sample_statement(
@@ -334,7 +345,10 @@ pub(crate) fn sample_statements(
             &columns[start..end],
             limit,
         )?;
-        debug_assert_eq!(server_audit_escaped_len(&s), len);
+        debug_assert_eq!(
+            (server_audit_escaped_len(&s), stored_len(s.as_bytes())),
+            len
+        );
         out.push((start..end, s));
         start = end;
     }
@@ -424,6 +438,22 @@ pub(crate) const MAX_OWN_STATEMENT: usize = 900;
 /// Longest CAS store guard statement ([`MAX_OWN_STATEMENT`]): its exact
 /// text must be recognized by the Audit stream.
 pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = MAX_OWN_STATEMENT;
+
+/// Upper estimate of the bytes `t` takes on the server in the client's
+/// character set (security review of 09e93da, R1): every allowed client
+/// character set is ASCII-compatible with at most 4 bytes per character,
+/// so an ASCII byte counts 1 and any other character 4 (any other byte 4
+/// when `t` is not UTF-8). `performance_schema` limits apply to these
+/// bytes (`audit::pfs::text_cut`). Never more than twice the length.
+#[must_use]
+pub(crate) fn stored_len(t: &[u8]) -> usize {
+    let ascii = t.iter().filter(|b| b.is_ascii()).count();
+    let other = match std::str::from_utf8(t) {
+        Ok(s) => s.chars().filter(|c| !c.is_ascii()).count(),
+        Err(_) => t.len() - ascii,
+    };
+    ascii + 4 * other
+}
 
 /// Length of `s` once escaped by MariaDB's `server_audit` (`'`, `\`,
 /// newline, carriage return, tab, backspace and form feed gain a `\`).
@@ -1029,13 +1059,28 @@ mod tests {
             let s = format!("{i:x}{}", "c".repeat(n));
             s.chars().take(n.max(1)).collect::<String>() + &format!("{i}")
         };
-        for (n, kind) in [
+        // Non-ASCII names (security review of cea63c5, S1): `中` (3 bytes
+        // in UTF-8), `é` (2), `😀` (4), each 4 bytes as stored.
+        let wide = |i: usize, n: usize, c: &str| -> String { format!("{}{i}", c.repeat(n)) };
+        let mut shapes: Vec<(Vec<String>, Sampled)> = [
             (1, Sampled::Plain),
             (1, Sampled::Text),
             (20, Sampled::Text),
             (60, Sampled::Plain),
-        ] {
-            let cols: Vec<String> = (0..4096).map(|i| name(i, n)).collect();
+        ]
+        .into_iter()
+        .map(|(n, kind)| ((0..4096).map(|i| name(i, n)).collect(), kind))
+        .collect();
+        for c in ["中", "é", "\u{1F600}"] {
+            for (n, kind) in [
+                (30, Sampled::Text),
+                (60, Sampled::Plain),
+                (1, Sampled::Text),
+            ] {
+                shapes.push(((0..200).map(|i| wide(i, n, c)).collect(), kind));
+            }
+        }
+        for (cols, kind) in shapes {
             let sel: Vec<(&str, Sampled)> = cols.iter().map(|c| (c.as_str(), kind)).collect();
             for flavor in [Flavor::Mysql, Flavor::Mariadb] {
                 for max in [1024, 3] {
@@ -1054,11 +1099,12 @@ mod tests {
                         assert_eq!(range.start, next);
                         assert!(!range.is_empty() && range.len() <= max);
                         next = range.end;
-                        let len = server_audit_escaped_len(s);
+                        let len = server_audit_escaped_len(s).max(stored_len(s.as_bytes()));
                         assert!(
                             len + SAMPLE_DIGEST_MARGIN * range.len() <= MAX_OWN_STATEMENT,
                             "{len}"
                         );
+                        assert!(stored_len(s.as_bytes()) + 4 < 1024);
                         assert_eq!(
                             *s,
                             sample_statement(
@@ -1078,7 +1124,7 @@ mod tests {
         }
         // The longest names (64 characters of 4 bytes, or of characters
         // `server_audit` escapes): one column always fits.
-        for c in ["\u{1F600}", "'", "`"] {
+        for c in ["\u{1F600}", "中", "é", "'", "`"] {
             let long = c.repeat(64);
             for flavor in [Flavor::Mysql, Flavor::Mariadb] {
                 let all = sample_statements(
@@ -1097,6 +1143,9 @@ mod tests {
                 assert_eq!(all.iter().map(|(r, _)| r.len()).sum::<usize>(), 2, "{c}");
                 for (_, s) in &all {
                     assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{c}");
+                    // Never taken as cut by `performance_schema` (a single
+                    // column of 64 four-byte names still fits).
+                    assert!(stored_len(s.as_bytes()) + 4 < 1024, "{c}");
                 }
             }
         }
@@ -1107,7 +1156,13 @@ mod tests {
     /// longest names, stay within `MAX_OWN_STATEMENT`.
     #[test]
     fn own_statements_stay_short() {
-        let long = ["\u{1F600}".repeat(64), "'".repeat(64), "`".repeat(64)];
+        let long = [
+            "\u{1F600}".repeat(64),
+            "中".repeat(64),
+            "é".repeat(64),
+            "'".repeat(64),
+            "`".repeat(64),
+        ];
         let mut all: Vec<String> = [
             INTROSPECT,
             SESSION_READ_ONLY,
@@ -1177,6 +1232,8 @@ mod tests {
         all.extend(cas_guard_statement_texts(None).unwrap());
         for s in &all {
             assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
+            // Not taken as cut by `performance_schema` either (S1).
+            assert!(stored_len(s.as_bytes()) + 4 < 1024, "{s}");
         }
     }
 
