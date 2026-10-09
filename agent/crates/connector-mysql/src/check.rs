@@ -73,7 +73,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
 pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 /// Most names listed in a log line.
 const MAX_LOGGED_NAMES: usize = 20;
-/// Most roles named in the MySQL `SHOW GRANTS … USING` statement; with
+/// Most roles named in the MySQL `SHOW GRANTS … USING` statements; with
 /// more, the roles are reported as not evaluated.
 const MAX_EVALUATED_ROLES: usize = 16;
 
@@ -1172,7 +1172,10 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// its roles through `SHOW GRANTS` only:
 /// - MySQL: `SHOW GRANTS FOR CURRENT_USER() USING <roles>` with the roles
 ///   granted to the account itself and the mandatory roles; the server
-///   expands the roles those grant.
+///   expands the roles those grant. The role list is split over several
+///   statements, each short enough never to be cut in the audit logs
+///   (`sql::MAX_OWN_STATEMENT`), and the privileges they show are added
+///   up (see [`merge_role_statements`]).
 /// - MariaDB: `SHOW GRANTS FOR CURRENT_ROLE`, the only role whose grants
 ///   MariaDB shows without `SELECT` on `mysql`: the default role enabled at
 ///   login. Every other applicable role is reported as not evaluated.
@@ -1184,8 +1187,8 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// Role names are written into the statement only after an allow-list
 /// check (`sql::show_grants_using`). A role whose grants cannot be read (a
 /// refused name, a server error, a line the parser does not understand) is
-/// counted in `roles_unevaluated`; on MySQL, where one statement covers
-/// every role, all of them are.
+/// counted in `roles_unevaluated`; on MySQL, where the statements cover
+/// every role together, all of them are when any statement fails.
 ///
 /// Fail closed (end-of-phase-4 review L2): when `APPLICABLE_ROLES` cannot
 /// be read (no such table before MySQL 8.0.19, or any non-fatal error),
@@ -1348,15 +1351,60 @@ async fn mysql_role_privileges(
     let using: Vec<(String, String)> = using.into_iter().collect();
     let mut evaluated = false;
     if using.len() <= MAX_EVALUATED_ROLES
-        && let Some(statement) = sql::show_grants_using(&using)
-        && let Some(Some(rows)) = optional_complete(session, &statement).await?
+        && let Some(statements) = sql::show_grants_using(&using)
     {
-        evaluated = merge_grant_lines(&rows, grants);
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in &statements {
+            match optional_complete(session, statement).await? {
+                Some(Some(rows)) => results.push(rows),
+                // An error, or rows skipped: every role is unevaluated.
+                _ => {
+                    results.clear();
+                    break;
+                }
+            }
+        }
+        evaluated = results.len() == statements.len() && merge_role_statements(&results, grants);
     }
     if !evaluated {
         grants.roles_unevaluated = grants.roles;
     }
     Ok(true)
+}
+
+/// Adds the privileges shown by the `SHOW GRANTS … USING` statements of
+/// one role list (`sql::show_grants_using`, split over several statements)
+/// to `grants`: their union. `false` when a line of any of them is not
+/// understood (every role is then counted as not evaluated, and what was
+/// added only over-reports).
+///
+/// Why the union of the split lists is the privileges of the whole list
+/// (MySQL 8.0+): the privileges of an account with active roles are the
+/// union of the account's and every role's, and partial revokes
+/// (`partial_revokes = ON`) combine the same way: a restriction (`REVOKE
+/// SELECT ON db.* FROM r1` under a global `SELECT`) holds only where no
+/// other source (the account, another role) grants the privilege there,
+/// so a `REVOKE` line shown with one part of the list may be lifted by a
+/// role of another part, never the reverse. The parser ignores `REVOKE`
+/// lines (`grants`: ignoring a revoke over-reports, never under-reports),
+/// so no restriction of one statement can hide a grant of another: the
+/// grant lines of every statement are added, as a single statement's
+/// would be. A `SHOW GRANTS` line holds only grants of the account and of
+/// the roles named in its statement (and those they grant), all of which
+/// the account holds through the whole list too, so no statement shows a
+/// privilege the whole list would not. Measured on MySQL 8.4 with
+/// `partial_revokes = ON`: `USING r1` (`SELECT ON *.*`, `REVOKE SELECT ON
+/// mysql.*`) shows the revoke, `USING r1, r2` (`r2`: `SELECT ON mysql.*`)
+/// shows neither the revoke nor the `mysql` line, which the global grant
+/// covers. Split, that `mysql` line is shown too: a privilege the account
+/// holds, so a note it may add (`privilege.system_database_select`) is
+/// true.
+fn merge_role_statements(results: &[Rows], grants: &mut Grants) -> bool {
+    let mut understood = true;
+    for rows in results {
+        understood &= merge_grant_lines(rows, grants);
+    }
+    understood
 }
 
 /// `Ok(false)`: `APPLICABLE_ROLES` could not be read (see

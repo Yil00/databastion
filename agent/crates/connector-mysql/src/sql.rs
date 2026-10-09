@@ -431,8 +431,9 @@ pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
 /// Audit stream reports a cut text with no table record as a read of `*`,
 /// always, whoever sent it (security review of #181, H1). Held by every
 /// fixed statement and the CAS store guard statements, and by the sampling
-/// statements, split into column batches ([`sample_statements`]). Not held
-/// by `SHOW GRANTS … USING` with many roles ([`show_grants_using`]).
+/// statements, split into column batches ([`sample_statements`]), and by
+/// `SHOW GRANTS … USING`, whose role list is split over several statements
+/// ([`show_grants_using`]).
 pub(crate) const MAX_OWN_STATEMENT: usize = 900;
 
 /// Longest CAS store guard statement ([`MAX_OWN_STATEMENT`]): its exact
@@ -665,29 +666,65 @@ fn role_part_ok(part: &str, may_be_empty: bool) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_$.%-:/".contains(&b))
 }
 
+/// Head of the [`show_grants_using`] statements.
+const SHOW_GRANTS_USING: &str = "SHOW GRANTS FOR CURRENT_USER() USING ";
+
 /// MySQL: the privileges of the account and of `roles` (`(name, host)`,
 /// the roles granted to it directly or mandatory; the server expands the
 /// roles they grant). `SHOW GRANTS` about the current user needs no
 /// privilege. `None` for an empty list or a name outside the allow-list.
-pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
+///
+/// The role list is split over several statements, in order, each within
+/// [`MAX_OWN_STATEMENT`] bytes as `server_audit` logs it (its quotes
+/// escaped) and as `performance_schema` may store it ([`stored_len`]), so
+/// that no statement is cut at the default log limits (a cut text with no
+/// table record is a read of `*`, always, even from the agent's account).
+/// One role always fits: an allow-listed name and host take at most 519
+/// bytes escaped. The caller takes the union of the privileges the
+/// statements show (MySQL combines the privileges of the account and of
+/// its active roles as a union, partial revokes included: a restriction
+/// of one source is lifted by a grant of another), and the parser ignores
+/// `REVOKE` lines (`grants`), so the split changes no result.
+pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<Vec<String>> {
     if roles.is_empty() {
         return None;
     }
-    let mut out = String::from("SHOW GRANTS FOR CURRENT_USER() USING ");
-    for (i, (name, host)) in roles.iter().enumerate() {
+    let fits = |t: &str| {
+        server_audit_escaped_len(t) <= MAX_OWN_STATEMENT
+            && stored_len(t.as_bytes()) <= MAX_OWN_STATEMENT
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::from(SHOW_GRANTS_USING);
+    for (name, host) in roles {
         if !role_part_ok(name, false) || !role_part_ok(host, true) {
             return None;
-        }
-        if i > 0 {
-            out.push_str(", ");
         }
         // `'name'@'host'`: the account-name form of the MySQL manual
         // ("Specifying Account Names"); an empty host is `''` (a quoted
         // identifier cannot be empty).
-        out.push_str(&quote_str(name)?);
-        out.push('@');
-        out.push_str(&quote_str(host)?);
+        let role = format!("{}@{}", quote_str(name)?, quote_str(host)?);
+        let first = cur.len() == SHOW_GRANTS_USING.len();
+        let next = if first {
+            format!("{cur}{role}")
+        } else {
+            format!("{cur}, {role}")
+        };
+        if fits(&next) {
+            cur = next;
+        } else if first {
+            // Unreachable with allow-listed parts; fail closed.
+            return None;
+        } else {
+            out.push(std::mem::replace(
+                &mut cur,
+                format!("{SHOW_GRANTS_USING}{role}"),
+            ));
+            if !fits(&cur) {
+                return None;
+            }
+        }
     }
+    out.push(cur);
     Some(out)
 }
 
@@ -935,6 +972,24 @@ mod tests {
         );
     }
 
+    /// Role lists for `SHOW GRANTS … USING`: 40 roles of 20 characters,
+    /// 64 of the longest allow-listed name and host (255 each), and names
+    /// with every allow-listed punctuation character.
+    fn role_lists() -> Vec<Vec<(String, String)>> {
+        vec![
+            (0..40)
+                .map(|i| (format!("databastion_role_{i:03}"), "%".to_owned()))
+                .collect(),
+            (0..64)
+                .map(|i| (format!("{i:02}{}", "r".repeat(253)), "h".repeat(255)))
+                .collect(),
+            (0..64)
+                .map(|i| (format!("r_$.%-:/{i}"), "10.0.0.0/255.0.0.0".to_owned()))
+                .collect(),
+            vec![("r".to_owned(), String::new())],
+        ]
+    }
+
     fn all_statements() -> Vec<String> {
         let mut v = vec![
             session_setup(Flavor::Mysql, 1000),
@@ -957,7 +1012,10 @@ mod tests {
             COLUMN_PRIVILEGES.to_owned(),
             APPLICABLE_ROLES_MYSQL.to_owned(),
             APPLICABLE_ROLES_MARIADB.to_owned(),
-            show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
+            show_grants_using(&[("app_read".to_owned(), "%".to_owned())])
+                .unwrap()
+                .remove(0),
+            SHOW_GRANTS_OWN.to_owned(),
             CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_PUBLIC.to_owned(),
@@ -982,6 +1040,9 @@ mod tests {
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
         ];
+        for roles in role_lists() {
+            v.extend(show_grants_using(&roles).unwrap());
+        }
         v.extend(
             cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()])
                 .unwrap()
@@ -1230,6 +1291,9 @@ mod tests {
         }
         all.push(kill_query(u32::MAX));
         all.extend(cas_guard_statement_texts(None).unwrap());
+        for roles in role_lists() {
+            all.extend(show_grants_using(&roles).unwrap());
+        }
         for s in &all {
             assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
             // Not taken as cut by `performance_schema` either (S1).
@@ -1417,8 +1481,9 @@ mod tests {
             ])
             .as_deref(),
             Some(
-                "SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
+                &["SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
                  'ops'@'10.0.0.0/255.0.0.0', 'r'@''"
+                    .to_owned()][..]
             )
         );
         assert_eq!(show_grants_using(&[]), None);
@@ -1445,5 +1510,55 @@ mod tests {
                 );
             }
         }
+        // A bad name anywhere in a long list: no statement at all.
+        let mut roles = role_lists().remove(0);
+        roles.push(("a'b".to_owned(), "%".to_owned()));
+        assert_eq!(show_grants_using(&roles), None);
+    }
+
+    /// Security review of 914c9d2 (Low): the role list is split over
+    /// statements of at most `MAX_OWN_STATEMENT` bytes by both measures,
+    /// each role named once, in order, and a statement is closed only when
+    /// the next role does not fit.
+    #[test]
+    fn role_lists_are_split_within_the_own_statement_bound() {
+        for roles in role_lists() {
+            let statements = show_grants_using(&roles).unwrap();
+            let mut named = Vec::new();
+            for (i, s) in statements.iter().enumerate() {
+                assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
+                assert!(stored_len(s.as_bytes()) <= MAX_OWN_STATEMENT, "{s}");
+                let list = s.strip_prefix(SHOW_GRANTS_USING).unwrap();
+                let here: Vec<&str> = list.split(", ").collect();
+                assert!(
+                    !here.is_empty() && here.iter().all(|r| !r.is_empty()),
+                    "{s}"
+                );
+                if let Some(next) = statements.get(i + 1) {
+                    let first = next
+                        .strip_prefix(SHOW_GRANTS_USING)
+                        .unwrap()
+                        .split(", ")
+                        .next()
+                        .unwrap();
+                    let joined = format!("{s}, {first}");
+                    assert!(
+                        server_audit_escaped_len(&joined) > MAX_OWN_STATEMENT
+                            || stored_len(joined.as_bytes()) > MAX_OWN_STATEMENT,
+                        "{s}"
+                    );
+                }
+                named.extend(here.into_iter().map(str::to_owned));
+            }
+            let want: Vec<String> = roles.iter().map(|(n, h)| format!("'{n}'@'{h}'")).collect();
+            assert_eq!(named, want);
+        }
+        // 40 roles of 20 characters: more than one statement, where one
+        // statement was cut before (1 315 bytes escaped).
+        assert!(show_grants_using(&role_lists()[0]).unwrap().len() > 1);
+        // The longest role alone, with the most escaping.
+        let one = show_grants_using(&[("r".repeat(255), "h".repeat(255))]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(server_audit_escaped_len(&one[0]) <= MAX_OWN_STATEMENT);
     }
 }
