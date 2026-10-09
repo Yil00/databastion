@@ -429,9 +429,11 @@ impl OwnAccount {
 
     /// Like [`OwnAccount::routine`] (account, application, address, no
     /// signal) but without the row budget: nothing is charged. Only for
-    /// events a connector has established read no row of any relation
-    /// (a closed list of its own statements); a connector that has no
-    /// such list never calls it.
+    /// statements a connector recognizes as its own by their whole, exact
+    /// text: catalog queries and `performance_schema` probes and polls,
+    /// which read no application row, and the extra batches of a sampling
+    /// statement whose first batch was charged (a credit). A connector
+    /// that has no such list never calls it.
     #[must_use]
     pub fn routine_unbudgeted(
         &self,

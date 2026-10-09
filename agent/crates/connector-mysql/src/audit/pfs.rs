@@ -57,7 +57,7 @@ use crate::error::{MyError, Stage};
 use crate::sql;
 
 /// Statements read per query.
-const BATCH: usize = 2000;
+const BATCH: usize = sql::PS_BATCH;
 /// Queries per poll at most (then the next poll continues).
 const MAX_BATCHES: usize = 10;
 /// Re-read window for statements finishing out of order.
@@ -68,7 +68,7 @@ const MAX_THREADS: usize = 4096;
 /// `performance_schema_max_digest_length`).
 const DEFAULT_TEXT_LIMIT: usize = 1024;
 /// Largest text read per statement, whatever the server limits say.
-const MAX_TEXT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Name of the persisted cursor.
 pub(crate) const CURSOR: &str = "performance_schema";
 /// Two server start times (Unix seconds, from `Uptime` and the agent's
@@ -208,7 +208,10 @@ pub(crate) fn digest_cut(d: &[u8], limit: usize) -> bool {
 
 /// Digest length (bytes) from which the poll also reads `SQL_TEXT`: every
 /// digest that [`digest_cut`] may judge cut by its estimate is at least
-/// this long (the estimate is at most 3 times the length plus 3).
+/// this long (the estimate is at most 3 times the length plus 3). The poll
+/// text computes it on the server (`sql::ps_sql_text_from_expr`, security
+/// review of #186, H1); this is the reference the tests pin it to.
+#[cfg(test)]
 pub(crate) fn sql_text_from(digest_limit: usize) -> usize {
     digest_limit.saturating_sub(MAX_DIGEST_TOKEN + 3) / 3
 }
@@ -281,7 +284,6 @@ struct Row {
 /// Poller state kept across polls.
 pub(crate) struct PsPoller {
     table: PsTable,
-    own_thread: u64,
     text_limit: usize,
     digest_limit: usize,
     with_program: bool,
@@ -405,6 +407,17 @@ async fn scalar(session: &mut Session, statement: &str) -> Result<Option<String>
     }
 }
 
+/// This session's thread is visible in `performance_schema.threads`: the
+/// poll texts find it there by `CONNECTION_ID()` (`sql::PS_OWN_THREAD_EXPR`)
+/// to leave it out; without it the source is unsupported.
+async fn own_thread(session: &mut Session) -> Result<(), MyError> {
+    scalar(session, sql::PS_OWN_THREAD)
+        .await?
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(drop)
+        .ok_or(MyError::new(FailureCode::Unsupported, Stage::Audit))
+}
+
 impl PsPoller {
     /// Starts polling `table` on `session` (its own thread is left out),
     /// from the cursor saved in `store` when it is of the same server run
@@ -415,10 +428,7 @@ impl PsPoller {
         builder: EventBuilder,
         store: Option<CursorStore>,
     ) -> Result<Self, MyError> {
-        let own_thread = scalar(session, sql::PS_OWN_THREAD)
-            .await?
-            .and_then(|v| v.parse().ok())
-            .ok_or(MyError::new(FailureCode::Unsupported, Stage::Audit))?;
+        own_thread(session).await?;
         let limit = |v: Option<String>| {
             v.and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_TEXT_LIMIT)
@@ -456,7 +466,6 @@ impl PsPoller {
         }
         Ok(Self {
             table,
-            own_thread,
             text_limit,
             digest_limit,
             with_program: true,
@@ -504,11 +513,7 @@ impl PsPoller {
     /// Re-attaches the poller to a new session (reconnection): the
     /// cursor is kept, the own thread is read again.
     pub(crate) async fn reattach(&mut self, session: &mut Session) -> Result<(), MyError> {
-        self.own_thread = scalar(session, sql::PS_OWN_THREAD)
-            .await?
-            .and_then(|v| v.parse().ok())
-            .ok_or(MyError::new(FailureCode::Unsupported, Stage::Audit))?;
-        Ok(())
+        own_thread(session).await
     }
 
     fn remember(&mut self, thread: u64, info: &ThreadInfo) {
@@ -523,16 +528,19 @@ impl PsPoller {
         self.threads.insert(thread, info.clone());
     }
 
+    /// Sets the session user variables of the constant poll texts
+    /// (ADR-0045 decision 4) on the poll session, right before one.
+    async fn set_variables(&self, session: &mut Session, from: u64) -> Result<(), MyError> {
+        session
+            .exec(Stage::Audit, &sql::ps_poll_variables(from))
+            .await
+            .map(drop)
+    }
+
     /// Reads one batch of rows.
     async fn read_rows(&mut self, session: &mut Session, from: u64) -> Result<Vec<Row>, MyError> {
-        let statement = sql::ps_statements(
-            self.table.name(),
-            self.own_thread,
-            from,
-            BATCH,
-            self.with_program,
-            sql_text_from(self.digest_limit),
-        );
+        self.set_variables(session, from).await?;
+        let statement = sql::ps_statements(self.table.name(), self.with_program);
         let (text_limit, digest_limit) = (self.text_limit, self.digest_limit);
         let mut rows: Vec<Row> = Vec::new();
         let streamed = session
@@ -592,7 +600,7 @@ impl PsPoller {
         session: &mut Session,
         sink: &EventSink,
     ) -> Result<(), PollError> {
-        let stats = sql::ps_stats(self.table.name(), self.own_thread);
+        let stats = sql::ps_stats(self.table.name());
         let row = session
             .query(Stage::Audit, &stats)
             .await?

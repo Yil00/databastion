@@ -38,7 +38,7 @@ const BIG_ROWS: u64 = 20_000;
 
 type Events = Vec<MaskedEvent>;
 
-fn describe(e: &MaskedEvent) -> String {
+pub(super) fn describe(e: &MaskedEvent) -> String {
     format!(
         "{:?} user={} app={:?} client={:?} objects={:?} rows={:?} signals={:?} source={}",
         e.action(),
@@ -77,7 +77,7 @@ fn has_write(events: &[MaskedEvent], table: &str) -> bool {
 }
 
 /// Collects events until `done` holds or `timeout`.
-async fn collect_until(
+pub(super) async fn collect_until(
     rx: &mut tokio::sync::mpsc::Receiver<MaskedEvent>,
     out: &mut Events,
     timeout: Duration,
@@ -93,7 +93,7 @@ async fn collect_until(
 }
 
 /// Runs `audit_stream` in a task (poll interval 1 s, cursors in `state`).
-fn start_audit(
+pub(super) fn start_audit(
     connector: Arc<MysqlConnector>,
     t: &TargetConfig,
     state: &Path,
@@ -141,7 +141,7 @@ fn env_path(var: &str, key: &str) -> Option<PathBuf> {
 }
 
 /// The Percona Server of `dev/`.
-fn percona() -> Option<Server> {
+pub(super) fn percona() -> Option<Server> {
     let var = |s: &str| std::env::var(format!("DATABASTION_TEST_PERCONA_{s}")).ok();
     let (Some(url), Some(ca)) = (var("URL").as_deref().and_then(parse_url), var("CA_FILE")) else {
         skip(
@@ -269,6 +269,23 @@ async fn audit_log_scenario(
         )
         .await;
     assert!(refused.is_err(), "{label}: INTO OUTFILE must fail here");
+    // Reads of statement-text tables (ADR-0045): named, always reported.
+    for statement in [
+        "SELECT COUNT(*) FROM information_schema.PROCESSLIST",
+        "SELECT COUNT(*) FROM performance_schema.events_statements_history_long",
+    ] {
+        a.query(Stage::Check, statement).await.unwrap();
+    }
+    let text_read = |ev: &[MaskedEvent], db: &str, t: &str| {
+        ev.iter().any(|e| {
+            e.action() == EventAction::Read
+                && e.always_report()
+                && e.principal().account_name() == admin.user
+                && e.objects()
+                    .iter()
+                    .any(|o| o.database().as_str() == db && o.object().as_str() == t)
+        })
+    };
     // A table of 40 columns, sampled in several column batches (security
     // review of 914c9d2, N3): one scan is charged once to the agent's
     // budget, its extra batches are left out by their credits.
@@ -327,6 +344,8 @@ async fn audit_log_scenario(
                     && e.objects().iter().any(|o| o.object().as_str() == table)
                     && e.principal().account_name() == admin.user
             })
+            && text_read(ev, "information_schema", "PROCESSLIST")
+            && text_read(ev, "performance_schema", "events_statements_history_long")
             && (!real
                 || ev.iter().any(|e| {
                     e.principal().client() != admin_addr
@@ -346,6 +365,18 @@ async fn audit_log_scenario(
     );
     assert!(has(&events, table, "shape.full_table_read"), "{label}");
     assert!(has(&events, table, "signature.into_outfile"), "{label}");
+    assert!(
+        text_read(&events, "information_schema", "PROCESSLIST"),
+        "{label}: {all:#?}"
+    );
+    assert!(
+        text_read(
+            &events,
+            "performance_schema",
+            "events_statements_history_long"
+        ),
+        "{label}: {all:#?}"
+    );
     assert!(
         events.iter().all(|e| e.source() == source),
         "{label}: {all:#?}"
