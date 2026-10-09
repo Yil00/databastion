@@ -192,8 +192,12 @@ impl<'de, const N: usize> serde::de::Visitor<'de> for Fields<'_, N> {
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut out = [None; N];
-        // A longer key cannot match: it is validated but not kept.
-        let max = self.keys.iter().map(|k| k.len()).max().unwrap_or(0) + 1;
+        // A longer key cannot match: it is validated but not kept. The cut
+        // keeps a whole character past the longest kept key (a character
+        // is at most 4 bytes), so a longer key is always cut to more bytes
+        // than any kept key and never to one of them (`useré` is not cut
+        // back to `user`).
+        let max = self.keys.iter().map(|k| k.len()).max().unwrap_or(0) + 4;
         while let Some(k) = map.next_key::<&'de RawValue>()? {
             let v = map.next_value::<&'de RawValue>()?;
             let name = unescape(k.get(), max)
@@ -334,5 +338,54 @@ mod tests {
         assert!(object(r#"{"a": 1} x"#, &["a"]).is_err());
         assert!(object(r#"{"\ud800": 1}"#, &["a"]).is_err());
         assert!(is_null(&raw("null")) && !is_null(&raw("0")));
+    }
+
+    #[test]
+    fn a_longer_key_is_never_cut_back_to_a_kept_one() {
+        let [user] = object(r#"{"user":"real","useré":"alias"}"#, &["user"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.unwrap().get(), r#""real""#);
+        for suffix in ["é", "€", "😀", "\\u00e9", "\\ud83d\\ude00"] {
+            let json = format!(r#"{{"program_name":"real","program_name{suffix}":"alias"}}"#);
+            let [name] = object(&json, &["program_name"]).unwrap().unwrap();
+            assert_eq!(name.unwrap().get(), r#""real""#, "{json}");
+        }
+    }
+
+    mod props {
+        use super::object;
+        use proptest::prelude::*;
+
+        fn wide_char() -> impl Strategy<Value = char> {
+            prop_oneof![
+                proptest::char::range('a', 'z'),
+                proptest::char::range('\u{80}', '\u{7ff}'),
+                proptest::char::range('\u{800}', '\u{d7ff}'),
+                proptest::char::range('\u{e000}', '\u{ffff}'),
+                proptest::char::range('\u{10000}', '\u{10ffff}'),
+            ]
+        }
+
+        proptest! {
+            /// A kept key followed by any characters is never read as a
+            /// kept key, whatever the characters' widths.
+            #[test]
+            fn suffixed_keys_never_alias(
+                kept in proptest::collection::vec("[a-z_]{1,16}", 1..4),
+                pick in any::<prop::sample::Index>(),
+                suffix in proptest::collection::vec(wide_char(), 1..4),
+            ) {
+                let base = pick.get(&kept);
+                let suffix: String = suffix.into_iter().collect();
+                let alias = format!("{base}{suffix}");
+                let json = serde_json::json!({ alias.as_str(): "alias" }).to_string();
+                let keys: [&str; 3] = std::array::from_fn(|i| kept.get(i).map_or("", String::as_str));
+                let got = object(&json, &keys).unwrap().unwrap();
+                for (k, v) in keys.iter().zip(got) {
+                    prop_assert!(v.is_none() || *k == alias, "{}", json);
+                }
+            }
+        }
     }
 }

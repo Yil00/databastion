@@ -1670,6 +1670,28 @@ mod tests {
             parse_definition(many.as_bytes()).unwrap_err(),
             DefinitionError::Bounds
         );
+        // Beyond the bounds and broken: refused as malformed (the whole
+        // document is checked as JSON first, review of #180).
+        let broken = format!("{{{base}, \"m\": {{{}", keys.join(","));
+        assert_eq!(
+            parse_definition(broken.as_bytes()).unwrap_err(),
+            DefinitionError::Malformed
+        );
+        let broken = format!("{{{base}, \"a\": {}", "[".repeat(10_000));
+        assert_eq!(
+            parse_definition(broken.as_bytes()).unwrap_err(),
+            DefinitionError::Malformed
+        );
+        // Valid but deep (no recursion limit when skipping): still bounds.
+        let deeper = format!(
+            "{{{base}, \"a\": {}{}}}",
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        assert_eq!(
+            parse_definition(deeper.as_bytes()).unwrap_err(),
+            DefinitionError::Bounds
+        );
         // Strings are cut on a character boundary.
         let long = "é".repeat(MAX_STRING_BYTES);
         let d = parse_definition(format!("{{{base}, \"description\": \"{long}\"}}").as_bytes())
@@ -1924,12 +1946,14 @@ mod tests {
             assert_eq!(pre.client_secret.is_some(), blanked, "{value:?}");
             assert_eq!(pre.text.len(), doc.len());
         }
-        // Not at the top level: blanked (a credential key), no form.
+        // Not at the top level: a key spelled `clientSecret` is left to
+        // the visitor (never blanked, no form).
         let doc = format!(
             "{YAML_HEAD}nested:\n  clientSecret: FAKE-NESTED\n  other: {{clientSecret: FAKE-FLOW, b: c}}\n"
         );
         let pre = yaml::prescan(doc.as_bytes()).unwrap();
-        assert!(!String::from_utf8_lossy(&pre.text).contains("FAKE-"));
+        let text = String::from_utf8_lossy(&pre.text).into_owned();
+        assert!(text.contains("FAKE-NESTED") && text.contains("FAKE-FLOW"));
         assert_eq!(pre.client_secret, None);
         let d = parse_yaml_definition(doc.as_bytes()).unwrap();
         assert_eq!(d.client_secret, SecretForm::Absent);
@@ -1938,10 +1962,100 @@ mod tests {
         let doc = "--- !<org.apereo.cas.services.OidcRegisteredService> {serviceId: x, clientSecret: '${S}', b: {clientSecret: FAKE-N}}\n";
         let pre = yaml::prescan(doc.as_bytes()).unwrap();
         assert_eq!(pre.client_secret, Some(SecretForm::Reference));
-        assert!(!String::from_utf8_lossy(&pre.text).contains("FAKE-"));
+        assert!(!String::from_utf8_lossy(&pre.text).contains("${S}"));
+        assert!(String::from_utf8_lossy(&pre.text).contains("FAKE-N"));
         let d = parse_yaml_definition(doc.as_bytes()).unwrap();
         assert_eq!(d.client_secret, SecretForm::Reference);
         assert_eq!(summary(&Ok(d)), summary(&yaml_unblanked(doc.as_bytes())));
+    }
+
+    /// A root block mapping indented under `--- !<class>` (valid YAML, and
+    /// CAS loads it): its `clientSecret` is top-level whatever the column
+    /// (review of #180, M1: it read as `Absent`, hiding a clear secret).
+    #[test]
+    fn yaml_indented_root_mappings_keep_the_client_secret_form() {
+        for indent in [1, 2, 3, 4, 8] {
+            let pad = " ".repeat(indent);
+            for (value, form) in [
+                ("fake-clear-secret", SecretForm::Clear),
+                ("'${S}'", SecretForm::Reference),
+                ("\"{cipher}AbCd\"", SecretForm::Encrypted),
+                ("~", SecretForm::Absent),
+            ] {
+                for (before, after) in [
+                    ("serviceId: \"^https://a\"\n", ""),
+                    ("", "serviceId: \"^https://a\"\n"),
+                    ("serviceId: x\nnested:\n  password: FAKE-P\n", "name: n\n"),
+                ] {
+                    let body: String = format!("{before}clientSecret: {value}\n{after}")
+                        .lines()
+                        .map(|l| format!("{pad}{l}\n"))
+                        .collect();
+                    let doc =
+                        format!("--- !<org.apereo.cas.services.OidcRegisteredService>\n{body}");
+                    let pre = yaml::prescan(doc.as_bytes()).unwrap();
+                    assert_eq!(pre.client_secret, Some(form), "{doc}");
+                    assert!(!String::from_utf8_lossy(&pre.text).contains("fake-clear"));
+                    let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+                    assert_eq!(d.client_secret, form, "{doc}");
+                    assert_eq!(summary(&Ok(d)), summary(&yaml_unblanked(doc.as_bytes())));
+                }
+            }
+        }
+        // The review's probe.
+        let doc = "--- !<org.apereo.cas.services.OidcRegisteredService>\n  serviceId: \"^https://a\"\n  clientSecret: fake-clear-secret\n";
+        assert_eq!(
+            parse_yaml_definition(doc.as_bytes()).unwrap().client_secret,
+            SecretForm::Clear
+        );
+        // A nested mapping at a deeper indentation is not top-level.
+        let doc = "--- !<org.apereo.cas.services.OidcRegisteredService>\n  serviceId: x\n  n:\n    clientSecret: FAKE-NESTED\n";
+        let pre = yaml::prescan(doc.as_bytes()).unwrap();
+        assert_eq!(pre.client_secret, None);
+        assert!(String::from_utf8_lossy(&pre.text).contains("FAKE-NESTED"));
+        let d = parse_yaml_definition(doc.as_bytes()).unwrap();
+        assert_eq!(d.client_secret, SecretForm::Absent);
+    }
+
+    /// Blanking never turns an invalid escape into a valid document
+    /// (review of #180, L1): a double-quoted value with `\` is left as is.
+    #[test]
+    fn yaml_blanking_leaves_escapes_to_the_parser() {
+        for value in [
+            r#""\q""#,
+            r#""\uD800""#,
+            r#""ok\q""#,
+            r#""\uD83D\uDE00""#,
+            r#""\U00110000""#,
+            r#""\x4""#,
+            r#""\'""#,
+        ] {
+            for key in ["apiPassword", "password", "clientSecret"] {
+                let doc = format!("{YAML_HEAD}{key}: {value}\n");
+                let ours = parse_yaml_definition(doc.as_bytes());
+                assert!(matches!(ours, Err(DefinitionError::Malformed)), "{doc}");
+                assert_eq!(summary(&ours), summary(&yaml_unblanked(doc.as_bytes())));
+                let pre = yaml::prescan(doc.as_bytes()).unwrap();
+                assert_eq!(pre.text.len(), doc.len());
+                assert!(String::from_utf8_lossy(&pre.text).contains(value), "{doc}");
+            }
+        }
+        // Escapes libyaml accepts are blanked, and read the same.
+        for value in [
+            r#""fake\x41""#,
+            r#""fake\U0001F600\u00e9\"\\\/""#,
+            r#""{\"d\": \"FAKE-K\"}""#,
+        ] {
+            let doc = format!("{YAML_HEAD}apiPassword: {value}\n");
+            let text = yaml::prescan(doc.as_bytes()).unwrap().text;
+            assert!(!String::from_utf8_lossy(&text).contains("FAKE"), "{doc}");
+            assert!(!String::from_utf8_lossy(&text).contains("fake"), "{doc}");
+            assert_eq!(
+                summary(&parse_yaml_definition(doc.as_bytes())),
+                summary(&yaml_unblanked(doc.as_bytes())),
+                "{doc}"
+            );
+        }
     }
 
     proptest::proptest! {
@@ -1961,7 +2075,7 @@ mod tests {
                     "clientSecret", "password", "apiKey", "'pass''word'", "\"token\"", "name",
                     "description", "x",
                 ]),
-                0u8..6,
+                0u8..7,
                 "[A-Za-z0-9$./-]{0,12}|[A-Za-z0-9 ${}#'\".:~/-]{0,16}",
                 0u8..3,
             ), 0..6),
@@ -1976,7 +2090,11 @@ mod tests {
                     2 => format!("\"{marker}{}\"", text.replace(['"', '\\'], "")),
                     3 => format!("\n  {marker}{text}"),
                     4 => format!("{text}{marker}"),
-                    _ => format!("{{a: {marker}, {key}: {marker}}}"),
+                    5 => format!("{{a: {marker}, {key}: {marker}}}"),
+                    // An escape libyaml may accept or refuse (review of
+                    // #180, L1): the outcome must not change (`Z` keeps the
+                    // closing quote out of the escape).
+                    _ => format!("\"{marker}\\{}Z\"", text.replace(['"', '\\'], "")),
                 };
                 if *indent == 1 {
                     doc.push_str(&format!("n{i}:\n  {key}: {}\n", value.replace('\n', "\n  ")));
@@ -1985,7 +2103,9 @@ mod tests {
                 }
                 let same_line_scalar = matches!(style, 0..=2) && !key.starts_with('"');
                 let is_cred = !matches!(*key, "name" | "description" | "x");
-                markers.push((marker, same_line_scalar && is_cred));
+                // A nested `clientSecret` is left to the visitor.
+                let nested_cs = *key == "clientSecret" && *indent == 1;
+                markers.push((marker, same_line_scalar && is_cred && !nested_cs));
             }
             let ours = parse_yaml_definition(doc.as_bytes());
             let theirs = yaml_unblanked(doc.as_bytes());

@@ -74,16 +74,21 @@
 //! ([`super::definition::is_credential_key`], the visitor's rule): a
 //! blanked plain scalar reads as `null`, a blanked quoted one as spaces,
 //! and the visitor skips the value of such a key either way. The
-//! [`SecretForm`] of the top-level `clientSecret` (a key at column 0 in
-//! the block context, or in a root flow mapping) is computed here first, from the value before
-//! blanking, and given back in [`Prescanned::client_secret`]. Out of
+//! [`SecretForm`] of the top-level `clientSecret` (a key of the root
+//! block mapping, at its first indentation level whatever its column, or
+//! of a root flow mapping) is computed here first, from the value before
+//! blanking, and given back in [`Prescanned::client_secret`]; any other
+//! key spelled `clientSecret` is never blanked, so that the visitor reads
+//! it as before. A double-quoted value holding `\` is never blanked
+//! either: its escapes are left for the parser to accept or refuse
+//! (blanking must not turn an invalid document into a valid one). Out of
 //! scope (left to a future parser change, ROADMAP phase 8 follow-ups):
 //! values on the next line, multi-line and block scalars, values after a
 //! tag, nested credential subtrees (`password:` followed by a mapping or
-//! a sequence), keys written with a double-quoted escape, and a top-level
-//! `clientSecret` whose double-quoted value holds an escape. This fails
-//! safe: whatever the scanner does not blank is still skipped by the
-//! visitor, as before (only the unwiped copies remain).
+//! a sequence), keys written with a double-quoted escape, and
+//! double-quoted values with an escape. This fails safe: whatever the
+//! scanner does not blank is still skipped by the visitor, as before
+//! (only the unwiped copies remain).
 
 use zeroize::Zeroizing;
 
@@ -272,8 +277,10 @@ struct ScalarSpan {
 struct CredentialKey {
     /// The line of its `:`.
     line: usize,
-    /// It is the top-level `clientSecret`.
+    /// It is spelled `clientSecret`.
     client_secret: bool,
+    /// It is a key of the root mapping.
+    top: bool,
 }
 
 struct Scanner<'a> {
@@ -302,6 +309,50 @@ struct Scanner<'a> {
     blanks: Vec<(usize, usize)>,
     /// The form of the blanked top-level `clientSecret`.
     client_secret: Option<SecretForm>,
+}
+
+/// Whether every escape of a single-line double-quoted scalar's content
+/// is one libyaml accepts (`scan_flow_scalar`, as vendored by
+/// `unsafe-libyaml` 0.2.11): a one-character escape of its list, or `x`,
+/// `u`, `U` with 2, 4 or 8 hexadecimal digits naming a Unicode scalar
+/// value (no surrogate, at most `U+10FFFF`; libyaml has no surrogate
+/// pairs). An escaped line break never reaches here (single-line only)
+/// and is refused.
+fn escapes_valid(raw: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&c) = raw.get(i) {
+        i += 1;
+        if c != b'\\' {
+            continue;
+        }
+        let Some(&e) = raw.get(i) else {
+            return false;
+        };
+        i += 1;
+        let digits = match e {
+            b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f' | b'r' | b'e' | b' ' | b'"'
+            | b'/' | b'\\' | b'N' | b'_' | b'L' | b'P' => continue,
+            b'x' => 2,
+            b'u' => 4,
+            b'U' => 8,
+            _ => return false,
+        };
+        let Some(hex) = raw.get(i..i + digits) else {
+            return false;
+        };
+        i += digits;
+        let mut value = 0u32;
+        for &h in hex {
+            let Some(d) = char::from(h).to_digit(16) else {
+                return false;
+            };
+            value = (value << 4) | d;
+        }
+        if (0xD800..=0xDFFF).contains(&value) || value > 0x10_FFFF {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_break(c: Option<u8>) -> bool {
@@ -821,13 +872,25 @@ impl<'a> Scanner<'a> {
         if !is_credential_key(key) {
             return None;
         }
-        // A key of the root mapping: at column 0 in the block context, or
-        // directly in a root flow mapping (no block indentation yet).
-        let top = (self.flow.is_empty() && k.col == 0)
-            || (self.flow == [Flow::Map] && self.indents.len() == 1);
+        // A key of the root mapping (`indents` is read before this key's
+        // `roll`): in the block context, the first key of the document (no
+        // block indentation yet) or a key at the root mapping's own
+        // indentation, whatever its column (`--- !<class>` may be followed
+        // by an indented mapping); or directly in a root flow mapping.
+        let col = isize::try_from(k.col).ok()?;
+        let top = if self.flow.is_empty() {
+            match self.indents.as_slice() {
+                [_] => true,
+                [_, root] => *root == col,
+                _ => false,
+            }
+        } else {
+            self.flow == [Flow::Map] && self.indents.len() == 1
+        };
         Some(CredentialKey {
             line: self.line,
-            client_secret: key == "clientSecret" && top,
+            client_secret: key == "clientSecret",
+            top,
         })
     }
 
@@ -849,7 +912,17 @@ impl<'a> Scanner<'a> {
         if from >= to {
             return;
         }
+        // Blanking must not hide an escape the parser would refuse
+        // (`"\q"`, `"\uD800"`): such a value is left for it to refuse.
+        if s.quote == Some(b'"') && !self.b.get(from..to).is_some_and(escapes_valid) {
+            return;
+        }
         if key.client_secret {
+            // Fail safe: only the top-level `clientSecret`, whose form is
+            // computed here, is blanked; any other is the visitor's.
+            if !key.top {
+                return;
+            }
             let Some(form) = self.form_of(s, from, to) else {
                 return;
             };

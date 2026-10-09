@@ -125,12 +125,17 @@ refused as a whole, and those files are never opened.
   the line of a credential key's `:` (a key matching the visitor's
   credential words): the parser never sees it, and the visitor skips the
   key's value as before. The `SecretForm` of the top-level `clientSecret`
-  is computed by the pre-scan from the value before blanking (YAML's null
-  spellings are absent). **Remaining gap**: values on the next line,
+  (a key of the root mapping, whatever the root block mapping's
+  indentation) is computed by the pre-scan from the value before blanking
+  (YAML's null spellings are absent); any other key spelled `clientSecret`
+  is never blanked (fail safe, review of #180, M1). A double-quoted value
+  with an escape libyaml refuses (`"\q"`, `"\uD800"`) is never blanked,
+  so that blanking never turns an invalid document into a valid one
+  (review of #180, L1). **Remaining gap**: values on the next line,
   multi-line and block scalars, values after a tag, nested credential
   subtrees (`apiPassword:` then a mapping or a list), keys written with a
-  double-quoted escape, and a top-level `clientSecret` whose double-quoted
-  value holds an escape are not blanked (left to a future parser change,
+  double-quoted escape, a nested `clientSecret`, and a top-level
+  `clientSecret` whose double-quoted value holds an escape are not blanked (left to a future parser change,
   ROADMAP phase 8 follow-ups); they are still skipped by the visitor, and
   every other scalar (the values classified) is copied by the parser.
 - Credential fields are never sampled: `clientSecret`, and every key whose

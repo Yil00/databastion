@@ -299,6 +299,9 @@ pub(crate) fn json_zeroizing<T: Serialize>(
     write(&mut count, value, pretty)?;
     let mut out = Zeroizing::new(Vec::with_capacity(count.0));
     write(&mut *out, value, pretty)?;
+    // Both passes serialize the same value: same length, so the buffer
+    // was never grown.
+    debug_assert_eq!(out.len(), count.0);
     Ok(out)
 }
 
