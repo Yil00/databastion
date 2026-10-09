@@ -1,6 +1,6 @@
 # ADR-0046: CAS YAML service definitions read by an own parser of the pre-scanned subset, without `unsafe-libyaml`
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-10-09; the maintainer accepted the recommended answers to the five open questions)
 - **Date**: 2026-10-09
 - **Refines**: [ADR-0041](0041-cas-connector.md) (which stays Accepted): decision 4 ("Parser": "the workspace `serde_json` (and the workspace `serde_yaml_ng` for YAML)", and its refinement of 2026-10-08, YAML service registry) and decision 13 ("Its dependencies are workspace crates only (`serde`, `serde_json`, `serde_yaml_ng`, …)"). The accepted YAML subset, the refusals, the bounds and the visitor are unchanged.
 - **Context references**: review of #169 (YAML service registries), finding L5; ROADMAP [phase 8 follow-ups](../ROADMAP.md#phase-8-follow-ups); `agent/crates/connector-cas/src/parse/yaml.rs` (pre-scanner), `src/parse/definition.rs` (`parse_yaml_definition`, `parse_with`, the closed visitor), `src/proptests.rs`, `fixtures/registry/` (JSON / YAML pairs); `agent/fuzz/fuzz_targets/cas_registry_yaml.rs` and the nightly AddressSanitizer campaign (`.github/workflows/fuzz-nightly.yml`, #179); `agent/deny.toml`, `.github/workflows/advisories.yml`; [08-engine-capabilities.md](../08-engine-capabilities.md#apereo-cas)
@@ -113,14 +113,15 @@ Option (a), for the CAS path only:
 - **Option (c)**: keeps archived, unsafe, translated C on a path any CAS administrator can feed, with nobody to fix what the ASan campaign finds, and keeps the unwiped copies.
 - **Moving `agent.yaml` to the CAS subset parser**: the subset does not cover the configuration's needs (enums, `Value`, error paths), and widening it for a root-owned file would grow the attack surface of the CAS path.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
+Each answer is the recommendation of this ADR, accepted by the maintainer on 2026-10-09.
 1. Option (a), an own parser for the pre-scanned subset, as proposed, or (b) `serde-saphyr` with an MSRV bump to 1.89, or (c) keep `serde_yaml_ng` with the ASan campaign?
-   **Recommended answer**: (a). It removes `unsafe` code and unwiped copies from the only YAML path hostile input reaches, keeps one tokenizer for refusing, blanking and parsing, and adds no dependency.
+   **Answer (decided by the maintainer on 2026-10-09)**: (a). It removes `unsafe` code and unwiped copies from the only YAML path hostile input reaches, keeps one tokenizer for refusing, blanking and parsing, and adds no dependency.
 2. Keep `serde_yaml_ng` as a dev-dependency of `connector-cas` and in the fuzz workspace, as the differential oracle?
-   **Recommended answer**: yes. It is never linked into the binary (`deny.toml` excludes dev-dependencies), and it is the only independent reference for the subset's semantics.
+   **Answer (decided by the maintainer on 2026-10-09)**: yes. It is never linked into the binary (`deny.toml` excludes dev-dependencies), and it is the only independent reference for the subset's semantics.
 3. `agent.yaml`: keep `serde_yaml_ng` in the core for now, as proposed, and with which criteria to move it later?
-   **Recommended answer**: keep it for now (root-owned input). Move it, by a later ADR, to a safe serde YAML crate once one has `forbid(unsafe_code)`, an MSRV no higher than the agent's, 12 months of releases since its 1.0 and no open advisory. `serde-saphyr` is the current candidate (1.0 on 2026-07-31, MSRV 1.89).
+   **Answer (decided by the maintainer on 2026-10-09)**: keep it for now (root-owned input). Move it, by a later ADR, to a safe serde YAML crate once one has `forbid(unsafe_code)`, an MSRV no higher than the agent's, 12 months of releases since its 1.0 and no open advisory. `serde-saphyr` is the current candidate (1.0 on 2026-07-31, MSRV 1.89).
 4. RustSec has no unmaintained advisory for `unsafe-libyaml`. Should the maintainer, after confirming the archive, submit one (`informational = "unmaintained"`), knowing that the agent's own advisories job will then fail until a scoped `ignore` is reviewed (decision 6)?
-   **Recommended answer**: yes. It warns every user of the crate, and the scoped `ignore` records that the agent keeps it for root-owned configuration only.
+   **Answer (decided by the maintainer on 2026-10-09)**: yes. It warns every user of the crate, and the scoped `ignore` records that the agent keeps it for root-owned configuration only.
 5. Keep the pre-scanner's positional blanking of credential values once the parser is ours and never copies them?
-   **Recommended answer**: yes, as defence in depth: it costs one pass, and it keeps credential values out of the event builder even if a later change makes the parser copy scalars.
+   **Answer (decided by the maintainer on 2026-10-09)**: yes, as defence in depth: it costs one pass, and it keeps credential values out of the event builder even if a later change makes the parser copy scalars.
