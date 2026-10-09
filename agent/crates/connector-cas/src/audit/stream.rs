@@ -25,7 +25,7 @@ use databastion_core::audit::CursorStore;
 use databastion_core::audit::tail::{Framing, TailError, Tailer};
 use zeroize::Zeroizing;
 
-use super::events::{Builder, CasEvent};
+use super::events::{Builder, CasEvent, CorrelationLog};
 use super::level::Evidence;
 use crate::config::{AuditLogSettings, CasSettings, UtcOffset};
 use crate::fsread::{self, Policy, Refusal};
@@ -113,6 +113,10 @@ pub struct AuditRunner {
     policy: Policy,
     /// Why the tailer's open check last refused the file.
     refused: Arc<std::sync::Mutex<Option<Refusal>>>,
+    /// Rate limit of the token correlation log line (ADR-0044).
+    correlation_log: CorrelationLog,
+    /// Tailer rotations and truncations already seen.
+    rotations: u64,
 }
 
 impl std::fmt::Debug for AuditRunner {
@@ -147,6 +151,11 @@ impl AuditRunner {
         let log = settings.audit_log.clone()?;
         let refused = Arc::new(std::sync::Mutex::new(None));
         let check = fsread::log_open_check(log.path.clone(), policy, Arc::clone(&refused));
+        // A fresh or resumed stream: records before its start were not seen
+        // (a token request just before it, or before a restart), so the
+        // first records name nothing (review of #182 L6).
+        let mut builder = builder;
+        builder.note_loss(None);
         Some(Self {
             tailer: Tailer::new(log.path.path().to_path_buf(), Framing::Lines, store)
                 .with_open_check(check),
@@ -156,6 +165,8 @@ impl AuditRunner {
             reported: (0, 0),
             policy,
             refused,
+            correlation_log: CorrelationLog::default(),
+            rotations: 0,
         })
     }
 
@@ -193,12 +204,30 @@ impl AuditRunner {
             d
         };
         let mut events = Vec::new();
+        // A line lost in this read (oversized, unparsable, a parser panic)
+        // may be a token request: no token response of this read, nor
+        // within the correlation window around it, is named (review of #182
+        // M1). Loss positions are not kept, so the whole read is tainted.
+        let span = batch.records.iter().map(|r| r.when).fold(
+            None,
+            |acc: Option<(SystemTime, SystemTime)>, t| {
+                Some(acc.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t))))
+            },
+        );
+        // A rotation or a truncation (the tailer resets its partial record)
+        // may lose a record too (review of #182 L5).
+        let rotated = self.tailer.rotations > self.rotations;
+        self.rotations = self.tailer.rotations;
+        if batch.dropped > 0 || skipped > 0 || rotated {
+            self.builder.note_loss(span);
+        }
         let mut panicked = 0u64;
         for r in &batch.records {
             let builder = &mut self.builder;
             let out = &mut events;
             if databastion_core::isolate(|| builder.push(r, now, out)).is_none() {
                 panicked += 1;
+                self.builder.note_loss(span);
             }
         }
         self.builder.flush(now, false, &mut events);
@@ -210,6 +239,18 @@ impl AuditRunner {
             tracing::warn!(
                 dropped,
                 "CAS audit records dropped (unparsable, oversized or internal error)"
+            );
+        }
+        // Token responses left unnamed (ADR-0044): counts only, at most one
+        // line per interval.
+        if let Some(d) = self.correlation_log.due(now, self.builder.correlation) {
+            tracing::info!(
+                named = d.named,
+                unmatched = d.unmatched,
+                ambiguous = d.ambiguous,
+                evicted = d.evicted,
+                "CAS token responses not named after their token request (no request record of \
+                 their client in the window, or several clients behind one address and user agent)"
             );
         }
         self.state.note_evidence(&batch.evidence);
@@ -311,6 +352,156 @@ mod tests {
             snap.evidence.level(now).0,
             databastion_core::AuditLevel::Partial
         );
+    }
+
+    fn token_lines(when: u128, between: &str) -> String {
+        format!(
+            "{{\"action\": \"OAUTH2_ACCESS_TOKEN_REQUEST_CREATED\", \"who\": \"audit:unknown\", \"when\": {when}, \
+             \"what\": {{\"code\": \"N/A\", \"grant_type\": \"client_credentials\", \"service\": \"scratch-m2m\"}}, \
+             \"clientIpAddress\": \"192.0.2.5\", \"serverIpAddress\": \"198.51.100.3\", \"userAgent\": \"curl/8.5.0\"}}\n\
+             {between}\
+             {{\"action\": \"OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED\", \"who\": \"scratch-m2m\", \"when\": {}, \
+             \"what\": {{\"access_token\": \"AT-1-FAKE\"}}, \
+             \"clientIpAddress\": \"192.0.2.5\", \"serverIpAddress\": \"198.51.100.3\", \"userAgent\": \"curl/8.5.0\"}}\n",
+            when + 40
+        )
+    }
+
+    /// Review of #182 M1: a line lost between a token request and its
+    /// response (unparsable, oversized, a parser panic, or alone in an
+    /// earlier read) leaves the response `*`.
+    #[test]
+    fn a_lost_line_leaves_token_responses_unnamed() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let def = crate::parse::definition::parse_definition(
+            br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#,
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        let objects = |between: &str, before: Option<&str>| {
+            let dir = TempDir::new("stream-loss");
+            append(&dir, "");
+            let s = settings(&dir);
+            let b = Builder::new(
+                key(),
+                &[],
+                ClientAddrMode::Truncated,
+                Some(Arc::clone(&idx)),
+            );
+            let mut r =
+                AuditRunner::with_policy(&s, None, b, Arc::new(CasState::default()), Policy::TESTS)
+                    .unwrap();
+            let now = SystemTime::now();
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let when = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            // The stream's start taints around its first record (review of
+            // #182 L6): one a minute earlier.
+            append(
+                &dir,
+                &format!(
+                    "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": {}}}\n",
+                    when - 60_000
+                ),
+            );
+            assert_eq!(r.poll(now).unwrap().events.len(), 1);
+            if let Some(lost) = before {
+                append(&dir, lost);
+                assert!(r.poll(now).unwrap().events.is_empty());
+            }
+            append(&dir, &token_lines(when, between));
+            r.poll(now)
+                .unwrap()
+                .events
+                .iter()
+                .map(|e| e.object.as_ref().unwrap().object().as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(objects("", None), ["M2M"], "control: nothing lost");
+        let oversized = format!("{{\"x\": \"{}\"}}\n", "a".repeat(1 << 21));
+        for lost in [
+            "WHO: jdoe\n".to_owned(),
+            "{\"action\": \"AUTHENTICATION_FAILED\", \"who\": \"TEST-PARSER-PANIC\", \"when\": 1}\n".to_owned(),
+            oversized,
+        ] {
+            assert_eq!(objects(&lost, None), ["*"], "between");
+            assert_eq!(objects("", Some(&lost)), ["*"], "in the read before");
+        }
+    }
+
+    /// Review of #182 L5 / L6: a rotation or a truncation between a token
+    /// request and its response, and the stream's start, leave the
+    /// response `*`.
+    #[test]
+    fn rotations_truncations_and_the_start_taint_token_responses() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let def = crate::parse::definition::parse_definition(
+            br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#,
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        // `cut`: 0 nothing, 1 rotation, 2 truncation, between request and
+        // response; `warm`: a record a minute earlier first.
+        let objects = |cut: u8, warm: bool| {
+            let dir = TempDir::new("stream-rotate");
+            append(&dir, "");
+            let s = settings(&dir);
+            let b = Builder::new(
+                key(),
+                &[],
+                ClientAddrMode::Truncated,
+                Some(Arc::clone(&idx)),
+            );
+            let mut r =
+                AuditRunner::with_policy(&s, None, b, Arc::new(CasState::default()), Policy::TESTS)
+                    .unwrap();
+            let now = SystemTime::now();
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let when = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            if warm {
+                append(
+                    &dir,
+                    &format!(
+                        "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"when\": {}}}\n",
+                        when - 60_000
+                    ),
+                );
+                assert_eq!(r.poll(now).unwrap().events.len(), 1);
+            }
+            let pair = token_lines(when, "");
+            let (request, response) = pair.split_once('\n').unwrap();
+            // Long enough that a truncated file is shorter than the offset.
+            append(&dir, &format!("{request}\n{request}\n"));
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let log = dir.path().join("cas_audit.log");
+            match cut {
+                1 => {
+                    std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+                    append(&dir, "");
+                }
+                2 => std::fs::write(&log, "").unwrap(),
+                _ => {}
+            }
+            append(&dir, response);
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.extend(r.poll(now).unwrap().events);
+            }
+            out.iter()
+                .map(|e| e.object.as_ref().unwrap().object().as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(objects(0, true), ["M2M"], "control");
+        assert_eq!(objects(0, false), ["*"], "the stream's first records");
+        assert_eq!(objects(1, true), ["*"], "rotation");
+        assert_eq!(objects(2, true), ["*"], "truncation");
     }
 
     #[test]

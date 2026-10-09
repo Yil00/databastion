@@ -15,6 +15,12 @@ pub mod yaml;
 pub(crate) use databastion_core::jtext;
 use zeroize::Zeroizing;
 
+/// Longest OAuth / OIDC client id compared, in bytes (ADR-0044): a longer
+/// `clientId` in a definition, or `service` in a token request, selects no
+/// registry entry. Well under every parser bound, so a client id that is
+/// compared was never cut.
+pub const MAX_CLIENT_ID_BYTES: usize = 1024;
+
 /// `s` cut to at most `max` bytes on a character boundary, in a zeroizing
 /// buffer.
 pub(crate) fn bounded_owned(s: &str, max: usize) -> Zeroizing<String> {

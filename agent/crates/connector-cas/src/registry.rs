@@ -15,14 +15,45 @@
 //!   (`*`), since CAS might have matched it (review of #138). A lookup
 //!   gives only the entry's type and normalized name: the host it was
 //!   given never leaves the agent.
+//! - **Client ids** (ADR-0044): each OAuth / OIDC entry's `clientId` is
+//!   reduced, when the entry is added, to a keyed tag ([`ClientTag`], a
+//!   tag key of the index's own, fresh and random, never persisted nor
+//!   sent); the raw client id is not kept. A tag maps to the one entry
+//!   holding that client id (exact, case-sensitive bytes); a client id
+//!   shared by two entries maps to none. A lookup gives the same type and
+//!   normalized name as a `serviceId` match.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
+
+use databastion_classifiers::masking::LocalTagKey;
 use databastion_classifiers::names::{
     NormalizedName, PathPart, normalize_field_path, normalize_path,
 };
 use regex::{Regex, RegexBuilder};
 
+use crate::parse::MAX_CLIENT_ID_BYTES;
 use crate::parse::definition::{Definition, Seg, ServiceType};
 use crate::parse::url::ServiceHost;
+
+/// Purpose of the index's tag key for client ids.
+pub const CLIENT_TAG_PURPOSE: &str = "cas-oauth-client-ids";
+
+/// A keyed tag of an OAuth / OIDC client id (made with the key of the
+/// [`ServiceIndex`] that gave it; meaningless for any other index). Never
+/// printed, persisted nor sent.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientTag([u8; 16]);
+
+impl std::fmt::Debug for ClientTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientTag(<redacted>)")
+    }
+}
+
+/// An entry of a [`ServiceIndex`] (valid for that index only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryRef(usize);
 
 /// Compiled size limit of one `serviceId` pattern, and of its lazy DFA
 /// cache, in bytes.
@@ -101,25 +132,92 @@ struct Entry {
     service_type: ServiceType,
     object: NormalizedName,
     pattern: Pattern,
+    /// Tag of the `clientId` (OAuth / OIDC entries only).
+    client: Option<ClientTag>,
 }
 
 /// The services of a registry, for the audit service match.
-#[derive(Default)]
 pub struct ServiceIndex {
     entries: Vec<Entry>,
     /// Pattern budget charged so far.
     charged: usize,
+    /// Tag key of the client ids (`None` when the system random source
+    /// failed: no client is then indexed).
+    client_key: Option<LocalTagKey>,
+    /// Client id tag to its entry (`None`: shared by several entries),
+    /// built by [`Self::finish`].
+    clients: HashMap<ClientTag, Option<usize>>,
+    /// No client id selects an entry: a service was not indexed (beyond
+    /// [`MAX_SERVICES`]) or a registry file was skipped, so a client id
+    /// that looks unique here may be shared in what CAS loaded (review of
+    /// #182 L1).
+    clients_disabled: bool,
+}
+
+impl Default for ServiceIndex {
+    /// An empty index with a fresh random client tag key.
+    fn default() -> Self {
+        Self::with_client_key(databastion_core::audit::ephemeral_tag_key(
+            CLIENT_TAG_PURPOSE,
+        ))
+    }
 }
 
 impl std::fmt::Debug for ServiceIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServiceIndex")
             .field("services", &self.entries.len())
+            .field("clients", &self.clients.len())
+            .field("clients_disabled", &self.clients_disabled)
             .finish()
     }
 }
 
 impl ServiceIndex {
+    /// An empty index whose client ids are tagged with `key` (tests and
+    /// fuzzing: a fixed key; `None`: no client is indexed).
+    #[must_use]
+    pub fn with_client_key(key: Option<LocalTagKey>) -> Self {
+        Self {
+            entries: Vec::new(),
+            charged: 0,
+            client_key: key,
+            clients: HashMap::new(),
+            clients_disabled: false,
+        }
+    }
+
+    /// The tag of a client id: `None` when it is empty or longer than
+    /// [`MAX_CLIENT_ID_BYTES`], or the index has no key. Exact bytes.
+    #[must_use]
+    pub fn client_tag(&self, id: &str) -> Option<ClientTag> {
+        if id.is_empty() || id.len() > MAX_CLIENT_ID_BYTES {
+            return None;
+        }
+        let t = self
+            .client_key
+            .as_ref()?
+            .tag(&[b"cas/oauth-client-id\0", id.as_bytes()]);
+        let mut out = [0u8; 16];
+        for (o, b) in out.iter_mut().zip(t.iter()) {
+            *o = *b;
+        }
+        Some(ClientTag(out))
+    }
+
+    /// The one entry whose `clientId` has this tag (`None` when no entry,
+    /// or several, hold it).
+    #[must_use]
+    pub fn client(&self, tag: ClientTag) -> Option<EntryRef> {
+        self.clients.get(&tag).copied().flatten().map(EntryRef)
+    }
+
+    /// An entry's type and normalized name, as [`Self::lookup`] gives them.
+    #[must_use]
+    pub fn entry(&self, r: EntryRef) -> Option<(ServiceType, &NormalizedName)> {
+        self.entries.get(r.0).map(|e| (e.service_type, &e.object))
+    }
+
     /// Indexes `defs` (at most [`MAX_SERVICES`]), in evaluation order.
     #[must_use]
     pub fn new<'a>(defs: impl IntoIterator<Item = &'a Definition>) -> Self {
@@ -137,6 +235,7 @@ impl ServiceIndex {
     /// pattern).
     pub fn add(&mut self, d: &Definition) -> bool {
         if self.entries.len() >= MAX_SERVICES {
+            self.clients_disabled = true;
             return false;
         }
         let cost = 2 * PATTERN_SIZE_LIMIT;
@@ -151,19 +250,59 @@ impl ServiceIndex {
         } else {
             Pattern::Unknown
         };
+        let client = match d.service_type {
+            ServiceType::Oauth | ServiceType::Oidc => {
+                d.client_id.as_deref().and_then(|id| self.client_tag(id))
+            }
+            _ => None,
+        };
         self.entries.push(Entry {
             order: d.evaluation_order.unwrap_or(i64::MAX),
             service_type: d.service_type,
             object: object_name(d),
             pattern,
+            client,
         });
         within
     }
 
+    /// Disables the client id match (no client id selects an entry): call
+    /// it when a registry file was skipped (unreadable, too large, refused,
+    /// a parser panic, out of time), since a client id unique among the
+    /// indexed services may be shared with a skipped one (review of #182
+    /// L1).
+    pub fn disable_clients(&mut self) {
+        self.clients_disabled = true;
+        self.clients.clear();
+    }
+
+    /// Whether client ids can select an entry.
+    #[must_use]
+    pub fn clients_enabled(&self) -> bool {
+        !self.clients_disabled && self.client_key.is_some()
+    }
+
     /// Sorts the services in evaluation order (stable: file order for
-    /// equal orders).
+    /// equal orders) and maps the client id tags to their entries (none
+    /// when the client match is disabled).
     pub fn finish(&mut self) {
         self.entries.sort_by_key(|e| e.order);
+        self.clients.clear();
+        if self.clients_disabled {
+            return;
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            if let Some(t) = e.client {
+                match self.clients.entry(t) {
+                    MapEntry::Vacant(v) => {
+                        v.insert(Some(i));
+                    }
+                    MapEntry::Occupied(mut o) => {
+                        o.insert(None);
+                    }
+                }
+            }
+        }
     }
 
     /// Services indexed.
@@ -257,6 +396,81 @@ mod tests {
             "*"
         );
         assert_eq!(object_name(&def(&format!("{{{base}}}"))).as_str(), "*");
+    }
+
+    /// Client ids (ADR-0044): OAuth / OIDC entries only, exact bytes, a
+    /// shared one selects nothing, the raw value is not kept.
+    #[test]
+    fn client_ids_select_one_oauth_entry() {
+        let mk = |class: &str, name: &str, client: &str, order: i64| {
+            def(&format!(
+                r#"{{"@class": "{class}", "name": "{name}", "serviceId": "^https://x/$",
+                    "clientId": {client}, "evaluationOrder": {order}}}"#
+            ))
+        };
+        let oidc = "org.apereo.cas.services.OidcRegisteredService";
+        let oauth = "org.apereo.cas.support.oauth.services.OAuthRegisteredService";
+        let long = format!("\"{}\"", "c".repeat(MAX_CLIENT_ID_BYTES + 1));
+        let defs = [
+            mk(oidc, "Late", r#""mixed-Case""#, 90),
+            mk(oauth, "Early", r#""batch-job""#, 10),
+            mk(oidc, "Dup-A", r#""shared""#, 20),
+            mk(oauth, "Dup-B", r#""shared""#, 30),
+            mk(
+                "org.apereo.cas.services.CasRegisteredService",
+                "Cas",
+                r#""cas-client""#,
+                40,
+            ),
+            mk(oidc, "Long", &long, 50),
+            mk(oidc, "Number", "3", 60),
+        ];
+        let idx = ServiceIndex::new(&defs);
+        let name = |id: &str| {
+            let t = idx.client_tag(id)?;
+            let r = idx.client(t)?;
+            idx.entry(r)
+                .map(|(t, o)| format!("{}.{}", t.as_str(), o.as_str()))
+        };
+        // Evaluation order does not change which entry a client id selects.
+        assert_eq!(name("batch-job").as_deref(), Some("oauth.Early"));
+        assert_eq!(name("mixed-Case").as_deref(), Some("oidc.Late"));
+        for none in ["mixed-case", "batch-job ", "shared", "cas-client", "3", ""] {
+            assert_eq!(name(none), None, "{none:?}");
+        }
+        assert_eq!(name(&"c".repeat(MAX_CLIENT_ID_BYTES + 1)), None);
+        // Tags are keyed per index: another index's tag selects nothing.
+        let other = ServiceIndex::new(&defs);
+        let t = other.client_tag("batch-job").unwrap();
+        assert!(idx.client(t).is_none());
+        // No key: no client.
+        let mut keyless = ServiceIndex::with_client_key(None);
+        let _ = keyless.add(&defs[1]);
+        keyless.finish();
+        assert!(keyless.client_tag("batch-job").is_none());
+        // A skipped registry file disables the match (review of #182 L1).
+        let mut skipped = ServiceIndex::new(&defs);
+        assert!(skipped.clients_enabled());
+        skipped.disable_clients();
+        skipped.finish();
+        assert!(!skipped.clients_enabled());
+        let t = skipped.client_tag("batch-job").unwrap();
+        assert!(skipped.client(t).is_none());
+        // So does a service beyond MAX_SERVICES.
+        let mut full = ServiceIndex::default();
+        for _ in 0..MAX_SERVICES {
+            let _ = full.add(&defs[4]);
+        }
+        assert!(!full.add(&defs[1]));
+        full.finish();
+        assert!(!full.clients_enabled());
+        let t = full.client_tag("batch-job").unwrap();
+        assert!(full.client(t).is_none());
+        let t = other.client_tag("batch-job").unwrap();
+        let dbg = format!("{idx:?} {t:?}");
+        for leak in ["batch", "shared", "mixed"] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
     }
 
     #[test]

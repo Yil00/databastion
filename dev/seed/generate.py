@@ -813,7 +813,8 @@ def gen_cas(f: Fake, t: Truth) -> dict[str, str]:
         "@class": CAS_CLASS["oidc"], "id": 1003, "name": "HR-Portal", "evaluationOrder": 30,
         "serviceId": "^https://hr\\.example\\.com/oidc/callback$",
         "clientId": "hr-portal", "clientSecret": clear_secret,
-        "supportedGrantTypes": ["java.util.HashSet", ["authorization_code"]],
+        # `client_credentials`: the e2e CAS scenario's token-only grant (ADR-0044).
+        "supportedGrantTypes": ["java.util.HashSet", ["authorization_code", "client_credentials"]],
         "supportedResponseTypes": ["java.util.HashSet", ["code"]],
         "scopes": ["java.util.HashSet", ["openid", "profile", "email"]],
         "description": "HR portal (FAKE data; its client secret is a dev-only value in clear)",
