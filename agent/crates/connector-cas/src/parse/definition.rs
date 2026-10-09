@@ -49,7 +49,11 @@
 //! ([`super::yaml::prescan`]: anchors, aliases, merge keys, tags other
 //! than CAS class hints, directives and second documents refused before
 //! any parsing), then the copy with its class hints blanked goes through
-//! the same visitor with `serde_yaml_ng`. The class is the root node's tag
+//! the same visitor with the crate's own YAML parser
+//! ([`super::yaml::Document`], ADR-0046: no `unsafe-libyaml` on this path;
+//! values the visitor skips are never decoded, the others are borrowed
+//! from the zeroizing copy or decoded into zeroizing buffers). The class
+//! is the root node's tag
 //! (`--- !<org.apereo.cas.…>`, what CAS 8.0.2 requires); a top-level
 //! `@class` key next to it refuses the document. YAML resolves unquoted
 //! digits to integers (`phone: 33612345678`, a card number): below the
@@ -378,9 +382,19 @@ pub fn parse_registry_file(
 /// [`DefinitionError`]; nothing of a refused document is returned.
 pub fn parse_yaml_definition(bytes: &[u8]) -> Result<Definition, DefinitionError> {
     let pre = yaml::prescan(bytes)?;
-    let de = serde_yaml_ng::Deserializer::from_slice(&pre.text);
     // The by-value deserializer refuses a stream of several documents.
-    let mut def = parse_with(de, Some(pre.class), false)?;
+    let doc = yaml::Document::parse(&pre.text)?;
+    yaml_definition_with(doc, &pre)
+}
+
+/// The visitor over a deserializer of a pre-scanned text: the crate's own
+/// ([`parse_yaml_definition`]), or `serde_yaml_ng` as the oracle of the
+/// differential tests and fuzz target.
+pub(crate) fn yaml_definition_with<'de, D: Deserializer<'de>>(
+    de: D,
+    pre: &yaml::Prescanned,
+) -> Result<Definition, DefinitionError> {
+    let mut def = parse_with(de, Some(pre.class.clone()), false)?;
     // A top-level `clientSecret` the pre-scan blanked: its form was taken
     // from the value before blanking.
     if let Some(form) = pre.client_secret {

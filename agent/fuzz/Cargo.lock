@@ -197,7 +197,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",
@@ -275,6 +274,7 @@ dependencies = [
  "databastion-connector-mongodb",
  "databastion-connector-openldap",
  "libfuzzer-sys",
+ "serde_yaml_ng",
 ]
 
 [[package]]

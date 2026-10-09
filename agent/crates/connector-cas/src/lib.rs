@@ -56,8 +56,9 @@ pub mod parse;
 pub mod registry;
 pub mod state;
 
-/// Fuzz target entry points (`agent/fuzz`); `fuzzing` feature only.
-#[cfg(feature = "fuzzing")]
+/// Fuzz target entry points (`agent/fuzz`); `fuzzing` feature only (and
+/// the crate's own tests).
+#[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub mod fuzz;
 

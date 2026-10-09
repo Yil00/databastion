@@ -37,10 +37,12 @@ jobs:
       max-parallel: 6
       matrix:
         # One entry per file in agent/fuzz/fuzz_targets/ (there is no MySQL / MariaDB fuzz target:
-        # its parsers are covered by property tests). The YAML service registry target gets the
-        # longest budget: its pre-scanner and serde_yaml_ng (unsafe-libyaml) are the newest code.
+        # its parsers are covered by property tests). The YAML service registry targets get the
+        # longest budget: the crate's own YAML parser (ADR-0046) is the newest code, and
+        # cas_registry_yaml_diff checks it against serde_yaml_ng (unsafe-libyaml, test only).
         include:
           - { target: cas_registry_yaml, seconds: 600 }
+          - { target: cas_registry_yaml_diff, seconds: 600 }
           - { target: cas_registry, seconds: 300 }
           - { target: cas_audit_log, seconds: 300 }
           - { target: mongodb_bson, seconds: 180 }

@@ -60,7 +60,7 @@ refused as a whole, and those files are never opened.
 - A file is used only when its top-level object has an `@class` of a CAS
   registered service and a `serviceId`; anything else is skipped and none of
   its values is classified. JSON comments are not accepted.
-- **YAML** (`yaml_dir`, `src/parse/yaml.rs`): CAS 8.0.2 loads a YAML file
+- **YAML** (`yaml_dir`, `src/parse/yaml/`): CAS 8.0.2 loads a YAML file
   only when it starts with `--- !<class>` (`RegisteredServiceYamlSerializer`:
   Jackson writes class hints as verbatim tags) and reads one document. The
   agent requires the same start (after blank lines of spaces only, as CAS
@@ -79,34 +79,41 @@ refused as a whole, and those files are never opened.
   lone CR or a Unicode line break (`U+0085`, `U+2028`, `U+2029`); flow
   collections nested deeper than 4, collections deeper than 32 (a lower
   bound: indentless sequences are not counted; the visitor's depth 32 and
-  `serde_yaml_ng`'s recursion limit 128 are the backstops), more than
+  the deserializer's recursion limit 128 are the backstops), more than
   32 768 lines, or more than 196 608 tokens (scalars, flow collection
   starts, `-` entries and `:` values: three per node the visitor allows),
-  since `serde_yaml_ng` loads every event before the visitor's bounds apply
-  (a 1 MiB `[a,a,…]` is refused before parsing). `&`, `*`, `!` and `#` inside quoted, plain and block
+  since the event builder holds every event before the visitor's bounds
+  apply (a 1 MiB `[a,a,…]` is refused before parsing). `&`, `*`, `!` and `#` inside quoted, plain and block
   scalars and comments are text. The class hints are then blanked (replaced
   by spaces, positions unchanged) in a zeroizing copy, which goes through
-  the same closed visitor and bounds as JSON with `serde_yaml_ng`: the YAML
-  parser never sees an anchor, an alias, a merge key nor a tag.
+  the same closed visitor and bounds as JSON with the crate's own YAML
+  parser: it never sees an anchor, an alias, a merge key nor a tag.
 - **Unquoted numbers (YAML)**: YAML resolves `phone: 33612345678` or a card
   number to an integer; below the top level the visitor classifies it as
   its decimal text (a leading `+`, a `0x` / `0o` prefix and `_` are lost;
   a number with a leading zero stays a string). Floats are not classified.
   JSON numbers are not classified (unchanged).
-- **YAML parser choice**: `serde_yaml_ng` 0.10, the maintained fork of the
-  deprecated `serde_yaml` (MIT / Apache-2.0), which the core already links
-  to read `agent.yaml`: no new crate in the agent binary (ADR-0041 decisions
-  4 and 13). It drives the closed serde visitor directly (no generic value
-  first) and refuses a stream of several documents. `serde_yml` was not
-  taken (unsound, unmaintained: RUSTSEC-2025-0068), nor `yaml-rust2` /
-  `saphyr` (new dependencies, and their event APIs would need a second
-  walker beside the serde visitor). Its scanner is `unsafe-libyaml` 0.2.11,
-  a machine translation of libyaml with `unsafe` code, archived by its
-  author (no advisory against 0.2.11; RUSTSEC-2023-0075 is fixed in it): the
-  pre-scan is what keeps hostile constructs away from it, and
-  `serde_yaml_ng` still bounds alias expansion and recursion on its own.
-  Moving the core and this crate together to a maintained fork
-  (`serde_norway`) or a safe parser is a separate decision.
+- **YAML parser** ([ADR-0046](../../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md),
+  refining ADR-0041 decisions 4 and 13): an own parser of the subset the
+  pre-scan accepts, under `#![forbid(unsafe_code)]`, adding no crate. The
+  scanner that refuses and blanks (`parse/yaml/scan.rs`) runs a second
+  time, in parse mode, over the blanked copy and emits libyaml's tokens,
+  with libyaml's own errors (a simple key at the indentation without its
+  `:`, a key more than 1024 bytes before its `:`, a document marker inside
+  a quoted scalar, a refused escape); `parse/yaml/events.rs` is libyaml's
+  parser state machine over them, building the events of the one document
+  before the visitor runs; `parse/yaml/de.rs` is the `serde::Deserializer`
+  over the events. The accepted subset, the refusals and the values are
+  those of the former `serde_yaml_ng` 0.10 path (plain scalars resolve as
+  its untagged scalars: nulls, booleans, decimal / `0x` / `0o` / `0b`
+  integers, floats; quoted and block scalars are strings; keys are read as
+  strings), so findings do not change. `serde_yaml_ng` (on `unsafe-libyaml`,
+  a machine translation of libyaml archived by its author) is a
+  dev-dependency only: the oracle of differential property tests
+  (`src/proptests.rs`) and of the `cas_registry_yaml_diff` fuzz target,
+  which check that both read the same values and the same definition on
+  every file the pre-scan accepts, or both fail. The core still links it
+  for `agent.yaml` (root-owned configuration, ADR-0046 decision 5).
 - **JSON without unwiped copies**: on the JSON path every key and value
   the visitor reads is a raw value borrowed from the zeroizing file buffer,
   and strings (the `clientSecret` whose form is taken, the classified
@@ -117,10 +124,20 @@ refused as a whole, and those files are never opened.
   bytes are not all UTF-8 is refused as malformed (before, bytes that are
   not UTF-8 in a skipped value were accepted); a lone surrogate escape or
   an out-of-range number in a skipped value is not examined, as before.
-- **Credential values blanked before YAML parsing** (review of #169, L2):
-  libyaml's internal buffers and `serde_yaml_ng`'s event list hold copies
-  of every scalar they parse, freed without being wiped. The pre-scan
-  therefore also blanks (spaces, positions unchanged) the content of every
+- **YAML without unwiped copies** (ADR-0046 decision 3): tokens and
+  events hold byte positions only. A scalar is decoded only when the
+  visitor reads it: a value the visitor skips (credential fields,
+  structural keys) is never decoded nor copied. A scalar whose value is its
+  own text (single-line plain, single-line quoted without escape nor `''`)
+  is borrowed from the zeroizing copy of the file; any other (line folding,
+  escapes, block scalars) is built once in a zeroizing buffer allocated at
+  its final size, which never grows, and wiped when the visitor returns.
+  Deserializer errors carry no text. A test parses a definition whose
+  credential values hold a run-time marker in every form that reaches the
+  parser, then searches the process's writable memory for it (none left;
+  the former `serde_yaml_ng` path left dozens of copies).
+- **Credential values blanked before YAML parsing** (review of #169, L2;
+  kept as defence in depth by ADR-0046): the pre-scan also blanks (spaces, positions unchanged) the content of every
   single-line plain, single-quoted or double-quoted scalar that starts on
   the line of a credential key's `:` (a key matching the visitor's
   credential words): the parser never sees it, and the visitor skips the
@@ -131,13 +148,13 @@ refused as a whole, and those files are never opened.
   is never blanked (fail safe, review of #180, M1). A double-quoted value
   with an escape libyaml refuses (`"\q"`, `"\uD800"`) is never blanked,
   so that blanking never turns an invalid document into a valid one
-  (review of #180, L1). **Remaining gap**: values on the next line,
+  (review of #180, L1). **Not blanked**: values on the next line,
   multi-line and block scalars, values after a tag, nested credential
   subtrees (`apiPassword:` then a mapping or a list), keys written with a
   double-quoted escape, a nested `clientSecret`, and a top-level
-  `clientSecret` whose double-quoted value holds an escape are not blanked (left to a future parser change,
-  ROADMAP phase 8 follow-ups); they are still skipped by the visitor, and
-  every other scalar (the values classified) is copied by the parser.
+  `clientSecret` whose double-quoted value holds an escape are not
+  blanked: the visitor skips them without decoding them (the top-level
+  `clientSecret` is decoded into a zeroizing buffer for its form only).
 - Credential fields are never sampled: `clientSecret`, and every key whose
   name contains (case-insensitively) `secret`, `password`, `passwd`, `pass`,
   `pwd`, `key`, `token`, `credential`, `jwk`, `private`, `keystore`,
