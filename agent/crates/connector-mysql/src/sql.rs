@@ -755,6 +755,9 @@ pub(crate) const SERVER_UPTIME: &str = "SHOW GLOBAL STATUS LIKE 'Uptime'";
 /// Text limits of `performance_schema` (statement text, digest text).
 pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
 pub(crate) const PS_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_digest_length";
+/// The parser's digest storage (`max_digest_length`, set at startup): a
+/// digest is cut at the smaller of the two limits.
+pub(crate) const MAX_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.max_digest_length";
 
 /// Timers of an Audit poll: this session's current statement start (the
 /// timer's "now") and the oldest and newest end in the polled table. No
@@ -770,7 +773,10 @@ pub(crate) fn ps_stats(table: &str, own_thread: u64) -> String {
 
 /// The Audit poll of `performance_schema` statements (the only statement
 /// that reads statement text, ADR-0018): `DIGEST_TEXT`, and `SQL_TEXT` only
-/// for a statement without a digest; with the session's account, host,
+/// for a statement without a digest, with a digest of `sql_text_from` bytes
+/// or more (it may have been cut at its token storage: `pfs::digest_cut`),
+/// or of the agent's own account (its Discovery statements are recognized
+/// by their exact text); with the session's account, host,
 /// type and `program_name` while it is connected. Rows are ordered by end
 /// timer from `from`, this session's own thread excluded, at most `limit`.
 /// `table` is one of the three statement tables (`PsTable`).
@@ -781,6 +787,7 @@ pub(crate) fn ps_statements(
     from: u64,
     limit: usize,
     with_program: bool,
+    sql_text_from: usize,
 ) -> String {
     let program = if with_program {
         "(SELECT a.ATTR_VALUE FROM performance_schema.session_connect_attrs a \
@@ -790,7 +797,9 @@ pub(crate) fn ps_statements(
     };
     format!(
         "SELECT h.THREAD_ID, h.EVENT_ID, h.TIMER_END, h.CURRENT_SCHEMA, h.DIGEST_TEXT, \
-         CASE WHEN h.DIGEST_TEXT IS NULL THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
+         CASE WHEN h.DIGEST_TEXT IS NULL OR LENGTH(h.DIGEST_TEXT) >= {sql_text_from} \
+           OR t.PROCESSLIST_USER = SUBSTRING_INDEX(CURRENT_USER(), '@', 1) \
+         THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
          h.MYSQL_ERRNO, t.PROCESSLIST_USER, t.PROCESSLIST_HOST, t.TYPE, {program} \
          FROM performance_schema.{table} h \
          LEFT JOIN performance_schema.threads t ON t.THREAD_ID = h.THREAD_ID \
@@ -937,6 +946,7 @@ mod tests {
             SESSION_USER.to_owned(),
             PS_TEXT_LIMIT.to_owned(),
             PS_DIGEST_LIMIT.to_owned(),
+            MAX_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
             ps_stats("events_statements_history_long", 7),
         ];
@@ -1129,6 +1139,7 @@ mod tests {
             SERVER_UPTIME,
             PS_TEXT_LIMIT,
             PS_DIGEST_LIMIT,
+            MAX_DIGEST_LIMIT,
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -1151,7 +1162,14 @@ mod tests {
             "events_statements_history",
         ] {
             all.push(ps_stats(table, u64::MAX));
-            all.push(ps_statements(table, u64::MAX, u64::MAX, usize::MAX, true));
+            all.push(ps_statements(
+                table,
+                u64::MAX,
+                u64::MAX,
+                usize::MAX,
+                true,
+                usize::MAX,
+            ));
         }
         all.push(kill_query(u32::MAX));
         all.extend(cas_guard_statement_texts(None).unwrap());
@@ -1216,14 +1234,26 @@ mod tests {
     #[test]
     fn the_audit_poll_reads_text_only_through_the_digest() {
         for with_program in [true, false] {
-            let s = ps_statements("events_statements_history_long", 7, 0, 10, with_program);
+            let s = ps_statements(
+                "events_statements_history_long",
+                7,
+                0,
+                10,
+                with_program,
+                254,
+            );
             let lower = s.to_lowercase();
-            // SQL_TEXT only when there is no digest; never the text of a
-            // running statement of another session (PROCESSLIST_INFO), the
+            // SQL_TEXT only when there is no digest, a long digest or
+            // the agent's own account; never the text of a running
+            // statement of another session (PROCESSLIST_INFO), the
             // processlist, or another attribute than program_name.
             assert_eq!(lower.matches("sql_text").count(), 1, "{s}");
             assert!(
-                lower.contains("case when h.digest_text is null then h.sql_text end"),
+                lower.contains(
+                    "case when h.digest_text is null or length(h.digest_text) >= 254 \
+                     or t.processlist_user = substring_index(current_user(), '@', 1) \
+                     then h.sql_text end"
+                ),
                 "{s}"
             );
             for d in [

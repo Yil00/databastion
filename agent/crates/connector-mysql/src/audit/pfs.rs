@@ -134,6 +134,100 @@ struct ThreadInfo {
     program: Option<String>,
 }
 
+/// Largest token of a stored digest: an identifier of 64 characters of 4
+/// bytes and its 4-byte header.
+pub(crate) const MAX_DIGEST_TOKEN: usize = 4 + 64 * 4;
+
+/// Upper estimate of the bytes a rendered `DIGEST_TEXT` took in the
+/// server's digest token storage, which is what the digest limit bounds
+/// (security review of 914c9d2, N1): an identifier is stored in 4 bytes
+/// plus its name but rendered in its name plus 3 (`` `a` ``), other tokens
+/// in 2 bytes. Each space-separated chunk counts 2, a backquoted
+/// identifier 4 plus its name, and a chunk holding a backquote or `@`
+/// that is not one identifier 4 plus its length. Never more than 3 times
+/// the rendered length plus 3 (see [`sql_text_from`]).
+pub(crate) fn digest_stored_estimate(d: &[u8]) -> usize {
+    let mut est = 0usize;
+    let mut i = 0;
+    while i < d.len() {
+        if d[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if d[i] == b'`' {
+            // `…` with doubled backquotes inside.
+            let mut j = i + 1;
+            let mut name = 0usize;
+            while j < d.len() {
+                if d[j] == b'`' {
+                    if d.get(j + 1) == Some(&b'`') {
+                        name += 1;
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    break;
+                }
+                name += 1;
+                j += 1;
+            }
+            if j >= d.len() || d[j] == b' ' {
+                est = est.saturating_add(4 + name);
+                i = j;
+                continue;
+            }
+        }
+        while i < d.len() && d[i] != b' ' {
+            i += 1;
+        }
+        let chunk = &d[start..i];
+        est = est.saturating_add(if chunk.iter().any(|b| matches!(b, b'`' | b'@')) {
+            4 + chunk.len()
+        } else {
+            2
+        });
+    }
+    est
+}
+
+/// Whether a `DIGEST_TEXT` may have been cut: its estimated storage is
+/// within one largest token of `limit`, or [`text_cut`] holds.
+pub(crate) fn digest_cut(d: &[u8], limit: usize) -> bool {
+    text_cut(d, true, limit) || digest_stored_estimate(d).saturating_add(MAX_DIGEST_TOKEN) >= limit
+}
+
+/// Digest length (bytes) from which the poll also reads `SQL_TEXT`: every
+/// digest that [`digest_cut`] may judge cut by its estimate is at least
+/// this long (the estimate is at most 3 times the length plus 3).
+pub(crate) fn sql_text_from(digest_limit: usize) -> usize {
+    digest_limit.saturating_sub(MAX_DIGEST_TOKEN + 3) / 3
+}
+
+/// The text a statement row is analyzed with, and whether it may have been
+/// cut (security review of 914c9d2, N1): `SQL_TEXT` when the poll read it
+/// and it is not cut (whole, literals included: the analyzer normalizes
+/// them); else the digest when it is not cut; else a cut text (the digest,
+/// or `SQL_TEXT` without a digest), reported as a read of `*` when it has
+/// no table record. A text past [`MAX_TEXT_BYTES`] is dropped, and cut.
+pub(crate) fn choose_text<'a>(
+    digest: Option<&'a [u8]>,
+    sql_text: Option<&'a [u8]>,
+    text_limit: usize,
+    digest_limit: usize,
+) -> (Option<&'a [u8]>, bool) {
+    let (text, cut) = match (digest, sql_text) {
+        (_, Some(s)) if !text_cut(s, false, text_limit) => (Some(s), false),
+        (Some(d), _) => (Some(d), digest_cut(d, digest_limit)),
+        (None, Some(s)) => (Some(s), true),
+        (None, None) => (None, false),
+    };
+    match text {
+        Some(t) if t.len() > MAX_TEXT_BYTES => (None, true),
+        t => (t, cut),
+    }
+}
+
 /// Whether a statement text (`SQL_TEXT`) or digest text (`DIGEST_TEXT`) of
 /// `performance_schema` may have been cut at the server's `limit` (bytes):
 /// within 4 bytes of it, or longer than it (a text past
@@ -317,7 +411,11 @@ impl PsPoller {
                  it at 1024 or more"
             );
         }
-        let digest_limit = limit(scalar(session, sql::PS_DIGEST_LIMIT).await?);
+        // A digest is cut at the smaller of the parser's storage and
+        // performance_schema's limit (security review of 914c9d2, N1).
+        let ps_digest = scalar(session, sql::PS_DIGEST_LIMIT).await?;
+        let parser_digest = scalar(session, sql::MAX_DIGEST_LIMIT).await?;
+        let digest_limit = limit(ps_digest).min(limit(parser_digest));
         let boot = server_boot(session).await?;
         let mut saved = load(store.as_ref());
         let (last, seen, floor) = resume(saved.clone(), boot);
@@ -411,6 +509,7 @@ impl PsPoller {
             from,
             BATCH,
             self.with_program,
+            sql_text_from(self.digest_limit),
         );
         let (text_limit, digest_limit) = (self.text_limit, self.digest_limit);
         let mut rows: Vec<Row> = Vec::new();
@@ -425,13 +524,8 @@ impl PsPoller {
                 else {
                     return Flow::Continue;
                 };
-                let (body, is_digest) = match get(4) {
-                    Some(d) => (Some(Zeroizing::new(d.to_vec())), true),
-                    None => (get(5).map(|t| Zeroizing::new(t.to_vec())), false),
-                };
-                let limit = if is_digest { digest_limit } else { text_limit };
-                let truncated = body.as_ref().is_some_and(|t| text_cut(t, is_digest, limit));
-                let body = body.filter(|t| t.len() <= MAX_TEXT_BYTES);
+                let (chosen, truncated) = choose_text(get(4), get(5), text_limit, digest_limit);
+                let body = chosen.map(|t| Zeroizing::new(t.to_vec()));
                 let user = text_of(get(9));
                 let thread_info = user.map(|user| ThreadInfo {
                     user,
@@ -629,6 +723,103 @@ fn text_of(v: Option<&[u8]>) -> Option<String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Security review of 914c9d2, N1: one-letter identifier padding fills
+    /// the digest storage (1024 bytes) while the rendered digest stays at
+    /// 895 bytes on MySQL 8.4 (896 on MariaDB 11.4), with no `...`; with
+    /// `max_digest_length = 300` (MySQL 8.4) it renders at 275 bytes.
+    #[test]
+    fn digests_cut_at_their_token_storage_are_cut() {
+        let head = "SELECT * FROM ( SELECT ? `a` ) `x` WHERE `a` IN ( `a`";
+        let mut d = head.to_owned();
+        while d.len() + 6 <= 895 {
+            d.push_str(" , `a`");
+        }
+        d.push_str(" ,");
+        assert_eq!(d.len(), 895);
+        assert!(!text_cut(d.as_bytes(), true, 1024));
+        assert!(digest_stored_estimate(d.as_bytes()) > 900);
+        assert!(digest_cut(d.as_bytes(), 1024));
+        // The same with a lowered parser limit.
+        let low = &d[..275];
+        assert!(!digest_cut(low.as_bytes(), 1024));
+        assert!(digest_cut(low.as_bytes(), 300));
+        // Short digests are not cut at the default limits.
+        let short = "SELECT * FROM `information_schema` . `TABLES` WHERE TABLE_NAME = ? \
+                     AND `TABLE_SCHEMA` = ? UNION ALL SELECT * FROM `hr` . `customers`";
+        assert!(!digest_cut(short.as_bytes(), 1024));
+        // Doubled backquotes and odd chunks.
+        assert_eq!(digest_stored_estimate(b"`a``b` ?"), 4 + 3 + 2);
+        assert_eq!(digest_stored_estimate(b"@x"), 4 + 2);
+        assert_eq!(digest_stored_estimate(b"`a`.`b`"), 4 + 7);
+        assert_eq!(digest_stored_estimate(b"`open"), 4 + 4);
+    }
+
+    /// Every digest the estimate may judge cut is long enough for the poll
+    /// to have read its `SQL_TEXT` ([`sql_text_from`]).
+    #[test]
+    fn the_estimate_stays_within_three_times_the_length() {
+        let parts: [&[u8]; 9] = [
+            b"`a` ", b"` ", b"@", b"? ", b", ", b"SELECT ", b"`", b"``", b" ",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            let mut d = Vec::new();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut x = seed;
+            for _ in 0..(seed % 64) {
+                d.extend_from_slice(parts[(x % 9) as usize]);
+                x = x.rotate_right(5).wrapping_mul(31);
+            }
+            assert!(digest_stored_estimate(&d) <= 3 * d.len() + 3, "{d:?}");
+        }
+        for limit in [0, 256, 300, 1024, 4096] {
+            let from = sql_text_from(limit);
+            // est + token >= limit and est <= 3 len + 3 imply len >= from.
+            assert!(3 * from + 3 + MAX_DIGEST_TOKEN <= limit.max(MAX_DIGEST_TOKEN + 3));
+        }
+        assert_eq!(sql_text_from(1024), 253);
+    }
+
+    /// `SQL_TEXT` first when the poll read it and it is not cut, else the
+    /// digest, cut or not; both cut: cut.
+    #[test]
+    fn the_text_of_a_row_is_chosen_fail_closed() {
+        let cut_digest = format!("SELECT `a`{}", " , `a`".repeat(160));
+        let whole_sql = "SELECT a FROM t WHERE a IN (a, a) UNION SELECT 1";
+        let cut_sql = "x".repeat(1021);
+        let c = |d: Option<&str>, s: Option<&str>| {
+            let (t, cut) = choose_text(d.map(str::as_bytes), s.map(str::as_bytes), 1024, 1024);
+            (t.map(|t| String::from_utf8_lossy(t).into_owned()), cut)
+        };
+        assert_eq!(
+            c(Some(&cut_digest), Some(whole_sql)),
+            (Some(whole_sql.to_owned()), false)
+        );
+        assert_eq!(c(Some(&cut_digest), None), (Some(cut_digest.clone()), true));
+        assert_eq!(
+            c(Some(&cut_digest), Some(&cut_sql)),
+            (Some(cut_digest.clone()), true)
+        );
+        assert_eq!(
+            c(Some("SELECT ?"), None),
+            (Some("SELECT ?".to_owned()), false)
+        );
+        assert_eq!(
+            c(Some("SELECT ?"), Some(&cut_sql)),
+            (Some("SELECT ?".to_owned()), false)
+        );
+        assert_eq!(c(None, Some(&cut_sql)), (Some(cut_sql.clone()), true));
+        assert_eq!(
+            c(None, Some(whole_sql)),
+            (Some(whole_sql.to_owned()), false)
+        );
+        assert_eq!(c(None, None), (None, false));
+        let huge = "y".repeat(MAX_TEXT_BYTES + 1);
+        assert_eq!(c(None, Some(&huge)), (None, true));
+    }
 
     fn saved(boot: u64, last: u64) -> Saved {
         Saved {

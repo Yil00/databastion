@@ -554,6 +554,9 @@ pub(crate) struct CheckState {
     records: Mutex<HashMap<String, Instant>>,
     streams: Mutex<HashMap<String, usize>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
+    /// Per target: credits for the extra sampling statements of Discovery
+    /// (`audit::credits`).
+    sample_credits: Mutex<HashMap<String, crate::audit::credits::SharedCredits>>,
     /// Per target: audit log records dropped (not parsable, oversized or
     /// damaged), and when the count started (reported for 24 h).
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
@@ -661,6 +664,16 @@ impl CheckState {
 
     /// The agent's own-read counters of `target_id`, created once and kept
     /// for the life of the connector.
+    pub(crate) fn sample_credits(&self, target_id: &str) -> crate::audit::credits::SharedCredits {
+        std::sync::Arc::clone(
+            self.sample_credits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
     pub(crate) fn own_usage(&self, target_id: &str) -> SharedOwnUsage {
         std::sync::Arc::clone(
             self.own_usage

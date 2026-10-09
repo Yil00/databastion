@@ -24,6 +24,7 @@
 //!   the events are handed to the core, which aggregates them before
 //!   spooling.
 
+pub(crate) mod credits;
 pub(crate) mod events;
 pub(crate) mod pfs;
 pub(crate) mod records;
@@ -193,6 +194,7 @@ fn builder(
 ) -> EventBuilder {
     EventBuilder::new(own_account(cfg, target, pre, state))
         .with_own_statements(own_statements(target))
+        .with_sample_credits(state.sample_credits(&target.id))
 }
 
 /// Exact texts of the statements `check()` sends that read

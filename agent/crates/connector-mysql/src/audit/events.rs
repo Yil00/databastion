@@ -724,6 +724,9 @@ pub(crate) struct EventBuilder {
     /// cut at the default log limits): recognized by their whole text and
     /// left out without a charge (see [`Self::own_statement`]).
     own_statements: Vec<Vec<u8>>,
+    /// Credits for the extra sampling statements of Discovery (see
+    /// [`Self::own_batch`]).
+    credits: Option<super::credits::SharedCredits>,
     sessions: Sessions,
     /// Table-access records waiting for their statement record.
     pending: Pending,
@@ -739,6 +742,7 @@ impl EventBuilder {
         Self {
             own,
             own_statements: Vec::new(),
+            credits: None,
             sessions: Sessions::default(),
             pending: Pending::default(),
             panicked: 0,
@@ -752,6 +756,55 @@ impl EventBuilder {
     pub(crate) fn with_own_statements(mut self, texts: Vec<Vec<u8>>) -> Self {
         self.own_statements = texts;
         self
+    }
+
+    /// The target's Discovery sampling credits (`audit::credits`).
+    #[must_use]
+    pub(crate) fn with_sample_credits(mut self, credits: super::credits::SharedCredits) -> Self {
+        self.credits = Some(credits);
+        self
+    }
+
+    /// An extra sampling statement of a Discovery scan (security review
+    /// of 914c9d2, N3): its exact, uncut text holds a live credit, its
+    /// table records (if any) only read the credit's table, and the
+    /// identity is the agent's. The credit is consumed; the statement is
+    /// left out without a charge (the table's first batch was charged).
+    fn own_batch(&self, a: &Access<'_>, now: SystemTime) -> bool {
+        let (Some(credits), Some(text)) = (&self.credits, a.text) else {
+            return false;
+        };
+        if a.truncated || a.opaque || a.tables.iter().any(|t| t.2 != TableOp::Read) {
+            return false;
+        }
+        let mono = Instant::now();
+        let mut c = credits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((schema, table)) = c.peek(text, mono) else {
+            return false;
+        };
+        if !a
+            .tables
+            .iter()
+            .all(|(db, t, _)| db.eq_ignore_ascii_case(&schema) && t.eq_ignore_ascii_case(&table))
+        {
+            return false;
+        }
+        let e = MaskedEvent::new(
+            a.source,
+            EventAction::Read,
+            a.principal.clone(),
+            a.ts.min(now),
+        )
+        .with_object(object(&schema, &table));
+        if !self
+            .own
+            .routine_unbudgeted(a.user, a.application, a.client, &e)
+        {
+            return false;
+        }
+        c.take(text, mono)
     }
 
     /// Whether a statement record is one of the connector's own statements
@@ -808,6 +861,9 @@ impl EventBuilder {
             {
                 return None;
             }
+        }
+        if self.own_batch(&a, now) {
+            return None;
         }
         let opaque = a.opaque || a.text.is_some_and(|t| std::str::from_utf8(t).is_err());
         let analysis: Option<QueryAnalysis> = a.text.map(|t| {
@@ -1829,6 +1885,113 @@ mod tests {
         for g in &set {
             assert!(!super::super::pfs::text_cut(g.as_bytes(), false, 1024));
         }
+    }
+
+    /// The sampling statements of a 40-column table (two batches at least).
+    fn wide_batches() -> Vec<String> {
+        let cols: Vec<String> = (0..40).map(|i| format!("customer_field_{i:02}")).collect();
+        let sel: Vec<(&str, crate::sql::Sampled)> = cols
+            .iter()
+            .map(|c| (c.as_str(), crate::sql::Sampled::Text))
+            .collect();
+        let all = crate::sql::sample_statements(
+            crate::conn::Flavor::Mariadb,
+            30_000,
+            "shop",
+            "customers",
+            &sel,
+            200,
+            1024,
+        )
+        .unwrap();
+        assert!(all.len() >= 2);
+        all.into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Security review of 914c9d2, N3: one scan of a wide table is charged
+    /// once to the agent's own budget (its extra batches hold credits), on
+    /// a QUERY-only `server_audit` log, with or without table records, and
+    /// on performance_schema; an extra batch text without a credit (outside
+    /// a scan, or replayed) is charged and reported.
+    #[test]
+    fn extra_sampling_batches_are_charged_once_per_scan() {
+        let batches = wide_batches();
+        let lines = |q0: u64, tables: bool| -> Vec<String> {
+            let mut out = Vec::new();
+            for (i, b) in batches.iter().enumerate() {
+                let q = q0 + i as u64;
+                if tables {
+                    out.push(format!(
+                        "20260929 09:40:35,h,databastion,172.18.0.1,30,{q},READ,shop,customers,"
+                    ));
+                }
+                out.push(sa_query("databastion", "172.18.0.1", q, b, None));
+            }
+            out
+        };
+        for tables in [false, true] {
+            let credits = super::super::credits::SharedCredits::default();
+            let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+            let grant = || {
+                let mut c = credits.lock().unwrap();
+                for t in &batches[1..] {
+                    c.grant(t, "shop", "customers", Instant::now());
+                }
+            };
+            // One scan: no event.
+            grant();
+            assert_eq!(
+                file(&mut b, sa_at(&lines(10, tables), 1024)),
+                Vec::<String>::new()
+            );
+            assert_eq!(credits.lock().unwrap().len(), 0);
+            // The extra batches again without credits: charged, reported.
+            let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+            let out = file(&mut b, sa_at(&lines(20, tables), 1024));
+            assert_eq!(out.len(), batches.len() - 1, "{out:?}");
+            assert!(
+                out.iter()
+                    .all(|e| e.starts_with("read [\"shop.customers\"]"))
+            );
+            // A credit is for its own table and the agent's identity only.
+            grant();
+            let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+            let other = sa_query("app", "10.0.0.5", 40, &batches[1], None);
+            assert_eq!(file(&mut b, sa_at(&[other], 1024)).len(), 1);
+            assert_eq!(credits.lock().unwrap().len(), batches.len() - 1);
+            let wrong_table = vec![
+                "20260929 09:40:35,h,databastion,172.18.0.1,30,41,READ,shop,orders,".to_owned(),
+                sa_query("databastion", "172.18.0.1", 41, &batches[1], None),
+            ];
+            let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+            let _ = file(&mut b, sa_at(&wrong_table, 1024));
+            assert_eq!(credits.lock().unwrap().len(), batches.len() - 1);
+            credits
+                .lock()
+                .unwrap()
+                .take(batches[1].as_bytes(), Instant::now());
+            for t in &batches[2..] {
+                credits.lock().unwrap().take(t.as_bytes(), Instant::now());
+            }
+        }
+        // performance_schema (`SQL_TEXT` of the agent's account).
+        let credits = super::super::credits::SharedCredits::default();
+        let mut b = EventBuilder::new(own()).with_sample_credits(credits.clone());
+        for t in &batches[1..] {
+            credits
+                .lock()
+                .unwrap()
+                .grant(t, "shop", "customers", Instant::now());
+        }
+        for t in &batches {
+            let mut a = pfs_access(t.as_bytes(), false, Vec::new());
+            a.rows = Some(1000);
+            assert!(b.statement(a, SystemTime::now()).is_none());
+        }
+        // Replayed: no credit left, over the budget.
+        let mut a = pfs_access(batches[1].as_bytes(), false, Vec::new());
+        a.rows = Some(1000);
+        assert!(b.statement(a, SystemTime::now()).is_some());
     }
 
     #[test]

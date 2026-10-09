@@ -269,11 +269,46 @@ async fn audit_log_scenario(
         )
         .await;
     assert!(refused.is_err(), "{label}: INTO OUTFILE must fail here");
-    drop(a);
-    // The agent's own Discovery scan: its sampling reads are left out
-    // when the agent's address is known.
-    let (r, _) = scan(&agent_target(server).1).await;
-    r.unwrap();
+    // A table of 40 columns, sampled in several column batches (security
+    // review of 914c9d2, N3): one scan is charged once to the agent's
+    // budget, its extra batches are left out by their credits.
+    exec(
+        &mut a,
+        &format!("DROP TABLE IF EXISTS `{database}`.it_wide40"),
+    )
+    .await;
+    exec(
+        &mut a,
+        &format!(
+            "CREATE TABLE `{database}`.it_wide40 ({})",
+            (0..40)
+                .map(|i| format!("customer_field_{i:02} VARCHAR(40)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    exec(
+        &mut a,
+        &format!(
+            "INSERT INTO `{database}`.it_wide40 VALUES ({})",
+            (0..40)
+                .map(|i| format!("'v{i}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    // The agent's own Discovery scan, by the connector that runs the
+    // Audit stream (one instance per agent): its sampling reads are left
+    // out when the agent's address is known.
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut rx) = FindingSink::channel(100_000);
+        connector.discover(&job, &sink).await.unwrap();
+        drop(sink);
+        while rx.recv().await.is_some() {}
+    }
     // check() at every heartbeat sends the CAS store guard statement, longer
     // than the default `server_audit_query_log_limit` (cut inside a string
     // literal there): never reported as the agent's read (mariadb-e2e I2).
@@ -364,6 +399,12 @@ async fn audit_log_scenario(
         );
     }
     assert_no_marker(&events, &logs);
+    exec(
+        &mut a,
+        &format!("DROP TABLE IF EXISTS `{database}`.it_wide40"),
+    )
+    .await;
+    drop(a);
     // A record was read: Partial.
     let health = connector.check(&t).await;
     assert_eq!(
@@ -562,6 +603,39 @@ async fn performance_schema_gives_events_with_rows() {
         )
         .await
         .unwrap();
+        // Security review of 914c9d2, N1: one-letter identifier padding
+        // fills the digest's token storage while it renders well under the
+        // limit, without `...`. With a whole `SQL_TEXT` (400 names) the
+        // read is named from it; with `SQL_TEXT` cut too (600 names), it
+        // is a read of `*`, always reported.
+        for n in [400, 600] {
+            a.query(
+                Stage::Check,
+                &format!(
+                    "SELECT * FROM (SELECT 1 a) x WHERE a IN ({}) \
+                     UNION ALL SELECT i FROM {AUDIT_DB}.d WHERE i = 3",
+                    vec!["a"; n].join(",")
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let named_d = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.principal().account_name() == admin.user
+                    && !e.always_report()
+                    && e.signals().is_empty()
+                    && e.objects().iter().any(|o| o.object().as_str() == "d")
+            })
+        };
+        let only_star = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.always_report()
+                    && e.principal().account_name() == admin.user
+                    && !e.objects().is_empty()
+                    && e.objects().iter().all(|o| o.object().as_str() == "*")
+            })
+        };
         let cut_star = |ev: &[MaskedEvent]| {
             ev.iter().any(|e| {
                 e.always_report()
@@ -573,6 +647,8 @@ async fn performance_schema_gives_events_with_rows() {
         let mut events: Events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
             cut_star(ev)
+                && named_d(ev)
+                && only_star(ev)
                 && has_write(ev, "setup_consumers")
                 && has(ev, "big", "volume.large_result")
                 && has(ev, "d", "signature.mysqldump")
@@ -620,6 +696,12 @@ async fn performance_schema_gives_events_with_rows() {
             server.name
         );
         assert!(cut_star(&events), "{}: cut digest: {all:#?}", server.name);
+        assert!(
+            named_d(&events),
+            "{}: digest storage full: {all:#?}",
+            server.name
+        );
+        assert!(only_star(&events), "{}: both cut: {all:#?}", server.name);
         if real {
             assert!(
                 has(&events, "employees", "signature.mysqldump"),

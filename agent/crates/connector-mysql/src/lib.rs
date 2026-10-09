@@ -86,7 +86,7 @@ impl Connector for MysqlConnector {
     }
 
     async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
-        discover::discover(job, sink).await
+        discover::discover(job, sink, &self.check_state).await
     }
 
     async fn audit_stream(
