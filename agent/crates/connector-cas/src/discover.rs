@@ -279,6 +279,11 @@ async fn scan_registry(
             }
         });
     }
+    // A skipped file may hold a duplicate of a client id (ADR-0044,
+    // review of #182 L1): no client is then named.
+    if facts.skipped > 0 {
+        index.disable_clients();
+    }
     index.finish();
     state.note_registry(facts, Some(Arc::new(index)));
     if facts.clear_secrets > 0 {
@@ -365,6 +370,9 @@ pub(crate) fn index_registry(
                 }
             }
         }
+    }
+    if facts.skipped > 0 {
+        index.disable_clients();
     }
     index.finish();
     Some((index, facts))
@@ -542,6 +550,17 @@ mod tests {
             })
         );
         assert_eq!(state.services().unwrap().len(), 2);
+        // Skipped files: no client id names a token response (ADR-0044,
+        // review of #182 L1), in the scan's index and in the stream's.
+        assert!(!state.services().unwrap().clients_enabled());
+        let (idx, _) = index_registry(&settings(&dir, false), Policy::TESTS).unwrap();
+        assert!(!idx.clients_enabled());
+        std::fs::remove_file(reg.join("Broken-5.json")).unwrap();
+        std::fs::remove_file(reg.join("Export-6.json")).unwrap();
+        let (_, state) = scan(&settings(&dir, false)).await;
+        assert!(state.services().unwrap().clients_enabled());
+        let (idx, _) = index_registry(&settings(&dir, false), Policy::TESTS).unwrap();
+        assert!(idx.clients_enabled());
     }
 
     #[tokio::test]

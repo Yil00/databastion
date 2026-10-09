@@ -250,9 +250,16 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   client id, no object `what`) only makes a response of its key `*`.
   Otherwise the response is a `read` of `*`, nothing is consumed, and the
   case is counted: named, unmatched, ambiguous and evicted counts go to the
-  agent log, at most one line per 10 minutes, counts only. Residual risk: a
-  lost token request record, with another request of the same key pending,
-  can name the wrong client within 5 s.
+  agent log, at most one line per 10 minutes, counts only. Losses fail
+  towards `*` (security review of #182): an evicted request or a line
+  dropped in a read (oversized, unparsable, a panic) makes every pending
+  request unnamed and taints 5 s around the read; a skipped registry file
+  (or more than 4096 services) disables the client match of that index; a
+  pending request more than 5 s before or after a record is dropped; a
+  duplicate `serverIpAddress` drops the token record only. Residual risk: a
+  token request record lost where the agent cannot see it (a restart
+  between request and response, a record CAS did not write), with another
+  request of the same key pending, can name the wrong client within 5 s.
 - `what` (which can hold a ticket id, a live SSO bearer credential) is a
   string or, as CAS 8.0 writes it, an object such as
   `{"service": "https://…", "ticketId": "ST-1-…"}`: from an object only the

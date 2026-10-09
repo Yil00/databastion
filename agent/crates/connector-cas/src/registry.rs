@@ -147,6 +147,11 @@ pub struct ServiceIndex {
     /// Client id tag to its entry (`None`: shared by several entries),
     /// built by [`Self::finish`].
     clients: HashMap<ClientTag, Option<usize>>,
+    /// No client id selects an entry: a service was not indexed (beyond
+    /// [`MAX_SERVICES`]) or a registry file was skipped, so a client id
+    /// that looks unique here may be shared in what CAS loaded (review of
+    /// #182 L1).
+    clients_disabled: bool,
 }
 
 impl Default for ServiceIndex {
@@ -163,6 +168,7 @@ impl std::fmt::Debug for ServiceIndex {
         f.debug_struct("ServiceIndex")
             .field("services", &self.entries.len())
             .field("clients", &self.clients.len())
+            .field("clients_disabled", &self.clients_disabled)
             .finish()
     }
 }
@@ -177,6 +183,7 @@ impl ServiceIndex {
             charged: 0,
             client_key: key,
             clients: HashMap::new(),
+            clients_disabled: false,
         }
     }
 
@@ -228,6 +235,7 @@ impl ServiceIndex {
     /// pattern).
     pub fn add(&mut self, d: &Definition) -> bool {
         if self.entries.len() >= MAX_SERVICES {
+            self.clients_disabled = true;
             return false;
         }
         let cost = 2 * PATTERN_SIZE_LIMIT;
@@ -258,11 +266,31 @@ impl ServiceIndex {
         within
     }
 
+    /// Disables the client id match (no client id selects an entry): call
+    /// it when a registry file was skipped (unreadable, too large, refused,
+    /// a parser panic, out of time), since a client id unique among the
+    /// indexed services may be shared with a skipped one (review of #182
+    /// L1).
+    pub fn disable_clients(&mut self) {
+        self.clients_disabled = true;
+        self.clients.clear();
+    }
+
+    /// Whether client ids can select an entry.
+    #[must_use]
+    pub fn clients_enabled(&self) -> bool {
+        !self.clients_disabled && self.client_key.is_some()
+    }
+
     /// Sorts the services in evaluation order (stable: file order for
-    /// equal orders) and maps the client id tags to their entries.
+    /// equal orders) and maps the client id tags to their entries (none
+    /// when the client match is disabled).
     pub fn finish(&mut self) {
         self.entries.sort_by_key(|e| e.order);
         self.clients.clear();
+        if self.clients_disabled {
+            return;
+        }
         for (i, e) in self.entries.iter().enumerate() {
             if let Some(t) = e.client {
                 match self.clients.entry(t) {
@@ -420,6 +448,25 @@ mod tests {
         let _ = keyless.add(&defs[1]);
         keyless.finish();
         assert!(keyless.client_tag("batch-job").is_none());
+        // A skipped registry file disables the match (review of #182 L1).
+        let mut skipped = ServiceIndex::new(&defs);
+        assert!(skipped.clients_enabled());
+        skipped.disable_clients();
+        skipped.finish();
+        assert!(!skipped.clients_enabled());
+        let t = skipped.client_tag("batch-job").unwrap();
+        assert!(skipped.client(t).is_none());
+        // So does a service beyond MAX_SERVICES.
+        let mut full = ServiceIndex::default();
+        for _ in 0..MAX_SERVICES {
+            let _ = full.add(&defs[4]);
+        }
+        assert!(!full.add(&defs[1]));
+        full.finish();
+        assert!(!full.clients_enabled());
+        let t = full.client_tag("batch-job").unwrap();
+        assert!(full.client(t).is_none());
+        let t = other.client_tag("batch-job").unwrap();
         let dbg = format!("{idx:?} {t:?}");
         for leak in ["batch", "shared", "mixed"] {
             assert!(!dbg.contains(leak), "{leak}");

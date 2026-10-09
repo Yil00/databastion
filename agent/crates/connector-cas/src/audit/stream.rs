@@ -196,12 +196,26 @@ impl AuditRunner {
             d
         };
         let mut events = Vec::new();
+        // A line lost in this read (oversized, unparsable, a parser panic)
+        // may be a token request: no token response of this read, nor
+        // within the correlation window around it, is named (review of #182
+        // M1). Loss positions are not kept, so the whole read is tainted.
+        let span = batch.records.iter().map(|r| r.when).fold(
+            None,
+            |acc: Option<(SystemTime, SystemTime)>, t| {
+                Some(acc.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t))))
+            },
+        );
+        if batch.dropped > 0 || skipped > 0 {
+            self.builder.note_loss(span);
+        }
         let mut panicked = 0u64;
         for r in &batch.records {
             let builder = &mut self.builder;
             let out = &mut events;
             if databastion_core::isolate(|| builder.push(r, now, out)).is_none() {
                 panicked += 1;
+                self.builder.note_loss(span);
             }
         }
         self.builder.flush(now, false, &mut events);
@@ -326,6 +340,74 @@ mod tests {
             snap.evidence.level(now).0,
             databastion_core::AuditLevel::Partial
         );
+    }
+
+    fn token_lines(when: u128, between: &str) -> String {
+        format!(
+            "{{\"action\": \"OAUTH2_ACCESS_TOKEN_REQUEST_CREATED\", \"who\": \"audit:unknown\", \"when\": {when}, \
+             \"what\": {{\"code\": \"N/A\", \"grant_type\": \"client_credentials\", \"service\": \"scratch-m2m\"}}, \
+             \"clientIpAddress\": \"192.0.2.5\", \"serverIpAddress\": \"198.51.100.3\", \"userAgent\": \"curl/8.5.0\"}}\n\
+             {between}\
+             {{\"action\": \"OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED\", \"who\": \"scratch-m2m\", \"when\": {}, \
+             \"what\": {{\"access_token\": \"AT-1-FAKE\"}}, \
+             \"clientIpAddress\": \"192.0.2.5\", \"serverIpAddress\": \"198.51.100.3\", \"userAgent\": \"curl/8.5.0\"}}\n",
+            when + 40
+        )
+    }
+
+    /// Review of #182 M1: a line lost between a token request and its
+    /// response (unparsable, oversized, a parser panic, or alone in an
+    /// earlier read) leaves the response `*`.
+    #[test]
+    fn a_lost_line_leaves_token_responses_unnamed() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let def = crate::parse::definition::parse_definition(
+            br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#,
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        let objects = |between: &str, before: Option<&str>| {
+            let dir = TempDir::new("stream-loss");
+            append(&dir, "");
+            let s = settings(&dir);
+            let b = Builder::new(
+                key(),
+                &[],
+                ClientAddrMode::Truncated,
+                Some(Arc::clone(&idx)),
+            );
+            let mut r =
+                AuditRunner::with_policy(&s, None, b, Arc::new(CasState::default()), Policy::TESTS)
+                    .unwrap();
+            let now = SystemTime::now();
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let when = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            if let Some(lost) = before {
+                append(&dir, lost);
+                assert!(r.poll(now).unwrap().events.is_empty());
+            }
+            append(&dir, &token_lines(when, between));
+            r.poll(now)
+                .unwrap()
+                .events
+                .iter()
+                .map(|e| e.object.as_ref().unwrap().object().as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(objects("", None), ["M2M"], "control: nothing lost");
+        let oversized = format!("{{\"x\": \"{}\"}}\n", "a".repeat(1 << 21));
+        for lost in [
+            "WHO: jdoe\n".to_owned(),
+            "{\"action\": \"AUTHENTICATION_FAILED\", \"who\": \"TEST-PARSER-PANIC\", \"when\": 1}\n".to_owned(),
+            oversized,
+        ] {
+            assert_eq!(objects(&lost, None), ["*"], "between");
+            assert_eq!(objects("", Some(&lost)), ["*"], "in the read before");
+        }
     }
 
     #[test]

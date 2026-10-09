@@ -9,7 +9,8 @@
 //! `serverIpAddress` is borrowed raw and decoded only for the token
 //! request and response records, as an IP literal for their correlation
 //! key (ADR-0044), never sent. **A record with a duplicate kept key is
-//! dropped.** A line that
+//! dropped** (a duplicate `serverIpAddress` drops a token request or
+//! response record only). A line that
 //! is not one JSON object, or lacks a valid `action` or `when`, is dropped.
 //!
 //! `what` can hold a ticket id (a live SSO bearer credential). It is only
@@ -464,6 +465,9 @@ struct Raw<'de> {
     /// Kept raw (borrowed, not examined): decoded only for a token request
     /// or response, once the action is known.
     server: Option<&'de RawValue>,
+    /// `serverIpAddress` came twice: drops a token record only (the only
+    /// ones it is read for; review of #182 L4).
+    server_duplicate: bool,
     headers: bool,
     duplicate: bool,
 }
@@ -511,7 +515,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 K::Server => {
                     let v = map.next_value::<&'de RawValue>()?;
                     if r.server.replace(v).is_some() {
-                        r.duplicate = true;
+                        r.server_duplicate = true;
                     }
                     continue;
                 }
@@ -622,6 +626,9 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
     // (ADR-0044): `serverIpAddress` is decoded here and nowhere else.
     let correlation = match action {
         Action::TokenRequested | Action::TokenIssued => {
+            if raw.server_duplicate {
+                return Err(RecordError::Invalid);
+            }
             let server = match raw.server {
                 Some(s) => jtext::string(s, 256)
                     .map_err(|_| RecordError::NotJson)?
@@ -1057,7 +1064,7 @@ mod tests {
     }
 
     /// `serverIpAddress` is decoded for the token request and response
-    /// only; a second one drops any record.
+    /// only; a second one drops those records only.
     #[test]
     fn server_addresses_are_read_for_token_records_only() {
         let rec = |action: &str, server: &str| {
@@ -1091,17 +1098,26 @@ mod tests {
         // Any other action: never decoded nor kept.
         let r = rec("SERVICE_TICKET_CREATED", r#""\udc00""#).unwrap();
         assert!(r.correlation.is_none());
-        assert_eq!(
-            parse_record(
-                &line(
-                    r#""action": "AUTHENTICATION_SUCCESS", "when": 1791115200000, "serverIpAddress": "a",
-                       "serverIpAddress": "b""#
-                ),
-                UTC
-            )
-            .err(),
-            Some(RecordError::Invalid)
-        );
+        // A second `serverIpAddress` drops the token records only (review
+        // of #182 L4).
+        let twice = r#""198.51.100.3", "serverIpAddress": "198.51.100.4""#;
+        for action in [
+            "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+            "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+        ] {
+            assert_eq!(
+                rec(action, twice).err(),
+                Some(RecordError::Invalid),
+                "{action}"
+            );
+        }
+        for action in [
+            "AUTHENTICATION_SUCCESS",
+            "SERVICE_TICKET_CREATED",
+            "TICKET_GRANTING_TICKET_CREATED",
+        ] {
+            assert!(rec(action, twice).is_ok(), "{action}");
+        }
     }
 
     /// For a non-issuance action `what` is never decoded: an escape that

@@ -48,7 +48,10 @@
 //!   only a response whose `who` tag equals the client id tag. Otherwise
 //!   the object is `*`, nothing is consumed, and the case is counted
 //!   ([`TokenCorrelation`], agent log only). The pending state is cleared
-//!   when the service index is replaced.
+//!   when the service index is replaced. Losses fail towards `*`
+//!   ([`Builder::note_loss`]: an eviction here, a dropped line from the
+//!   stream), and requests more than [`TOKEN_WINDOW`] away from a record,
+//!   before or after it, expire.
 //!
 //! [`CasEvent::into_masked`] gives the `MaskedEvent` the core accepts
 //! (source `cas_audit_log`, the signals as `masking::Signal`, the `*`
@@ -106,6 +109,10 @@ pub struct TokenCorrelation {
     pub ambiguous: u64,
     /// Pending requests evicted because the state was full.
     pub evicted: u64,
+    /// Losses noted (an evicted request, a line dropped, cut or isolated
+    /// after a panic): each one taints the correlation (see
+    /// [`Builder::note_loss`]).
+    pub losses: u64,
 }
 
 impl TokenCorrelation {
@@ -117,13 +124,14 @@ impl TokenCorrelation {
             unmatched: self.unmatched.saturating_sub(before.unmatched),
             ambiguous: self.ambiguous.saturating_sub(before.ambiguous),
             evicted: self.evicted.saturating_sub(before.evicted),
+            losses: self.losses.saturating_sub(before.losses),
         }
     }
 
     /// Whether a response could not be named or a request was evicted.
     #[must_use]
     pub fn has_misses(&self) -> bool {
-        self.unmatched > 0 || self.ambiguous > 0 || self.evicted > 0
+        self.unmatched > 0 || self.ambiguous > 0 || self.evicted > 0 || self.losses > 0
     }
 }
 
@@ -381,6 +389,12 @@ pub struct Builder {
     pending: VecDeque<PendingRequest>,
     /// Token response correlation counters.
     pub correlation: TokenCorrelation,
+    /// Record times during which no request can name (a loss was noted
+    /// around them), inclusive.
+    taint: Option<(SystemTime, SystemTime)>,
+    /// A loss was noted with no record time: the next record's time
+    /// anchors the taint.
+    taint_next: bool,
     /// Failures aggregated because a window was full (heartbeat metric
     /// `audit_window_overflow_total` once wired).
     pub overflow: u64,
@@ -421,6 +435,8 @@ impl Builder {
             principals: HashMap::new(),
             aggregates: BTreeMap::new(),
             pending: VecDeque::new(),
+            taint: None,
+            taint_next: false,
             correlation: TokenCorrelation::default(),
             overflow: 0,
             ignored: BTreeMap::new(),
@@ -467,20 +483,61 @@ impl Builder {
         out
     }
 
-    /// Drops the pending requests whose window ended at `when`.
+    /// Drops the pending requests more than [`TOKEN_WINDOW`] away from
+    /// `when`, before or after it (a clock stepped back does not keep them).
     fn expire_pending(&mut self, when: SystemTime) {
         self.pending.retain(|p| {
-            when.duration_since(p.when)
-                .map_or(true, |age| age <= TOKEN_WINDOW)
+            let gap = when.duration_since(p.when).unwrap_or_else(|e| e.duration());
+            gap <= TOKEN_WINDOW
         });
+    }
+
+    /// Notes that a record may have been lost (security review of #182
+    /// M1): a request evicted, or a line dropped (oversized, unparsable,
+    /// a parser or conversion panic) somewhere among the records whose
+    /// times span `span` (`None`: no record time known, the next record's
+    /// time is used). Every pending request becomes unnamed, and requests
+    /// whose time is within [`TOKEN_WINDOW`] of the span name nothing, so
+    /// no response near a loss is named: a lost request record never lets
+    /// its response be named after another client's request.
+    pub fn note_loss(&mut self, span: Option<(SystemTime, SystemTime)>) {
+        for p in &mut self.pending {
+            p.client = PendingClient::Unnamed;
+        }
+        self.correlation.losses = self.correlation.losses.saturating_add(1);
+        match span {
+            Some((lo, hi)) => self.extend_taint(lo, hi),
+            None => self.taint_next = true,
+        }
+    }
+
+    fn extend_taint(&mut self, lo: SystemTime, hi: SystemTime) {
+        let lo = lo.checked_sub(TOKEN_WINDOW).unwrap_or(UNIX_EPOCH);
+        let hi = hi.checked_add(TOKEN_WINDOW).unwrap_or(hi);
+        self.taint = Some(match self.taint {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+    }
+
+    fn tainted(&self, when: SystemTime) -> bool {
+        self.taint.is_some_and(|(lo, hi)| lo <= when && when <= hi)
     }
 
     /// A token request: kept pending (see the module documentation).
     fn token_request(&mut self, r: &AuditRecord) {
         self.expire_pending(r.when);
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            self.pending.pop_front();
+            self.correlation.evicted = self.correlation.evicted.saturating_add(1);
+            // The evicted request's response must not be named after
+            // another pending request (review of #182 M1).
+            self.note_loss(Some((r.when, r.when)));
+        }
         let key = self.correlation_key(r);
+        let tainted = self.tainted(r.when);
         let named = r.token_request.as_ref().and_then(|tr| {
-            if !tr.grant.is_token_only() {
+            if tainted || !tr.grant.is_token_only() {
                 return None;
             }
             let idx = self.services.as_ref()?;
@@ -492,10 +549,6 @@ impl Builder {
                 client_credentials: tr.grant == Grant::ClientCredentials,
             })
         });
-        if self.pending.len() >= MAX_PENDING_REQUESTS {
-            self.pending.pop_front();
-            self.correlation.evicted = self.correlation.evicted.saturating_add(1);
-        }
         self.pending.push_back(PendingRequest {
             key,
             when: r.when,
@@ -639,6 +692,10 @@ impl Builder {
     /// emitted by [`Self::flush`]). `now` is the agent clock: record times
     /// after it are clamped.
     pub fn push(&mut self, r: &AuditRecord, now: SystemTime, out: &mut Vec<CasEvent>) {
+        if self.taint_next {
+            self.taint_next = false;
+            self.extend_taint(r.when, r.when);
+        }
         let ts = r.when.min(now);
         let who = match r.who.as_deref() {
             Some(w) if !is_unidentified(w) => w.as_str(),
@@ -1437,17 +1494,116 @@ mod tests {
         assert!(run(&mut b, &recs, at(100_000)).is_empty());
         assert_eq!(b.pending.len(), MAX_PENDING_REQUESTS);
         assert_eq!(b.correlation.evicted, 10);
-        // The oldest were evicted: their responses are unnamed.
+        // The oldest were evicted: their responses are unnamed, and so are
+        // those of every request pending at the eviction (review of #182 M1:
+        // the evicted one's response must not be named after another).
         assert_eq!(named(&mut b, &[tresp("jdoe", "10.0.0.0", UA, 1)]), ["*"]);
-        assert_eq!(
-            named(&mut b, &[tresp("jdoe", "10.0.0.10", UA, 1)]),
-            ["oidc.M2M"]
+        assert_eq!(named(&mut b, &[tresp("jdoe", "10.0.0.10", UA, 1)]), ["*"]);
+        assert!(b.correlation.losses >= 1);
+        // Within the taint window, a new request names nothing either.
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", "192.0.2.99", UA, 4_000),
+                tresp("jdoe", "192.0.2.99", UA, 4_040),
+            ],
         );
+        assert_eq!(got, ["*"]);
+        // After it, naming resumes.
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", "192.0.2.98", UA, 5_100),
+                tresp("jdoe", "192.0.2.98", UA, 5_140),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M"]);
         let dbg = format!("{b:?}");
         assert!(dbg.contains("pending_token_requests"));
         for leak in ["scratch", "10.0.", "python"] {
             assert!(!dbg.contains(leak), "{leak}");
         }
+    }
+
+    /// Review of #182 M1, scenario A: Y's request evicted by a flood from
+    /// other keys while X's is pending; Y's response (with X's key) is
+    /// never named X.
+    #[test]
+    fn an_evicted_request_never_names_its_response_after_another() {
+        let mut b = clients_builder();
+        let mut recs = vec![
+            treq("refresh_token", "batch-job", "192.0.2.10", UA, 0),
+            treq("refresh_token", "scratch-m2m", "192.0.2.10", UA, 1),
+        ];
+        recs.extend((0..(MAX_PENDING_REQUESTS as u64 - 1)).map(|i| {
+            treq(
+                "password",
+                "unknown",
+                &format!("10.1.{}.{}", i / 256, i % 256),
+                UA,
+                2,
+            )
+        }));
+        recs.push(tresp("bob", "192.0.2.10", UA, 100));
+        assert_eq!(named(&mut b, &recs), ["*"]);
+        assert_eq!(b.correlation.evicted, 1);
+        assert_eq!(b.correlation.named, 0);
+    }
+
+    /// A loss with no record time taints around the next record.
+    #[test]
+    fn a_loss_without_a_time_taints_the_next_records() {
+        let ip = "192.0.2.10";
+        let mut b = clients_builder();
+        run(
+            &mut b,
+            &[treq("password", "scratch-m2m", ip, UA, 0)],
+            at(100_000),
+        );
+        b.note_loss(None);
+        assert_eq!(named(&mut b, &[tresp("jdoe", ip, UA, 40)]), ["*"]);
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 1_000),
+                tresp("jdoe", ip, UA, 1_040),
+            ],
+        );
+        assert_eq!(got, ["*"]);
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 6_000),
+                tresp("jdoe", ip, UA, 6_040),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M"]);
+    }
+
+    /// Review of #182 L2: pending requests later than a record by more
+    /// than the window (a clock stepped back) are dropped.
+    #[test]
+    fn a_clock_stepped_back_expires_later_requests() {
+        let ip = "192.0.2.10";
+        let mut b = clients_builder();
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 60_000),
+                tresp("jdoe", ip, UA, 1_000),
+            ],
+        );
+        assert_eq!(got, ["*"]);
+        assert!(b.pending.is_empty());
+        // A small step back (within the window) still matches.
+        let got = named(
+            &mut b,
+            &[
+                treq("password", "scratch-m2m", ip, UA, 10_000),
+                tresp("jdoe", ip, UA, 9_000),
+            ],
+        );
+        assert_eq!(got, ["oidc.M2M"]);
     }
 
     #[test]

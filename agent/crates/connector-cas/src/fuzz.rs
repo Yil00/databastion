@@ -57,6 +57,9 @@ pub fn registry_yaml(data: &[u8]) {
 /// Most lines of one audit log input.
 const MAX_AUDIT_LINES: usize = 64;
 
+/// [`fuzz_index`], built once (its patterns compile once per process).
+static FUZZ_INDEX: std::sync::OnceLock<Arc<ServiceIndex>> = std::sync::OnceLock::new();
+
 /// The fuzzing service index: OAuth / OIDC clients (one client id shared
 /// by two entries) and a CAS service, client ids tagged with a fixed key.
 fn fuzz_index() -> ServiceIndex {
@@ -66,10 +69,10 @@ fn fuzz_index() -> ServiceIndex {
             .and_then(|k| k.local_tag_key(crate::registry::CLIENT_TAG_PURPOSE)),
     );
     for d in [
-        &br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M", "serviceId": "^https://m2m\.example\.org/cb$", "clientId": "scratch-m2m"}"#[..],
-        br#"{"@class": "org.apereo.cas.support.oauth.services.OAuthRegisteredService", "name": "Batch", "serviceId": "^https://batch\.example\.org/.*", "clientId": "batch"}"#,
-        br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "Dup", "serviceId": "^https://dup\.example\.org/.*", "clientId": "batch"}"#,
-        br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "name": "App", "serviceId": "^https://app\.example\.org/.*"}"#,
+        &br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M", "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": "scratch-m2m"}"#[..],
+        br#"{"@class": "org.apereo.cas.support.oauth.services.OAuthRegisteredService", "name": "Batch", "serviceId": "^https://batch\\.example\\.org/.*", "clientId": "batch"}"#,
+        br#"{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "Dup", "serviceId": "^https://dup\\.example\\.org/.*", "clientId": "batch"}"#,
+        br#"{"@class": "org.apereo.cas.services.CasRegisteredService", "name": "App", "serviceId": "^https://app\\.example\\.org/.*"}"#,
     ] {
         if let Ok(d) = definition::parse_definition(d) {
             let _ = idx.add(&d);
@@ -86,14 +89,19 @@ fn fuzz_index() -> ServiceIndex {
 /// interleaved with its own leftovers).
 pub fn audit_log(data: &[u8]) {
     let mut records = Vec::new();
+    let mut lost = false;
     for line in data.split(|b| *b == b'\n').take(MAX_AUDIT_LINES) {
         if let Ok(text) = std::str::from_utf8(line) {
             let _ = url::service_of(text);
             let _ = url::strip_credentials(text);
             let _ = when::parse_when(text, UtcOffset(3600));
         }
-        if let Ok(r) = record::parse_record(line, UtcOffset(0)) {
-            records.push(r);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match record::parse_record(line, UtcOffset(0)) {
+            Ok(r) => records.push(r),
+            Err(_) => lost = true,
         }
     }
     if records.is_empty() {
@@ -109,10 +117,19 @@ pub fn audit_log(data: &[u8]) {
         key,
         &["svc".to_owned()],
         ClientAddrMode::Truncated,
-        Some(Arc::new(fuzz_index())),
+        Some(Arc::clone(
+            FUZZ_INDEX.get_or_init(|| Arc::new(fuzz_index())),
+        )),
     );
     let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let mut out = Vec::new();
+    // As the stream does: a line that does not parse taints the
+    // correlation over the read.
+    if lost {
+        let lo = records.iter().map(|r| r.when).min();
+        let hi = records.iter().map(|r| r.when).max();
+        b.note_loss(lo.zip(hi));
+    }
     for _ in 0..2 {
         for r in &records {
             b.push(r, now, &mut out);
@@ -151,6 +168,20 @@ mod tests {
             registry_yaml(input);
             audit_log(input);
         }
+        // The fuzzing index holds its clients (review of #182 M2: the
+        // named correlation path must be reachable by the fuzzer).
+        let idx = fuzz_index();
+        assert_eq!(idx.len(), 4);
+        let entry = idx
+            .client_tag("scratch-m2m")
+            .and_then(|t| idx.client(t))
+            .and_then(|r| idx.entry(r).map(|(_, n)| n.as_str().to_owned()));
+        assert_eq!(entry.as_deref(), Some("M2M"));
+        assert!(
+            idx.client_tag("batch")
+                .and_then(|t| idx.client(t))
+                .is_none()
+        );
         // The real CAS 8.0.2 OAuth / OIDC excerpt, as one input.
         audit_log(include_bytes!(
             "../fixtures/cas-8.0.2-oauth-oidc-audit.jsonl"
