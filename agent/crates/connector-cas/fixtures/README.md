@@ -12,7 +12,12 @@
   `eyJFAKE.REDACTED.FAKE`, the token request's `Authorization` header (CAS logs the client id and
   secret there in clear) by `Basic REDACTED-FAKE`, the `TGC` and `JSESSIONID` cookies (the
   encrypted ticket-granting cookie and the session id, logged in clear) by `REDACTED`, and `txn` by a fixed UUID. The user is a fake dev
-  user. Used by `audit::events` tests.
+  user. Used by `audit::events` tests (with a registry entry whose `clientId` is `scratch-m2m`, the
+  token responses of the `refresh_token`, `client_credentials` and `password` grants are named after
+  their token request, ADR-0044), by the `fuzz` entry point test, and its token request and response
+  records seed the `cas_audit_log` fuzz target (`agent/fuzz/smoke.sh`). Not extended: the
+  interleaving, expiry, duplicate `clientId` and `who` mismatch cases are synthetic records built by
+  the tests.
 - `registry/`: fake service definitions in pairs, each in JSON and in the YAML form CAS 8.0.2
   writes (`--- !<class>`, Jackson class hints as verbatim tags; the sample of the CAS 8.0.2 YAML
   service registry documentation, extended): an OIDC relying party with a clear `clientSecret`,

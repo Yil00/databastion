@@ -801,6 +801,33 @@ timeout 60 python3 "$I2_CHECK" audit --ground-truth "$GROUND_TRUTH" --engine cas
   --require-incident "${POLICY_READS}:@fingerprint" --require-incident "${POLICY_READS}:${CLEAR_PRINCIPAL}" >&2 \
   || fail "Audit check of ${CAS_TARGET} failed (see above)"
 rm -f -- "$E2E_WORK_DIR/events.json" "$E2E_WORK_DIR/incidents.json"
+
+# Token-only grant (ADR-0044): one `client_credentials` request of the HR-Portal OIDC client (its
+# dev-only client secret is in clear in dev/cas/services, a ground-truth value never sampled),
+# without scope, so CAS writes the token request and response records only. The response's `read`
+# must name the client's registry entry (object HR-Portal, never `*`), its principal (the client
+# id) fingerprinted. The tokens issued join the one-time values searched by the I2 scans below.
+HR_DEF="$HERE/../dev/cas/services/HR-Portal-1003.json"
+HR_CLIENT_ID="$(jq -r '.clientId' "$HR_DEF")"
+jq -r '.clientSecret' "$HR_DEF" >"$E2E_WORK_DIR/hr-client-secret"
+read_hr_named() {
+  console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${CAS_TARGET}'
+    AND action = 'read' AND db_user IS NULL AND db_user_fingerprint IS NOT NULL
+    AND objects @> '[{\"database\": \"service_registry\", \"object\": \"HR-Portal\"}]'"
+}
+[ "$(read_hr_named)" = 0 ] || fail "Audit: a read of HR-Portal before its token request"
+out="$(scenario client-credentials --client-id "$HR_CLIENT_ID" --secret-file "$E2E_WORK_DIR/hr-client-secret" \
+  --patterns "$TP")" || fail "CAS client_credentials token request failed (see above)"
+rm -f -- "$E2E_WORK_DIR/hr-client-secret"
+mask_dir "$TP"
+log "CAS client_credentials: $out"
+deadline=$(( $(date +%s) + EVENTS_TIMEOUT_S ))
+until [ "$(read_hr_named)" = 1 ]; do
+  [ "$(date +%s)" -lt "$deadline" ] \
+    || fail "Audit: the client_credentials token response is not a read of HR-Portal within ${EVENTS_TIMEOUT_S} s (ADR-0044)"
+  sleep 3
+done
+log "Audit: the client_credentials token response is a read of HR-Portal (ADR-0044)"
 phase_done audit
 
 # --------------------------------------------------------------------------- CAS store guard

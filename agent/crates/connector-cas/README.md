@@ -209,9 +209,12 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
 - `AUTHENTICATION_SUCCESS` → `connect`, `AUTHENTICATION_FAILED` →
   `auth_failure`, `SERVICE_TICKET_CREATED` → `read` of the matching service,
   `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED` (OAuth 2.0 / OIDC tokens issued by
-  the token endpoint, any grant) → `read` of `*` (CAS 8.0.2 writes no service
-  in that record), `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`;
-  other actions are counted only.
+  the token endpoint, any grant) → `read` of the client's registry entry for
+  the token-only grants when the token request names it (below), of `*`
+  otherwise (CAS 8.0.2 writes no service in that record),
+  `SAVE_SERVICE_SUCCESS` / `DELETE_SERVICE_SUCCESS` → `dcl`; other actions
+  (`OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` included) give no event and are
+  counted only.
 - OAuth 2.0 / OIDC action names and `what` shapes were taken from the CAS
   8.0.2 dev service (authorization code, implicit, `refresh_token`,
   `client_credentials`, `password`): real records, token values redacted, in
@@ -220,11 +223,43 @@ The `DEFAULT` (`WHO: … WHAT: …`) format is not supported
   local-only service definition with every grant enabled, not from the dev
   registry). An authorization code login writes `SERVICE_TICKET_CREATED`
   (`service` = the redirect URI) and then the token response: two `read`
-  events. `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` (`who` `audit:unknown`),
-  `OIDC_ID_TOKEN_CREATED` (its `what` holds the ID token and the token
-  request's `Authorization` header, client secret included),
+  events. `OIDC_ID_TOKEN_CREATED` (its `what` holds the ID token and the
+  token request's `Authorization` header, client secret included),
   `OAUTH2_AUTHORIZATION_RESPONSE_CREATED` and `OAUTH2_USER_PROFILE_CREATED`
   are counted only; their `what` is never read.
+- **Token-only grants** ([ADR-0044](../../../docs/adr/0044-cas-token-only-grants-client-naming.md)):
+  `refresh_token`, `client_credentials` and `password` write no service
+  ticket, and their token request's `service` is the client id. From
+  `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` (`who` `audit:unknown`) the parser
+  reads only the strings `grant_type` and `service` of the object-form
+  `what` (`code`, the authorization code or refresh token id, `scope`,
+  `response_type` and every other key are skipped unread; a duplicate
+  `grant_type` or `service` drops the record), and, for that record and the
+  token response only, `serverIpAddress` as an IP literal. The service index
+  maps a keyed tag of each OAuth / OIDC entry's top-level `clientId` (exact
+  bytes, at most 1024; a client id shared by two entries maps to none) to
+  its entry; raw client ids are not kept, and the tag key is a fresh random
+  key of each index. Each token request stays pending for 5 s (at most 1024
+  per stream, the oldest evicted; not persisted; dropped when the index is
+  replaced), keyed by a keyed tag of the client address, the server address
+  and the whole user agent. A token response is named after the entry when
+  every pending request of its key selects that entry and, for
+  `client_credentials`, its `who` tag equals the client id tag; the request
+  consumed is the oldest the response can belong to. A pending request that
+  cannot name (`authorization_code`, the device grant, an unknown grant or
+  client id, no object `what`) only makes a response of its key `*`.
+  Otherwise the response is a `read` of `*`, nothing is consumed, and the
+  case is counted: named, unmatched, ambiguous and evicted counts go to the
+  agent log, at most one line per 10 minutes, counts only. Losses fail
+  towards `*` (security review of #182): an evicted request or a line
+  dropped in a read (oversized, unparsable, a panic) makes every pending
+  request unnamed and taints 5 s around the read; a skipped registry file
+  (or more than 4096 services) disables the client match of that index; a
+  pending request more than 5 s before or after a record is dropped; a
+  duplicate `serverIpAddress` drops the token record only. Residual risk: a
+  token request record lost where the agent cannot see it (a restart
+  between request and response, a record CAS did not write), with another
+  request of the same key pending, can name the wrong client within 5 s.
 - `what` (which can hold a ticket id, a live SSO bearer credential) is a
   string or, as CAS 8.0 writes it, an object such as
   `{"service": "https://…", "ticketId": "ST-1-…"}`: from an object only the

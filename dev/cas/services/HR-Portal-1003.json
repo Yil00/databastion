@@ -9,7 +9,8 @@
   "supportedGrantTypes": [
     "java.util.HashSet",
     [
-      "authorization_code"
+      "authorization_code",
+      "client_credentials"
     ]
   ],
   "supportedResponseTypes": [

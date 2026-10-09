@@ -21,6 +21,13 @@ Subcommands
             --names (`name_<n>`, they must reach the console as fingerprints only; one of them is
             a random password-like string, a password typed into the username field); the wrong
             passwords to --patterns (`typed_password_<n>`).
+  client-credentials
+            One OAuth 2.0 `client_credentials` token request to /oauth2.0/accessToken for
+            --client-id, the client secret read from --secret-file and sent in HTTP Basic form, no
+            scope (so CAS writes no OIDC_ID_TOKEN_CREATED record, the one that logs the request's
+            Authorization header): CAS writes OAUTH2_ACCESS_TOKEN_REQUEST_CREATED and
+            OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED, the pair ADR-0044 correlates. The tokens issued go
+            to --patterns (`at_<n>`, `rt_<n>`), never printed.
   load      Fixed-rate logins for --duration seconds: --rate successful logins per second (with a
             validated service ticket) and --fail-rate failed ones (random typed names), on --workers
             threads. Writes --out (JSON): counts per kind, failed requests, and the latency of the
@@ -33,6 +40,7 @@ the CI log must not become the leak.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.cookiejar
 import json
@@ -88,9 +96,10 @@ class Response:
 
 
 def request(o: urllib.request.OpenerDirector, url: str, data: dict[str, str] | None = None,
-            timeout: float = TIMEOUT_S) -> Response:
+            timeout: float = TIMEOUT_S, headers: dict[str, str] | None = None) -> Response:
     body = urllib.parse.urlencode(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, method="POST" if body is not None else "GET")
+    req = urllib.request.Request(url, data=body, method="POST" if body is not None else "GET",
+                                 headers=headers or {})
     try:
         with o.open(req, timeout=timeout) as r:
             return Response(r.status, {k.lower(): v for k, v in r.headers.items()},
@@ -243,6 +252,43 @@ def cmd_failures(args: argparse.Namespace) -> dict:
     return {"failed_logins": refused, "distinct_names": args.count}
 
 
+def basic_auth(client_id: str, secret: str) -> str:
+    """The HTTP Basic credentials of an OAuth client (RFC 6749 section 2.3.1: both parts
+    form-urlencoded first; the dev client id and secret are unreserved characters only)."""
+    pair = f"{urllib.parse.quote_plus(client_id)}:{urllib.parse.quote_plus(secret)}"
+    return "Basic " + base64.b64encode(pair.encode()).decode()
+
+
+def tokens_of(body: str) -> tuple[str, str | None]:
+    """The access token (required) and refresh token of a token endpoint answer."""
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        raise ScenarioError("token answer: not JSON") from None
+    at = doc.get("access_token") if isinstance(doc, dict) else None
+    if not isinstance(at, str) or not at:
+        raise ScenarioError("token answer: no access token")
+    rt = doc.get("refresh_token")
+    return at, rt if isinstance(rt, str) and rt else None
+
+
+def cmd_client_credentials(args: argparse.Namespace) -> dict:
+    secret = read_password(args.secret_file)
+    o, _ = opener()
+    r = request(o, f"{args.base}/oauth2.0/accessToken", {"grant_type": "client_credentials"},
+                timeout=FIRST_TIMEOUT_S,
+                headers={"Authorization": basic_auth(args.client_id, secret),
+                         "Accept": "application/json"})
+    if r.status != 200:
+        raise ScenarioError(f"client_credentials token request: HTTP {r.status}")
+    at, rt = tokens_of(r.body)
+    n = next_index(args.patterns, "at_")
+    write_value(args.patterns, f"at_{n}", at)
+    if rt:
+        write_value(args.patterns, f"rt_{n}", rt)
+    return {"access_tokens": 1, "refresh_tokens": 1 if rt else 0}
+
+
 # ------------------------------------------------------------------------------ load
 def percentile(values: list[float], p: float) -> float | None:
     """Nearest-rank percentile (p in 0..100), None without values."""
@@ -357,6 +403,11 @@ def main(argv: list[str] | None = None) -> int:
     fl.add_argument("--count", type=int, required=True)
     fl.add_argument("--patterns", required=True)
     fl.add_argument("--names", required=True)
+    cc = sub.add_parser("client-credentials")
+    cc.add_argument("--base", required=True)
+    cc.add_argument("--client-id", required=True)
+    cc.add_argument("--secret-file", required=True)
+    cc.add_argument("--patterns", required=True)
     ld = sub.add_parser("load")
     ld.add_argument("--base", required=True)
     ld.add_argument("--password-file", required=True)
@@ -372,7 +423,8 @@ def main(argv: list[str] | None = None) -> int:
         print("cas scenario: error: --base must be http://127.0.0.1:<port>/cas", file=sys.stderr)
         return 2
     try:
-        out = {"logins": cmd_logins, "failures": cmd_failures, "load": cmd_load}[args.cmd](args)
+        out = {"logins": cmd_logins, "failures": cmd_failures, "client-credentials": cmd_client_credentials,
+               "load": cmd_load}[args.cmd](args)
     except (ScenarioError, OSError) as e:
         # Messages name a step and an HTTP status or an error class, never a value.
         print(f"cas scenario {args.cmd}: FAIL {e if isinstance(e, ScenarioError) else type(e).__name__}",

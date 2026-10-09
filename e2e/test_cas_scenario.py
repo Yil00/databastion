@@ -160,5 +160,62 @@ class Main(unittest.TestCase):
             self.assertNotIn("@example.invalid", err.getvalue())
 
 
+class ClientCredentials(unittest.TestCase):
+    def test_basic_auth_form(self) -> None:
+        self.assertEqual(cs.basic_auth("hr-portal", "s3cret"), "Basic aHItcG9ydGFsOnMzY3JldA==")
+        # Reserved characters are form-urlencoded before Base64 (RFC 6749 2.3.1).
+        self.assertEqual(cs.basic_auth("a:b", "c d"), "Basic YSUzQWI6Yytk")
+
+    def test_tokens_of(self) -> None:
+        self.assertEqual(cs.tokens_of('{"access_token": "AT-1-x", "token_type": "Bearer"}'), ("AT-1-x", None))
+        self.assertEqual(cs.tokens_of('{"access_token": "AT-1-x", "refresh_token": "RT-1-y"}'),
+                         ("AT-1-x", "RT-1-y"))
+        for body in ["", "[]", '{"access_token": ""}', '{"error": "invalid_client"}', "AT-1-x"]:
+            with self.assertRaises(cs.ScenarioError) as e:
+                cs.tokens_of(body)
+            self.assertNotIn("AT-1", str(e.exception))
+
+    def test_tokens_only_in_files(self) -> None:
+        seen = []
+
+        def fake_request(o, url, data=None, timeout=cs.TIMEOUT_S, headers=None):
+            seen.append((url, data, headers))
+            return cs.Response(200, {}, '{"access_token": "AT-1-FAKEaccessVALUE", "refresh_token": "RT-1-FAKErefresh"}')
+
+        with tempfile.TemporaryDirectory() as p, tempfile.TemporaryDirectory() as d:
+            secret_file = os.path.join(d, "secret")
+            with open(secret_file, "w", encoding="utf-8") as f:
+                f.write("dev-only-secret\n")
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(cs, "request", fake_request), redirect_stdout(out), redirect_stderr(err):
+                code = cs.main(["client-credentials", "--base", "http://127.0.0.1:1/cas", "--client-id",
+                                "hr-portal", "--secret-file", secret_file, "--patterns", p])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out.getvalue()), {"access_tokens": 1, "refresh_tokens": 1})
+            self.assertEqual(sorted(os.listdir(p)), ["at_0", "rt_0"])
+            url, data, headers = seen[0]
+            self.assertEqual(url, "http://127.0.0.1:1/cas/oauth2.0/accessToken")
+            # No scope: CAS writes no OIDC_ID_TOKEN_CREATED record (it logs the Authorization header).
+            self.assertEqual(data, {"grant_type": "client_credentials"})
+            self.assertEqual(headers["Authorization"], cs.basic_auth("hr-portal", "dev-only-secret"))
+            for v in ["FAKE", "dev-only-secret", headers["Authorization"]]:
+                self.assertNotIn(v, out.getvalue() + err.getvalue())
+
+    def test_a_refused_grant_fails_without_values(self) -> None:
+        with tempfile.TemporaryDirectory() as p, tempfile.TemporaryDirectory() as d:
+            secret_file = os.path.join(d, "secret")
+            with open(secret_file, "w", encoding="utf-8") as f:
+                f.write("dev-only-secret\n")
+            err = io.StringIO()
+            answer = cs.Response(401, {}, '{"error": "invalid_client"}')
+            with mock.patch.object(cs, "request", lambda *a, **k: answer), redirect_stderr(err):
+                code = cs.main(["client-credentials", "--base", "http://127.0.0.1:1/cas", "--client-id",
+                                "hr-portal", "--secret-file", secret_file, "--patterns", p])
+            self.assertEqual(code, 1)
+            self.assertIn("HTTP 401", err.getvalue())
+            self.assertNotIn("dev-only-secret", err.getvalue())
+            self.assertEqual(os.listdir(p), [])
+
+
 if __name__ == "__main__":
     unittest.main()
