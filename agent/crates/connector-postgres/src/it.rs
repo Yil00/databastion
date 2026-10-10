@@ -2046,3 +2046,70 @@ async fn statistics_reads_are_named_and_always_reported() {
     );
     assert!(!text.contains("pg_stats"), "statement text in the logs");
 }
+
+/// `pg_catalog` relations found by the statistics drift test that hold no
+/// sampled value: (relation, reason).
+const NOT_VALUE_STATISTICS: [(&str, &str); 1] = [
+    // `attmissingval` (`anyarray`): the default of a column added with
+    // `ALTER TABLE … ADD COLUMN … DEFAULT`, a constant of the DDL, for the
+    // rows that existed before; not sampled from the data.
+    ("pg_attribute", "fast default of an added column"),
+];
+
+/// ADR-0048 drift test: every `pg_catalog` relation with a column of type
+/// `anyarray`, `pg_mcv_list` or `pg_statistic[]`, or a column named
+/// `most_common_vals`, `histogram_bounds` or `most_common_elems`, is in
+/// `STATISTICS_RELATIONS` or a commented exception. A new server version
+/// that adds such a relation fails the engine matrix instead of being
+/// missed.
+#[tokio::test]
+async fn statistics_relations_match_the_server() {
+    let Some(adm) = admin_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let a = admin(&adm, &adm.dbname).await;
+    let version: String = a
+        .query_one("SELECT pg_catalog.version()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let rows = a
+        .query(
+            "SELECT DISTINCT c.relname::text FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'pg_catalog' AND a.attnum > 0 AND NOT a.attisdropped \
+             AND (a.atttypid IN ('pg_catalog.anyarray'::pg_catalog.regtype, \
+               'pg_catalog.pg_mcv_list'::pg_catalog.regtype, \
+               'pg_catalog.pg_statistic[]'::pg_catalog.regtype) \
+             OR a.attname IN ('most_common_vals', 'histogram_bounds', 'most_common_elems')) \
+             ORDER BY 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let found: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    eprintln!("{version}: statistics columns in {found:?}");
+    let listed = crate::audit::events::STATISTICS_RELATIONS;
+    let missing: Vec<&String> = found
+        .iter()
+        .filter(|r| {
+            !listed.contains(&r.as_str()) && !NOT_VALUE_STATISTICS.iter().any(|(n, _)| n == r)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{version}: pg_catalog relations with statistics columns not in STATISTICS_RELATIONS \
+         (add them, or to NOT_VALUE_STATISTICS with a reason): {missing:?}"
+    );
+    // Every listed relation exists on the server.
+    let absent: Vec<&&str> = listed
+        .iter()
+        .filter(|n| !found.iter().any(|f| f == **n))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "{version}: listed, not found: {absent:?}"
+    );
+}
