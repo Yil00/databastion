@@ -194,7 +194,13 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   (the legacy `audit_log` and `performance_schema` log no table), for reads
   and writes only: DDL and DCL events take no name from the text (it can
   hold program bodies, such as MySQL JavaScript routines, that the SQL
-  lexer does not delimit). An unqualified name is in the statement's
+  lexer does not delimit), except `CREATE TABLE … AS <query>` and
+  `CREATE` / `ALTER … VIEW … AS <query>`, which hold no body: one DDL
+  event names the created table or view and the sources of the query, as
+  an `INSERT … SELECT` write names its target and sources. A read whose
+  values go into variables (`SELECT … INTO @v`, `@v := …`, `SET` / `DO`
+  with a subquery) is always reported, with no row count, and never the
+  agent's own (docs/08). An unqualified name is in the statement's
   current database. A name holding
   a dot is sent as `*` (as in Discovery). A text that does not lex (cut at
   the server's limit, an ambiguous `sql_mode` reading) and `CALL` are
