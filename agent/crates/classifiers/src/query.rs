@@ -1854,16 +1854,50 @@ fn has_qualified_call(s: &[Tok], kind: StatementKind) -> bool {
 /// statement of this kind names a table followed by a column list
 /// (`INSERT INTO t (a)`, `CREATE TABLE t (…)`, `REFERENCES t (id)`), not
 /// a function call: `write` for `INSERT` / `UPDATE` / `DELETE` /
-/// `REPLACE`, `schema_change` for DDL and DCL.
+/// `REPLACE`, `schema_change` for DDL and DCL. A modifier (`IGNORE`,
+/// `LOW_PRIORITY`, `DELAYED`, `HIGH_PRIORITY`) names a table next only in
+/// the write's own head: after a `SELECT` and its modifiers (`INSERT …
+/// SELECT HIGH_PRIORITY f(1)`), what follows is a select list (security
+/// review of #184, N1).
 fn table_name_before(s: &[Tok], i: usize, write: bool, schema_change: bool) -> bool {
     match i.checked_sub(1).and_then(|j| word(s.get(j))) {
-        Some(
-            "into" | "insert" | "replace" | "ignore" | "low_priority" | "delayed" | "high_priority",
-        ) => write,
+        Some("into" | "insert" | "replace") => write,
+        Some("ignore" | "low_priority" | "delayed" | "high_priority") => {
+            write && !after_select_modifiers(s, i - 1)
+        }
         Some("table") => write || schema_change,
         Some("exists" | "on" | "view" | "references") => schema_change,
         _ => false,
     }
+}
+
+/// Whether the modifier at `m` follows a `SELECT` through select (or
+/// write) modifiers only (`SELECT DISTINCT HIGH_PRIORITY`).
+fn after_select_modifiers(s: &[Tok], m: usize) -> bool {
+    let mut j = m;
+    while let Some(k) = j.checked_sub(1) {
+        match word(s.get(k)) {
+            Some("select") => return true,
+            Some(
+                "all"
+                | "distinct"
+                | "distinctrow"
+                | "high_priority"
+                | "straight_join"
+                | "sql_small_result"
+                | "sql_big_result"
+                | "sql_buffer_result"
+                | "sql_cache"
+                | "sql_no_cache"
+                | "sql_calc_found_rows"
+                | "ignore"
+                | "low_priority"
+                | "delayed",
+            ) => j = k,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// A call of a function whose name holds a non-ASCII character
@@ -4539,6 +4573,9 @@ mod tests {
             "INSERT INTO t VALUES (f\u{e9}(1))",
             "INSERT INTO t (a) SELECT f\u{e9}(1)",
             "SET @x = caf\u{e9}(1)",
+            // After a select modifier inside a write (#184 review N1).
+            "INSERT INTO t SELECT HIGH_PRIORITY f\u{e9}(1)",
+            "INSERT INTO t SELECT DISTINCT HIGH_PRIORITY hr.f\u{e9}(1)",
         ] {
             let a = my(q);
             assert!(a.lexed(), "{q}");
@@ -4552,6 +4589,8 @@ mod tests {
             "INSERT INTO `client\u{e8}le` (nom) VALUES ('x')",
             "INSERT INTO hr.`client\u{e8}le` (nom) VALUES ('x')",
             "REPLACE INTO caf\u{e9} (a) VALUES (1)",
+            "INSERT LOW_PRIORITY IGNORE caf\u{e9} (a) VALUES (1)",
+            "INSERT HIGH_PRIORITY caf\u{e9} (a) SELECT 1",
             "CREATE TABLE caf\u{e9} (a INT)",
             "CREATE TABLE IF NOT EXISTS hr.caf\u{e9} (a INT, FOREIGN KEY (a) REFERENCES th\u{e9} (id))",
             "WITH ct\u{e9} (a) AS (SELECT 1) SELECT a FROM ct\u{e9}",
@@ -4973,6 +5012,11 @@ mod tests {
             "SELECT a FROM t FOR SYSTEM_TIME FROM json_table() TO NOW()",
             // After `SET STATEMENT … FOR`.
             "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // A select modifier inside a write is not the write's head
+            // (security review of #184, N1).
+            "INSERT INTO hr.t SELECT HIGH_PRIORITY f(1)",
+            "INSERT IGNORE INTO hr.t SELECT DISTINCT HIGH_PRIORITY f(1)",
+            "REPLACE INTO hr.t SELECT SQL_NO_CACHE HIGH_PRIORITY `f`(1)",
             // A text that does not lex: a raw scan.
             "SELECT f('a",
             "SELECT 'a\\' , f(1)",
@@ -4995,6 +5039,9 @@ mod tests {
             "INSERT t (a) VALUE (1)",
             "REPLACE INTO hr.t (a) VALUES (1)",
             "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = VALUES(a)",
+            "INSERT LOW_PRIORITY IGNORE t (a) VALUES (1)",
+            "INSERT HIGH_PRIORITY INTO t (a) SELECT 1",
+            "REPLACE DELAYED t (a) VALUES (1)",
             "WITH x (a) AS (SELECT 1) SELECT * FROM x",
             "WITH x AS (SELECT 1), y (b, c) AS (SELECT 2, 3) SELECT * FROM y",
             "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r",
@@ -5025,6 +5072,11 @@ mod tests {
         // Qualified calls are routine calls, not unknown ones.
         let a = analyze("SELECT hr.f()", uc_opts());
         assert!(a.parts()[0].routine_call && !a.unknown_call());
+        // Also after a select modifier inside a write (#184 review N1).
+        let a = analyze("INSERT INTO t SELECT HIGH_PRIORITY hr.f(1)", uc_opts());
+        assert!(a.parts()[0].routine_call && !a.unknown_call());
+        let a = analyze("INSERT HIGH_PRIORITY hr.t (a) SELECT 1", uc_opts());
+        assert!(!a.parts()[0].routine_call && !a.unknown_call());
     }
 
     /// Without a list, every unqualified call is unknown (fail closed).
