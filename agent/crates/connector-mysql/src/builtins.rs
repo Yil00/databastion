@@ -245,12 +245,14 @@ pub(crate) fn for_server(flavor: Flavor, version: (u32, u32, u32)) -> &'static B
     if series > newest.series {
         let logged = &NEWER_LOGGED[usize::from(flavor == Flavor::Mariadb)];
         if !logged.swap(true, Ordering::Relaxed) {
-            tracing::info!(
+            tracing::warn!(
                 flavor = flavor.as_str(),
                 server = %format!("{}.{}", series.0, series.1),
                 list = %format!("{}.{}", newest.series.0, newest.series.1),
                 "no built-in function list for this server series: the newest list of its \
-                 flavor is used, and calls of functions added since are reported as reads of `*`"
+                 flavor is used; calls of functions added since are reported as reads of `*`, \
+                 but a stored function named after a function removed since is taken as \
+                 built in (upgrade the agent)"
             );
         }
         return newest;
