@@ -1637,6 +1637,61 @@ mod tests {
         );
     }
 
+    /// A read of the agent's identity that returns no row is charged one
+    /// row (security review of #196, Low), on pgaudit (with
+    /// `pgaudit.log_rows`) per statement, and on `pg_stat_statements` per
+    /// call of a delta: a walk of 0-row reads is left out for at most the
+    /// per-object budget of statements, then reported.
+    #[test]
+    fn own_zero_row_reads_are_charged_one_row_each() {
+        let walk = |n: u64| {
+            rec(
+                "w1",
+                n,
+                1,
+                "READ",
+                "SELECT",
+                "crm.t",
+                "SELECT 1 FROM crm.t WHERE id = $1 AND email = $2",
+                Some(0),
+                "databastion-agent",
+            )
+        };
+        let mut b = PgauditEvents::new(own_with(
+            ClientAddr::parse("192.0.2.14"),
+            3,
+            SharedOwnUsage::default(),
+        ));
+        let reported: Vec<usize> = (1..=5)
+            .map(|n| b.convert(vec![walk(n)], SystemTime::now()).len())
+            .collect();
+        assert_eq!(reported, [0, 0, 0, 1, 1]);
+        // pg_stat_statements: one delta of 3 calls uses up a budget of 3,
+        // one of 4 calls is over it.
+        let routine = analyze_pss("SELECT 1 FROM crm.t WHERE id = $1 AND email = $2", false);
+        let delta = |calls| StatementDelta {
+            own_text: false,
+            user: "databastion",
+            database: "shop",
+            analysis: &routine,
+            calls,
+            rows: 0,
+        };
+        let t0 = SystemTime::UNIX_EPOCH;
+        let own3 = || {
+            own_with(
+                ClientAddr::parse("192.0.2.14"),
+                3,
+                SharedOwnUsage::default(),
+            )
+        };
+        let mut own = own3();
+        let cats = Catalogs::default();
+        assert!(pss_events(&[delta(3)], &mut own, &cats, t0, t0).is_empty());
+        assert_eq!(pss_events(&[delta(1)], &mut own, &cats, t0, t0).len(), 1);
+        assert_eq!(pss_events(&[delta(4)], &mut own3(), &cats, t0, t0).len(), 1);
+    }
+
     /// The per-transaction statements of one Discovery scan (about 90
     /// transactions) and the check / stream probes, as the agent sends
     /// them.
