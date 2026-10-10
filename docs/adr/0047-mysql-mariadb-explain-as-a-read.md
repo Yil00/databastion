@@ -120,3 +120,19 @@ Each answer is the recommendation of this ADR, accepted by the maintainer on 202
    **Answer (decided by the maintainer on 2026-10-10)**: no allow-list. Analysers that explain real statements read real rows, and their credentials are often shared; the console can scope or exclude principals.
 6. A dedicated signal (for example `shape.explain`) so that console policies can tell an explain read from a `SELECT`?
    **Answer (decided by the maintainer on 2026-10-10)**: not in this ADR. It is a protocol change (`signals.json`, [ADR-0022](0022-protocol-capability-negotiation.md)); the principal and objects are enough for the first policies. Revisit if users ask to scope explains separately.
+
+## Implementation note (2026-10-10)
+Recorded with the implementation (`feat/p8-mysql-explain-as-read`), before its security review.
+
+- **Integer literals only in the probe shape.** Decision 5 says "one numeric literal". The lexer keeps plain decimal integers apart from every other literal; strings and decimal or exponent numbers share one token kind. The shape therefore takes an integer or the digest placeholder `?` only; `EXPLAIN SELECT 1.5 FROM t` is an explain of a statement (narrower, fail closed).
+- **A probe shape the rule does not leave out is an explain of a statement.** When the table records of a probe-shaped statement read another table, or the probe shape is one statement of a longer text, the statement is reported as decision 1 says (always reported, never the agent's own). Inside a longer text, its relation is named with the others.
+- **Objects with table records.** Decision 2 says "the same union as a read today", but a read with table records takes its objects from the records only. For an explain, the objects are the records' tables and the relations of the text, both filtered as for a read. This covers an `audit_log_filter` record set without a `performance_schema` table, and an explained write, which has no write record.
+- **Relations of the explained statement only.** The relations are taken from the explained statement read on its own, from its keyword. `EXPLAIN TABLE t` and `EXPLAIN REPLACE t SELECT …` then name `t`, and the common table expressions of `EXPLAIN WITH c AS (…) SELECT … FROM c` are not taken for tables. The prefix (`FORMAT = x`, `INTO @var`) names nothing.
+- **No signal of the explained statement, `INTO OUTFILE` included.** An explained `SELECT … INTO OUTFILE` writes no file. It sets no `signature.into_outfile`, and a failed one is not kept as an attempt. `volume.large_result` is not set either, since there is no row count.
+- **`EXPLAIN (SELECT …)` adds `*`.** The unqualified-call rule of ADR-0045 part (b) reads `EXPLAIN (` as a call of a name that is not built in. Decision 7 keeps that rule unchanged, so the event names the explained relations and `*`.
+- **Leading parentheses.** A statement written `(EXPLAIN SELECT …)` is not valid SQL. The analysis still treats it as an explain of a statement (fail closed).
+- **Integration tests.** The tests run on MySQL 8.4 and MariaDB 11.4 (`performance_schema`), MariaDB 11.4 `server_audit` (`QUERY_DML` and `TABLE`) and Percona 8.4 `audit_log_filter`.
+  - A second account walks a table with `EXPLAIN SELECT * … WHERE id = n` and `SHOW WARNINGS`. Each explain gives one read event naming the table, always reported, with no row count and no signal.
+  - `DESCRIBE t` and `EXPLAIN SELECT 1 FROM t` from that account give none, and the agent's probes give none on any source.
+  - The `min_rows` filter and aggregation run in the agent core, not in the connector stream the tests read. The tests check the always-reported mark and count one event per explain; the core unit test `always_reported_events_pass_min_rows` covers the filter.
+  - The engine-matrix pinning test of the verified server facts is not part of this change.
