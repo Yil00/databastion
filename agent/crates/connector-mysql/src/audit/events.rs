@@ -1009,6 +1009,16 @@ pub(crate) struct Access<'a> {
     pub(crate) source: EventSource,
 }
 
+/// Whether `text` holds `name` written in another ASCII case than `name`
+/// (anywhere: a name, a literal or a comment; fails closed).
+fn case_variant_in(text: &[u8], name: &str) -> bool {
+    let n = name.as_bytes();
+    !n.is_empty()
+        && text
+            .windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n) && w != n)
+}
+
 fn object(database: &str, name: &str) -> EventObject {
     let db = if database.is_empty() {
         NormalizedName::wildcard()
@@ -1654,6 +1664,21 @@ impl EventBuilder {
             // reading `table_stats` too, a `table_stats` subquery, a
             // statistics load of a joined table): the record is kept, and
             // the relation named too (security re-review of #199, N-H1).
+            //
+            // A relation is recorded only by a record of exactly its name:
+            // `server_audit` logs names as stored, and with
+            // `lower_case_table_names = 0` (the Linux default) `hr.V_stats`
+            // and `hr.v_stats` are two relations. With
+            // `lower_case_table_names = 1` a text naming a table in
+            // another case than stored over-reports (security review of
+            // #199, R3-M1). A text that creates or drops a temporary table
+            // records nothing for sure: a temporary table may hide a
+            // permanent one of the same name, before and after it (R3-L2),
+            // so every relation of the text counts as unrecorded.
+            let temporary = parts.iter().any(|p| {
+                matches!(p.lead.first().map(String::as_str), Some("create" | "drop"))
+                    && p.lead.iter().take(4).any(|w| w == "temporary")
+            });
             let mut unrecorded: Vec<(String, String)> = Vec::new();
             if reads_column_stats {
                 for p in parts {
@@ -1662,9 +1687,22 @@ impl EventBuilder {
                         if is_dual(r) || is_system_relation(r, a.database) {
                             continue;
                         }
-                        let recorded = a.tables.iter().any(|(d, t, _)| {
-                            d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(&r.name)
-                        });
+                        // The analyzer folds unquoted names to lower case:
+                        // a name written in another case anywhere in the
+                        // text (`hr.V_stats`, `HR.v_stats`) may be another
+                        // relation than the record's.
+                        let variant = |n: &str| {
+                            [a.text, a.alt_text]
+                                .into_iter()
+                                .flatten()
+                                .any(|t| case_variant_in(t, n))
+                        };
+                        let recorded = !temporary
+                            && !variant(&r.name)
+                            && r.schema.as_deref().is_none_or(|s| !variant(s))
+                            && a.tables
+                                .iter()
+                                .any(|(d, t, _)| *d == db && *t == r.name.as_str());
                         let o = (db.to_owned(), r.name.clone());
                         if !recorded && !unrecorded.contains(&o) {
                             unrecorded.push(o);
@@ -7512,6 +7550,83 @@ mod tests {
         assert_eq!(
             ev.iter().map(shown).collect::<Vec<_>>(),
             ["read [\"hr.customers\", \"hr.orders\"]"]
+        );
+    }
+
+    /// Security review of #199, R3-M1 and R3-L2: a relation is recorded
+    /// only by a record of exactly its name, in a text that writes it in
+    /// no other case (`lower_case_table_names = 0`: `hr.V_stats` is not
+    /// `hr.v_stats`; unquoted names are folded by the analyzer, so named
+    /// in lower case), and not at all in a text that creates or drops a
+    /// temporary table.
+    #[test]
+    fn statistics_records_next_to_case_variants_and_temporary_tables() {
+        let rec = |q: u64, db: &str, t: &str| {
+            format!("20260929 09:40:35,h,app,10.0.0.5,30,{q},READ,{db},{t},")
+        };
+        for (q, text, want) in [
+            (
+                21,
+                "SELECT * FROM hr.V_stats JOIN hr.v_stats ON 1=1",
+                &["hr.v_stats", "mysql.column_stats"][..],
+            ),
+            (
+                22,
+                "SELECT * FROM `hr`.`V_STATS`",
+                &["hr.V_STATS", "hr.v_stats", "mysql.column_stats"][..],
+            ),
+            (
+                23,
+                "SELECT * FROM HR.v_stats",
+                &["hr.v_stats", "mysql.column_stats"][..],
+            ),
+        ] {
+            let lines = vec![
+                rec(q, "hr", "v_stats"),
+                rec(q, "mysql", "column_stats"),
+                rec(q, "mysql", "table_stats"),
+                sa_line("app", "10.0.0.5", q, text),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{text}");
+            let mut names: Vec<String> = ev[0]
+                .objects()
+                .iter()
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect();
+            names.sort();
+            assert_eq!(names, want, "{text}");
+            assert!(ev[0].always_report(), "{text}");
+        }
+        // A temporary table of the view's name, created and dropped in the
+        // same text: its records do not tell which relation was read.
+        let text = "CREATE TEMPORARY TABLE hr.v_stats (a INT); \
+                    DROP TEMPORARY TABLE hr.v_stats; SELECT * FROM hr.v_stats";
+        let lines = vec![
+            rec(24, "hr", "v_stats"),
+            rec(24, "mysql", "column_stats"),
+            rec(24, "mysql", "table_stats"),
+            sa_line("app", "10.0.0.5", 24, text),
+        ];
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert!(!ev.is_empty());
+        assert!(
+            ev.iter().any(|e| e.always_report()
+                && e.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "column_stats")),
+            "{:?}",
+            ev.iter().map(shown).collect::<Vec<_>>()
         );
     }
 

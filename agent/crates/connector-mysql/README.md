@@ -303,7 +303,10 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   the load's `table_stats` record and a text read whole, and names
   `mysql.column_stats` otherwise (code out of sight, an unreadable or cut
   text, `HANDLER`, no `table_stats` record, or a relation of the text with
-  no table record of its own, such as a view, which is then named too). Code out of sight adds `*` whatever its table
+  no table record of its own, such as a view, which is then named too;
+  a record counts only for its exact name, so a text writing a name in
+  another case over-reports under `lower_case_table_names = 1`, and a
+  text creating or dropping a temporary table counts none). Code out of sight adds `*` whatever its table
   records. Drift
   test and server facts: `it::statistics_it`. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).

@@ -11,9 +11,11 @@
 //! listed), always reported. On MariaDB, `FLUSH TABLES` then a plain
 //! `SELECT` of the application table (the server loads its statistics
 //! under the reader's account, which `server_audit` logs as `READ` records
-//! of `mysql.column_stats`) gives no statistics object. The agent's own
-//! probes give none on any source. No seeded value reaches an event or a
-//! log.
+//! of `mysql.column_stats`) gives no statistics object, nor does a join
+//! of two application tables, nor the agent's own Discovery scan, each
+//! right after their statistics are reloaded (security review of #199,
+//! R3-L1). The agent's own probes give none on any source. No seeded value
+//! reaches an event or a log.
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -117,8 +119,23 @@ async fn st_fixture(a: &mut Session, flavor: Flavor) {
                 ),
             )
             .await;
+            // A second application table, for a join whose two tables'
+            // statistics are loaded.
+            exec(
+                a,
+                &format!(
+                    "CREATE TABLE {ST_DB}.orders (id INT PRIMARY KEY, customer_id INT, \
+                     qty INT) ENGINE=InnoDB"
+                ),
+            )
+            .await;
+            exec(
+                a,
+                &format!("INSERT INTO {ST_DB}.orders VALUES (1, 1, 3), (2, 2, 5), (3, 1, 7)"),
+            )
+            .await;
             (
-                format!("ANALYZE TABLE {ST_DB}.customers PERSISTENT FOR ALL"),
+                reload_statement(),
                 format!("SELECT COUNT(*) FROM mysql.column_stats WHERE db_name = '{ST_DB}'"),
             )
         }
@@ -139,6 +156,31 @@ async fn st_fixture(a: &mut Session, flavor: Flavor) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     assert!(n >= 2, "the statistics were not filled ({n})");
+}
+
+/// MariaDB: the statistics of both application tables, rewritten so that
+/// their next open loads them again.
+fn reload_statement() -> String {
+    format!("ANALYZE TABLE {ST_DB}.customers, {ST_DB}.orders PERSISTENT FOR ALL")
+}
+
+/// MariaDB: the statistics rewritten and the tables closed: the next
+/// statement opening them loads their statistics (`server_audit` writes
+/// `READ` records of `table_stats`, `column_stats` and `index_stats`).
+async fn reload_statistics(admin: &mut Session) {
+    admin
+        .query(Stage::Check, &reload_statement())
+        .await
+        .unwrap();
+    exec(admin, "FLUSH TABLES").await;
+}
+
+/// MariaDB: the reader's join of the two application tables.
+fn join_statement() -> String {
+    format!(
+        "SELECT c.id, o.qty FROM {ST_DB}.customers c JOIN {ST_DB}.orders o \
+         ON o.customer_id = c.id"
+    )
 }
 
 /// The reader's statements of the statistics table: whole-row, and
@@ -187,7 +229,9 @@ async fn st_traffic(server: &Server, admin: &mut Session) -> Held {
         assert!(!rows.is_empty(), "{}: no statistics row", server.name);
     }
     if flavor == Flavor::Mariadb {
-        exec(admin, "FLUSH TABLES").await;
+        reload_statistics(admin).await;
+        s.query(Stage::Check, &join_statement()).await.unwrap();
+        reload_statistics(admin).await;
         s.query(
             Stage::Check,
             &format!("SELECT id FROM {ST_DB}.customers WHERE id = 1"),
@@ -242,6 +286,15 @@ fn view_reads() -> Vec<String> {
     ]
 }
 
+/// The reader's join of the two application tables (MariaDB).
+fn join_read(e: &MaskedEvent) -> bool {
+    e.principal().account_name() == ST_USER
+        && e.action() == EventAction::Read
+        && e.objects()
+            .iter()
+            .any(|o| o.database().as_str() == ST_DB && o.object().as_str() == "orders")
+}
+
 /// A reader's read of a view over the statistics (MariaDB).
 fn view_read(e: &MaskedEvent) -> bool {
     e.principal().account_name() == ST_USER
@@ -268,7 +321,10 @@ fn st_done(flavor: Flavor, records: bool) -> impl Fn(&[MaskedEvent]) -> bool {
         let reads = st_reads(flavor).len() + if records { views } else { 0 };
         ev.iter().filter(|e| stats_read(e, flavor)).count() >= reads
             && (flavor == Flavor::Mysql
-                || (ev.iter().any(|e| plain_read(e) && !view_read(e))
+                || (ev
+                    .iter()
+                    .any(|e| plain_read(e) && !view_read(e) && !join_read(e))
+                    && ev.iter().any(join_read)
                     && if records {
                         ev.iter()
                             .filter(|e| view_read(e) && stats_read(e, flavor))
@@ -300,9 +356,21 @@ fn st_check(label: &str, flavor: Flavor, admin: &str, ev: &[MaskedEvent], logs: 
     if flavor == Flavor::Mariadb {
         assert!(
             ev.iter()
-                .filter(|e| plain_read(e) && !view_read(e))
+                .filter(|e| plain_read(e) && !view_read(e) && !join_read(e))
                 .all(|e| !names_statistics(e) && e.objects().len() == 1),
             "{label}: the statistics load named a statistics table: {all:#?}"
+        );
+        // A join of two application tables right after their statistics
+        // are reloaded: the two tables only (security review of #199,
+        // R3-L1).
+        assert!(
+            ev.iter().filter(|e| join_read(e)).all(|e| {
+                let mut names: Vec<&str> =
+                    e.objects().iter().map(|o| o.object().as_str()).collect();
+                names.sort_unstable();
+                !names_statistics(e) && names == ["customers", "orders"]
+            }),
+            "{label}: the join named a statistics table: {all:#?}"
         );
     }
     let joined = all.join("\n");
@@ -428,6 +496,19 @@ async fn statistics_reads_on_audit_logs() {
             assert!(connector.check(&t).await.reachable, "{format}");
         }
         let held = st_traffic(&server, &mut a).await;
+        // The agent's own Discovery scan of the analyzed tables, right
+        // after their statistics are reloaded, on `server_audit` with table
+        // records: no statistics event (security review of #199, R3-L1).
+        let agent_grant = format!("ON {ST_DB}.* TO '{}'@'%'", server.url.user);
+        if format == "server_audit" {
+            exec(&mut a, &format!("GRANT SELECT {agent_grant}")).await;
+            reload_statistics(&mut a).await;
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (sink, mut frx) = FindingSink::channel(100_000);
+            connector.discover(&job, &sink).await.unwrap();
+            drop(sink);
+            while frx.recv().await.is_some() {}
+        }
         let mut ev: Vec<MaskedEvent> = Vec::new();
         collect_until(
             &mut rx,
@@ -441,6 +522,17 @@ async fn statistics_reads_on_audit_logs() {
         drop(held);
         collect_until(&mut rx, &mut ev, Duration::from_secs(4), |_| false).await;
         task.abort();
+        if format == "server_audit" {
+            let agent = server.url.user.as_str();
+            assert!(
+                !ev.iter()
+                    .any(|e| e.principal().account_name() == agent && names_statistics(e)),
+                "{format}: the agent's Discovery scan named a statistics table: {:#?}",
+                ev.iter().map(describe).collect::<Vec<_>>()
+            );
+            let revoke = agent_grant.replacen(" TO ", " FROM ", 1);
+            exec(&mut a, &format!("REVOKE SELECT {revoke}")).await;
+        }
         st_check(
             &format!("{} {format}", server.name),
             flavor,
