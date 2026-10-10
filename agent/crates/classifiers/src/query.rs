@@ -1116,6 +1116,24 @@ pub struct StatementInfo {
     /// 8.4's `FORMAT=TREE` show its conditions with their literals: a read
     /// of another session's statement text (ADR-0045 open question 3).
     pub explain_connection: bool,
+    /// MySQL: an *explain of a statement* (ADR-0047 decision 1): `EXPLAIN`
+    /// / `DESCRIBE` / `DESC`, with no `ANALYZE` and no `FOR` before its
+    /// statement, and its statement keyword (`SELECT`, `TABLE`, `WITH`,
+    /// `VALUES`, `(`, `UPDATE`, `DELETE`, `INSERT`, `REPLACE`) within the
+    /// first [`MAX_EXPLAIN_PREFIX_TOKENS`] tokens, whatever options come
+    /// before it. The optimizer reads `const` and `system` tables and
+    /// evaluates uncorrelated scalar subqueries while it plans: a read of
+    /// the relations the explained statement names, which
+    /// [`Self::relations`] holds. The table form (`DESCRIBE t`, `EXPLAIN
+    /// t`) is not one.
+    pub explain_statement: bool,
+    /// MySQL: the literal probe shape (ADR-0047 decision 5): the whole
+    /// statement is exactly `EXPLAIN | DESCRIBE | DESC`, `SELECT`, one
+    /// integer literal (or the digest placeholder `?`), `FROM` and one
+    /// table name (`t`, `` `t` ``, `s.t`), with no wrapper. It shows no
+    /// column value on any verified server. Implies
+    /// [`Self::explain_statement`].
+    pub explain_probe: bool,
     /// [`Self::relations`] reached [`MAX_RELATIONS`]: the statement may
     /// name more relations than were kept (a caller that must see every
     /// name fails closed).
@@ -1542,7 +1560,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map_or(StatementKind::Other, |s| my_kind(s));
     let mut relations = Vec::new();
     for s in &statements {
-        collect_relations_dialect(s, Dialect::Mysql, &mut relations);
+        my_statement_relations(s, &mut relations);
     }
     let parts: Vec<StatementInfo> = statements
         .iter()
@@ -1566,6 +1584,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 || explain_analyze(original)
                 || explain_analyze(s);
             info.compound = wrappers.contains(&Wrapper::Compound);
+            info.explain_probe = info.explain_statement && explain_probe(original);
             info
         })
         .collect();
@@ -1646,6 +1665,57 @@ fn explain_unbounded(s: &[Tok]) -> bool {
     matches!(word(s.first()), Some("explain" | "describe" | "desc"))
         && s.len() > MAX_EXPLAIN_PREFIX_TOKENS
         && !(1..MAX_EXPLAIN_PREFIX_TOKENS).any(|j| runs_statement_at(s, j, true))
+}
+
+/// The position of the statement an `EXPLAIN` / `DESCRIBE` / `DESC` of a
+/// statement explains ([`StatementInfo::explain_statement`]): `None` for
+/// any other statement, the table form (`DESCRIBE t`, `EXPLAIN t`), an
+/// `ANALYZE` or a `FOR` before the statement (`EXPLAIN ANALYZE` runs it,
+/// `… FOR CONNECTION` keeps its own rule), and a statement past
+/// [`MAX_EXPLAIN_PREFIX_TOKENS`] (`explain_unbounded`). Leading
+/// parentheses are skipped (not valid SQL; fail closed).
+fn explain_statement_at(s: &[Tok]) -> Option<usize> {
+    let lead = s.iter().take_while(|t| is_punct(Some(t), "(")).count();
+    let e = &s[lead..];
+    if !matches!(word(e.first()), Some("explain" | "describe" | "desc")) {
+        return None;
+    }
+    let start =
+        (1..e.len().min(MAX_EXPLAIN_PREFIX_TOKENS)).find(|&j| runs_statement_at(e, j, true))?;
+    let prefix_word = |w: &str| {
+        e[1..start]
+            .iter()
+            .any(|t| matches!(t, Tok::Word(x) if x == w))
+    };
+    (!prefix_word("analyze") && !prefix_word("for")).then_some(lead + start)
+}
+
+/// See [`StatementInfo::explain_probe`]. Comments are not tokens (a
+/// version comment that a server may run gives readings that differ, so
+/// the text keeps only its kind and never gets here); a hint is a comment.
+fn explain_probe(s: &[Tok]) -> bool {
+    let name = |t: Option<&Tok>| matches!(t, Some(Tok::Word(_) | Tok::Quoted(_)));
+    matches!(word(s.first()), Some("explain" | "describe" | "desc"))
+        && word(s.get(1)) == Some("select")
+        && matches!(s.get(2), Some(Tok::Int(_) | Tok::Param))
+        && word(s.get(3)) == Some("from")
+        && name(s.get(4))
+        && match s.len() {
+            5 => true,
+            7 => is_punct(s.get(5), ".") && name(s.get(6)),
+            _ => false,
+        }
+}
+
+/// The relations of a MySQL statement ([`collect_relations_dialect`]);
+/// for an explain of a statement, those of the explained statement read
+/// on its own (`EXPLAIN TABLE t`, `EXPLAIN REPLACE t SELECT …` and the
+/// common table expressions of `EXPLAIN WITH …` are told by its lead
+/// words), ADR-0047 decision 2. The prefix (`FORMAT = x`, `INTO @var`)
+/// names no relation.
+fn my_statement_relations(s: &[Tok], out: &mut Vec<RelationName>) {
+    let s = explain_statement_at(s).map_or(s, |start| &s[start..]);
+    collect_relations_dialect(s, Dialect::Mysql, out);
 }
 
 /// See [`StatementInfo::explain_connection`]. An `EXPLAIN` whose
@@ -2756,7 +2826,11 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         Dialect::Postgres => first_kind(s),
     };
     let mut relations = Vec::new();
-    collect_relations_dialect(s, opts.dialect, &mut relations);
+    match opts.dialect {
+        Dialect::Mysql => my_statement_relations(s, &mut relations),
+        Dialect::Postgres => collect_relations_dialect(s, opts.dialect, &mut relations),
+    }
+    let explain_statement = opts.dialect == Dialect::Mysql && explain_statement_at(s).is_some();
     let (shape, copy) = if opts.possibly_truncated {
         (None, None)
     } else {
@@ -2774,7 +2848,9 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         shape,
         copy,
         nested,
-        outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
+        // An explained `SELECT … INTO OUTFILE` writes no file (ADR-0047
+        // decision 2: no signal of the explained statement).
+        outfile: opts.dialect == Dialect::Mysql && !explain_statement && has_outfile(s),
         lead: lead_words(s),
         routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
         // Set by `analyze_mysql`, which has the spacing of the tokens.
@@ -2790,6 +2866,10 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         non_ascii_call: opts.dialect == Dialect::Mysql && has_non_ascii_call(s, kind),
         explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
         explain_connection: opts.dialect == Dialect::Mysql && explain_connection(s),
+        explain_statement,
+        // Set by `analyze_mysql`, on the statement before its wrappers
+        // (the whole token sequence must be the shape).
+        explain_probe: false,
     }
 }
 
@@ -4824,6 +4904,252 @@ mod tests {
             "FORMAT = TREE ".repeat(10)
         ));
         assert!(a.parts()[0].analyze_wrapped);
+    }
+
+    fn rels_of(p: &StatementInfo) -> Vec<String> {
+        p.relations
+            .iter()
+            .map(|r| match &r.schema {
+                Some(s) => format!("{s}.{}", r.name),
+                None => r.name.clone(),
+            })
+            .collect()
+    }
+
+    /// ADR-0047 decisions 1 and 2: every lead word, option and explained
+    /// statement is an explain of a statement naming the explained
+    /// statement's relations (targets of explained writes included).
+    #[test]
+    fn mysql_explain_of_a_statement() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "EXPLAIN SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "DESCRIBE SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "desc select email from customers where id = 1",
+                &["customers"],
+            ),
+            (
+                "EXPLAIN EXTENDED SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN PARTITIONS SELECT * FROM hr.customers",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT=TRADITIONAL SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT = JSON SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "DESC FORMAT=TREE SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT=JSON INTO @x SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT o.note FROM hr.orders o JOIN hr.customers c ON c.id = o.cid WHERE o.oid = 1",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT * FROM (SELECT * FROM hr.customers WHERE id = 42) d",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN WITH c AS (SELECT * FROM hr.customers WHERE id = 42) SELECT * FROM c",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT * FROM hr.orders WHERE note = (SELECT iban FROM hr.customers WHERE id = 42)",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN (SELECT * FROM hr.customers WHERE id = 42)",
+                &["hr.customers"],
+            ),
+            ("EXPLAIN VALUES ROW(1)", &[]),
+            ("EXPLAIN TABLE hr.customers", &["hr.customers"]),
+            ("DESCRIBE TABLE hr.customers", &["hr.customers"]),
+            (
+                "EXPLAIN UPDATE hr.customers SET name = 'x' WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN UPDATE hr.orders o, hr.customers c SET o.note = 'x' WHERE c.email = 'a@b' AND o.cid = c.id",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN DELETE FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN INSERT INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.archive", "hr.orders"],
+            ),
+            (
+                "EXPLAIN REPLACE hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.orders", "hr.archive"],
+            ),
+            (
+                "EXPLAIN REPLACE INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.archive", "hr.orders"],
+            ),
+            ("EXPLAIN SELECT 1", &[]),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR EXPLAIN SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            // `performance_schema` digests.
+            (
+                "EXPLAIN SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+                &["hr.customers"],
+            ),
+            (
+                "DESC SELECT * FROM hr . customers WHERE id = ?",
+                &["hr.customers"],
+            ),
+        ];
+        for (q, want) in cases {
+            let a = analyze(q, AnalyzeOptions::mysql().digest(q.contains(" . ")));
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.parts().len(), 1, "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement, "{q}");
+            assert!(!p.explain_probe, "{q}");
+            assert!(
+                !p.analyze_wrapped && !p.explain_connection && !p.explain_unbounded,
+                "{q}"
+            );
+            assert_eq!(p.kind, StatementKind::Other, "{q}");
+            assert!(!p.outfile && p.shape.is_none(), "{q}");
+            let got = rels_of(p);
+            assert_eq!(got.len(), want.len(), "{q}: {got:?}");
+            let top: Vec<String> = a
+                .relations()
+                .iter()
+                .map(|r| match &r.schema {
+                    Some(s) => format!("{s}.{}", r.name),
+                    None => r.name.clone(),
+                })
+                .collect();
+            for w in *want {
+                assert!(got.iter().any(|g| g == w), "{q}: {got:?}");
+                assert!(top.iter().any(|g| g == w), "{q}: {top:?}");
+            }
+        }
+        // An explained `INTO OUTFILE` writes no file.
+        let a = my("EXPLAIN SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'");
+        assert!(a.parts()[0].explain_statement && !a.parts()[0].outfile);
+        assert!(my("SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'").parts()[0].outfile);
+        // Not an explain of a statement: the table form, the other
+        // connection, `ANALYZE` (the statement runs), no explain at all.
+        for q in [
+            "DESCRIBE hr.customers",
+            "DESCRIBE hr.customers email",
+            "DESC hr.customers 'e%'",
+            "EXPLAIN hr.customers",
+            "DESC t",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN FORMAT=JSON FOR CONNECTION 12",
+            "EXPLAIN ANALYZE SELECT * FROM hr.customers",
+            "EXPLAIN FORMAT=TREE INTO @x ANALYZE SELECT * FROM hr.customers",
+            "ANALYZE SELECT * FROM hr.customers",
+            "SHOW COLUMNS FROM hr.customers",
+            "SHOW EXPLAIN FOR 12",
+            "SELECT * FROM hr.customers",
+            "SELECT 'EXPLAIN SELECT 1 FROM t'",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(!a.parts()[0].explain_statement, "{q}");
+            assert!(!a.parts()[0].explain_probe, "{q}");
+        }
+        // The table form of a digest.
+        let a = analyze(
+            "EXPLAIN `hr` . `customers`",
+            AnalyzeOptions::mysql().digest(true),
+        );
+        assert!(!a.parts()[0].explain_statement);
+        // Past the prefix bound: its own rule.
+        let far = format!("EXPLAIN {}SELECT * FROM t", "FORMAT = TREE ".repeat(11));
+        let a = my(&far);
+        assert!(a.parts()[0].explain_unbounded && !a.parts()[0].explain_statement);
+    }
+
+    /// ADR-0047 decision 5: the literal probe shape, and one-step
+    /// variations of it.
+    #[test]
+    fn mysql_explain_probe_shape() {
+        for q in [
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long",
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history",
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current",
+            "DESCRIBE SELECT 1 FROM hr.customers",
+            "desc select 0 from customers",
+            "EXPLAIN SELECT 1 FROM `hr`.`customers`;",
+            "EXPLAIN SELECT 1 FROM `customers`",
+            "EXPLAIN /* plain comment */ SELECT 1 FROM t",
+            "EXPLAIN SELECT /*+ NO_INDEX(t) */ 1 FROM t",
+            // Digests.
+            "EXPLAIN SELECT ? FROM performance_schema . events_statements_history_long",
+            "EXPLAIN SELECT ? FROM `performance_schema` . `events_statements_history_long`",
+        ] {
+            let a = analyze(q, AnalyzeOptions::mysql().digest(q.contains(" . ")));
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.parts().len(), 1, "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement && p.explain_probe, "{q}");
+            assert_eq!(p.relations.len(), 1, "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT 1 FROM hr.customers WHERE id = 42",
+            "EXPLAIN SELECT 1 FROM hr.customers, hr.orders",
+            "EXPLAIN SELECT 1 FROM hr.customers JOIN hr.orders",
+            "EXPLAIN SELECT 1 FROM hr.customers c",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "EXPLAIN SELECT id FROM hr.customers",
+            "EXPLAIN SELECT 'x' FROM hr.customers",
+            "EXPLAIN SELECT 1.5 FROM hr.customers",
+            "EXPLAIN SELECT -1 FROM hr.customers",
+            "EXPLAIN SELECT 1, 2 FROM hr.customers",
+            "EXPLAIN FORMAT=JSON SELECT 1 FROM hr.customers",
+            "EXPLAIN EXTENDED SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT (SELECT 1 FROM hr.orders) FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.customers LIMIT 1",
+            "EXPLAIN SELECT 1 FROM hr.customers FOR UPDATE",
+            "EXPLAIN SELECT 1 FROM a.b.c",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN SELECT 1 FROM \"t\"",
+            "EXPLAIN (SELECT 1 FROM t)",
+            "EXPLAIN TABLE t",
+            "SELECT 1 FROM t",
+            "SET STATEMENT max_statement_time = 1 FOR EXPLAIN SELECT 1 FROM t",
+            "EXPLAIN ANALYZE SELECT 1 FROM t",
+        ] {
+            assert!(my(q).parts().iter().all(|p| !p.explain_probe), "{q}");
+        }
+        // A version comment every supported server runs is code; one that
+        // a server may run gives readings that differ: only the kind.
+        let a = my("EXPLAIN SELECT /*!50000 * */ 1 FROM t");
+        assert!(a.lexed() && !a.parts()[0].explain_probe);
+        for q in [
+            "EXPLAIN SELECT /*!99999 * */ 1 FROM t",
+            "EXPLAIN SELECT 1 FROM t /*M!100000 WHERE id = 1 */",
+        ] {
+            let a = my(q);
+            assert!(!a.lexed() && a.parts().is_empty(), "{q}");
+        }
     }
 
     /// A statement naming [`MAX_RELATIONS`] relations or more says so: the
