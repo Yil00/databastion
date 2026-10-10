@@ -1690,6 +1690,25 @@ impl EventBuilder {
                 .any(QueryAnalysis::create_unread);
         if create_unread {
             unknown = true;
+            // The relations every reading names (never their union: a name
+            // in one reading may be a literal in another, I2), filtered as
+            // a read's sources.
+            for x in analysis.iter().chain(&alt_analysis) {
+                for r in x.create_unread_relations() {
+                    let db = r.schema.as_deref().unwrap_or(a.database);
+                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
+                        continue;
+                    }
+                    let o = text_table.map_or_else(
+                        || (db.to_owned(), r.name.clone()),
+                        |(d, t)| (d.to_owned(), t.to_owned()),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
         }
         // A failed statement that is still reported (not refused before
         // reading anything, above) and sent no row: its error or warning
@@ -1702,6 +1721,15 @@ impl EventBuilder {
             && a.rows.unwrap_or(0) == 0
             && (action == EventAction::Read
                 || (action == EventAction::Write && parts.iter().any(|p| p.subquery)));
+        // Such a failure is never the agent's own either (security
+        // re-review of #196, M2): with 0 rows it would be charged nothing
+        // and left out indefinitely. The agent's own statements fail only
+        // in ways that carry no value: its statement timeout
+        // (`max_execution_time`, 3024; MariaDB `max_statement_time`,
+        // 1969), its server-side cancel (`KILL QUERY`, 1317) and its lock
+        // wait timeouts (`lock_wait_timeout` / `innodb_lock_wait_timeout`,
+        // 1205), all set by `sql::session_setup`.
+        let failed_leak = failed_unsent && !matches!(a.status, 3024 | 1969 | 1317 | 1205);
         if processlist && rw {
             let o = ("information_schema".to_owned(), "PROCESSLIST".to_owned());
             if !objects.contains(&o) {
@@ -1739,7 +1767,12 @@ impl EventBuilder {
         // with a `SET` after its read) keeps them, and `volume.*` with
         // them (security review of #196, H1).
         let stored_unsent = stored && a.rows.unwrap_or(0) == 0;
-        let rows = if explain || ((analyze_wrapped || stored_unsent) && action == EventAction::Read)
+        // An explain known only from the lead word of a text that cannot
+        // be read (`/*!99999 EXPLAIN */ SELECT …`, which a server may run
+        // as a `SELECT`) keeps its rows (security re-review of #196, M1).
+        let parsed_explain = parts.iter().any(|p| p.explain_statement);
+        let rows = if parsed_explain
+            || ((analyze_wrapped || stored_unsent) && action == EventAction::Read)
         {
             None
         } else {
@@ -1839,6 +1872,7 @@ impl EventBuilder {
         }
         if !changes
             && !text_tables
+            && !failed_leak
             && self
                 .own
                 .routine(a.user, a.application, a.client, &e, Instant::now())
@@ -3096,6 +3130,35 @@ mod tests {
     /// row may carry values in its error or warning text: always reported.
     #[test]
     fn failed_reads_that_sent_no_row_are_always_reported() {
+        // With the agent's identity (security re-review of #196, M2): a
+        // failure that can show a value is never its own; its timeouts,
+        // cancels and lock waits are, as before.
+        for (text, status, left_out) in [
+            (
+                "SELECT EXTRACTVALUE(1, CONCAT(0x7e, email)) FROM hr.customers WHERE id = 1",
+                1105,
+                false,
+            ),
+            (
+                "SELECT JSON_EXTRACT(email, '$') FROM hr.customers WHERE id = 1",
+                3141,
+                false,
+            ),
+            ("SELECT email FROM hr.customers LIMIT 10", 3024, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1969, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1317, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1205, true),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+            access.status = status;
+            access.rows = Some(0);
+            let ev = b.statement(access, SystemTime::now());
+            assert_eq!(ev.is_none(), left_out, "{status}: {text}");
+            if let Some(e) = ev {
+                assert!(e.always_report(), "{status}");
+            }
+        }
         let run = |text: &str, status: u32, rows: Option<u64>| {
             let mut b = EventBuilder::new(own());
             let mut access = pfs_access(text.as_bytes(), false, Vec::new());
@@ -5772,11 +5835,35 @@ mod tests {
             "CREATE TABLE hr.copy AS ( WITH system AS (SELECT email FROM hr.customers) SELECT * FROM system )",
             |_| copy.to_owned(),
         );
-        // Readings that differ, one a `CREATE … AS SELECT`: `*`.
+        // Readings that differ, one a `CREATE … AS SELECT`: what every
+        // reading names, and `*` (security re-review of #196).
         expect_everywhere(
             "CREATE /*!99999 TEMPORARY*/ TABLE hr.copy AS SELECT * FROM hr.customers",
-            |s| format!("ddl [{:?}] always", star(s)),
+            |s| match star(s) {
+                "*.*" => "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always".to_owned(),
+                st => format!("ddl [\"hr.copy\", \"hr.customers\", {st:?}] always"),
+            },
         );
+        // Never a name that one reading takes from a literal (I2): with
+        // backslash escapes, `jane_doe` is inside the literal.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "CREATE TABLE hr.copy AS SELECT 'a\\' FROM jane_doe, hr.customers -- '",
+            ) {
+                let e = ev.expect("reported");
+                let got = shown(&e);
+                assert!(
+                    e.action() == EventAction::Ddl
+                        && e.always_report()
+                        && !got.contains("jane_doe")
+                        && !got.contains("customers")
+                        && got.contains("hr.copy")
+                        && got.contains('*'),
+                    "{user} {source:?}: {got}"
+                );
+            }
+        }
         // Other DDL still takes no name from the text (ADR-0023 decision
         // 7).
         for text in [
@@ -5863,6 +5950,23 @@ mod tests {
     /// records, always reported, with no row count, never the agent's own.
     #[test]
     fn unreadable_explains_with_read_records_are_always_reported() {
+        // An explain word only a server may run (a version comment): the
+        // text keeps its rows, and `volume.large_result` (security re-review
+        // of #196, M1).
+        for text in [
+            "/*!99999 EXPLAIN */ SELECT * FROM hr.customers WHERE id > 0",
+            "/*M!100000 EXPLAIN */ SELECT * FROM hr.customers WHERE id > 0",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, text, false, 500_000).expect(text);
+                assert_eq!(e.rows(), Some(500_000), "{user:?}: {text}");
+                assert!(
+                    e.signals().contains(&Signal::LargeResult) && e.always_report(),
+                    "{user:?}: {text}"
+                );
+            }
+        }
         let text = "EXPLAIN SELECT * FROM `hr`.`caf\u{e9}` WHERE id = 1";
         assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
         for user in ["app", "databastion"] {

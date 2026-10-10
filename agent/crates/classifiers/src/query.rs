@@ -1199,6 +1199,7 @@ pub struct QueryAnalysis {
     non_ascii_call: bool,
     unknown_call: bool,
     create_unread: bool,
+    create_unread_relations: Vec<RelationName>,
 }
 
 impl QueryAnalysis {
@@ -1217,6 +1218,7 @@ impl QueryAnalysis {
             non_ascii_call: false,
             unknown_call: false,
             create_unread: false,
+            create_unread_relations: Vec::new(),
         }
     }
 
@@ -1228,6 +1230,16 @@ impl QueryAnalysis {
     #[must_use]
     pub fn create_unread(&self) -> bool {
         self.create_unread
+    }
+
+    /// For a [`Self::create_unread`] text: the relations that **every**
+    /// reading names (created table or view and sources, the
+    /// intersection, never the union: a name in one reading may be the
+    /// content of a literal or a comment in another, I2). Empty when a
+    /// reading does not lex.
+    #[must_use]
+    pub fn create_unread_relations(&self) -> &[RelationName] {
+        &self.create_unread_relations
     }
 
     /// MySQL: the text calls an unqualified name that is not a built-in
@@ -1502,6 +1514,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         non_ascii_call: false,
         unknown_call: false,
         create_unread: false,
+        create_unread_relations: Vec::new(),
     }
 }
 
@@ -1605,6 +1618,9 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                     .iter()
                     .any(|s| create_query(my_set_statement_body(s).unwrap_or(s)).is_some())
             });
+            if a.create_unread {
+                a.create_unread_relations = common_relations(&readings);
+            }
             return a;
         }
     };
@@ -1678,7 +1694,40 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         non_ascii_call: false,
         unknown_call: false,
         create_unread: false,
+        create_unread_relations: Vec::new(),
     }
+}
+
+/// The relations every reading names (each reading: the created table or
+/// view and the relations of each statement), in the order of the first;
+/// empty when a reading does not lex.
+fn common_relations(readings: &[Result<MyLexed, LexError>]) -> Vec<RelationName> {
+    let mut per = Vec::new();
+    for r in readings {
+        let Ok(l) = r else {
+            return Vec::new();
+        };
+        let mut v: Vec<RelationName> = Vec::new();
+        for s in split_statements(&l.toks) {
+            let body = my_set_statement_body(s).unwrap_or(s);
+            if let Some((Some(target), _)) = create_query(body)
+                && v.len() < MAX_RELATIONS
+                && !v.contains(&target)
+            {
+                v.push(target);
+            }
+            my_statement_relations(body, &mut v);
+        }
+        per.push(v);
+    }
+    let Some((first, rest)) = per.split_first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .filter(|r| rest.iter().all(|o| o.contains(r)))
+        .cloned()
+        .collect()
 }
 
 /// Most nested wrapper levels unwrapped (`SET STATEMENT … FOR`,
@@ -6246,7 +6295,27 @@ mod tests {
         ] {
             let a = my(q);
             assert!(!a.lexed() && a.create_unread(), "{q}");
+            let names: Vec<String> = a
+                .create_unread_relations()
+                .iter()
+                .map(|r| format!("{}.{}", r.schema.as_deref().unwrap_or("-"), r.name))
+                .collect();
+            assert_eq!(names, ["-.copy", "db.t"], "{q}");
         }
+        // A name that one reading takes from a literal is never kept: the
+        // intersection of the readings, not their union (I2).
+        let a = my("CREATE TABLE hr.copy AS SELECT 'a\\' FROM jane_doe, hr.customers -- '");
+        assert!(!a.lexed() && a.create_unread());
+        assert!(
+            a.create_unread_relations()
+                .iter()
+                .all(|r| r.name != "jane_doe" && r.name != "customers"),
+            "{:?}",
+            a.create_unread_relations()
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        );
         assert!(!my("CREATE /*!99999 TEMPORARY*/ TABLE copy (a INT)").create_unread());
         for q in [
             "CREATE TABLE copy LIKE db.t",
