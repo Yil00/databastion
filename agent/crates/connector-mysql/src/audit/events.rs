@@ -39,7 +39,12 @@
 //! `performance_schema` source off), and so does a table record that
 //! writes a system schema table, whatever the statement's action. The
 //! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
-//! access worth reporting). Server configuration changes (`SET GLOBAL` /
+//! access worth reporting). Two exceptions keep their names in reads,
+//! always reported and never the agent's own: the statement-text tables
+//! (ADR-0045) and the statistics tables that hold column values
+//! (`information_schema.COLUMN_STATISTICS`, `mysql.column_stats`:
+//! ADR-0048), the latter only when the statement text names them, since
+//! MariaDB writes `column_stats` read records for its own statistics loads. Server configuration changes (`SET GLOBAL` /
 //! `PERSIST`, `INSTALL` / `UNINSTALL`, `TRUNCATE`) are DDL events. A
 //! text that only kept its kind (opaque, ambiguous readings, not
 //! lexable) is reported against `*` with the most reportable kind of its
@@ -266,6 +271,42 @@ pub(crate) fn statement_text_table(
         .map(|(d, t, _)| (*d, *t))
 }
 
+/// The statistics tables that hold column values (ADR-0048 decision 1):
+/// MySQL's histograms (`information_schema.COLUMN_STATISTICS`, `HISTOGRAM`:
+/// every distinct value of a singleton histogram, bucket bounds otherwise,
+/// strings base64-encoded) and MariaDB's engine-independent statistics
+/// (`mysql.column_stats`: `min_value`, `max_value` in clear, and `JSON_HB`
+/// bucket start values). As listed: (schema, table). Both are listed for
+/// both flavors: the flavor comes from a version string a proxy can
+/// rewrite. `mysql.table_stats`, `index_stats`, `innodb_table_stats`,
+/// `innodb_index_stats` and `information_schema.STATISTICS` hold no value
+/// and are not listed; `mysql.column_statistics` is refused to every
+/// account (error 3554).
+pub(crate) const STATISTICS_TABLES: &[(&str, &str)] = &[
+    ("information_schema", "COLUMN_STATISTICS"),
+    ("mysql", "column_stats"),
+];
+
+/// The statistics table `db`.`table` is, as listed (compared
+/// ASCII-case-insensitively).
+pub(crate) fn statistics_table(db: &str, table: &str) -> Option<(&'static str, &'static str)> {
+    STATISTICS_TABLES
+        .iter()
+        .find(|(d, t)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
+        .map(|(d, t)| (*d, *t))
+}
+
+/// A table whose reads are named, always reported and never the agent's
+/// own: a statement-text table (ADR-0045) or a statistics table
+/// (ADR-0048), as listed.
+pub(crate) fn listed_table(
+    flavor: Option<Flavor>,
+    db: &str,
+    table: &str,
+) -> Option<(&'static str, &'static str)> {
+    statement_text_table(flavor, db, table).or_else(|| statistics_table(db, table))
+}
+
 /// A `USE` with another statement in one text, in either order (security
 /// review of #186, M1): unqualified names after it resolve in the database
 /// it sets, and the database a source logs for the whole text may be the
@@ -289,12 +330,15 @@ fn use_then(x: &QueryAnalysis) -> bool {
 /// performance_schema` in an earlier record, or a connect database, then
 /// `SELECT … FROM events_statements_history_long`). It keeps the name the
 /// source shows (`processlist` is in three schemas), and is marked like a
-/// listed table: always reported, never the agent's own.
+/// listed table: always reported, never the agent's own. The same holds
+/// for the name of a statistics table (ADR-0048).
 fn unresolved_text_table(flavor: Option<Flavor>, db: &str, table: &str) -> bool {
     db.is_empty()
-        && STATEMENT_TEXT_TABLES.iter().any(|(d, t, _)| {
+        && (STATEMENT_TEXT_TABLES.iter().any(|(d, t, _)| {
             t.eq_ignore_ascii_case(table) && statement_text_table(flavor, d, t).is_some()
-        })
+        }) || STATISTICS_TABLES
+            .iter()
+            .any(|(_, t)| t.eq_ignore_ascii_case(table)))
 }
 
 /// `SHOW [FULL] PROCESSLIST`: a read of `information_schema.PROCESSLIST`
@@ -1148,7 +1192,7 @@ impl EventBuilder {
             && a.tables.iter().all(|(db, table, op)| {
                 *op == TableOp::Read
                     && db.eq_ignore_ascii_case("information_schema")
-                    && statement_text_table(None, db, table).is_none()
+                    && listed_table(None, db, table).is_none()
             })
     }
 
@@ -1555,7 +1599,7 @@ impl EventBuilder {
                     let db = r.schema.as_deref().unwrap_or(a.database);
                     // A statement-text table keeps its name, as listed
                     // (ADR-0045 decision 1).
-                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    let text_table = listed_table(self.flavor, db, &r.name);
                     if is_dual(r)
                         || (!keep_system
                             && text_table.is_none()
@@ -1588,12 +1632,18 @@ impl EventBuilder {
                 // statement names every table it touched, and a table
                 // record that writes or changes a system schema table
                 // names it whatever the statement's action (a `CALL`).
+                // A read record of an internal statistics table is
+                // dropped whatever the statement's action: MariaDB writes
+                // `READ,mysql,column_stats` (and `table_stats`,
+                // `index_stats`) under the reader's account whenever it
+                // loads a table's statistics (ADR-0048 decision 2). A
+                // statistics table the text names is added below.
                 let text_table = statement_text_table(self.flavor, db, table);
                 let system = (is_system_schema(db)
                     && !write
                     && *op == TableOp::Read
                     && text_table.is_none())
-                    || (is_internal_table(db, table) && !write)
+                    || (is_internal_table(db, table) && (!write || *op == TableOp::Read))
                     || (!rw && db.eq_ignore_ascii_case("mysql"));
                 let o = text_table.map_or_else(
                     || ((*db).to_owned(), (*table).to_owned()),
@@ -1612,7 +1662,7 @@ impl EventBuilder {
                 for p in parts.iter().filter(|p| p.explain_statement) {
                     for r in &p.relations {
                         let db = r.schema.as_deref().unwrap_or(a.database);
-                        let text_table = statement_text_table(self.flavor, db, &r.name);
+                        let text_table = listed_table(self.flavor, db, &r.name);
                         if is_dual(r)
                             || (!write
                                 && !p.explain_probe_case
@@ -1627,6 +1677,23 @@ impl EventBuilder {
                         );
                         if !objects.contains(&o) {
                             objects.push(o);
+                        }
+                    }
+                }
+            }
+            // A statistics table the text names (ADR-0048 decision 2):
+            // its table records are not enough (the server's own loads
+            // write them, above), and `audit_log_filter` writes none for
+            // `information_schema`.
+            if rw {
+                for p in parts {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        if let Some((d, t)) = statistics_table(db, &r.name) {
+                            let o = (d.to_owned(), t.to_owned());
+                            if !objects.contains(&o) {
+                                objects.push(o);
+                            }
                         }
                     }
                 }
@@ -1659,7 +1726,7 @@ impl EventBuilder {
                 }
                 for r in &p.relations {
                     let db = r.schema.as_deref().unwrap_or(a.database);
-                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    let text_table = listed_table(self.flavor, db, &r.name);
                     if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
                         continue;
                     }
@@ -1696,7 +1763,7 @@ impl EventBuilder {
             for x in analysis.iter().chain(&alt_analysis) {
                 for r in x.create_unread_relations() {
                     let db = r.schema.as_deref().unwrap_or(a.database);
-                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    let text_table = listed_table(self.flavor, db, &r.name);
                     if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
                         continue;
                     }
@@ -1736,19 +1803,18 @@ impl EventBuilder {
                 objects.push(o);
             }
         }
-        // Reads of statement-text tables (ADR-0045 decisions 1 to 4):
-        // named first (an event names 16 objects at most), always
-        // reported, and never the agent's own (its exact texts are left
-        // out above).
+        // Reads of statement-text tables (ADR-0045 decisions 1 to 4) and
+        // of statistics tables (ADR-0048 decisions 1 to 4): named first
+        // (an event names 16 objects at most), always reported, and never
+        // the agent's own (its exact texts are left out above; it names
+        // no statistics table).
         let text_tables = objects.iter().any(|(db, t)| {
-            statement_text_table(self.flavor, db, t).is_some()
-                || unresolved_text_table(self.flavor, db, t)
+            listed_table(self.flavor, db, t).is_some() || unresolved_text_table(self.flavor, db, t)
         });
         if text_tables {
             let flavor = self.flavor;
             objects.sort_by_key(|(db, t)| {
-                statement_text_table(flavor, db, t).is_none()
-                    && !unresolved_text_table(flavor, db, t)
+                listed_table(flavor, db, t).is_none() && !unresolved_text_table(flavor, db, t)
             });
         }
         if rw && objects.is_empty() && !unknown && !dquoted {
@@ -6908,5 +6974,298 @@ mod tests {
         }
         assert!(!is_dump_program("mysql"));
         assert!(!is_dump_program("databastion-agent"));
+    }
+
+    /// ADR-0048 decisions 1 to 4 and open question 4: every statistics
+    /// table, qualified, backquoted, in any case, whole-row or naming no
+    /// value column, in a `JOIN`, in a subquery, is a read naming it (as
+    /// listed), always reported, from any account, the agent's included,
+    /// on every source.
+    #[test]
+    fn statistics_tables_are_named_and_always_reported() {
+        for (db, table) in STATISTICS_TABLES {
+            let named = format!("{db}.{table}");
+            let want = format!("read [{named:?}] always");
+            for text in [
+                format!("SELECT * FROM {db}.{table}"),
+                format!("select * from `{db}`.`{table}` where 1 = 1 limit 5"),
+                format!(
+                    "SELECT COUNT(*) FROM {}.{}",
+                    db.to_ascii_uppercase(),
+                    table.to_ascii_uppercase()
+                ),
+                format!(
+                    "SELECT {}, {} FROM {}.{}",
+                    "COLUMN_NAME",
+                    "TABLE_NAME",
+                    db.to_ascii_lowercase(),
+                    table.to_ascii_lowercase()
+                ),
+                format!("SELECT s.* FROM {db}.{table} s"),
+                format!("SELECT JSON_OBJECT('a', s.TABLE_NAME) FROM {db}.{table} AS s"),
+                format!("TABLE {db}.{table}"),
+                format!("SET @x = (SELECT COUNT(*) FROM {db}.{table})"),
+                format!("SELECT 1 FROM DUAL WHERE EXISTS (SELECT 1 FROM {db}.{table})"),
+                format!("SELECT * FROM (SELECT * FROM {db}.{table}) AS d"),
+            ] {
+                expect_everywhere(&text, |_| want.clone());
+            }
+            // With an application table: both, in a `JOIN` or a subquery.
+            let mut both = [named.clone(), "hr.customers".to_owned()];
+            both.sort();
+            for text in [
+                format!("SELECT * FROM hr.customers c JOIN {db}.{table} s ON 1 = 1"),
+                format!("SELECT * FROM hr.customers WHERE id IN (SELECT 1 FROM {db}.{table})"),
+            ] {
+                expect_everywhere(&text, |_| format!("read {both:?} always"));
+            }
+            // Unqualified, in the statement's current database.
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let out = file(
+                    &mut b,
+                    sa_at(
+                        &[sa_in(
+                            user,
+                            "172.18.0.1",
+                            1,
+                            db,
+                            &format!("SELECT * FROM `{table}`"),
+                        )],
+                        1024,
+                    ),
+                );
+                assert_eq!(out, [format!("read [{named:?}] None []")], "{user}");
+                let mut b = EventBuilder::new(own());
+                let text = format!("SELECT * FROM {table}");
+                let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+                access.user = user;
+                access.principal = EventPrincipal::account(user);
+                access.database = db;
+                access.rows = Some(1);
+                let e = b.statement(access, SystemTime::now()).expect(user);
+                assert!(e.always_report());
+                assert_eq!(show(&e), format!("read [{named:?}] Some(1) []"), "{user}");
+                // In an unknown database (the `audit_log` JSON records):
+                // the name the source shows, always reported.
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 1, &text)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{user}");
+                assert!(ev[0].always_report(), "{user}");
+            }
+            // The same name in another schema is an ordinary table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &[sa_line(
+                        "app",
+                        "10.0.0.5",
+                        1,
+                        &format!("SELECT * FROM hr.{table} WHERE id = 1"),
+                    )],
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [format!("read [\"hr.{}\"]", table.to_ascii_lowercase())]
+            );
+        }
+        // Writes name them too, always reported.
+        expect_everywhere(
+            "UPDATE mysql.column_stats SET min_value = NULL WHERE 1 = 0",
+            |_| "write [\"mysql.column_stats\"] always".to_owned(),
+        );
+    }
+
+    /// ADR-0048: the `performance_schema` digests name the statistics
+    /// table (the table it describes is a `?`).
+    #[test]
+    fn statistics_tables_are_named_in_digests() {
+        for (digest, named) in [
+            (
+                "SELECT COLUMN_NAME , `min_value` , `max_value` FROM `mysql` . `column_stats` WHERE TABLE_NAME = ?",
+                "mysql.column_stats",
+            ),
+            (
+                "SELECT `HISTOGRAM` FROM `information_schema` . `COLUMN_STATISTICS` WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?",
+                "information_schema.COLUMN_STATISTICS",
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+                access.user = user;
+                access.principal = EventPrincipal::account(user);
+                access.digest = true;
+                access.rows = Some(2);
+                let e = b.statement(access, SystemTime::now()).expect(user);
+                assert!(e.always_report(), "{user}");
+                assert_eq!(show(&e), format!("read [{named:?}] Some(2) []"), "{user}");
+            }
+        }
+    }
+
+    /// ADR-0048 decision 2 and open question 7: MariaDB writes
+    /// `READ,mysql,column_stats` (and `table_stats`, `index_stats`) records
+    /// under the reader's account when it loads a table's statistics
+    /// (verified after `FLUSH TABLES` on 11.4.13). Without a text that
+    /// names a statistics table they stay dropped, whatever the statement
+    /// does; with one, the table is named.
+    #[test]
+    fn mariadb_statistics_loads_are_not_statistics_reads() {
+        let loads = |user: &str, q: u64| -> Vec<String> {
+            ["table_stats", "column_stats", "index_stats"]
+                .iter()
+                .map(|t| format!("20260929 09:40:35,h,{user},10.0.0.5,30,{q},READ,mysql,{t},"))
+                .collect()
+        };
+        // A read of an application table.
+        let mut lines = vec!["20260929 09:40:35,h,app,10.0.0.5,30,1,READ,hr,customers,".to_owned()];
+        lines.extend(loads("app", 1));
+        lines.push(sa_line("app", "10.0.0.5", 1, "SELECT * FROM hr.customers"));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\"]"]
+        );
+        // A write reading an application table.
+        let mut lines = vec![
+            "20260929 09:40:35,h,app,10.0.0.5,30,2,READ,hr,customers,".to_owned(),
+            "20260929 09:40:35,h,app,10.0.0.5,30,2,WRITE,hr,archive,".to_owned(),
+        ];
+        lines.extend(loads("app", 2));
+        lines.push(sa_line(
+            "app",
+            "10.0.0.5",
+            2,
+            "INSERT INTO hr.archive SELECT * FROM hr.customers",
+        ));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1);
+        let names: Vec<String> = ev[0]
+            .objects()
+            .iter()
+            .map(|o| o.object().as_str().to_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.ends_with("_stats")), "{names:?}");
+        // Load records alone: no event.
+        let mut lines = loads("app", 3);
+        lines.push(sa_line("app", "10.0.0.5", 3, "SELECT 1"));
+        let mut b = EventBuilder::new(own());
+        assert!(
+            b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        // The agent's own Discovery sample with load records: left out as
+        // its own (charged to `hr.customers`), no statistics object.
+        let mut lines =
+            vec!["20260929 09:40:35,h,databastion,172.18.0.1,30,4,READ,hr,customers,".to_owned()];
+        lines.extend(loads("databastion", 4));
+        lines.push(sa_line(
+            "databastion",
+            "172.18.0.1",
+            4,
+            "SELECT `email` FROM `hr`.`customers` LIMIT 100",
+        ));
+        let mut b = EventBuilder::new(own());
+        assert!(
+            b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        // A text naming `mysql.column_stats`, with its record: named,
+        // always reported, from any account.
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            let mut lines = loads(user, 5);
+            lines.push(sa_line(
+                user,
+                ip,
+                5,
+                "SELECT COLUMN_NAME, min_value, max_value FROM mysql.column_stats WHERE table_name = 1",
+            ));
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"mysql.column_stats\"] always"],
+                "{user}"
+            );
+        }
+        // Percona `audit_log_filter`: no `table_access` record for
+        // `information_schema`, but one for the application table of a
+        // `JOIN`: the text names the statistics table.
+        let recs = filter_json(
+            "app",
+            "10.0.0.5",
+            6,
+            &[("hr", "customers")],
+            "SELECT * FROM hr.customers c JOIN information_schema.COLUMN_STATISTICS s ON s.TABLE_NAME = 'customers'",
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"information_schema.COLUMN_STATISTICS\"] always"]
+        );
+    }
+
+    /// ADR-0048: the dictionary and the statistics that hold no value stay
+    /// quiet, from any account, on every source.
+    #[test]
+    fn dictionary_and_counter_statistics_stay_quiet() {
+        for text in [
+            "SELECT * FROM mysql.table_stats",
+            "SELECT * FROM mysql.index_stats",
+            "SELECT * FROM mysql.innodb_table_stats",
+            "SELECT * FROM mysql.innodb_index_stats",
+            "SELECT * FROM information_schema.STATISTICS",
+            "SELECT * FROM information_schema.COLUMNS",
+            "SELECT * FROM information_schema.TABLE_STATISTICS",
+            "SHOW INDEX FROM hr.customers",
+            "ANALYZE TABLE hr.customers",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        assert!(statistics_table("MYSQL", "COLUMN_STATS").is_some());
+        assert!(statistics_table("information_schema", "column_statistics").is_some());
+        assert!(statistics_table("mysql", "column_statistics").is_none());
+        assert!(statistics_table("hr", "column_stats").is_none());
     }
 }

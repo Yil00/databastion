@@ -291,6 +291,17 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   (`sql::own_performance_schema_reads`); its readability probes are
   `EXPLAIN`s (the same privilege, no row read, quiet). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
+- **Statistics tables** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)):
+  `information_schema.COLUMN_STATISTICS` and `mysql.column_stats`
+  (`audit::events::STATISTICS_TABLES`) hold column values. Named by the
+  statement text on every source, they are objects of reads (as listed),
+  always reported and never the agent's own (it names neither: `sql.rs`
+  unit test). Table records alone do not name them: MariaDB writes
+  `server_audit` `READ` records of `mysql.column_stats`, `table_stats` and
+  `index_stats` under the reader's account when it loads a table's
+  statistics, and these stay dropped whatever the statement does. Drift
+  test and server facts: `it::statistics_it`. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by
   `server_audit`, JSON-encoded by `audit_log`), so it cannot add records.

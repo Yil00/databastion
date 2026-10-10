@@ -1419,6 +1419,11 @@ mod tests {
             "digest_text",
             "processlist",
             "session_connect_attrs",
+            // The statistics tables that hold column values (ADR-0048
+            // decision 4: never the agent's own, so it sends none).
+            "column_stat",
+            "table_stats",
+            "index_stats",
         ];
         for s in all_statements() {
             let lower = s.to_lowercase();
@@ -1444,6 +1449,27 @@ mod tests {
                     continue;
                 }
                 assert!(!lower.contains(d), "{d} in {s}");
+            }
+        }
+    }
+
+    /// ADR-0048 decision 4: no statement of the agent, its
+    /// `performance_schema` polls and probes included, names a statistics
+    /// table (`COLUMN_STATISTICS`, `mysql.column_stats`).
+    #[test]
+    fn no_statement_names_a_statistics_table() {
+        let mut all = all_statements();
+        all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
+        for with_program in [true, false] {
+            all.push(ps_statements(
+                "events_statements_history_long",
+                with_program,
+            ));
+        }
+        for s in &all {
+            let lower = s.to_lowercase();
+            for (db, t) in crate::audit::events::STATISTICS_TABLES {
+                assert!(!lower.contains(&t.to_lowercase()), "{db}.{t} in {s}");
             }
         }
     }
