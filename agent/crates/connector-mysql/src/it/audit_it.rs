@@ -105,7 +105,20 @@ pub(super) fn start_audit(
         min_audit_poll_interval_s: 1,
         ..Limits::default()
     };
-    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(state.to_owned());
+    start_audit_with(connector, t, state, &limits)
+}
+
+/// [`start_audit`] under `limits` (`min_audit_poll_interval_s` 1).
+fn start_audit_with(
+    connector: Arc<MysqlConnector>,
+    t: &TargetConfig,
+    state: &Path,
+    limits: &Limits,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectorError>>,
+    tokio::sync::mpsc::Receiver<MaskedEvent>,
+) {
+    let cfg = databastion_core::AuditConfig::local(t, 1, limits).with_state_dir(state.to_owned());
     let (sink, rx) = databastion_core::EventSink::channel(10_000);
     let task = tokio::spawn(async move { connector.audit_stream(&cfg, &sink).await });
     (task, rx)
@@ -1022,5 +1035,185 @@ async fn many_roles_stay_whole_and_load_file_is_reported() {
             .collect();
         assert_eq!(own_events.len(), 1, "{name}: {own_events:#?}");
         drop_many_roles(&mut a, mysql).await;
+    }
+}
+
+/// Test account of the own-budget test.
+const OWN_USER: &str = "databastion_it_own";
+/// Statements of the 0-row walk, and the own budget it runs under.
+const WALK: usize = 8;
+const WALK_BUDGET: u32 = 5;
+
+/// Security review of #196, Low: on `performance_schema` (row counts),
+/// the agent's real Discovery scan (an empty table included) and its
+/// heartbeat checks produce no event of its account under the default
+/// budget, while a walk of 0-row reads with the agent's identity, each
+/// showing a value through warning 1292, is charged one row per
+/// statement: past the budget its statements are reported, and the
+/// value never reaches an event or a log line.
+#[tokio::test]
+async fn own_zero_row_reads_are_charged_on_performance_schema() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let mut a = admin_session(&server, &admin).await;
+        let db = server.url.dbname.clone();
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OWN_USER}'@'%'")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{OWN_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON `{db}`.* TO '{OWN_USER}'@'%'"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON performance_schema.* TO '{OWN_USER}'@'%'"),
+        )
+        .await;
+        for t in ["it_own_empty", "it_own_walk"] {
+            exec(&mut a, &format!("DROP TABLE IF EXISTS `{db}`.{t}")).await;
+        }
+        exec(
+            &mut a,
+            &format!("CREATE TABLE `{db}`.it_own_empty (id INT PRIMARY KEY, email VARCHAR(64))"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("CREATE TABLE `{db}`.it_own_walk (id INT PRIMARY KEY, email VARCHAR(64))"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("INSERT INTO `{db}`.it_own_walk VALUES (1, '{AUDIT_MARKER}')"),
+        )
+        .await;
+        let (_d, t) = audit_target(&server, OWN_USER, IT_PASSWORD, None);
+        // 1. The agent's real traffic, under the default budget.
+        let connector = Arc::new(MysqlConnector::new());
+        assert!(connector.check(&t).await.reachable, "{}", server.name);
+        assert_eq!(
+            connector.audit_source(&t),
+            Some(EventSource::PerformanceSchema),
+            "{}",
+            server.name
+        );
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // A session of the agent, kept open: its address as the server
+        // sees it, and its account readable on every poll.
+        let mut own = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let own_addr = seen_address(&mut own).await;
+        {
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (sink, mut frx) = FindingSink::channel(100_000);
+            connector.discover(&job, &sink).await.unwrap();
+            drop(sink);
+            while frx.recv().await.is_some() {}
+        }
+        for _ in 0..3 {
+            assert!(connector.check(&t).await.reachable, "{}", server.name);
+        }
+        let mut events: Events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(5), |_| false).await;
+        task.abort();
+        let _ = task.await;
+        let all: Vec<String> = events.iter().map(describe).collect();
+        eprintln!("{} own traffic events:\n{}", server.name, all.join("\n"));
+        if own_addr.is_some() {
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.principal().account_name() == OWN_USER),
+                "{}: the agent's own traffic was reported: {all:#?}",
+                server.name
+            );
+        }
+        // On this source a statement of a session that ended before the
+        // poll has no account (ADR-0023 residual): the scan's own session
+        // usually has, so its samples show up as reads by an unknown
+        // principal, whatever the budget. Counted for the log only.
+        let routine = events.iter().filter(|e| !e.principal().send_name()).count();
+        // 2. A walk of 0-row reads with the agent's identity, under a
+        // budget of WALK_BUDGET rows (another connector: fresh counters).
+        let connector = Arc::new(MysqlConnector::new());
+        assert!(connector.check(&t).await.reachable, "{}", server.name);
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            max_sample_rows: WALK_BUDGET,
+            ..Limits::default()
+        };
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit_with(Arc::clone(&connector), &t, &state.0, &limits);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // `email = n` compares as numbers: the stored text converts to 0
+        // with warning 1292 (which shows it), so no row for n >= 1.
+        for n in 1..=WALK {
+            let walk = format!("SELECT 1 FROM `{db}`.it_own_walk WHERE id = 1 AND email = {n}");
+            let rows = own.query(Stage::Check, &walk).await.unwrap();
+            assert!(rows.is_empty(), "{}: {walk}", server.name);
+        }
+        let walked = |ev: &[MaskedEvent]| {
+            ev.iter()
+                .filter(|e| {
+                    e.principal().account_name() == OWN_USER
+                        && e.action() == EventAction::Read
+                        && e.objects()
+                            .iter()
+                            .any(|o| o.object().as_str() == "it_own_walk")
+                })
+                .count()
+        };
+        let mut events: Events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
+            walked(ev) >= WALK - WALK_BUDGET as usize
+        })
+        .await;
+        collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+        drop(own);
+        task.abort();
+        let _ = task.await;
+        let all: Vec<String> = events.iter().map(describe).collect();
+        eprintln!("{} walk events:\n{}", server.name, all.join("\n"));
+        if own_addr.is_some() {
+            // One row each: the first WALK_BUDGET are left out, the rest
+            // reported, with no row count above 0.
+            assert_eq!(
+                walked(&events),
+                WALK - WALK_BUDGET as usize,
+                "{}: {all:#?}",
+                server.name
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|e| e.principal().account_name() == OWN_USER)
+                    .all(|e| e.rows() == Some(0)),
+                "{}: {all:#?}",
+                server.name
+            );
+        } else {
+            assert_eq!(walked(&events), WALK, "{}: {all:#?}", server.name);
+        }
+        assert_no_marker(&events, &logs);
+        eprintln!(
+            "{}: {routine} unidentified events of the routine phase",
+            server.name
+        );
+        for t in ["it_own_empty", "it_own_walk"] {
+            exec(&mut a, &format!("DROP TABLE IF EXISTS `{db}`.{t}")).await;
+        }
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OWN_USER}'@'%'")).await;
     }
 }

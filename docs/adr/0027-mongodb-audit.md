@@ -101,3 +101,6 @@ The agent's Discovery account (ADR-0026 decision 5) has no privilege that shows 
 - **`clusterMonitor` or `read` for the profiler**: `find` on `system.profile` of every database, `inprog`, change streams; decision 5's per-database role is enough.
 - **`getCmdLineOpts` / `getParameter` to read the audit and profiler settings**: cluster privileges the Discovery account must not hold (ADR-0026 decision 5).
 - **Edit ADR-0026 or ADR-0023 in place**: the ADR convention does not allow editing an accepted ADR.
+
+## Refinement (2026-10-10, phase 8 follow-ups)
+- **Decision 7, the agent's own account** (security reviews of #196 and #197). The engine-agnostic own-account rule of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md#refinement-2026-10-10-phase-8-follow-ups) (refinement of decision 6) applies here too: every read with the agent's identity is charged at least one row, aggregates `max(r, 1) + n - 1`, and budget keys ignore case.

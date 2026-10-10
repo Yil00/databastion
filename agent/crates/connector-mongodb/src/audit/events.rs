@@ -799,6 +799,96 @@ mod tests {
         );
     }
 
+    /// A read of the agent's identity that returns no document is charged
+    /// one (security review of #196, Low): a filter walk of 0-document
+    /// `find`s is left out for at most the per-collection budget of
+    /// reads, then reported; the free `count` and the credited profiler
+    /// polls stay free.
+    #[test]
+    fn own_reads_without_documents_are_charged_one_each() {
+        let mut b = builder();
+        let app = Some("databastion-agent");
+        let walk = || {
+            let mut r = own_record(Cmd::Find, "customers", Some(0), app);
+            r.shape.filter = Filter::Keys(2);
+            r
+        };
+        let left_out = (0..200)
+            .filter(|_| {
+                b.convert(
+                    vec![walk()],
+                    EventSource::MongodbProfiler,
+                    SystemTime::now(),
+                )
+                .is_empty()
+            })
+            .count();
+        assert_eq!(left_out, 200);
+        assert_eq!(
+            b.convert(
+                vec![walk()],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+        // Uncharged reads stay uncharged, past the budget too.
+        let mut b = builder();
+        for _ in 0..300 {
+            b.grant_poll("app");
+            let mut poll = own_record(Cmd::Find, "system.profile", Some(0), app);
+            poll.shape.filter = Filter::Keys(1);
+            poll.shape.limit = Some(crate::audit::profiler::BATCH);
+            let own = vec![own_record(Cmd::Count, "customers", None, app), poll];
+            assert!(
+                b.convert(own, EventSource::MongodbProfiler, SystemTime::now())
+                    .is_empty()
+            );
+        }
+        // A poll-shaped read beyond the credits: charged one each.
+        let reported = (0..201)
+            .filter(|_| {
+                let mut poll = own_record(Cmd::Find, "system.profile", Some(0), app);
+                poll.shape.filter = Filter::Keys(1);
+                poll.shape.limit = Some(crate::audit::profiler::BATCH);
+                !b.convert(vec![poll], EventSource::MongodbProfiler, SystemTime::now())
+                    .is_empty()
+            })
+            .count();
+        assert_eq!(reported, 1);
+    }
+
+    /// Collection names that differ only in case share one budget
+    /// (security review of #197, M2).
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let mut b = builder();
+        let app = Some("databastion-agent");
+        let read = |coll: &str| {
+            let mut r = own_record(Cmd::Find, coll, Some(150), app);
+            r.shape.filter = Filter::Keys(1);
+            r
+        };
+        assert!(
+            b.convert(
+                vec![read("Customers")],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            b.convert(
+                vec![read("customers")],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+    }
+
     /// Security review M1: only the agent's exact profiler polls, on the
     /// profiler source, are free; any other read of `system.profile` with
     /// the agent's identity is charged (and reported past the budget).

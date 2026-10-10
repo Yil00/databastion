@@ -3208,6 +3208,73 @@ mod tests {
         assert!(run("SELECT email FROM hr.customers", 1142, Some(0)).is_none());
     }
 
+    /// A 0-row read of the agent's identity is charged one row (security
+    /// review of #196, Low): a value walk through warnings (1292 on a
+    /// successful 0-row read, or before an exempt 3024 / 1969 / 1317 /
+    /// 1205 failure) is left out for at most the per-object budget of
+    /// statements, then reported.
+    #[test]
+    fn own_zero_row_reads_are_charged_one_row_each() {
+        for status in [0, 3024, 1969, 1317, 1205] {
+            let usage = SharedOwnUsage::default();
+            let mut b = EventBuilder::new(OwnAccount::new(
+                "databastion",
+                Some("databastion-agent"),
+                ClientAddr::parse("172.18.0.1"),
+                3,
+                usage.clone(),
+            ));
+            let texts: Vec<String> = (1..=5)
+                .map(|n| format!("SELECT 1 FROM hr.customers WHERE id = {n} AND email = 0"))
+                .collect();
+            let reported: Vec<bool> = texts
+                .iter()
+                .map(|t| {
+                    let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+                    access.status = status;
+                    access.rows = Some(0);
+                    b.statement(access, SystemTime::now()).is_some()
+                })
+                .collect();
+            assert_eq!(reported, [false, false, false, true, true], "{status}");
+            // The other tables keep their own budget.
+            let mut access = pfs_access(b"SELECT 1 FROM hr.orders WHERE id = 1", false, Vec::new());
+            access.status = status;
+            access.rows = Some(0);
+            assert!(b.statement(access, SystemTime::now()).is_none(), "{status}");
+            assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 2);
+        }
+    }
+
+    /// Names that differ only in case share one budget (security review
+    /// of #197, M2): with `lower_case_table_names` 1 or 2 they are the
+    /// same table.
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let usage = SharedOwnUsage::default();
+        let mut b = EventBuilder::new(OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("172.18.0.1"),
+            2,
+            usage.clone(),
+        ));
+        let reported: Vec<bool> = [
+            "SELECT 1 FROM hr.customers WHERE id = 1",
+            "SELECT 1 FROM `HR`.`Customers` WHERE id = 2",
+            "SELECT 1 FROM Hr.CUSTOMERS WHERE id = 3",
+        ]
+        .iter()
+        .map(|t| {
+            let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+            access.rows = Some(0);
+            b.statement(access, SystemTime::now()).is_some()
+        })
+        .collect();
+        assert_eq!(reported, [false, false, true]);
+        assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
+    }
+
     #[test]
     fn failed_statements_with_read_records_are_reported() {
         // A function SIGNALs 1146 after rows were sent: the TABLE records

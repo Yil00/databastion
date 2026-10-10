@@ -115,3 +115,6 @@ LDAP raises its own questions:
 - **`object` = container, `schema` = object class**: aligns with Audit (which never sees the object class) but contradicts the contract's scan filters and coverage counters, which call LDAP objects "objectClasses"; decision 7 gets the same matching from `sensitive_objects`.
 - **`disable_insecure`**: a simple bind in clear on a network gives the service DN's password to anyone on the path.
 - **Anonymous Discovery**: coverage would depend on what anonymous may read, and the agent's reads could not be told apart in the log.
+
+## Refinement (2026-10-10, phase 8 follow-ups)
+- **Decision 9, the agent's own account** (security reviews of #196 and #197). The engine-agnostic own-account rule of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md#refinement-2026-10-10-phase-8-follow-ups) (refinement of decision 6) applies here too: every read with the agent's identity is charged at least one row, aggregates `max(r, 1) + n - 1`, and budget keys ignore case.
