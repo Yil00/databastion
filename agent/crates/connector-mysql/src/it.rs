@@ -34,6 +34,7 @@
 mod audit_it;
 mod builtins_it;
 mod cas_guard_it;
+mod explain_it;
 mod stmt_text_it;
 
 use std::collections::{BTreeMap, BTreeSet};

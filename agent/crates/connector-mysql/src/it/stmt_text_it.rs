@@ -315,7 +315,8 @@ async fn statement_text_reads_are_named_and_the_agents_own_are_not() {
             assert_eq!(own.len(), 1, "{} {label}: {all:#?}", server.name);
             // No other principal names a statement-text table: the
             // heartbeat sessions of `check()` end before the poll (no
-            // account), and their readability probes are `EXPLAIN`s.
+            // account), and their readability probes have the literal
+            // probe shape of ADR-0047 (quiet for every account).
             assert!(
                 ev.iter()
                     .filter(|e| {
