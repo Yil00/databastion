@@ -402,17 +402,33 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
 /// Whether a raw statement text starts with `EXPLAIN`, `DESCRIBE` or
 /// `DESC`, compared ASCII-case-insensitively: for texts that did not lex
 /// (ADR-0047). ASCII whitespace, opening parentheses, `/* … */` and `#` /
-/// `-- ` comments before the word are skipped; executable comments
-/// (`/*!…`, `/*M!…`, with their version digits) are read inside, as code a
-/// server may run (security review of #195, L1).
+/// `-- ` comments before the word are skipped. An executable comment
+/// (`/*!…`, `/*M!…`) is read both ways: its content as code (after its
+/// version digits) and skipped whole, since a server may run it or not;
+/// either reading that reaches an explain word counts (security review of
+/// #195, L1).
 fn explain_lead(text: &[u8]) -> bool {
+    explain_lead_at(text, 0, 0)
+}
+
+/// Most executable comments [`explain_lead`] reads both ways.
+const MAX_LEAD_BRANCHES: u8 = 4;
+
+fn explain_lead_at(text: &[u8], mut i: usize, depth: u8) -> bool {
     let n = text.len();
-    let mut i = 0;
     while i < n {
         let rest = &text[i..];
         if rest[0].is_ascii_whitespace() || rest[0] == b'(' {
             i += 1;
         } else if rest.starts_with(b"/*!") || rest.starts_with(b"/*M!") {
+            // Skipped whole (a server that does not run it).
+            if depth < MAX_LEAD_BRANCHES
+                && let Some(k) = rest[2..].windows(2).position(|w| w == b"*/")
+                && explain_lead_at(text, i + 2 + k + 2, depth + 1)
+            {
+                return true;
+            }
+            // Read as code.
             i += if rest[2] == b'!' { 3 } else { 4 };
             while i < n && text[i].is_ascii_digit() {
                 i += 1;
@@ -1508,7 +1524,9 @@ impl EventBuilder {
                 // A write names its system tables (`UPDATE
                 // performance_schema.setup_consumers …` turns the
                 // `performance_schema` source off): only reads skip them.
-                let keep_system = write || is_write_kind(p.kind);
+                // So does the probe shape with its schema name in another
+                // case (re-review of #195, L2).
+                let keep_system = write || is_write_kind(p.kind) || p.explain_probe_case;
                 for r in &p.relations {
                     named_any = true;
                     let db = r.schema.as_deref().unwrap_or(a.database);
@@ -1568,24 +1586,25 @@ impl EventBuilder {
             // write record): its text names them too (ADR-0047 decision
             // 2), filtered like a read's.
             if explain && rw {
-                for r in parts
-                    .iter()
-                    .filter(|p| p.explain_statement)
-                    .flat_map(|p| &p.relations)
-                {
-                    let db = r.schema.as_deref().unwrap_or(a.database);
-                    let text_table = statement_text_table(self.flavor, db, &r.name);
-                    if is_dual(r)
-                        || (!write && text_table.is_none() && is_system_relation(r, a.database))
-                    {
-                        continue;
-                    }
-                    let o = text_table.map_or_else(
-                        || (db.to_owned(), r.name.clone()),
-                        |(d, t)| (d.to_owned(), t.to_owned()),
-                    );
-                    if !objects.contains(&o) {
-                        objects.push(o);
+                for p in parts.iter().filter(|p| p.explain_statement) {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        let text_table = statement_text_table(self.flavor, db, &r.name);
+                        if is_dual(r)
+                            || (!write
+                                && !p.explain_probe_case
+                                && text_table.is_none()
+                                && is_system_relation(r, a.database))
+                        {
+                            continue;
+                        }
+                        let o = text_table.map_or_else(
+                            || (db.to_owned(), r.name.clone()),
+                            |(d, t)| (d.to_owned(), t.to_owned()),
+                        );
+                        if !objects.contains(&o) {
+                            objects.push(o);
+                        }
                     }
                 }
             }
@@ -1623,7 +1642,9 @@ impl EventBuilder {
         // An explain's row count is the plan's, not the data's; so is
         // that of `EXPLAIN ANALYZE` / MariaDB `ANALYZE`, which shows the
         // same const values (security review of #195, M2).
-        let rows = if explain || analyze_wrapped {
+        // Writes run by `EXPLAIN ANALYZE` / `ANALYZE` keep their affected
+        // rows (security review of #195, L3).
+        let rows = if explain || (analyze_wrapped && action == EventAction::Read) {
             None
         } else {
             a.rows
@@ -5358,6 +5379,47 @@ mod tests {
             assert!(out[0].always_report() && out[0].rows().is_none(), "{user}");
             assert_eq!(out[0].action(), EventAction::Read, "{user}");
         }
+        // Re-review of #195, L1: an executable comment a server may skip
+        // before the explain word (readings differ: not lexed).
+        let text = "/*!99999 x */ EXPLAIN SELECT * FROM hr.customers WHERE id = 1";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        let lines = [
+            "20260929 09:40:35,h,app,172.18.0.1,30,1,READ,hr,customers,".to_owned(),
+            sa_line("app", "172.18.0.1", 1, text),
+        ];
+        let mut b = EventBuilder::new(own());
+        let out = b.convert_file(
+            sa_at(&lines, 4096),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].always_report() && out[0].rows().is_none());
+        // Re-review of #195, L3: writes run by `ANALYZE` keep their
+        // affected rows, always reported; reads have none.
+        for (text, action, rows) in [
+            (
+                "ANALYZE DELETE FROM hr.customers WHERE id = 1",
+                EventAction::Write,
+                Some(7),
+            ),
+            (
+                "EXPLAIN ANALYZE UPDATE hr.customers SET a = 1",
+                EventAction::Write,
+                Some(7),
+            ),
+            (
+                "EXPLAIN ANALYZE SELECT * FROM hr.customers",
+                EventAction::Read,
+                None,
+            ),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(&mut b, Some("app"), text, false, 7).unwrap();
+            assert_eq!(e.action(), action, "{text}");
+            assert_eq!(e.rows(), rows, "{text}");
+            assert!(e.always_report(), "{text}");
+        }
         for (t, want) in [
             (&b"EXPLAIN x"[..], true),
             (b"  (describe x", true),
@@ -5379,6 +5441,10 @@ mod tests {
             (b"-- EXPLAIN", false),
             (b"--x\nEXPLAIN", false),
             (b"/* EXPLAIN */ SELECT", false),
+            // Re-review of #195, L1: an executable comment skipped whole.
+            (b"/*!99999 x */ EXPLAIN SELECT 1", true),
+            (b"/*M!999999 x */ desc t", true),
+            (b"/*!99999 x */ SELECT 1", false),
             (b"", false),
         ] {
             assert_eq!(explain_lead(t), want, "{t:?}");
@@ -5406,7 +5472,7 @@ mod tests {
             crate::sql::PS_HISTORY,
             crate::sql::PS_CURRENT,
             "DESCRIBE SELECT 1 FROM `performance_schema`.`threads`;",
-            "desc select 7 from PERFORMANCE_SCHEMA.setup_consumers",
+            "desc select 7 from performance_schema.setup_consumers",
         ] {
             for user in ["app", "databastion"] {
                 for (source, ev) in on_every_source(user, text) {
@@ -5533,7 +5599,30 @@ mod tests {
             );
         }
         // Security review of #195, H1: the literal shape on any table
-        // outside `performance_schema`, qualified or not, is a read.
+        // outside `performance_schema`, qualified or not, is a read; the
+        // schema name is compared exactly (re-review, L2).
+        for (text, want) in [
+            (
+                "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+                "PERFORMANCE_SCHEMA.v",
+            ),
+            (
+                "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
+                "Performance_Schema.v",
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let e = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert!(e.always_report(), "{user} {source:?}: {text}");
+                    assert!(
+                        shown(&e).to_lowercase().contains(&want.to_lowercase()),
+                        "{user} {source:?}: {}",
+                        shown(&e)
+                    );
+                }
+            }
+        }
         for text in [
             "EXPLAIN SELECT 1 FROM hr.customers",
             "EXPLAIN SELECT 1 FROM hr.v",

@@ -261,6 +261,10 @@ struct TokFlags {
     /// A [`Tok::Literal`] that the servers read as a name starting with
     /// digits (`1f`, [`my_digit_name`]).
     digit_name: bool,
+    /// A [`Tok::Word`] written with an upper-case ASCII letter (the token
+    /// holds it lower-cased): the literal probe shape compares the
+    /// `performance_schema` name exactly (re-review of #195, L2).
+    upper: bool,
 }
 
 /// The tokens of a MySQL text, with their [`TokFlags`].
@@ -278,6 +282,7 @@ impl MyLexed {
         self.flags.push(TokFlags {
             spaced: start != self.last_end,
             digit_name: false,
+            upper: false,
         });
         self.last_end = end;
     }
@@ -456,6 +461,9 @@ fn lex_mysql_range(
                     i += 1;
                 }
                 out.push(Tok::Word(text[from..i].to_ascii_lowercase()), tok_start, i);
+                if let Some(f) = out.flags.last_mut() {
+                    f.upper = text[from..i].bytes().any(|b| b.is_ascii_uppercase());
+                }
             }
             _ if is_my_op_char(c) => {
                 let from = i;
@@ -1141,6 +1149,11 @@ pub struct StatementInfo {
     /// the server resolves them to is not proven, so callers add `*`
     /// (security review of #195, L2).
     pub explain_schema: bool,
+    /// MySQL: the literal probe shape but for the case of its schema name
+    /// (`PERFORMANCE_SCHEMA.v`, `` `Performance_Schema`.`v` ``): an
+    /// explain of a statement, whose relation callers keep even though it
+    /// reads as a system schema (re-review of #195, L2).
+    pub explain_probe_case: bool,
     /// [`Self::relations`] reached [`MAX_RELATIONS`]: the statement may
     /// name more relations than were kept (a caller that must see every
     /// name fails closed).
@@ -1534,6 +1547,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 for (f, o) in flags.iter_mut().zip(&r.flags) {
                     f.spaced |= o.spaced;
                     f.digit_name |= o.digit_name;
+                    f.upper |= o.upper;
                 }
             }
             (t.toks.clone(), flags)
@@ -1591,7 +1605,9 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 || explain_analyze(original)
                 || explain_analyze(s);
             info.compound = wrappers.contains(&Wrapper::Compound);
-            info.explain_probe = info.explain_statement && explain_probe(original);
+            info.explain_probe = info.explain_statement && explain_probe(original, o_flags);
+            info.explain_probe_case =
+                info.explain_statement && probe_shape(original, o_flags) == Some(false);
             info
         })
         .collect();
@@ -1736,22 +1752,38 @@ fn explain_statement_at(s: &[Tok]) -> Option<usize> {
 /// See [`StatementInfo::explain_probe`]. Comments are not tokens (a
 /// version comment that a server may run gives readings that differ, so
 /// the text keeps only its kind and never gets here); a hint is a comment.
-fn explain_probe(s: &[Tok]) -> bool {
+fn explain_probe(s: &[Tok], flags: &[TokFlags]) -> bool {
+    probe_shape(s, flags) == Some(true)
+}
+
+/// The literal probe shape with `performance_schema` compared
+/// ASCII-case-insensitively: `Some(exact)`, where `exact` says whether
+/// the schema is written `performance_schema` (plain or backquoted);
+/// `None` for any other statement.
+fn probe_shape(s: &[Tok], flags: &[TokFlags]) -> Option<bool> {
     let name = |t: Option<&Tok>| matches!(t, Some(Tok::Word(_) | Tok::Quoted(_)));
     // `performance_schema` only, qualified (security review of #195, H1):
     // no account can create a view there, so the table is a base table
     // with no condition; a view elsewhere is merged, and its `ON` /
-    // `WHERE` const reads happen while it is planned.
-    let ps = matches!(s.get(4), Some(Tok::Word(n) | Tok::Quoted(n))
-        if n.eq_ignore_ascii_case("performance_schema"));
-    s.len() == 7
+    // `WHERE` const reads happen while it is planned. Compared exactly
+    // (re-review of #195, L2): the agent's texts and the digests are
+    // lower case, and a schema named otherwise may exist where names are
+    // case-sensitive.
+    let exact = match s.get(4) {
+        Some(Tok::Word(n)) if n == "performance_schema" => !flags.get(4).is_some_and(|f| f.upper),
+        Some(Tok::Quoted(n)) if n.eq_ignore_ascii_case("performance_schema") => {
+            n == "performance_schema"
+        }
+        _ => return None,
+    };
+    (s.len() == 7
         && matches!(word(s.first()), Some("explain" | "describe" | "desc"))
         && word(s.get(1)) == Some("select")
         && matches!(s.get(2), Some(Tok::Int(_) | Tok::Param))
         && word(s.get(3)) == Some("from")
-        && ps
         && is_punct(s.get(5), ".")
-        && name(s.get(6))
+        && name(s.get(6)))
+    .then_some(exact)
 }
 
 /// The relations of a MySQL statement ([`collect_relations_dialect`]);
@@ -2926,6 +2958,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         explain_connection: opts.dialect == Dialect::Mysql && explain_connection(s),
         explain_statement,
         explain_schema: opts.dialect == Dialect::Mysql && explain_schema_name(s).is_some(),
+        explain_probe_case: false,
         // Set by `analyze_mysql`, on the statement before its wrappers
         // (the whole token sequence must be the shape).
         explain_probe: false,
@@ -5187,7 +5220,7 @@ mod tests {
             "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history",
             "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current",
             "DESCRIBE SELECT 1 FROM performance_schema.threads",
-            "desc select 0 from PERFORMANCE_SCHEMA.setup_consumers",
+            "desc select 0 from performance_schema.setup_consumers",
             "EXPLAIN SELECT 1 FROM `performance_schema`.`threads`;",
             "EXPLAIN /* plain comment */ SELECT 1 FROM performance_schema.threads",
             "EXPLAIN SELECT /*+ NO_INDEX(t) */ 1 FROM performance_schema.threads",
@@ -5208,6 +5241,8 @@ mod tests {
             // const reads), qualified or not.
             "EXPLAIN SELECT 1 FROM hr.customers",
             "EXPLAIN SELECT 1 FROM hr.v",
+            "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+            "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
             "DESCRIBE SELECT 1 FROM `hr`.`customers`",
             "desc select 0 from customers",
             "EXPLAIN SELECT 1 FROM t",
@@ -5242,6 +5277,18 @@ mod tests {
         ] {
             assert!(my(q).parts().iter().all(|p| !p.explain_probe), "{q}");
         }
+        // Re-review of #195, L2: the schema name is compared exactly.
+        for q in [
+            "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+            "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
+        ] {
+            let p = &my(q).parts()[0];
+            assert!(
+                p.explain_statement && !p.explain_probe && p.explain_probe_case,
+                "{q}"
+            );
+        }
+        assert!(!my("EXPLAIN SELECT 1 FROM performance_schema.v").parts()[0].explain_probe_case);
         // Security review of #195, M1: a variable named like a keyword is
         // not the keyword.
         for q in [
