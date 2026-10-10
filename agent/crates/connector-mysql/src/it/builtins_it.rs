@@ -14,8 +14,11 @@
 //!     is a keyword function of `sql_functions`), and does in the forms it
 //!     does not accept (the list is exact, so a server change fails here).
 //! - A stored function reading a table its caller cannot read, called as
-//!   `SELECT f()`, `DO f()` and `SET @x = f()`, is a read of `*`, always
-//!   reported, on every source; a table-less built-in mix gives no event.
+//!   `SELECT f()` (also backquoted, and double-quoted under `ANSI_QUOTES`),
+//!   `DO f()` and `SET @x = f()`, is a read of `*`, always reported, on
+//!   every source (`server_audit` with `QUERY_DML` logs no `SET`: there the
+//!   function's `TABLE` record is a read of the table); a table-less
+//!   built-in mix gives no event.
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -192,8 +195,8 @@ async fn builtin_lists_match_the_server() {
     }
 }
 
-/// ADR-0045 residuals to verify: a loadable function cannot take a
-/// built-in's name (the server refuses it before loading any library),
+/// ADR-0045 residuals to verify: a loadable function cannot take any
+/// listed name (the server refuses it before loading any library),
 /// and a stored function named after a keyword function is what a call
 /// with a space before `(` runs.
 #[tokio::test]
@@ -211,14 +214,31 @@ async fn builtin_names_cannot_hide_a_routine() {
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {BUILTINS_DB}")).await;
         exec(&mut a, &format!("CREATE DATABASE {BUILTINS_DB}")).await;
         exec(&mut a, &format!("USE {BUILTINS_DB}")).await;
-        // A loadable function under a native name: refused, whatever the
-        // library (none exists here).
-        let udf = errno(
-            &mut a,
-            "CREATE FUNCTION concat RETURNS STRING SONAME 'databastion_none.so'",
-        )
-        .await;
-        assert!(udf.is_some(), "{version}: loadable CONCAT created");
+        // A loadable function under any listed name: refused before any
+        // library is opened, as a native name (1585) or as a keyword that
+        // does not parse there (1064); never "cannot open the library"
+        // (1126), which would mean the name is free.
+        let (flavor, v) = crate::conn::parse_version(&version).unwrap();
+        let mut free: Vec<String> = Vec::new();
+        let mut udf = None;
+        let mut refused = 0;
+        for (name, _) in for_server(flavor, v).names() {
+            let code = errno(
+                &mut a,
+                &format!("CREATE FUNCTION {name} RETURNS STRING SONAME 'databastion_none.so'"),
+            )
+            .await;
+            if matches!(code, Some(1585 | 1064)) {
+                refused += 1;
+            } else {
+                free.push(format!("{name}: {code:?}"));
+            }
+            if name == "concat" {
+                udf = code;
+            }
+        }
+        assert!(free.is_empty(), "{version}: loadable names free: {free:#?}");
+        assert_eq!(udf, Some(1585), "{version}: loadable CONCAT");
         let exists = scalar(
             &mut a,
             "SELECT COUNT(*) FROM mysql.func WHERE name = 'concat'",
@@ -241,7 +261,8 @@ async fn builtin_names_cannot_hide_a_routine() {
             assert_eq!(got.as_deref(), want, "{version}: {call}");
         }
         eprintln!(
-            "{} {version}: loadable CONCAT refused ({udf:?}); `now ()` runs the stored function",
+            "{} {version}: loadable function refused under {refused} listed names; `now ()` \
+             runs the stored function",
             server.name
         );
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {BUILTINS_DB}")).await;
@@ -283,10 +304,29 @@ async fn uc_fixture(a: &mut Session) {
     .await;
 }
 
+/// The application sessions, kept open until the events are collected:
+/// `performance_schema` names the account of a statement from its
+/// session's thread, which an ended session no longer has.
+struct Held {
+    _dirs: Vec<TempDir>,
+    _sessions: Vec<Session>,
+}
+
+/// The calls of the stored function: plain, backquoted and, under
+/// `ANSI_QUOTES`, double-quoted in a select list, then `DO` and `SET`.
+const UC_CALLS: [&str; 6] = [
+    "SELECT get_customer_email(1)",
+    "SELECT `get_customer_email`(2)",
+    "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
+    "SELECT \"get_customer_email\"(3)",
+    "DO get_customer_email(4)",
+    "SET @x = get_customer_email(5)",
+];
+
 /// The application traffic: the built-in mix first (it must give no
-/// event), then the three calls.
-async fn uc_traffic(server: &Server) {
-    let (_dp, tp) = target(server, UC_PLAIN, IT_PASSWORD);
+/// event), then the calls of [`UC_CALLS`].
+async fn uc_traffic(server: &Server) -> Held {
+    let (dp, tp) = target(server, UC_PLAIN, IT_PASSWORD);
     let mut p = Session::connect(&tp, Timeouts::new(Duration::from_secs(30)))
         .await
         .unwrap();
@@ -300,10 +340,11 @@ async fn uc_traffic(server: &Server) {
         "SET NAMES utf8mb4",
         "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP(), CONCAT('a', 'b'), IFNULL(NULL, 1)",
         "SELECT COUNT(*), MAX(1), SUBSTRING('abc', 1, 2), CAST(1 AS CHAR(4))",
+        "SELECT `concat`('a', 'b'), now(), current_timestamp, `json_object`('k', 1)",
     ] {
         p.query(Stage::Check, statement).await.unwrap();
     }
-    let (_dc, tc) = target(server, UC_CALLER, IT_PASSWORD);
+    let (dc, tc) = target(server, UC_CALLER, IT_PASSWORD);
     let mut c = Session::connect(&tc, Timeouts::new(Duration::from_secs(30)))
         .await
         .unwrap();
@@ -320,12 +361,12 @@ async fn uc_traffic(server: &Server) {
         server.name
     );
     exec(&mut c, &format!("USE {UC_DB}")).await;
-    for statement in [
-        "SELECT get_customer_email(1)",
-        "DO get_customer_email(2)",
-        "SET @x = get_customer_email(3)",
-    ] {
+    for statement in UC_CALLS {
         c.query(Stage::Check, statement).await.unwrap();
+    }
+    Held {
+        _dirs: vec![dp, dc],
+        _sessions: vec![p, c],
     }
 }
 
@@ -341,13 +382,30 @@ fn caller_star(ev: &[MaskedEvent]) -> usize {
         .count()
 }
 
-/// Checks the events and logs of one source.
-fn uc_check(label: &str, ev: &[MaskedEvent], logs: &Logs) {
+/// Reads of the function's table by the caller (from the table records
+/// of an audit log).
+fn caller_table(ev: &[MaskedEvent]) -> usize {
+    ev.iter()
+        .filter(|e| {
+            e.principal().account_name() == UC_CALLER
+                && e.action() == EventAction::Read
+                && e.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "customers")
+        })
+        .count()
+}
+
+/// Checks the events and logs of one source: at least `star` reads of
+/// `*` by the caller, no event but connections for the built-in mix, and
+/// neither the routine's name nor a seeded value anywhere.
+fn uc_check(label: &str, ev: &[MaskedEvent], logs: &Logs, star: usize) {
     let all: Vec<String> = ev.iter().map(describe).collect();
     eprintln!("{label} events ({}):\n{}", all.len(), all.join("\n"));
-    assert!(caller_star(ev) >= 3, "{label}: {all:#?}");
+    assert!(caller_star(ev) >= star, "{label}: {all:#?}");
     assert!(
-        ev.iter().all(|e| e.principal().account_name() != UC_PLAIN),
+        ev.iter().all(|e| e.principal().account_name() != UC_PLAIN
+            || e.action() == EventAction::Connect),
         "{label}: the built-in mix gave events: {all:#?}"
     );
     let joined = all.join("\n");
@@ -398,15 +456,22 @@ async fn unknown_calls_are_reported_on_performance_schema() {
         let state = TempDir::new();
         let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        uc_traffic(&server).await;
+        let held = uc_traffic(&server).await;
         let mut ev: Vec<MaskedEvent> = Vec::new();
+        // Every call: the select lists, `DO` and `SET`.
         collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            caller_star(e) >= 3
+            caller_star(e) >= 5
         })
         .await;
         collect_until(&mut rx, &mut ev, Duration::from_secs(3), |_| false).await;
         task.abort();
-        uc_check(&format!("{} performance_schema", server.name), &ev, &logs);
+        drop(held);
+        uc_check(
+            &format!("{} performance_schema", server.name),
+            &ev,
+            &logs,
+            5,
+        );
         for user in [UC_AGENT, UC_CALLER, UC_PLAIN] {
             exec(&mut a, &format!("DROP USER IF EXISTS '{user}'@'%'")).await;
         }
@@ -450,15 +515,34 @@ async fn unknown_calls_are_reported_on_audit_logs() {
         let state = TempDir::new();
         let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        uc_traffic(&server).await;
+        let held = uc_traffic(&server).await;
+        // `server_audit` with `QUERY_DML` (the dev set, one of the
+        // recommended ones) logs no `SET` statement: the `SET @x = f()`
+        // call shows as the `TABLE` record of the function's read, a read
+        // of the table (docs/08). The JSON log has every statement.
+        let server_audit = source == EventSource::MariadbServerAudit;
+        let star = if server_audit { 4 } else { 5 };
         let mut ev: Vec<MaskedEvent> = Vec::new();
         collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            caller_star(e) >= 3
+            caller_star(e) >= star
+        })
+        .await;
+        // The `TABLE` records of a statement with no `QUERY` record are
+        // grouped until the connection's next record (its disconnection
+        // here).
+        drop(held);
+        collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
+            !server_audit || caller_table(e) >= 5
         })
         .await;
         collect_until(&mut rx, &mut ev, Duration::from_secs(3), |_| false).await;
         task.abort();
-        uc_check(&format!("{} {format}", server.name), &ev, &logs);
+        let label = format!("{} {format}", server.name);
+        if server_audit {
+            let all: Vec<String> = ev.iter().map(describe).collect();
+            assert!(caller_table(&ev) >= 5, "{label}: {all:#?}");
+        }
+        uc_check(&label, &ev, &logs, star);
         for user in [UC_CALLER, UC_PLAIN] {
             exec(&mut a, &format!("DROP USER IF EXISTS '{user}'@'%'")).await;
         }
