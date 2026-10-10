@@ -4034,6 +4034,84 @@ mod tests {
         }
     }
 
+    /// The side accounts of the load harness's MariaDB Audit run
+    /// (`e2e/load/side-clients.sh`, ADR-0045): the monitoring-like reader
+    /// names `threads` and `PROCESSLIST` only (the digest summary holds no
+    /// statement text on MariaDB), always reported; the table-less built-in
+    /// mix gives no event on any MariaDB list.
+    #[test]
+    fn load_harness_side_statements() {
+        let monitor = [
+            (
+                "SELECT SCHEMA_NAME, DIGEST, COUNT_STAR, SUM_TIMER_WAIT FROM \
+                 performance_schema.events_statements_summary_by_digest ORDER BY SUM_TIMER_WAIT \
+                 DESC LIMIT 50",
+                None,
+            ),
+            (
+                "SELECT THREAD_ID, PROCESSLIST_ID, PROCESSLIST_USER, PROCESSLIST_COMMAND, \
+                 PROCESSLIST_STATE FROM performance_schema.threads",
+                Some("performance_schema.threads"),
+            ),
+            (
+                "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE FROM information_schema.PROCESSLIST",
+                Some("information_schema.PROCESSLIST"),
+            ),
+        ];
+        let builtins = [
+            "SELECT NOW()",
+            "SELECT LAST_INSERT_ID()",
+            "SELECT DATABASE()",
+            "SELECT @@session.auto_increment_increment AS auto_increment_increment, \
+             @@character_set_client AS character_set_client, @@max_allowed_packet AS \
+             max_allowed_packet, @@sql_mode AS sql_mode",
+            "SELECT CONNECTION_ID(), VERSION(), USER(), CURRENT_USER()",
+            "SET NAMES utf8mb4",
+            "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP(), CONCAT('a', 'b'), IFNULL(NULL, 1), \
+             COALESCE(NULL, 2)",
+            "SELECT 1",
+        ];
+        let lists = crate::builtins::lists()
+            .iter()
+            .filter(|l| l.flavor == Flavor::Mariadb);
+        let mut checked = 0;
+        for list in lists {
+            for (text, want) in monitor {
+                let mut b = EventBuilder::new(own())
+                    .with_flavor(Flavor::Mariadb)
+                    .with_builtins(list);
+                let out = b.convert_file(
+                    sa_at(&[sa_line("load_monitor", "10.0.0.7", 1, text)], 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                let names: Vec<String> = out
+                    .iter()
+                    .flat_map(|e| {
+                        e.objects()
+                            .iter()
+                            .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    })
+                    .collect();
+                assert_eq!(names, want.into_iter().collect::<Vec<_>>(), "{text}");
+                assert!(out.iter().all(MaskedEvent::always_report), "{text}");
+                checked += 1;
+            }
+            for text in builtins {
+                let mut b = EventBuilder::new(own())
+                    .with_flavor(Flavor::Mariadb)
+                    .with_builtins(list);
+                let out = file(
+                    &mut b,
+                    sa_at(&[sa_line("load_builtins", "10.0.0.7", 1, text)], 1024),
+                );
+                assert!(out.is_empty(), "{:?}: {text}: {out:?}", list.series);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3 * 11);
+    }
+
     /// ADR-0045 part (b): every listed built-in, called table-less (plain;
     /// backquoted when native; spaced unless `sql_functions`), gives no
     /// event, on the list of its series; so do a driver's session probes.

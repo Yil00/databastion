@@ -297,6 +297,22 @@ services:
     tmpfs: [/tmp]
     networks: [agent-net]
 
+  # The side accounts of the MariaDB Audit run (ADR-0045): a monitoring-like reader and a table-less
+  # built-in mix, through the target image's `mariadb` client (side-clients.sh).
+  my-side:
+    <<: *hardening
+    profiles: [tools]
+    image: *mariadb-image
+    user: "10003:10003"
+    entrypoint: ["/bin/bash", "/usr/local/bin/side-clients.sh"]
+    environment:
+      HOME: /tmp
+    secrets: [load_client_password]
+    volumes:
+      - ./side-clients.sh:/usr/local/bin/side-clients.sh:ro
+    tmpfs: [/tmp]
+    networks: [agent-net]
+
   # ------------------------------------------------------------------ agent
   agent:
     <<: *hardening

@@ -686,6 +686,42 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
                p_on, f"<= {bound}", f"{lim.p95_factor} x p95 without Audit ({p_off} ms) + {lim.p95_slack_ms} ms")
     rep["audit"] = audit
 
+    # ---- 2b. Side accounts of the Audit run (ADR-0045): a monitoring-like reader of statement-text
+    # tables (at most one event per principal, object set and aggregation window) and a table-less
+    # built-in mix (no event but connections). Their statements are not in the workload's count.
+    side: dict = {}
+    for s in facts_of(facts, "side_events"):
+        target, account, role = s.get("target"), s.get("account"), s.get("role")
+        runs = [w for w in facts_of(facts, "side") if w.get("target") == target and w.get("account") == account]
+        on = [w for w in runs if w.get("phase") == "on"]
+        issued = sum(int(w.get("issued") or 0) for w in on)
+        failed = sum(int(w.get("failed") or 0) for w in runs)
+        e = {"account": account, "issued_audit_on": issued, "failed": failed}
+        for k in ("events", "received", "groups", "max_events_per_group", "max_excess", "non_connect",
+                  "objects", "window_s"):
+            e[k] = s.get(k)
+        side[f"{target}/{role}"] = e
+        ck.add(f"audit.{target}.{role}_ran", bool(runs) and issued > 0 and failed == 0,
+               {"issued": issued, "failed": failed}, "> 0 issued, 0 failed", f"side account {account}")
+        if role == "monitor":
+            got = {str(o).lower() for o in (s.get("objects") or [])}
+            want = [str(o) for o in (s.get("expected") or [])]
+            missing = [o for o in want if o.lower() not in got]
+            ck.add(f"audit.{target}.monitor_reported", bool(want) and not missing, s.get("objects"),
+                   f"names {want}", "reads of statement-text tables name them (ADR-0045 part (a))")
+            ex = s.get("max_excess")
+            ck.add(f"audit.{target}.monitor_one_event_per_window",
+                   None if ex is None or not s.get("events") else ex <= 0, ex,
+                   "<= 0",
+                   "per principal, action, source and object set: events - (floor(span / window) + 2), "
+                   "the most windows of the agent's aggregator that span can meet")
+        elif role == "builtins":
+            nc = s.get("non_connect")
+            ck.add(f"audit.{target}.builtins_no_event", None if nc is None else nc == 0, nc, "0",
+                   "table-less built-in calls (ADR-0045 part (b)): no event but connections")
+    if side:
+        rep["side"] = side
+
     # ---- 3. Agent resources and spool
     agent: dict = {}
     cpu = series(samples, "agent", "cpu_usec")
@@ -794,6 +830,15 @@ def render_markdown(rep: dict) -> str:
                    f"{fmt(a.get('source_statements'))} | {fmt(a.get('events_received'))} | {fmt(a.get('events_ratio'))} | {fmt(a.get('drain_s'))} | "
                    f"{fmt(a.get('lag_p95_s'))} | {fmt(a.get('p95_ms_audit_off'))} | {fmt(a.get('p95_ms_audit_on'))} | "
                    f"{fmt(a.get('p95_added_ms'))} | {fmt(a.get('db_cores_audit_off'))} / {fmt(a.get('db_cores_audit_on'))} |")
+    if rep.get("side"):
+        out += ["", "Side accounts of the Audit run (not in the workload counts): a monitoring-like reader and a "
+                "table-less built-in mix.", "",
+                "| Target / role | Account | Issued (Audit on) | Events | Received | Groups | Most events in a group | Excess over the windows | Non-connect events | Objects |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
+        for k, e in sorted(rep["side"].items()):
+            out.append(f"| {k} | {fmt(e.get('account'))} | {fmt(e.get('issued_audit_on'))} | {fmt(e.get('events'))} | "
+                       f"{fmt(e.get('received'))} | {fmt(e.get('groups'))} | {fmt(e.get('max_events_per_group'))} | "
+                       f"{fmt(e.get('max_excess'))} | {fmt(e.get('non_connect'))} | {fmt(e.get('objects'))} |")
     ag = rep.get("agent") or {}
     out += ["", "## 3. Agent resources", ""]
     for k in ("cpu_cores_audit_off", "cpu_cores_audit_on", "cpu_ms_per_1000_statements", "rss_mb_audit_on",

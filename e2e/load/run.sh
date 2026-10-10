@@ -683,7 +683,7 @@ phase_done discovery
 PG_SCRIPTS=""
 for f in "$W"/workload/pg/*.sql; do PG_SCRIPTS+=" -f /load/$(basename "$f")@1"; done
 run_workload() {
-  local phase="$1" dur="$2" t_start pg_pid sb_pid pg_rc=0 sb_rc=0
+  local phase="$1" dur="$2" t_start pg_pid sb_pid side_pid pg_rc=0 sb_rc=0 side_rc=0 tag account issued failed
   WL_START_UTC="$(date -u +'%Y-%m-%d %H:%M:%S')"
   log "workload ($phase): pgbench ${LOAD_PG_RATE}/s and sysbench ${LOAD_MARIADB_RATE}/s, ${LOAD_CLIENTS} clients each, ${dur} s"
   t_start="$(now_s)"
@@ -703,13 +703,25 @@ run_workload() {
        --threads='"$LOAD_CLIENTS"' --rate='"$LOAD_MARIADB_RATE"' --time='"$dur"' --percentile=95 run' \
     >"$W/out/mariadb-$phase.summary" 2>&1 &
   sb_pid=$!
+  # The side accounts on target-mariadb (ADR-0045, side-clients.sh): a monitoring-like reader and a
+  # table-less built-in mix, once a second each, in both phases (same load with and without Audit).
+  timeout $((dur + 300)) docker compose -f "$COMPOSE_FILE" --profile tools run --rm -T --no-deps my-side "$dur" \
+    >"$W/out/side-$phase.out" 2>&1 &
+  side_pid=$!
   wait "$pg_pid" || pg_rc=$?
   wait "$sb_pid" || sb_rc=$?
+  wait "$side_pid" || side_rc=$?
   WL_T0="$(jq -n --argjson t "$t_start" '$t + 5')"
   WL_T1="$(jq -n --argjson t "$t_start" --argjson d "$dur" '$t + $d')"
   WL_END="$(now_s)"
   [ "$pg_rc" = 0 ] || { tail -n 20 "$W/out/pg-$phase.summary" >&2; fail "pgbench ($phase) exited $pg_rc"; }
   [ "$sb_rc" = 0 ] || { tail -n 20 "$W/out/mariadb-$phase.summary" >&2; fail "sysbench ($phase) exited $sb_rc"; }
+  [ "$side_rc" = 0 ] || { tail -n 20 "$W/out/side-$phase.out" >&2; fail "side clients ($phase) exited $side_rc"; }
+  while read -r tag account issued failed; do
+    [ "$tag" = side ] && [[ "$issued" =~ ^[0-9]+$ ]] && [[ "$failed" =~ ^[01]$ ]] || continue
+    fact --arg account "$account" --arg phase "$phase" --argjson n "$issued" --argjson f "$failed" \
+      '{kind: "side", target: "mariadb-load", account: $account, phase: $phase, issued: $n, failed: $f}'
+  done <"$W/out/side-$phase.out"
   fact --arg name "workload_audit_$phase" --argjson t0 "$WL_T0" --argjson t1 "$WL_T1" \
     '{kind: "window", name: $name, t0: $t0, t1: $t1}'
   python3 "$LOADLIB" pgbench --summary "$W/out/pg-$phase.summary" --log "$W/out/pg-$phase.tx" \
@@ -864,6 +876,28 @@ if wait_spool_empty "$(now_s)" "after the Audit run"; then
 else
   fact '{kind: "spool_drained", ok: false}'
 fi
+# The side accounts of the MariaDB Audit run (ADR-0045), once the spool is empty: per principal,
+# action, source and object set, the events against the most aggregation windows (60 s, the contract
+# default of audit.configure) their time span can meet; the objects; the non-connect events.
+side_events() {
+  local account="$1" role="$2" expected="$3"
+  console_sql "SELECT json_build_object('kind', 'side_events', 'target', 'mariadb-load',
+      'account', '$account', 'role', '$role', 'expected', '$expected'::json, 'window_s', 60,
+      'events', coalesce(sum(n), 0), 'received', coalesce(sum(r), 0), 'groups', count(*),
+      'max_events_per_group', max(n), 'max_excess', max(n - (floor(span / 60)::int + 2)),
+      'non_connect', coalesce(sum(nc), 0),
+      'objects', (SELECT coalesce(json_agg(DISTINCT o->>'database' || '.' || (o->>'object')), '[]')
+                  FROM access_events e, jsonb_array_elements(e.objects) AS o
+                  WHERE e.agent_id = '$AGENT_ID' AND e.target_id = 'mariadb-load' AND e.db_user = '$account'))
+    FROM (SELECT count(*) AS n, sum(aggregated_count) AS r,
+                 extract(epoch from max(coalesce(ts_last, ts)) - min(ts))::float8 AS span,
+                 count(*) FILTER (WHERE action <> 'connect') AS nc
+          FROM access_events WHERE agent_id = '$AGENT_ID' AND target_id = 'mariadb-load' AND db_user = '$account'
+          GROUP BY principal_key, action, source, objects) AS g" >>"$FACTS" \
+    || fail "cannot read the events of $account"
+}
+side_events load_monitor monitor '["performance_schema.threads", "information_schema.PROCESSLIST"]'
+side_events load_builtins builtins '[]'
 lost="$(timeout 30 docker compose -f "$COMPOSE_FILE" logs --no-color agent 2>/dev/null \
   | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|events dropped|rejected batch items|unreadable spool file' || true)"
 fact --argjson n "$lost" '{kind: "agent_log", lost: $n}'
