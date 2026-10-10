@@ -1,0 +1,18 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+contacts:
+- phone: 0612345678
+  mobile: 33612345678
+  hex: 0x1F
+  neg: -0x10
+  oct: -0o7
+  bin: 0b101
+  plus: +12
+  big: 18446744073709551616
+  neg-big: -170141183460469231731687303715884105728
+  float: 1e3
+  inf: -.Inf
+  nan: .nan
+  nulls: [~, Null, '', ""]
+  bools: [TRUE, False, yes]

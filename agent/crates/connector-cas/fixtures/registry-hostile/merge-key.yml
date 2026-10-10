@@ -1,0 +1,6 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+base: {email: jane.doe@example.org}
+other:
+  <<: {email: fake@example.org}

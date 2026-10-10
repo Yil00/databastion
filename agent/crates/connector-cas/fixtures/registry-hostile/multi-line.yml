@@ -1,0 +1,25 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+description: multi
+  line
+
+  plain
+quoted: 'it''s
+  two'
+clientSecret: |
+  FAKE-BLOCK-SECRET
+privateKey:
+  FAKE-NEXT-LINE
+literal: |+
+  a
+
+
+folded: >-
+  x
+
+   y
+  z
+token: !<java.lang.String> FAKE-TAGGED
+credentials: [FAKE-A, {b: FAKE-B}, "FAKE
+  C"]

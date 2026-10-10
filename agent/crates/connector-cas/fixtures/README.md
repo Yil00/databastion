@@ -25,3 +25,11 @@
   collections (`Wiki-10000004.yaml`) and a SAML service provider with a block scalar
   (`SP-10000005`). Every value is fake. Used by the `parse::definition` and `discover` tests that
   check a YAML definition gives the same findings as its JSON equivalent.
+- `registry-hostile/`: synthetic YAML files (fake values only, each under 4 KiB) that the pre-scan
+  or libyaml refuse, or that exercise the parser's harder paths: billion laughs, merge keys,
+  `!!python` tags, deep block and flow nesting, keys more than 1024 bytes before their `:`, keys
+  without their `:`, bad indentation, escapes (valid and refused), multi-line, block and folded
+  scalars with chomping, credential values the pre-scan does not blank, flow single-pair
+  mappings and collection keys, number resolution, a second document and CRLF line ends. They
+  seed the `cas_registry_yaml` and `cas_registry_yaml_diff` fuzz targets (`agent/fuzz/smoke.sh`,
+  `.github/scripts/fuzz-nightly.sh`) and are read by the `fuzz` entry point test.
