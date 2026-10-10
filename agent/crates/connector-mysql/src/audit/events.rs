@@ -510,14 +510,23 @@ const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// Fixed overhead counted per pending record.
 const RECORD_OVERHEAD: usize = 256;
 /// A pending statement whose statement record has not come after this
-/// long is reported from its table-access records alone.
-const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
+/// long is reported from its table-access records alone. It outlasts the
+/// longest statement timeout an agent may configure, plus a margin: since
+/// a group without a statement record is a read of `*`, always reported
+/// and never the agent's own, an agent sample still running when its
+/// table records are flushed would otherwise be reported as a read with
+/// the agent's credential (security review of #188, N1).
+const PENDING_TIMEOUT: Duration = Duration::from_secs(660);
+const _: () = assert!(
+    PENDING_TIMEOUT.as_secs()
+        >= databastion_core::config::STATEMENT_TIMEOUT_MS_RANGE.1 as u64 / 1000 + 60
+);
 /// A statement flushed early is forgotten after this long: its late
 /// records are then handled as a new statement (security review of #93,
 /// L4: the memory of `reported` does not outlive the statements it is for,
 /// and a connection id reused after a server restart is not mistaken for
 /// the old one for long).
-const REPORTED_TTL: Duration = Duration::from_secs(2 * 300);
+const REPORTED_TTL: Duration = Duration::from_secs(2 * 660);
 
 /// Bytes a pending record holds (see [`MAX_PENDING_BYTES`]).
 fn record_bytes(r: &FileRecord) -> usize {
