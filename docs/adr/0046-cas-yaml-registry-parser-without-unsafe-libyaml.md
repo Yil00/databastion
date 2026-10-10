@@ -125,3 +125,13 @@ Each answer is the recommendation of this ADR, accepted by the maintainer on 202
    **Answer (decided by the maintainer on 2026-10-09)**: yes. It warns every user of the crate, and the scoped `ignore` records that the agent keeps it for root-owned configuration only.
 5. Keep the pre-scanner's positional blanking of credential values once the parser is ours and never copies them?
    **Answer (decided by the maintainer on 2026-10-09)**: yes, as defence in depth: it costs one pass, and it keeps credential values out of the event builder even if a later change makes the parser copy scalars.
+
+## Implementation note (2026-10-09)
+Recorded with the implementation (#187), after its security review.
+
+- **Two passes of one scanner.** The same scanner code runs twice: in pre-scan mode over the raw bytes (refusals, blanking), then in parse mode over the blanked copy (libyaml's tokens). The two passes therefore read different texts, and "they cannot disagree" (option (a), "One tokenizer") holds only because anything that blanking could change structurally is refused in the pre-scan. Blanked credential values are single-line scalars right after their key's `:`, so blanking removes no token that moves the indentation or a simple key. Class hints are tags: a tag is accepted only on the line of the `:`, `-`, `[` or `,` it follows, as Jackson writes it. A tag alone on a later line moved the block indentation on the raw bytes but not on the blanked copy (security review of #187, M1). That could swap the form of the top-level `clientSecret`, a residual since #169, and gave a differential false positive. libyaml refused such files anyway. They are now refused, with refusal tests and hostile fuzz seeds. A refusal in parse mode, which would mean the passes disagree, fails closed (the file is refused).
+- **Zeroization test.** Decision "Tests" planned a counting allocator. It needs `unsafe impl GlobalAlloc`, which the workspace lint `unsafe_code = "forbid"` rules out in every target, tests included. It is replaced by a memory scan:
+  - The test parses a definition whose credential values hold a run-time marker in every form that reaches the parser, including a top-level `clientSecret` over 1 KiB with escapes.
+  - It drops everything, then searches the process's writable memory through `/proc/self/maps` and `/proc/self/mem` (Linux only). The search buffers are allocated before parsing, so the search allocates nothing.
+  - It finds no copy, and a control per block size shows that an unwiped copy is found. The former `serde_yaml_ng` path left dozens of copies.
+  - Keys (field names) are still copied into ordinary strings by the visitor; only value scalars are covered.

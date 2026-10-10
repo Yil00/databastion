@@ -918,3 +918,179 @@ proptest! {
         prop_assert_eq!(pairs(&d), pairs(&json));
     }
 }
+
+/// The crate's YAML parser and `serde_yaml_ng` (the oracle, ADR-0046)
+/// disagree on `bytes`, if anywhere.
+fn yaml_diff(bytes: &[u8]) -> Option<&'static str> {
+    crate::fuzz::yaml_difference(bytes, &crate::fuzz::Ng)
+}
+
+/// Lines of YAML the subset accepts, in every style the parser decodes
+/// (folding, escapes, block scalars and chomping, indentation, flow
+/// collections, resolution of numbers and nulls), at varied indentations,
+/// so that some documents are not valid YAML.
+fn yaml_line() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec![
+        "name",
+        "k",
+        "ké",
+        "\"q k\"",
+        "'s''k'",
+        "clientSecret",
+        "password",
+        "serviceId",
+        "1",
+        "x y",
+    ]);
+    let value = prop::sample::select(vec![
+        "",
+        "plain",
+        "two words",
+        "a:b",
+        "x # c",
+        "0x1F",
+        "-0x10",
+        "-0X10",
+        "+12",
+        "012",
+        "-0o7",
+        "0b101",
+        "-0b",
+        "1e3",
+        "1_000",
+        ".inf",
+        "-.Inf",
+        "+.inf",
+        ".nan",
+        "+.nan",
+        "nan",
+        "0.",
+        ".5",
+        "-0",
+        "~",
+        "Null",
+        "TRUE",
+        "yes",
+        "18446744073709551616",
+        "-9223372036854775809",
+        "-170141183460469231731687303715884105728",
+        "340282366920938463463374607431768211456",
+        "'it''s'",
+        "''",
+        "\"\"",
+        "\"a\\x41\\u00e9\\U0001F600\\N\\L\\P\\_\\0\\t\\/\\\\\\\"\"",
+        "\"a\\\n  b\"",
+        "\"multi\n  line\n\n   text \"",
+        "'single\n\n  multi '",
+        "plain\n  continued\n\n  again",
+        "|\n  lit\n   more\n\n",
+        "|-\n  a\n  b\n",
+        "|+\n  a\n\n",
+        ">\n  folded\n  text\n\n   indented\n  back\n",
+        ">-\n\n  x\n",
+        "[a, b c, 'd', \"e\", [f], {g: h}]",
+        "{a: 1, b, c: [d], 'e': \"f\"}",
+        "[a: b, c]",
+        "[a,]",
+        "{}",
+        "[]",
+    ]);
+    (
+        0usize..5,
+        prop::bool::ANY,
+        prop::option::of(key),
+        value,
+        prop::bool::ANY,
+    )
+        .prop_map(|(indent, dash, key, value, crlf)| {
+            let mut line = " ".repeat(indent);
+            if dash {
+                line.push_str("- ");
+            }
+            if let Some(k) = key {
+                line.push_str(k);
+                line.push(':');
+                if !value.is_empty() {
+                    line.push(' ');
+                }
+            }
+            line.push_str(&value.replace('\n', &format!("\n{}", " ".repeat(indent))));
+            if crlf {
+                line = line.replace('\n', "\r\n");
+            }
+            line
+        })
+}
+
+proptest! {
+    #![proptest_config(config(1024))]
+
+    /// Generated documents (anchors and aliases left out): the crate's
+    /// parser reads every value and definition as `serde_yaml_ng` does.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_rendered_documents(doc in yaml_doc()) {
+        let (clean, _) = Render::doc(&doc, usize::MAX, Inject::Nothing);
+        prop_assert_eq!(yaml_diff(clean.as_bytes()), None, "{}", clean);
+    }
+
+    /// Lines in every style at random indentations: valid documents read
+    /// the same, documents libyaml refuses are refused (or refused by the
+    /// pre-scan).
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_lines(
+        lines in proptest::collection::vec(yaml_line(), 0..10),
+        indent in 0usize..3,
+        trailing in prop::bool::ANY,
+        service_id in prop::bool::ANY,
+    ) {
+        let mut doc = String::from("--- !<org.apereo.cas.services.CasRegisteredService>\n");
+        let pad = " ".repeat(indent);
+        if service_id {
+            doc.push_str(&pad);
+            doc.push_str("serviceId: \"^https://app.example.org/.*\"\n");
+        }
+        for l in &lines {
+            doc.push_str(&pad);
+            doc.push_str(l);
+            doc.push('\n');
+        }
+        if !trailing {
+            doc.pop();
+        }
+        prop_assert_eq!(yaml_diff(doc.as_bytes()), None, "{:?}", doc);
+    }
+
+    /// YAML-ish fragments after the class hint.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_fragments(data in yaml_ish()) {
+        let mut bytes = b"--- !<org.apereo.cas.services.CasRegisteredService>\n".to_vec();
+        bytes.extend_from_slice(&data);
+        prop_assert_eq!(yaml_diff(&bytes), None, "{:?}", String::from_utf8_lossy(&bytes));
+    }
+
+    /// Mutations of the fixtures (truncations, flips, insertions).
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_mutations(
+        base in 0usize..3,
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>(), any::<u8>()), 0..8),
+    ) {
+        let fixtures = [
+            include_str!("../fixtures/registry/HR-Portal-10000003.yml"),
+            include_str!("../fixtures/registry/Wiki-10000004.yaml"),
+            include_str!("../fixtures/registry/SP-10000005.yml"),
+        ];
+        let bytes = mutate(fixtures[base].as_bytes().to_vec(), &edits);
+        prop_assert_eq!(yaml_diff(&bytes), None, "{:?}", String::from_utf8_lossy(&bytes));
+    }
+
+    /// Credential documents in YAML form, with any value.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_credentials(
+        secret in marker(),
+        user in marker(),
+        value in "[ -~]{0,40}",
+    ) {
+        let doc = yaml_definition(&secret, "apiKeyX", &value, &user);
+        prop_assert_eq!(yaml_diff(doc.as_bytes()), None, "{}", doc);
+    }
+}

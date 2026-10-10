@@ -1,7 +1,8 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
 # server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
-# cn=accesslog entries; CAS service definitions (JSON and YAML) and JSON audit log lines. See
+# cn=accesslog entries; CAS service definitions (JSON and YAML, the YAML parser also against
+# serde_yaml_ng as a differential oracle) and JSON audit log lines. See
 # README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
@@ -22,6 +23,9 @@ libfuzzer-sys = "0.4"
 databastion-connector-mongodb = { path = "../crates/connector-mongodb", features = ["fuzzing"] }
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
+# The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
+# connector-cas used before its own.
+serde_yaml_ng = "0.10"
 
 [workspace]
 members = ["."]
@@ -102,6 +106,13 @@ bench = false
 [[bin]]
 name = "cas_registry_yaml"
 path = "fuzz_targets/cas_registry_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cas_registry_yaml_diff"
+path = "fuzz_targets/cas_registry_yaml_diff.rs"
 test = false
 doc = false
 bench = false

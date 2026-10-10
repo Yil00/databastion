@@ -1,9 +1,17 @@
-//! Pre-scanner of CAS YAML service definitions (ADR-0041 decision 4,
-//! security review L8): runs on the raw bytes **before any YAML parsing**
-//! and refuses every file outside a small, safe subset of YAML. Only an
-//! accepted file reaches the YAML parser, as a copy where the CAS class
-//! hints (`!<org.apereo.cas.…>` tags) are blanked out, so the parser never
-//! sees an anchor, an alias, a merge key, a tag or a second document.
+//! The scanner of CAS YAML service definitions (ADR-0041 decision 4,
+//! security review L8; ADR-0046 decision 1): one tokenizer that refuses,
+//! blanks and tokenizes. It runs twice over a file:
+//!
+//! 1. **Pre-scan** ([`prescan`]), on the raw bytes, before any parsing: it
+//!    refuses every file outside a small, safe subset of YAML and returns a
+//!    copy where the CAS class hints (`!<org.apereo.cas.…>` tags) and the
+//!    single-line credential values are blanked out, so the parser never
+//!    sees an anchor, an alias, a merge key, a tag or a second document.
+//! 2. **Tokens** ([`Scanner::parser`]), on that blanked copy: the same code
+//!    in parse mode hands libyaml's token stream to the event builder
+//!    (`super::events`), with libyaml's own errors where libyaml would
+//!    refuse a document the pre-scan accepted. Scalars are tokens holding
+//!    byte positions only: nothing is copied here.
 //!
 //! CAS 8.0.2 (`RegisteredServiceYamlSerializer`, Jackson's `YAMLFactory`)
 //! loads a file only when its trimmed content starts with `--- !<` and reads
@@ -17,11 +25,12 @@
 //! attributeReleasePolicy: !<org.apereo.cas.services.ReturnAllAttributeReleasePolicy> {}
 //! ```
 //!
-//! The scanner follows libyaml's tokenizer (the parser behind
-//! `serde_yaml_ng`) closely enough to know, for every byte, whether it is
-//! in a comment, a quoted scalar, a block scalar's content, a plain scalar,
-//! or where a token starts; wherever its model could differ from libyaml's
-//! it refuses. A file is refused ([`Refusal`]) when:
+//! The scanner follows libyaml's tokenizer (the reference the agent was
+//! built against, `unsafe-libyaml` 0.2.11 behind `serde_yaml_ng` 0.10, now a
+//! test and fuzzing oracle only) closely enough to know, for every byte,
+//! whether it is in a comment, a quoted scalar, a block scalar's content, a
+//! plain scalar, or where a token starts; wherever its model could differ
+//! from libyaml's it refuses. A file is refused ([`Refusal`]) when:
 //!
 //! - it does not start with `--- !<class>` ([`Refusal::NotCas`]: CAS would
 //!   not load it either); CAS trims the content first, so blank lines
@@ -40,8 +49,7 @@
 //!   refused;
 //! - a scalar starts with `<<` (the merge key, quoted or not)
 //!   ([`Refusal::MergeKey`]); a key spelled with an escape (`"\x3c<"`)
-//!   passes, harmlessly: `serde_yaml_ng` applies merge keys only in
-//!   `Value::apply_merge`, which the agent never calls, so `<<` is an
+//!   passes, harmlessly: the parser never applies merge keys, so `<<` is an
 //!   ordinary key to the visitor whatever its spelling;
 //! - a directive (`%YAML`, `%TAG`), a second `---` or a `...` appears
 //!   ([`Refusal::Directive`], [`Refusal::Documents`]);
@@ -54,7 +62,7 @@
 //!   collections deeper than [`MAX_NESTING`], the file has more than
 //!   [`MAX_LINES`] lines, or more than [`MAX_TOKENS`] scalars, flow
 //!   collection starts, block entries and values ([`Refusal::Bounds`]):
-//!   `serde_yaml_ng` loads every event of the document before the
+//!   the event builder holds every event of the document before the
 //!   visitor's node bounds apply, so the token count is what bounds its
 //!   memory;
 //! - anything else the scanner does not follow (an unterminated quote or
@@ -64,14 +72,13 @@
 //!
 //! The scanner never panics (`get`, no indexing) and runs in linear time.
 //!
-//! **Credential values are blanked before parsing** (review of #169, L2):
-//! `serde_yaml_ng` copies every scalar into plain `String`s (libyaml's
-//! buffers, then the event's value), which are freed without being wiped.
-//! The copy handed to the parser therefore also has, replaced by spaces
-//! (byte positions unchanged), the content of every single-line scalar
-//! (plain, single-quoted or double-quoted) that starts on the line of a
-//! key's `:` right after it, when the key names a credential
-//! ([`super::definition::is_credential_key`], the visitor's rule): a
+//! **Credential values are blanked before parsing** (review of #169, L2;
+//! kept as defence in depth by ADR-0046 open question 5): the copy handed
+//! to the parser has, replaced by spaces (byte positions unchanged), the
+//! content of every single-line scalar (plain, single-quoted or
+//! double-quoted) that starts on the line of a key's `:` right after it,
+//! when the key names a credential
+//! ([`crate::parse::definition::is_credential_key`], the visitor's rule): a
 //! blanked plain scalar reads as `null`, a blanked quoted one as spaces,
 //! and the visitor skips the value of such a key either way. The
 //! [`SecretForm`] of the top-level `clientSecret` (a key of the root
@@ -83,18 +90,20 @@
 //! in it is one libyaml accepts ([`escapes_valid`]); a value with a refused
 //! escape is left for the parser to refuse (blanking must not turn an
 //! invalid document into a valid one), and the top-level `clientSecret`
-//! with any escape is left to the visitor. Out of scope (left to a future
-//! parser change, ROADMAP phase 8 follow-ups): values on the next line,
-//! multi-line and block scalars, values after a tag, nested credential
-//! subtrees (`password:` followed by a mapping or a sequence), keys
-//! written with a double-quoted escape, and double-quoted values with a
-//! refused escape. This fails safe: whatever the
-//! scanner does not blank is still skipped by the visitor, as before
-//! (only the unwiped copies remain).
+//! with any escape is left to the visitor. Not blanked: values on the next
+//! line, multi-line and block scalars, values after a tag, nested
+//! credential subtrees (`password:` followed by a mapping or a sequence),
+//! keys written with a double-quoted escape, and double-quoted values with
+//! a refused escape. Whatever the scanner does not blank is skipped by the
+//! visitor without being decoded (`super::de`: a skipped value is never
+//! copied), except the top-level `clientSecret`, decoded into a zeroizing
+//! buffer for its form only.
+
+use std::collections::VecDeque;
 
 use zeroize::Zeroizing;
 
-use super::definition::{SecretForm, is_credential_key};
+use crate::parse::definition::{SecretForm, is_credential_key};
 
 /// Most lines per file.
 pub const MAX_LINES: usize = 32_768;
@@ -104,17 +113,20 @@ pub const MAX_FLOW_DEPTH: usize = 4;
 /// the scanner. A lower bound only: an indentless sequence (`key:` then
 /// `- a` at the key's column) adds a level without an indentation and is
 /// not counted. The backstops are the visitor's own depth bound
-/// (`definition::MAX_DEPTH`, 32) and `serde_yaml_ng`'s recursion limit
-/// (128).
+/// (`definition::MAX_DEPTH`, 32) and the deserializer's recursion limit
+/// (128, as `serde_yaml_ng`'s).
 pub const MAX_NESTING: usize = 32;
 /// Most tokens per file: scalars (keys included), flow collection
 /// starts, block sequence entries and value indicators. Each node the
 /// visitor counts (at most `definition::MAX_NODES`) costs the scanner at
 /// most three tokens (a key, its `:` or a `-`, the node), so no document
 /// within the visitor's bounds is refused for it.
-pub const MAX_TOKENS: usize = 3 * super::definition::MAX_NODES;
+pub const MAX_TOKENS: usize = 3 * crate::parse::definition::MAX_NODES;
 /// Longest class name in a tag, in bytes.
 pub const MAX_CLASS_BYTES: usize = 256;
+/// libyaml forgets a possible simple key more than this many bytes back
+/// (`yaml_parser_stale_simple_keys`).
+const SIMPLE_KEY_SPAN: usize = 1024;
 
 /// Why a YAML file is refused before parsing (kinds only, never content).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,9 +184,9 @@ impl std::fmt::Debug for Prescanned {
 /// [`Refusal`]; nothing of a refused file is returned.
 pub fn prescan(bytes: &[u8]) -> Result<Prescanned, Refusal> {
     check_encoding(bytes)?;
-    let mut s = Scanner::new(bytes);
-    let class = s.header()?;
-    s.run()?;
+    let mut s = Scanner::new(bytes, Mode::Prescan);
+    let class = s.header().map_err(Fail::refusal)?;
+    while s.step().map_err(Fail::refusal)? {}
     let mut text = Zeroizing::new(bytes.to_vec());
     for &(start, end) in s.tags.iter().chain(&s.blanks) {
         if let Some(span) = text.get_mut(start..end) {
@@ -223,6 +235,107 @@ fn check_encoding(bytes: &[u8]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Why scanning stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fail {
+    /// Outside the accepted subset.
+    Refused(Refusal),
+    /// A document libyaml refuses (parse mode only): the events before it
+    /// stand, the document is malformed.
+    Yaml,
+}
+
+impl From<Refusal> for Fail {
+    fn from(r: Refusal) -> Self {
+        Self::Refused(r)
+    }
+}
+
+impl Fail {
+    /// The refusal of the pre-scan (which never fails as libyaml would).
+    fn refusal(self) -> Refusal {
+        match self {
+            Self::Refused(r) => r,
+            Self::Yaml => Refusal::Syntax,
+        }
+    }
+}
+
+/// Which pass the scanner runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Refusals and blanking, on the raw bytes.
+    Prescan,
+    /// Tokens and libyaml's errors, on the blanked copy.
+    Parse,
+}
+
+/// Block scalar chomping (`|-`, `|`, `|+`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Chomp {
+    Strip,
+    Clip,
+    Keep,
+}
+
+/// A scalar's style and what its value needs to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Style {
+    /// `start..end` is the scalar, from its first to its last non-blank
+    /// byte.
+    Plain,
+    /// `start..end` includes the quotes.
+    Single,
+    /// `start..end` includes the quotes.
+    Double,
+    /// `start` is the first content line (after the header's line break),
+    /// `end` where the scalar ends; `literal` is `|` (else `>`).
+    Block {
+        literal: bool,
+        indent: usize,
+        chomp: Chomp,
+    },
+}
+
+/// A scalar token: positions in the scanned text only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Scalar {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) style: Style,
+}
+
+impl Scalar {
+    /// The empty plain scalar libyaml's parser makes up for a missing
+    /// node.
+    pub(super) const EMPTY: Self = Self {
+        start: 0,
+        end: 0,
+        style: Style::Plain,
+    };
+}
+
+/// libyaml's tokens, as the scanner hands them to the event builder
+/// (directives, anchors, aliases and tags are refused before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tok {
+    StreamStart,
+    StreamEnd,
+    DocumentStart,
+    BlockSequenceStart,
+    BlockMappingStart,
+    BlockEnd,
+    FlowSequenceStart,
+    FlowSequenceEnd,
+    FlowMappingStart,
+    FlowMappingEnd,
+    BlockEntry,
+    FlowEntry,
+    Key,
+    Value,
+    Scalar(Scalar),
+}
+
 /// What the last token was (to place tags).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Last {
@@ -257,6 +370,12 @@ struct Candidate {
     /// Byte position of its first byte.
     pos: usize,
     kind: CandKind,
+    /// libyaml's `required`: at the block indentation (parse mode: a key
+    /// that never gets its `:` is an error).
+    required: bool,
+    /// Its token's number in the stream (parse mode: where the `KEY` and
+    /// `BLOCK-MAPPING-START` tokens go).
+    number: usize,
 }
 
 /// The extent of the last scalar read (to name keys and blank values).
@@ -285,8 +404,9 @@ struct CredentialKey {
     top: bool,
 }
 
-struct Scanner<'a> {
+pub(super) struct Scanner<'a> {
     b: &'a [u8],
+    mode: Mode,
     pos: usize,
     line: usize,
     /// Column in characters (libyaml counts characters).
@@ -299,6 +419,9 @@ struct Scanner<'a> {
     /// the bottom one for the block context.
     candidates: Vec<Option<Candidate>>,
     last: Last,
+    /// The line of the last `:`, `-`, `[` / `{` or `,` (a tag must be on
+    /// it).
+    last_line: usize,
     /// Byte spans of the tags to blank.
     tags: Vec<(usize, usize)>,
     /// Tokens seen (see [`MAX_TOKENS`]).
@@ -311,15 +434,21 @@ struct Scanner<'a> {
     blanks: Vec<(usize, usize)>,
     /// The form of the blanked top-level `clientSecret`.
     client_secret: Option<SecretForm>,
+    /// Parse mode: tokens scanned, not yet taken (libyaml's queue).
+    queue: VecDeque<Tok>,
+    /// Parse mode: tokens taken (libyaml's `tokens_parsed`).
+    tokens_parsed: usize,
+    /// Parse mode: the head of the queue may be taken.
+    token_available: bool,
+    /// Parse mode: `STREAM-END` was scanned.
+    done: bool,
+    /// Parse mode: the `---` was scanned.
+    document_started: bool,
 }
 
 /// Whether every escape of a single-line double-quoted scalar's content
-/// is one libyaml accepts (`scan_flow_scalar`, as vendored by
-/// `unsafe-libyaml` 0.2.11): a one-character escape of its list, or `x`,
-/// `u`, `U` with 2, 4 or 8 hexadecimal digits naming a Unicode scalar
-/// value (no surrogate, at most `U+10FFFF`; libyaml has no surrogate
-/// pairs). An escaped line break never reaches here (single-line only)
-/// and is refused.
+/// is one libyaml accepts ([`escape_len`]). An escaped line break never
+/// reaches here (single-line only) and is refused.
 fn escapes_valid(raw: &[u8]) -> bool {
     let mut i = 0;
     while let Some(&c) = raw.get(i) {
@@ -327,41 +456,53 @@ fn escapes_valid(raw: &[u8]) -> bool {
         if c != b'\\' {
             continue;
         }
-        let Some(&e) = raw.get(i) else {
+        let Some(len) = raw.get(i..).and_then(escape_len) else {
             return false;
         };
-        i += 1;
-        let digits = match e {
-            b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f' | b'r' | b'e' | b' ' | b'"'
-            | b'/' | b'\\' | b'N' | b'_' | b'L' | b'P' => continue,
-            b'x' => 2,
-            b'u' => 4,
-            b'U' => 8,
-            _ => return false,
-        };
-        let Some(hex) = raw.get(i..i + digits) else {
-            return false;
-        };
-        i += digits;
-        let mut value = 0u32;
-        for &h in hex {
-            let Some(d) = char::from(h).to_digit(16) else {
-                return false;
-            };
-            value = (value << 4) | d;
-        }
-        if (0xD800..=0xDFFF).contains(&value) || value > 0x10_FFFF {
-            return false;
-        }
+        i += len;
     }
     true
 }
 
-fn is_break(c: Option<u8>) -> bool {
+/// The length of the escape that follows a `\` in a double-quoted scalar
+/// (its letter and its hexadecimal digits), when libyaml accepts it
+/// (`scan_flow_scalar`, as vendored by `unsafe-libyaml` 0.2.11): a
+/// one-character escape of its list, or `x`, `u`, `U` with 2, 4 or 8
+/// hexadecimal digits naming a Unicode scalar value (no surrogate, at most
+/// `U+10FFFF`; libyaml has no surrogate pairs). An escaped line break is
+/// not an escape here.
+pub(super) fn escape_len(rest: &[u8]) -> Option<usize> {
+    let e = *rest.first()?;
+    let digits = match e {
+        b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f' | b'r' | b'e' | b' ' | b'"'
+        | b'/' | b'\\' | b'N' | b'_' | b'L' | b'P' => return Some(1),
+        b'x' => 2,
+        b'u' => 4,
+        b'U' => 8,
+        _ => return None,
+    };
+    escape_code(rest.get(1..1 + digits)?)?;
+    Some(1 + digits)
+}
+
+/// The Unicode scalar value named by hexadecimal `digits`, as libyaml
+/// accepts it.
+pub(super) fn escape_code(digits: &[u8]) -> Option<char> {
+    let mut value = 0u32;
+    for &h in digits {
+        value = (value << 4) | char::from(h).to_digit(16)?;
+    }
+    if (0xD800..=0xDFFF).contains(&value) || value > 0x10_FFFF {
+        return None;
+    }
+    char::from_u32(value)
+}
+
+pub(super) fn is_break(c: Option<u8>) -> bool {
     matches!(c, Some(b'\n' | b'\r'))
 }
 
-fn is_blank(c: Option<u8>) -> bool {
+pub(super) fn is_blank(c: Option<u8>) -> bool {
     matches!(c, Some(b' ' | b'\t'))
 }
 
@@ -382,32 +523,75 @@ fn is_class_byte(c: u8) -> bool {
 }
 
 impl<'a> Scanner<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    fn new(b: &'a [u8], mode: Mode) -> Self {
+        let mut queue = VecDeque::new();
+        if mode == Mode::Parse {
+            queue.push_back(Tok::StreamStart);
+        }
         Self {
             b,
+            mode,
             pos: 0,
             line: 0,
             col: 0,
             indents: vec![-1],
             flow: Vec::new(),
-            simple_key_allowed: false,
+            // libyaml's `fetch_stream_start`; the pre-scan reads the
+            // header first.
+            simple_key_allowed: mode == Mode::Parse,
             candidates: vec![None],
             last: Last::Start,
+            last_line: 0,
             tags: Vec::new(),
             tokens: 0,
             last_scalar: None,
             credential_key: None,
             blanks: Vec::new(),
             client_secret: None,
+            queue,
+            tokens_parsed: 0,
+            token_available: false,
+            done: false,
+            document_started: false,
         }
     }
 
+    /// The scanner of the parse pass, over a pre-scanned (blanked) text.
+    pub(super) fn parser(text: &'a [u8]) -> Self {
+        Self::new(text, Mode::Parse)
+    }
+
+    fn parse_mode(&self) -> bool {
+        self.mode == Mode::Parse
+    }
+
     /// Counts one token against [`MAX_TOKENS`].
-    fn token(&mut self) -> Result<(), Refusal> {
+    fn token(&mut self) -> Result<(), Fail> {
         self.tokens += 1;
         if self.tokens > MAX_TOKENS {
-            return Err(Refusal::Bounds);
+            return Err(Refusal::Bounds.into());
         }
+        Ok(())
+    }
+
+    /// Queues a token (parse mode).
+    fn emit(&mut self, t: Tok) {
+        if self.parse_mode() {
+            self.queue.push_back(t);
+        }
+    }
+
+    /// Inserts a token before the token numbered `number` (parse mode:
+    /// libyaml's `QUEUE_INSERT` of `KEY` and `BLOCK-MAPPING-START`).
+    fn insert(&mut self, number: usize, t: Tok) -> Result<(), Fail> {
+        if !self.parse_mode() {
+            return Ok(());
+        }
+        let at = number.checked_sub(self.tokens_parsed).ok_or(Fail::Yaml)?;
+        if at > self.queue.len() {
+            return Err(Fail::Yaml);
+        }
+        self.queue.insert(at, t);
         Ok(())
     }
 
@@ -421,6 +605,13 @@ impl<'a> Scanner<'a> {
 
     fn starts_with(&self, p: &[u8]) -> bool {
         self.b.get(self.pos..).is_some_and(|r| r.starts_with(p))
+    }
+
+    /// `---` or `...` at column 0, followed by a blank or a line end.
+    fn at_document_marker(&self) -> bool {
+        self.col == 0
+            && (self.starts_with(b"---") || self.starts_with(b"..."))
+            && is_blankz(self.at(3))
     }
 
     /// Advances one byte (not a line break): columns count characters.
@@ -457,43 +648,97 @@ impl<'a> Scanner<'a> {
         isize::try_from(self.col).unwrap_or(isize::MAX)
     }
 
-    /// libyaml's `roll_indent` (block context only).
-    fn roll(&mut self, col: usize) -> Result<(), Refusal> {
+    /// libyaml's `roll_indent` (block context only): `tok` is appended, or
+    /// inserted before the token numbered `at`.
+    fn roll(&mut self, col: usize, at: Option<usize>, tok: Tok) -> Result<(), Fail> {
         let col = isize::try_from(col).map_err(|_| Refusal::Bounds)?;
         if self.flow.is_empty() && self.top() < col {
             self.indents.push(col);
             if self.nesting() > MAX_NESTING {
-                return Err(Refusal::Bounds);
+                return Err(Refusal::Bounds.into());
+            }
+            match at {
+                Some(n) => self.insert(n, tok)?,
+                None => self.emit(tok),
             }
         }
         Ok(())
     }
 
-    /// libyaml's `save_simple_key` (replaces the level's candidate).
-    fn save_candidate(&mut self, kind: CandKind) {
+    /// libyaml's `unroll_indent` (block context only).
+    fn unroll(&mut self, col: isize) {
+        if !self.flow.is_empty() {
+            return;
+        }
+        while self.top() > col {
+            self.indents.pop();
+            self.emit(Tok::BlockEnd);
+        }
+    }
+
+    /// libyaml's `save_simple_key` (replaces the level's candidate; in
+    /// parse mode, a required one it replaces is an error).
+    fn save_candidate(&mut self, kind: CandKind) -> Result<(), Fail> {
         if self.simple_key_allowed {
             let k = Candidate {
                 line: self.line,
                 col: self.col,
                 pos: self.pos,
                 kind,
+                required: self.flow.is_empty() && self.top() == self.col_i(),
+                number: self.tokens_parsed + self.queue.len(),
             };
+            self.remove_candidate()?;
             if let Some(slot) = self.candidates.last_mut() {
                 *slot = Some(k);
             }
         }
+        Ok(())
     }
 
-    /// libyaml's `remove_simple_key` (the current level's candidate).
+    /// The current level's candidate, taken (for its `:`).
     fn take_candidate(&mut self) -> Option<Candidate> {
         self.candidates.last_mut().and_then(Option::take)
+    }
+
+    /// libyaml's `remove_simple_key`: in parse mode, dropping a required
+    /// candidate is an error.
+    fn remove_candidate(&mut self) -> Result<(), Fail> {
+        match self.take_candidate() {
+            Some(k) if k.required && self.parse_mode() => Err(Fail::Yaml),
+            _ => Ok(()),
+        }
+    }
+
+    /// libyaml's `stale_simple_keys`: a candidate does not survive a line
+    /// change (nor, in parse mode, 1024 bytes); in parse mode, a required
+    /// one is an error.
+    fn stale(&mut self) -> Result<(), Fail> {
+        let (line, pos, parse) = (self.line, self.pos, self.parse_mode());
+        for slot in &mut self.candidates {
+            let Some(k) = *slot else {
+                continue;
+            };
+            let stale = if parse {
+                k.line < line || k.pos.saturating_add(SIMPLE_KEY_SPAN) < pos
+            } else {
+                k.line != line
+            };
+            if stale {
+                if parse && k.required {
+                    return Err(Fail::Yaml);
+                }
+                *slot = None;
+            }
+        }
+        Ok(())
     }
 
     /// `--- !<class>`, followed by a blank or a line end. CAS trims the
     /// content before checking its start: blank lines (spaces only) may
     /// come first, so that `---` is still at column 0; a tab, a comment or
     /// spaces before `---` on its own line are refused.
-    fn header(&mut self) -> Result<String, Refusal> {
+    fn header(&mut self) -> Result<String, Fail> {
         loop {
             let line_start = self.pos;
             while self.peek() == Some(b' ') {
@@ -504,12 +749,12 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             if self.pos != line_start {
-                return Err(Refusal::NotCas);
+                return Err(Refusal::NotCas.into());
             }
             break;
         }
         if !self.starts_with(b"--- !<") {
-            return Err(Refusal::NotCas);
+            return Err(Refusal::NotCas.into());
         }
         for _ in 0..4 {
             self.advance();
@@ -546,13 +791,13 @@ impl<'a> Scanner<'a> {
     }
 
     /// libyaml's `scan_to_next_token`: spaces, comments and line breaks.
-    fn skip_to_token(&mut self) -> Result<(), Refusal> {
+    fn skip_to_token(&mut self) -> Result<(), Fail> {
         loop {
             while self.peek() == Some(b' ') {
                 self.advance();
             }
             if self.peek() == Some(b'\t') {
-                return Err(Refusal::Syntax);
+                return Err(Refusal::Syntax.into());
             }
             if self.peek() == Some(b'#') {
                 while !is_break(self.peek()) && self.peek().is_some() {
@@ -570,148 +815,207 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn run(&mut self) -> Result<(), Refusal> {
-        loop {
-            self.skip_to_token()?;
-            // A possible simple key does not survive a line change.
-            let line = self.line;
-            for slot in &mut self.candidates {
-                if slot.is_some_and(|k| k.line != line) {
-                    *slot = None;
-                }
+    /// One token (libyaml's `fetch_next_token`); `false` at the end.
+    fn step(&mut self) -> Result<bool, Fail> {
+        self.skip_to_token()?;
+        // A possible simple key does not survive a line change.
+        self.stale()?;
+        let Some(c) = self.peek() else {
+            self.stream_end()?;
+            return Ok(false);
+        };
+        if self.flow.is_empty() {
+            self.unroll(self.col_i());
+        }
+        if self.col == 0 && c == b'%' {
+            return Err(Refusal::Directive.into());
+        }
+        if self.at_document_marker() {
+            if self.parse_mode() && !self.document_started && c == b'-' {
+                return self.document_start().map(|()| true);
             }
-            let Some(c) = self.peek() else {
-                break;
-            };
-            if self.flow.is_empty() {
-                let col = self.col_i();
-                while self.top() > col {
-                    self.indents.pop();
+            return Err(Refusal::Documents.into());
+        }
+        // Only the token right after a credential key's `:` may be
+        // its value.
+        let credential_key = self.credential_key.take();
+        // Closers, separators and tags (blanked) make no event.
+        if !matches!(c, b']' | b'}' | b',' | b'!') {
+            self.token()?;
+        }
+        match c {
+            b'[' | b'{' => {
+                self.save_candidate(CandKind::Collection)?;
+                if self.flow.len() >= MAX_FLOW_DEPTH {
+                    return Err(Refusal::Bounds.into());
                 }
+                let (flow, tok) = if c == b'[' {
+                    (Flow::Seq, Tok::FlowSequenceStart)
+                } else {
+                    (Flow::Map, Tok::FlowMappingStart)
+                };
+                self.flow.push(flow);
+                self.candidates.push(None);
+                if self.nesting() > MAX_NESTING {
+                    return Err(Refusal::Bounds.into());
+                }
+                self.simple_key_allowed = true;
+                self.last = Last::FlowOpen;
+                self.last_line = self.line;
+                self.advance();
+                self.emit(tok);
             }
-            if self.col == 0 && c == b'%' {
-                return Err(Refusal::Directive);
+            b']' | b'}' => {
+                let (want, tok) = if c == b']' {
+                    (Flow::Seq, Tok::FlowSequenceEnd)
+                } else {
+                    (Flow::Map, Tok::FlowMappingEnd)
+                };
+                if self.flow.last() != Some(&want) {
+                    return Err(Refusal::Syntax.into());
+                }
+                self.remove_candidate()?;
+                self.flow.pop();
+                self.candidates.pop();
+                // The collection itself stays a possible key (refused
+                // as one by `value`).
+                self.simple_key_allowed = false;
+                self.last = Last::FlowClose;
+                self.advance();
+                self.emit(tok);
             }
-            if self.col == 0
-                && (self.starts_with(b"---") || self.starts_with(b"..."))
-                && is_blankz(self.at(3))
-            {
-                return Err(Refusal::Documents);
+            b',' => {
+                if self.flow.is_empty() {
+                    return Err(Refusal::Syntax.into());
+                }
+                self.remove_candidate()?;
+                self.simple_key_allowed = true;
+                self.last = Last::FlowEntry;
+                self.last_line = self.line;
+                self.advance();
+                self.emit(Tok::FlowEntry);
             }
-            // Only the token right after a credential key's `:` may be
-            // its value.
-            let credential_key = self.credential_key.take();
-            // Closers, separators and tags (blanked) make no event.
-            if !matches!(c, b']' | b'}' | b',' | b'!') {
-                self.token()?;
+            b'-' if is_blankz(self.at(1)) => {
+                if !self.flow.is_empty() || !self.simple_key_allowed {
+                    return Err(Refusal::Syntax.into());
+                }
+                self.roll(self.col, None, Tok::BlockSequenceStart)?;
+                self.remove_candidate()?;
+                self.simple_key_allowed = true;
+                self.last = Last::BlockEntry;
+                self.last_line = self.line;
+                self.advance();
+                self.emit(Tok::BlockEntry);
             }
-            match c {
-                b'[' | b'{' => {
-                    self.save_candidate(CandKind::Collection);
-                    if self.flow.len() >= MAX_FLOW_DEPTH {
-                        return Err(Refusal::Bounds);
-                    }
-                    self.flow
-                        .push(if c == b'[' { Flow::Seq } else { Flow::Map });
-                    self.candidates.push(None);
-                    if self.nesting() > MAX_NESTING {
-                        return Err(Refusal::Bounds);
-                    }
-                    self.simple_key_allowed = true;
-                    self.last = Last::FlowOpen;
-                    self.advance();
+            b'?' => return Err(Refusal::ComplexKey.into()),
+            b':' if !self.flow.is_empty() || is_blankz(self.at(1)) => self.value()?,
+            // `:x` in the block context is a plain scalar for libyaml;
+            // not worth following.
+            b':' => return Err(Refusal::Syntax.into()),
+            b'&' => return Err(Refusal::Anchor.into()),
+            b'*' => return Err(Refusal::Alias.into()),
+            b'!' => self.tag()?,
+            b'|' | b'>' => {
+                if !self.flow.is_empty() {
+                    return Err(Refusal::Syntax.into());
                 }
-                b']' | b'}' => {
-                    let want = if c == b']' { Flow::Seq } else { Flow::Map };
-                    if self.flow.pop() != Some(want) {
-                        return Err(Refusal::Syntax);
-                    }
-                    self.candidates.pop();
-                    // The collection itself stays a possible key (refused
-                    // as one by `value`).
-                    self.simple_key_allowed = false;
-                    self.last = Last::FlowClose;
-                    self.advance();
-                }
-                b',' => {
-                    if self.flow.is_empty() {
-                        return Err(Refusal::Syntax);
-                    }
-                    let _ = self.take_candidate();
-                    self.simple_key_allowed = true;
-                    self.last = Last::FlowEntry;
-                    self.advance();
-                }
-                b'-' if is_blankz(self.at(1)) => {
-                    if !self.flow.is_empty() || !self.simple_key_allowed {
-                        return Err(Refusal::Syntax);
-                    }
-                    self.roll(self.col)?;
-                    let _ = self.take_candidate();
-                    self.simple_key_allowed = true;
-                    self.last = Last::BlockEntry;
-                    self.advance();
-                }
-                b'?' => return Err(Refusal::ComplexKey),
-                b':' if !self.flow.is_empty() || is_blankz(self.at(1)) => self.value()?,
-                // `:x` in the block context is a plain scalar for libyaml;
-                // not worth following.
-                b':' => return Err(Refusal::Syntax),
-                b'&' => return Err(Refusal::Anchor),
-                b'*' => return Err(Refusal::Alias),
-                b'!' => self.tag()?,
-                b'|' | b'>' => {
-                    if !self.flow.is_empty() {
-                        return Err(Refusal::Syntax);
-                    }
-                    self.block_scalar()?;
-                }
-                b'\'' | b'"' => {
-                    self.quoted(c)?;
-                    self.blank_value(credential_key);
-                }
-                b'%' | b'@' | b'`' | b'\t' => return Err(Refusal::Syntax),
-                _ => {
-                    self.plain()?;
-                    self.blank_value(credential_key);
-                }
+                self.block_scalar()?;
+            }
+            b'\'' | b'"' => {
+                self.quoted(c)?;
+                self.blank_value(credential_key);
+            }
+            b'%' | b'@' | b'`' | b'\t' => return Err(Refusal::Syntax.into()),
+            _ => {
+                self.plain()?;
+                self.blank_value(credential_key);
             }
         }
+        Ok(true)
+    }
+
+    /// The end of the input (libyaml's `fetch_stream_end`).
+    fn stream_end(&mut self) -> Result<(), Fail> {
         if !self.flow.is_empty() {
-            return Err(Refusal::Syntax);
+            return Err(Refusal::Syntax.into());
         }
+        if self.parse_mode() {
+            self.unroll(-1);
+            self.remove_candidate()?;
+            self.simple_key_allowed = false;
+            self.emit(Tok::StreamEnd);
+            self.done = true;
+        }
+        Ok(())
+    }
+
+    /// The `---` of the blanked header (parse mode; libyaml's
+    /// `fetch_document_indicator`).
+    fn document_start(&mut self) -> Result<(), Fail> {
+        self.unroll(-1);
+        self.remove_candidate()?;
+        self.simple_key_allowed = false;
+        for _ in 0..3 {
+            self.advance();
+        }
+        self.document_started = true;
+        self.emit(Tok::DocumentStart);
         Ok(())
     }
 
     /// `:`: the value indicator of a simple key.
-    fn value(&mut self) -> Result<(), Refusal> {
+    fn value(&mut self) -> Result<(), Fail> {
         match self.take_candidate() {
             Some(k) if k.kind == CandKind::Scalar => {
-                self.credential_key = self.credential_key_of(k);
-                self.roll(k.col)?;
+                if !self.parse_mode() {
+                    self.credential_key = self.credential_key_of(k);
+                }
+                self.insert(k.number, Tok::Key)?;
+                self.roll(k.col, Some(k.number), Tok::BlockMappingStart)?;
                 // libyaml: no simple key right after a key's `:`.
                 self.simple_key_allowed = false;
             }
-            Some(k) if k.kind == CandKind::Tagged => return Err(Refusal::Tag),
-            _ => return Err(Refusal::ComplexKey),
+            Some(k) if k.kind == CandKind::Tagged => return Err(Refusal::Tag.into()),
+            Some(_) => return Err(Refusal::ComplexKey.into()),
+            // Parse mode: a key the pre-scan saw but libyaml forgot (more
+            // than 1024 bytes back) is libyaml's to refuse.
+            None if self.parse_mode() => {
+                if self.flow.is_empty() {
+                    if !self.simple_key_allowed {
+                        return Err(Fail::Yaml);
+                    }
+                    self.roll(self.col, None, Tok::BlockMappingStart)?;
+                }
+                self.simple_key_allowed = self.flow.is_empty();
+            }
+            None => return Err(Refusal::ComplexKey.into()),
         }
         self.last = Last::Value;
+        self.last_line = self.line;
         self.advance();
+        self.emit(Tok::Value);
         Ok(())
     }
 
-    /// A tag: only a verbatim class name, in a value position.
-    fn tag(&mut self) -> Result<(), Refusal> {
+    /// A tag: only a verbatim class name, in a value position (pre-scan
+    /// only: the parse pass reads the copy where every tag is blanked).
+    fn tag(&mut self) -> Result<(), Fail> {
         let in_seq = self.flow.last() == Some(&Flow::Seq);
         let placed = match self.last {
             Last::Value | Last::BlockEntry => true,
             Last::FlowOpen | Last::FlowEntry => in_seq,
             _ => false,
         };
-        if !placed {
-            return Err(Refusal::Tag);
+        // On the line of the indicator it follows, as Jackson writes it
+        // (security review of #187, M1): a tag alone on a later line would
+        // move the block indentation on the raw bytes but not on the
+        // blanked copy the parse pass reads (where it is spaces), so the
+        // two passes would disagree.
+        let placed = placed && self.last_line == self.line;
+        if !placed || self.parse_mode() {
+            return Err(Refusal::Tag.into());
         }
-        self.save_candidate(CandKind::Tagged);
+        self.save_candidate(CandKind::Tagged)?;
         let start = self.pos;
         self.verbatim_tag().ok_or(Refusal::Tag)?;
         self.tags.push((start, self.pos));
@@ -720,18 +1024,27 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
+    /// Parse mode: libyaml refuses a document marker at the start of a
+    /// line inside a quoted scalar.
+    fn marker_in_quoted(&self) -> Result<(), Fail> {
+        if self.parse_mode() && self.at_document_marker() {
+            return Err(Fail::Yaml);
+        }
+        Ok(())
+    }
+
     /// A single- or double-quoted scalar, to its closing quote.
-    fn quoted(&mut self, q: u8) -> Result<(), Refusal> {
-        self.save_candidate(CandKind::Scalar);
+    fn quoted(&mut self, q: u8) -> Result<(), Fail> {
+        self.save_candidate(CandKind::Scalar)?;
         let line = self.line;
         let start = self.pos;
         self.advance();
         if self.starts_with(b"<<") {
-            return Err(Refusal::MergeKey);
+            return Err(Refusal::MergeKey.into());
         }
         loop {
             match self.peek() {
-                None => return Err(Refusal::Syntax),
+                None => return Err(Refusal::Syntax.into()),
                 Some(b'\'') if q == b'\'' => {
                     if self.at(1) == Some(b'\'') {
                         self.advance();
@@ -749,16 +1062,26 @@ impl<'a> Scanner<'a> {
                     self.advance();
                     if is_break(self.peek()) {
                         self.eat_break();
+                        self.marker_in_quoted()?;
                     } else {
+                        if self.parse_mode()
+                            && self.b.get(self.pos..).and_then(escape_len).is_none()
+                        {
+                            return Err(Fail::Yaml);
+                        }
                         self.advance();
                     }
                 }
-                Some(b'\n' | b'\r') => self.eat_break(),
+                Some(b'\n' | b'\r') => {
+                    self.eat_break();
+                    self.marker_in_quoted()?;
+                }
                 Some(_) => self.advance(),
             }
         }
-        // A multi-line scalar cannot be a key.
-        if self.line != line {
+        // A multi-line scalar cannot be a key (in parse mode, libyaml's
+        // staleness decides).
+        if self.line != line && !self.parse_mode() {
             let _ = self.take_candidate();
         }
         self.last_scalar = Some(ScalarSpan {
@@ -770,24 +1093,33 @@ impl<'a> Scanner<'a> {
         });
         self.simple_key_allowed = false;
         self.last = Last::Scalar;
+        self.emit(Tok::Scalar(Scalar {
+            start,
+            end: self.pos,
+            style: if q == b'"' {
+                Style::Double
+            } else {
+                Style::Single
+            },
+        }));
         Ok(())
     }
 
     /// A plain scalar, as libyaml's `scan_plain_scalar` delimits it.
-    fn plain(&mut self) -> Result<(), Refusal> {
-        self.save_candidate(CandKind::Scalar);
+    fn plain(&mut self) -> Result<(), Fail> {
+        self.save_candidate(CandKind::Scalar)?;
         if self.starts_with(b"<<") {
-            return Err(Refusal::MergeKey);
+            return Err(Refusal::MergeKey.into());
         }
         let indent = self.top() + 1;
+        // Any line break crossed (pre-scan), and libyaml's
+        // `leading_blanks`: a line break after the last content.
         let mut crossed = false;
+        let mut leading_blanks = false;
         let (start, line) = (self.pos, self.line);
         let (mut end, mut end_line) = (self.pos, self.line);
         loop {
-            if self.col == 0
-                && (self.starts_with(b"---") || self.starts_with(b"..."))
-                && is_blankz(self.at(3))
-            {
+            if self.at_document_marker() {
                 break;
             }
             if self.peek() == Some(b'#') {
@@ -800,7 +1132,7 @@ impl<'a> Scanner<'a> {
                         break;
                     }
                     // `x:y` in a flow collection: libyaml versions differ.
-                    return Err(Refusal::Syntax);
+                    return Err(Refusal::Syntax.into());
                 }
                 if c == Some(b':') && is_blankz(self.at(1)) {
                     break;
@@ -809,6 +1141,7 @@ impl<'a> Scanner<'a> {
                     break;
                 }
                 self.advance();
+                leading_blanks = false;
                 (end, end_line) = (self.pos, self.line);
             }
             if !(is_blank(self.peek()) || is_break(self.peek())) {
@@ -816,11 +1149,12 @@ impl<'a> Scanner<'a> {
             }
             while is_blank(self.peek()) || is_break(self.peek()) {
                 if self.peek() == Some(b'\t') {
-                    return Err(Refusal::Syntax);
+                    return Err(Refusal::Syntax.into());
                 }
                 if is_break(self.peek()) {
                     self.eat_break();
                     crossed = true;
+                    leading_blanks = true;
                 } else {
                     self.advance();
                 }
@@ -836,14 +1170,21 @@ impl<'a> Scanner<'a> {
             quote: None,
             single_line: end_line == line,
         });
-        if crossed {
-            // libyaml allows a simple key after a plain scalar that ended
-            // on a line break (the candidate itself went stale).
-            self.simple_key_allowed = true;
+        // libyaml allows a simple key after a plain scalar that ended on
+        // a line break (the candidate itself went stale). The pre-scan
+        // allows it after any line break in the scalar (it refuses what
+        // could follow otherwise).
+        self.simple_key_allowed = if self.parse_mode() {
+            leading_blanks
         } else {
-            self.simple_key_allowed = false;
-        }
+            crossed
+        };
         self.last = Last::Scalar;
+        self.emit(Tok::Scalar(Scalar {
+            start,
+            end,
+            style: Style::Plain,
+        }));
         Ok(())
     }
 
@@ -899,7 +1240,8 @@ impl<'a> Scanner<'a> {
     /// Blanks the scalar just read if it is the single-line value of a
     /// credential key on the line of its `:`; for the top-level
     /// `clientSecret`, records its [`SecretForm`] first (or leaves it to
-    /// the visitor when it cannot be computed here).
+    /// the visitor when it cannot be computed here). Pre-scan only (the
+    /// key is never set in parse mode).
     fn blank_value(&mut self, key: Option<CredentialKey>) {
         let (Some(key), Some(s)) = (key, self.last_scalar) else {
             return;
@@ -963,14 +1305,20 @@ impl<'a> Scanner<'a> {
 
     /// A block scalar (`|` or `>`), as libyaml's `scan_block_scalar`
     /// delimits it; an indentation indicator is refused.
-    fn block_scalar(&mut self) -> Result<(), Refusal> {
-        let _ = self.take_candidate();
+    fn block_scalar(&mut self) -> Result<(), Fail> {
+        self.remove_candidate()?;
+        let literal = self.peek() == Some(b'|');
         self.advance();
-        if matches!(self.peek(), Some(b'+' | b'-')) {
+        let chomp = match self.peek() {
+            Some(b'+') => Chomp::Keep,
+            Some(b'-') => Chomp::Strip,
+            _ => Chomp::Clip,
+        };
+        if chomp != Chomp::Clip {
             self.advance();
         }
         if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            return Err(Refusal::Syntax);
+            return Err(Refusal::Syntax.into());
         }
         while self.peek() == Some(b' ') {
             self.advance();
@@ -983,12 +1331,23 @@ impl<'a> Scanner<'a> {
         if self.peek().is_none() {
             self.simple_key_allowed = true;
             self.last = Last::Scalar;
+            // No content line: an empty scalar.
+            self.emit(Tok::Scalar(Scalar {
+                start: self.pos,
+                end: self.pos,
+                style: Style::Block {
+                    literal,
+                    indent: 1,
+                    chomp,
+                },
+            }));
             return Ok(());
         }
         if !is_break(self.peek()) {
-            return Err(Refusal::Syntax);
+            return Err(Refusal::Syntax.into());
         }
         self.eat_break();
+        let start = self.pos;
         // Leading breaks and the indentation (libyaml's
         // `scan_block_scalar_breaks` with an unknown indentation).
         let mut max_indent = 0usize;
@@ -997,7 +1356,7 @@ impl<'a> Scanner<'a> {
                 self.advance();
             }
             if self.peek() == Some(b'\t') {
-                return Err(Refusal::Syntax);
+                return Err(Refusal::Syntax.into());
             }
             max_indent = max_indent.max(self.col);
             if is_break(self.peek()) {
@@ -1021,7 +1380,7 @@ impl<'a> Scanner<'a> {
                     self.advance();
                 }
                 if self.col < indent && self.peek() == Some(b'\t') {
-                    return Err(Refusal::Syntax);
+                    return Err(Refusal::Syntax.into());
                 }
                 if is_break(self.peek()) {
                     self.eat_break();
@@ -1032,7 +1391,69 @@ impl<'a> Scanner<'a> {
         }
         self.simple_key_allowed = true;
         self.last = Last::Scalar;
+        self.emit(Tok::Scalar(Scalar {
+            start,
+            end: self.pos,
+            style: Style::Block {
+                literal,
+                indent,
+                chomp,
+            },
+        }));
         Ok(())
+    }
+
+    /// The next token (parse mode; libyaml's `PEEK_TOKEN`).
+    pub(super) fn peek_token(&mut self) -> Result<Tok, Fail> {
+        if !self.token_available {
+            self.fetch_more()?;
+            self.token_available = true;
+        }
+        self.queue.front().copied().ok_or(Fail::Yaml)
+    }
+
+    /// Takes the next token (parse mode; libyaml's `SKIP_TOKEN`).
+    pub(super) fn skip_token(&mut self) {
+        if self.queue.pop_front().is_some() {
+            self.tokens_parsed += 1;
+        }
+        self.token_available = false;
+    }
+
+    /// libyaml's `fetch_more_tokens`: scans until the head of the queue
+    /// cannot become a key any more.
+    fn fetch_more(&mut self) -> Result<(), Fail> {
+        loop {
+            let need = if self.queue.is_empty() {
+                true
+            } else {
+                self.stale()?;
+                let head = self.tokens_parsed;
+                self.candidates.iter().flatten().any(|k| k.number == head)
+            };
+            if !need {
+                return Ok(());
+            }
+            if self.done {
+                return Err(Fail::Yaml);
+            }
+            self.step()?;
+        }
+    }
+}
+
+/// Every token of a pre-scanned text, in order (tests).
+#[cfg(test)]
+pub(super) fn tokens_of(text: &[u8]) -> Result<Vec<Tok>, Fail> {
+    let mut s = Scanner::parser(text);
+    let mut out = Vec::new();
+    loop {
+        let t = s.peek_token()?;
+        s.skip_token();
+        out.push(t);
+        if t == Tok::StreamEnd {
+            return Ok(out);
+        }
     }
 }
 
@@ -1143,6 +1564,33 @@ mod tests {
             "a: !<java.util.ArrayList>\n- !<org.apereo.cas.services.DefaultRegisteredServiceContact>\n  name: \"J\"\n",
         );
         ok("a: [!<java.lang.String> x, !<java.lang.String> y]\n");
+        // Not on the line of its indicator (security review of #187, M1).
+        for body in [
+            "a:\n  !<java.util.HashMap>\n  b: 1\n",
+            "a:\n  b:\n!<java.util.HashMap>\n  c: 1\n",
+            "-\n  !<java.util.HashMap>\n  b: 1\n",
+            "a: [\n  !<java.lang.String> x]\n",
+            "a: [x,\n !<java.lang.String> y]\n",
+        ] {
+            assert_eq!(refused(body), Refusal::Tag, "{body:?}");
+        }
+        // The review's repro: a clear top-level `clientSecret` whose form
+        // a later nested one could replace.
+        let doc = "--- !<org.apereo.cas.support.oauth.services.OAuthRegisteredService>\n  serviceId: x\n  clientSecret: fake-clear-1\n  a:\n    b:\n!<java.util.HashMap>\n    clientSecret: ${REF}\n";
+        assert_eq!(prescan(doc.as_bytes()).unwrap_err(), Refusal::Tag);
+        // A tag line in the middle of a deep block nesting (it reset the
+        // pre-scan's indentation stack, not the parse pass's).
+        let mut deep = String::from(HEAD);
+        for i in 0..40 {
+            if i == 20 {
+                deep.push_str("!<java.util.HashMap>\n");
+            }
+            deep.push_str(&" ".repeat(i));
+            deep.push_str("k:\n");
+        }
+        deep.push_str(&" ".repeat(40));
+        deep.push_str("v: 1\n");
+        assert_eq!(prescan(deep.as_bytes()).unwrap_err(), Refusal::Tag);
     }
 
     #[test]
@@ -1255,5 +1703,34 @@ mod tests {
                 "{doc:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn keys_and_mapping_starts_go_before_their_scalar() {
+        let toks = tokens_of(b"---\na: 1\nb:\n- c\n").unwrap();
+        let kinds: Vec<&str> = toks
+            .iter()
+            .map(|t| match t {
+                Tok::StreamStart => "S",
+                Tok::StreamEnd => "E",
+                Tok::DocumentStart => "D",
+                Tok::BlockMappingStart => "{",
+                Tok::BlockSequenceStart => "[",
+                Tok::BlockEnd => "}",
+                Tok::Key => "K",
+                Tok::Value => "V",
+                Tok::BlockEntry => "-",
+                Tok::Scalar(_) => "s",
+                _ => "?",
+            })
+            .collect();
+        // `b:` holds an indentless sequence (no block start).
+        assert_eq!(kinds.concat(), "SD{KsVsKsV-s}E");
+        assert_eq!(tokens_of(b"---\na: 1\nb\n"), Err(Fail::Yaml));
     }
 }

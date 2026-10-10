@@ -1,0 +1,45 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+k:
+ k:
+  k:
+   k:
+    k:
+     k:
+      k:
+       k:
+        k:
+         k:
+          k:
+           k:
+            k:
+             k:
+              k:
+               k:
+                k:
+                 k:
+                  k:
+                   k:
+!<java.util.HashMap>
+                    k:
+                     k:
+                      k:
+                       k:
+                        k:
+                         k:
+                          k:
+                           k:
+                            k:
+                             k:
+                              k:
+                               k:
+                                k:
+                                 k:
+                                  k:
+                                   k:
+                                    k:
+                                     k:
+                                      k:
+                                       k:
+                                        v: 1

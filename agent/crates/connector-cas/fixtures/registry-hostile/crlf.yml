@@ -1,0 +1,9 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+description: a
+  b
+list:
+- x
+- |
+  y

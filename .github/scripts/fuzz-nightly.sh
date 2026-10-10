@@ -44,7 +44,8 @@ mkdir -p "$CORPUS" "$FUZZ/artifacts/$TARGET"
 FIXTURES="$ROOT/agent/crates/connector-cas/fixtures"
 case "$TARGET" in
   cas_registry) cp "$FIXTURES"/registry/*.json "$CORPUS"/ ;;
-  cas_registry_yaml) cp "$FIXTURES"/registry/*.yml "$FIXTURES"/registry/*.yaml "$CORPUS"/ ;;
+  cas_registry_yaml | cas_registry_yaml_diff)
+    cp "$FIXTURES"/registry/*.yml "$FIXTURES"/registry/*.yaml "$FIXTURES"/registry-hostile/*.yml "$CORPUS"/ ;;
   cas_audit_log) split -l 1 -a 3 -d "$FIXTURES/cas-8.0.2-oauth-oidc-audit.jsonl" "$CORPUS/fixture-" ;;
   *) ;; # the MongoDB and OpenLDAP targets start from an empty corpus, as in smoke.sh
 esac

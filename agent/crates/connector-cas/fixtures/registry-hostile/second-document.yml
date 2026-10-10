@@ -1,0 +1,8 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+description: x
+---
+name: B
+...
+%YAML 1.1
